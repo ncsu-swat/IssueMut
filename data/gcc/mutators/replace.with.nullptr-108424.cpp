@@ -16,18 +16,6 @@ public:
         TraverseAST(getASTContext());
         bool Modified = false;
 
-        /**
-         * 
-         * the original mutator mutations mutations in several places, wherever 
-         * there is a literal. there is a bug in the original mutator making 
-         * the changes to overlap. instead of nullptr you see nullptnullptr. 
-         * 
-         * to circumvent the problem, we choose only ONE location to apply the 
-         * mutation.
-         * 
-         *   -Marcelo
-         */
-
         if (Targets.empty()) return false;
         const auto &Target = randElement(Targets);        
 
