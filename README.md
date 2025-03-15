@@ -1,5 +1,14 @@
 # IssueMut-ICSE2026
 
+This is the replication package for the paper "Bug Histories as Sources of Compiler Fuzzing Mutators" submitted to ICSE'26.
+
+This paper proposes IssueMut, an approach for extracting compiler
+fuzzing mutators from bug histories. Our insight is that bug reports
+contain hints about program elements that induced compiler bugs,
+which can guide fuzzers towards similar bugs. IssueMut uses a
+semi-automated method to mine mutators from bug reports and
+retrofit such mutators into existing mutational compiler fuzzers.
+
 ## Structure of the project
 
 ```
