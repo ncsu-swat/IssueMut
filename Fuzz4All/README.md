@@ -1,6 +1,6 @@
 # Fuzz4All
 
-This folder contains the output logs for Fuzz4All and crashes we find.
+This folder contains crashes we find using Fuzz4All.
 
 ```shell
 - Fuzz4All
