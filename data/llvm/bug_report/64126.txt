@@ -1,0 +1,35 @@
+Issue Title: Several Solaris/amd64 asan tests FAIL with ASan init calls itself!
+Original Post: A couple of asan tests `FAIL` on Solaris/amd64:
+```
+  AddressSanitizer-Unit :: ./Asan-i386-calls-Dynamic-Test/failed_to_discover_tests_from_gtest
+  AddressSanitizer-Unit :: ./Asan-i386-inline-Dynamic-Test/failed_to_discover_tests_from_gtest
+  AddressSanitizer-i386-sunos-dynamic :: TestCases/Posix/no-fd.cpp
+  AddressSanitizer-i386-sunos-dynamic :: TestCases/Posix/start-deactivated.cpp
+  AddressSanitizer-i386-sunos-dynamic :: TestCases/default_options.cpp
+```
+The failure mode is always the same:
+```
+AddressSanitizer: CHECK failed: asan_rtl.cpp:387 "((!asan_init_is_running && "ASan init calls itself!")) != (0)" (0x0, 0x0) (tid=1)
+```
+With great help from Ali Bahrami, the Solaris linker engineer, I've managed to determine what's going on here: there's a cycle calling `AsanInitInternal` like so:
+```
+  libclang_rt-i386.so	.init_array	-> asan_rtl.cpp (AsanInitInternal)
+  					-> asan_flags.cpp (InitializeFlags)
+					-> executable (__asan_default_options)
+  executable		.init_array	-> executable (asan.module_ctor)
+  					-> asan_rtl.cpp (__asan_init)
+					-> asan_rtl.cpp (AsanInitInternal)
+```
+When `AsanInitInternal` calls `InitializeFlags`, that calls back into the executable where `clang` has created a definition of `__asan_default_options`.  However, that call triggers the executable's `.init_array` processing, which includes `asan.module_ctor`.  That again calls `__asan_init` and into `AsanInitInternal` a second time, completing the cycle.
+
+I've long known that this can be avoided by disabling lazy binding, either with `LD_BIND_NOW=1` or by passing `-z now` to `ld`, either directly or via the `LD_OPTIONS` environment variable.  Ali confirmed that this seems to be the sensible thing to do given the circumstances.
+
+For a long time, I've used that workaround locally and in the Solaris/amd64 buildbot, but this has now broken down for one testcase (`AddressSanitizer-i386-sunos-dynamic :: TestCases/Posix/start-deactivated.cpp`) where the testsuite explicitly doesn't pass on `LD_*` environment variables.
+
+I've now got a driver patch to pass `-z now` as appropriate, to be submitted shortly.
+
+Comment by llvmbot: @llvm/issue-subscribers-clang-driver
+Comment by rorth: Patch now posted: [[Driver] Link shared asan runtime lib with -z now on Solaris/x86](https://reviews.llvm.org/D156325)
+Comment by rorth: /cherry-pick 6b5149aa442efc10afa00e8864e58a24a9cf5c9f
+Comment by llvmbot: /branch llvm/llvm-project-release-prs/issue64126
+Comment by llvmbot: /pull-request llvm/llvm-project-release-prs#489

@@ -1,0 +1,60 @@
+Issue Title: Regression with -D_FORTIFY_SOURCE=2
+Original Post: There was a regression compiling [libmbim](https://github.com/freedesktop/libmbim) between clang-14 and clang-15, and it's still present in main.
+
+The bad behavior began after bfb9b8e075ee32197157ccaf0c301122ca9b81af, however, I think the root cause is a bug in Clang's handling of `-D_FORTIFY_SOURCE=2`.  When building libmbim, the libmbim-glib-scan utility hangs, and from some limited debugging I did, it appears that it gets stuck in a loop of `strncpy` calling itself, which I think has happened before due to inlining of the `*_chk` functions in glibc.
+
+I am able to reliably reproduce this bug in a Fedora 37 container using the script below:
+
+```shell
+sudo dnf install 'dnf-command(builddep)' git
+sudo dnf builddep libmbim
+git clone https://github.com/freedesktop/libmbim
+cd libmbim
+git checkout 1.26.4
+
+export CFLAGS='-O2 -flto -g -Wp,-D_FORTIFY_SOURCE=2 -Wno-cast-align -gdwarf-4'
+export LDFLAGS='-flto -fuse-ld=lld'
+export CC=clang
+export AR=llvm-ar
+export RANLIB=llvm-ranlib
+export NM=llvm-nm
+
+./autogen.sh
+
+./configure --build=x86_64-redhat-linux-gnu --host=x86_64-redhat-linux-gnu --program-prefix= --disable-dependency-tracking --prefix=/usr --exec-prefix=/usr --bindir=/usr/bin --sbindir=/usr/sbin --sysconfdir=/etc --datadir=/usr/share --includedir=/usr/include --libdir=/usr/lib64 --libexecdir=/usr/libexec --localstatedir=/var --sharedstatedir=/var/lib --mandir=/usr/share/man --infodir=/usr/share/info --disable-static --enable-gtk-doc
+
+/usr/bin/make -O -j8 V=1 VERBOSE=1
+```
+@serge-sans-paille
+
+Comment by efriedma-quic: Clang has to do some weird stuff to "correctly" lower the strange functions that call themselves defined by glibc `_FORTIFY_SOURCE`.  I think this was last touched by https://reviews.llvm.org/D134362 ?  We constantly run into edge cases involving this kind of code.
+
+Could use a reduced testcase.
+Comment by tstellar: Here is a [reduced testcase](https://github.com/llvm/llvm-project/files/11067369/reduced.ii.txt)
+
+Compile with
+```shell
+clang -flto -x c -std=gnu89 -O2 -S -emit-llvm reduced.ii -o reduced.ll
+```
+
+The generated `strncpy` function looks wrong:
+
+```ll
+; Function Attrs: alwaysinline nofree nounwind willreturn memory(argmem: readwrite) uwtable
+define available_externally ptr @strncpy(ptr noalias noundef nonnull returned writeonly %0, ptr noalias nocapture noundef nonnull readonly %1, i64 noundef %2) local_unnamed_addr #3 {
+  br label %4
+
+4:                                                ; preds = %4, %3
+  %5 = phi ptr [ poison, %3 ], [ %7, %4 ]
+  %6 = phi i1 [ false, %3 ], [ true, %4 ]
+  %7 = select i1 %6, ptr %5, ptr %0
+  br label %4
+}
+```
+Comment by serge-sans-paille: https://reviews.llvm.org/D147307 << potential fix. 
+Comment by llvmbot: @llvm/issue-subscribers-clang-frontend
+Comment by nikic: /cherry-pick fd8745c252bcd4bc974ce3ff30c19f1cc5c4e3e0
+Comment by llvmbot: /branch llvm/llvm-project-release-prs/issue61691
+Comment by llvmbot: /pull-request llvm/llvm-project-release-prs#417
+Comment by tstellar: Since this commit introduced a regression, we will not be backporting it to 16.0.x.
+Comment by nikic: Closing this as the issue has been fixed and this was now tracking the backport -- with the backport declined, we can close this again.

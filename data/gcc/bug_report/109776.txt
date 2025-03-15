@@ -1,0 +1,137 @@
+Bug Summary: [14 Regression] pr81192 fails on some targets after recent propagator changes
+Product: gcc
+Component: testsuite
+
+  (show other bugs)
+Keywords: testsuite-fail
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jeffrey A. Law | Time: 2023-05-08 16:41:03 UTC
+  Text: pr81192is failing on some targets (xstormy16-elf for example) after this change:
+
+commit 21e2ef2dc25de318de29ec32d5390350c6717c6a
+Author: Andrew Pinski <apinski@marvell.com>
+Date:   Tue May 2 00:10:46 2023 -0700
+
+    Move substitute_and_fold over to use simple_dce_from_worklist
+    
+    While looking into a different issue, I noticed that it
+    would take until the second forwprop pass to do some
+    forward proping and it was because the ssa name was
+    used more than once but the second statement was
+    "dead" and we don't remove that until much later.
+    
+    So this uses simple_dce_from_worklist instead of manually
+    removing of the known unused statements instead.
+    Propagate engine does not do a cleanupcfg afterwards either but manually
+    cleans up possible EH edges so simple_dce_from_worklist
+    needs to communicate that back to the propagate engine.
+    
+    Some testcases needed to be updated/changed even because of better optimization.
+    gcc.dg/pr81192.c even had to be changed to be using the gimple FE so it would
+    be less fragile in the future too.
+    gcc.dg/tree-ssa/pr98737-1.c was failing because __atomic_fetch_ was being matched
+    but in those cases, the result was not being used so both __atomic_fetch_ and
+    __atomic_x_and_fetch_ are valid choices and would not make a code generation difference.
+    evrp7.c, evrp8.c, vrp35.c, vrp36.c: just needed a slightly change as the removal message
+    is different slightly.
+    kernels-alias-8.c: ccp1 is able to remove an unused load which causes ealias to have
+    one less load to analysis so update the expected scan #.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu with no regressions.
+    
+    gcc/ChangeLog:PR tree-optimization/109691* tree-ssa-dce.cc (simple_dce_from_worklist): Add need_eh_cleanup
+            argument.
+            If the removed statement can throw, have need_eh_cleanup
+            include the bb of that statement.
+            * tree-ssa-dce.h (simple_dce_from_worklist): Update declaration.
+            * tree-ssa-propagate.cc (struct prop_stats_d): Remove
+            num_dce.
+            (substitute_and_fold_dom_walker::substitute_and_fold_dom_walker):
+            Initialize dceworklist instead of stmts_to_remove.
+            (substitute_and_fold_dom_walker::~substitute_and_fold_dom_walker):
+            Destore dceworklist instead of stmts_to_remove.
+            (substitute_and_fold_dom_walker::before_dom_children):
+            Set dceworklist instead of adding to stmts_to_remove.
+            (substitute_and_fold_engine::substitute_and_fold):
+            Call simple_dce_from_worklist instead of poping
+            from the list.
+            Don't update the stat on removal statements.
+
+[ ... ]
+
+The compiler is complaining with this message:
+
+/home/jlaw/test/gcc/gcc/testsuite/gcc.dg/pr81192.c: In function 'fn2':^M
+/home/jlaw/test/gcc/gcc/testsuite/gcc.dg/pr81192.c:50:1: error: type mismatch in binary expression^M
+long int^M
+^M
+long int^M
+^M
+int^M
+^M
+iftmp2_8_14 = j_6(D) + 1;^M
+/home/jlaw/test/gcc/gcc/testsuite/gcc.dg/pr81192.c:50:1: error: mismatching comparison operand types^M
+long int^M
+int^M
+if (c0_1_13 != 0)^M
+compiler exited with status 1
+
+
+I suspect the testsuite needs further twiddling to work on 16bit int targets.
+
+- User: Andrew Pinski | Time: 2023-05-08 16:57:09 UTC
+  Text: >I suspect the testsuite needs further twiddling to work on 16bit int targets.Actually it looks like a gimple front-end issue really.
+iftmp2_8 and j and c0_1 are all declared as int types rather than long int. So the testcase seems correct.
+
+Do other gcc.dg/gimplefe-* testcase fail on this target too?
+
+- User: Andrew Pinski | Time: 2023-05-08 16:58:00 UTC
+  Text: For an example gcc.dg/gimplefe-10.c ?
+
+- User: Richard Biener | Time: 2023-05-08 17:39:55 UTC
+  Text: The issue is xstormy has a 16bit int type and both 1 and 0 are getting assigned
+'int'.
+
+Since you #define int you need to wrap all literals with _Literal (int) ...
+and of course 2147483647 won't fit (thus dg-require-effective-target int32plus?)
+
+- User: Andrew Pinski | Time: 2023-05-08 17:43:23 UTC
+  Text: (In reply to Richard Biener fromcomment #3)> The issue is xstormy has a 16bit int type and both 1 and 0 are getting
+> assigned
+> 'int'.
+> 
+> Since you #define int you need to wrap all literals with _Literal (int) ...
+> and of course 2147483647 won't fit (thus dg-require-effective-target
+> int32plus?)Oh I missed the define for some reason when I was looking into the tests today.
+Let me try to fix it for 16bit int targets.
+
+- User: GCC Commits | Time: 2023-05-08 18:04:48 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:5d85b5d649fff675ff00adcc99371bccf4ef5944commitr14-587-g5d85b5d649fff675ff00adcc99371bccf4ef5944Author: Andrew Pinski <apinski@marvell.com>
+Date:   Mon May 8 10:58:06 2023 -0700
+
+    Fixpr81192.c for int16 targets
+    
+    I had missed when converting this
+    testcase to Gimple that there was a define
+    for int/unsigned type specifically to get
+    an INT32 type. This means when using a
+    literal integer constant you need to use the
+    `_Literal (type)` to form the types correctly on the
+    constants.
+    
+    This fixes the issue and has been both tested on
+    xstormy16-elf and x86_64-linux-gnu.
+    
+    Committed as obvious.
+    
+    gcc/testsuite/ChangeLog:PR testsuite/109776* gcc.dg/pr81192.c: Fix integer constants for int16 targets.
+
+- User: Andrew Pinski | Time: 2023-05-08 18:06:07 UTC
+  Text: Fixed. I ran `make check-gcc RUNTESTFLAGS="dg.exp=pr81192.c"` to make sure the testcase now works too.
+
+- User: Jeffrey A. Law | Time: 2023-05-08 18:31:58 UTC
+  Text: Thanks.  That took care of the xstormy16 issues.
+

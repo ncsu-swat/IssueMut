@@ -1,0 +1,93 @@
+Bug Summary: vectorizing simd clone calls without loop masking applied
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Richard Biener | Time: 2023-06-29 12:21:21 UTC
+  Text: #include <math.h>
+
+double a[1024];
+double b[1024];
+
+void foo (int n)
+{
+  for (int i = 0; i < n; ++i)
+    a[i] = pow (b[i], 71.2);
+}
+
+with -Ofast -march=znver4 --param vect-partial-vector-usage=1 gets us
+the following OK main loop
+
+.L4:
+        vmovapd b(%rbx), %zmm0
+        vmovapd -112(%rbp), %zmm1
+        addq    $64, %rbx
+        call    _ZGVeN8vv_pow
+        vmovapd %zmm0, a-64(%rbx)
+        cmpq    %r13, %rbx
+        jne     .L4
+
+but the following vectorized masked epilogue:
+
+        movl    %r12d, %eax
+        andl    $-8, %eax
+        testb   $7, %r12b
+        je      .L13
+.L3:
+        subl    %eax, %r12d
+        movl    %eax, %edx
+        vmovapd -112(%rbp), %zmm1
+        vpbroadcastw    %r12d, %xmm0
+        leaq    0(,%rdx,8), %rbx
+        vpcmpuw $6, .LC2(%rip), %xmm0, %k1
+        vmovapd b(,%rdx,8), %zmm0{%k1}{z}
+        kmovb   %k1, -113(%rbp)
+        call    _ZGVeN8vv_pow
+        kmovb   -113(%rbp), %k1
+        vmovapd %zmm0, a(%rbx){%k1}
+
+so we simply call _ZGVeN8vv_pow without any masking applied.  That's
+possibly OK since we use zero-masking and thus actual masked argument
+lanes are zero but it seems this isn't the expected behavior for
+vectorizable_simd_clone_call.  Instead it should probably unconditionally
+set LOOP_VINFO_CAN_USE_PARTIAL_VECTORS_P (loop_vinfo) to false?
+
+Is there a way to query which SIMD clone is "happy" with zero arguments
+and thus for example with -ffast-math would be OK to run unmasked?
+
+- User: Richard Sandiford | Time: 2023-07-02 21:10:46 UTC
+  Text: I think Andre was looking at this area.
+
+- User: Richard Biener | Time: 2023-07-03 08:52:14 UTC
+  Text: Btw, the math.h header declares
+
+__attribute__ ((__simd__ ("notinbranch"))) extern double pow (double __x, double __y) __attribute__ ((__nothrow__ , __leaf__));
+
+- User: GCC Commits | Time: 2023-10-19 17:31:03 UTC
+  Text: The master branch has been updated by Andre Simoes Dias Vieira <avieira@gcc.gnu.org>:https://gcc.gnu.org/g:8b704ed0b8f35ec1a57e70bd8e6913ba0e9d1f24commitr14-4765-g8b704ed0b8f35ec1a57e70bd8e6913ba0e9d1f24Author: Andre Vieira <andre.simoesdiasvieira@arm.com>
+Date:   Thu Oct 19 18:28:12 2023 +0100
+
+    vect: don't allow fully masked loops with non-masked simd clones [PR 110485]
+    
+    When analyzing a loop and choosing a simdclone to use it is possible to choose
+    a simdclone that cannot be used 'inbranch' for a loop that can use partial
+    vectors.  This may lead to the vectorizer deciding to use partial vectors which
+    are not supported for notinbranch simd clones.  This patch fixes that by
+    disabling the use of partial vectors once a notinbranch simd clone has been
+    selected.
+    
+    gcc/ChangeLog:PR tree-optimization/110485* tree-vect-stmts.cc (vectorizable_simd_clone_call): Disable partial
+            vectors usage if a notinbranch simdclone has been selected.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/gomp/pr110485.c: New test.
+
+- User: Richard Biener | Time: 2023-12-05 14:25:41 UTC
+  Text: This has been fixed.
+

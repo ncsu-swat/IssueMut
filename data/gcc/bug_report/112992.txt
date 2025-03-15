@@ -1,0 +1,421 @@
+Bug Summary: Inefficient vector initialization using vec_duplicate/broadcast
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Roger Sayle | Time: 2023-12-13 00:18:13 UTC
+  Text: The following four functions should in theory all produce the same code:
+
+typedef unsigned long long v4di __attribute((vector_size(32)));
+typedef unsigned int v8si __attribute((vector_size(32)));
+typedef unsigned short v16hi __attribute((vector_size(32)));
+typedef unsigned char v32qi __attribute((vector_size(32)));
+
+#define MASK  0x01010101
+#define MASKL 0x0101010101010101ULL
+#define MASKS 0x0101
+
+v4di fooq() {
+  return (v4di){MASKL,MASKL,MASKL,MASKL};
+}
+
+v8si food() {
+  return (v8si){MASK,MASK,MASK,MASK,MASK,MASK,MASK,MASK};
+}
+
+v16hi foow() {
+  return (v16hi){MASKS,MASKS,MASKS,MASKS,MASKS,MASKS,MASKS,MASKS,
+                 MASKS,MASKS,MASKS,MASKS,MASKS,MASKS,MASKS,MASKS};
+}
+
+v32qi foob() {
+  return (v32qi){1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+                 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};
+}
+
+On x86_64 with -mavx, we currently produce very different implementations:
+
+fooq:
+        movabs  rax, 72340172838076673
+        push    rbp
+        mov     rbp, rsp
+        and     rsp, -32
+        mov     QWORD PTR [rsp-8], rax
+        vbroadcastsd    ymm0, QWORD PTR [rsp-8]
+        leave
+        ret
+food:
+        vbroadcastss    ymm0, DWORD PTR .LC2[rip]
+        ret
+foow:
+        vmovdqa ymm0, YMMWORD PTR .LC3[rip]
+        ret
+foob:
+        vmovdqa ymm0, YMMWORD PTR .LC4[rip]
+        ret
+
+clang currently produces the vbroadcastss for all four.
+I discovered that some of my "day job" code used the "fooq" idiom, requiring a stack frame, and both reads and writes to memory [of a compile-time constant].
+
+I suspect the fix is to add a define_insn_and_split or two to i386/sse.md, and
+perhaps something can be done in expand, but I'm confused why LRA/reload spills the DImode component of V4DI to the stack frame, but places the SImode component of V8SI in the constant pool.
+
+This is related (distantly) to PRs 100865 and 106060, but is potentially target independent, and seems to be going wrong in LRA/reload's REG_EQUIV elimination.
+Thoughts?  Apologies if this is a dup.  I'm happy to work up a patch if someone could advise on where best this should be fixed.  Perhaps RTL's vec_duplicate could be canonicalized to the most appropriate vector mode?
+
+- User: Andrew Pinski | Time: 2023-12-13 00:22:36 UTC
+  Text: Using  -mtune=intel, fooq does not use a stack location ...
+
+- User: Andrew Pinski | Time: 2023-12-13 00:28:11 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> Using  -mtune=intel, fooq does not use a stack location ...Seehttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=78954#c2for the reasoning on that.
+
+- User: Hongtao Liu | Time: 2023-12-13 01:25:07 UTC
+  Text: I think we need to also guard SImode and DImode case under AVX2 when MODE_SIZE==256.
+
+- User: Hongtao Liu | Time: 2023-12-13 01:26:52 UTC
+  Text: (In reply to Hongtao Liu fromcomment #3)> I think we need to also guard SImode and DImode case under AVX2 when
+> MODE_SIZE==256.Since there's vbroadcastss only support m alternative under avx
+
+- User: Hongtao Liu | Time: 2023-12-13 02:44:29 UTC
+  Text: (In reply to Roger Sayle fromcomment #0)> The following four functions should in theory all produce the same code:
+> 
+> typedef unsigned long long v4di __attribute((vector_size(32)));
+> typedef unsigned int v8si __attribute((vector_size(32)));
+> typedef unsigned short v16hi __attribute((vector_size(32)));
+> typedef unsigned char v32qi __attribute((vector_size(32)));
+> 
+> #define MASK  0x01010101
+> #define MASKL 0x0101010101010101ULL
+> #define MASKS 0x0101
+> 
+> v4di fooq() {
+>   return (v4di){MASKL,MASKL,MASKL,MASKL};
+> }
+> 
+> v8si food() {
+>   return (v8si){MASK,MASK,MASK,MASK,MASK,MASK,MASK,MASK};
+> }
+> 
+> v16hi foow() {
+>   return (v16hi){MASKS,MASKS,MASKS,MASKS,MASKS,MASKS,MASKS,MASKS,
+>                  MASKS,MASKS,MASKS,MASKS,MASKS,MASKS,MASKS,MASKS};
+> }
+> 
+> v32qi foob() {
+>   return (v32qi){1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+>                  1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};
+> }
+> 
+> On x86_64 with -mavx, we currently produce very different implementations:
+> 
+> fooq:
+>         movabs  rax, 72340172838076673
+>         push    rbp
+>         mov     rbp, rsp
+>         and     rsp, -32
+>         mov     QWORD PTR [rsp-8], rax
+>         vbroadcastsd    ymm0, QWORD PTR [rsp-8]
+>         leave
+>         ret
+> food:
+>         vbroadcastss    ymm0, DWORD PTR .LC2[rip]
+>         ret
+> foow:
+>         vmovdqa ymm0, YMMWORD PTR .LC3[rip]
+>         ret
+> foob:
+>         vmovdqa ymm0, YMMWORD PTR .LC4[rip]
+>         ret
+> 
+> clang currently produces the vbroadcastss for all four.I guess here, you mean .rodata optimization, not sure about this part, with the fix we now generate 
+
+	.file	"test.c"
+	.text
+	.p2align 4
+	.globl	fooq
+	.type	fooq, @function
+fooq:
+.LFB0:
+	.cfi_startproc
+	vbroadcastsd	.LC1(%rip), %ymm0
+	ret
+	.cfi_endproc
+.LFE0:
+	.size	fooq, .-fooq
+	.p2align 4
+	.globl	food
+	.type	food, @function
+food:
+.LFB1:
+	.cfi_startproc
+	vbroadcastss	.LC3(%rip), %ymm0
+	ret
+	.cfi_endproc
+.LFE1:
+	.size	food, .-food
+	.p2align 4
+	.globl	foow
+	.type	foow, @function
+foow:
+.LFB2:
+	.cfi_startproc
+	vmovdqa	.LC4(%rip), %ymm0
+	ret
+	.cfi_endproc
+.LFE2:
+	.size	foow, .-foow
+	.p2align 4
+	.globl	foob
+	.type	foob, @function
+foob:
+.LFB3:
+	.cfi_startproc
+	vmovdqa	.LC5(%rip), %ymm0
+	ret
+	.cfi_endproc
+.LFE3:
+	.size	foob, .-foob
+	.set	.LC1,.LC4
+	.set	.LC3,.LC4
+	.section	.rodata.cst32,"aM",@progbits,32
+	.align 32
+.LC4:
+	.value	257
+	.value	257
+	.value	257
+	.value	257
+	.value	257
+	.value	257
+	.value	257
+	.value	257
+	.value	257
+	.value	257
+	.value	257
+	.value	257
+	.value	257
+	.value	257
+	.value	257
+	.value	257
+	.set	.LC5,.LC4
+	.ident	"GCC: (GNU) 14.0.0 20231212 (experimental)"
+	.section	.note.GNU-stack,"",@progbits
+
+- User: Hongtao Liu | Time: 2023-12-13 02:46:00 UTC
+  Text: > Thoughts?  Apologies if this is a dup.  I'm happy to work up a patch if
+> someone could advise on where best this should be fixed.  Perhaps RTL's
+> vec_duplicate could be canonicalized to the most appropriate vector mode?That may breaks avx512 embedded broadcast.
+
+- User: Hongtao Liu | Time: 2023-12-13 07:42:04 UTC
+  Text: (In reply to Hongtao Liu fromcomment #6)> > Thoughts?  Apologies if this is a dup.  I'm happy to work up a patch if
+> > someone could advise on where best this should be fixed.  Perhaps RTL's
+> > vec_duplicate could be canonicalized to the most appropriate vector mode?
+> That may breaks avx512 embedded broadcast.But perhaps we can add some postreload splitter to check for load from memory or broadcast from memeory to see if we can use the smallest constant pool.
+
+- User: GCC Commits | Time: 2023-12-14 08:41:32 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:be0ff0866a6f072ccfbbb3a3c2079adf1db51aa1commitr14-6534-gbe0ff0866a6f072ccfbbb3a3c2079adf1db51aa1Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Dec 13 11:20:46 2023 +0800
+
+    Force broadcast constant to mem for vec_dup{v4di,v8si,v4df,v8df} when TARGET_AVX2 is not available.
+    
+    vpbroadcastd/vpbroadcastq is avaiable under TARGET_AVX2, but
+    vec_dup{v4di,v8si} pattern is avaiable under AVX with memory operand.
+    And it will cause LRA/Reload to generate spill and reload if we put
+    constant in register.
+    
+    gcc/ChangeLog:PR target/112992* config/i386/i386-expand.cc
+            (ix86_convert_const_wide_int_to_broadcast): Don't convert to
+            broadcast for vec_dup{v4di,v8si} when TARGET_AVX2 is not
+            available.
+            (ix86_broadcast_from_constant): Allow broadcast for V4DI/V8SI
+            when !TARGET_AVX2 since it will be forced to memory later.
+            (ix86_expand_vector_move): Force constant to mem for
+            vec_dup{vssi,v4di} when TARGET_AVX2 is not available.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr100865-7a.c: Adjust testcase.
+            * gcc.target/i386/pr100865-7c.c: Ditto.
+            * gcc.target/i386/pr112992.c: New test.
+
+- User: GCC Commits | Time: 2024-01-09 08:33:51 UTC
+  Text: The master branch has been updated by Roger Sayle <sayle@gcc.gnu.org>:https://gcc.gnu.org/g:6a67fdcb3f0cc8be47b49ddd246d0c50c3770800commitr14-7026-g6a67fdcb3f0cc8be47b49ddd246d0c50c3770800Author: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Tue Jan 9 08:28:42 2024 +0000
+
+    i386:PR target/112992: Optimize mode for broadcast of constants.
+    
+    The issue addressed by this patch is that when initializing vectors by
+    broadcasting integer constants, the compiler has the flexibility to
+    select the most appropriate vector mode to perform the broadcast, as
+    long as the resulting vector has an identical bit pattern.
+    For example, the following constants are all equivalent:
+    V4SImode {0x01010101, 0x01010101, 0x01010101, 0x01010101 }
+    V8HImode {0x0101, 0x0101, 0x0101, 0x0101, 0x0101, 0x0101, 0x0101, 0x0101 }
+    V16QImode {0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, ... 0x01 }
+    So instruction sequences that construct any of these can be used to
+    construct the others (with a suitable cast/SUBREG).
+    
+    On x86_64, it turns out that broadcasts of SImode constants are preferred,
+    as DImode constants often require a longer movabs instruction, and
+    HImode and QImode broadcasts require multiple uops on some architectures.
+    Hence, SImode is always the equal shortest/fastest implementation.
+    
+    Examples of this improvement, can be seen in the testsuite.
+    
+    gcc.target/i386/pr102021.c
+    Before:
+       0:   48 b8 0c 00 0c 00 0c    movabs $0xc000c000c000c,%rax
+       7:   00 0c 00
+       a:   62 f2 fd 28 7c c0       vpbroadcastq %rax,%ymm0
+      10:   c3                      retq
+    
+    After:
+       0:   b8 0c 00 0c 00          mov    $0xc000c,%eax
+       5:   62 f2 7d 28 7c c0       vpbroadcastd %eax,%ymm0
+       b:   c3                      retq
+    
+    and
+    gcc.target/i386/pr90773-17.c:
+    Before:
+       0:   48 8b 15 00 00 00 00    mov    0x0(%rip),%rdx        # 7 <foo+0x7>
+       7:   b8 0c 00 00 00          mov    $0xc,%eax
+       c:   62 f2 7d 08 7a c0       vpbroadcastb %eax,%xmm0
+      12:   62 f1 7f 08 7f 02       vmovdqu8 %xmm0,(%rdx)
+      18:   c7 42 0f 0c 0c 0c 0c    movl   $0xc0c0c0c,0xf(%rdx)
+      1f:   c3                      retq
+    
+    After:
+       0:   48 8b 15 00 00 00 00    mov    0x0(%rip),%rdx        # 7 <foo+0x7>
+       7:   b8 0c 0c 0c 0c          mov    $0xc0c0c0c,%eax
+       c:   62 f2 7d 08 7c c0       vpbroadcastd %eax,%xmm0
+      12:   62 f1 7f 08 7f 02       vmovdqu8 %xmm0,(%rdx)
+      18:   c7 42 0f 0c 0c 0c 0c    movl   $0xc0c0c0c,0xf(%rdx)
+      1f:   c3                      retq
+    
+    where according to Agner Fog's instruction tables broadcastd is slightly
+    faster on some microarchitectures, for example Knight's Landing.
+    
+    2024-01-09  Roger Sayle  <roger@nextmovesoftware.com>
+                Hongtao Liu  <hongtao.liu@intel.com>
+    
+    gcc/ChangeLogPR target/112992* config/i386/i386-expand.cc
+            (ix86_convert_const_wide_int_to_broadcast): Allow call to
+            ix86_expand_vector_init_duplicate to fail, and return NULL_RTX.
+            (ix86_broadcast_from_constant): Revert recent change; Return a
+            suitable MEMREF independently of mode/target combinations.
+            (ix86_expand_vector_move): Allow ix86_expand_vector_init_duplicate
+            to decide whether expansion is possible/preferrable.  Only try
+            forcing DImode constants to memory (and trying again) if calling
+            ix86_expand_vector_init_duplicate fails with an DImode immediate
+            constant.
+            (ix86_expand_vector_init_duplicate) <case E_V2DImode>: Try using
+            V4SImode for suitable immediate constants.
+            <case E_V4DImode>: Try using V8SImode for suitable constants.
+            <case E_V4HImode>: Fail for CONST_INT_P, i.e. use constant pool.
+            <case E_V2HImode>: Likewise.
+            <case E_V8HImode>: For CONST_INT_P try using V4SImode via widen.
+            <case E_V16QImode>: For CONT_INT_P try using V8HImode via widen.
+            <label widen>: Handle CONT_INTs via simplify_binary_operation.
+            Allow recursive calls to ix86_expand_vector_init_duplicate to fail.
+            <case E_V16HImode>: For CONST_INT_P try V8SImode via widen.
+            <case E_V32QImode>: For CONST_INT_P try V16HImode via widen.
+            (ix86_expand_vector_init): Move try using a broadcast for all_same
+            with ix86_expand_vector_init_duplicate before using constant pool.
+    
+    gcc/testsuite/ChangeLog
+            * gcc.target/i386/auto-init-8.c: Update test case.
+            * gcc.target/i386/avx512f-broadcast-pr87767-1.c: Likewise.
+            * gcc.target/i386/avx512f-broadcast-pr87767-5.c: Likewise.
+            * gcc.target/i386/avx512fp16-13.c: Likewise.
+            * gcc.target/i386/avx512vl-broadcast-pr87767-1.c: Likewise.
+            * gcc.target/i386/avx512vl-broadcast-pr87767-5.c: Likewise.
+            * gcc.target/i386/pr100865-1.c: Likewise.
+            * gcc.target/i386/pr100865-10a.c: Likewise.
+            * gcc.target/i386/pr100865-10b.c: Likewise.
+            * gcc.target/i386/pr100865-2.c: Likewise.
+            * gcc.target/i386/pr100865-3.c: Likewise.
+            * gcc.target/i386/pr100865-4a.c: Likewise.
+            * gcc.target/i386/pr100865-4b.c: Likewise.
+            * gcc.target/i386/pr100865-5a.c: Likewise.
+            * gcc.target/i386/pr100865-5b.c: Likewise.
+            * gcc.target/i386/pr100865-9a.c: Likewise.
+            * gcc.target/i386/pr100865-9b.c: Likewise.
+            * gcc.target/i386/pr102021.c: Likewise.
+            * gcc.target/i386/pr90773-17.c: Likewise.
+
+- User: Roger Sayle | Time: 2024-01-14 11:51:43 UTC
+  Text: This has now been fixed on mainline (we generate identical code for all four functions incomment #1).
+
+- User: GCC Commits | Time: 2024-05-07 06:19:15 UTC
+  Text: The master branch has been updated by Roger Sayle <sayle@gcc.gnu.org>:https://gcc.gnu.org/g:79649a5dcd81bc05c0ba591068c9075de43bd417commitr15-222-g79649a5dcd81bc05c0ba591068c9075de43bd417Author: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Tue May 7 07:14:40 2024 +0100PR target/106060: Improved SSE vector constant materialization on x86.
+    
+    This patch resolvesPR target/106060by providing efficient methods for
+    materializing/synthesizing special "vector" constants on x86.  Currently
+    there are three methods of materializing a vector constant; the most
+    general is to load a vector from the constant pool, secondly "duplicated"
+    constants can be synthesized by moving an integer between units and
+    broadcasting (of shuffling it), and finally the special cases of the
+    all-zeros vector and all-ones vectors can be loaded via a single SSE
+    instruction.   This patch handle additional cases that can be synthesized
+    in two instructions, loading an all-ones vector followed by another SSE
+    instruction.  Following my recent patch forPR target/112992, there's
+    conveniently a single place in i386-expand.cc where these special cases
+    can be handled.
+    
+    Two examples are given in the original bugzilla PR for 106060.
+    
+    __m256i should_be_cmpeq_abs ()
+    {
+      return _mm256_set1_epi8 (1);
+    }
+    
+    is now generated (with -O3 -march=x86-64-v3) as:
+    
+            vpcmpeqd        %ymm0, %ymm0, %ymm0
+            vpabsb  %ymm0, %ymm0
+            ret
+    
+    and
+    
+    __m256i should_be_cmpeq_add ()
+    {
+      return _mm256_set1_epi8 (-2);
+    }
+    
+    is now generated as:
+    
+            vpcmpeqd        %ymm0, %ymm0, %ymm0
+            vpaddb  %ymm0, %ymm0, %ymm0
+            ret
+    
+    2024-05-07  Roger Sayle  <roger@nextmovesoftware.com>
+                Hongtao Liu  <hongtao.liu@intel.com>
+    
+    gcc/ChangeLogPR target/106060* config/i386/i386-expand.cc (enum ix86_vec_bcast_alg): New.
+            (struct ix86_vec_bcast_map_simode_t): New type for table below.
+            (ix86_vec_bcast_map_simode): Table of SImode constants that may
+            be efficiently synthesized by a ix86_vec_bcast_alg method.
+            (ix86_vec_bcast_map_simode_cmp): New comparator for bsearch.
+            (ix86_vector_duplicate_simode_const): Efficiently synthesize
+            V4SImode and V8SImode constants that duplicate special constants.
+            (ix86_vector_duplicate_value): Attempt to synthesize "special"
+            vector constants using ix86_vector_duplicate_simode_const.
+            * config/i386/i386.cc (ix86_rtx_costs) <case ABS>: ABS of a
+            vector integer mode costs with a single SSE instruction.
+    
+    gcc/testsuite/ChangeLogPR target/106060* gcc.target/i386/auto-init-8.c: Update test case.
+            * gcc.target/i386/avx512fp16-13.c: Likewise.
+            * gcc.target/i386/pr100865-9a.c: Likewise.
+            * gcc.target/i386/pr101796-1.c: Likewise.
+            * gcc.target/i386/pr106060-1.c: New test case.
+            * gcc.target/i386/pr106060-2.c: Likewise.
+            * gcc.target/i386/pr106060-3.c: Likewise.
+            * gcc.target/i386/pr70314.c: Update test case.
+            * gcc.target/i386/vect-shiftv4qi.c: Likewise.
+            * gcc.target/i386/vect-shiftv8qi.c: Likewise.
+

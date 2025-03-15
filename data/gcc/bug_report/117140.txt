@@ -1,0 +1,222 @@
+Bug Summary: [15 regression] RISC-V: ICE in initialize_flags_in_bb for rv32gcv
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Edwin Lu | Time: 2024-10-14 20:19:53 UTC
+  Text: Createdattachment 59347[details]freport-bug output
+
+The following tests are failing on rv32gcv-ilp32d for linux and newlib targets
+
+FAIL: gcc.target/riscv/rvv/autovec/partial/multiple_rgroup_run-1.c (internal compiler error: in initialize_flags_in_bb, at tree-into-ssa.cc:434)
+FAIL: gcc.target/riscv/rvv/autovec/partial/multiple_rgroup_run-1.c (test for excess errors)https://github.com/patrick-rivos/gcc-postcommit-ci/issues/1925In the process of bisecting and reducing testcase
+
+- User: Andrew Pinski | Time: 2024-10-14 20:30:36 UTC
+  Text: /* We are going to use the operand cache API, such as
+         SET_USE, SET_DEF, and FOR_EACH_IMM_USE_FAST.  The operand
+         cache for each statement should be up-to-date.  */
+      gcc_checking_assert (!gimple_modified_p (stmt));
+
+- User: Andrew Pinski | Time: 2024-10-14 20:42:40 UTC
+  Text: I suspectr15-4324-gaccb85345edb91.
+
+- User: Edwin Lu | Time: 2024-10-14 22:07:08 UTC
+  Text: Createdattachment 59349[details]reduced testcase
+
+(In reply to Andrew Pinski fromcomment #2)> I suspectr15-4324-gaccb85345edb91.Confirmed to be the first bad commit.
+
+In the reduced testcase, if the first code snippet is not included (commented out), the following ice details appear:
+
+ewlu@ewlu:/scratch/ewlu/ci/triage/baseline/build-ice$ ./build-gcc-linux-stage1/gcc/xgcc -B./build-gcc-linux-stage1/gcc/ testcase.i -march=rv32gcv -mabi=ilp32d -mcmodel=medlow -fdiagnostics-plain-output -ftree-vectorize -O2 -mrvv-max-lmul=m8 -mrvv-vector-bits=zvl -lm -o ./multiple_rgroup_run-1.exe
+during GIMPLE pass: vect
+testcase.i: In function 'main':
+testcase.i:64:5: internal compiler error: tree check: expected class 'type', have 'exceptional' (error_mark) in element_mode, at tree.cc:13450
+0x2f15805 internal_error(char const*, ...)
+        ../../../gcc/gcc/diagnostic-global-context.cc:517
+0xbad22d tree_class_check_failed(tree_node const*, tree_code_class, char const*, int, char const*)
+        ../../../gcc/gcc/tree.cc:9053
+0xbb3be6 tree_class_check(tree_node const*, tree_code_class, char const*, int, char const*)
+        ../../../gcc/gcc/tree.h:4076
+0xbb3be6 element_mode(tree_node const*)
+        ../../../gcc/gcc/tree.cc:13450
+0x133e13c HONOR_NANS(tree_node const*)
+        ../../../gcc/gcc/real.cc:5492
+0x16107e3 process_bb
+        ../../../gcc/gcc/tree-ssa-sccvn.cc:8101
+0x161165e do_rpo_vn_1
+        ../../../gcc/gcc/tree-ssa-sccvn.cc:8648
+0x1612fd3 do_rpo_vn(function*, edge_def*, bitmap_head*, bool, bool, bool, vn_lookup_kind)
+        ../../../gcc/gcc/tree-ssa-sccvn.cc:8752
+0x173d778 execute
+        ../../../gcc/gcc/tree-vectorizer.cc:1396
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: Richard Biener | Time: 2024-10-15 07:03:25 UTC
+  Text: This means an update_stmt call is missing.
+
+- User: Tamar Christina | Time: 2024-10-15 08:18:21 UTC
+  Text: Ok, mine then.
+
+It looks like it's this loop:
+
+    int n_3_TYPE1_int64_t = 32;
+    int32_t x_3_int32_t = 233;
+    int32_t x2_3_int32_t = 78;
+    int64_t y_3_int64_t = 1234;
+    int32_t f_3_int32_t[33 * 2 + 1] = { 0 };
+    int64_t d_3_int64_t[33] = { 0 };
+    test_1_TYPE1_int64_t (f_3_int32_t, d_3_int64_t, x_3_int32_t, x2_3_int32_t,
+                          y_3_int64_t, n_3_TYPE1_int64_t);
+    for (int i = 0; i < n_3_TYPE1_int64_t; ++i)
+        {
+            if (f_3_int32_t[i * 2 + 0] != x_3_int32_t)
+                __builtin_abort ();
+            if (f_3_int32_t[i * 2 + 1] != x2_3_int32_t)
+                __builtin_abort ();
+            if (d_3_int64_t[i] != y_3_int64_t)
+                __builtin_abort ();
+        }
+
+the first two exits vectorize fine, the third one is vectorized but the statement never gets replaced:
+
+;;   basic block 7, loop depth 1, count 32534376 (estimated locally, freq 1.0000), maybe hot
+;;    prev block 19, next block 32, flags: (NEW, REACHABLE, VISITED)
+;;    pred:       5 [always]  count:32534376 (estimated locally, freq 1.0000) (FALSE_VALUE,EXECUTABLE)
+  _73 = loop_len_64 / 2;
+  _75 = loop_len_65 / 2;
+  if (_21 != 0)
+    goto <bb 32>; [0.00%]
+  else
+    goto <bb 9>; [100.00%]
+
+Looking into why the last update didn't happen.  I think I just need to get cc1 working so will try to build an rv32 cross.
+
+- User: Tamar Christina | Time: 2024-10-15 08:18:37 UTC
+  Text: Ok, mine then.
+
+It looks like it's this loop:
+
+    int n_3_TYPE1_int64_t = 32;
+    int32_t x_3_int32_t = 233;
+    int32_t x2_3_int32_t = 78;
+    int64_t y_3_int64_t = 1234;
+    int32_t f_3_int32_t[33 * 2 + 1] = { 0 };
+    int64_t d_3_int64_t[33] = { 0 };
+    test_1_TYPE1_int64_t (f_3_int32_t, d_3_int64_t, x_3_int32_t, x2_3_int32_t,
+                          y_3_int64_t, n_3_TYPE1_int64_t);
+    for (int i = 0; i < n_3_TYPE1_int64_t; ++i)
+        {
+            if (f_3_int32_t[i * 2 + 0] != x_3_int32_t)
+                __builtin_abort ();
+            if (f_3_int32_t[i * 2 + 1] != x2_3_int32_t)
+                __builtin_abort ();
+            if (d_3_int64_t[i] != y_3_int64_t)
+                __builtin_abort ();
+        }
+
+the first two exits vectorize fine, the third one is vectorized but the statement never gets replaced:
+
+;;   basic block 7, loop depth 1, count 32534376 (estimated locally, freq 1.0000), maybe hot
+;;    prev block 19, next block 32, flags: (NEW, REACHABLE, VISITED)
+;;    pred:       5 [always]  count:32534376 (estimated locally, freq 1.0000) (FALSE_VALUE,EXECUTABLE)
+  _73 = loop_len_64 / 2;
+  _75 = loop_len_65 / 2;
+  if (_21 != 0)
+    goto <bb 32>; [0.00%]
+  else
+    goto <bb 9>; [100.00%]
+
+Looking into why the last update didn't happen.  I think I just need to get cc1 working so will try to build an rv32 cross.
+
+- User: Tamar Christina | Time: 2024-10-16 11:32:51 UTC
+  Text: For this statement somehow the location of the gsi ends up having
+first == last, so gsi_insert_before just silently ignores the insert.
+
+The ICE happens because for this one BB, no vector statement is ever emitted to the BB.
+
+Reverting to the original code I had
+
+diff --git a/gcc/tree-vect-slp.cc b/gcc/tree-vect-slp.cc
+index 8727246c27a..c028594e18b 100644
+--- a/gcc/tree-vect-slp.cc
++++ b/gcc/tree-vect-slp.cc
+@@ -11128,7 +11128,8 @@ vectorize_slp_instance_root_stmt (vec_info *vinfo, slp_tree node, slp_instance i
+         can't support lane > 1 at this time.  */
+       gcc_assert (instance->root_stmts.length () == 1);
+       auto root_stmt_info = instance->root_stmts[0];
+-      auto last_stmt = STMT_VINFO_STMT (root_stmt_info);
++      auto last_stmt = vect_find_first_scalar_stmt_in_slp (node)->stmt;
+       gimple_stmt_iterator rgsi = gsi_for_stmt (last_stmt);
+       gimple *vec_stmt = NULL;
+       gcc_assert (!SLP_TREE_VEC_DEFS (node).is_empty ());
+
+works correctly, but I'd like to figure out why.  So looking into that first.
+
+- User: rguenther@suse.de | Time: 2024-10-16 12:53:16 UTC
+  Text: On Wed, 16 Oct 2024, tnfchris at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=117140> 
+> ---Comment #7from Tamar Christina <tnfchris at gcc dot gnu.org> ---
+> For this statement somehow the location of the gsi ends up having
+> first == last, so gsi_insert_before just silently ignores the insert.
+> 
+> The ICE happens because for this one BB, no vector statement is ever emitted to
+> the BB.
+> 
+> Reverting to the original code I had
+> 
+> diff --git a/gcc/tree-vect-slp.cc b/gcc/tree-vect-slp.cc
+> index 8727246c27a..c028594e18b 100644
+> --- a/gcc/tree-vect-slp.cc
+> +++ b/gcc/tree-vect-slp.cc
+> @@ -11128,7 +11128,8 @@ vectorize_slp_instance_root_stmt (vec_info *vinfo,
+> slp_tree node, slp_instance i
+>          can't support lane > 1 at this time.  */
+>        gcc_assert (instance->root_stmts.length () == 1);
+>        auto root_stmt_info = instance->root_stmts[0];
+> -      auto last_stmt = STMT_VINFO_STMT (root_stmt_info);if this is a pattern you'd want STMT_VINFO_STMT (vect_orig_stmt 
+(root_stmt_info))
+
+- User: Tamar Christina | Time: 2024-10-16 13:06:12 UTC
+  Text: (In reply torguenther@suse.defromcomment #8)> On Wed, 16 Oct 2024, tnfchris at gcc dot gnu.org wrote:
+> > diff --git a/gcc/tree-vect-slp.cc b/gcc/tree-vect-slp.cc
+> > index 8727246c27a..c028594e18b 100644
+> > --- a/gcc/tree-vect-slp.cc
+> > +++ b/gcc/tree-vect-slp.cc
+> > @@ -11128,7 +11128,8 @@ vectorize_slp_instance_root_stmt (vec_info *vinfo,
+> > slp_tree node, slp_instance i
+> >          can't support lane > 1 at this time.  */
+> >        gcc_assert (instance->root_stmts.length () == 1);
+> >        auto root_stmt_info = instance->root_stmts[0];
+> > -      auto last_stmt = STMT_VINFO_STMT (root_stmt_info);
+> 
+> if this is a pattern you'd want STMT_VINFO_STMT (vect_orig_stmt 
+> (root_stmt_info))Ah of course.. doh..
+
+running regression tests..
+
+- User: GCC Commits | Time: 2024-10-18 09:37:47 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:51291ad0f1f89a81de917110af96e019dcd5690ccommitr15-4463-g51291ad0f1f89a81de917110af96e019dcd5690cAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Fri Oct 18 10:37:28 2024 +0100
+
+    middle-end: Fix GSI for gcond root [PR117140]
+    
+    When finding the gsi to use for code of the root statements we should use the
+    one of the original statement rather than the gcond which may be inside a
+    pattern.
+    
+    Without this the emitted instructions may be discarded later.
+    
+    gcc/ChangeLog:PR tree-optimization/117140* tree-vect-slp.cc (vectorize_slp_instance_root_stmt): Use gsi from
+            original statement.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/117140* gcc.dg/vect/vect-early-break_129-pr117140.c: New test.
+
+- User: Tamar Christina | Time: 2024-10-18 09:39:42 UTC
+  Text: Fixed, thanks for the repot.
+

@@ -1,0 +1,281 @@
+Bug Summary: [14 Regression] 416.gamess fails with a run-time abort when compiled with -O2 -flto after r14-3226-gd073e2d75d9ed4
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Martin Jambor | Time: 2023-08-25 14:30:29 UTC
+  Text: Benchmark 416.gamess from SPEC 2006 fails with a run-time error (STOP IN ABRT), starting with my very ownr14-3226-gd073e2d75d9ed4(Feed results of IPA-CP into tree value numbering).
+
+- User: Martin Jambor | Time: 2023-08-25 16:46:24 UTC
+  Text: interestingly, the issue goes away with -flto-partition=one
+
+It is triggered by propagating 0 as the last parameter of point.constprop.isra which however looks correct, all four calls to the function (in different partitions) look like this:
+
+  istat = 0;
+  _272 = MEM[(double &)&elprop];
+  point.constprop.isra (_272, &ipoint, &xyzprp.xp, &xyzprp.yp, &xyzprp.zp, &istat);
+  _46 = istat;
+
+- User: Martin Jambor | Time: 2023-08-25 17:14:32 UTC
+  Text: With the propagation, PRE performs the following:
+
+ void point.constprop.isra (double ISRA.1740, int & restrict ipoint, double & restrict x, double & restrict y, double & restrict z, int & restrict istat)
+ {
+   int iy;
+   int ix;
+   double & restrict prploc;
+   int _5;
+-  int _9;
+   int _11;
+   int _12;
+   long int _13;
+@@ -13284,7 +15377,6 @@
+   <bb 2> [local count: 1073741824]:
+   # DEBUG D#556 s=> prploc
+   # DEBUG prploc => D#556
+-  *istat_1(D) = 0;
+   if (ISRA.1740_70(D) != 6.08805302369215843745180305174265706886482420102590225625e-154)
+     goto <bb 7>; [50.00%]
+   else
+@@ -13301,8 +15393,7 @@
+   calcom (x_6(D), y_7(D), z_8(D));
+ 
+   <bb 5> [local count: 536870912]:
+-  _9 = *ipoint_4(D);
+-  if (_9 > 1)
++  if (_5 > 1)
+     goto <bb 6>; [59.00%]
+   else
+     goto <bb 25>; [41.00%]
+
+
+The write of zero to where we know there is already zero is however
+problematic because all callers expect the pointed to value to be
+overwritten and dse2 pass does:
+
+@@ -20229,7 +14076,6 @@
+   xpt = 0.0;
+   ypt = 0.0;
+   zpt = 0.0;
+-  istat = 0;
+   point.constprop.isra (_73, &ipoint, &xpt, &ypt, &zpt, &istat);
+   _77 = istat;
+   if (_77 < 0)
+
+
+So I guess this is a nasty interaction with IPA-modref, and indeed
+-fno-ipa-modref avoids the issue.
+
+I'll discuss with Honza whether IPA-modref can be modified to kill the
+known values in summaries in such cases or whether it is IPA-CP that
+should avoid "knowing" the value.
+
+- User: Martin Jambor | Time: 2023-08-25 20:07:16 UTC
+  Text: Simple C testcase:
+
+----------pr111157_0.c ----------
+/* { dg-lto-do run } */
+/* { dg-lto-options { { -O2 -flto=auto } } } */
+/* { dg-extra-ld-options { -flto-partition=1to1 } } */
+
+extern __attribute__((noinline))
+void foo (int *p);
+
+
+void __attribute__((noinline))
+bar (void)
+{
+  int istat;
+
+  istat = 1234;
+  foo (&istat);
+  if (istat != 1234)
+    __builtin_abort ();
+}
+
+int main (int argc, char **argv)
+{
+  bar ();
+  return 0;
+}
+----------pr111157_1.c ----------
+volatile int v = 0;
+
+void __attribute__((noinline))
+foo (int *p)
+{
+  *p = 1234;
+  if (v)
+    *p = 0;
+  return;
+}
+----------------------------------
+
+- User: Jan Hubicka | Time: 2023-08-26 11:50:53 UTC
+  Text: So here ipa-modref declares the field dead, while ipa-prop determines its value even if it is unused and makes it used later?
+
+I think dead argument is probably better than optimizing out one store, so I think ipa-prop, however question is how to detect this reliably.
+
+ipa-modref has update_signature which updates summaries after ipa-sra work, so it is also place to erase the info about parameter being dead from the summary.
+Other option would be to ask ipa-modref from FRE when considering propagation of known value.
+
+- User: Richard Biener | Time: 2023-08-28 07:18:40 UTC
+  Text: I think if IPA modref declares the argument dead at the call site then IPA CP/SRA cannot declare it known constant.
+
+Now, I wonder why IPA CP/SRA does not replace the known constant parameter
+with an automatic var like
+
+point.constprop.isra (double ISRA.1740, int & restrict ipoint, double & restrict x, double & restrict y, double & restrict z, int & restrict istat)
+{
+...
+  const int istat.local = 0;
+  istat = &istat.local;
+
+?  So if not all uses of 'istat' get resolved we avoid generating wrong
+code.  The expense is a constant pool entry (if not all uses are removed),
+but I think that's OK.  It would also work for aggregates.  It would also
+relieve IPA-CP modification phase from doing anything but trival value
+replacement (in case the arg isn't apointer).
+
+- User: Martin Jambor | Time: 2023-08-28 12:12:04 UTC
+  Text: (In reply to Richard Biener fromcomment #5)> I think if IPA modref declares the argument dead at the call site then IPA
+> CP/SRA cannot declare it known constant.It is declared "killed" by the function.  I still need to figure out
+whether that is all I need or whether the fact that it is not read
+either is the combination I am after.  But I agree that IPA-CP should
+refrain from propagating clearly unneeded info in that case.> 
+> Now, I wonder why IPA CP/SRA does not replace the known constant parameter
+> with an automatic var like
+> 
+> point.constprop.isra (double ISRA.1740, int & restrict ipoint, double &
+> restrict x, double & restrict y, double & restrict z, int & restrict istat)
+> {
+> ...
+>   const int istat.local = 0;
+>   istat = &istat.local;
+> 
+> ?  So if not all uses of 'istat' get resolved we avoid generating wrong
+> code.  The expense is a constant pool entry (if not all uses are removed),
+> but I think that's OK.  It would also work for aggregates.  It would also
+> relieve IPA-CP modification phase from doing anything but trival value
+> replacement (in case the arg isn't apointer).I'm afraid I don't understand.  Even in this particular case, istat is
+checked by the caller and the callee can assign to it also other
+values, not just the one which happens to be what it it initialized to
+by the caller - and in the original code it does when there is an
+error - those writes cannot be redirected to a local variable.
+
+- User: Martin Jambor | Time: 2023-08-28 12:16:56 UTC
+  Text: (In reply to Jan Hubicka fromcomment #4)> So here ipa-modref declares the field dead, while ipa-prop determines its
+> value even if it is unused and makes it used later?This is what I wanted to ask about.  Looking at the dumps, ipa-modref
+knows it is "killed."  Is that enough or does it need to be also not
+read to be know to be useless?> 
+> I think dead argument is probably better than optimizing out one store, so I
+> think ipa-prop, however question is how to detect this reliably.
+> 
+> ipa-modref has update_signature which updates summaries after ipa-sra work,
+> so it is also place to erase the info about parameter being dead from the
+> summary.This is what I have been looking at last week and where I'd like to
+plug such mechanism in so that it is not even streamed from WPA.
+
+- User: Jan Hubicka | Time: 2023-08-29 11:32:45 UTC
+  Text: > This is what I wanted to ask about.  Looking at the dumps, ipa-modref
+> knows it is "killed."  Is that enough or does it need to be also not
+> read to be know to be useless?The killed info means that the data does not need to be stored before
+function call (since it will always be overwritten before reading).
+So indeed that is what braks with ipa-cp/FRE transform now.
+
+- User: Martin Jambor | Time: 2023-10-05 12:22:50 UTC
+  Text: I have proposed a fix on the mailing list consisting of:
+  -https://gcc.gnu.org/pipermail/gcc-patches/2023-October/632042.htmland
+  -https://gcc.gnu.org/pipermail/gcc-patches/2023-October/632044.htmland an (optional) RFC onehttps://gcc.gnu.org/pipermail/gcc-patches/2023-October/632043.html
+
+- User: GCC Commits | Time: 2023-10-30 17:38:21 UTC
+  Text: The master branch has been updated by Martin Jambor <jamborm@gcc.gnu.org>:https://gcc.gnu.org/g:1437df40f12ade35fd1f1a3e4cbba4b4656cab0bcommitr14-5016-g1437df40f12ade35fd1f1a3e4cbba4b4656cab0bAuthor: Martin Jambor <mjambor@suse.cz>
+Date:   Mon Oct 30 18:34:59 2023 +0100
+
+    ipa-cp: Templatize filtering of m_agg_valuesPR 111157points to another place where IPA-CP collected aggregate
+    compile-time constants need to be filtered, in addition to the one
+    place that already does this in ipa-sra.  In order to re-use code,
+    this patch turns the common bit into a template.
+    
+    The functionality is still covered by testcase gcc.dg/ipa/pr108959.c.
+    
+    gcc/ChangeLog:
+    
+    2023-09-13  Martin Jambor  <mjambor@suse.cz>PR ipa/111157* ipa-prop.h (ipcp_transformation): New member function template
+            remove_argaggs_if.
+            * ipa-sra.cc (zap_useless_ipcp_results): Use remove_argaggs_if to
+            filter aggreagate constants.
+
+- User: GCC Commits | Time: 2023-10-30 17:38:26 UTC
+  Text: The master branch has been updated by Martin Jambor <jamborm@gcc.gnu.org>:https://gcc.gnu.org/g:997c8219f020091d00fd225c81270aa551bfe9e4commitr14-5017-g997c8219f020091d00fd225c81270aa551bfe9e4Author: Martin Jambor <mjambor@suse.cz>
+Date:   Mon Oct 30 18:34:59 2023 +0100
+
+    ipa: Prune any IPA-CP aggregate constants known by modref to be killed (111157)PR 111157shows that IPA-modref and IPA-CP (when plugged into value
+    numbering) can optimize out a store both before a call (because the
+    call will overwrite it) and in the call (because the store is of the
+    same value) and by eliminating both create miscompilation.
+    
+    This patch fixes that by pruning any constants from the list of IPA-CP
+    aggregate value constants that it knows the contents of the memory can
+    be "killed."  Unfortunately, doing so is tricky.  First, IPA-modref
+    loads override kills and so only stores not loaded are truly not
+    necessary.  Looking stuff up there means doing what most of what
+    modref_may_alias may do but doing exactly what it does is tricky
+    because it takes also aliasing into account and has bail-out counters.
+    
+    To err on the side of caution in order to avoid this miscompilation we
+    have to prune a constant when in doubt.  However, pruning can
+    interfere with the mechanism of how clone materialization
+    distinguishes between the cases when a parameter was entirely removed
+    and when it was both IPA-CPed and IPA-SRAed (in order to make up for
+    the removal in debug info, which can bump into an assert when
+    compiling g++.dg/torture/pr103669.C when we are not careful).
+    
+    Therefore this patch:
+    
+      1) marks constants that IPA-modref has in its kill list with a new
+         "killed" flag, and
+      2) prunes the list from entries with this flag after materialization
+         and IPA-CP transformation is done using the template introduced in
+         the previous patch
+    
+    It does not try to look up anything in the load lists, this will be
+    done as a follow-up in order to ease review.
+    
+    gcc/ChangeLog:
+    
+    2023-10-27  Martin Jambor  <mjambor@suse.cz>PR ipa/111157* ipa-prop.h (struct ipa_argagg_value): Newf flag killed.
+            * ipa-modref.cc (ipcp_argagg_and_kill_overlap_p): New function.
+            (update_signature): Mark any any IPA-CP aggregate constants at
+            positions known to be killed as killed.  Move check that there is
+            clone_info after this pruning.
+            * ipa-cp.cc (ipa_argagg_value_list::dump): Dump the killed flag.
+            (ipa_argagg_value_list::push_adjusted_values): Clear the new flag.
+            (push_agg_values_from_plats): Likewise.
+            (ipa_push_agg_values_from_jfunc): Likewise.
+            (estimate_local_effects): Likewise.
+            (push_agg_values_for_index_from_edge): Likewise.
+            * ipa-prop.cc (write_ipcp_transformation_info): Stream the killed
+            flag.
+            (read_ipcp_transformation_info): Likewise.
+            (ipcp_get_aggregate_const): Update comment, assert that encountered
+            record does not have killed flag set.
+            (ipcp_transform_function): Prune all aggregate constants with killed
+            set.
+    
+    gcc/testsuite/ChangeLog:
+    
+    2023-09-18  Martin Jambor  <mjambor@suse.cz>PR ipa/111157* gcc.dg/lto/pr111157_0.c: New test.
+            * gcc.dg/lto/pr111157_1.c: Second file of the same new test.
+
+- User: Martin Jambor | Time: 2023-10-30 17:41:22 UTC
+  Text: Fixed.
+
+- User: Richard Biener | Time: 2023-10-31 07:43:12 UTC
+  Text: ***Bug 111734has been marked as a duplicate of this bug. ***
+

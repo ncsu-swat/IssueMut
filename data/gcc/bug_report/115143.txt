@@ -1,0 +1,352 @@
+Bug Summary: [11 Regression] tree check: expected class 'type', have 'exceptional' (error_mark) in useless_type_conversion_p, at gimple-expr.cc:85
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, patch
+Known to Work: 12.3.1, 13.3.1, 14.1.1, 15.0
+Known to Fail: 10.1.0, 11.5.0, 13.2.1, 13.3.0
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-05-17 21:29:16 UTC
+  Text: Testcase:
+short a, d;
+char b;
+long c;
+unsigned long e, f;
+void g(unsigned long h) {
+  if (c ? e : b)
+    if (e)
+      if (d) {
+        a = f ? ({
+          unsigned long i = d ? f : 0, j = e ? h : 0;
+          i < j ? i : j;
+        }) : 0;
+      }
+}
+
+Backtrace:> /scratch/tc-testing/tc-may-17/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -O3 red.c -o red.outduring GIMPLE pass: phiopt
+./red.c: In function 'g':
+./red.c:14:1: internal compiler error: tree check: expected class 'type', have 'exceptional' (error_mark) in useless_type_conversion_p, at gimple-expr.cc:85
+   14 | }
+      | ^
+0xb17187 tree_class_check_failed(tree_node const*, tree_code_class, char const*, int, char const*)
+        ../../../gcc/gcc/tree.cc:9045
+0xa40033 tree_class_check(tree_node*, tree_code_class, char const*, int, char const*)
+        ../../../gcc/gcc/tree.h:3779
+0xa40033 useless_type_conversion_p(tree_node*, tree_node*)
+        ../../../gcc/gcc/gimple-expr.cc:85
+0x1378e92 verify_gimple_assign_binary
+        ../../../gcc/gcc/tree-cfg.cc:4309
+0x13841de verify_gimple_in_cfg(function*, bool, bool)
+        ../../../gcc/gcc/tree-cfg.cc:5614
+0x11fff20 execute_function_todo
+        ../../../gcc/gcc/passes.cc:2089
+0x120046b execute_todo
+        ../../../gcc/gcc/passes.cc:2143
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+Godbolt:https://godbolt.org/z/o187xKdP1Affects x86, arm, risc-v.
+
+Found via fuzzer.
+
+- User: Andrew Pinski | Time: 2024-05-18 02:22:18 UTC
+  Text: Looks to be maybe mine.
+
+Before phiopt we start out with:
+  if (f.7_6 != 0)
+    goto <bb 9>; [INV]
+  else
+    goto <bb 10>; [INV]
+
+  <bb 9> :
+  # iftmp.10_12 = PHI <h_22(D)(8)>
+  _25 = MIN_EXPR <f.7_6, iftmp.10_12>;
+  iftmp.6_26 = (short int) _25;
+
+  <bb 10> :
+  # iftmp.6_10 = PHI <iftmp.6_26(9), 0(8)>
+
+
+And then we move the cast outside of the if condition:
+```
+PHI iftmp.6_10 changed to factor operation out from COND_EXPR.
+New stmt with OPERATION that defines iftmp.6_10.
+Applying pattern match.pd:7193, generic-match-6.cc:1904
+Applying pattern match.pd:4062, gimple-match-7.cc:15093
+Removing basic block 9
+;; basic block 9, loop depth 0
+;;  pred:       8
+# iftmp.10_12 = PHI <h_22(D)(8)>
+;;  succ:       10
+
+```
+
+the bug is in minmax part of phiopt and I think it was caused by myr14-4279-g68fa82e2d8f868.
+
+Anyways removing minmax is on my plan but I have not gotten to the patches yet.
+
+- User: Andrew Pinski | Time: 2024-05-18 13:11:40 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> the bug is in minmax part of phiopt and I think it was caused by my
+>r14-4279-g68fa82e2d8f868.
+>It was not caused by that. Rather it was caused byr14-3827-g30e6ee074588ba.
+
+- User: Andrew Pinski | Time: 2024-05-18 13:12:43 UTC
+  Text: Which means it is now a regression in GCC 13.
+
+- User: Andrew Pinski | Time: 2024-05-18 13:15:42 UTC
+  Text: And GCC 11, and 12 too.
+
+- User: Andrew Pinski | Time: 2024-05-18 13:27:09 UTC
+  Text: Note this is a latent bug that dates back tor0-66475-g8eaa0f34a3387d(GCC 4.1.0)
+
+Note alsor13-1950-g9bb19e143cfe88introduced the similar bug too.
+
+Basically there needs a check for no phi nodes in the middle bb's.
+
+- User: Andrew Pinski | Time: 2024-05-18 13:27:49 UTC
+  Text: Createdattachment 58232[details]Patch which I am testing
+
+- User: Andrew Pinski | Time: 2024-05-18 14:04:44 UTC
+  Text: here is the simplified gimple testcase so it does not depend on optimizations before hand:
+```
+unsigned __GIMPLE (ssa,startwith("phiopt"))
+foo (unsigned a, unsigned b)
+{
+  unsigned j;
+  unsigned _23;
+  unsigned _12;
+
+  __BB(2):
+  if (a_6(D) != 0u)
+    goto __BB3;
+  else
+    goto __BB4;
+
+  __BB(3):
+  j_10 = __PHI (__BB2: b_11(D));
+  _23 = __MIN (a_6(D), j_10);
+  goto __BB4;
+
+  __BB(4):
+  _12 = __PHI (__BB3: _23, __BB2: 0u);
+  return _12;
+
+}
+```
+
+
+Here is one which failed since GCC 10 (when __MIN support was added for gimple FE):
+```
+signed __GIMPLE (ssa,startwith("phiopt"))
+foo (signed a, unsigned b)
+{
+  signed j;
+  signed _23;
+  signed _12;
+
+  __BB(2):
+  if (a_6(D) > 0)
+    goto __BB3;
+  else
+    goto __BB4;
+
+  __BB(3):
+  j_10 = __PHI (__BB2: b_11(D));
+  _23 = __MIN (a_6(D), j_10);
+  goto __BB4;
+
+  __BB(4):
+  _12 = __PHI (__BB3: _23, __BB2: 0);
+  return _12;
+
+}
+```
+
+- User: Andrew Pinski | Time: 2024-05-18 14:10:08 UTC
+  Text: (In reply to Andrew Pinski fromcomment #7)> Here is one which failed since GCC 10 (when __MIN support was added for
+> gimple FE):
+> ```
+> signed __GIMPLE (ssa,startwith("phiopt"))
+> foo (signed a, unsigned b)
+> {
+>   signed j;
+>   signed _23;
+>   signed _12;
+> 
+>   __BB(2):
+>   if (a_6(D) > 0)
+>     goto __BB3;
+>   else
+>     goto __BB4;
+> 
+>   __BB(3):
+>   j_10 = __PHI (__BB2: b_11(D));
+>   _23 = __MIN (a_6(D), j_10);
+>   goto __BB4;
+> 
+>   __BB(4):
+>   _12 = __PHI (__BB3: _23, __BB2: 0);
+>   return _12;
+> 
+> }
+> ```This testcase is buggy.
+
+- User: Andrew Pinski | Time: 2024-05-18 14:36:08 UTC
+  Text: here is one that is more correct to show the failure:
+```
+unsigned __GIMPLE (ssa,startwith("phiopt"))
+foo (unsigned a, unsigned b)
+{
+  unsigned j;
+  unsigned _23;
+  unsigned _12;
+
+  __BB(2):
+  if (a_6(D) > 0u)
+    goto __BB3;
+  else
+    goto __BB4;
+
+  __BB(3):
+  j_10 = __PHI (__BB2: b_7(D));
+  _23 = __MIN (a_6(D), j_10);
+  goto __BB4;
+
+  __BB(4):
+  _12 = __PHI (__BB3: _23, __BB2: 0u);
+  return _12;
+}
+```
+
+But note this does use the canonical form for the comparison; `a > 0u` is the non-canonical form of `a != 0u` (for unsigned types). That is why it didn't show up before. My patch (r14-3827-g30e6ee074588ba) fixed the issue with the way comparison was doing and exposed this latent bug. It was trying `j_10 >= 1u` before when it should have been doing `j_10 >= 0u` and that is the issue.
+
+THIS only shows up with unsigned types because  `j_10 >= 0u` is always true and it needed that to match the constant really.
+
+Anyways my patch fixes the issue
+
+- User: Andrew Pinski | Time: 2024-05-18 23:12:52 UTC
+  Text: Patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2024-May/652095.html
+
+- User: GCC Commits | Time: 2024-05-20 21:45:48 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:9ff8f041331ef8b56007fb3c4d41d76f9850010dcommitr15-699-g9ff8f041331ef8b56007fb3c4d41d76f9850010dAuthor: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Sat May 18 11:55:58 2024 -0700
+
+    PHIOPT: Don't transform minmax if middle bb contains a phi [PR115143]
+    
+    The problem here is even if last_and_only_stmt returns a statement,
+    the bb might still contain a phi node which defines a ssa name
+    which is used in that statement so we need to add a check to make sure
+    that the phi nodes are empty for the middle bbs in both the
+    `CMP?MINMAX:MINMAX` case and the `CMP?MINMAX:B` cases.
+    
+    Bootstrapped and tested on x86_64_linux-gnu with no regressions.PR tree-optimization/115143gcc/ChangeLog:
+    
+            * tree-ssa-phiopt.cc (minmax_replacement): Check for empty
+            phi nodes for middle bbs for the case where middle bb is not empty.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/compile/pr115143-1.c: New test.
+            * gcc.c-torture/compile/pr115143-2.c: New test.
+            * gcc.c-torture/compile/pr115143-3.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: GCC Commits | Time: 2024-05-20 21:57:18 UTC
+  Text: The releases/gcc-14 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:89ab128656b9da1359705bd770ae7d2367b33ec2commitr14-10222-g89ab128656b9da1359705bd770ae7d2367b33ec2Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Sat May 18 11:55:58 2024 -0700
+
+    PHIOPT: Don't transform minmax if middle bb contains a phi [PR115143]
+    
+    The problem here is even if last_and_only_stmt returns a statement,
+    the bb might still contain a phi node which defines a ssa name
+    which is used in that statement so we need to add a check to make sure
+    that the phi nodes are empty for the middle bbs in both the
+    `CMP?MINMAX:MINMAX` case and the `CMP?MINMAX:B` cases.
+    
+    Bootstrapped and tested on x86_64_linux-gnu with no regressions.PR tree-optimization/115143gcc/ChangeLog:
+    
+            * tree-ssa-phiopt.cc (minmax_replacement): Check for empty
+            phi nodes for middle bbs for the case where middle bb is not empty.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/compile/pr115143-1.c: New test.
+            * gcc.c-torture/compile/pr115143-2.c: New test.
+            * gcc.c-torture/compile/pr115143-3.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+    (cherry picked from commit 9ff8f041331ef8b56007fb3c4d41d76f9850010d)
+
+- User: Andrew Pinski | Time: 2024-05-20 21:58:33 UTC
+  Text: Fixed so far on the trunk and gcc-14 branches. Waiting for GCC 13.3.0 release to backport (unless approved tomorrow for the branch).
+
+- User: Jakub Jelinek | Time: 2024-05-21 09:20:37 UTC
+  Text: GCC 13.3 is being released, retargeting bugs to GCC 13.4.
+
+- User: GCC Commits | Time: 2024-05-21 14:32:20 UTC
+  Text: The releases/gcc-13 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:3f6a42510a1bd4b004ed70ac44cdad2770b732a8commitr13-8784-g3f6a42510a1bd4b004ed70ac44cdad2770b732a8Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Sat May 18 11:55:58 2024 -0700
+
+    PHIOPT: Don't transform minmax if middle bb contains a phi [PR115143]
+    
+    The problem here is even if last_and_only_stmt returns a statement,
+    the bb might still contain a phi node which defines a ssa name
+    which is used in that statement so we need to add a check to make sure
+    that the phi nodes are empty for the middle bbs in both the
+    `CMP?MINMAX:MINMAX` case and the `CMP?MINMAX:B` cases.
+    
+    Bootstrapped and tested on x86_64_linux-gnu with no regressions.PR tree-optimization/115143gcc/ChangeLog:
+    
+            * tree-ssa-phiopt.cc (minmax_replacement): Check for empty
+            phi nodes for middle bbs for the case where middle bb is not empty.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/compile/pr115143-1.c: New test.
+            * gcc.c-torture/compile/pr115143-2.c: New test.
+            * gcc.c-torture/compile/pr115143-3.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+    (cherry picked from commit 9ff8f041331ef8b56007fb3c4d41d76f9850010d)
+
+- User: Andrew Pinski | Time: 2024-05-21 14:36:14 UTC
+  Text: Fixed on the GCC 13 branch too. Backporting further requires removing the hunk that handles diamond bbs as that was not in 12 or 11. I will handle that tomorrow.
+
+- User: GCC Commits | Time: 2024-06-11 17:19:35 UTC
+  Text: The releases/gcc-12 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:d30afaae6764379a63c22459b40aaecfa82b0fc4commitr12-10546-gd30afaae6764379a63c22459b40aaecfa82b0fc4Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Sat May 18 11:55:58 2024 -0700
+
+    PHIOPT: Don't transform minmax if middle bb contains a phi [PR115143]
+    
+    The problem here is even if last_and_only_stmt returns a statement,
+    the bb might still contain a phi node which defines a ssa name
+    which is used in that statement so we need to add a check to make sure
+    that the phi nodes are empty for the middle bbs in both the
+    `CMP?MINMAX:MINMAX` case and the `CMP?MINMAX:B` cases.
+    
+    Bootstrapped and tested on x86_64_linux-gnu with no regressions.PR tree-optimization/115143gcc/ChangeLog:
+    
+            * tree-ssa-phiopt.cc (minmax_replacement): Check for empty
+            phi nodes for middle bbs for the case where middle bb is not empty.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/compile/pr115143-1.c: New test.
+            * gcc.c-torture/compile/pr115143-2.c: New test.
+            * gcc.c-torture/compile/pr115143-3.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+    (cherry picked from commit 9ff8f041331ef8b56007fb3c4d41d76f9850010d)
+
+- User: Andrew Pinski | Time: 2024-06-11 17:20:37 UTC
+  Text: (In reply to Andrew Pinski fromcomment #16)> Fixed on the GCC 13 branch too. Backporting further requires removing the
+> hunk that handles diamond bbs as that was not in 12 or 11. I will handle
+> that tomorrow.Fixed on the GCC 12 branch too now. Will handle 11 tomorrow.
+
+- User: Richard Biener | Time: 2024-07-19 12:24:41 UTC
+  Text: Fixed in GCC 12.4
+

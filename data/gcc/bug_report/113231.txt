@@ -1,0 +1,119 @@
+Bug Summary: x86_64 uses SSE instructions for `*mem <<= const` at -Os
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: N/A | Time: 2024-01-04 09:07:38 UTC
+  Text: Compiled with -Os, the following functions use MMX instructions for simple shift.
+
+------------------
+void foo(int *i)
+{
+    *i *=2;
+}
+
+void bar(int *i)
+{
+    *i <<=2;
+}
+
+void baz(int *i)
+{
+    *i >>=2;
+}
+------------------
+
+foo(int*):
+        movd    xmm0, DWORD PTR [rdi]
+        pslld   xmm0, 1
+        movd    DWORD PTR [rdi], xmm0
+        ret
+bar(int*):
+        movd    xmm0, DWORD PTR [rdi]
+        pslld   xmm0, 2
+        movd    DWORD PTR [rdi], xmm0
+        ret
+baz(int*):
+        movd    xmm0, DWORD PTR [rdi]
+        psrad   xmm0, 2
+        movd    DWORD PTR [rdi], xmm0
+        ret
+
+-----------------
+
+I would expect the generated code to use "sar" or "sal" instructions like O2 uses.
+
+The functions used to generate optimal code with version 9.5.
+
+- User: Andrew Pinski | Time: 2024-01-04 09:13:18 UTC
+  Text: xmm0 is sse registers rather than mmx :).
+
+- User: Andrew Pinski | Time: 2024-01-04 09:22:41 UTC
+  Text: >  Registers conversion cost: 0In this case we start off with:
+```
+(insn 6 3 0 2 (parallel [
+            (set (mem:SI (reg/v/f:DI 100 [ iD.2766 ]) [1 *i_4(D)+0 S4 A32])
+                (ashift:SI (mem:SI (reg/v/f:DI 100 [ iD.2766 ]) [1 *i_4(D)+0 S4 A32])
+                    (const_int 1 [0x1])))
+            (clobber (reg:CC 17 flags))
+        ]) "/app/example.cpp":3:8 911 {*ashlsi3_1}
+     (expr_list:REG_DEAD (reg/v/f:DI 100 [ iD.2766 ])
+        (expr_list:REG_UNUSED (reg:CC 17 flags)
+            (nil))))
+```
+
+Which has 0 registers usage but then STV does not take into account the need for the load/store for SSE registers.
+
+- User: Uroš Bizjak | Time: 2024-01-04 12:45:46 UTC
+  Text: CC Roger.
+
+- User: Roger Sayle | Time: 2024-01-04 16:25:35 UTC
+  Text: I'm testing a patch, for more accurate conversion gains/costs in the scalar-to-vector pass.  Adding -mno-stv will work around the problem.
+
+- User: GCC Commits | Time: 2024-01-07 17:43:19 UTC
+  Text: The master branch has been updated by Roger Sayle <sayle@gcc.gnu.org>:https://gcc.gnu.org/g:0a8aba760f62e9d66cc5610ecc276c1f0befc651commitr14-6985-g0a8aba760f62e9d66cc5610ecc276c1f0befc651Author: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Sun Jan 7 17:42:00 2024 +0000
+
+    i386:PR target/113231: Improved costs in Scalar-To-Vector (STV) pass.
+    
+    This patch improves the cost/gain calculation used during the i386 backend's
+    SImode/DImode scalar-to-vector (STV) conversion pass.  The current code
+    handles loads and stores, but doesn't consider that converting other
+    scalar operations with a memory destination, requires an explicit load
+    before and an explicit store after the vector equivalent.
+    
+    To ease the review, the significant change looks like:
+    
+             /* For operations on memory operands, include the overhead
+                of explicit load and store instructions.  */
+             if (MEM_P (dst))
+               igain += !optimize_insn_for_size_p ()
+                        ? -COSTS_N_BYTES (8);
+                        : (m * (ix86_cost->int_load[2]
+                                + ix86_cost->int_store[2])
+                           - (ix86_cost->sse_load[sse_cost_idx] +
+                              ix86_cost->sse_store[sse_cost_idx]));
+    
+    however the patch itself is complicated by a change in indentation
+    which leads to a number of lines with only whitespace changes.
+    For architectures where integer load/store costs are the same as
+    vector load/store costs, there should be no change without -Os/-Oz.
+    
+    2024-01-07  Roger Sayle  <roger@nextmovesoftware.com>
+                Uros Bizjak  <ubizjak@gmail.com>
+    
+    gcc/ChangeLogPR target/113231* config/i386/i386-features.cc (compute_convert_gain): Include
+            the overhead of explicit load and store (movd) instructions when
+            converting non-store scalar operations with memory destinations.
+            Various indentation whitespace fixes.
+    
+    gcc/testsuite/ChangeLogPR target/113231* gcc.target/i386/pr113231.c: New test case.
+
+- User: Roger Sayle | Time: 2024-01-09 08:57:09 UTC
+  Text: This should now be fixed on mainline.
+

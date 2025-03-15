@@ -1,0 +1,271 @@
+Bug Summary: [10 Regression] error: EDGE_CROSSING missing across section boundary
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, inline-asm
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2023-01-30 11:31:12 UTC
+  Text: For this C code, derived from yesterday's linux-6.2-rc6:
+
+enum { false, true };
+__attribute__((__cold__)) _printk();
+_static_cpu_has() {
+  asm goto("" : : : : t_yes, t_no);
+t_yes:
+  return true;
+t_no:
+  return false;
+}
+acpi_sleep_prepare() {
+  _Bool __trans_tmp_1 = _static_cpu_has();
+  if (!__trans_tmp_1)
+    acpi_set_waking_vector();
+  _printk();
+}
+
+does this:
+
+$ /home/dcb36/gcc/results/bin/gcc -c -w -std=gnu11   -O2bug878.cbug878.c: In function ‘acpi_sleep_prepare’:bug878.c:15:1: error: EDGE_CROSSING missing across section boundary
+   15 | }
+      | ^
+during RTL pass: bbpartbug878.c:15:1: internal compiler error: verify_flow_info failed
+0x8818f1 verify_flow_info()
+	../../trunk.d1/gcc/cfghooks.cc:285
+
+$ /home/dcb36/gcc/results/bin/gcc -c -w -std=gnu11   -O1bug878.c 
+$
+ 
+The bug first seems to occur sometime beforeg:9b111debbfb79a0a,
+dated 20221229.
+
+- User: Richard Biener | Time: 2023-01-30 12:06:30 UTC
+  Text: Confirmed.
+
+- User: Jakub Jelinek | Time: 2023-01-30 12:16:46 UTC
+  Text: Seems to have started withr9-4548-g3b131f6a86798c11093eee79b6069139efb92af9
+
+- User: Jakub Jelinek | Time: 2023-01-30 12:24:41 UTC
+  Text: Likely latent before that though.
+Slightly cleaned up testcase, just -O2 is needed:
+
+__attribute__((__cold__)) void foo (void);
+void qux (void);
+
+int
+bar (void)
+{
+  asm goto ("" : : : : l1, l0);
+l1:
+  return 1;
+l0:
+  return 0;
+}
+
+void
+baz ()
+{
+  _Bool x = bar ();
+  if (!x)
+    qux ();
+  foo ();
+}
+
+Or even simpler (again -O2):
+__attribute__((__cold__)) void foo (void);
+void bar (void);
+
+void
+baz ()
+{
+  asm goto ("" : : : : l1, l0);
+  goto l0;
+l1:
+  bar ();
+l0:
+  foo ();
+}
+
+- User: Jakub Jelinek | Time: 2023-01-30 17:08:25 UTC
+  Text: Createdattachment 54373[details]gcc13-pr108596.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2023-01-31 08:47:16 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:603a6fbcaac1e80aa90d1d26318c881a53473066commitr13-5527-g603a6fbcaac1e80aa90d1d26318c881a53473066Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jan 31 09:46:35 2023 +0100
+
+    bbpart: Fix up ICE on asm goto [PR108596]
+    
+    On the following testcase we have asm goto in hot block with 2 successors,
+    one cold to which it both falls through and has one of the label
+    pointing to it and another hot successor with another label.
+    
+    Now, during bbpart we want to ensure that no blocks from one partition fall
+    through into a block in a different partition.  fix_up_fall_thru_edges
+    does that by temporarily clearing the EDGE_CROSSING on the fallthrough edge,
+    calling force_nonfallthru and then depending on whether it created a new
+    bb either set EDGE_CROSSING on the single successor edge from the new bb
+    (the new bb is kept in the same partition as the predecessor block), or
+    if no new bb has been created setting EDGE_CROSSING back on the fallthru
+    edge which has been forced non-EDGE_FALLTHRU.
+    For asm goto this doesn't always work, force_nonfallthru can create a new bb
+    and change the fallthrough edge to point to that, but if the original
+    fallthru destination block has its label referenced among the asm goto
+    labels, it will create a new non-fallthru edge for the label(s).
+    But because we've temporarily cheated and cleared EDGE_CROSSING on the edge,
+    it is cleared on the new edge as well, then the caller sees we've created
+    a new bb and just sets EDGE_CROSSING on the single fallthru edge from the
+    new bb.  But the direct edge from cur_bb to fallthru edge's destination
+    isn't handled and fails afterwards consistency checks, because it crosses
+    partitions.
+    
+    The following patch notes the case and sets EDGE_CROSSING on that edge too.
+    
+    2023-01-31  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/108596* bb-reorder.cc (fix_up_fall_thru_edges): Handle the case where cur_bb
+            ends with asm goto and has a crossing fallthrough edge to the same bb
+            that contains at least one of its labels by restoring EDGE_CROSSING
+            flag even on possible edge from cur_bb to new_bb successor.
+    
+            * gcc.c-torture/compile/pr108596.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-01-31 08:48:02 UTC
+  Text: Fixed on the trunk so far.
+
+- User: David Binderman | Time: 2023-02-02 09:04:41 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #6)> Fixed on the trunk so far.linux-6.2-rc6 builds fine, when built with -O3.
+
+Thanks for the quick fix.
+
+- User: GCC Commits | Time: 2023-02-10 17:46:10 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:e365bfacf2617403f6bc6aa79a45a27bdba8da36commitr12-9146-ge365bfacf2617403f6bc6aa79a45a27bdba8da36Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jan 31 09:46:35 2023 +0100
+
+    bbpart: Fix up ICE on asm goto [PR108596]
+    
+    On the following testcase we have asm goto in hot block with 2 successors,
+    one cold to which it both falls through and has one of the label
+    pointing to it and another hot successor with another label.
+    
+    Now, during bbpart we want to ensure that no blocks from one partition fall
+    through into a block in a different partition.  fix_up_fall_thru_edges
+    does that by temporarily clearing the EDGE_CROSSING on the fallthrough edge,
+    calling force_nonfallthru and then depending on whether it created a new
+    bb either set EDGE_CROSSING on the single successor edge from the new bb
+    (the new bb is kept in the same partition as the predecessor block), or
+    if no new bb has been created setting EDGE_CROSSING back on the fallthru
+    edge which has been forced non-EDGE_FALLTHRU.
+    For asm goto this doesn't always work, force_nonfallthru can create a new bb
+    and change the fallthrough edge to point to that, but if the original
+    fallthru destination block has its label referenced among the asm goto
+    labels, it will create a new non-fallthru edge for the label(s).
+    But because we've temporarily cheated and cleared EDGE_CROSSING on the edge,
+    it is cleared on the new edge as well, then the caller sees we've created
+    a new bb and just sets EDGE_CROSSING on the single fallthru edge from the
+    new bb.  But the direct edge from cur_bb to fallthru edge's destination
+    isn't handled and fails afterwards consistency checks, because it crosses
+    partitions.
+    
+    The following patch notes the case and sets EDGE_CROSSING on that edge too.
+    
+    2023-01-31  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/108596* bb-reorder.cc (fix_up_fall_thru_edges): Handle the case where cur_bb
+            ends with asm goto and has a crossing fallthrough edge to the same bb
+            that contains at least one of its labels by restoring EDGE_CROSSING
+            flag even on possible edge from cur_bb to new_bb successor.
+    
+            * gcc.c-torture/compile/pr108596.c: New test.
+    
+    (cherry picked from commit 603a6fbcaac1e80aa90d1d26318c881a53473066)
+
+- User: Jakub Jelinek | Time: 2023-02-10 18:01:07 UTC
+  Text: Fixed for gcc 12.3 too.
+
+- User: GCC Commits | Time: 2023-05-02 20:14:03 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:9a2302a2d268c5cd0b1016d916493d7cf78f495dcommitr11-10704-g9a2302a2d268c5cd0b1016d916493d7cf78f495dAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jan 31 09:46:35 2023 +0100
+
+    bbpart: Fix up ICE on asm goto [PR108596]
+    
+    On the following testcase we have asm goto in hot block with 2 successors,
+    one cold to which it both falls through and has one of the label
+    pointing to it and another hot successor with another label.
+    
+    Now, during bbpart we want to ensure that no blocks from one partition fall
+    through into a block in a different partition.  fix_up_fall_thru_edges
+    does that by temporarily clearing the EDGE_CROSSING on the fallthrough edge,
+    calling force_nonfallthru and then depending on whether it created a new
+    bb either set EDGE_CROSSING on the single successor edge from the new bb
+    (the new bb is kept in the same partition as the predecessor block), or
+    if no new bb has been created setting EDGE_CROSSING back on the fallthru
+    edge which has been forced non-EDGE_FALLTHRU.
+    For asm goto this doesn't always work, force_nonfallthru can create a new bb
+    and change the fallthrough edge to point to that, but if the original
+    fallthru destination block has its label referenced among the asm goto
+    labels, it will create a new non-fallthru edge for the label(s).
+    But because we've temporarily cheated and cleared EDGE_CROSSING on the edge,
+    it is cleared on the new edge as well, then the caller sees we've created
+    a new bb and just sets EDGE_CROSSING on the single fallthru edge from the
+    new bb.  But the direct edge from cur_bb to fallthru edge's destination
+    isn't handled and fails afterwards consistency checks, because it crosses
+    partitions.
+    
+    The following patch notes the case and sets EDGE_CROSSING on that edge too.
+    
+    2023-01-31  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/108596* bb-reorder.c (fix_up_fall_thru_edges): Handle the case where cur_bb
+            ends with asm goto and has a crossing fallthrough edge to the same bb
+            that contains at least one of its labels by restoring EDGE_CROSSING
+            flag even on possible edge from cur_bb to new_bb successor.
+    
+            * gcc.c-torture/compile/pr108596.c: New test.
+    
+    (cherry picked from commit 603a6fbcaac1e80aa90d1d26318c881a53473066)
+
+- User: Jakub Jelinek | Time: 2023-05-03 10:36:50 UTC
+  Text: Fixed for 11.4 as well.
+
+- User: GCC Commits | Time: 2023-05-03 15:20:58 UTC
+  Text: The releases/gcc-10 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:73abd84646142b2a6177df9366917fea696d4df3commitr10-11359-g73abd84646142b2a6177df9366917fea696d4df3Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jan 31 09:46:35 2023 +0100
+
+    bbpart: Fix up ICE on asm goto [PR108596]
+    
+    On the following testcase we have asm goto in hot block with 2 successors,
+    one cold to which it both falls through and has one of the label
+    pointing to it and another hot successor with another label.
+    
+    Now, during bbpart we want to ensure that no blocks from one partition fall
+    through into a block in a different partition.  fix_up_fall_thru_edges
+    does that by temporarily clearing the EDGE_CROSSING on the fallthrough edge,
+    calling force_nonfallthru and then depending on whether it created a new
+    bb either set EDGE_CROSSING on the single successor edge from the new bb
+    (the new bb is kept in the same partition as the predecessor block), or
+    if no new bb has been created setting EDGE_CROSSING back on the fallthru
+    edge which has been forced non-EDGE_FALLTHRU.
+    For asm goto this doesn't always work, force_nonfallthru can create a new bb
+    and change the fallthrough edge to point to that, but if the original
+    fallthru destination block has its label referenced among the asm goto
+    labels, it will create a new non-fallthru edge for the label(s).
+    But because we've temporarily cheated and cleared EDGE_CROSSING on the edge,
+    it is cleared on the new edge as well, then the caller sees we've created
+    a new bb and just sets EDGE_CROSSING on the single fallthru edge from the
+    new bb.  But the direct edge from cur_bb to fallthru edge's destination
+    isn't handled and fails afterwards consistency checks, because it crosses
+    partitions.
+    
+    The following patch notes the case and sets EDGE_CROSSING on that edge too.
+    
+    2023-01-31  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/108596* bb-reorder.c (fix_up_fall_thru_edges): Handle the case where cur_bb
+            ends with asm goto and has a crossing fallthrough edge to the same bb
+            that contains at least one of its labels by restoring EDGE_CROSSING
+            flag even on possible edge from cur_bb to new_bb successor.
+    
+            * gcc.c-torture/compile/pr108596.c: New test.
+    
+    (cherry picked from commit 603a6fbcaac1e80aa90d1d26318c881a53473066)
+
+- User: Jakub Jelinek | Time: 2023-05-04 07:24:17 UTC
+  Text: Fixed for 10.5 too.
+

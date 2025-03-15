@@ -1,0 +1,201 @@
+Bug Summary: [14 Regression] ICE on valgrind-3.20.0: in modify_expression, at ipa-param-manipulation.cc:1866 since r14-295-gd89e23f27215fc
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2023-04-27 18:07:33 UTC
+  Text: Got the ICE on valgrind-3.20.0 against today's gcc master (r14-300-g65369ab62cee68). Minimal reproducer:
+
+// $ cat bug.c.c
+typedef int UInt;
+UInt skeletal_RI5_instr;
+__attribute__((__noreturn__)) void vex_assert_fail();
+typedef struct {
+  union {
+    struct {
+      UInt imm5;
+    } I5;
+  } ARMri5;
+} ARMRI5;
+typedef enum { ARMin_Alu, ARMin_Shift } ARMInstrTag;
+void iregEnc();
+static UInt skeletal_RI5(ARMRI5 *ri) {
+  UInt imm5 = ri->ARMri5.I5.imm5;
+  __builtin_expect(imm5, 1) ?: vex_assert_fail();
+  iregEnc(ri->ARMri5);
+  return skeletal_RI5_instr;
+}
+ARMInstrTag emit_ARMInstr_i_0;
+void *emit_ARMInstr_disp_cp_chain_me_to_slowEP() {
+  switch (emit_ARMInstr_i_0) {
+  case ARMin_Alu:
+    UInt instr, subopc;
+    UInt rD, rN;
+    goto bad;
+    instr |= subopc | rN;
+  case ARMin_Shift:
+    rD = 0;
+    UInt rM = 0;
+    ARMRI5 argR;
+    instr = skeletal_RI5(&argR);
+    instr |= rD | rM;
+    goto done;
+  }
+bad:
+done:
+  return 0;
+}
+
+Crashing:
+
+$ gcc  -O2  -c bug.c.c -o bug.o
+during IPA pass: inline
+In function 'skeletal_RI5.isra':
+cc1: internal compiler error: in modify_expression, at ipa-param-manipulation.cc:1866
+0x69367d ipa_param_body_adjustments::modify_expression(tree_node**, bool, gimple**)
+        ../../source/gcc/ipa-param-manipulation.cc:1866
+0xa7f038 ipa_param_body_adjustments::modify_call_stmt(gcall**, gimple*)
+        ../../source/gcc/ipa-param-manipulation.cc:2165
+0xcfd246 remap_gimple_stmt
+        ../../source/gcc/tree-inline.cc:1961
+0xd003f8 copy_bb
+        ../../source/gcc/tree-inline.cc:2056
+0xd0171f copy_cfg_body
+        ../../source/gcc/tree-inline.cc:3069
+0xd0171f copy_body
+        ../../source/gcc/tree-inline.cc:3322
+0xd0424a tree_function_versioning(tree_node*, tree_node*, vec<ipa_replace_map*, va_gc, vl_embed>*, ipa_param_adjustments*, bool, bitmap_head*, basic_block_def*)
+        ../../source/gcc/tree-inline.cc:6347
+0x852aae cgraph_node::materialize_clone()
+        ../../source/gcc/cgraphclones.cc:1155
+0x842f85 cgraph_node::get_untransformed_body()
+        ../../source/gcc/cgraph.cc:3992
+0xa3ee05 maybe_materialize_called_clones
+        ../../source/gcc/ipa-inline-transform.cc:720
+0xa40b8b inline_transform(cgraph_node*)
+        ../../source/gcc/ipa-inline-transform.cc:777
+0xb9796f execute_one_ipa_transform_pass
+        ../../source/gcc/passes.cc:2343
+0xb9796f execute_all_ipa_transforms(bool)
+        ../../source/gcc/passes.cc:2406
+0x84d83f cgraph_node::expand()
+        ../../source/gcc/cgraphunit.cc:1834
+0x84d83f cgraph_node::expand()
+        ../../source/gcc/cgraphunit.cc:1794
+0x84ee2a expand_all_functions
+        ../../source/gcc/cgraphunit.cc:2024
+0x84ee2a symbol_table::compile()
+        ../../source/gcc/cgraphunit.cc:2398
+0x8513a7 symbol_table::compile()
+        ../../source/gcc/cgraphunit.cc:2311
+0x8513a7 symbol_table::finalize_compilation_unit()
+        ../../source/gcc/cgraphunit.cc:2583
+
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=/<<NIX>>/gcc-14.0.0/bin/gcc
+COLLECT_LTO_WRAPPER=/<<NIX>>/gcc-14.0.0/libexec/gcc/x86_64-unknown-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-unknown-linux-gnu
+Configured with:
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 99999999 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2023-04-27 22:19:44 UTC
+  Text: Most likely caused byr14-295-gd89e23f27215fc.
+
+- User: Sam James | Time: 2023-04-27 22:22:46 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> Most likely caused byr14-295-gd89e23f27215fc.bisecting it now
+
+- User: Sam James | Time: 2023-04-27 22:56:51 UTC
+  Text: (In reply to Sam James fromcomment #2)> (In reply to Andrew Pinski fromcomment #1)
+> > Most likely caused byr14-295-gd89e23f27215fc.
+> 
+> bisecting it nowconfirmed,r14-295-gd89e23f27215fc.
+
+- User: Richard Biener | Time: 2023-04-28 06:40:03 UTC
+  Text: So we're replacing (in a call this time) the aggregate argument ri_3(D)->ARMri5
+(it's a union) with a register
+
+(gdb) p debug_tree (repl)
+ <parm_decl 0x7ffff7fc9900 ISRA.3
+    type <integer_type 0x7ffff736fa80 UInt sizes-gimplified SI
+
+and we VIEW_CONVERT that to the original aggregate type.  That's not
+really GIMPLE IL we want to have.  Instead in this case ISRA.3 should
+be forced a non-register.  The question is whether we can detect this
+case where I originally tried to fix the original issue - namely
+
+diff --git a/gcc/ipa-param-manipulation.cc b/gcc/ipa-param-manipulation.cc
+index 42488ee09c3..473d759f983 100644
+--- a/gcc/ipa-param-manipulation.cc
++++ b/gcc/ipa-param-manipulation.cc
+@@ -1384,6 +1384,8 @@ ipa_param_body_adjustments::common_initialization (tree old_fndecl,
+          DECL_CONTEXT (new_parm) = m_fndecl;
+          TREE_USED (new_parm) = 1;
+          DECL_IGNORED_P (new_parm) = 1;
++         if (is_gimple_reg_type (new_type))
++           DECL_NOT_GIMPLE_REG_P (new_parm) = 1;
+          layout_decl (new_parm, 0);
+          m_new_decls.quick_push (new_parm);
+
+I only see
+
+(gdb) p *apm
+$7 = {type = <integer_type 0x7ffff736fa80 UInt>, 
+  alias_ptr_type = <pointer_type 0x7ffff739eb28>, unit_offset = 0, 
+  base_index = 0, prev_clone_index = 0, op = IPA_PARAM_OP_SPLIT, 
+  prev_clone_adjustment = 0, param_prefix_index = 1, reverse = 0, 
+  user_flag = 0}
+
+so there doesn't seem to be something indicating there's an aggregate use?
+
+Of course in theory we can fix up in modify_expression by copying the
+register to a non-register for such case but that might not be the
+most efficient way to deal with this.
+
+The "easiest" fix is to let this case slip through.  It isn't catched
+by my planned extra IL checking.  We'll generate
+
+  iregEnc (VIEW_CONVERT_EXPR<union
+{
+  struct
+  {
+    UInt imm5;
+  } I5;
+}>(_7));
+
+- User: GCC Commits | Time: 2023-04-28 11:36:50 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:a94dcac59ee4c99b523ae593cb1c0ad43d4a110bcommitr14-326-ga94dcac59ee4c99b523ae593cb1c0ad43d4a110bAuthor: Richard Biener <rguenther@suse.de>
+Date:   Fri Apr 28 08:40:07 2023 +0200
+
+    ipa/109652 - ICE in modification phase of IPA SRA
+    
+    There's another questionable IL transform by IPA SRA, replacing
+    foo (p_1(D)->x) with foo (VIEW_CONVERT <union type> (ISRA.PARM.1))
+    where ISRA.PARM.1 is a register.  Conversion of a register to
+    an aggregate type is questionable but not entirely unreasonable
+    and not within the set of IL I am rejecting when fixingPR109644.
+    
+    The following lets this slip through in IPA SRA transform by
+    restricting re-gimplification to the case of register type
+    results.  To not break the previous testcase again we need to
+    optimize the BIT_FIELD_REF <VIEW_CONVERT <...>, ...> case
+    to elide the conversion.PR ipa/109652* ipa-param-manipulation.cc
+            (ipa_param_body_adjustments::modify_expression): Allow
+            conversion of a register to a non-register type.  Elide
+            conversions inside BIT_FIELD_REFs.
+    
+            * gcc.dg/torture/pr109652.c: New testcase.
+
+- User: Richard Biener | Time: 2023-04-28 11:38:18 UTC
+  Text: Should be fixed now.
+
+- User: Sergei Trofimovich | Time: 2023-04-28 20:47:29 UTC
+  Text: (In reply to Richard Biener fromcomment #6)> Should be fixed now.I confirm it fixed valgrind-3.20.0 build as well. Thank you!
+

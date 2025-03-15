@@ -1,0 +1,131 @@
+Bug Summary: ICE: SSA corruption: Unable to coalesce ssa_names 1 and 3 which are marked as MUST COALESCE. with _BitInt() and computed goto
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-01-23 19:50:49 UTC
+  Text: Createdattachment 57196[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc testcase.c 
+
+Unable to coalesce ssa_names 1 and 3 which are marked as MUST COALESCE.
+a_1(ab) and  a_3(ab)
+during GIMPLE pass: bitintlower0
+testcase.c: In function 'foo':
+testcase.c:2:1: internal compiler error: SSA corruption
+    2 | foo(_BitInt(953) a)
+      | ^~~
+0x163e4dd fail_abnormal_edge_coalesce
+        /repo/gcc-trunk/gcc/tree-ssa-coalesce.cc:1012
+0x163e4dd coalesce_partitions
+        /repo/gcc-trunk/gcc/tree-ssa-coalesce.cc:1444
+0x163e4dd coalesce_ssa_name(_var_map*)
+        /repo/gcc-trunk/gcc/tree-ssa-coalesce.cc:1898
+0x271baf3 gimple_lower_bitint
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:6319
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-8373-20240123195900-gdbc5f1f523b-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-8373-20240123195900-gdbc5f1f523b-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240123 (experimental) (GCC)
+
+- User: Marek Polacek | Time: 2024-01-23 20:00:50 UTC
+  Text: Started withr14-4592:
+
+commit 0d00385eaf72ccacff17935b0d214a26773e095f
+Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Oct 12 16:01:12 2023 +0200
+
+    wide-int: Allow up to 16320 bits wide_int and change widest_int precision to 32640 bits [PR102989]
+
+before:
+
+113567.c:2:5: error: ‘_BitInt’ argument ‘953’ is larger than ‘BITINT_MAXWIDTH’ ‘575’
+    2 | foo(_BitInt(953) a)
+      |     ^~~~~~~
+
+- User: Andrew Pinski | Time: 2024-01-26 08:14:34 UTC
+  Text: (In reply to Marek Polacek fromcomment #1)> Started withr14-4592:Better testcase that does not depend on a very large size:
+```
+void
+foo(_BitInt(128+1) a)
+{
+lab:
+  a %= 3;
+  void *p = &&lab;
+  goto *p;
+}
+```
+
+- User: Andrew Pinski | Time: 2024-01-26 08:20:09 UTC
+  Text: Also here is one which fails even at -O1:
+```
+_BitInt(128+1) a1;
+void foo(_BitInt(128+1) a, int i)
+{
+   __label__  lab, lab1;
+   i &=1;
+   void *p[] = {&&lab, &&lab1};
+lab:
+  a %= 3;
+  a1 = a;
+  i = !i;
+  goto *(p[i]);
+lab1:
+}
+```
+
+- User: Jakub Jelinek | Time: 2024-02-14 17:32:26 UTC
+  Text: Createdattachment 57429[details]gcc14-pr113567.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-02-15 08:53:22 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:baa40971d1600672f3a1abf688905a70cf655c92commitr14-8995-gbaa40971d1600672f3a1abf688905a70cf655c92Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Feb 15 09:52:47 2024 +0100
+
+    lower-bitint: Ensure we don't get coalescing ICEs for (ab) SSA_NAMEs used in mul/div/mod [PR113567]
+    
+    The build_bitint_stmt_ssa_conflicts hook has a special case for
+    multiplication, division and modulo, where to ensure there is no overlap
+    between lhs and rhs1/rhs2 arrays we make the lhs conflict with the
+    operands.
+    On the following testcase, we have
+      # a_1(ab) = PHI <a_2(D)(0), a_3(ab)(3)>
+    lab:
+      a_3(ab) = a_1(ab) % 3;
+    before lowering and this special case causes a_3(ab) and a_1(ab) to
+    conflict, but the PHI requires them not to conflict, so we ICE because we
+    can't find some partitioning that will work.
+    
+    The following patch fixes this by special casing such statements before
+    the partitioning, force the inputs of the multiplication/division which
+    have large/huge _BitInt (ab) lhs into new non-(ab) SSA_NAMEs initialized
+    right before the multiplication/division.  This allows the partitioning
+    to work then, as it has the possibility to use a different partition for
+    the */% operands.
+    
+    2024-02-15  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113567* gimple-lower-bitint.cc (gimple_lower_bitint): For large/huge
+            _BitInt multiplication, division or modulo with
+            SSA_NAME_OCCURS_IN_ABNORMAL_PHI lhs and at least one of rhs1 and rhs2
+            force the affected inputs into a new SSA_NAME.
+    
+            * gcc.dg/bitint-90.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-15 08:54:09 UTC
+  Text: Fixed.
+

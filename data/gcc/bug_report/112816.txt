@@ -1,0 +1,299 @@
+Bug Summary: [11/12 Regression] ICE unrecognizable_insn with __builtin_signbit and returning struct with int[4]
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 9.5.0
+Known to Fail: 10.1.0
+
+Comments:
+- User: Andrei Elovikov | Time: 2023-12-01 21:12:44 UTC
+  Text: https://godbolt.org/z/3vzejjWcqconstexpr int N = 4;
+
+template <typename T>
+struct S {
+    T x[N];
+    T& operator[](int idx) { return x[idx]; }
+};
+auto foo(S<float> x) {
+  S<int> res;
+  for (int i = 0; i < 4; ++i)
+    res[i] = __builtin_signbit(x[i]) ? -1 : 0;
+  return res;
+}
+
+Copy-pasting "x86-64 gcc (trunk)" output from the godbolt link above (-O3 -std=c++17 options used):
+<source>: In function 'auto foo(S<float>)':
+<source>:13:1: error: unrecognizable insn:
+   13 | }
+      | ^
+(insn 20 19 21 2 (set (reg:V4SI 99 [ vect__2.11 ])
+        (lshiftrt:V4SI (subreg:V4SI (subreg:V4SF (reg/v:TI 105 [ x ]) 0) 0)
+            (const_int 31 [0x1f]))) "<source>":11:31 discrim 1 -1
+     (nil))
+during RTL pass: vregs
+<source>:13:1: internal compiler error: in extract_insn, at recog.cc:2804
+0x26c14fe internal_error(char const*, ...)
+	???:0
+0xb125b9 fancy_abort(char const*, int, char const*)
+	???:0
+0x925e6a _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+	???:0
+0x925e8c _fatal_insn_not_found(rtx_def const*, char const*, int, char const*)
+	???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+Compiler returned: 1
+
+Also reproducible with (the version I discovered it with)
+
+$ g++ --version
+g++ (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0
+Copyright (C) 2021 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+- User: Andrew Pinski | Time: 2023-12-01 21:19:48 UTC
+  Text: Createdattachment 56760[details]C testcase
+
+- User: Andrew Pinski | Time: 2023-12-01 21:20:39 UTC
+  Text: Confirmed.
+
+- User: Jakub Jelinek | Time: 2023-12-02 09:05:55 UTC
+  Text: Createdattachment 56767[details]gcc14-pr112816.patch
+
+Untested fix.
+
+Another issue is that the emitted code is terrible:
+        pxor    %xmm1, %xmm1
+        psrld   $31, %xmm0
+        pcmpeqd %xmm1, %xmm0
+        pcmpeqd %xmm1, %xmm0
+Why not just
+        psrad   $31, %xmm0
+instead of all this?
+
+- User: Jakub Jelinek | Time: 2023-12-02 09:10:29 UTC
+  Text: I think we want to add some patterns for combine which would match
+(set (reg:V4SI 115)
+    (eq:V4SI (lshiftrt:V4SI (subreg:V4SI (reg:V2DI 110) 0)
+            (const_int 31 [0x1f]))
+        (const_vector:V4SI [
+                (const_int 0 [0]) repeated x4
+            ])))
+(and ditto for ashiftrt, in both cases with just match_operand:V4SI for the register_operand and obviously iterators over 16/32-byte integral vector modes) and
+turn that into ashiftrt by the same count.
+
+- User: Jakub Jelinek | Time: 2023-12-02 09:16:16 UTC
+  Text: BTW, with -O2 the ICE started withr12-4240, with -O3 withr10-2804-gbf05a3bbb58b355899ccabe861a06e85b7abe6e4and guess it has been latent before that.
+
+- User: Hongtao Liu | Time: 2023-12-04 04:12:57 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #3)> Createdattachment 56767[details]> gcc14-pr112816.patch
+> 
+> Untested fix.
+> 
+> Another issue is that the emitted code is terrible:
+>         pxor    %xmm1, %xmm1
+>         psrld   $31, %xmm0
+>         pcmpeqd %xmm1, %xmm0
+>         pcmpeqd %xmm1, %xmm0
+> Why not just
+>         psrad   $31, %xmm0
+> instead of all this?We have optimization in ix86_expand_int_vcond.
+ 5090  /* Try to optimize x < 0 ? -1 : 0 into (signed) x >> 31
+ 5091     and x < 0 ? 1 : 0 into (unsigned) x >> 31.  */
+
+But for signbit case, it's 
+
+  vect__1.10_4 = MEM <vector(4) float> [(float *)&x];
+  vect__2.11_3 = .SIGNBIT (vect__1.10_4);
+  mask__11.12_22 = vect__2.11_3 != { 0, 0, 0, 0 };
+  vect__13.14_26 = VIEW_CONVERT_EXPR<vector(4) int>(mask__11.12_22);
+
+I'm curious, can we move all of those to the middle-end, like match.pd?
+
+- User: GCC Commits | Time: 2023-12-04 08:01:48 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:994d6dc64435d6b7c50accca9941ee7decd92a22commitr14-6108-g994d6dc64435d6b7c50accca9941ee7decd92a22Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Dec 4 09:00:18 2023 +0100
+
+    i386: Fix up signbit<mode>2 expander [PR112816]
+    
+    The following testcase ICEs, because the signbit<mode>2 expander uses an
+    explicit SUBREG in the pattern around match_operand with register_operand
+    predicate.  If we are unlucky enough that expansion tries to expand it
+    with some SUBREG as operands[1], we have two nested SUBREGs in the IL,
+    which is not valid and causes ICE later.
+    
+    2023-12-04  Jakub Jelinek  <jakub@redhat.com>PR target/112816* config/i386/sse.md (signbit<mode>2): Force operands[1] into a REG.
+    
+            * gcc.target/i386/sse2-pr112816.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-12-04 08:02:36 UTC
+  Text: Fixed on the trunk so far.
+
+- User: Andrei Elovikov | Time: 2023-12-04 17:04:43 UTC
+  Text: Createdattachment 56789[details]Another reproducer, now using short instead of int
+
+Once the fix is ready, please verify the "uint16_t" version of it passes as well. I'm not familiar with GCC internals to understand if it's a single crash or two different issues. Godbolt link (same as the attached file):https://godbolt.org/z/cEh1W7PdG.
+
+- User: GCC Commits | Time: 2023-12-05 08:09:29 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:bf418db27c0b48abb8203dd9e08135793cd9ce18commitr14-6136-gbf418db27c0b48abb8203dd9e08135793cd9ce18Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Dec 5 09:08:45 2023 +0100
+
+    i386: Improve code generation for vector __builtin_signbit (x.x[i]) ? -1 : 0 [PR112816]
+    
+    On the testcase I've recently fixed I've noticed bad code generation,
+    we emit
+            pxor    %xmm1, %xmm1
+            psrld   $31, %xmm0
+            pcmpeqd %xmm1, %xmm0
+            pcmpeqd %xmm1, %xmm0
+    or
+            vpxor   %xmm1, %xmm1, %xmm1
+            vpsrld  $31, %xmm0, %xmm0
+            vpcmpeqd        %xmm1, %xmm0, %xmm0
+            vpcmpeqd        %xmm1, %xmm0, %xmm2
+    rather than
+            psrad   $31, %xmm2
+    or
+            vpsrad  $31, %xmm1, %xmm2
+    The following patch fixes that using a combiner splitter.
+    
+    2023-12-05  Jakub Jelinek  <jakub@redhat.com>PR target/112816* config/i386/sse.md ((eq (eq (lshiftrt x elt_bits-1) 0) 0)): New
+            splitter to turn psrld $31; pcmpeq; pcmpeq into psrad $31.
+    
+            * gcc.target/i386/pr112816.c: New test.
+
+- User: GCC Commits | Time: 2023-12-05 16:32:56 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:05d8dec0f9f9660b1f437d52252852a2f86d3ac8commitr13-8125-g05d8dec0f9f9660b1f437d52252852a2f86d3ac8Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Dec 4 09:00:18 2023 +0100
+
+    i386: Fix up signbit<mode>2 expander [PR112816]
+    
+    The following testcase ICEs, because the signbit<mode>2 expander uses an
+    explicit SUBREG in the pattern around match_operand with register_operand
+    predicate.  If we are unlucky enough that expansion tries to expand it
+    with some SUBREG as operands[1], we have two nested SUBREGs in the IL,
+    which is not valid and causes ICE later.
+    
+    2023-12-04  Jakub Jelinek  <jakub@redhat.com>PR target/112816* config/i386/sse.md (signbit<mode>2): Force operands[1] into a REG.
+    
+            * gcc.target/i386/sse2-pr112816.c: New test.
+    
+    (cherry picked from commit 994d6dc64435d6b7c50accca9941ee7decd92a22)
+
+- User: Jakub Jelinek | Time: 2023-12-05 17:02:07 UTC
+  Text: Now fixed for 13.3 as well.
+
+- User: GCC Commits | Time: 2023-12-16 00:38:04 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:0246a37ebdef4ffc863fe4c56e812c0614026e02commitr12-10052-g0246a37ebdef4ffc863fe4c56e812c0614026e02Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Dec 4 09:00:18 2023 +0100
+
+    i386: Fix up signbit<mode>2 expander [PR112816]
+    
+    The following testcase ICEs, because the signbit<mode>2 expander uses an
+    explicit SUBREG in the pattern around match_operand with register_operand
+    predicate.  If we are unlucky enough that expansion tries to expand it
+    with some SUBREG as operands[1], we have two nested SUBREGs in the IL,
+    which is not valid and causes ICE later.
+    
+    2023-12-04  Jakub Jelinek  <jakub@redhat.com>PR target/112816* config/i386/sse.md (signbit<mode>2): Force operands[1] into a REG.
+    
+            * gcc.target/i386/sse2-pr112816.c: New test.
+    
+    (cherry picked from commit 994d6dc64435d6b7c50accca9941ee7decd92a22)
+
+- User: GCC Commits | Time: 2023-12-17 13:55:21 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:531d80228d85624c0e2eac40cd525dc75686ba95commitr11-11152-g531d80228d85624c0e2eac40cd525dc75686ba95Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Dec 4 09:00:18 2023 +0100
+
+    i386: Fix up signbit<mode>2 expander [PR112816]
+    
+    The following testcase ICEs, because the signbit<mode>2 expander uses an
+    explicit SUBREG in the pattern around match_operand with register_operand
+    predicate.  If we are unlucky enough that expansion tries to expand it
+    with some SUBREG as operands[1], we have two nested SUBREGs in the IL,
+    which is not valid and causes ICE later.
+    
+    2023-12-04  Jakub Jelinek  <jakub@redhat.com>PR target/112816* config/i386/sse.md (signbit<mode>2): Force operands[1] into a REG.
+    
+            * gcc.target/i386/sse2-pr112816.c: New test.
+    
+    (cherry picked from commit 994d6dc64435d6b7c50accca9941ee7decd92a22)
+
+- User: Andrei Elovikov | Time: 2023-12-18 19:30:12 UTC
+  Text: I'd like to point out that while the first reproducer (https://godbolt.org/z/3vzejjWcq) started to pass now on godbolt, the second (https://godbolt.org/z/cEh1W7PdG) still fails with an ICE. Please let me know if you'd prefer me to submit a separate report for it.
+
+- User: Jakub Jelinek | Time: 2023-12-18 20:03:48 UTC
+  Text: Createdattachment 56903[details]gcc14-pr112816-3.patch
+
+Ah, forgot some expanders in mmx.md.
+
+- User: GCC Commits | Time: 2023-12-19 09:25:04 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:80e1375ed7a7a05a5a60a57e72c5ad5eba005798commitr14-6679-g80e1375ed7a7a05a5a60a57e72c5ad5eba005798Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Dec 19 10:24:33 2023 +0100
+
+    i386: Fix mmx.md signbit expanders [PR112816]
+    
+    Apparently when looking for "signbit<mode>2" vector expanders, I've only
+    looked at sse.md and forgot mmx.md, which has two further ones and the
+    following patch still ICEd.
+    
+    2023-12-19  Jakub Jelinek  <jakub@redhat.com>PR target/112816* config/i386/mmx.md (signbitv2sf2, signbit<mode>2): Force operands[1]
+            into a REG.
+    
+            * gcc.target/i386/sse2-pr112816-2.c: New test.
+
+- User: GCC Commits | Time: 2023-12-19 09:33:14 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:0cf251fba0f0a374225a81021af5ec6c6ccceb5bcommitr13-8167-g0cf251fba0f0a374225a81021af5ec6c6ccceb5bAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Dec 19 10:24:33 2023 +0100
+
+    i386: Fix mmx.md signbit expanders [PR112816]
+    
+    Apparently when looking for "signbit<mode>2" vector expanders, I've only
+    looked at sse.md and forgot mmx.md, which has another one and the
+    following patch still ICEd.
+    
+    2023-12-19  Jakub Jelinek  <jakub@redhat.com>PR target/112816* config/i386/mmx.md (signbitv2sf2): Force operands[1] into a REG.
+    
+            * gcc.target/i386/sse2-pr112816-2.c: New test.
+    
+    (cherry picked from commit 80e1375ed7a7a05a5a60a57e72c5ad5eba005798)
+
+- User: GCC Commits | Time: 2023-12-19 09:37:32 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:08a9df82bc2958df1c5508a0352d31a29c0ebe74commitr12-10061-g08a9df82bc2958df1c5508a0352d31a29c0ebe74Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Dec 19 10:24:33 2023 +0100
+
+    i386: Fix mmx.md signbit expanders [PR112816]
+    
+    Apparently when looking for "signbit<mode>2" vector expanders, I've only
+    looked at sse.md and forgot mmx.md, which has another one and the
+    following patch still ICEd.
+    
+    2023-12-19  Jakub Jelinek  <jakub@redhat.com>PR target/112816* config/i386/mmx.md (signbitv2sf2): Force operands[1] into a REG.
+    
+            * gcc.target/i386/sse2-pr112816-2.c: New test.
+    
+    (cherry picked from commit 80e1375ed7a7a05a5a60a57e72c5ad5eba005798)
+
+- User: GCC Commits | Time: 2023-12-19 09:45:30 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d9b7e78dae13945dd9b296f2cca67650da0f869dcommitr11-11159-gd9b7e78dae13945dd9b296f2cca67650da0f869dAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Dec 19 10:24:33 2023 +0100
+
+    i386: Fix mmx.md signbit expanders [PR112816]
+    
+    Apparently when looking for "signbit<mode>2" vector expanders, I've only
+    looked at sse.md and forgot mmx.md, which has another one and the
+    following patch still ICEd.
+    
+    2023-12-19  Jakub Jelinek  <jakub@redhat.com>PR target/112816* config/i386/mmx.md (signbitv2sf2): Force operands[1] into a REG.
+    
+            * gcc.target/i386/sse2-pr112816-2.c: New test.
+    
+    (cherry picked from commit 80e1375ed7a7a05a5a60a57e72c5ad5eba005798)
+
+- User: Jakub Jelinek | Time: 2023-12-19 09:46:52 UTC
+  Text: Should be fixed now.
+

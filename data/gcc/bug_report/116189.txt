@@ -1,0 +1,242 @@
+Bug Summary: [14/15 Regression] compare debug failure at -O2 on sh since r14-8319-g86de9b66480b71
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: build, compare-debug-failure
+Known to Work: 12.4.1, 13.3.1, 14.2.1, 15.0
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2024-08-02 03:01:45 UTC
+  Text: Createdattachment 58803[details]reduced testcase
+
+When I reduced the testcase forPR 116185, I accidently stumbled on to a different compare debug failure. This is extracting it from there.
+
+- User: Andrew Pinski | Time: 2024-08-02 03:03:06 UTC
+  Text: ` -fcompare-debug -O2` is enough to reproduce this one.
+
+The first difference comes from rtl gcse (pre).
+register usage starts to differ.
+
+- User: Andrew Pinski | Time: 2024-08-02 03:40:04 UTC
+  Text: Hmm, GCC 13 also had the pre difference but we didn't start to compare debug failure there either.
+
+- User: Andrew Pinski | Time: 2024-08-03 02:29:24 UTC
+  Text: expr_hash_table has a different order depending on debug and non-debug ...
+
+- User: Andrew Pinski | Time: 2024-08-03 02:35:16 UTC
+  Text: -Expression hash table (31 buckets, 24 entries)
+-Index 0 (hash value 1; max distance 0)
++Expression hash table (29 buckets, 24 entries)
++Index 0 (hash value 6; max distance 0)
+
+The number of buckets is different between the 2 which I think is causing the difference.
+
+That is because it is based on the insn count ..
+
+  n = get_max_insn_count ();
+
+  table->size = n / 4;
+  if (table->size < 11)
+    table->size = 11;
+
+Let me figure out the better answer here.
+
+- User: Andrew Pinski | Time: 2024-08-03 02:46:54 UTC
+  Text: Note cprop.cc also allocates the hashtable a similar way but its walk over the hashtable is ok because it does not allocate psedu-registers based on the order.
+
+- User: Andrew Pinski | Time: 2024-08-03 02:59:22 UTC
+  Text: The code for get_max_insn_count is the following:
+
+```
+int
+get_max_insn_count (void)
+{
+  int n = cur_insn_uid;
+
+  /* The table size must be stable across -g, to avoid codegen
+     differences due to debug insns, and not be affected by
+     -fmin-insn-uid, to avoid excessive table size and to simplify
+     debugging of -fcompare-debug failures.  */
+  if (cur_debug_insn_uid > param_min_nondebug_insn_uid)
+    n -= cur_debug_insn_uid;
+  else
+    n -= param_min_nondebug_insn_uid;
+
+  return n;
+}
+
+
+```
+
+But this is definitely not working the way it should be.
+-num of insn: 120
++num of insn: 116
+
+- User: Andrew Pinski | Time: 2024-08-03 04:10:15 UTC
+  Text: make_insn_raw: cur_uid: 1084
+make_insn_raw: cur_debug_uid: 21
+make_insn_raw: cur_uid: 1085
+make_insn_raw: cur_debug_uid: 21
+cannot propagate from insn 1022 into insn 19: would increase complexity of pattern
+
+This is from forwprop. This is where the issue of the difference comes from.
+
+- User: Andrew Pinski | Time: 2024-08-03 04:21:56 UTC
+  Text: ```
+(gdb) condition 1 x_rtl.emit.x_cur_insn_uid==1083
+
+#0  make_insn_raw (pattern=0x7ffff7570858) at ../../gcc/emit-rtl.cc:4137
+#1  0x0000000001f10469 in sh_recog_treg_set_expr (op=0x7ffff7570018, mode=E_SImode) at ../../gcc/config/sh/sh.cc:12300
+#2  0x000000000280042c in treg_set_expr (op=0x7ffff7570018, mode=E_SImode) at ../../gcc/config/sh/predicates.md:628
+#3  0x0000000001ef5462 in addsubcosts (x=0x7ffff7570060) at ../../gcc/config/sh/sh.cc:3177
+#4  0x0000000001ef5f7f in sh_rtx_costs (x=0x7ffff7570060, mode=E_SImode, outer_code=25, opno=1, total=0x7fffffffd2a4, speed=false) at ../../gcc/config/sh/sh.cc:3466
+#5  0x000000000197ead3 in rtx_cost (x=0x7ffff7570060, mode=E_SImode, outer_code=SET, opno=1, speed=false) at ../../gcc/rtlanal.cc:4605
+```
+
+oh this is a bad hack but ok.
+
+- User: Andrew Pinski | Time: 2024-08-03 04:26:33 UTC
+  Text: ***Bug 116185has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2024-08-03 04:29:39 UTC
+  Text: Createdattachment 58808[details]Fix to sh_recog_treg_set_expr
+
+The problem is sh_recog_treg_set_expr is called from rtx_costs which sometimes happens while proping into a debug_insn and sh_recog_treg_set_expr uses make_insn_raw which increment the uid and so we would get a difference between the max uids that is done for the GCSE hashtable. This fixes the issue by creating the INSN RTX manually and not using make_insn_raw .
+
+- User: Andrew Pinski | Time: 2024-08-03 04:37:11 UTC
+  Text: So rtx_costs started to be called from fwprop byr14-8319-g86de9b66480b71. So that exposed the latent bug in the sh backend. 
+
+As forr15-2069-g9f9faebb8ebfc0exposing the issue is most likely a similar reason, you accidently get different regnums from GCSE but before the patch it would just happen the RA would get the same result but now you don't.
+
+Anyways the bug is definitely in the backend here.
+
+Let me try to figure out the best way to test this patch.
+
+- User: Oleg Endo | Time: 2024-08-03 04:57:55 UTC
+  Text: (In reply to Andrew Pinski fromcomment #8)> ```
+> (gdb) condition 1 x_rtl.emit.x_cur_insn_uid==1083
+> 
+> #0  make_insn_raw (pattern=0x7ffff7570858) at ../../gcc/emit-rtl.cc:4137
+> #1  0x0000000001f10469 in sh_recog_treg_set_expr (op=0x7ffff7570018,
+> mode=E_SImode) at ../../gcc/config/sh/sh.cc:12300
+> #2  0x000000000280042c in treg_set_expr (op=0x7ffff7570018, mode=E_SImode)
+> at ../../gcc/config/sh/predicates.md:628
+> #3  0x0000000001ef5462 in addsubcosts (x=0x7ffff7570060) at
+> ../../gcc/config/sh/sh.cc:3177
+> #4  0x0000000001ef5f7f in sh_rtx_costs (x=0x7ffff7570060, mode=E_SImode,
+> outer_code=25, opno=1, total=0x7fffffffd2a4, speed=false) at
+> ../../gcc/config/sh/sh.cc:3466
+> #5  0x000000000197ead3 in rtx_cost (x=0x7ffff7570060, mode=E_SImode,
+> outer_code=SET, opno=1, speed=false) at ../../gcc/rtlanal.cc:4605
+> ```
+> 
+> oh this is a bad hack but ok.Please forgive me, I was probably desperate at that time.
+Thanks a lot for figuring this out!
+
+- User: Andrew Pinski | Time: 2024-08-05 21:17:21 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2024-August/659486.html
+
+- User: GCC Commits | Time: 2024-08-06 02:38:24 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:0355c943b9e954e8f59068971d934f1b91ecb729commitr15-2736-g0355c943b9e954e8f59068971d934f1b91ecb729Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Sat Aug 3 09:30:57 2024 -0700
+
+    sh: Don't call make_insn_raw in sh_recog_treg_set_expr [PR116189]
+    
+    This was an interesting compare debug failure to debug. The first symptom
+    was in gcse which would produce different order of creating psedu-registers. This
+    was caused by a different order of a hashtable walk, due to the hash table having different
+    number of entries. Which in turn was due to the number of max insn being different between
+    the 2 runs. The place max insn uid comes from was in sh_recog_treg_set_expr which is called
+    via rtx_costs and fwprop would cause rtx_costs in some cases for debug insn related stuff.
+    
+    Build and tested for sh4-linux-gnu.PR target/116189gcc/ChangeLog:
+    
+            * config/sh/sh.cc (sh_recog_treg_set_expr): Don't call make_insn_raw,
+            make the insn with a fake uid.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/torture/pr116189-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: GCC Commits | Time: 2024-08-06 02:39:27 UTC
+  Text: The releases/gcc-14 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:ba45573c8072f06f67af22a2ca60da5f5c12beaecommitr14-10564-gba45573c8072f06f67af22a2ca60da5f5c12beaeAuthor: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Sat Aug 3 09:30:57 2024 -0700
+
+    sh: Don't call make_insn_raw in sh_recog_treg_set_expr [PR116189]
+    
+    This was an interesting compare debug failure to debug. The first symptom
+    was in gcse which would produce different order of creating psedu-registers. This
+    was caused by a different order of a hashtable walk, due to the hash table having different
+    number of entries. Which in turn was due to the number of max insn being different between
+    the 2 runs. The place max insn uid comes from was in sh_recog_treg_set_expr which is called
+    via rtx_costs and fwprop would cause rtx_costs in some cases for debug insn related stuff.
+    
+    Build and tested for sh4-linux-gnu.PR target/116189gcc/ChangeLog:
+    
+            * config/sh/sh.cc (sh_recog_treg_set_expr): Don't call make_insn_raw,
+            make the insn with a fake uid.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/torture/pr116189-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+    (cherry picked from commit 0355c943b9e954e8f59068971d934f1b91ecb729)
+
+- User: GCC Commits | Time: 2024-08-06 02:40:49 UTC
+  Text: The releases/gcc-13 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:73064a28689fe3799f4fb5f1bab7634df889a43ecommitr13-8962-g73064a28689fe3799f4fb5f1bab7634df889a43eAuthor: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Sat Aug 3 09:30:57 2024 -0700
+
+    sh: Don't call make_insn_raw in sh_recog_treg_set_expr [PR116189]
+    
+    This was an interesting compare debug failure to debug. The first symptom
+    was in gcse which would produce different order of creating psedu-registers. This
+    was caused by a different order of a hashtable walk, due to the hash table having different
+    number of entries. Which in turn was due to the number of max insn being different between
+    the 2 runs. The place max insn uid comes from was in sh_recog_treg_set_expr which is called
+    via rtx_costs and fwprop would cause rtx_costs in some cases for debug insn related stuff.
+    
+    Build and tested for sh4-linux-gnu.PR target/116189gcc/ChangeLog:
+    
+            * config/sh/sh.cc (sh_recog_treg_set_expr): Don't call make_insn_raw,
+            make the insn with a fake uid.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/torture/pr116189-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+    (cherry picked from commit 0355c943b9e954e8f59068971d934f1b91ecb729)
+
+- User: GCC Commits | Time: 2024-08-06 02:42:31 UTC
+  Text: The releases/gcc-12 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:dfacc021c9775b1563c717cf3f8114d0f874b030commitr12-10660-gdfacc021c9775b1563c717cf3f8114d0f874b030Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Sat Aug 3 09:30:57 2024 -0700
+
+    sh: Don't call make_insn_raw in sh_recog_treg_set_expr [PR116189]
+    
+    This was an interesting compare debug failure to debug. The first symptom
+    was in gcse which would produce different order of creating psedu-registers. This
+    was caused by a different order of a hashtable walk, due to the hash table having different
+    number of entries. Which in turn was due to the number of max insn being different between
+    the 2 runs. The place max insn uid comes from was in sh_recog_treg_set_expr which is called
+    via rtx_costs and fwprop would cause rtx_costs in some cases for debug insn related stuff.
+    
+    Build and tested for sh4-linux-gnu.PR target/116189gcc/ChangeLog:
+    
+            * config/sh/sh.cc (sh_recog_treg_set_expr): Don't call make_insn_raw,
+            make the insn with a fake uid.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/torture/pr116189-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+    (cherry picked from commit 0355c943b9e954e8f59068971d934f1b91ecb729)
+
+- User: Andrew Pinski | Time: 2024-08-06 02:43:56 UTC
+  Text: Fixed.
+

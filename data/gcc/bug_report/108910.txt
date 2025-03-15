@@ -1,0 +1,376 @@
+Bug Summary: [12 Regression] Further ICE in aarch64_layout_arg
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 12.2.0
+Known to Fail: 12.2.1
+
+Comments:
+- User: Jakub Jelinek | Time: 2023-02-23 20:56:02 UTC
+  Text: extern void foo (float, float *, float *);
+
+void
+bar (void *p)
+{
+  float *__attribute__((aligned (64))) q = __builtin_assume_aligned (p, 64);
+  foo (0.0f, q, q);
+}
+
+ICEs on aarch64-linux with -O2 likely sincer13-5124with:
+during RTL pass: expand
+woohoo.c: In function ‘bar’:
+woohoo.c:7:3: internal compiler error: in aarch64_layout_arg, at config/aarch64/aarch64.cc:7688
+    7 |   foo (0.0f, q, q);
+      |   ^~~~~~~~~~~~~~~~
+0x12c4993 aarch64_layout_arg
+	../../gcc/config/aarch64/aarch64.cc:7688
+0x12c527a aarch64_function_arg
+	../../gcc/config/aarch64/aarch64.cc:7868
+0xa44efb initialize_argument_information
+	../../gcc/calls.cc:1499
+
+I know trying to overalign a pointer type (rather than what it points to) is very dumb,
+but some real-world code (most likely just by mistake (but many)) does that:https://github.com/darktable-org/darktable/blob/master/src/common/bspline.h#L178
+
+- User: Andrew Pinski | Time: 2023-02-23 21:01:10 UTC
+  Text: What I don't understand is how the alignment of the function argument 64 bytes aligned being taken into account here ...
+The alignment of the argument type is still 4 byte aligned even because of the declaration of foo.
+
+- User: Andrew Pinski | Time: 2023-02-23 21:03:14 UTC
+  Text: > ICEs on aarch64-linux with -O2 likely sincer13-5124Which has been backported to the GCC 12 branch too.
+
+- User: Jakub Jelinek | Time: 2023-02-23 21:09:26 UTC
+  Text: As I've tried to explain in the past, C/C++ considers float * and float *__attribute__((aligned (64))) types to be compatible, similarly to int and int __attribute__((aligned (64))), so in calling convention one should ignore alignment on scalar types of passed arguments at least, because they can be pretty much random.
+
+Though
+extern void foo (long, long, long);
+void baz (void *);
+
+void
+bar (void *p)
+{
+  long __attribute__((aligned (64))) q = 1;
+  asm volatile ("" : "+r" (q));
+  foo (0.0L, q, q);
+}
+doesn't ICE.
+
+- User: Jakub Jelinek | Time: 2023-02-23 21:55:42 UTC
+  Text: There is another bug, in darktable actually such overaligned pointer isn't passed, but it is cvise reduced into:
+$ cat color_picker.c
+void
+bar (void)
+{
+  float *__attribute__((aligned(64))) x;
+}
+$ cat color_vocabulary.c
+int a, b, c;
+
+void
+foo (void)
+{
+  c = __builtin_cosf (2.0f * 3.14159265358979324f * a);
+  b = __builtin_sinf (2.0f * 3.14159265358979324f * a);
+}
+$ ./xgcc -B ./ -c -flto=auto -ffat-lto-objects -g -O3 -ffast-math -fno-finite-math-only -fPIC -fexpensive-optimizations color_picker.c
+$ ./xgcc -B ./ -c -flto=auto -ffat-lto-objects -g -O3 -ffast-math -fno-finite-math-only -fPIC -fexpensive-optimizations color_vocabulary.c
+$ ./xgcc -B ./  -flto=auto -ffat-lto-objects -o color_picker -r color_picker.o color_vocabulary.o
+during RTL pass: expand
+color_vocabulary.c: In function ‘foo’:
+color_vocabulary.c:4:1: internal compiler error: in aarch64_layout_arg, at config/aarch64/aarch64.cc:7688
+    4 | foo (void)
+      | ^
+0x118d493 aarch64_layout_arg
+	../../gcc/config/aarch64/aarch64.cc:7688
+0x118dd7a aarch64_function_arg
+	../../gcc/config/aarch64/aarch64.cc:7868
+0x92080b initialize_argument_information
+	../../gcc/calls.cc:1499
+0x925273 expand_call(tree_node*, rtx_def*, int)
+	../../gcc/calls.cc:2973
+0x90a2da expand_builtin(tree_node*, rtx_def*, rtx_def*, machine_mode, int)
+	../../gcc/builtins.cc:8452
+0xa5ecfe expand_expr_real_1(tree_node*, rtx_def*, machine_mode, expand_modifier, rtx_def**, bool)
+	../../gcc/expr.cc:11872
+0x8f638d expand_builtin_cexpi
+	../../gcc/builtins.cc:2685
+0x9077ee expand_builtin(tree_node*, rtx_def*, rtx_def*, machine_mode, int)
+	../../gcc/builtins.cc:7476
+0xa5ecfe expand_expr_real_1(tree_node*, rtx_def*, machine_mode, expand_modifier, rtx_def**, bool)
+	../../gcc/expr.cc:11872
+0xa694b5 store_expr(tree_node*, rtx_def*, int, bool, bool)
+	../../gcc/expr.cc:6333
+0xa6bbf0 expand_assignment(tree_node*, tree_node*, bool)
+	../../gcc/expr.cc:6051
+0x93866a expand_call_stmt
+	../../gcc/cfgexpand.cc:2829
+0x93866a expand_gimple_stmt_1
+	../../gcc/cfgexpand.cc:3880
+0x93866a expand_gimple_stmt
+	../../gcc/cfgexpand.cc:4044
+0x93e0c6 expand_gimple_basic_block
+	../../gcc/cfgexpand.cc:6096
+0x93fa67 execute
+	../../gcc/cfgexpand.cc:6831
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+lto-wrapper: fatal error: ./xgcc returned 1 exit status
+compilation terminated.
+/usr/bin/aarch64-linux-gnu-ld: error: lto-wrapper failed
+collect2: error: ld returned 1 exit status
+
+Now, I believe the reason why this #c0 bug triggers even when the aligned (64) pointer appears in completely unrelated function
+is that while without LTO, TYPE_POINTER_TO/TYPE_NEXT_PTR_TO is only registered for types actually created with build_pointer_type_for_mode,
+so pretty much for type with basic alignment, no extra attributes, no cv-qualification/TYPE_ADDR_SPACE etc. (note, I'm talking
+about the POINTER_TYPE, not what it points to), during LTO streaming in that is all of sudden not the case.
+LTO streaming itself doesn't do anything about those, but then lto_fixup_prevailing_type can add there some other POINTER_TYPE
+which as in the testcase has TYPE_USER_ALIGN, or could have any other weird stuff.  I think we should add to TYPE_POINTER_TO
+chain only if it is really a pointer type without any of those extras and only if such a type doesn't appear in the chain already.
+
+- User: Jakub Jelinek | Time: 2023-02-27 13:05:49 UTC
+  Text: Createdattachment 54544[details]gcc13-pr108910-lto.patch
+
+Untested fix for the lto side of this bug.  No testcase included, as when
+the target bug is fixed, the lto testcase will not fail regardless of whether
+this fix is in or not.
+
+- User: Christophe Lyon | Time: 2023-02-28 16:47:54 UTC
+  Text: I can see that aarch64_function_arg_alignment has:
+  if (!AGGREGATE_TYPE_P (type))
+    return TYPE_ALIGN (TYPE_MAIN_VARIANT (type));
+which returns 512 with the testcase fromcomment #0type is (TYPE_MAIN_VARIANT(type) is the same):
+
+ <pointer_type 0x7ffff74f7bd0
+    type <real_type 0x7ffff76222a0 float SF
+        size <integer_cst 0x7ffff761e060 constant 32>
+        unit-size <integer_cst 0x7ffff761e078 constant 4>
+        align:32 warn_if_not_align:0 symtab:0 alias-set -1 canonical-type 0x7ffff76222a0 precision:32
+        pointer_to_this <pointer_type 0x7ffff7622888>>
+    sizes-gimplified public unsigned DI
+    size <integer_cst 0x7ffff7602e10 type <integer_type 0x7ffff761a0a8 bitsizetype> constant 64>
+    unit-size <integer_cst 0x7ffff7602e28 type <integer_type 0x7ffff761a000 sizetype> constant 8>
+    user align:512 warn_if_not_align:0 symtab:0 alias-set -1 canonical-type 0x7ffff7622888
+    attributes <tree_list 0x7ffff74fb280
+        purpose <identifier_node 0x7ffff74fc8c0 aligned>
+        value <tree_list 0x7ffff74fb208
+            value <integer_cst 0x7ffff7769b58 constant 64>>>>
+
+- User: GCC Commits | Time: 2023-03-01 09:00:01 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:9b4f7004a77b10bc403875f56c94f73ef86562d8commitr13-6385-g9b4f7004a77b10bc403875f56c94f73ef86562d8Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Mar 1 09:54:52 2023 +0100
+
+    lto: Fix up lto_fixup_prevailing_type [PR108910]
+    
+    Without LTO, TYPE_POINTER_TO/TYPE_REFERENCE_TO chains are only maintained
+    inside of build_{pointer,reference}_type_for_mode and those routines
+    ensure that the pointer/reference type added to the chain is really
+    without any user attributes (unless something would modify the types
+    in place, but that would be wrong).
+    
+    Now, LTO adds stuff to these chains in lto_fixup_prevailing_type but
+    doesn't guarantee that.  The testcase in the PR (which I'm not including
+    for testsuite because when (I hope) the aarch64 backend bug will be fixed,
+    the testcase would work either way) shows a case where user has
+    TYPE_USER_ALIGN type with very high alignment, as there aren't enough
+    pointers to float in the code left that one becomes the prevailing one
+    (because types with attributes are created with build_distinct_type_copy
+    and thus their own TYPE_MAIN_VARIANTs), lto_fixup_prevailing_type puts
+    it into the TYPE_POINTER_TO chain of float and later on during expansion
+    of __builtin_cexpif expander uses build_pointer_type (float_type_node)
+    to emit a sincosf call and instead of getting a normal pointer type gets
+    this non-standard one.
+    
+    The following patch fixes that by not adding into those chains
+    types with TYPE_ATTRIBUTES, and for REFERENCE_TYPEs not even with
+    TYPE_REF_IS_RVALUE - while the C++ FE adds those into those chains,
+    it always ensures such a type goes immediately after the corresponding
+    non-TYPE_REF_IS_RVALUE REFERENCE_TYPE with the same
+    mode/TYPE_REF_CAN_ALIAS_ALL, so LTO would need to ensure that too, but
+    TYPE_REF_IS_RVALUE types are looked that way only in the C++ FE.
+    
+    2023-03-01  Jakub Jelinek  <jakub@redhat.com>PR target/108910* lto-common.cc (lto_fixup_prevailing_type): Don't add t to
+            TYPE_POINTER_TO or TYPE_REFERENCE_TO chain if it has
+            TYPE_ATTRIBUTES or is TYPE_REF_IS_RVALUE.
+
+- User: Jakub Jelinek | Time: 2023-03-01 09:04:42 UTC
+  Text: The above commit fixed just the #c4 testcase, not the #c0 one.
+
+- User: Christophe Lyon | Time: 2023-03-10 15:10:11 UTC
+  Text: Looking at #c6 again, the behavior of aarch64_function_arg_alignment does not seem to match the comment preceding it. IIUC, it should ignore user alignment.
+
+So is it expected that the alignment of TYPE_MAIN_VARIANT(type) is 512? (ie. is the bug in aarch64_function_arg_alignment or earlier, when we build "type"?)
+
+- User: Jakub Jelinek | Time: 2023-03-10 15:14:45 UTC
+  Text: (In reply to Christophe Lyon fromcomment #9)> So is it expected that the alignment of TYPE_MAIN_VARIANT(type) is 512?Yes, it is.  aligned attribute on non-aggregate types create a distinct type, and TYPE_MAIN_VARIANT of a distinct type is the non-qualified variant of such a distinct type.  For structures/unions, I believe we disallow creation of less/more aligned variants of the original types, one needs to supply the alignment when defining the structure/union type.
+
+- User: Jakub Jelinek | Time: 2023-03-10 16:09:38 UTC
+  Text: To be exact, it is more complicated than that.
+Some types with extra types are created using build_variant_type_copy and so their TYPE_MAIN_VARIANT is without the attributes.
+Example is handle_aligned_attribute -> common_handle_aligned_attribute -> build_variant_type_copy.
+Others are created as build_distinct_type_copy and don't have TYPE_MAIN_VARIANT without it, e.g. build_type_attribute_variant -> build_type_attribute_qual_variant -> build_distinct_type_copy.
+
+Compare e.g. the #c0 testcase vs.
+extern void foo (float, float *, float *);
+
+void
+bar (void *p)
+{
+  typedef float *FP;
+  typedef FP FP2 __attribute__((aligned (64)));
+  FP2 q = __builtin_assume_aligned (p, 64);
+  foo (0.0f, q, q);
+}
+which doesn't ICE.
+#0  build_distinct_type_copy (type=<pointer_type 0x7fffea274a80>) at ../../gcc/tree.cc:5693
+#1  0x0000000000c143bb in build_type_attribute_qual_variant (otype=<pointer_type 0x7fffea274a80>, attribute=<tree_list 0x7fffea2728c0>, quals=0) at ../../gcc/attribs.cc:1298
+#2  0x0000000000c156f0 in build_type_attribute_variant (ttype=<pointer_type 0x7fffea274a80>, attribute=<tree_list 0x7fffea2728c0>) at ../../gcc/attribs.cc:1591
+#3  0x0000000000c13465 in decl_attributes (node=0x7fffffffd1f8, attributes=<tree_list 0x7fffea272898>, flags=1, last_decl=<tree 0x0>) at ../../gcc/attribs.cc:964
+#4  0x0000000000c32a69 in grokdeclarator (declarator=0x3716e40, declspecs=0x3716cc0, decl_context=NORMAL, initialized=true, width=0x0, decl_attrs=0x7fffffffd3d0, 
+    expr=0x7fffffffd3f0, expr_const_operands=0x7fffffffd1ef, deprecated_state=DEPRECATED_NORMAL) at ../../gcc/c/c-decl.cc:6967
+#5  0x0000000000c2d270 in start_decl (declarator=0x3716e70, declspecs=0x3716cc0, initialized=true, attributes=<tree 0x0>, do_push=true, lastloc=0x0) at ../../gcc/c/c-decl.cc:5364
+on #c0 while this one:
+#1  0x000000000191494b in build_variant_type_copy (type=<pointer_type 0x7fffea274a80 FP>) at ../../gcc/tree.cc:5727
+#2  0x0000000000dbaeba in common_handle_aligned_attribute (node=0x7fffffffd270, name=<identifier_node 0x7fffea288dc0 aligned>, args=<tree_list 0x7fffea272848>, flags=0, 
+    no_add_attrs=0x7fffffffd28f, warn_if_not_aligned_p=false) at ../../gcc/c-family/c-attribs.cc:2386
+#3  0x0000000000dbb633 in handle_aligned_attribute (node=0x7fffffffd270, name=<identifier_node 0x7fffea288dc0 aligned>, args=<tree_list 0x7fffea272848>, flags=0, 
+    no_add_attrs=0x7fffffffd28f) at ../../gcc/c-family/c-attribs.cc:2499
+#4  0x0000000000c12dcd in decl_attributes (node=0x7fffffffd3f8, attributes=<tree_list 0x7fffea272898>, flags=0, last_decl=<tree 0x0>) at ../../gcc/attribs.cc:878
+#5  0x0000000000c2d1bc in c_decl_attributes (node=0x7fffffffd3f8, attributes=<tree_list 0x7fffea272898>, flags=0) at ../../gcc/c/c-decl.cc:5323
+#6  0x0000000000c2d699 in start_decl (declarator=0x3716f60, declspecs=0x3716ea0, initialized=false, attributes=<tree_list 0x7fffea272898>, do_push=true, lastloc=0x7fffffffd584)
+    at ../../gcc/c/c-decl.cc:5460
+
+- User: GCC Commits | Time: 2023-03-19 05:29:57 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:467a789b0c5e50676bb7e65f861b9d79e0c9fe4ccommitr12-9278-g467a789b0c5e50676bb7e65f861b9d79e0c9fe4cAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Mar 1 09:54:52 2023 +0100
+
+    lto: Fix up lto_fixup_prevailing_type [PR108910]
+    
+    Without LTO, TYPE_POINTER_TO/TYPE_REFERENCE_TO chains are only maintained
+    inside of build_{pointer,reference}_type_for_mode and those routines
+    ensure that the pointer/reference type added to the chain is really
+    without any user attributes (unless something would modify the types
+    in place, but that would be wrong).
+    
+    Now, LTO adds stuff to these chains in lto_fixup_prevailing_type but
+    doesn't guarantee that.  The testcase in the PR (which I'm not including
+    for testsuite because when (I hope) the aarch64 backend bug will be fixed,
+    the testcase would work either way) shows a case where user has
+    TYPE_USER_ALIGN type with very high alignment, as there aren't enough
+    pointers to float in the code left that one becomes the prevailing one
+    (because types with attributes are created with build_distinct_type_copy
+    and thus their own TYPE_MAIN_VARIANTs), lto_fixup_prevailing_type puts
+    it into the TYPE_POINTER_TO chain of float and later on during expansion
+    of __builtin_cexpif expander uses build_pointer_type (float_type_node)
+    to emit a sincosf call and instead of getting a normal pointer type gets
+    this non-standard one.
+    
+    The following patch fixes that by not adding into those chains
+    types with TYPE_ATTRIBUTES, and for REFERENCE_TYPEs not even with
+    TYPE_REF_IS_RVALUE - while the C++ FE adds those into those chains,
+    it always ensures such a type goes immediately after the corresponding
+    non-TYPE_REF_IS_RVALUE REFERENCE_TYPE with the same
+    mode/TYPE_REF_CAN_ALIAS_ALL, so LTO would need to ensure that too, but
+    TYPE_REF_IS_RVALUE types are looked that way only in the C++ FE.
+    
+    2023-03-01  Jakub Jelinek  <jakub@redhat.com>PR target/108910* lto-common.cc (lto_fixup_prevailing_type): Don't add t to
+            TYPE_POINTER_TO or TYPE_REFERENCE_TO chain if it has
+            TYPE_ATTRIBUTES or is TYPE_REF_IS_RVALUE.
+    
+    (cherry picked from commit 9b4f7004a77b10bc403875f56c94f73ef86562d8)
+
+- User: Jakub Jelinek | Time: 2023-04-03 14:06:45 UTC
+  Text: Jason, any thoughts on why we for build_type_attribute_qual_variant call
+build_distinct_type_copy rather than build_variant_type_copy, which is e.g. what
+all spots in c-family/c-attribs.cc that need a separate type use?
+Or could we use build_variant_type_copy say for a subset of types (perhaps integral/pointer/reference/vector/complex types or something similar) and use distinct copies of the rest (function/method types, aggregates)?
+
+- User: GCC Commits | Time: 2023-04-13 15:58:21 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:66946624b96b762985de56444d726a0ebd4e0df5commitr13-7167-g66946624b96b762985de56444d726a0ebd4e0df5Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Thu Apr 13 16:57:57 2023 +0100
+
+    aarch64: Don't trust TYPE_ALIGN for pointers [PR108910]
+    
+    The aarch64 PCS rules ignore user alignment for scalars and
+    vectors and use the "natural" alignment of the type.  GCC tried
+    to calculate that natural alignment using:
+    
+      TYPE_ALIGN (TYPE_MAIN_VARIANT (type))
+    
+    But as discussed in the PR, it's possible that the main variant
+    of a pointer type is an overaligned type (although that's usually
+    accidental).
+    
+    This isn't known to be a problem for other types, so this patch
+    changes the bare minimum.  It might be that we need to ignore
+    TYPE_ALIGN in other cases too.
+    
+    gcc/PR target/108910* config/aarch64/aarch64.cc (aarch64_function_arg_alignment): Do
+            not trust TYPE_ALIGN for pointer types; use POINTER_SIZE instead.
+    
+    gcc/testsuite/PR target/108910* gcc.dg/torture/pr108910.c: New test.
+
+- User: Richard Sandiford | Time: 2023-04-13 15:58:58 UTC
+  Text: Fixed on trunk so far.
+
+- User: Andreas Schwab | Time: 2023-04-14 07:12:37 UTC
+  Text: This breaks Ada:
+
+/opt/gcc/gcc-20230414/Build/./gcc/xgcc -B/opt/gcc/gcc-20230414/Build/./gcc/ -B/usr/aarch64-suse-linux/bin/ -B/usr/aarch64-suse-linux/lib/ -isystem /usr/aarch64-suse-linux/include -isystem /usr/aarch64-suse-linux/sys-include    -c -g -O2  -fPIC -fno-lto  -W -Wall -gnatpg -nostdinc   s-bitfie.ads -o s-bitfie.o
++===========================GNAT BUG DETECTED==============================+
+| 13.0.1 20230414 (experimental) [master 48d0244b605] (aarch64-suse-linux) GCC error:|
+| in aarch64_function_arg_alignment, at config/aarch64/aarch64.cc:7498     |
+| Error detected at s-bituti.adb:195:7 [s-bitfie.ads:55:4]                 |
+| Compiling s-bitfie.ads                                                   |
+
+- User: Richard Biener | Time: 2023-04-14 08:24:30 UTC
+  Text: (In reply to Andreas Schwab fromcomment #16)> This breaks Ada:
+> 
+> /opt/gcc/gcc-20230414/Build/./gcc/xgcc -B/opt/gcc/gcc-20230414/Build/./gcc/
+> -B/usr/aarch64-suse-linux/bin/ -B/usr/aarch64-suse-linux/lib/ -isystem
+> /usr/aarch64-suse-linux/include -isystem /usr/aarch64-suse-linux/sys-include
+> -c -g -O2  -fPIC -fno-lto  -W -Wall -gnatpg -nostdinc   s-bitfie.ads -o
+> s-bitfie.o
+> +===========================GNAT BUG DETECTED==============================+
+> | 13.0.1 20230414 (experimental) [master 48d0244b605] (aarch64-suse-linux)
+> GCC error:|
+> | in aarch64_function_arg_alignment, at config/aarch64/aarch64.cc:7498     |
+> | Error detected at s-bituti.adb:195:7 [s-bitfie.ads:55:4]                 |
+> | Compiling s-bitfie.ads                                                   |tracking this inPR109510now.
+
+- User: Jason Merrill | Time: 2023-04-14 20:51:15 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #13)> Jason, any thoughts on why we for build_type_attribute_qual_variant call
+> build_distinct_type_copy rather than build_variant_type_copyThat does seem weird.  It should probably depend on whether any of the attributes have affects_type_identity.  And so should setting of TYPE_CANONICAL.  Unless we never use it with such attributes, in which case we should checking_assert that, and always use build_variant_type_copy.
+
+- User: GCC Commits | Time: 2023-04-17 13:41:20 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:66700dde0dfb2c2b07d771f90df1fe16d1d61ce9commitr12-9416-g66700dde0dfb2c2b07d771f90df1fe16d1d61ce9Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Mon Apr 17 14:41:00 2023 +0100
+
+    aarch64: Don't trust TYPE_ALIGN for pointers [PR108910]
+    
+    The aarch64 PCS rules ignore user alignment for scalars and
+    vectors and use the "natural" alignment of the type.  GCC tried
+    to calculate that natural alignment using:
+    
+      TYPE_ALIGN (TYPE_MAIN_VARIANT (type))
+    
+    But as discussed in the PR, it's possible that the main variant
+    of a pointer type is an overaligned type (although that's usually
+    accidental).
+    
+    This isn't known to be a problem for other types, so this patch
+    changes the bare minimum.  It might be that we need to ignore
+    TYPE_ALIGN in other cases too.
+    
+    gcc/PR target/108910* config/aarch64/aarch64.cc (aarch64_function_arg_alignment): Do
+            not trust TYPE_ALIGN for pointer types; use POINTER_SIZE instead.
+    
+    gcc/testsuite/PR target/108910* gcc.dg/torture/pr108910.c: New test.
+    
+    (cherry picked from commit 66946624b96b762985de56444d726a0ebd4e0df5)
+
+- User: Richard Sandiford | Time: 2023-04-17 13:43:07 UTC
+  Text: Backported to GCC 12 without the assert.
+

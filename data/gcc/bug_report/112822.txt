@@ -1,0 +1,210 @@
+Bug Summary: [14 regression] ICE: invalid RHS for gimple memory store after r14-5831-gaae723d360ca26
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: N/A | Time: 2023-12-02 02:24:03 UTC
+  Text: g:aae723d360ca26cd9fd0b039fb0a616bd0eae363,r14-5831-gaae723d360ca26commit aae723d360ca26cd9fd0b039fb0a616bd0eae363 (HEAD)
+Author: Martin Jambor <mjambor@suse.cz>
+Date:   Fri Nov 24 17:32:35 2023 +0100
+
+    sra: SRA of non-escaped aggregates passed by reference to calls
+
+
+This is a huge C++ program that I have not cut down yet.  I will look at that on Monday if need be.
+
+
+seurer@ltcden2-lp1:~/tst$ ~/gcc/git/install/gcc-test/bin/g++ -w -O3 -c small.i
+           
+small.i: In function 'std::enable_if_t<(!((((((((Rows == 1) && (Depth != 1)) && (OA == Eigen::ColMajor)) || (((Depth == 1) && (Rows != 1)) && (OA == Eigen::RowMajor))) || (((Cols == 1) && (Depth != 1)) && (OB == Eigen::RowMajor))) || (((Depth == 1) && (Cols != 1)) && (OB == Eigen::ColMajor))) || (((Rows == 1) && (Cols != 1)) && (OC == Eigen::ColMajor))) || (((Cols == 1) && (Rows != 1)) && (OC == Eigen::RowMajor)))), void> test_lazy_single(int, int, int) [with T = std::complex<double>; int Rows = 1; int Cols = 4; int Depth = 6; int OC = 1; int OA = 1; int OB = 1]':
+small.i:133795:1: error: invalid RHS for gimple memory store: 'view_convert_expr'
+133795 | test_lazy_single(int rows, int cols, int depth)
+       | ^~~~~~~~~~~~~~~~
+D$_M_value
+
+VIEW_CONVERT_EXPR<_ComplexT>(C_1302);
+
+# .MEM_1318 = VDEF <.MEM_1313>
+D$_M_value = VIEW_CONVERT_EXPR<_ComplexT>(C_1302);
+small.i:133795:1: error: invalid RHS for gimple memory store: 'view_convert_expr'
+D$16$_M_value
+
+VIEW_CONVERT_EXPR<_ComplexT>(C$16_1303);
+
+# .MEM_1319 = VDEF <.MEM_1318>
+D$16$_M_value = VIEW_CONVERT_EXPR<_ComplexT>(C$16_1303);
+small.i:133795:1: error: invalid RHS for gimple memory store: 'view_convert_expr'
+D$32$_M_value
+
+VIEW_CONVERT_EXPR<_ComplexT>(C$32_1304);
+
+# .MEM_1320 = VDEF <.MEM_1319>
+D$32$_M_value = VIEW_CONVERT_EXPR<_ComplexT>(C$32_1304);
+small.i:133795:1: error: invalid RHS for gimple memory store: 'view_convert_expr'
+D$48$_M_value
+
+VIEW_CONVERT_EXPR<_ComplexT>(C$48_1309);
+
+# .MEM_1323 = VDEF <.MEM_1320>
+D$48$_M_value = VIEW_CONVERT_EXPR<_ComplexT>(C$48_1309);
+during GIMPLE pass: sra
+small.i:133795:1: internal compiler error: verify_gimple failed
+0x11136103 verify_gimple_in_cfg(function*, bool, bool)
+	/home/seurer/gcc/git/gcc-test/gcc/tree-cfg.cc:5662
+0x10f27edf execute_function_todo
+	/home/seurer/gcc/git/gcc-test/gcc/passes.cc:2088
+0x10f28eab do_per_function
+	/home/seurer/gcc/git/gcc-test/gcc/passes.cc:1687
+0x10f290cb execute_todo
+	/home/seurer/gcc/git/gcc-test/gcc/passes.cc:2142
+
+- User: Andrew Pinski | Time: 2023-12-02 02:43:28 UTC
+  Text: >This is a huge C++ program that I have not cut down yet.I think it didn't attach because it was too big, maybe compress and attach that.
+
+- User: Peter Bergner | Time: 2023-12-02 18:30:36 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> >This is a huge C++ program that I have not cut down yet.
+> 
+> I think it didn't attach because it was too big, maybe compress and attach
+> that.I have a creduce running to minimize it.  Looks like it'll take a while to run.  I'll attach it when it's done.
+
+I also note Bill's build was configured with --with-cpu=power10, so -O3 -mcpu=power10 are the options required to hit the ICE.
+
+Confirmed.
+
+- User: Peter Bergner | Time: 2023-12-04 03:22:17 UTC
+  Text: Createdattachment 56784[details]creduce minimized test case
+
+Attached creduce minimized test case.  Use -O3 -mcpu=power10 to recreate.
+
+- User: Martin Jambor | Time: 2023-12-11 15:30:02 UTC
+  Text: Mine.
+
+- User: Martin Jambor | Time: 2023-12-11 16:27:38 UTC
+  Text: The following should fix it.  I'll try a bit more to come up with a testcase that would not require __builtin_vec_vsx_st but so far my simple attempts failed. 
+
+
+diff --git a/gcc/tree-sra.cc b/gcc/tree-sra.cc
+index 3bd0c7a9af0..99a1b0a6d17 100644
+--- a/gcc/tree-sra.cc
++++ b/gcc/tree-sra.cc
+@@ -4219,11 +4219,15 @@ load_assign_lhs_subreplacements (struct access *lacc,
+          if (racc && racc->grp_to_be_replaced)
+            { 
+              rhs = get_access_replacement (racc);
++             bool vce = false;
+              if (!useless_type_conversion_p (lacc->type, racc->type))
+-               rhs = fold_build1_loc (sad->loc, VIEW_CONVERT_EXPR,
+-                                      lacc->type, rhs);
++               {
++                 rhs = fold_build1_loc (sad->loc, VIEW_CONVERT_EXPR,
++                                        lacc->type, rhs);
++                 vce = true;
++               }
+
+-             if (racc->grp_partial_lhs && lacc->grp_partial_lhs)
++             if (lacc->grp_partial_lhs && (vce || racc->grp_partial_lhs))
+                rhs = force_gimple_operand_gsi (&sad->old_gsi, rhs, true,
+                                                NULL_TREE, true, GSI_SAME_STMT);
+            }
+
+- User: Peter Bergner | Time: 2023-12-11 17:53:26 UTC
+  Text: (In reply to Martin Jambor fromcomment #5)> The following should fix it.  I'll try a bit more to come up with a testcase
+> that would not require __builtin_vec_vsx_st but so far my simple attempts
+> failed.This patch to the small test case I attached still ICEs for me using the same compiler options:
+
+@@ -84,7 +84,7 @@
+ template <typename cj, int> cj cp;
+ template <typename bu, typename cj, int> void cl(bu *cr, cj cs) { ct(cr, cs); }
+ typedef __attribute__((altivec(vector__))) double co;
+-void ct(double *cr, co cs) { __builtin_vec_vsx_st(cs, 0, cr); }
++void ct(double *cr, co cs) { *(co *)cr = cs; }
+ struct cq {
+   co q;
+ };
+
+I'll give your patch a try.
+
+- User: Peter Bergner | Time: 2023-12-11 18:08:42 UTC
+  Text: (In reply to Martin Jambor fromcomment #5)> diff --git a/gcc/tree-sra.cc b/gcc/tree-sra.cc
+> index 3bd0c7a9af0..99a1b0a6d17 100644
+> --- a/gcc/tree-sra.cc
+> +++ b/gcc/tree-sra.cc
+> @@ -4219,11 +4219,15 @@ load_assign_lhs_subreplacements (struct access *lacc,
+>           if (racc && racc->grp_to_be_replaced)
+>             { 
+>               rhs = get_access_replacement (racc);
+> +             bool vce = false;
+>               if (!useless_type_conversion_p (lacc->type, racc->type))
+> -               rhs = fold_build1_loc (sad->loc, VIEW_CONVERT_EXPR,
+> -                                      lacc->type, rhs);
+> +               {
+> +                 rhs = fold_build1_loc (sad->loc, VIEW_CONVERT_EXPR,
+> +                                        lacc->type, rhs);
+> +                 vce = true;
+> +               }
+> 
+> -             if (racc->grp_partial_lhs && lacc->grp_partial_lhs)
+> +             if (lacc->grp_partial_lhs && (vce || racc->grp_partial_lhs))
+>                 rhs = force_gimple_operand_gsi (&sad->old_gsi, rhs, true,
+>                                                 NULL_TREE, true,
+> GSI_SAME_STMT);
+>             }This fixes the ICE on the large original test case and the smaller test cases.  I'll bootstrap and regtest it and report back on the results.
+
+- User: Peter Bergner | Time: 2023-12-11 19:57:05 UTC
+  Text: (In reply to Peter Bergner fromcomment #7)> This fixes the ICE on the large original test case and the smaller test
+> cases.  I'll bootstrap and regtest it and report back on the results.I did a normal bootstrap and regtest on powerpc64le-linux and a --with-cpu=power10 powerpc64le-linux bootstrap and regtest and both were clean with no regressions.
+
+- User: Martin Jambor | Time: 2023-12-12 16:56:04 UTC
+  Text: Thank you, I have proposed the patch on the mailing list:https://gcc.gnu.org/pipermail/gcc-patches/2023-December/640356.htmlIf it is approved, I'd also like you to add the testcase to the testsuite as a target specific test.
+
+- User: GCC Commits | Time: 2023-12-12 20:21:33 UTC
+  Text: The master branch has been updated by Martin Jambor <jamborm@gcc.gnu.org>:https://gcc.gnu.org/g:cd7d0b4cf789264cd75ab7df5df232dc58061ed7commitr14-6466-gcd7d0b4cf789264cd75ab7df5df232dc58061ed7Author: Martin Jambor <mjambor@suse.cz>
+Date:   Tue Dec 12 21:19:21 2023 +0100
+
+    SRA: Force gimple operand in an additional corner case (PR 112822)PR 112822revealed a corner case in load_assign_lhs_subreplacements
+    where it creates invalid gimple: an assignment where on the LHS there
+    is a complex variable which however is not a gimple register because
+    it has partial defs and on the right hand side there is a
+    VIEW_CONVERT_EXPR.  This patch invokes force_gimple_operand_gsi on
+    such statements (like it already does when both sides of a generated
+    assignment have partial definitions.
+    
+    gcc/ChangeLog:
+    
+    2023-12-12  Martin Jambor  <mjambor@suse.cz>PR tree-optimization/112822* tree-sra.cc (load_assign_lhs_subreplacements): Invoke
+            force_gimple_operand_gsi also when LHS has partial stores and RHS is a
+            VIEW_CONVERT_EXPR.
+
+- User: GCC Commits | Time: 2023-12-12 22:46:57 UTC
+  Text: The master branch has been updated by Peter Bergner <bergner@gcc.gnu.org>:https://gcc.gnu.org/g:788e0d48ec639d44294434f4f20ae94023c3759dcommitr14-6470-g788e0d48ec639d44294434f4f20ae94023c3759dAuthor: Peter Bergner <bergner@linux.ibm.com>
+Date:   Tue Dec 12 16:46:16 2023 -0600
+
+    testsuite: Add testcase for already fixed PR [PR112822]
+    
+    Adding a testcase forPR112822to ensure we won't regress.
+    
+    2023-12-12  Peter Bergner  <bergner@linux.ibm.com>
+    
+    gcc/testsuite/PR tree-optimization/112822* g++.dg/pr112822.C: New test.
+
+- User: Peter Bergner | Time: 2023-12-12 22:48:17 UTC
+  Text: This should be fixed now.
+
+- User: GCC Commits | Time: 2023-12-13 14:14:18 UTC
+  Text: The master branch has been updated by Peter Bergner <bergner@gcc.gnu.org>:https://gcc.gnu.org/g:373a85a82650d9938adb02a14686049cbcbe6892commitr14-6498-g373a85a82650d9938adb02a14686049cbcbe6892Author: Peter Bergner <bergner@linux.ibm.com>
+Date:   Wed Dec 13 08:13:34 2023 -0600
+
+    testsuite: Add dg-do compile target c++17 directive for testcase [PR112822]
+    
+    Add dg-do compile target directive that limits the test case to being built
+    on c++17 compiles or greater.
+    
+    2023-12-13  Peter Bergner  <bergner@linux.ibm.com>
+    
+    gcc/testsuite/PR tree-optimization/112822* g++.dg/pr112822.C: Add dg-do compile target c++17 directive.
+

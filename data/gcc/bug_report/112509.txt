@@ -1,0 +1,131 @@
+Bug Summary: [14 Regression] internal compiler error: in verify_range, at value-range.cc:1132
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-checking, ice-on-valid-code, needs-bisection
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: wierton | Time: 2023-11-13 11:59:13 UTC
+  Text: Compiler Explorer:https://gcc.godbolt.org/z/151vEnafjWhen compiling this program with `gcc-14 -O2 -fno-tree-vrp -fno-tree-fre -fno-tree-forwprop`, gcc crashes:
+
+```
+struct S {
+  unsigned j : 3;
+};
+int k, l, m_1 = {0};
+void f(int l, struct S x) {
+  unsigned int k_1;
+  while (m_1 % 8) switch (x.j) {
+    case 1:
+    case 3:
+    case 4:
+    case 6:
+    case 2:
+    case 5: l = m_1;
+    case 7:
+    case 0: k_1 = 0;
+    default: break;
+    }
+}
+void foo(struct S x) { f(l, x); }
+```
+
+The crash output:
+```
+during GIMPLE pass: dom
+<source>: In function 'f':
+<source>:5:6: internal compiler error: in verify_range, at value-range.cc:1132
+    5 | void f(int l, struct S x) {
+      |      ^
+0x238b06e internal_error(char const*, ...)
+	???:0
+0xa1125c fancy_abort(char const*, int, char const*)
+	???:0
+0x148ea37 irange::set(tree_node*, generic_wide_int<wide_int_storage> const&, generic_wide_int<wide_int_storage> const&, value_range_kind)
+	???:0
+0x144ca1f find_case_label_range(gswitch*, irange const*)
+	???:0
+0x139e1ef hybrid_jt_simplifier::simplify(gimple*, gimple*, basic_block_def*, jt_state*)
+	???:0
+0x139d525 jump_threader::simplify_control_stmt_condition(edge_def*, gimple*)
+	???:0
+0x139db5a jump_threader::thread_through_normal_block(vec<jump_thread_edge*, va_heap, vl_ptr>*, edge_def*, bitmap_head*)
+	???:0
+0x139fa66 jump_threader::thread_across_edge(edge_def*)
+	???:0
+0x139fc5a jump_threader::thread_outgoing_edges(basic_block_def*)
+	???:0
+0x126f828 dom_opt_dom_walker::after_dom_children(basic_block_def*)
+	???:0
+0x1ed3f2f dom_walker::walk(basic_block_def*)
+	???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+Compiler returned: 1
+```
+
+- User: Richard Biener | Time: 2023-11-13 12:26:47 UTC
+  Text: Confirmed.  Somehow lb and ub are "swapped".
+
+- User: Andrew Macleod | Time: 2023-11-13 14:46:56 UTC
+  Text: the original switch is an unsigned value with precision of 3 bits, so 0..7 just fits.
+
+It gets translated to an int index during gimplification, but the case labels are still precision 3 values. 
+
+find_case_label_ranges in tree-vrp.cc does the following:
+
+     tree label = gimple_switch_label (switch_stmt, i);
+      tree case_high
+        = CASE_HIGH (label) ? CASE_HIGH (label) : CASE_LOW (label);
+      wide_int wlow = wi::to_wide (CASE_LOW (label));
+      wide_int whigh = wi::to_wide (case_high);
+      int_range_max label_range (type,
+                                 wide_int::from (wlow, prec, sign),
+                                 wide_int::from (whigh, prec, sign));
+
+ CASE_HIGH is indeed 6, but when we to the to_wide call, it is sign extended to produce:
+(gdb) p whigh.dump ()
+[0xfffffffffffffffe], precision = 3
+
+but then when we do wide_int::from() in the signed int precision 32 of the new switch type, we get -2 for the high value.
+
+Whats suppose to happen here?  seems odd to me that the case labels are a different precision than the switch itself..  but then we would also lose the fact that there is only 3 bits of precision in the switch.
+
+Should the low and high values be cast from the original case precision/type to the new perhaps?
+
+something like this seems to work:
+ tree
+ find_case_label_range (gswitch *switch_stmt, const irange *range_of_op)
+@@ -900,9 +901,9 @@ find_case_label_range (gswitch *switch_stmt, const irange *range_of_op)
+        = CASE_HIGH (label) ? CASE_HIGH (label) : CASE_LOW (label);
+       wide_int wlow = wi::to_wide (CASE_LOW (label));
+       wide_int whigh = wi::to_wide (case_high);
+-      int_range_max label_range (type,
+-                                wide_int::from (wlow, prec, sign),
+-                                wide_int::from (whigh, prec, sign));
++      int_range_max label_range (TREE_TYPE (case_high), wlow, whigh);
++      range_cast (label_range, type);
++      label_range.dump(stderr);
+
+- User: Andrew Pinski | Time: 2023-11-14 06:03:21 UTC
+  Text: This looks to be a GCC 14 regression.
+
+- User: GCC Commits | Time: 2023-11-14 15:33:42 UTC
+  Text: The master branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:8f331be42991aa4d58ac770faf993accfcce882bcommitr14-5449-g8f331be42991aa4d58ac770faf993accfcce882bAuthor: Andrew MacLeod <amacleod@redhat.com>
+Date:   Mon Nov 13 09:58:10 2023 -0500
+
+    Use case label type to create case range.
+    
+    Create a range from the label type, and cast it to the required type.PR tree-optimization/112509gcc/
+            * tree-vrp.cc (find_case_label_range): Create range from case labels.
+    
+            gcc/testsuite/
+            * gcc.dg/pr112509.c: New.
+
+- User: Andrew Macleod | Time: 2023-11-14 15:34:37 UTC
+  Text: fixed.
+

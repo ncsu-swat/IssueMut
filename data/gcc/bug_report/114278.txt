@@ -1,0 +1,102 @@
+Bug Summary: ICE: in extract_bit_field_1, at expmed.cc:1838 with memmove, _BitInt() and -O2 -fno-tree-dce -fno-tree-dse -fno-tree-ccp -m32
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-03-08 06:44:46 UTC
+  Text: Createdattachment 57653[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O2 -fno-tree-dce -fno-tree-dse -fno-tree-ccp -m32 testcase.c -Wall -W
+during RTL pass: expand
+testcase.c: In function 'foo':
+testcase.c:4:37: internal compiler error: in extract_bit_field_1, at expmed.cc:1838
+    4 |   _BitInt(128) b = *(_BitInt(128) *)__builtin_memmove(&b, p, 16);
+      |                                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+0x758082 extract_bit_field_1
+        /repo/gcc-trunk/gcc/expmed.cc:1838
+0x10a868c extract_bit_field(rtx_def*, poly_int<1u, unsigned long>, poly_int<1u, unsigned long>, int, rtx_def*, machine_mode, machine_mode, bool, rtx_def**)
+        /repo/gcc-trunk/gcc/expmed.cc:2151
+0x10c7654 expand_expr_real_1(tree_node*, rtx_def*, machine_mode, expand_modifier, rtx_def**, bool)
+        /repo/gcc-trunk/gcc/expr.cc:12456
+0x10d323d store_expr(tree_node*, rtx_def*, int, bool, bool)
+        /repo/gcc-trunk/gcc/expr.cc:6740
+0x10d5e6f expand_assignment(tree_node*, tree_node*, bool)
+        /repo/gcc-trunk/gcc/expr.cc:6461
+0x10d5e6f expand_assignment(tree_node*, tree_node*, bool)
+        /repo/gcc-trunk/gcc/expr.cc:5946
+0xf8cfe9 expand_gimple_stmt_1
+        /repo/gcc-trunk/gcc/cfgexpand.cc:3998
+0xf8cfe9 expand_gimple_stmt
+        /repo/gcc-trunk/gcc/cfgexpand.cc:4077
+0xf8e677 expand_gimple_basic_block
+        /repo/gcc-trunk/gcc/cfgexpand.cc:6133
+0xf90cfe execute
+        /repo/gcc-trunk/gcc/cfgexpand.cc:6872
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-9346-20240306205443-g74e8cc28eda-checking-yes-rtl-df-extra-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-9346-20240306205443-g74e8cc28eda-checking-yes-rtl-df-extra-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240306 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2024-03-08 12:47:09 UTC
+  Text: This is execute_update_addresses_taken trying to drop address taken from a large/huge _BitInt variable and rewriting it back to SSA.  That is undesirable when
+(cfun->curr_properties & PROP_gimple_lbitint) != 0, because we then no longer lower it again.
+
+- User: Jakub Jelinek | Time: 2024-03-08 13:36:58 UTC
+  Text: Createdattachment 57654[details]gcc14-pr114278.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-03-11 10:02:03 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:dbe5ccda4dbbd064c703cd3ab2a58ea40f08dd1acommitr14-9424-gdbe5ccda4dbbd064c703cd3ab2a58ea40f08dd1aAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Mar 11 11:00:54 2024 +0100
+
+    bitint: Avoid rewriting large/huge _BitInt vars into SSA after bitint lowering [PR114278]
+    
+    The following testcase ICEs, because update-address-taken subpass of
+    fre5 rewrites
+      _BitInt(128) b;
+      vector(16) unsigned char _3;
+    
+      <bb 2> [local count: 1073741824]:
+      _3 = MEM <vector(16) unsigned char> [(char * {ref-all})p_2(D)];
+      MEM <vector(16) unsigned char> [(char * {ref-all})&b] = _3;
+      b ={v} {CLOBBER(eos)};
+    to
+      _BitInt(128) b;
+      vector(16) unsigned char _3;
+    
+      <bb 2> [local count: 1073741824]:
+      _3 = MEM <vector(16) unsigned char> [(char * {ref-all})p_2(D)];
+      b_5 = VIEW_CONVERT_EXPR<_BitInt(128)>(_3);
+    but we can't have large/huge _BitInt vars in SSA form after the bitint
+    lowering except for function arguments loaded from memory, as expansion
+    isn't able to deal with those, it relies on bitint lowering to lower
+    those operations.
+    The following patch fixes that by setting DECL_NOT_GIMPLE_REG_P for
+    large/huge _BitInt vars after bitint lowering, such that we don't
+    rewrite them into SSA form.
+    
+    2024-03-11  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114278* tree-ssa.cc (maybe_optimize_var): If large/huge _BitInt vars are no
+            longer addressable, set DECL_NOT_GIMPLE_REG_P on them.
+    
+            * gcc.dg/bitint-99.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-03-11 10:02:39 UTC
+  Text: Fixed.
+

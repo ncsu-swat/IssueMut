@@ -1,0 +1,194 @@
+Bug Summary: htobe64-like function is not optimized on 32-bit x86
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 11.4.0
+
+Comments:
+- User: Pali Rohár | Time: 2024-03-12 17:45:36 UTC
+  Text: Here is very simple and straightforward implementation of htobe64 function which takes 64-bit number stored in unsigned long long variable and encodes it into byte buffer unsigned char[].
+
+void test1(unsigned long long val, unsigned char *buf) {
+  buf[0] = val >> 56;
+  buf[1] = val >> 48;
+  buf[2] = val >> 40;
+  buf[3] = val >> 32;
+  buf[4] = val >> 24;
+  buf[5] = val >> 16;
+  buf[6] = val >> 8;
+  buf[7] = val;
+}
+
+Compiling it for 64-bit x86 via "gcc -m64 -O2" produces optimized code:
+
+0000000000000000 <test1>:
+   0:   48 0f cf                bswap  %rdi
+   3:   48 89 3e                mov    %rdi,(%rsi)
+   6:   c3                      retq
+
+But compiling it for 32-bit x86 via "gcc -m32 -O2" produces not so optimized code:
+
+00000000 <test1>:
+   0:   8b 54 24 08             mov    0x8(%esp),%edx
+   4:   8b 44 24 0c             mov    0xc(%esp),%eax
+   8:   89 d1                   mov    %edx,%ecx
+   a:   88 70 02                mov    %dh,0x2(%eax)
+   d:   c1 e9 18                shr    $0x18,%ecx
+  10:   88 50 03                mov    %dl,0x3(%eax)
+  13:   88 08                   mov    %cl,(%eax)
+  15:   89 d1                   mov    %edx,%ecx
+  17:   8b 54 24 04             mov    0x4(%esp),%edx
+  1b:   c1 e9 10                shr    $0x10,%ecx
+  1e:   0f ca                   bswap  %edx
+  20:   88 48 01                mov    %cl,0x1(%eax)
+  23:   89 50 04                mov    %edx,0x4(%eax)
+  26:   c3                      ret
+
+
+I tried to compile it for 32-bit powerpc via "powerpc-linux-gnu-gcc -m32 -O2" and it produces optimized code:
+
+00000000 <test1>:
+   0:   90 65 00 00     stw     r3,0(r5)
+   4:   90 85 00 04     stw     r4,4(r5)
+   8:   4e 80 00 20     blr
+
+Same for 64-bit powerpc via "powerpc-linux-gnu-gcc -m64 -O2":
+
+0000000000000000 <.test1>:
+   0:   f8 64 00 00     std     r3,0(r4)
+   4:   4e 80 00 20     blr
+
+
+As a next experiment I tried to rewrite the simple implementation to use gcc builtins.
+
+void test2(unsigned long long val, unsigned char *buf) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  val = __builtin_bswap64(val);
+#endif
+  __builtin_memcpy(buf, &val, sizeof(val));
+}
+
+If I compile it for 32-bit x86 then I get optimized code:
+
+00000030 <test2>:
+  30:   8b 4c 24 0c             mov    0xc(%esp),%ecx
+  34:   8b 44 24 04             mov    0x4(%esp),%eax
+  38:   8b 54 24 08             mov    0x8(%esp),%edx
+  3c:   0f c8                   bswap  %eax
+  3e:   89 41 04                mov    %eax,0x4(%ecx)
+  41:   0f ca                   bswap  %edx
+  43:   89 11                   mov    %edx,(%ecx)
+  45:   c3                      ret
+
+If I compile it for 64-bit x86 then I get exactly same code as for test1:
+
+0000000000000010 <test2>:
+  10:   48 0f cf                bswap  %rdi
+  13:   48 89 3e                mov    %rdi,(%rsi)
+  16:   c3                      retq
+
+I tried to compile it for powerpc too and the result of test1 and test2 was same.
+
+
+
+So it looks like that the issue here is specific for 32-bit x86 and gcc does not detect that test1 function on x86 is doing bswap64.
+
+All tests I have done on (amd64) Debian gcc and for powerpc target I used Debian's powerpc-linux-gnu-gcc cross compiler.
+
+- User: Andrew Pinski | Time: 2024-03-12 17:56:38 UTC
+  Text: >But compiling it for 32-bit x86 via "gcc -m32 -O2" produces not so optimized code:I get that code generation for GCC 11.4.0 and before.
+
+For GCC 12.1.0 and above I get:
+```
+        movl    8(%esp), %ecx
+        bswap   %ecx
+        movl    %ecx, %eax
+        movl    4(%esp), %ecx
+        bswap   %ecx
+        movl    %ecx, %edx
+        movl    12(%esp), %ecx
+        movl    %eax, (%ecx)
+        movl    %edx, 4(%ecx)
+        ret
+```
+
+Which just has a few extra moves.
+
+But adding  -mno-sse, GCC 12 produces worse code.
+
+- User: Andrew Pinski | Time: 2024-03-12 18:04:06 UTC
+  Text: Confirmed. I see the trunk even without -mno-sse does not produce the 2 bswaps.
+
+Looks like the store-merging pass is not recognizing bswap<<32 for some reason.
+
+Also I thought there was a dup somewhere ...
+
+- User: Pali Rohár | Time: 2024-03-12 18:07:04 UTC
+  Text: For details, here is the compiler which produces the mentioned code:
+
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=gcc
+COLLECT_LTO_WRAPPER=/usr/lib/gcc/x86_64-linux-gnu/12/lto-wrapper
+OFFLOAD_TARGET_NAMES=nvptx-none:amdgcn-amdhsa
+OFFLOAD_TARGET_DEFAULT=1
+Target: x86_64-linux-gnu
+Configured with: ../src/configure -v --with-pkgversion='Debian 12.2.0-14' --with-bugurl=file:///usr/share/doc/gcc-12/README.Bugs --enable-languages=c,ada,c++,go,d,fortran,objc,obj-c++,m2 --prefix=/usr --with-gcc-major-version-only --program-suffix=-12 --program-prefix=x86_64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/lib --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-gnu-unique-object --disable-vtable-verify --enable-plugin --enable-default-pie --with-system-zlib --enable-libphobos-checking=release --with-target-system-zlib=auto --enable-objc-gc=auto --enable-multiarch --disable-werror --enable-cet --with-arch-32=i686 --with-abi=m64 --with-multilib-list=m32,m64,mx32 --enable-multilib --with-tune=generic --enable-offload-targets=nvptx-none=/build/gcc-12-bTRWOB/gcc-12-12.2.0/debian/tmp-nvptx/usr,amdgcn-amdhsa=/build/gcc-12-bTRWOB/gcc-12-12.2.0/debian/tmp-gcn/usr --enable-offload-defaulted --without-cuda-driver --enable-checking=release --build=x86_64-linux-gnu --host=x86_64-linux-gnu --target=x86_64-linux-gnu
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 12.2.0 (Debian 12.2.0-14)
+
+I guess that with these configure options you should be able to compile gcc which produces the mentioned code.
+
+- User: Andrew Pinski | Time: 2024-03-12 18:10:57 UTC
+  Text: (In reply to Pali Rohár fromcomment #3)> --with-arch-32=i686This basically causes SSE to be disabled for 32bit by default ...
+With the default options to configure GCC, -m32 for x86_64 still enables sse ...
+
+- User: Richard Biener | Time: 2024-03-13 09:47:17 UTC
+  Text: Coalescing successful!
+Merged into 1 stores
+32 bit bswap implementation found at: _37
+
+looks like we are only merging one store.  Note we cannot recognize
+bswap to memory this is a known issue.  So for the bswap64 we need to
+merge to a 64bit store which we never do on a 32bit platform.  We
+could with SSE, but appearantly we don't try with the bswap trick
+at least.  The bswap trick also doesn't seem to consider the split
+64bit bswap.  Oddly enough we also fail to merge the other store
+(maybe missing a val >> 32 pre-shift "trick").
+
+Possibly could be shown to be a similar issue with a 126bit bswap
+on x86_64 which we could emulate with two 64bit bswaps.
+
+- User: GCC Commits | Time: 2024-03-13 14:35:54 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:74bca21db31e3f4ab6543b56c3f26b4dfe586fefcommitr14-9453-g74bca21db31e3f4ab6543b56c3f26b4dfe586fefAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Mar 13 15:34:59 2024 +0100
+
+    store-merging: Match bswap64 on 32-bit targets with bswapsi2 [PR114319]
+    
+    gimple-ssa-store-merging.cc tests bswap_optab in 3 different places,
+    in 2 of them it has special exception for double-word bswap using pair
+    of word-mode bswap optabs, but in the last one it doesn't.
+    
+    The following patch changes even the last spot.
+    We don't handle 128-bit bswaps in the passes at all, because currently we
+    just use uint64_t to represent the byte reshuffling (we'd need to use
+    offset_int or something like that instead) and we don't have
+    __builtin_bswap128 nor type-generic __builtin_bswap, so there is nothing
+    for 64-bit targets there.
+    
+    2024-03-13  Jakub Jelinek  <jakub@redhat.com>PR middle-end/114319* gimple-ssa-store-merging.cc
+            (imm_store_chain_info::try_coalesce_bswap): For 32-bit targets
+            allow matching __builtin_bswap64 if there is bswapsi2 optab.
+    
+            * gcc.target/i386/pr114319.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-03-13 14:38:01 UTC
+  Text: Fixed for GCC 14.
+
+- User: Pali Rohár | Time: 2024-03-13 21:31:26 UTC
+  Text: Thanks for quick response and fixup of this issue.
+

@@ -1,0 +1,117 @@
+Bug Summary: ICE: in omp_extract_for_data, at omp-general.cc:411 with -fopenmp-simd and _BitInt()
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code, openmp
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-01-15 20:37:10 UTC
+  Text: Createdattachment 57095[details]reduced testcase
+
+This is reduced from gcc.dg/ipa/pr90555.c, when testsuite is run with -Dint=_BitInt($RANDOM)
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -fopenmp-simd testcase.c 
+during GIMPLE pass: omplower
+testcase.c: In function 'test_simduid2':
+testcase.c:9:9: internal compiler error: in omp_extract_for_data, at omp-general.cc:411
+    9 | #pragma omp simd reduction(+: c2)
+      |         ^~~
+0x7cb15b omp_extract_for_data(gomp_for*, omp_for_data*, omp_for_data_loop*)
+        /repo/gcc-trunk/gcc/omp-general.cc:411
+0x137d0c9 lower_omp_for
+        /repo/gcc-trunk/gcc/omp-low.cc:11782
+0x1368804 lower_omp_1
+        /repo/gcc-trunk/gcc/omp-low.cc:14388
+0x1368804 lower_omp
+        /repo/gcc-trunk/gcc/omp-low.cc:14590
+0x13681db lower_omp_1
+        /repo/gcc-trunk/gcc/omp-low.cc:14372
+0x13681db lower_omp
+        /repo/gcc-trunk/gcc/omp-low.cc:14590
+0x136c420 execute_lower_omp
+        /repo/gcc-trunk/gcc/omp-low.cc:14629
+0x136c420 execute
+        /repo/gcc-trunk/gcc/omp-low.cc:14683
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-7255-20240115165927-g6c703b4eb68-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-7255-20240115165927-g6c703b4eb68-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240115 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2024-01-16 12:10:26 UTC
+  Text: On e.g.
+void bar (_BitInt(931));
+
+void
+foo (_BitInt(931) x)
+{
+  #pragma omp parallel for
+  for (_BitInt(931) i = 0; i < x; ++i)
+    bar (i);
+}
+
+clang emits
+warning: OpenMP loop iteration variable cannot have more than 64 bits size and will be narrowed [-Wopenmp-loop-form]
+warning.
+On
+void bar (__int128);
+
+void
+foo (__int128 x)
+{
+  #pragma omp parallel for // schedule(runtime)
+  for (__int128 i = 0; i < x; ++i)
+    bar (i);
+}
+we actually emit something that probably works and with schedule(runtime) silently assume it won't be more than 64-bit of iterations.
+So supposedly we should treat BITINT_TYPEs the same.
+
+- User: Jakub Jelinek | Time: 2024-01-16 13:13:43 UTC
+  Text: Createdattachment 57102[details]gcc14-pr113409.patch
+
+Untested fix.
+
+- User: Jakub Jelinek | Time: 2024-01-16 15:13:29 UTC
+  Text: Createdattachment 57103[details]gcc14-pr113409.patch
+
+Updated patch with collapse test and some further improvements.
+
+- User: GCC Commits | Time: 2024-01-17 09:51:13 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:c8f10456795c84bdbf45b1612321eb1f9b3c1415commitr14-8178-gc8f10456795c84bdbf45b1612321eb1f9b3c1415Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Jan 17 10:47:31 2024 +0100
+
+    openmp: Add OpenMP _BitInt support [PR113409]
+    
+    The following patch adds support for _BitInt iterators of OpenMP canonical
+    loops (with the preexisting limitation that when not using compile time
+    static scheduling the iterators in the library are at most unsigned long long
+    or signed long, so one can't in the runtime/dynamic/guided etc. cases iterate
+    more than what those types can represent, like is the case of e.g. __int128
+    iterators too) and the testcase also covers linear/reduction clauses for them.
+    
+    2024-01-17  Jakub Jelinek  <jakub@redhat.com>PR middle-end/113409* omp-general.cc (omp_adjust_for_condition): Handle BITINT_TYPE like
+            INTEGER_TYPE.
+            (omp_extract_for_data): Use build_bitint_type rather than
+            build_nonstandard_integer_type if either iter_type or loop->v type
+            is BITINT_TYPE.
+            * omp-expand.cc (expand_omp_for_generic,
+            expand_omp_taskloop_for_outer, expand_omp_taskloop_for_inner): Handle
+            BITINT_TYPE like INTEGER_TYPE.
+    
+            * testsuite/libgomp.c/bitint-1.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-01-17 10:37:57 UTC
+  Text: Fixed (though, as Tobias mentioned on IRC, perhaps we want extra testcase coverage).
+

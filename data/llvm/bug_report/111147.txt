@@ -1,0 +1,50 @@
+Issue Title: `alpha.core.BoolAssignment` causes failure of `assert(IsUnsigned == RHS.IsUnsigned && "Signedness mismatch!")` at APSInt.h:179
+Original Post: Apparently the analyzer mixes signed and unsigned `APSInt` values in a `<=` comparison which causes an assertion failure. I found this issue while analyzing a preprocessed version of `unicode.c` from the ruby project, but it was easy to extract a short reproducer: https://github.com/Ericsson/llvm-project/commit/b1e4ddbfad5baa1ba243a38653aa8c39715371b0
+
+This bug is probably introduced by the recent changes to `BoolAssignment` and/or the modeling of `__builtin_mul_overflow`, because if I understand correctly `steakhal` was able to analyze the same file with a clang version that was probably a bit older than the fresh main that I'm using now. 
+
+Comment by llvmbot: 
+@llvm/issue-subscribers-clang-static-analyzer
+
+Author: Donát Nagy (NagyDonat)
+
+<details>
+Apparently the analyzer mixes signed and unsigned `APSInt` values in a `&lt;=` comparison which causes an assertion failure. I found this issue while analyzing a preprocessed version of `unicode.c` from the ruby project, but it was easy to extract a short reproducer: https://github.com/Ericsson/llvm-project/commit/b1e4ddbfad5baa1ba243a38653aa8c39715371b0
+
+This bug is probably introduced by the recent changes to `BoolAssignment` and/or the modeling of `__builtin_mul_overflow`, because if I understand correctly @<!-- -->steakhal was able to analyze the same file with a clang version that was probably a bit older than the fresh main that I'm using now. 
+</details>
+
+Comment by steakhal: FYI I could not get the assertion failure even on main.
+Comment by NagyDonat: The relevant parts of the stack dump look like
+```
+clang: llvm/include/llvm/ADT/APSInt.h:179: bool llvm::APSInt::operator>=(const llvm::APSInt&) const: Assertion `IsUnsigned == RHS.IsUnsigned && "Signedness mismatch!"' failed.
+Stack dump:
+0.      Program arguments: build/bin/clang -cc1 -internal-isystem build/lib/clang/20/include -nostdsysteminc -analyze -analyzer-constraints=range -setup-static-analyzer -analyzer-checker=core,alpha.core.BoolAssignment,optin.taint -verify -std=c99 -Dbool=_Bool /repo/llvm-project/clang/test/Analysis/bool-assignment.c
+1.      <eof> parser at end of file
+2.      While analyzing stack:
+        #0 Calling rbimpl_size_mul_overflow
+3.      /repo/llvm-project/clang/test/Analysis/bool-assignment.c:131:5: Error evaluating statement
+4.      /repo/llvm-project/clang/test/Analysis/bool-assignment.c:131:5: Error evaluating statement
+ #1-#7 <generic signal handling machinery>
+ #8 SimpleConstraintManager::assumeInclusiveRangeInternal(llvm::IntrusiveRefCntPtr<ProgramState const>, NonLoc, llvm::APSInt const&, llvm::APSInt const&, bool) 
+ #9 <lambda functon with long ugly type>
+#10 ConstraintManager::assumeInclusiveRangeDual(llvm::IntrusiveRefCntPtr<ProgramState const>, NonLoc, llvm::APSInt const&, llvm::APSInt const&) 
+#11 void check::Bind::_checkBind<(anonymous namespace)::BoolAssignmentChecker>(void*, SVal, SVal, clang::Stmt const*, CheckerContext&) BoolAssignmentChecker.cpp
+#12 CheckerManager::runCheckersForBind(ExplodedNodeSet&, ExplodedNodeSet const&, SVal, SVal, clang::Stmt const*, ExprEngine&, clang::ProgramPoint const&) 
+#13 ExprEngine::evalBind(ExplodedNodeSet&, clang::Stmt const*, ExplodedNode*, SVal, SVal, bool, clang::ProgramPoint const*) 
+#14 ExprEngine::evalStore(ExplodedNodeSet&, clang::Expr const*, clang::Expr const*, ExplodedNode*, llvm::IntrusiveRefCntPtr<ProgramState const>, SVal, SVal, clang::ProgramPointTag const*) 
+#15 ExprEngine::VisitBinaryOperator(clang::BinaryOperator const*, ExplodedNode*, ExplodedNodeSet&)         
+```
+_(I stripped lots of cruft, including hexadecimal garbage and `clang::ento::` prefixes before everything.)_
+Comment by NagyDonat: > FYI I could not get the assertion failure even on main.
+
+That's very strange. I rebased https://github.com/Ericsson/llvm-project/commit/b1e4ddbfad5baa1ba243a38653aa8c39715371b0 to current main (although it's already on a slightly earlier main version from today) and on my system building `check-clang-analysis` with this patch still produces the assertion failure.
+Comment by steakhal: > > FYI I could not get the assertion failure even on main.
+> 
+> That's very strange. I rebased [Ericsson@b1e4ddb](https://github.com/Ericsson/llvm-project/commit/b1e4ddbfad5baa1ba243a38653aa8c39715371b0) to current main (although it's already on a slightly earlier main version from today) and on my system building `check-clang-analysis` with this patch still produces the assertion failure.
+
+nvm, reproduces. I just forgot to rebase :D I only fetched main.
+Comment by pskrgag: Will take a look (likely on Monday). Thanks for the report!
+Comment by pskrgag: So I found a problem. `handleOverflowBuiltin` uses `makeTruthVal` with default type, which ends up being `int`, since it's what standard specifies for result of the condition.
+
+On the other hand, `_Bool` is an unsigned, so `alpha.core.BoolAssignment` gets confused. Fix posted

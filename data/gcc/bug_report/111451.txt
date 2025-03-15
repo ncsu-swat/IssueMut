@@ -1,0 +1,128 @@
+Bug Summary: RISC-V: Missed optimization of vrgather.vv into vrgatherei16.vv
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2023-09-18 03:24:42 UTC
+  Text: Consider this following case:
+
+#include <stdint.h>
+typedef int32_t vnx32si __attribute__ ((vector_size (128)));
+
+#define MASK_2(X, Y) (Y) - 1 - (X), (Y) - 2 - (X)
+#define MASK_4(X, Y) MASK_2 (X, Y), MASK_2 (X + 2, Y)
+#define MASK_8(X, Y) MASK_4 (X, Y), MASK_4 (X + 4, Y)
+#define MASK_16(X, Y) MASK_8 (X, Y), MASK_8 (X + 8, Y)
+#define MASK_32(X, Y) MASK_16 (X, Y), MASK_16 (X + 16, Y)
+#define MASK_64(X, Y) MASK_32 (X, Y), MASK_32 (X + 32, Y)
+#define MASK_128(X, Y) MASK_64 (X, Y), MASK_64 (X + 64, Y)
+
+#define PERMUTE(TYPE, NUNITS)                                                  \
+  __attribute__ ((noipa)) void permute_##TYPE (TYPE values1, TYPE values2,     \
+					       TYPE *out)                      \
+  {                                                                            \
+    TYPE v                                                                     \
+      = __builtin_shufflevector (values1, values2, MASK_##NUNITS (0, NUNITS)); \
+    *(TYPE *) out = v;                                                         \
+  }
+
+#define TEST_ALL(T)                                                            \
+  T (vnx32si, 32)                                                              \
+
+TEST_ALL (PERMUTE)
+
+ASM:
+
+permute_vnx32si:
+        li      a5,32
+        li      a4,31
+        vsetvli zero,a5,e32,m8,ta,ma
+        vid.v   v8
+        vle32.v v24,0(a0)
+        vrsub.vx        v8,v8,a4
+        vrgather.vv     v16,v24,v8
+        vse32.v v16,0(a2)
+        rethttps://godbolt.org/z/Mh77YY91rHere we use:
+
+vsetvli zero,a5,e32,m8,ta,ma
+...
+vrgather.vv     v16,v24,v8
+
+The index vector register "v8" occupies 8 registers.
+We should optimize it into vrgatherei16.vv which is using int16 as the index 
+elements.
+
+Then with vrgatherei16.vv, the v8 will occupy 4 registers instead of 8.
+Lower the register consuming and register pressure.
+
+- User: JuzheZhong | Time: 2023-09-21 08:23:34 UTC
+  Text: Fixed on the trunk.
+
+- User: JuzheZhong | Time: 2023-09-21 08:28:32 UTC
+  Text: Reopen it since I closed by mistake.
+
+- User: GCC Commits | Time: 2023-09-22 04:20:08 UTC
+  Text: The master branch has been updated by Li Xu <xuli@gcc.gnu.org>:https://gcc.gnu.org/g:0ed05db7cee8f92604b5d7761713b7a7161e0db0commitr14-4219-g0ed05db7cee8f92604b5d7761713b7a7161e0db0Author: xuli <xuli1@eswincomputing.com>
+Date:   Fri Sep 22 01:25:39 2023 +0000
+
+    RISC-V: Optimization of vrgather.vv into vrgatherei16.vv[PR111451]
+    
+    Consider this following case:
+    
+    typedef int32_t vnx32si __attribute__ ((vector_size (128)));
+    
+      __attribute__ ((noipa)) void permute_##TYPE (TYPE values1, TYPE values2,     \
+                                                   TYPE *out)                      \
+      {                                                                            \
+        TYPE v                                                                     \
+          = __builtin_shufflevector (values1, values2, MASK_##NUNITS (0, NUNITS)); \
+        *(TYPE *) out = v;                                                         \
+      }
+    
+      T (vnx32si, 32)                                                              \
+    
+    TEST_ALL (PERMUTE)
+    
+    Before this patch:
+      li    a4,31
+      vsetvli       a5,zero,e32,m8,ta,ma
+      vl8re32.v     v24,0(a0)
+      vid.v v8
+      vrsub.vx      v8,v8,a4
+      vrgather.vv   v16,v24,v8
+      vs8r.v        v16,0(a2)
+      ret
+    
+    The index vector register "v8" occupies 8 registers.
+    We should optimize it into vrgatherei16.vv which is
+    using int16 as the index elements.
+    
+    After this patch:
+      vsetvli       a5,zero,e16,m4,ta,ma
+      li    a4,31
+      vid.v v4
+      vl8re32.v     v16,0(a0)
+      vrsub.vx      v4,v4,a4
+      vsetvli       zero,zero,e32,m8,ta,ma
+      vrgatherei16.vv       v8,v16,v4
+      vs8r.v        v8,0(a2)
+      ret
+    With vrgatherei16.vv, the v8 will occupy 4 registers instead
+    of 8. Lower the register consuming and register pressure.PR target/111451gcc/ChangeLog:
+    
+            * config/riscv/riscv-v.cc (emit_vlmax_gather_insn): Optimization of vrgather.vv
+                                                            into vrgatherei16.vv.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/vls-vlmax/perm-4.c: Adjust case.
+            * gcc.target/riscv/rvv/autovec/vls/perm-4.c: Ditto.
+
+- User: JuzheZhong | Time: 2023-09-22 07:20:43 UTC
+  Text: Fixed
+

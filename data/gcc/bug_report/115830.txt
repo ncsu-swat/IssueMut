@@ -1,0 +1,209 @@
+Bug Summary: [avr] Make better use of SREG in conditional jumps
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Georg-Johann Lay | Time: 2024-07-08 20:23:52 UTC
+  Text: Createdattachment 58609[details]C99 test case
+
+The avr backed could produce better code by making use of the condition code (SREG) set by some instructions.  For example,
+
+$ avr-gcc-14 stride.c -S -Os -dp -fno-tree-loop-optimize
+
+volatile int v;
+
+void loop (void)
+{
+    for (int i = 36; i >= 0; i -= 2)
+        v = i;
+}
+
+becomes:
+
+loop:
+    ...
+.L2:
+    sts v+1,r25  ;  22  [c=4 l=4]  *movhi/3
+    sts v,r24
+    sbiw r24,2   ;  23  [c=4 l=1]  *addhi3_clobber/0
+    sbrs r25,7	 ;  32  [c=4 l=2]  *sbrx_branchhi
+    rjmp .L2	
+    ...
+
+where insn 32 compares the sign bit with SBRS (more precisely, it skips the next instruction when bit r25.7 (MSB of i) is set.  A more efficient code would be like follows, as insn 23's SBIW already sets SREG.N:
+
+loop:
+    ...
+.L2:
+    sts v+1,r25  ;  24  [c=4 l=4]  *movhi/3
+    sts v,r24
+    sbiw r24,2   ;  34  [c=4 l=1]  *add.for.ccn.hi/0
+    brpl .L2     ;  35  [c=4 l=1]  branch_N
+    ...
+
+- User: Georg-Johann Lay | Time: 2024-08-19 05:54:34 UTC
+  Text: Createdattachment 58953[details]proposed patch:https://gcc.gnu.org/pipermail/gcc-patches/2024-August/659422.htmlAVR: target/115830 - Make better use of SREG.N and SREG.Z.
+
+This patch adds new CC modes CCN and CCZN for operations that
+set SREG.N, resp. SREG.Z and SREG.N.  Add peephole2 patterns
+to generate new compute + branch insns that make use
+of the Z and N flags.  Most of these patterns need their own
+asm output routines that don't do all the micro-optimizations
+that the ordinary outputs may perform, as the latter have no
+requirement to set CC in a usable way.
+
+We don't use cmpelim because it cannot provide scratch regs
+(which peephole2 can), and some of the patterns require a
+scratch reg, whereas the same operations that don't set REG_CC
+don't require a scratch.  See the comments in avr.md for details.
+
+The existing add.for.cc* patterns are simplified as they no
+more cover QImode, which is handled in a separate QImode case.
+Apart from that, it adds 3 patterns for subtractions and one
+pattern for shift left, all for multi-byte cases (HI, PSI, SI).
+
+The add.for.cc* patterns now use CC[Z]Nmode, instead of the
+formerly abuse of CCmode.PR target/115830gcc/
+	* config/avr/avr-modes.def (CCN, CCZN): New CC_MODEs.
+	* config/avr/avr-protos.h (avr_cond_branch): New from
+	ret_cond_branch.
+	(avr_out_plus_set_N, avr_op8_ZN_operator)
+	(avr_out_op8_set_ZN, avr_len_op8_set_ZN): New protos.
+	(ccn_reg_rtx, cczn_reg_rtx): New declarations.
+	* config/avr/avr.cc (avr_cond_branch): New from ret_cond_branch.
+	(avr_cond_string): Add bool cc_overflow_unusable argument.
+	(avr_print_operand) ['L']: Like 'j' but overflow unusable.
+	['K']: Like 'k' but overflow unusable.
+	(avr_out_plus_set_ZN): Remove handling of QImode.
+	(avr_out_plus_set_N, avr_op8_ZN_operator)
+	(avr_out_op8_set_ZN, avr_len_op8_set_ZN): New functions.
+	(avr_adjust_insn_length) [ADJUST_LEN_ADD_SET_N]: Hande case.
+	(avr_class_max_nregs): All MODE_CCs occupy one hard reg.
+	(avr_hard_regno_nregs): Same.
+	(avr_hard_regno_mode_ok) [REG_CC]: Allow all MODE_CC.
+	(pass_manager.h): Include it.
+	(ccn_reg_rtx, cczn_reg_rtx): New GTY variables.
+	(avr_init_expanders): Initialize them.
+	(avr_option_override): Run peephole2 a second time.
+	* config/avr/avr.md (adjust_len) [add_set_N]: New attr value.
+	(ALLCC, HI_SI): New mode iterators.
+	(CCname): New mode attribute.
+	(eqnegtle, cmp_signed, op8_ZN): New code iterators.
+	(branch): Handle CCNmode and CCZNmode.  Assimilate...
+	(difficult_branch): ...this insn.
+	(p1m1): Remove.
+	(gen_add_for_<code>_<mode>): Adjust to CCNmode and CCZNmode. Use
+	HISI as mode iterator.  Extend peephole2s that produce them.
+	(*add.for.eqne.<mode>): Extend to *add.for.cc[z]n.<mode>.
+	(*ashift.for.ccn.<mode>): New insn and peephole2 to make them.
+	(*sub.for.cczn.<mode>, "*sub-extend<mode>.for.cczn.<mode>:
+	New insns and peephole2s to make them.
+	(*op8.for.cczn.<code>): New insn and peephole2 to make them.
+	* config/avr/predicates.md (const_1_to_3_operand)
+	(abs1_abs2_operand, signed_comparison_operator)
+	(op8_ZN_operator): New predicates.
+gcc/testsuite/
+	* gcc.target/avr/pr115830-add.c: New test.
+	* gcc.target/avr/pr115830-add-c.c: New test.
+	* gcc.target/avr/pr115830-add-i.c: New test.
+	* gcc.target/avr/pr115830-and.c: New test.
+	* gcc.target/avr/pr115830-asl.c: New test.
+	* gcc.target/avr/pr115830-asr.c: New test.
+	* gcc.target/avr/pr115830-ior.c: New test.
+	* gcc.target/avr/pr115830-lsr.c: New test.
+	* gcc.target/avr/pr115830-asl32.c: New test.
+	* gcc.target/avr/pr115830-sub.c: New test.
+	* gcc.target/avr/pr115830-sub-ext: New test.
+
+- User: GCC Commits | Time: 2024-08-29 12:22:10 UTC
+  Text: The master branch has been updated by Georg-Johann Lay <gjl@gcc.gnu.org>:https://gcc.gnu.org/g:07e5e054a1c579dec3e1ed2192992b2fea14ad40commitr15-3286-g07e5e054a1c579dec3e1ed2192992b2fea14ad40Author: Georg-Johann Lay <avr@gjlay.de>
+Date:   Sun Aug 4 19:46:43 2024 +0200
+
+    AVR: target/115830 - Make better use of SREG.N and SREG.Z.
+    
+    This patch adds new CC modes CCN and CCZN for operations that
+    set SREG.N, resp. SREG.Z and SREG.N.  Add peephole2 patterns
+    to generate new compute + branch insns that make use
+    of the Z and N flags.  Most of these patterns need their own
+    asm output routines that don't do all the micro-optimizations
+    that the ordinary outputs may perform, as the latter have no
+    requirement to set CC in a usable way.
+    
+    We don't use cmpelim because it cannot provide scratch regs
+    (which peephole2 can), and some of the patterns require a
+    scratch reg, whereas the same operations that don't set REG_CC
+    don't require a scratch.  See the comments in avr.md for details.
+    
+    The existing add.for.cc* patterns are simplified as they no
+    more cover QImode, which is handled in a separate QImode case.
+    Apart from that, it adds 3 patterns for subtractions and one
+    pattern for shift left, all for multi-byte cases (HI, PSI, SI).
+    
+    The add.for.cc* patterns now use CC[Z]Nmode, instead of the
+    formerly abuse of CCmode.PR target/115830gcc/
+            * config/avr/avr-modes.def (CCN, CCZN): New CC_MODEs.
+            * config/avr/avr-protos.h (avr_cond_branch): New from
+            ret_cond_branch.
+            (avr_out_plus_set_N, avr_op8_ZN_operator, avr_cmp0_code)
+            (avr_out_op8_set_ZN, avr_len_op8_set_ZN): New protos.
+            (ccn_reg_rtx, cczn_reg_rtx): New declarations.
+            * config/avr/avr.cc (avr_cond_branch): New from ret_cond_branch.
+            (avr_cond_string): Add bool cc_overflow_unusable argument.
+            (avr_print_operand) ['L']: Like 'j' but overflow unusable.
+            ['K']: Like 'k' but overflow unusable.
+            (avr_out_plus_set_ZN): Remove handling of QImode.
+            (avr_out_plus_set_N, avr_op8_ZN_operator, avr_cmp0_code)
+            (avr_out_op8_set_ZN, avr_len_op8_set_ZN): New functions.
+            (avr_adjust_insn_length) [ADJUST_LEN_ADD_SET_N]: Hande case.
+            (avr_class_max_nregs): All MODE_CCs occupy one hard reg.
+            (avr_hard_regno_nregs): Same.
+            (avr_hard_regno_mode_ok) [REG_CC]: Allow all MODE_CC.
+            (pass_manager.h, context.h, tree-pass.h): Include them.
+            (ccn_reg_rtx, cczn_reg_rtx): New GTY variables.
+            (avr_init_expanders): Initialize them.
+            (avr_option_override): Run peephole2 a second time.
+            * config/avr/avr.md (adjust_len) [add_set_N]: New attr value.
+            (ALLCC, HI_SI): New mode iterators.
+            (CCname): New mode attribute.
+            (eqnegtle, cmp_signed, op8_ZN): New code iterators.
+            (swap, SWAP): New code attributes.
+            (branch): Handle CCNmode and CCZNmode.  Assimilate...
+            (difficult_branch): ...this insn.
+            (p1m1): Remove.
+            (gen_add_for_<code>_<mode>): Adjust to CCNmode and CCZNmode. Use
+            HISI as mode iterator.  Extend peephole2s that produce them.
+            (*add.for.eqne.<mode>): Extend to *add.for.cc[z]n.<mode>.
+            (*ashift.for.ccn.<mode>): New insn and peephole2 to make them.
+            (*sub.for.cczn.<mode>, *sub-extend<mode>.for.cczn.<mode>):
+            New insns and peephole2s to make them.
+            (*op8.for.cczn.<code>): New insn and peephole2 to make them.
+            * config/avr/predicates.md (const_1_to_3_operand)
+            (abs1_abs2_operand, signed_comparison_operator)
+            (op8_ZN_operator): New predicates.
+    gcc/testsuite/
+            * gcc.target/avr/pr115830-add.c: New test.
+            * gcc.target/avr/pr115830-add-c.c: New test.
+            * gcc.target/avr/pr115830-add-i.c: New test.
+            * gcc.target/avr/pr115830-and.c: New test.
+            * gcc.target/avr/pr115830-asl.c: New test.
+            * gcc.target/avr/pr115830-asr.c: New test.
+            * gcc.target/avr/pr115830-ior.c: New test.
+            * gcc.target/avr/pr115830-lsr.c: New test.
+            * gcc.target/avr/pr115830-asl32.c: New test.
+            * gcc.target/avr/pr115830-sub.c: New test.
+            * gcc.target/avr/pr115830-sub-ext.c: New test.
+
+- User: Georg-Johann Lay | Time: 2024-08-29 12:53:32 UTC
+  Text: Added in v15.
+
+For now, most cases are handled, except:
+
+* Multi-byte bit operations that set SREG.N.
+
+* Unary operations like NEG and COM.
+

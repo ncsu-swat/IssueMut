@@ -1,0 +1,316 @@
+Bug Summary: __builtin_(add|mul|sub)_overflow methods generate duplicate operations if both operands are const which in turn causes wrong code due to overlapping arguments
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Shane Holden | Time: 2023-02-14 17:51:23 UTC
+  Text: #include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+bool add(uint8_t *r, const uint8_t *a, const uint8_t *b) {
+  return __builtin_add_overflow(*a, *b, r);
+}
+
+bool mul(uint8_t *r, const uint8_t *a, const uint8_t *b) {
+  return __builtin_mul_overflow(*a, *b, r);
+}
+
+int main() {
+  uint8_t x;
+
+  /* 64 + 64 should not overflow */
+  x = 64;
+  if (add(&x, &x, &x))
+    printf("false positive: x=%i\n", x);
+
+  /* 4 * 4 should not overflow */
+  x = 4;
+  if (mul(&x, &x, &x))
+    printf("false positive: x=%i\n", x);
+
+  /* 128 + 128 should overflow */
+  x = 128;
+  if (!add(&x, &x, &x))
+    printf("false negative: x=%i\n", x);
+
+  /* 16 * 16 should overflow */
+  x = 16;
+  if (!mul(&x, &x, &x))
+    printf("false negative: x=%i\n", x);
+
+  return 0;
+}
+
+$ gcc -g3 -O1 -o test test.c; ./test
+false positive: x=128
+false positive: x=16
+false negative: x=0
+false negative: x=0
+
+The generated assembly correctly adds a with b and stores in r but
+then it does the operation again before testing for carry and
+returning.  If r is also one of the operands then the erroneous
+second operation will use the computed value of r in place of the
+original operand leading to an incorrect overflow result.
+
+0000000000400895 <add>:
+;   return __builtin_add_overflow(*a, *b, r);
+  400895: 0f b6 02                      movzbl  (%rdx), %eax
+  400898: 02 06                         addb    (%rsi), %al
+  40089a: 88 07                         movb    %al, (%rdi)
+  40089c: 0f b6 02                      movzbl  (%rdx), %eax  <<
+  40089f: 02 06                         addb    (%rsi), %al   <<
+  4008a1: 0f 92 c0                      setb    %al
+; }
+  4008a4: c3                            retq
+
+00000000004008a5 <mul>:
+;   return __builtin_mul_overflow(*a, *b, r);
+  4008a5: 0f b6 06                      movzbl  (%rsi), %eax
+  4008a8: f6 22                         mulb    (%rdx)
+  4008aa: 88 07                         movb    %al, (%rdi)
+  4008ac: 0f b6 06                      movzbl  (%rsi), %eax  <<
+  4008af: f6 22                         mulb    (%rdx)        <<
+  4008b1: 0f 90 c0                      seto    %al
+; }
+  4008b4: c3                            retq
+
+This only seems to be triggered when both a *and* b are const.
+Removing const from either or both operands generates the correct
+assembly.
+
+0000000000400855 <add>:
+;   return __builtin_add_overflow(*a, *b, r);
+  400855: 0f b6 02                      movzbl  (%rdx), %eax
+  400858: 02 06                         addb    (%rsi), %al
+  40085a: 88 07                         movb    %al, (%rdi)
+  40085c: 0f 92 c0                      setb    %al
+; }
+  40085f: c3                            retq
+
+0000000000400860 <mul>:
+;   return __builtin_mul_overflow(*a, *b, r);
+  400860: 0f b6 06                      movzbl  (%rsi), %eax
+  400863: f6 22                         mulb    (%rdx)
+  400865: 88 07                         movb    %al, (%rdi)
+  400867: 0f 90 c0                      seto    %al
+; }
+  40086a: c3                            retq
+
+Tested on the following systems:
+
+$ uname -srm; gcc12 --version
+FreeBSD 13.1-RELEASE-p2 amd64
+gcc12 (FreeBSD Ports Collection) 12.2.0
+
+$ uname -smr; gcc --version
+Linux 6.1.2-1-MANJARO-ARM aarch64
+gcc (GCC) 12.1.0
+
+$ uname -srm; gcc --version
+MINGW64_NT-10.0-22000 3.4.5.x86_64 x86_64
+gcc.exe (Rev10, Built by MSYS2 project) 12.2.0
+
+Poking around godbolt indicates this was likely introduced in 9.4.
+
+- User: Andrew Pinski | Time: 2023-02-14 17:53:33 UTC
+  Text: The middle-end is not adding a SAVE_EXPR in the const case which causes the duplication which is not optimized back.
+
+- User: Andrew Pinski | Time: 2023-11-09 06:29:10 UTC
+  Text: Confirmed.
+
+The obvious workaround is to use a temporary variables for the arguments of __builtin_add_overflow .
+
+- User: Andrew Pinski | Time: 2024-06-03 13:56:30 UTC
+  Text: ***Bug 115326has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2024-06-03 13:59:03 UTC
+  Text: Note the missing SAVE_EXPR issue is similar toPR 52339(which has a patch attached to it that would fix the issue here too I think).
+
+- User: Jakub Jelinek | Time: 2024-06-03 15:35:24 UTC
+  Text: Createdattachment 58336[details]gcc15-pr108789.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-06-04 10:28:52 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:b8e28381cb5c0cddfe5201faf799d8b27f5d7d6ccommitr15-1009-gb8e28381cb5c0cddfe5201faf799d8b27f5d7d6cAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jun 4 12:28:01 2024 +0200
+
+    builtins: Force SAVE_EXPR for __builtin_{add,sub,mul}_overflow and __builtin{add,sub}c [PR108789]
+    
+    The following testcase is miscompiled, because we use save_expr
+    on the .{ADD,SUB,MUL}_OVERFLOW call we are creating, but if the first
+    two operands are not INTEGER_CSTs (in that case we just fold it right away)
+    but are TREE_READONLY/!TREE_SIDE_EFFECTS, save_expr doesn't actually
+    create a SAVE_EXPR at all and so we lower it to
+    *arg2 = REALPART_EXPR (.ADD_OVERFLOW (arg0, arg1)), \
+    IMAGPART_EXPR (.ADD_OVERFLOW (arg0, arg1))
+    which evaluates the ifn twice and just hope it will be CSEd back.
+    As *arg2 aliases *arg0, that is not the case.
+    The builtins are really never const/pure as they store into what
+    the third arguments points to, so after handling the INTEGER_CST+INTEGER_CST
+    case, I think we should just always use SAVE_EXPR.  Just building SAVE_EXPR
+    by hand and setting TREE_SIDE_EFFECTS on it doesn't work, because
+    c_fully_fold optimizes it away again, so the following patch marks the
+    ifn calls as TREE_SIDE_EFFECTS (but doesn't do it for the
+    __builtin_{add,sub,mul}_overflow_p case which were designed for use
+    especially in constant expressions and don't really evaluate the
+    realpart side, so we don't really need a SAVE_EXPR in that case).
+    
+    2024-06-04  Jakub Jelinek  <jakub@redhat.com>PR middle-end/108789* builtins.cc (fold_builtin_arith_overflow): For ovf_only,
+            don't call save_expr and don't build REALPART_EXPR, otherwise
+            set TREE_SIDE_EFFECTS on call before calling save_expr.
+            (fold_builtin_addc_subc): Set TREE_SIDE_EFFECTS on call before
+            calling save_expr.
+    
+            * gcc.c-torture/execute/pr108789.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-06-04 10:33:17 UTC
+  Text: Fixed for 15.1+ so far.
+
+- User: GCC Commits | Time: 2024-06-04 14:26:38 UTC
+  Text: The releases/gcc-14 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:f9af4a05e027a8b797628f1a2c39ef0b28dc36d9commitr14-10279-gf9af4a05e027a8b797628f1a2c39ef0b28dc36d9Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jun 4 12:28:01 2024 +0200
+
+    builtins: Force SAVE_EXPR for __builtin_{add,sub,mul}_overflow and __builtin{add,sub}c [PR108789]
+    
+    The following testcase is miscompiled, because we use save_expr
+    on the .{ADD,SUB,MUL}_OVERFLOW call we are creating, but if the first
+    two operands are not INTEGER_CSTs (in that case we just fold it right away)
+    but are TREE_READONLY/!TREE_SIDE_EFFECTS, save_expr doesn't actually
+    create a SAVE_EXPR at all and so we lower it to
+    *arg2 = REALPART_EXPR (.ADD_OVERFLOW (arg0, arg1)), \
+    IMAGPART_EXPR (.ADD_OVERFLOW (arg0, arg1))
+    which evaluates the ifn twice and just hope it will be CSEd back.
+    As *arg2 aliases *arg0, that is not the case.
+    The builtins are really never const/pure as they store into what
+    the third arguments points to, so after handling the INTEGER_CST+INTEGER_CST
+    case, I think we should just always use SAVE_EXPR.  Just building SAVE_EXPR
+    by hand and setting TREE_SIDE_EFFECTS on it doesn't work, because
+    c_fully_fold optimizes it away again, so the following patch marks the
+    ifn calls as TREE_SIDE_EFFECTS (but doesn't do it for the
+    __builtin_{add,sub,mul}_overflow_p case which were designed for use
+    especially in constant expressions and don't really evaluate the
+    realpart side, so we don't really need a SAVE_EXPR in that case).
+    
+    2024-06-04  Jakub Jelinek  <jakub@redhat.com>PR middle-end/108789* builtins.cc (fold_builtin_arith_overflow): For ovf_only,
+            don't call save_expr and don't build REALPART_EXPR, otherwise
+            set TREE_SIDE_EFFECTS on call before calling save_expr.
+            (fold_builtin_addc_subc): Set TREE_SIDE_EFFECTS on call before
+            calling save_expr.
+    
+            * gcc.c-torture/execute/pr108789.c: New test.
+    
+    (cherry picked from commit b8e28381cb5c0cddfe5201faf799d8b27f5d7d6c)
+
+- User: GCC Commits | Time: 2024-06-11 06:17:44 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:f9db8b0571348adfcc98204ea7be787058af85cdcommitr13-8836-gf9db8b0571348adfcc98204ea7be787058af85cdAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jun 4 12:28:01 2024 +0200
+
+    builtins: Force SAVE_EXPR for __builtin_{add,sub,mul}_overflow [PR108789]
+    
+    The following testcase is miscompiled, because we use save_expr
+    on the .{ADD,SUB,MUL}_OVERFLOW call we are creating, but if the first
+    two operands are not INTEGER_CSTs (in that case we just fold it right away)
+    but are TREE_READONLY/!TREE_SIDE_EFFECTS, save_expr doesn't actually
+    create a SAVE_EXPR at all and so we lower it to
+    *arg2 = REALPART_EXPR (.ADD_OVERFLOW (arg0, arg1)), \
+    IMAGPART_EXPR (.ADD_OVERFLOW (arg0, arg1))
+    which evaluates the ifn twice and just hope it will be CSEd back.
+    As *arg2 aliases *arg0, that is not the case.
+    The builtins are really never const/pure as they store into what
+    the third arguments points to, so after handling the INTEGER_CST+INTEGER_CST
+    case, I think we should just always use SAVE_EXPR.  Just building SAVE_EXPR
+    by hand and setting TREE_SIDE_EFFECTS on it doesn't work, because
+    c_fully_fold optimizes it away again, so the following patch marks the
+    ifn calls as TREE_SIDE_EFFECTS (but doesn't do it for the
+    __builtin_{add,sub,mul}_overflow_p case which were designed for use
+    especially in constant expressions and don't really evaluate the
+    realpart side, so we don't really need a SAVE_EXPR in that case).
+    
+    2024-06-04  Jakub Jelinek  <jakub@redhat.com>PR middle-end/108789* builtins.cc (fold_builtin_arith_overflow): For ovf_only,
+            don't call save_expr and don't build REALPART_EXPR, otherwise
+            set TREE_SIDE_EFFECTS on call before calling save_expr.
+    
+            * gcc.c-torture/execute/pr108789.c: New test.
+    
+    (cherry picked from commit b8e28381cb5c0cddfe5201faf799d8b27f5d7d6c)
+
+- User: GCC Commits | Time: 2024-06-11 10:39:04 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:91a371254494934e191e3060ae2a86905eb4b2b2commitr12-10532-g91a371254494934e191e3060ae2a86905eb4b2b2Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jun 4 12:28:01 2024 +0200
+
+    builtins: Force SAVE_EXPR for __builtin_{add,sub,mul}_overflow [PR108789]
+    
+    The following testcase is miscompiled, because we use save_expr
+    on the .{ADD,SUB,MUL}_OVERFLOW call we are creating, but if the first
+    two operands are not INTEGER_CSTs (in that case we just fold it right away)
+    but are TREE_READONLY/!TREE_SIDE_EFFECTS, save_expr doesn't actually
+    create a SAVE_EXPR at all and so we lower it to
+    *arg2 = REALPART_EXPR (.ADD_OVERFLOW (arg0, arg1)), \
+    IMAGPART_EXPR (.ADD_OVERFLOW (arg0, arg1))
+    which evaluates the ifn twice and just hope it will be CSEd back.
+    As *arg2 aliases *arg0, that is not the case.
+    The builtins are really never const/pure as they store into what
+    the third arguments points to, so after handling the INTEGER_CST+INTEGER_CST
+    case, I think we should just always use SAVE_EXPR.  Just building SAVE_EXPR
+    by hand and setting TREE_SIDE_EFFECTS on it doesn't work, because
+    c_fully_fold optimizes it away again, so the following patch marks the
+    ifn calls as TREE_SIDE_EFFECTS (but doesn't do it for the
+    __builtin_{add,sub,mul}_overflow_p case which were designed for use
+    especially in constant expressions and don't really evaluate the
+    realpart side, so we don't really need a SAVE_EXPR in that case).
+    
+    2024-06-04  Jakub Jelinek  <jakub@redhat.com>PR middle-end/108789* builtins.cc (fold_builtin_arith_overflow): For ovf_only,
+            don't call save_expr and don't build REALPART_EXPR, otherwise
+            set TREE_SIDE_EFFECTS on call before calling save_expr.
+    
+            * gcc.c-torture/execute/pr108789.c: New test.
+    
+    (cherry picked from commit b8e28381cb5c0cddfe5201faf799d8b27f5d7d6c)
+
+- User: Jakub Jelinek | Time: 2024-06-11 10:56:25 UTC
+  Text: Should be fixed for 12.4+, 13.4+ and 14.2+ too.
+
+- User: GCC Commits | Time: 2024-06-20 13:23:58 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:2922060a7fe04397df1ca69dd1f4de1edf8d2282commitr11-11513-g2922060a7fe04397df1ca69dd1f4de1edf8d2282Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jun 4 12:28:01 2024 +0200
+
+    builtins: Force SAVE_EXPR for __builtin_{add,sub,mul}_overflow [PR108789]
+    
+    The following testcase is miscompiled, because we use save_expr
+    on the .{ADD,SUB,MUL}_OVERFLOW call we are creating, but if the first
+    two operands are not INTEGER_CSTs (in that case we just fold it right away)
+    but are TREE_READONLY/!TREE_SIDE_EFFECTS, save_expr doesn't actually
+    create a SAVE_EXPR at all and so we lower it to
+    *arg2 = REALPART_EXPR (.ADD_OVERFLOW (arg0, arg1)), \
+    IMAGPART_EXPR (.ADD_OVERFLOW (arg0, arg1))
+    which evaluates the ifn twice and just hope it will be CSEd back.
+    As *arg2 aliases *arg0, that is not the case.
+    The builtins are really never const/pure as they store into what
+    the third arguments points to, so after handling the INTEGER_CST+INTEGER_CST
+    case, I think we should just always use SAVE_EXPR.  Just building SAVE_EXPR
+    by hand and setting TREE_SIDE_EFFECTS on it doesn't work, because
+    c_fully_fold optimizes it away again, so the following patch marks the
+    ifn calls as TREE_SIDE_EFFECTS (but doesn't do it for the
+    __builtin_{add,sub,mul}_overflow_p case which were designed for use
+    especially in constant expressions and don't really evaluate the
+    realpart side, so we don't really need a SAVE_EXPR in that case).
+    
+    2024-06-04  Jakub Jelinek  <jakub@redhat.com>PR middle-end/108789* builtins.c (fold_builtin_arith_overflow): For ovf_only,
+            don't call save_expr and don't build REALPART_EXPR, otherwise
+            set TREE_SIDE_EFFECTS on call before calling save_expr.
+    
+            * gcc.c-torture/execute/pr108789.c: New test.
+    
+    (cherry picked from commit b8e28381cb5c0cddfe5201faf799d8b27f5d7d6c)
+
+- User: Jakub Jelinek | Time: 2024-06-20 13:25:07 UTC
+  Text: Fixed for 11.5 as well.
+

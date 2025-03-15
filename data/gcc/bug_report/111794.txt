@@ -1,0 +1,313 @@
+Bug Summary: RISC-V: Missed SLP optimization due to mask mode precision
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2023-10-13 07:41:56 UTC
+  Text: void
+f (int *restrict x, short *restrict y)
+{
+  x[0] = x[0] == 1 & y[0] == 2;
+  x[1] = x[1] == 1 & y[1] == 2;
+  x[2] = x[2] == 1 & y[2] == 2;
+  x[3] = x[3] == 1 & y[3] == 2;
+  x[4] = x[4] == 1 & y[4] == 2;
+  x[5] = x[5] == 1 & y[5] == 2;
+  x[6] = x[6] == 1 & y[6] == 2;
+  x[7] = x[7] == 1 & y[7] == 2;
+}
+
+Realize that we failed to vectorize this case:https://godbolt.org/z/rWz9fjM4rThe root cause is the mask bit precision of "small mask mode" (Potentially has 
+bitsize smaller than 1 bytes).
+
+If we remove this following adjust precision:
+
+ADJUST_PRECISION (V1BI, 1);
+ADJUST_PRECISION (V2BI, 2);
+ADJUST_PRECISION (V4BI, 4);
+
+ADJUST_PRECISION (RVVMF16BI, riscv_v_adjust_precision (RVVMF16BImode, 4));
+ADJUST_PRECISION (RVVMF32BI, riscv_v_adjust_precision (RVVMF32BImode, 2));
+ADJUST_PRECISION (RVVMF64BI, riscv_v_adjust_precision (RVVMF64BImode, 1));
+
+It can vectorize such case but will cause bugs in other situations.
+
+Is it possible to fix that in GCC?
+
+- User: JuzheZhong | Time: 2023-10-13 07:47:15 UTC
+  Text: This is RISC-V target specific issue.
+
+ARM SVE can vectorize it.
+
+- User: JuzheZhong | Time: 2023-10-13 07:51:59 UTC
+  Text: Note that the reason we adjust the mask mode precision here is because 
+the DSE bug for "small mask mode"https://github.com/gcc-mirror/gcc/commit/247cacc9e381d666a492dfa4ed61b7b19e2d008fThis is the commit show why we adjust precision.
+
+- User: Richard Biener | Time: 2023-10-13 08:13:30 UTC
+  Text: I'm failing to see the issue as with -march=rv64gcv I run into
+
+t.c:4:8: missed:   not vectorized: relevant stmt not supported: *x_50(D) = _6;
+t.c:4:8: note:   removing SLP instance operations starting from: *x_50(D) = _6;
+t.c:4:8: missed:  not vectorized: bad operation in basic block.
+
+but just guessing, the issue is bool pattern recognition and
+
+t.c:12:1: note:   using normal nonmask vectors for _2 = _1 == 1;
+t.c:12:1: note:   using normal nonmask vectors for _4 = _3 == 2;
+t.c:12:1: note:   using normal nonmask vectors for _5 = _2 & _4;
+...
+
+?  To vectorize you'd want to see
+
+t.c:12:1: note:   using boolean precision 32 for _2 = _1 == 1;
+t.c:12:1: note:   using boolean precision 16 for _4 = _3 == 2;
+t.c:12:1: note:   using boolean precision 16 for _5 = _2 & _4;
+...
+
+and a pattern used for the value use:
+
+t.c:12:1: note:   extra pattern stmt: patt_62 = _5 ? 1 : 0;
+
+You need to see why this doesn't work (it's a very delicate area).
+
+- User: Robin Dapp | Time: 2023-10-13 08:17:12 UTC
+  Text: Just to mention here as well.  As this seems ninstance++ where the adjust_precision thing comes back to bite us, I'm going to go back and check if the issue why it was introduced (DCE?) cannot be solved differently.  I'd rather have us not deviate from other backends at such a central part as mode precisions.
+
+- User: Robin Dapp | Time: 2023-10-16 07:56:51 UTC
+  Text: Disregarding the reasons for the precision adjustment, for this case here, we seem to fail at:
+
+  /* We do not handle bit-precision changes.  */
+  if ((CONVERT_EXPR_CODE_P (code)
+       || code == VIEW_CONVERT_EXPR)
+      && ((INTEGRAL_TYPE_P (TREE_TYPE (scalar_dest))
+	   && !type_has_mode_precision_p (TREE_TYPE (scalar_dest)))
+	  || (INTEGRAL_TYPE_P (TREE_TYPE (op))
+	      && !type_has_mode_precision_p (TREE_TYPE (op))))
+      /* But a conversion that does not change the bit-pattern is ok.  */
+      && !(INTEGRAL_TYPE_P (TREE_TYPE (scalar_dest))
+	   && INTEGRAL_TYPE_P (TREE_TYPE (op))
+	   && (TYPE_PRECISION (TREE_TYPE (scalar_dest))
+	       > TYPE_PRECISION (TREE_TYPE (op)))
+	   && TYPE_UNSIGNED (TREE_TYPE (op))))
+    {
+      if (dump_enabled_p ())
+        dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
+                         "type conversion to/from bit-precision "
+                         "unsupported.\n");
+      return false;
+    }
+
+for the expression
+ patt_156 = (<signed-boolean:1>) _2;
+where _2 (op) is of type _Bool (i.e. TYPE_MODE QImode) and patt_156 (scalar_dest) is signed-boolean:1.  In that case the mode's precision (8) does not match the type's precision (1) for both op and _scalar_dest.
+
+The second part of the condition I don't fully get.  When does a conversion change the bit pattern?  When the source has higher precision than the dest we would need to truncate which we probably don't want.  When the dest has higher precision that's considered ok?  What about equality?
+
+If both op and dest have precision 1 the padding could differ (or rather the 1 could be at different positions) but do we even support that?  In other words, could we relax the condition to TYPE_PRECISION (TREE_TYPE (scalar_dest)) >= TYPE_PRECISION (TREE_TYPE (op)) (>= instead of >)?
+
+FWIW bootstrap and testsuite unchanged with >= instead of > on x86, aarch64 and power10 but we might not have a proper test for that?
+
+- User: rguenther@suse.de | Time: 2023-10-16 08:50:31 UTC
+  Text: On Mon, 16 Oct 2023, rdapp at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=111794> 
+> ---Comment #5from Robin Dapp <rdapp at gcc dot gnu.org> ---
+> Disregarding the reasons for the precision adjustment, for this case here, we
+> seem to fail at:
+> 
+>   /* We do not handle bit-precision changes.  */
+>   if ((CONVERT_EXPR_CODE_P (code)
+>        || code == VIEW_CONVERT_EXPR)
+>       && ((INTEGRAL_TYPE_P (TREE_TYPE (scalar_dest))
+>            && !type_has_mode_precision_p (TREE_TYPE (scalar_dest)))
+>           || (INTEGRAL_TYPE_P (TREE_TYPE (op))
+>               && !type_has_mode_precision_p (TREE_TYPE (op))))
+>       /* But a conversion that does not change the bit-pattern is ok.  */
+>       && !(INTEGRAL_TYPE_P (TREE_TYPE (scalar_dest))
+>            && INTEGRAL_TYPE_P (TREE_TYPE (op))
+>            && (TYPE_PRECISION (TREE_TYPE (scalar_dest))
+>                > TYPE_PRECISION (TREE_TYPE (op)))
+>            && TYPE_UNSIGNED (TREE_TYPE (op))))
+>     {
+>       if (dump_enabled_p ())
+>         dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
+>                          "type conversion to/from bit-precision "
+>                          "unsupported.\n");
+>       return false;
+>     }
+> 
+> for the expression
+>  patt_156 = (<signed-boolean:1>) _2;
+> where _2 (op) is of type _Bool (i.e. TYPE_MODE QImode) and patt_156
+> (scalar_dest) is signed-boolean:1.  In that case the mode's precision (8) does
+> not match the type's precision (1) for both op and _scalar_dest.
+> 
+> The second part of the condition I don't fully get.  When does a conversion
+> change the bit pattern?  When the source has higher precision than the dest we
+> would need to truncate which we probably don't want.  When the dest has higher
+> precision that's considered ok?  What about equality?
+> 
+> If both op and dest have precision 1 the padding could differ (or rather the 1
+> could be at different positions) but do we even support that?  In other words,
+> could we relax the condition to TYPE_PRECISION (TREE_TYPE (scalar_dest)) >=
+> TYPE_PRECISION (TREE_TYPE (op)) (>= instead of >)?
+> 
+> FWIW bootstrap and testsuite unchanged with >= instead of > on x86, aarch64 and
+> power10 but we might not have a proper test for that?It's about sign- vs. zero-extending into padding.  What kind of code
+does the vectorizer emit?
+
+- User: Robin Dapp | Time: 2023-10-16 09:05:21 UTC
+  Text: vectp.4_188 = x_50(D);
+  vect__1.5_189 = MEM <vector(8) int> [(int *)vectp.4_188];
+  mask__2.6_190 = { 1, 1, 1, 1, 1, 1, 1, 1 } == vect__1.5_189;
+  mask_patt_156.7_191 = VIEW_CONVERT_EXPR<vector(8) <signed-boolean:1>>(mask__2.6_190);
+  _1 = *x_50(D);
+  _2 = _1 == 1;
+  vectp.9_192 = y_51(D);
+  vect__3.10_193 = MEM <vector(8) short int> [(short int *)vectp.9_192];
+  mask__4.11_194 = { 2, 2, 2, 2, 2, 2, 2, 2 } == vect__3.10_193;
+  mask_patt_157.12_195 = mask_patt_156.7_191 & mask__4.11_194;
+  vect_patt_158.13_196 = VEC_COND_EXPR <mask_patt_157.12_195, { 1, 1, 1, 1, 1, 1, 1, 1 }, { 0, 0, 0, 0, 0, 0, 0, 0 }>;
+  vect_patt_159.14_197 = (vector(8) int) vect_patt_158.13_196;
+
+
+This yields the following assembly:
+	vsetivli	zero,8,e32,m2,ta,ma
+	vle32.v	v2,0(a0)
+	vmv.v.i	v4,1
+	vle16.v	v1,0(a1)
+	vmseq.vv	v0,v2,v4
+	vsetvli	zero,zero,e16,m1,ta,ma
+	vmseq.vi	v1,v1,2
+	vsetvli	zero,zero,e32,m2,ta,ma
+	vmv.v.i	v2,0
+	vmand.mm	v0,v0,v1
+	vmerge.vvm	v2,v2,v4,v0
+	vse32.v	v2,0(a0)
+
+Apart from CSE'ing v4 this looks pretty good to me.  My connection is really poor at the moment so I cannot quickly compare what aarch64 does for that example.
+
+- User: rguenther@suse.de | Time: 2023-10-16 09:29:38 UTC
+  Text: On Mon, 16 Oct 2023, rdapp at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=111794> 
+> ---Comment #7from Robin Dapp <rdapp at gcc dot gnu.org> ---
+>   vectp.4_188 = x_50(D);
+>   vect__1.5_189 = MEM <vector(8) int> [(int *)vectp.4_188];
+>   mask__2.6_190 = { 1, 1, 1, 1, 1, 1, 1, 1 } == vect__1.5_189;
+>   mask_patt_156.7_191 = VIEW_CONVERT_EXPR<vector(8)
+> <signed-boolean:1>>(mask__2.6_190);
+>   _1 = *x_50(D);
+>   _2 = _1 == 1;
+>   vectp.9_192 = y_51(D);
+>   vect__3.10_193 = MEM <vector(8) short int> [(short int *)vectp.9_192];
+>   mask__4.11_194 = { 2, 2, 2, 2, 2, 2, 2, 2 } == vect__3.10_193;
+>   mask_patt_157.12_195 = mask_patt_156.7_191 & mask__4.11_194;
+>   vect_patt_158.13_196 = VEC_COND_EXPR <mask_patt_157.12_195, { 1, 1, 1, 1, 1,
+> 1, 1, 1 }, { 0, 0, 0, 0, 0, 0, 0, 0 }>;
+>   vect_patt_159.14_197 = (vector(8) int) vect_patt_158.13_196;
+> 
+> 
+> This yields the following assembly:
+>         vsetivli        zero,8,e32,m2,ta,ma
+>         vle32.v v2,0(a0)
+>         vmv.v.i v4,1
+>         vle16.v v1,0(a1)
+>         vmseq.vv        v0,v2,v4
+>         vsetvli zero,zero,e16,m1,ta,ma
+>         vmseq.vi        v1,v1,2
+>         vsetvli zero,zero,e32,m2,ta,ma
+>         vmv.v.i v2,0
+>         vmand.mm        v0,v0,v1
+>         vmerge.vvm      v2,v2,v4,v0
+>         vse32.v v2,0(a0)
+> 
+> Apart from CSE'ing v4 this looks pretty good to me.  My connection is really
+> poor at the moment so I cannot quickly compare what aarch64 does for that
+> example.That looks reasonable.  Note this then goes through
+vectorizable_assignment as a no-op move.  The question is
+if we can arrive here with signed bool : 2 vs. _Bool : 2
+somehow (I wonder how we arrive with singed bool : 1 here - that's
+from pattern recog, right?  why didn't that produce a
+COND_EXPR for this?).
+
+I think for more thorough testing the condition should change to
+
+      /* But a conversion that does not change the bit-pattern is ok.  */
+      && !(INTEGRAL_TYPE_P (TREE_TYPE (scalar_dest))
+           && INTEGRAL_TYPE_P (TREE_TYPE (op))
+           && ((TYPE_PRECISION (TREE_TYPE (scalar_dest))
+               > TYPE_PRECISION (TREE_TYPE (op)))
+               && TYPE_UNSIGNED (TREE_TYPE (op))))
+               || TYPE_PRECISION (TREE_TYPE (scalar_dest))
+                  == TYPE_PRECISION (TREE_TYPE (op)))))
+
+rather than just doing >= which would be odd (why allow
+to skip sign-extenting from the unsigned MSB but not allow
+to skip zero-extending from it)
+
+- User: Robin Dapp | Time: 2023-10-16 09:58:51 UTC
+  Text: Yes, that's from pattern recog:
+
+slp.c:11:20: note:   === vect_pattern_recog ===
+slp.c:11:20: note:   vect_recog_mask_conversion_pattern: detected: _5 = _2 & _4;
+slp.c:11:20: note:   mask_conversion pattern recognized: patt_157 = patt_156 & _4;
+slp.c:11:20: note:   extra pattern stmt: patt_156 = (<signed-boolean:1>) _2;
+slp.c:11:20: note:   vect_recog_bool_pattern: detected: _6 = (int) _5;
+slp.c:11:20: note:   bool pattern recognized: patt_159 = (int) patt_158;
+slp.c:11:20: note:   extra pattern stmt: patt_158 = _5 ? 1 : 0;
+slp.c:11:20: note:   vect_recog_mask_conversion_pattern: detected: _11 = _8 & _10;
+slp.c:11:20: note:   mask_conversion pattern recognized: patt_161 = patt_160 & _10;
+slp.c:11:20: note:   extra pattern stmt: patt_160 = (<signed-boolean:1>) _8;
+...
+
+In vect_recog_mask_conversion_pattern we arrive at
+
+  if (TYPE_PRECISION (rhs1_type) < TYPE_PRECISION (rhs2_type))
+    {
+      vectype1 = get_mask_type_for_scalar_type (vinfo, rhs1_type);
+      if (!vectype1)
+	return NULL;
+      rhs2 = build_mask_conversion (vinfo, rhs2, vectype1, stmt_vinfo);
+    }
+  else
+    {
+      vectype1 = get_mask_type_for_scalar_type (vinfo, rhs2_type);
+      if (!vectype1)
+	return NULL;
+      rhs1 = build_mask_conversion (vinfo, rhs1, vectype1, stmt_vinfo);
+    }
+  lhs = vect_recog_temp_ssa_var (TREE_TYPE (lhs), NULL);
+  pattern_stmt = gimple_build_assign (lhs, rhs_code, rhs1, rhs2);
+
+
+vectype1 is then e.g. vector([8,8]) <signed-boolean:1>.  Then vect_recog_bool_pattern creates the COND_EXPR.
+
+Testsuites are running with your proposed change.
+
+- User: Robin Dapp | Time: 2023-10-16 14:23:02 UTC
+  Text: From what I can tell with my barely working connection no regressions on x86, aarch64 or power10 with the adjusted check.
+
+- User: GCC Commits | Time: 2023-10-23 16:44:16 UTC
+  Text: The master branch has been updated by Robin Dapp <rdapp@gcc.gnu.org>:https://gcc.gnu.org/g:32b74c9e1d46932a4bbb1f46353bfc43c702c20acommitr14-4868-g32b74c9e1d46932a4bbb1f46353bfc43c702c20aAuthor: Robin Dapp <rdapp@ventanamicro.com>
+Date:   Sun Oct 15 22:36:59 2023 +0200
+
+    vect: Allow same precision for bit-precision conversions.
+    
+    InPR111794we miss a vectorization because on riscv type precision and
+    mode precision differ for mask types.  We can still vectorize when
+    allowing assignments with the same precision for dest and source which
+    is what this patch does.
+    
+    gcc/ChangeLog:PR tree-optimization/111794* tree-vect-stmts.cc (vectorizable_assignment): Add
+            same-precision exception for dest and source.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/slp-mask-1.c: New test.
+            * gcc.target/riscv/rvv/autovec/slp-mask-run-1.c: New test.
+
+- User: JuzheZhong | Time: 2023-11-01 02:31:31 UTC
+  Text: Fixed
+

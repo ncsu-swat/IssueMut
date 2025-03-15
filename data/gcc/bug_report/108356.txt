@@ -1,0 +1,176 @@
+Bug Summary: [13 Regression] Dead Code Elimination Regression at -O2 since r13-434-g6b156044c12bc4
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Yann Girsberger | Time: 2023-01-10 12:50:54 UTC
+  Text: Createdattachment 54231[details]presented code as file
+
+cat case.c #93
+char a;
+static char c = 3;
+char d;
+void foo();
+short(b)(short e, short f) { return e + f; }
+int main() {
+  unsigned g = 0;
+  if (c)
+    ;
+  else
+    foo();
+  for (; g < 2; g = b(g, 2)) {
+    d = g ? 0 : a;
+    if (g)
+      c = 0;
+  }
+}
+
+`gcc-cb93c5f8008b95743b741d6f1842f9be50c6985c (trunk) -O2` can not eliminate `foo` but `gcc-releases/gcc-12.2.0 -O2` can.
+
+`gcc-cb93c5f8008b95743b741d6f1842f9be50c6985c (trunk) -O2 -S -o /dev/stdout case.c`
+--------- OUTPUT ---------
+main:
+.LFB1:
+	.cfi_startproc
+	subq	$8, %rsp
+	.cfi_def_cfa_offset 16
+	cmpb	$0, c(%rip)
+	je	.L6
+.L4:
+	movzbl	a(%rip), %eax
+	movb	%al, d(%rip)
+	xorl	%eax, %eax
+	addq	$8, %rsp
+	.cfi_remember_state
+	.cfi_def_cfa_offset 8
+	ret
+.L6:
+	.cfi_restore_state
+	xorl	%eax, %eax
+	call	foo
+	jmp	.L4
+---------- END OUTPUT ---------
+
+
+`gcc-releases/gcc-12.2.0 -O2 -S -o /dev/stdout case.c`
+--------- OUTPUT ---------
+main:
+.LFB1:
+	.cfi_startproc
+	movzbl	a(%rip), %eax
+	movb	%al, d(%rip)
+	xorl	%eax, %eax
+	ret
+---------- END OUTPUT ---------
+
+
+Bisects to:https://gcc.gnu.org/git/?p=gcc.git;a=commit;h=6b156044c12bc4582511fe270b10450c943476dd
+
+- User: Andrew Macleod | Time: 2023-01-10 16:16:57 UTC
+  Text: From ccp2 :
+
+Simulating block 2
+
+Visiting statement:
+c.2_1 = c;
+which is likely CONSTANT
+Lattice value changed to VARYING.  Adding SSA edges to worklist.
+
+
+Whereas in GCC12 I see:
+
+Simulating block 2
+
+Visiting statement:
+c.2_1 = c;
+which is likely CONSTANT
+Lattice value changed to CONSTANT 3.  Adding SSA edges to worklist.
+marking stmt to be not simulated again
+
+
+So we use to pick up that the memory load produces a 3 in CCP, but we no longer do.   I'm not sure how that specified ranger cache patch causes this?    ISTR some other PR where we aren't picking up a constant from a memory load as well.
+
+- User: Richard Biener | Time: 2023-01-10 16:26:29 UTC
+  Text: (In reply to Andrew Macleod fromcomment #1)> From ccp2 :
+> 
+> Simulating block 2
+> 
+> Visiting statement:
+> c.2_1 = c;
+> which is likely CONSTANT
+> Lattice value changed to VARYING.  Adding SSA edges to worklist.
+> 
+> 
+> Whereas in GCC12 I see:
+> 
+> Simulating block 2
+> 
+> Visiting statement:
+> c.2_1 = c;
+> which is likely CONSTANT
+> Lattice value changed to CONSTANT 3.  Adding SSA edges to worklist.
+> marking stmt to be not simulated again
+> 
+> 
+> So we use to pick up that the memory load produces a 3 in CCP, but we no
+> longer do.   I'm not sure how that specified ranger cache patch causes this?
+> ISTR some other PR where we aren't picking up a constant from a memory load
+> as well.The store c = 0 needs to be eliminated before IPA for that to work (and c
+promoted constant).  Possibly some change in jump-threading?
+
+- User: Andrew Macleod | Time: 2023-01-10 16:55:00 UTC
+  Text: Hmm. It is not eliminated until VRP1 now.  Looks like something in EVRP.  lets see...
+
+- User: Andrew Macleod | Time: 2023-01-13 21:37:56 UTC
+  Text: Createdattachment 54270[details]possible patch
+
+When the on-entry cache is updated for a block, all incoming ranges are unioned together and the result saved.  Some of those blocks may turn out to be unexecutable, with that information already reflected in the cache.  When updating, intersect the new value with the original to avoid losing this information.
+
+This patch fixes the problem so the cache never loses information once it has it.  However, its causing a regression in c-c++-common/Warray-bounds-3.c in the wrestrict pass for some reason:
+
+ T (char, 9, a, a + SAR ( 0,  6), 3);   /* { dg-warning "forming offset 9 is out of the bounds \\\[0, 9] of object " "memcpy" } */
+
+is now issuing the message with an offset of -1 instead of 9, even though every range I can find is still the same,   I spent some time looking at it, but have a hard time figuring out what wrestrict is actually doing. 
+
+I'll keep looking at it next week to see if I can figure out what is going on..
+
+- User: Andrew Macleod | Time: 2023-01-13 22:23:24 UTC
+  Text: The full comment is the test case is:
+
+/* Verify offsets in an anti-range.  */
+<...>
+
+ /* The initial source range is valid but the final range after the access
+     has complete cannot be.  The value mentioned in the warning is the final
+     offset, i.e., 7 + 3.  Including the whole final range because would be
+     confusing (the upper bound would either be negative or a very large
+     positive number) so only the lower bound is included.  */
+  T (char, 9, a, a + SAR ( 0,  6), 3);   /* { dg-warning "forming offset 9 is out of the bounds \\\[0, 9] of object " "memcpy" } */
+
+I'm not sure what it means exactly, but I presume -1 is a bad thing. I find it marginally disturbing that this is happening in a function that is focused on "verifying offsets in an anti-range"  as we move away from anti-ranges. 
+
+That one of 7 warnings affected in this function.
+
+- User: GCC Commits | Time: 2023-02-01 14:27:20 UTC
+  Text: The master branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:881bf8de9b07fb501d61ade8f521f1cc9dbe712ecommitr13-5630-g881bf8de9b07fb501d61ade8f521f1cc9dbe712eAuthor: Andrew MacLeod <amacleod@redhat.com>
+Date:   Tue Jan 10 13:40:56 2023 -0500
+
+    Ranger cache - always use range_from_dom when updating.
+    
+    When updating an existing range, if we dont query the dom tree, we can
+    get the global range instead of a proper range on some incoming edges
+    which cause the range to not be refined properly.PR tree-optimization/108356gcc/
+            * gimple-range-cache.cc (ranger_cache::range_on_edge): Always
+            do a search of the DOM tree for a range.
+    
+            gcc/testsuite/
+            * gcc.dg/pr108356.c: New.
+
+- User: Andrew Macleod | Time: 2023-02-01 14:27:52 UTC
+  Text: Fixed.
+

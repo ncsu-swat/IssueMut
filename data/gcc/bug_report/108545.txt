@@ -1,0 +1,192 @@
+Bug Summary: [13 Regression] ICE in install_var_field, at omp-low.cc:799 since r13-2665-g23baa717c991d77f
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code, openmp
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: G. Steinmetz | Time: 2023-01-25 17:50:55 UTC
+  Text: Started between 20220911 and 20220918 :
+
+
+$ cat z1.f90
+program p
+   type t
+      integer, pointer :: a(:)
+   end type
+   type(t), volatile :: x
+   !$omp target enter data map(to: x%a)
+end
+
+
+$ cat z2.f90
+program p
+   type t
+      integer, pointer :: a(:)
+   end type
+   type(t) :: x
+   !$omp target enter data map(to: x%a)
+end
+
+
+$ gfortran-13-20230122 -c z2.f90 -fopenmp
+$ gfortran-12          -c z1.f90 -fopenmp
+$
+$ gfortran-13-20230122 -c z1.f90 -fopenmp
+during GIMPLE pass: omplower
+z1.f90:6:39:
+
+    6 |    !$omp target enter data map(to: x%a)
+      |                                       ^
+internal compiler error: in install_var_field, at omp-low.cc:799
+0xc6accb install_var_field
+        ../../gcc/omp-low.cc:798
+0xc6f882 scan_sharing_clauses
+        ../../gcc/omp-low.cc:1678
+0xc71c24 scan_omp_target
+        ../../gcc/omp-low.cc:3111
+0xc7282d scan_omp_1_stmt
+        ../../gcc/omp-low.cc:4327
+0xaf96a6 walk_gimple_stmt(gimple_stmt_iterator*, tree_node* (*)(gimple_stmt_iterator*, bool*, walk_stmt_info*), tree_node* (*)(tree_node**, int*, void*), walk_stmt_info*)
+        ../../gcc/gimple-walk.cc:608
+0xaf9880 walk_gimple_seq_mod(gimple**, tree_node* (*)(gimple_stmt_iterator*, bool*, walk_stmt_info*), tree_node* (*)(tree_node**, int*, void*), walk_stmt_info*)
+        ../../gcc/gimple-walk.cc:51
+0xaf9761 walk_gimple_stmt(gimple_stmt_iterator*, tree_node* (*)(gimple_stmt_iterator*, bool*, walk_stmt_info*), tree_node* (*)(tree_node**, int*, void*), walk_stmt_info*)
+        ../../gcc/gimple-walk.cc:635
+0xaf9880 walk_gimple_seq_mod(gimple**, tree_node* (*)(gimple_stmt_iterator*, bool*, walk_stmt_info*), tree_node* (*)(tree_node**, int*, void*), walk_stmt_info*)
+        ../../gcc/gimple-walk.cc:51
+0xaf9761 walk_gimple_stmt(gimple_stmt_iterator*, tree_node* (*)(gimple_stmt_iterator*, bool*, walk_stmt_info*), tree_node* (*)(tree_node**, int*, void*), walk_stmt_info*)
+        ../../gcc/gimple-walk.cc:635
+0xaf9880 walk_gimple_seq_mod(gimple**, tree_node* (*)(gimple_stmt_iterator*, bool*, walk_stmt_info*), tree_node* (*)(tree_node**, int*, void*), walk_stmt_info*)
+        ../../gcc/gimple-walk.cc:51
+0xc6852d scan_omp
+        ../../gcc/omp-low.cc:4377
+0xc7c73a execute_lower_omp
+        ../../gcc/omp-low.cc:14691
+0xc7c73a execute
+        ../../gcc/omp-low.cc:14755
+
+- User: Martin Liška | Time: 2023-01-26 09:41:28 UTC
+  Text: Started withr13-2665-g23baa717c991d77f.
+
+- User: Tobias Burnus | Time: 2023-02-24 14:19:00 UTC
+  Text: !$omp target enter data map(to: x%a)
+
+The original tree has the expected:
+
+#pragma omp target enter data
+ map(to:x.a [len: 64])
+ map(to:*(integer(kind=4)[0:] *) x.a.data [len: D.4282 * 4])
+ map(always_pointer:(integer(kind=4)[0:] *) x.a.data [pointer assign, bias: 0])
+
+The gimple dump adds a single 'struct':
+
+#pragma omp target enter data
+ map(struct:x [len: 1])
+ map(to:x.a [len: 64])
+map(struct:x [len: 1])
+map(alloc:x.a.data [len: 8])
+ map(to:MEM <integer(kind=4)[0:]> [(integer(kind=4)[0:] *)_6] [len: _5])
+ map(always_pointer:x.a.data [pointer assign, bias: 0])
+
+The nonindented lines are new in GCC 13 (mainline) compared to GCC 12
+and obviously wrong.
+
+ * * *
+
+Observations:
+* OG12 is not affected but it also does not have the commitr13-2665-g23baa717c991d77f206a9358ce2c04960ccf9eea"struct sibling list gimplification extension and rework"
+
+* Except for an added 'always', the dump does not change with my pending
+  patchhttps://gcc.gnu.org/pipermail/gcc-patches/2023-February/612678.html"Fortran/OpenMP: Fix mapping of array descriptors and deferred-length strings"
+
+- User: Tobias Burnus | Time: 2023-02-24 14:46:38 UTC
+  Text: Fortran: Same issue (ICE) also with:
+   !$omp target enter data map(to: x)
+
+Crucial is the VOLATILE attribute.
+
+ * * *
+
+The following C code already gives an ICE with GCC 12, it works with GCC 11.
+(Either of the two lines fail. I think that's invalid OpenMP code, but
+I do not have a real overview about 'map' - and I fear no one has.)
+
+
+volatile struct t {
+  struct t2 { int *a; int c; } u;
+  int b;
+} my_struct;
+volatile struct t3 { int *a; int c; } my_struct3;
+
+void f() {
+  #pragma omp target enter data map(to:my_struct.u) map(to:my_struct.u.a)
+  #pragma omp target enter data map(to:my_struct3) map(to:my_struct3.a)
+}
+
+- User: Tobias Burnus | Time: 2023-02-24 15:53:56 UTC
+  Text: For the C/C++ testcase ofcomment 3, bisecting points to
+  commitr12-5835-g0ab29cf0bb68960c1f87405f14b4fb2109254e2f"openmp: Improve OpenMP target support for C++ (PR92120)"
+
+- User: Tobias Burnus | Time: 2023-02-28 11:24:59 UTC
+  Text: Createdattachment 54554[details]Draft patch - adds and uses tree_operand_sideeff_hash
+
+The patch does what I wrote last: Adds 
+
+The problem (for the Fortran testcase but probably for both) occurs for
+omp_mapped_by_containing_struct's
+         omp_mapping_group **wholestruct = grpmap->get (wsdecl);
+where 'wsdecl' is 'x.a'.
+
+If I look at operand_equal_p – invoked by 'tree_operand_hash::equal,
+I get 'true' without 'volatile' and 'false' with.
+
+The only difference is "side-effects volatile" for the component_ref and that "component_ref 0x7ffff6e25e70" are not identical but different tree; the arguments etc. are identical.
+
+
+In operand_compare::operand_equal_p there is:
+
+  if (arg0 == arg1 && ! (flags & OEP_ONLY_CONST)
+      && (TREE_CODE (arg0) == SAVE_EXPR
+          || (flags & OEP_MATCH_SIDE_EFFECTS)
+          || (! TREE_SIDE_EFFECTS (arg0) && ! TREE_SIDE_EFFECTS (arg1))))
+    return true;
+
+Thus, it seems as if we need a variant of 
+gcc/tree-hash-traits.h that passes not 0 but OEP_MATCH_SIDE_EFFECTS as flag
+to  operand_equal_p.
+
+- User: GCC Commits | Time: 2023-03-01 14:24:58 UTC
+  Text: The master branch has been updated by Tobias Burnus <burnus@gcc.gnu.org>:https://gcc.gnu.org/g:3843dc1460259fbca1f336b0259f0b6b527d77aecommitr13-6394-g3843dc1460259fbca1f336b0259f0b6b527d77aeAuthor: Tobias Burnus <tobias@codesourcery.com>
+Date:   Wed Mar 1 15:11:53 2023 +0100
+
+    OpenMP: Ignore side-effects when finding struct comps [PR108545]
+    
+    With volatile, two 'x.data' comp refs aren't regarded as identical,
+    causing that the two items in the first map of
+      map(to:x.a, x.a.data) map(pset: x.a.data)
+    end up in separate 'map(struct:x)', which will cause a later ICE.
+    
+    Solution: Ignore side effects when checking the operands in the hash
+    for being equal. (Do so by creating a variant of tree_operand_hash
+    that calls operand_equal_p with OEP_MATCH_SIDE_EFFECTS.)
+    
+    gcc/ChangeLog:PR middle-end/108545* gimplify.cc (struct tree_operand_hash_no_se): New.
+            (omp_index_mapping_groups_1, omp_index_mapping_groups,
+            omp_reindex_mapping_groups, omp_mapped_by_containing_struct,
+            omp_tsort_mapping_groups_1, omp_tsort_mapping_groups,
+            oacc_resolve_clause_dependencies, omp_build_struct_sibling_lists,
+            gimplify_scan_omp_clauses): Use tree_operand_hash_no_se instead
+            of tree_operand_hash.
+    
+    gcc/testsuite/ChangeLog:PR middle-end/108545* c-c++-common/gomp/map-8.c: New test.
+            * gfortran.dg/gomp/map-9.f90: New test.
+
+- User: Tobias Burnus | Time: 2023-03-01 14:28:50 UTC
+  Text: FIXED on mainline (GCC 13).
+
+Thanks for this any many other reports!
+

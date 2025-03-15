@@ -1,0 +1,499 @@
+Bug Summary: [14 Regression] wrong code with vector compares and vector lowering
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: patch, wrong-code
+Known to Work: 13.2.1
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-07-26 15:42:18 UTC
+  Text: Createdattachment 55639[details]reduced testcase
+
+Output:
+$ aarch64-unknown-linux-gnu-gcc -O testcase.c -static && ./a.out
+$ x86_64-pc-linux-gnu-gcc -O testcase.c -static && ./a.out
+$ armv7a-hardfloat-linux-gnueabi-gcc -O testcase.c -static && ./a.out
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted
+$ mips64el-unknown-linux-gnuabi64-gcc -O testcase.c -static && ./a.out
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted
+$ mipsel-unknown-linux-gnu-gcc -O testcase.c -static && ./a.out
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted
+$ powerpc64-unknown-linux-gnu-gcc -O testcase.c -static && ./a.out
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted
+$ powerpc64le-unknown-linux-gnu-gcc -O testcase.c -static && ./a.out
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted
+$ powerpc-unknown-linux-gnu-gcc -O testcase.c -static && ./a.out
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted
+$ riscv64-unknown-linux-gnu-gcc -O testcase.c -static && ./a.out
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted
+
+armv7a-hardfloat-linux-gnueabi-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-armv7a-hardfloat/bin/armv7a-hardfloat-linux-gnueabi-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-20230726115220-g819f3d3692c-checking-yes-rtl-df-extra-sanitizer-armv7a-hardfloat/bin/../libexec/gcc/armv7a-hardfloat-linux-gnueabi/14.0.0/lto-wrapper
+Target: armv7a-hardfloat-linux-gnueabi
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --with-cloog --with-ppl --with-isl --enable-libsanitizer --with-float=hard --with-fpu=vfpv4 --with-arch=armv7-a --with-sysroot=/usr/armv7a-hardfloat-linux-gnueabi --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=armv7a-hardfloat-linux-gnueabi --with-ld=/usr/bin/armv7a-hardfloat-linux-gnueabi-ld --with-as=/usr/bin/armv7a-hardfloat-linux-gnueabi-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-20230726115220-g819f3d3692c-checking-yes-rtl-df-extra-sanitizer-armv7a-hardfloat
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20230726 (experimental) (GCC) 
+
+$
+
+- User: Andrew Pinski | Time: 2023-07-26 17:44:15 UTC
+  Text: This testcase fails with -mno-sse on x86_64 at -O1:
+```
+typedef unsigned char u8;
+typedef unsigned __attribute__((__vector_size__ (8))) V;
+
+V v;
+unsigned char c;
+
+int
+main (void)
+{
+  V x = (v > 0) > (v != c);
+ // V x = foo ();
+  if (x[0] || x[1])
+    __builtin_abort ();
+  return 0;
+}
+```
+
+- User: Andrew Pinski | Time: 2023-07-26 17:57:15 UTC
+  Text: Confirmed.
+
+- User: Richard Biener | Time: 2023-07-27 07:26:55 UTC
+  Text: Hmm, we lower from
+
+  v.0_1 = v;
+  _2 = v.0_1 != { 0, 0 };
+  c.1_8 = c;
+  _4 = (unsigned int) c.1_8;
+  _3 = {_4, _4};
+  _10 = v.0_1 == _3;
+  _9 = _2 | _10;
+  _5 = VEC_COND_EXPR <_9, { 0, 0 }, { -1, -1 }>;
+  _6 = VIEW_CONVERT_EXPR<long unsigned int>(_5);
+  if (_6 != 0)
+
+that's v != 0 | v == c, I don't think that's equal to the original expression.
+
+Some match.pd pattern goes wrong here I think, possibly not honoring the
+sign of vector bools.
+
+goes wrong during forwprop1:
+
+--- a-t2.c.034t.ccp1    2023-07-27 09:22:25.683940331 +0200
++++ a-t2.c.035t.forwprop1       2023-07-27 09:22:25.683940331 +0200
+@@ -6,19 +6,14 @@
+ Applying pattern match.pd:4716, gimple-match-2.cc:16058
+ Applying pattern match.pd:4586, gimple-match-2.cc:9314
+ Applying pattern match.pd:4586, gimple-match-2.cc:11869
++Applying pattern match.pd:5327, gimple-match-8.cc:3364
++Matching expression match.pd:1979, gimple-match-7.cc:91
++Applying pattern match.pd:4683, gimple-match-2.cc:15638
++Matching expression match.pd:1979, gimple-match-7.cc:91
+...
+@@ -48,10 +45,12 @@
+   v.2_7 = v;
+   _8 = _4 != v.2_7;
+   _9 = VEC_COND_EXPR <_8, { -1, -1 }, { 0, 0 }>;
+-  _10 = _3 > _9;
+-  _11 = VEC_COND_EXPR <_10, { -1, -1 }, { 0, 0 }>;
++  _10 = VEC_COND_EXPR <_2, { 0, 0 }, _8>;
++  _18 = _4 == v.2_7;
++  _17 = _2 | _18;
++  _11 = VEC_COND_EXPR <_17, { 0, 0 }, { -1, -1 }>;
+   _12 = VIEW_CONVERT_EXPR<V>(_11);
+-  _13 = VIEW_CONVERT_EXPR<long unsigned int>(_12);
++  _13 = VIEW_CONVERT_EXPR<long unsigned int>(_11);
+   if (_13 != 0)
+
+- User: Andrew Pinski | Time: 2023-07-27 07:57:35 UTC
+  Text: >that's v != 0 | v == c, I don't think that's equal to the original expression.It is.
+
+Here is the proof there:
+((v > 0) ? -1 : 0) > ((v != c) ? -1 : 0)
+v is unsigned char:
+((v != 0) ? -1 : 0) > ((v != c) ? -1 : 0)
+
+((v != 0) ? (-1 > ((v != c) ? -1 : 0)) : 0 > (((v != c) ? -1 : 0)))
+
+(v != 0) ? 0 : (((v == c) ? -1 : 0))
+
+((v != 0) | (v == c)) ? -1 : 0
+
+- User: Andrew Pinski | Time: 2023-07-27 07:59:29 UTC
+  Text: veclower produces:
+  _36 = BIT_FIELD_REF <_9, 32, 0>;
+  _37 = _36 != 0;
+  _38 = _36 == 0;
+  _39 = (signed int) _38;
+  _40 = (signed int) _36;
+  _41 = _40 + -1;
+  _42 = BIT_FIELD_REF <_9, 32, 32>;
+  _43 = _42 != 0;
+  _44 = _42 == 0;
+  _45 = (signed int) _44;
+  _46 = (signed int) _42;
+  _47 = _46 + -1;
+  _5 = {_41, _47};(In reply to Andrew Pinski fromcomment #4)> >that's v != 0 | v == c, I don't think that's equal to the original expression.
+> 
+> It is.
+> 
+> Here is the proof there:
+> ((v > 0) ? -1 : 0) > ((v != c) ? -1 : 0)
+> v is unsigned char:Sorry it is unsigned (not unsigned char).
+
+- User: Andrew Pinski | Time: 2023-07-27 08:06:54 UTC
+  Text: _5 = VEC_COND_EXPR <_9, { 0, 0 }, { -1, -1 }>;
+  _6 = VIEW_CONVERT_EXPR<long unsigned intD.10>(_5);
+
+From that veclower produces:
+  <signed-boolean:32> _36;
+
+  _36 = BIT_FIELD_REF <_9, 32, 0>;
+  _37 = _36 != 0;
+  _38 = _36 == 0;
+  _39 = (signed int) _38;
+  _40 = (signed int) _36;
+  _41 = _40 + -1;
+  _42 = BIT_FIELD_REF <_9, 32, 32>;
+  _43 = _42 != 0;
+  _44 = _42 == 0;
+  _45 = (signed int) _44;
+  _46 = (signed int) _42;
+  _47 = _46 + -1;
+  _5 = {_41, _47};
+  _6 = VIEW_CONVERT_EXPR<long unsigned intD.10>(_5);
+
+Which looks wrong. that is 
+
+
+  _38 = _36 == 0;
+  _40 = (signed int) _36;
+  _41 = _40 + -1;
+
+  _36 == 0 ? 0 : -1
+
+which is the wrong way around ...
+
+GCC 13 veclower produced:
+  <signed-boolean:32> _32;
+
+  _32 = BIT_FIELD_REF <_7, 32, 0>;
+  _33 = (_BoolD.2306) _32;
+  _34 = ~_33;
+  _35 = (intD.6) _34;
+  _36 = _32 & 1;
+  _37 = (intD.6) _36;
+  _38 = _37 + -1;
+
+Which is: (_32 & 1) ? 0 :  - 1;
+
+- User: Andrew Pinski | Time: 2023-07-27 08:16:18 UTC
+  Text: (In reply to Andrew Pinski fromcomment #6)>   _5 = VEC_COND_EXPR <_9, { 0, 0 }, { -1, -1 }>;
+>   _6 = VIEW_CONVERT_EXPR<long unsigned intD.10>(_5);
+> 
+> From that veclower produces:
+>   <signed-boolean:32> _36;...>   _38 = _36 == 0;
+>   _40 = (signed int) _36;
+>   _41 = _40 + -1;
+> 
+>   _36 == 0 ? 0 : -1I read it wrong, actually it is:
+_40 = (signed int) _36
+_41 = _40 + - 1;
+
+Which gives -2 and -1 rather than -1 and 0 ...
+
+- User: Andrew Pinski | Time: 2023-07-27 08:26:11 UTC
+  Text: The problem is:
+_37 = _36 != 0;
+
+is not being used but I can't see how though.
+
+- User: Andrew Pinski | Time: 2023-07-27 20:42:10 UTC
+  Text: Here is a reduced testcase that does not need -mno-sse or any other option but fails everywhere:
+```
+typedef unsigned __attribute__((__vector_size__ (1*sizeof(unsigned)))) V;
+
+V v;
+unsigned char c;
+
+int
+main (void)
+{
+  V x = (v > 0) > (v != c);
+  volatile signed int t = x[0];
+  if (t)
+    __builtin_abort ();
+  return 0;
+}
+```
+
+t in this case is -2
+
+- User: Zdenek Sojka | Time: 2023-09-01 10:29:13 UTC
+  Text: Probably related, even simpler testcase, failing everywhere at -O0:
+
+$ cat testcase.c
+typedef unsigned long __attribute__((__vector_size__ (8))) V;
+
+int
+main (void)
+{
+  V v = ~((V) { } <=0);
+  if (v[0])
+    __builtin_abort ();
+  return 0;
+}
+$ x86_64-pc-linux-gnu-gcc testcase.c && ./a.out
+Aborted
+$ aarch64-unknown-linux-gnu-gcc testcase.c -static && ./a.out
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted
+
+- User: Andrew Pinski | Time: 2023-09-01 10:34:40 UTC
+  Text: (In reply to Zdenek Sojka fromcomment #10)> Probably related, even simpler testcase, failing everywhere at -O0:
+> 
+> $ cat testcase.c
+> typedef unsigned long __attribute__((__vector_size__ (8))) V;
+> 
+> int
+> main (void)
+> {
+>   V v = ~((V) { } <=0);
+>   if (v[0])
+>     __builtin_abort ();
+>   return 0;
+> }But unsigned<=0 is always false and taking the bitwise not of that is always -1.
+
+- User: Zdenek Sojka | Time: 2023-09-01 11:07:03 UTC
+  Text: (In reply to Andrew Pinski fromcomment #11)> (In reply to Zdenek Sojka fromcomment #10)
+> > Probably related, even simpler testcase, failing everywhere at -O0:
+> > 
+> > $ cat testcase.c
+> > typedef unsigned long __attribute__((__vector_size__ (8))) V;
+> > 
+> > int
+> > main (void)
+> > {
+> >   V v = ~((V) { } <=0);
+> >   if (v[0])
+> >     __builtin_abort ();
+> >   return 0;
+> > }
+> 
+> But unsigned<=0 is always false and taking the bitwise not of that is always
+> -1.Interesting, all the gcc's starting from gcc-6 up to gcc-13 at -O0 to -O3 (including 32bit and 64bit targets) seem to "PASS" on this testcase.
+
+... wait, no, (unsigned)0 <= 0 is TRUE ...
+
+- User: Andrew Pinski | Time: 2023-09-01 20:17:07 UTC
+  Text: (In reply to Zdenek Sojka fromcomment #12)> Interesting, all the gcc's starting from gcc-6 up to gcc-13 at -O0 to -O3
+> (including 32bit and 64bit targets) seem to "PASS" on this testcase.
+> 
+> ... wait, no, (unsigned)0 <= 0 is TRUE ...Oh you are correct I read it incorrectly.
+Anyways it is definitely a bug in veclower; looking into it.
+  _1 = { -1 };
+  _9 = VIEW_CONVERT_EXPR<<signed-boolean:64>>(_1);
+  _10 = _9 != 0;
+  _11 = _9 == 0;
+  _12 = (unsigned long) _11;
+  _13 = (unsigned long) _9;
+  _14 = _13 + 18446744073709551615;
+  _2 = {_14};
+
+That produces:
+_14 = _13 - 1; or rather _9 - 1 .
+I suspect there is a missing check somewhere in match.pd really ...
+
+- User: Andrew Pinski | Time: 2023-09-01 20:45:58 UTC
+  Text: So I suspecting it is this pattern:
+/* -(type)!A -> (type)A - 1.  */
+(simplify
+ (negate (convert?:s (logical_inverted_value:s @0)))
+ (if (INTEGRAL_TYPE_P (type)
+      && TREE_CODE (type) != BOOLEAN_TYPE
+      && TYPE_PRECISION (type) > 1
+      && TREE_CODE (@0) == SSA_NAME
+      && ssa_name_has_boolean_range (@0))
+  (plus (convert:type @0) { build_all_ones_cst (type); })))
+
+We start out with:
+-(unsigned int)(bool:31 == 0)
+
+Yes bool:31 == 0 will have 0/1 but bool:31 does not.
+
+Even more:
+bool
+ssa_name_has_boolean_range (tree op)
+{
+  gcc_assert (TREE_CODE (op) == SSA_NAME);
+
+  /* Boolean types always have a range [0..1].  */
+  if (TREE_CODE (TREE_TYPE (op)) == BOOLEAN_TYPE)
+    return true;
+
+Changing that pattern to:
+/* -(type)!A -> (type)A - 1.  */
+(simplify
+ (negate (convert?:s (logical_inverted_value:s zero_one_valued_p@0)))
+ (if (INTEGRAL_TYPE_P (type)
+      && TREE_CODE (type) != BOOLEAN_TYPE
+      && TYPE_PRECISION (type) > 1)
+  (plus (convert:type @0) { build_all_ones_cst (type); })))
+
+Fixes the testcase incomment #10and should fix the original issue too.
+
+- User: Andrew Pinski | Time: 2023-09-01 20:48:51 UTC
+  Text: (In reply to Andrew Pinski fromcomment #14)> Even more:
+> bool
+> ssa_name_has_boolean_range (tree op)
+> {
+>   gcc_assert (TREE_CODE (op) == SSA_NAME);
+> 
+>   /* Boolean types always have a range [0..1].  */
+>   if (TREE_CODE (TREE_TYPE (op)) == BOOLEAN_TYPE)
+>     return true;The other fix is for the above to check if the boolean type is signed or not ...
+
+- User: Andrew Pinski | Time: 2023-09-01 21:02:26 UTC
+  Text: Or just change ssa_name_has_boolean_range to use gimple_zero_one_valued_p instead:
+
+extern bool gimple_zero_one_valued_p (tree t, tree (*valueize)(tree));
+bool
+ssa_name_has_boolean_range (tree op)
+{
+  gcc_assert (TREE_CODE (op) == SSA_NAME);
+  return gimple_zero_one_valued_p (op, NULL);
+}
+
+Later on we can remove the ssa_name_has_boolean_range wrapper around gimple_zero_one_valued_p  too ...
+
+- User: Andrew Pinski | Time: 2023-09-01 21:40:18 UTC
+  Text: (In reply to Andrew Pinski fromcomment #16)> Or just change ssa_name_has_boolean_range to use gimple_zero_one_valued_p
+> instead:
+> 
+> extern bool gimple_zero_one_valued_p (tree t, tree (*valueize)(tree));
+> bool
+> ssa_name_has_boolean_range (tree op)
+> {
+>   gcc_assert (TREE_CODE (op) == SSA_NAME);
+>   return gimple_zero_one_valued_p (op, NULL);
+> }
+> 
+> Later on we can remove the ssa_name_has_boolean_range wrapper around
+> gimple_zero_one_valued_p  too ...But get_nonzero_bits needs to change to use not just the cached version of the range (nonzero bits) but instead `get_range_query (cfun)->range_of_expr`.
+
+Anyways I have a fix still and this should fix other issues too ...
+
+- User: Andrew Pinski | Time: 2023-09-01 21:53:29 UTC
+  Text: (In reply to Andrew Pinski fromcomment #17)> (In reply to Andrew Pinski fromcomment #16)
+> > Or just change ssa_name_has_boolean_range to use gimple_zero_one_valued_p
+> > instead:
+> > 
+> > extern bool gimple_zero_one_valued_p (tree t, tree (*valueize)(tree));
+> > bool
+> > ssa_name_has_boolean_range (tree op)
+> > {
+> >   gcc_assert (TREE_CODE (op) == SSA_NAME);
+> >   return gimple_zero_one_valued_p (op, NULL);
+> > }
+> > 
+> > Later on we can remove the ssa_name_has_boolean_range wrapper around
+> > gimple_zero_one_valued_p  too ...
+> 
+> But get_nonzero_bits needs to change to use not just the cached version of
+> the range (nonzero bits) but instead `get_range_query (cfun)->range_of_expr`.
+> 
+> Anyways I have a fix still and this should fix other issues too ...Except that does not work as we remove now during evrp too many __builtin_unreachable's.
+
+So back to drawing board for a second.
+
+- User: Andrew Pinski | Time: 2023-09-02 01:09:22 UTC
+  Text: (In reply to Andrew Pinski fromcomment #14)> So I suspecting it is this pattern:
+> /* -(type)!A -> (type)A - 1.  */
+> (simplify
+>  (negate (convert?:s (logical_inverted_value:s @0)))
+>  (if (INTEGRAL_TYPE_P (type)
+>       && TREE_CODE (type) != BOOLEAN_TYPE
+>       && TYPE_PRECISION (type) > 1
+>       && TREE_CODE (@0) == SSA_NAME
+>       && ssa_name_has_boolean_range (@0))
+>   (plus (convert:type @0) { build_all_ones_cst (type); })))
+> 
+> We start out with:
+> -(unsigned int)(bool:31 == 0)
+> 
+> Yes bool:31 == 0 will have 0/1 but bool:31 does not.
+> 
+> Even more:
+> bool
+> ssa_name_has_boolean_range (tree op)
+> {
+>   gcc_assert (TREE_CODE (op) == SSA_NAME);
+> 
+>   /* Boolean types always have a range [0..1].  */
+>   if (TREE_CODE (TREE_TYPE (op)) == BOOLEAN_TYPE)
+>     return true;In the end I decided to just delete the above check.
+
+- User: Andrew Pinski | Time: 2023-09-02 02:33:21 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2023-September/629152.html
+
+- User: Andrew Pinski | Time: 2023-09-22 05:21:13 UTC
+  Text: ***Bug 111534has been marked as a duplicate of this bug. ***
+
+- User: Richard Biener | Time: 2023-10-17 12:17:04 UTC
+  Text: Patch was approved I think?
+
+- User: GCC Commits | Time: 2023-10-17 22:44:24 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:5e4abf4233cd34212680cca700d6438445e6a16acommitr14-4695-g5e4abf4233cd34212680cca700d6438445e6a16aAuthor: Andrew Pinski <apinski@marvell.com>
+Date:   Fri Sep 1 22:09:08 2023 +0000
+
+    ssa_name_has_boolean_range vs signed-boolean:31 types
+    
+    This turns out to be a latent bug in ssa_name_has_boolean_range
+    where it would return true for all boolean types but all of the
+    uses of ssa_name_has_boolean_range was expecting 0/1 as the range
+    rather than [-1,0].
+    So when I fixed vector lower to do all comparisons in boolean_type
+    rather than still in the signed-boolean:31 type (to fix a different issue),
+    the pattern in match for `-(type)!A -> (type)A - 1.` would assume A (which
+    was signed-boolean:31) had a range of [0,1] which broke down and sometimes
+    gave us -1/-2 as values rather than what we were expecting of -1/0.
+    
+    This was the simpliest patch I found while testing.
+    
+    We have another way of matching [0,1] range which we could use instead
+    of ssa_name_has_boolean_range except that uses only the global ranges
+    rather than the local range (during VRP).
+    I tried to clean this up slightly by using gimple_match_zero_one_valuedp
+    inside ssa_name_has_boolean_range but that failed because due to using
+    only the global ranges. I then tried to change get_nonzero_bits to use
+    the local ranges at the optimization time but that failed also because
+    we would remove branches to __builtin_unreachable during evrp and lose
+    information as we don't set the global ranges during evrp.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu.PR tree-optimization/110817gcc/ChangeLog:
+    
+            * tree-ssanames.cc (ssa_name_has_boolean_range): Remove the
+            check for boolean type as they don't have "[0,1]" range.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/execute/pr110817-1.c: New test.
+            * gcc.c-torture/execute/pr110817-2.c: New test.
+            * gcc.c-torture/execute/pr110817-3.c: New test.
+
+- User: Andrew Pinski | Time: 2023-10-17 22:44:44 UTC
+  Text: Fixed.
+

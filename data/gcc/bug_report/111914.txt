@@ -1,0 +1,153 @@
+Bug Summary: ICE with function pointer array as argument with non-constant size
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: ice-checking, ice-on-valid-code
+Known to Work: 14.0
+Known to Fail: 7.1.0
+
+Comments:
+- User: wierton | Time: 2023-10-22 02:23:03 UTC
+  Text: Compiler Explorer:https://gcc.godbolt.org/z/Yn354q5zPWhen compile this program with `-O0`, gcc crashes:
+```
+ __attribute__((always_inline))
+void f(int n, int (*a())[n]) {
+}
+
+void g(void)
+{
+  int (*a())[1];
+  f(1, a);
+}
+
+```
+
+Interestingly, `-O1` or above do not trigger the crash.
+
+The full stack dump:
+```
+<source>:2:6: warning: 'always_inline' function might not be inlinable [-Wattributes]
+    2 | void f(int n, int (*a())[n]) {
+      |      ^
+<source>: In function 'g':
+<source>:9:1: error: type mismatch between an SSA_NAME and its symbol
+    9 | }
+      | ^
+<source>:9:1: error: type mismatch between an SSA_NAME and its symbol
+while verifying SSA_NAME a_4 in statement
+a_4 = a;
+during GIMPLE pass: einline
+<source>:9:1: internal compiler error: verify_ssa failed
+0x231f49e internal_error(char const*, ...)
+	???:0
+0x139c15e verify_ssa(bool, bool)
+	???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+```
+
+- User: Andrew Pinski | Time: 2023-10-22 02:31:44 UTC
+  Text: Confirmed, goes back to before GCC 7, maybe before (-fchecking only exist in GCC 7+).
+
+Slightly better testcase:
+```
+
+ __attribute__((always_inline))
+static inline void f(int n, int (*a())[n]) {
+}
+
+void g(void)
+{
+  int (*a())[1];
+  f(1, a);
+}
+
+```
+
+- User: Richard Biener | Time: 2023-10-23 09:17:16 UTC
+  Text: I will have a look.
+
+- User: Richard Biener | Time: 2023-10-23 11:08:18 UTC
+  Text: The issue is we do
+
+setup_one_parameter (copy_body_data *id, tree p, tree value, tree fn,
+                     basic_block bb, tree *vars)
+...
+  /* Make an equivalent VAR_DECL.  Note that we must NOT remap the type
+     here since the type of this decl must be visible to the calling
+     function.  */
+  var = copy_decl_to_var (p, id);
+...
+          else if (!optimize)
+            {
+              def = make_ssa_name (var);
+              init_stmt = gimple_build_assign (def, rhs);
+
+but then
+
+static void
+initialize_inlined_parameters (copy_body_data *id, gimple *stmt,
+                               tree fn, basic_block bb)
+...
+  /* After remapping parameters remap their types.  This has to be done
+     in a second loop over all parameters to appropriately remap
+     variable sized arrays when the size is specified in a
+     parameter following the array.  */
+  for (p = parms, i = 0; p; p = DECL_CHAIN (p), i++)
+    {
+      tree *varp = id->decl_map->get (p);
+      if (varp && VAR_P (*varp))
+        {
+          tree def = (gimple_in_ssa_p (cfun) && is_gimple_reg (p)
+                      ? ssa_default_def (id->src_cfun, p) : NULL);
+          tree var = *varp;
+          TREE_TYPE (var) = remap_type (TREE_TYPE (var), id);
+          /* Also remap the default definition if it was remapped
+             to the default definition of the parameter replacement
+             by the parameter setup.  */
+          if (def)
+            {
+              tree *defp = id->decl_map->get (def);
+              if (defp
+                  && TREE_CODE (*defp) == SSA_NAME
+                  && SSA_NAME_VAR (*defp) == var)
+                TREE_TYPE (*defp) = TREE_TYPE (var);
+
+but we never adjust the type of the SSA names we create during initial
+parameter setup.  We have special handling for the default def but
+not for the (dead?!) stmt we emit when !optimize.  It says
+
+      /* If we are in SSA form properly remap the default definition
+         or assign to a dummy SSA name if the parameter is unused and
+         we are not optimizing.  */
+
+so that seems to be on purpose but it's broken.
+
+- User: Richard Biener | Time: 2023-10-23 11:29:21 UTC
+  Text: Caused byr0-116946-g27eb31c9de20cdI guess.  The easiest is to not perform
+the load of the unused parameter for VLA types, but we can also perform this
+extra load after remapping types.
+
+- User: GCC Commits | Time: 2023-10-23 13:33:09 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:738d44348e7392a9f8e370afa3a9d8c24ee080cdcommitr14-4864-g738d44348e7392a9f8e370afa3a9d8c24ee080cdAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Oct 23 13:29:30 2023 +0200
+
+    ipa/111914 - perform parameter init after remapping types
+    
+    The following addresses a mismatch in SSA name vs. symbol when
+    we emit a dummy assignment when not optimizing.  The temporary
+    we create is not remapped by initialize_inlined_parameters because
+    we have no easy way to get at it.  The following instead emits
+    the additional statement after we have remapped the type of
+    the replacement variable.PR ipa/111914* tree-inline.cc (setup_one_parameter): Move code emitting
+            a dummy load when not optimizing ...
+            (initialize_inlined_parameters): ... here to after when
+            we remapped the parameter type.
+    
+            * gcc.dg/pr111914.c: New testcase.
+
+- User: Richard Biener | Time: 2023-10-23 13:33:35 UTC
+  Text: Fixed on trunk, not worth backporting.
+

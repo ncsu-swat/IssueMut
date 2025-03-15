@@ -1,0 +1,136 @@
+Bug Summary: [14 Regression] s390x miscompilation since r14-322
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jakub Jelinek | Time: 2024-02-23 11:39:44 UTC
+  Text: Sincer14-322-g821ef93976e750c118d42a2ad33b96dbd1b9f3a5the following testcase is miscompiled at -O2 -fopenmp-simd -march=z13 on s390x-linux:
+typedef float V __attribute__((__vector_size__ (16)));
+
+__attribute__((__always_inline__)) inline static float
+foo (V a)
+{
+  float r = 0;
+#pragma omp simd reduction(+:r)
+  for (unsigned long i = 0; i < (sizeof (a) / sizeof (float)); i++)
+    r += a[i];
+  return r;
+}
+
+int
+main ()
+{
+  static const struct { V a; float r; } t[] = {
+    { (V) { -654.47f, -946.98f, -606.16f, 426.64f }, -1780.97f },
+    { (V) { 663.94f, 660.23f, 682.64f, -644.47f }, 1362.34f },
+    { (V) { -909.10f, 23.60f, -382.13f, -563.57f }, -1831.20f }
+  };
+  for (unsigned long i = 0; i < (sizeof (t) / sizeof (t[0])); i++)
+    {
+      float r = foo (t[i].a);
+      if (r < t[i].r - 1.0f || r > t[i].r + 1.0f)
+        __builtin_abort ();
+    }
+}
+
+Before that change, all the 3 results were correct, now all of them are +-0.0f.
+
+- User: Jakub Jelinek | Time: 2024-02-23 11:49:48 UTC
+  Text: Inr14-321this wasn't vectorized, inr14-322it is with vf 2, but the floating point addition is performed in some weird unsigned long operation instead:
+  _14 = VIEW_CONVERT_EXPR<unsigned long>(vect__17.11_42);
+  _32 = VIEW_CONVERT_EXPR<unsigned long>(vect__18.12_29);
+  _35 = _14 ^ _32;
+  _34 = _32 & 9223372034707292159;
+  _33 = _14 & 9223372034707292159;
+  _51 = _35 & 9223372039002259456;
+  _52 = _33 + _34;
+  _53 = _52 ^ _51;
+  _54 = VIEW_CONVERT_EXPR<vector(2) float>(_53);
+  _19 = _17 + _18;
+  MEM <vector(2) float> [(float *)&D.2632] = _54;
+The involved constants are 0x7fffffff7fffffff and 0x8000000080000000.
+Perhaps using the emulated vectors should be restricted only to integer types?
+
+- User: Jakub Jelinek | Time: 2024-02-23 12:03:54 UTC
+  Text: Ah, there ishttps://gcc.gnu.org/pipermail/gcc-patches/2024-February/645928.htmlbut that didn't come up with a testcase.
+Not sure if checking FLOAT_MODE_P is the right thing, whether it wouldn't be better to check !ANY_INTEGRAL_TYPE_P (vectype) or !INTEGRAL_TYPE_P (TREE_TYPE (vectype)).
+
+- User: Jakub Jelinek | Time: 2024-02-23 12:30:24 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #1)> Inr14-321this wasn't vectorized, inr14-322it is with vf 2, but the
+> floating point addition is performed in some weird unsigned long operation
+> instead:
+>   _14 = VIEW_CONVERT_EXPR<unsigned long>(vect__17.11_42);
+>   _32 = VIEW_CONVERT_EXPR<unsigned long>(vect__18.12_29);
+>   _35 = _14 ^ _32;
+>   _34 = _32 & 9223372034707292159;
+>   _33 = _14 & 9223372034707292159;
+>   _51 = _35 & 9223372039002259456;
+>   _52 = _33 + _34;
+>   _53 = _52 ^ _51;
+>   _54 = VIEW_CONVERT_EXPR<vector(2) float>(_53);
+>   _19 = _17 + _18;
+>   MEM <vector(2) float> [(float *)&D.2632] = _54;
+> The involved constants are 0x7fffffff7fffffff and 0x8000000080000000.OT, wouldn't it be cheaper to use 0xffffffff7fffffff and 0x80000000 constants instead,
+i.e. for the MSB just use normal addition/subtraction behavior, there we don't need to be afraid of overflow into another emulated element?
+Though, maybe 0x7f7f7f7f7f7f7f7f and 0x8080808080808080 are cheaper than
+0xff7f7f7f7f7f7f7f and 0x0080808080808080.
+
+- User: N/A | Time: 2024-02-23 13:35:18 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #2)> Ah, there is
+>https://gcc.gnu.org/pipermail/gcc-patches/2024-February/645928.html> but that didn't come up with a testcase.
+> Not sure if checking FLOAT_MODE_P is the right thing, whether it wouldn't be
+> better to check !ANY_INTEGRAL_TYPE_P (vectype) or !INTEGRAL_TYPE_P
+> (TREE_TYPE (vectype)).Hi,
+
+yes, that patch was designed to fix this problem.  But thinking about it, I guess your second suggestion would be better.
+
+- User: N/A | Time: 2024-02-23 13:44:21 UTC
+  Text: Just sent a v2 of the patch including your suggested test and updated the commit message.
+
+- User: GCC Commits | Time: 2024-02-28 10:17:43 UTC
+  Text: The master branch has been updated by Juergen Christ <jchrist@gcc.gnu.org>:https://gcc.gnu.org/g:82ebfd35da49e5df87da132a7b8c41baeebc57b4commitr14-9205-g82ebfd35da49e5df87da132a7b8c41baeebc57b4Author: Juergen Christ <jchrist@linux.ibm.com>
+Date:   Mon Feb 19 10:10:35 2024 +0100
+
+    Only emulate integral vectors.
+    
+    The emulation via word mode tries to perform integer arithmetic on floating
+    point values instead of floating point arithmetic.  This leads to
+    mis-compilations.
+    
+    Failure occured on s390x on these existing test cases:
+    gcc.dg/vect/tsvc/vect-tsvc-s112.c
+    gcc.dg/vect/tsvc/vect-tsvc-s113.c
+    gcc.dg/vect/tsvc/vect-tsvc-s119.c
+    gcc.dg/vect/tsvc/vect-tsvc-s121.c
+    gcc.dg/vect/tsvc/vect-tsvc-s131.c
+    gcc.dg/vect/tsvc/vect-tsvc-s132.c
+    gcc.dg/vect/tsvc/vect-tsvc-s2233.c
+    gcc.dg/vect/tsvc/vect-tsvc-s421.c
+    gcc.dg/vect/vect-alias-check-14.c
+    gcc.target/s390/vector/partial/s390-vec-length-epil-run-1.c
+    gcc.target/s390/vector/partial/s390-vec-length-epil-run-3.c
+    gcc.target/s390/vector/partial/s390-vec-length-full-run-3.c
+    
+    gcc/ChangeLog:PR tree-optimization/114075* tree-vect-stmts.cc (vectorizable_operation): Don't emulate floating
+            point vectors
+    
+    Signed-off-by: Juergen Christ <jchrist@linux.ibm.com>
+
+- User: GCC Commits | Time: 2024-02-28 10:50:44 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:db465230cccf0844e803dd6701756054fe97244acommitr14-9206-gdb465230cccf0844e803dd6701756054fe97244aAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Feb 28 11:49:29 2024 +0100
+
+    testsuite: Add testcase for recently fixed PR [PR114075]
+    
+    This adds testcase fromPR114075which has been fixed by ther14-9205change on s390x-linux with -march=z13.
+    
+    2024-02-28  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114075* gcc.dg/gomp/pr114075.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-28 10:56:14 UTC
+  Text: Fixed, thanks.
+

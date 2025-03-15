@@ -1,0 +1,186 @@
+Bug Summary: [13 Regression] wrong warning: array subscript 0 is outside the bounds of an interior zero-length array ‘struct lock_class_key[3]’
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: diagnostic
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Uroš Bizjak | Time: 2023-03-20 14:26:08 UTC
+  Text: The linux kernel compile fails with gcc-13 in super.c with:
+
+fs/super.c: In function ‘alloc_super.isra’:
+fs/super.c:234:21: error: array subscript 2 is outside the bounds of an interior zero-length array ‘struct lock_class_key[3]’ [-Werror=zero-length-bounds]
+  234 |                 if (__percpu_init_rwsem(&s->s_writers.rw_sem[i],
+      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  235 |                                         sb_writers_name[i],
+      |                                         ~~~~~~~~~~~~~~~~~~~
+  236 |                                         &type->s_writers_key[i]))
+      |                                         ~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from ./include/linux/highmem.h:5,
+                 from ./include/linux/bvec.h:10,
+                 from ./include/linux/blk_types.h:10,
+                 from ./include/linux/blkdev.h:9,
+                 from fs/super.c:26:
+./include/linux/fs.h:2211:31: note: while referencing ‘s_writers_key’
+ 2211 |         struct lock_class_key s_writers_key[SB_FREEZE_LEVELS];
+      |                               ^~~~~~~~~~~~~
+cc1: all warnings being treated as errors
+
+- User: Uroš Bizjak | Time: 2023-03-20 14:27:37 UTC
+  Text: The minimized testcase:
+
+--cut here--
+#define SB_FREEZE_COMPLETE 4
+
+struct lock_class_key { };
+
+struct file_system_type {
+ struct lock_class_key s_writers_key[(SB_FREEZE_COMPLETE - 1)];
+ struct lock_class_key i_lock_key;
+};
+
+void foo (struct file_system_type *type)
+{
+  for (int i = 0; i < (SB_FREEZE_COMPLETE - 1); i++)
+    __builtin_printf ("%p\n", &type->s_writers_key[i]);
+}
+--cut here--
+
+gcc -O2 -Wall:
+
+super-i.c: In function ‘foo’:
+super-i.c:13:5: warning: array subscript 0 is outside the bounds of an interior zero-length array ‘struct lock_class_key[3]’ [-Wzero-length-bounds]
+   13 |     __builtin_printf ("%p\n", &type->s_writers_key[i]);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+super-i.c:6:24: note: while referencing ‘s_writers_key’
+    6 |  struct lock_class_key s_writers_key[(SB_FREEZE_COMPLETE - 1)];
+      |                        ^~~~~~~~~~~~~
+
+- User: Andrew Pinski | Time: 2023-03-20 15:11:22 UTC
+  Text: Confirmed.
+
+- User: Jakub Jelinek | Time: 2023-03-20 16:40:43 UTC
+  Text: Started withr13-4521-g710c9676520dfd38b4bfdcc937ce026ed89921d6
+
+- User: Jakub Jelinek | Time: 2023-03-20 17:20:46 UTC
+  Text: Slightly simplified -O2 -Wall:
+struct S {};
+struct T { struct S s[3]; struct S t; };
+void bar (struct S *);
+
+void
+foo (struct T *t)
+{
+  for (int i = 0; i < 3; i++)
+    bar (&t->s[i]);
+}
+On:
+void
+baz (struct T *t)
+{
+  for (int i = 0; i < 4; i++)
+    bar (&t->s[i]);
+}
+we on the other side don't warn iN GCC 12 even when we probably should:
+fre3 in that case replaces:
+  _10 = &t_5(D)->s[0];
+  bar (_10);
+  _15 = &t_5(D)->s[1];
+  bar (_15);
+  _20 = &t_5(D)->s[2];
+  bar (_20);
+  _25 = &t_5(D)->s[3];
+  bar (_25);
+with
+  _10 = &t_5(D)->s[0];
+  bar (_10);
+  bar (_10);
+  bar (_10);
+  bar (_10);
+and the warning is only in vrp1.
+void
+qux (struct T *t)
+{
+  bar (&t->s[2]);
+}
+
+void
+corge (struct T *t)
+{
+  bar (&t->s[3]);
+}
+are then even simpler cases.r13-4521and later warns for all those, GCC 12 for none of those.
+
+- User: Jakub Jelinek | Time: 2023-03-20 17:42:24 UTC
+  Text: This is complete mess.
+/* Describes a "special" array member for a COMPONENT_REF.  */
+enum struct special_array_member
+  {
+    none,       /* Not a special array member.  */
+    int_0,      /* Interior array member with size zero.  */
+    trail_0,    /* Trailing array member with size zero.  */
+    trail_1,    /* Trailing array member with one element.  */
+    trail_n,    /* Trailing array member with two or more elements.  */
+    int_n       /* Interior array member with one or more elements.  */
+  };
+Why is this defined differently for _0 and _1?  Because what is interior
+array with zero sized elements with 3 members?  Both int_0 because the member has zero size, and int_n because it has one or more elements.
+I think we should make int_0/trail_0 mean with zero elements, anything else is inconsistent.
+
+- User: Jakub Jelinek | Time: 2023-03-20 18:51:12 UTC
+  Text: Createdattachment 54715[details]gcc13-pr109215.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2023-03-21 10:07:14 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:03041e0361cbdd7f541f2f39060759aad866ed58commitr13-6782-g03041e0361cbdd7f541f2f39060759aad866ed58Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Mar 21 11:06:20 2023 +0100
+
+    tree: Fix up component_ref_sam_type handling of arrays of 0 sized elements [PR109215]
+    
+    Our documentation sadly talks about elt_type arr[0]; as zero-length arrays,
+    not arrays with zero elements.  Unfortunately, those aren't the only arrays
+    which can have zero size, the same size can be also result of zero-length
+    element, like in GNU C struct whatever {} or in GNU C/C++ if the element
+    type is [0] array or combination thereof (dunno if Ada doesn't allow
+    something similar too).  One can't do much with them, taking address of
+    their elements, (no-op) copying of the elements in and out.  But they
+    behave differently from arr[0] arrays e.g. in that using non-zero indexes
+    in them (as long as they are within bounds as for normal arrays) is valid.
+    
+    I think this naming inaccuracy resulted in Martin designing
+    special_array_member in an inconsistent way, mixing size zero array members
+    with array members of one or two or more elements and then using the
+    size zero interchangeably with zero elements.
+    
+    The following patch changes that (but doesn't do any
+    documentation/diagnostics renaming, as this is really a corner case),
+    such that int_0/trail_0 for consistency is just about [0] arrays
+    plus [] for the latter, not one or more zero sized elements case.
+    
+    The testcase has one xfailed case for where perhaps in later GCC versions
+    we could add extra code to handle it, for some reason we don't diagnose
+    out of bounds accesses for the zero sized elements cases.  It will be
+    harder because e.g. FRE will canonicalize &var.fld[0] and &var.fld[10]
+    to just one of them because they are provably the same address.
+    But the important thing is to fix this regression (where we warn on
+    completely valid code in the Linux kernel).  Anyway, for further work
+    on this we don't really need any extra help from special_array_member,
+    all code can just check integer_zerop (TYPE_SIZE_UNIT (TREE_TYPE (type))),
+    it doesn't depend on the position of the members etc.
+    
+    2023-03-21  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109215* tree.h (enum special_array_member): Adjust comments for int_0
+            and trail_0.
+            * tree.cc (component_ref_sam_type): Clear zero_elts if memtype
+            has zero sized element type and the array has variable number of
+            elements or constant one or more elements.
+            (component_ref_size): Adjust comments, formatting fix.
+    
+            * gcc.dg/Wzero-length-array-bounds-3.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-03-21 10:07:44 UTC
+  Text: Fixed.
+

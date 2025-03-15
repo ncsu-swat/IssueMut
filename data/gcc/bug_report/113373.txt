@@ -1,0 +1,124 @@
+Bug Summary: [14 regression] ICE in verify_ssa since r14-6822
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2024-01-13 09:43:21 UTC
+  Text: Createdattachment 57069[details]C++ source code
+
+Still some fallout from recent gcc trunk changes.
+
+The attached code does this:
+
+foundBugs $ /home/dcb38/gcc/results.20231221.asan.ubsan/bin/g++ -c -w -O3 -march=znver3bug996.cc
+foundBugs $ /home/dcb38/gcc/results.20231227.asan.ubsan/bin/g++ -c -w -O3 -march=znver3bug996.cc
+../sdk/angelscript/source/as_restore.cpp: In member function ‘void asCReader::TranslateFunction(asCScriptFunction*)’:
+../sdk/angelscript/source/as_restore.cpp:2824:6: error: definition in block 453 does not dominate use in block 457
+for SSA_NAME: _1244 in statement:
+size_1336 = PHI <_1244(457), 0(227)>
+PHI argument
+_1244
+for PHI node
+size_1336 = PHI <_1244(457), 0(227)>
+during GIMPLE pass: vect
+../sdk/angelscript/source/as_restore.cpp:2824:6: internal compiler error: verify_ssa failed
+
+- User: David Binderman | Time: 2024-01-13 14:47:41 UTC
+  Text: $  /home/dcb38/gcc/results.20231221.asan.ubsan/bin/g++  -v 2>&1 | grep exp
+gcc version 14.0.0 20231221 (experimental) (514ea1df444ca7f6) 
+$  /home/dcb38/gcc/results.20231227.asan.ubsan/bin/g++  -v 2>&1 | grep expgcc version 14.0.0 20231227 (experimental) (f19ceb2d49afdfa5) 
+$ git log 514ea1df444ca7f6..f19ceb2d49afdfa5 | grep -c "^commit"
+83
+$
+
+- User: David Binderman | Time: 2024-01-13 21:22:27 UTC
+  Text: Reducing ...
+
+- User: David Binderman | Time: 2024-01-13 21:45:58 UTC
+  Text: Reduced C++ code seems to be:
+
+void __assert_fail(char *, char *, int, const char *)
+    __attribute__((__noreturn__));
+template <class T> struct asCArray {
+  asCArray(int);
+  T &operator[](unsigned);
+  T *array;
+  int length;
+};
+template <class T> T &asCArray<T>::operator[](unsigned index) {
+  index < length ? void() : __assert_fail("", "", 8, __PRETTY_FUNCTION__);
+  return array[index];
+}
+unsigned asCReaderTranslateFunction_bc_1;
+int asCReaderTranslateFunction_bcLength;
+void asCReaderTranslateFunction() {
+  asCArray<unsigned> bcSizes(asCReaderTranslateFunction_bcLength);
+  int offset, size;
+  for (int num; offset--; num++)
+    size += bcSizes[num];
+  asCReaderTranslateFunction_bc_1 = size;
+}
+
+- User: Andrew Pinski | Time: 2024-01-13 22:56:02 UTC
+  Text: Createdattachment 57076[details]Reduced C testcase
+
+- User: Andrew Pinski | Time: 2024-01-13 22:56:10 UTC
+  Text: Confirmed.
+
+- User: Jakub Jelinek | Time: 2024-01-15 08:49:43 UTC
+  Text: Started withr14-6822-g01f4251b8775c832a92d55e2df57c9ac72eaceef
+
+- User: Richard Biener | Time: 2024-01-16 13:57:37 UTC
+  Text: All good after vect_do_peeling.  It's wrecked by vect_create_epilog_for_reduction here:
+
+          scalar_result = scalar_results[k];
+          FOR_EACH_IMM_USE_STMT (use_stmt, imm_iter, orig_name)
+            {
+              FOR_EACH_IMM_USE_ON_STMT (use_p, imm_iter)
+                SET_USE (use_p, scalar_result);
+              update_stmt (use_stmt);
+
+we have two reduction epilogues, one for the early and one for the late
+exit but we mismatch the scalar use to replace.
+
+We're also picking up a reduction that's only live on one edge on the other
+(but that doesn't seem to result in a problem here).
+
+It also seems we're doing epilogue code generation before creating some
+exit PHIs required for that - vect_do_peeling fails to do that.
+
+We can try to hack around that a bit, but there's more issues with this
+testcase, like we generate useless epilogues - it seems we should
+identify the scalar exit PHI to transform when calling epilogue generation
+for a specific edge and skip if there isn't one.
+
+- User: GCC Commits | Time: 2024-01-22 07:50:19 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:86f3cbdaa6f60eaff1cdb4ab2f1a9bc796b67207commitr14-8330-g86f3cbdaa6f60eaff1cdb4ab2f1a9bc796b67207Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Jan 19 13:55:09 2024 +0100
+
+    tree-optimization/113373 - add missing LC PHIs for live operations
+    
+    The following makes reduction epilogue code generation happy by properly
+    adding LC PHIs to the exit blocks for multiple exit vectorized loops.
+    
+    Some refactoring might make the flow easier to follow but I've refrained
+    from doing that with this patch.
+    
+    I've kept some fixes in reduction epilogue generation from the earlier
+    attempt fixing this PR.PR tree-optimization/113373* tree-vect-loop-manip.cc (slpeel_tree_duplicate_loop_to_edge_cfg):
+            Create LC PHIs in the exit blocks where necessary.
+            * tree-vect-loop.cc (vectorizable_live_operation): Do not try
+            to handle missing LC PHIs.
+            (find_connected_edge): Remove.
+            (vect_create_epilog_for_reduction): Cleanup use of auto_vec.
+    
+            * gcc.dg/vect/vect-early-break_104-pr113373.c: New testcase.
+
+- User: Richard Biener | Time: 2024-01-22 07:50:49 UTC
+  Text: Fixed.
+

@@ -1,0 +1,327 @@
+Bug Summary: [14 Regression] Wrong code at -O3
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: needs-bisection, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-01-16 21:45:13 UTC
+  Text: Testcase:
+int a[2][9];
+int b;
+int c;
+int d;
+int main() {
+  for (b = 0;b < 2; b++)
+    for (long e = 8; e > 0; e--)
+      a[b][e] = a[0][1] == 0;
+
+  if (!a[1][1])
+    return 0;
+  else
+    return 1;
+}
+
+Commands:> /scratch/tc-testing/tc-jan-16-trunk/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -O3 -march=rv64gcv red_copy.c -o user-config.out
+> QEMU_CPU=rv64,vlen=128,v=true,vext_spec=v1.0,Zve32f=true,Zve64f=true timeout --verbose -k 0.1 1 /scratch/tc-testing/tc-jan-16-trunk/build-rv64gcv/bin/qemu-riscv64 user-config.out
+> echo $?1> /scratch/tc-testing/tc-jan-16-trunk/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -O2 -march=rv64gcv red_copy.c -o user-config.out
+> QEMU_CPU=rv64,vlen=128,v=true,vext_spec=v1.0,Zve32f=true,Zve64f=true timeout --verbose -k 0.1 1 /scratch/tc-testing/tc-jan-16-trunk/build-rv64gcv/bin/qemu-riscv64 user-config.out
+> echo $?0> /scratch/tc-testing/tc-jan-16-trunk/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -O3 -march=rv64gc red_copy.c -o user-config.out
+> QEMU_CPU=rv64,vlen=128,v=true,vext_spec=v1.0,Zve32f=true,Zve64f=true timeout --verbose -k 0.1 1 /scratch/tc-testing/tc-jan-16-trunk/build-rv64gcv/bin/qemu-riscv64 user-config.out
+> echo $?0
+
+When a[1][1] is set a[0][1] is true(1) so a[1][1] == 0 should be false(0). At -O3 rv64gcv the condition is evaluated incorrectly.
+
+Godbolt:https://godbolt.org/z/Tfz3d646e
+
+- User: Patrick O'Neill | Time: 2024-01-16 21:46:29 UTC
+  Text: Forgot to mention - this was found with the fuzzer.
+
+- User: JuzheZhong | Time: 2024-01-16 22:37:06 UTC
+  Text: Will take a look today.
+
+- User: Patrick O'Neill | Time: 2024-01-16 22:57:39 UTC
+  Text: This has the same behavior with --param=vsetvl-strategy=simple so this is probably not a vsetvl issue.> /scratch/tc-testing/tc-jan-16-vsetvl-toggle/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -O3 -march=rv64gcv red_copy.c -o user-config.out --param=vsetvl-strategy=simple
+> QEMU_CPU=rv64,vlen=128,v=true,vext_spec=v1.0,Zve32f=true,Zve64f=true timeout --verbose -k 0.1 1 /scratch/tc-testing/tc-jan-16-trunk/build-rv64gcv/bin/qemu-riscv64 user-config.out
+> echo $?1
+
+- User: JuzheZhong | Time: 2024-01-17 01:38:44 UTC
+  Text: a[0][1] seems to be undefined value.
+
+And the test seems to trigger undefined behavior.
+
+I just checked ARM SVE and RVV.
+
+The vectorized IR is totally the same and I don't see anything obviously wrong in
+RVV assembler.https://godbolt.org/z/jz866KfsvHi, Andrew. Could you confirm it whether ARM SVE has the same behavior as RVV?
+That is, with vectorized, return 1, whereas no vectorized, return 0;
+
+- User: Patrick O'Neill | Time: 2024-01-17 01:42:34 UTC
+  Text: (In reply to JuzheZhong fromcomment #4)> a[0][1] seems to be undefined value.a is a global variable so the elements are initialized to 0. a[0][1] is within the bounds a[2][9].
+
+- User: JuzheZhong | Time: 2024-01-17 01:44:50 UTC
+  Text: (In reply to Patrick O'Neill fromcomment #5)> (In reply to JuzheZhong fromcomment #4)
+> > a[0][1] seems to be undefined value.
+> 
+> a is a global variable so the elements are initialized to 0. a[0][1] is
+> within the bounds a[2][9].Yes, I believe a[0][1] is 0. Then for all a[b][e] == a[0][1] == 0 should always be
+1. 
+
+Then if (!a[1][1]) should be false and then return 1;
+
+I failed to see anything wrong here.
+
+- User: Patrick O'Neill | Time: 2024-01-17 01:53:50 UTC
+  Text: (In reply to JuzheZhong fromcomment #6)> (In reply to Patrick O'Neill fromcomment #5)
+> > (In reply to JuzheZhong fromcomment #4)
+> > > a[0][1] seems to be undefined value.
+> > 
+> > a is a global variable so the elements are initialized to 0. a[0][1] is
+> > within the bounds a[2][9].
+> 
+> Yes, I believe a[0][1] is 0. Then for all a[b][e] == a[0][1] == 0 should
+> always be
+> 1. 
+> 
+> Then if (!a[1][1]) should be false and then return 1;
+> 
+> I failed to see anything wrong here.The value inside a[0][1] changes during the for loop. It starts out as 0 but is changed to 1 when b=0,e=1. The elements in a after b=0,e=1 should be 1.
+
+Since a[1][1] is set after b=0,e=1 it should evaluate a[0][1]==0 to false and set a[1][1] to 0.
+
+- User: JuzheZhong | Time: 2024-01-17 01:56:12 UTC
+  Text: (In reply to Patrick O'Neill fromcomment #7)> (In reply to JuzheZhong fromcomment #6)
+> > (In reply to Patrick O'Neill fromcomment #5)
+> > > (In reply to JuzheZhong fromcomment #4)
+> > > > a[0][1] seems to be undefined value.
+> > > 
+> > > a is a global variable so the elements are initialized to 0. a[0][1] is
+> > > within the bounds a[2][9].
+> > 
+> > Yes, I believe a[0][1] is 0. Then for all a[b][e] == a[0][1] == 0 should
+> > always be
+> > 1. 
+> > 
+> > Then if (!a[1][1]) should be false and then return 1;
+> > 
+> > I failed to see anything wrong here.
+> 
+> The value inside a[0][1] changes during the for loop. It starts out as 0 but
+> is changed to 1 when b=0,e=1. The elements in a after b=0,e=1 should be 1.
+> 
+> Since a[1][1] is set after b=0,e=1 it should evaluate a[0][1]==0 to false
+> and set a[1][1] to 0.So I doubt it is not RISC-V backend issue. It's middle-end loop vectorizer issue.
+It's vectorized with evaluating whether it is 0 or not.
+
+Let's wait for Andrew confirm it.
+
+- User: Andrew Pinski | Time: 2024-01-17 03:33:29 UTC
+  Text: So some good/bad news, it even fails on x86_64-linux-gnu.
+
+- User: Richard Biener | Time: 2024-01-17 08:08:43 UTC
+  Text: Looks like a dependence issue - we vectorize it as
+
+  _24 = a[0][1];
+  vect_cst__13 = {_24, _24, _24, _24};
+  mask__19.9_3 = { 0, 0, 0, 0 } == vect_cst__13;
+  vect_patt_31.10_1 = VEC_COND_EXPR <mask__19.9_3, { 1, 1, 1, 1 }, { 0, 0, 0, 0 }>;
+  
+  <bb 3> [local count: 29488088]:
+  # b.2_66 = PHI <_4(5), 0(2)>
+  # ivtmp_45 = PHI <ivtmp_38(5), 2(2)>
+  # ivtmp_8 = PHI <ivtmp_14(5), &MEM <int[2][9]> [(void *)&a + 4B](2)>
+  # ivtmp_23 = PHI <ivtmp_25(5), 0(2)>
+  _18 = a[0][1];
+  _19 = _18 == 0;
+  _20 = (int) _19;
+  MEM <vector(4) int> [(int *)ivtmp_8] = vect_patt_31.10_1;
+  MEM <vector(4) int> [(int *)ivtmp_8 + 16B] = vect_patt_31.10_1;
+  ivtmp_22 = ivtmp_8 + 36;
+  _4 = b.2_66 + 1;
+  ivtmp_38 = ivtmp_45 - 1;
+  ivtmp_14 = ivtmp_8 + 36;
+  ivtmp_25 = ivtmp_23 + 1;
+  if (ivtmp_25 < 2)
+    goto <bb 5>; [50.00%]
+  else
+    goto <bb 4>; [50.00%]
+
+  <bb 5> [local count: 14744044]:
+  goto <bb 3>; [100.00%]
+
+(compute_affine_dependence
+  ref_a: a[0][1], stmt_a: _18 = a[0][1];
+  ref_b: a[b.2_66][1], stmt_b: a[b.2_66][1] = _20;
+(analyze_overlapping_iterations
+  (chrec_a = 1)
+  (chrec_b = 1)
+(analyze_ziv_subscript
+)
+  (overlap_iterations_a = [0])
+  (overlap_iterations_b = [0]))
+(analyze_overlapping_iterations
+  (chrec_a = 0)
+  (chrec_b = {0, +, 1}<nw>_1)
+(analyze_siv_subscript
+)
+  (overlap_iterations_a = [0])
+  (overlap_iterations_b = [0]))
+(Dependence relation cannot be represented by distance vector.)
+)
+
+t.c:8:21: missed:   versioning for alias required: bad dist vector for a[0][1] and a[b.2_66][1]
+consider run-time aliasing test between a[0][1] and a[b.2_66][1]
+
+that looks OK, but we're not emitting such alias test.  We're using SLP
+since we can handle non-grouped loads (guess that what it will bisect to).
+Then:
+
+t.c:6:16: note:   === vect_prune_runtime_alias_test_list ===
+t.c:6:16: note:   no need for alias check between a[0][1] and a[b.2_66][1] when VF is 1
+t.c:6:16: note:   improved number of alias checks from 1 to 0
+
+which is then obviously wrong.
+
+- User: JuzheZhong | Time: 2024-01-17 08:31:10 UTC
+  Text: I think this following:https://godbolt.org/z/5sWEWWGoxARM SVE GCC-11 correctly vectorize this codes.
+
+But both GCC-12 and GCC-13 failed to vectorize it.
+
+GCC-14 vectorize it in a wrong way.
+
+Would it be possible to recover it back to GCC-11 ?
+
+- User: Richard Biener | Time: 2024-01-17 08:48:55 UTC
+  Text: (In reply to JuzheZhong fromcomment #11)> I think this following:
+> 
+>https://godbolt.org/z/5sWEWWGox> 
+> ARM SVE GCC-11 correctly vectorize this codes.
+> 
+> But both GCC-12 and GCC-13 failed to vectorize it.
+> 
+> GCC-14 vectorize it in a wrong way.
+> 
+> Would it be possible to recover it back to GCC-11 ?With GCC 11 it probably SLP vectorizes the completely unrolled nest.  That
+can be recovered with -fno-tree-loop-vectorize on trunk which on x86_64
+produces
+
+main:
+.LFB0:
+        .cfi_startproc
+        movl    a+4(%rip), %edx
+        xorl    %eax, %eax
+        movl    $2, b(%rip)
+        testl   %edx, %edx
+        sete    %al
+        movd    %eax, %xmm0
+        setne   %al
+        movzbl  %al, %eax
+        pshufd  $0, %xmm0, %xmm0
+        movups  %xmm0, a+4(%rip)
+        movd    %eax, %xmm1
+        movups  %xmm0, a+20(%rip)
+        pshufd  $0, %xmm1, %xmm0
+        movups  %xmm0, a+40(%rip)
+        movups  %xmm0, a+56(%rip)
+        ret
+
+- User: Richard Biener | Time: 2024-01-17 12:34:42 UTC
+  Text: Mine.
+
+- User: Richard Biener | Time: 2024-01-17 12:59:20 UTC
+  Text: So the issue is that we ignore the dependence because vect_preserves_scalar_order_p - which is correct iff we'd execute the
+stmt within the vectorized loop body.  But as we discover it invariant
+we hoist it, making the outcome of vect_preserves_scalar_order_p invalid.
+
+I have a fix doing
+
+t.c:5:17: note:   === vect_prune_runtime_alias_test_list ===
+t.c:5:17: note:   can tell at compile time that a[0][1] and a[b.2_8][1] alias
+t.c:7:15: missed:   not vectorized: compilation time alias: _18 = a[0][1];
+a[b.2_8][1] = _20;
+
+and then falling back to SLP vectorizing the unrolled loop as desired.
+
+- User: GCC Commits | Time: 2024-01-18 07:37:22 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:b981d5c60b8ef78e2adecd6b5d7e36f9e5e61c54commitr14-8207-gb981d5c60b8ef78e2adecd6b5d7e36f9e5e61c54Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Jan 17 14:05:42 2024 +0100
+
+    tree-optimization/113431 - wrong dependence with invariant load
+    
+    The vectorizer dependence analysis is confused with invariant loads
+    when figuring whether the circumstances are so that we preserve
+    scalar stmt execution order.  The following rectifies this.PR tree-optimization/113431* tree-vect-data-refs.cc (vect_preserves_scalar_order_p):
+            When there is an invariant load we might not preserve
+            scalar order.
+    
+            * gcc.dg/vect/pr113431.c: New testcase.
+
+- User: Richard Biener | Time: 2024-01-18 07:39:01 UTC
+  Text: Fixed.
+
+- User: Rainer Orth | Time: 2024-01-19 08:55:00 UTC
+  Text: The new test FAILs on 32 and 64-bit Solaris/SPARC:
+
++FAIL: gcc.dg/vect/pr113431.c -flto -ffat-lto-objects  scan-tree-dump-times slp1 "optimized: basic block part vectorized" 2
++FAIL: gcc.dg/vect/pr113431.c scan-tree-dump-times slp1 "optimized: basic block part vectorized" 2
+
+I'm attaching the dump.
+
+- User: Rainer Orth | Time: 2024-01-19 08:56:03 UTC
+  Text: Createdattachment 57155[details]32-bit sparc-sun-solaris2.11pr113431.c.185t.slp1
+
+- User: Rainer Orth | Time: 2024-02-28 14:55:02 UTC
+  Text: The SPARC dump suggests
+
+/vol/gcc/src/hg/master/local/gcc/testsuite/gcc.dg/vect/pr113431.c:12:15: missed:   unsupported unaligned access
+/vol/gcc/src/hg/master/local/gcc/testsuite/gcc.dg/vect/pr113431.c:12:15: missed:   not vectorized: relevant stmt not supported: a[0][1] = _60;
+
+that the tests needs vect_hw_misalign?
+
+- User: Jakub Jelinek | Time: 2024-03-15 14:06:13 UTC
+  Text: Though, trying that in a cross to arm, with -march=armv9-a -munaligned-access it matches (in that case I believe vect_hw_misalign should be true), but it matches even with -march=armv9-a -mno-unaligned-access (and in that case I think it should be !vect_hw_misaligned target).
+That said, sure, if it is
+/* { dg-final { scan-tree-dump-times "optimized: basic block part vectorized" 2 "slp1" { target { vect_int && vect_hw_misaligned } } } } */
+then it will simply not test anything on the non-vect_hw_misaligned targets, rather than say XPASS, so maybe that is ok.
+
+Richi, thoughts on that?
+
+- User: Richard Biener | Time: 2024-03-15 15:42:46 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #20)> Though, trying that in a cross to arm, with -march=armv9-a
+> -munaligned-access it matches (in that case I believe vect_hw_misalign
+> should be true), but it matches even with -march=armv9-a
+> -mno-unaligned-access (and in that case I think it should be
+> !vect_hw_misaligned target).
+> That said, sure, if it is
+> /* { dg-final { scan-tree-dump-times "optimized: basic block part
+> vectorized" 2 "slp1" { target { vect_int && vect_hw_misaligned } } } } */
+> then it will simply not test anything on the non-vect_hw_misaligned targets,
+> rather than say XPASS, so maybe that is ok.
+> 
+> Richi, thoughts on that?Yeah, I think that's OK.
+
+- User: GCC Commits | Time: 2024-03-15 15:52:14 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:ffd47fb63ddc024db847daa07f8ae27fffdfcb28commitr14-9497-gffd47fb63ddc024db847daa07f8ae27fffdfcb28Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Mar 15 16:50:25 2024 +0100
+
+    testsuite: Fixpr113431.c FAIL on sparc* [PR113431]
+    
+    As mentioned in the PR, the new testcase FAILs on sparc*-* due to
+    lack of support of misaligned store.
+    
+    This patch restricts that to vect_hw_misalign targets.
+    
+    2024-03-15  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113431* gcc.dg/vect/pr113431.c: Restrict scan-tree-dump-times to
+            vect_hw_misalign targets.
+
+- User: Jakub Jelinek | Time: 2024-03-15 15:53:50 UTC
+  Text: Assuming fixed even on sparc*.
+
+- User: ro@CeBiTec.Uni-Bielefeld.DE | Time: 2024-03-19 09:44:52 UTC
+  Text: > ---Comment #23from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> Assuming fixed even on sparc*.It is.  I've missed this one when collecting instances of missing
+vect_hw_misalign likePR tree-optimization/98238.  Thanks.
+

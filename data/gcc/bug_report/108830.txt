@@ -1,0 +1,163 @@
+Bug Summary: Excess warnings from -Wanalyzer-null-dereference
+Product: gcc
+Component: analyzer
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Malcolm | Time: 2023-02-17 00:10:44 UTC
+  Text: Createdattachment 54477[details]Reproducer
+
+I see lots of (probable) false positives from the attached on GCC 11 through 13.
+
+Trunk:https://godbolt.org/z/nzYreY1zxGCC 12.2:https://godbolt.org/z/zjod5768fGCC 11.3:https://godbolt.org/z/aeevhssG4After the initial warning:
+  <source>:77:24: warning: dereference of NULL 'new_vals' [CWE-476] [-Wanalyzer-null-dereference]
+
+...we emit 4 further almost identical warnings.
+
+I think they're all false positives, due to invariants we can't know about, but presumably we should only emit the first warning: once we've determined that we're derefing NULL 'new_vals', it doesn't make sense to repeatedly complain each time through the loop (which is what I think is happening).
+
+There are also a huge number of spammy "'new_vals' is NULL" messages.
+
+- User: GCC Commits | Time: 2023-02-21 22:05:57 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:8f6369157917a4371b5d66dfe82b84aded3b8268commitr13-6267-g8f6369157917a4371b5d66dfe82b84aded3b8268Author: David Malcolm <dmalcolm@redhat.com>
+Date:   Tue Feb 21 16:58:36 2023 -0500
+
+    analyzer: stop exploring the path after certain diagnostics [PR108830]PR analyzer/108830reports a situation in which there are lots of
+    followup -Wanalyzer-null-dereference warnings after the first access of
+    a NULL pointer, leading to very noisy output from -fanalyzer.
+    
+    The analyzer's logic for stopping emitting multiple warnings from a
+    state machine doesn't quite work for NULL pointers: it attempts to
+    transition the malloc state machine's NULL pointer to the "stop" state,
+    which doesn't seem to make much sense in retrospect, and seems to get
+    confused over types.
+    
+    Similarly, poisoned_value_diagnostic can be very noisy for uninit
+    variables, emitting a warning for every access to an uninitialized
+    variable.  In theory, region_model::check_for_poison makes some attempts
+    to suppress followups, but only for the symbolic value itself; if the
+    user's code keeps accessing the same region, we would get a warning on
+    each one.  For example, this showed up in Doom's s_sound.c where there
+    were 7 followup uninit warnings after the first uninit warning in
+    "S_ChangeMusic".
+    
+    This patch adds an extra mechanism, giving pending diagnostics the
+    option of stopping the analysis of an execution path if they're saved
+    for emission on it, and turning this on for these warnings:
+      -Wanalyzer-null-dereference
+      -Wanalyzer-null-argument
+      -Wanalyzer-use-after-free
+      -Wanalyzer-use-of-pointer-in-stale-stack-frame
+      -Wanalyzer-use-of-uninitialized-value
+    
+    Doing so should hopefully reduce the cascades of diagnostics that
+    -fanalyzer can sometimes emit.
+    
+    I added a -fno-analyzer-suppress-followups for the cases where you
+    really want the followup warnings (e.g. in some DejaGnu tests, and
+    for microbenchmarks of UB detection, such asPR analyzer/104224).
+    
+    Integration testing shows this patch reduces the number of probable
+    false positives reported by 94, and finds one more true positive:
+    
+    Comparison: 9.34% -> 10.91%
+      GOOD:  66 ->  67  (+1)
+       BAD: 641 -> 547 (-94)
+    
+    where the affected warnings/projects are:
+    
+      -Wanalyzer-null-dereference: 0.00% GOOD: 0 BAD: 269 -> 239 (-30)
+         Unclassified: 257 -> 228 (-29)
+                      apr-1.7.0:  12 ->   5  (-7)
+                           doom:   1 ->   0  (-1)
+                  haproxy-2.7.1:  47 ->  41  (-6)
+           ImageMagick-7.1.0-57:  13 ->   9  (-4)
+                     qemu-7.2.0: 165 -> 154 (-11)
+    
+          Known false: 7 -> 6 (-1)
+                       xz-5.4.0:   4 ->   3  (-1)
+    
+      -Wanalyzer-use-of-uninitialized-value: 0.00% GOOD: 0 BAD: 143 -> 80 (-63)
+          Known false: 47 -> 16 (-31)
+                           doom: 42 -> 11 (-31)
+    
+         Unclassified: 96 -> 64 (-32)
+                  coreutils-9.1: 14 -> 10  (-4)
+                  haproxy-2.7.1: 29 -> 23  (-6)
+                     qemu-7.2.0: 48 -> 26 (-22)
+    
+      -Wanalyzer-null-argument: 0.00% -> 2.33% GOOD: 0 -> 1 (+1) BAD: 43 -> 42 (-1)
+         Unclassified: 39 -> 38 (-1)
+          due to coreutils-9.1: 9 -> 8 (-1)
+    
+        True positive: 0 -> 1 (+1)
+          (in haproxy-2.7.1)
+    
+    gcc/analyzer/ChangeLog:PR analyzer/108830* analyzer.opt (fanalyzer-suppress-followups): New option.
+            * engine.cc (impl_region_model_context::warn): Terminate the path
+            if the diagnostic's terminate_path_p vfunc returns true and
+            -fanalyzer-suppress-followups is true (the default).
+            (impl_sm_context::warn): Likewise, for both overloads.
+            * pending-diagnostic.h (pending_diagnostic::terminate_path_p): New
+            vfunc.
+            * program-state.cc (program_state::on_edge): Terminate the path if
+            the ctxt requests it during updating the edge.
+            * region-model.cc (poisoned_value_diagnostic::terminate_path_p):
+            New vfunc.
+            * sm-malloc.cc (null_deref::terminate_path_p): New vfunc.
+            (null_arg::terminate_path_p): New vfunc.
+    
+    gcc/ChangeLog:PR analyzer/108830* doc/invoke.texi: Document -fno-analyzer-suppress-followups.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/108830* gcc.dg/analyzer/attribute-nonnull.c: Update for
+            -Wanalyzer-use-of-uninitialized-value terminating analysis along
+            a path.
+            * gcc.dg/analyzer/call-summaries-2.c: Likewise.
+            * gcc.dg/analyzer/data-model-1.c: Likewise.
+            * gcc.dg/analyzer/data-model-5.c: Likewise.
+            * gcc.dg/analyzer/doom-s_sound-pr108867.c: New test.
+            * gcc.dg/analyzer/memset-CVE-2017-18549-1.c: Add
+            -fno-analyzer-suppress-followups.
+            * gcc.dg/analyzer/null-deref-pr108830.c: New test.
+            * gcc.dg/analyzer/pipe-1.c: Add -fno-analyzer-suppress-followups.
+            * gcc.dg/analyzer/pipe-void-return.c: Likewise.
+            * gcc.dg/analyzer/pipe2-1.c: Likewise.
+            * gcc.dg/analyzer/pr101547.c: Update for
+            -Wanalyzer-use-of-uninitialized-value terminating analysis along
+            a path.
+            * gcc.dg/analyzer/pr101875.c: Likewise.
+            * gcc.dg/analyzer/pr104224-split.c: New test, based on...
+            * gcc.dg/analyzer/pr104224.c: Add
+            -fno-analyzer-suppress-followups.
+            * gcc.dg/analyzer/realloc-2.c: Add
+            -fno-analyzer-suppress-followups.
+            * gcc.dg/analyzer/realloc-3.c: Likewise.
+            * gcc.dg/analyzer/realloc-5.c: Likewise.
+            * gcc.dg/analyzer/stdarg-1-ms_abi.c: Likewise.
+            * gcc.dg/analyzer/stdarg-1-sysv_abi.c: Likewise.
+            * gcc.dg/analyzer/stdarg-1.c: Likewise.
+            * gcc.dg/analyzer/symbolic-1.c: Likewise.
+            * gcc.dg/analyzer/symbolic-7.c: Update for
+            -Wanalyzer-use-of-uninitialized-value terminating analysis along a
+            path.
+            * gcc.dg/analyzer/uninit-4.c: Likewise.
+            * gcc.dg/analyzer/uninit-8.c: New test.
+            * gcc.dg/analyzer/uninit-pr94713.c: Update for
+            -Wanalyzer-use-of-uninitialized-value terminating analysis along a
+            path.
+            * gcc.dg/analyzer/zlib-6a.c: Add -fno-analyzer-suppress-followups.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2023-02-21 22:30:31 UTC
+  Text: Should be fixed on trunk by the above patch.
+
+I don't plan to backport this fix.
+
+- User: David Malcolm | Time: 2023-02-22 18:44:27 UTC
+  Text: (In reply to David Malcolm fromcomment #0)> There are also a huge number of spammy "'new_vals' is NULL" messages.Seehttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=105958#c1
+

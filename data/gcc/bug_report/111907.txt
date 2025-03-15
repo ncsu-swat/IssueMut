@@ -1,0 +1,118 @@
+Bug Summary: ICE: in curr_insn_transform, at lra-constraints.cc:4294 unable to generate reloads for: {*andnottf3} with -mavx512f -mno-evex512
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-10-21 09:20:56 UTC
+  Text: Createdattachment 56165[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -mavx512f -mno-evex512 -mbionic testcase.c 
+testcase.c: In function 'foo':
+testcase.c:5:1: error: unable to generate reloads for:
+    5 | }
+      | ^
+(insn 14 13 15 2 (set (reg:TF 104)
+        (and:TF (not:TF (reg:TF 103))
+            (reg:TF 99 [ _2 ]))) "testcase.c":4:10 3138 {*andnottf3}
+     (expr_list:REG_DEAD (reg:TF 99 [ _2 ])
+        (nil)))
+during RTL pass: reload
+testcase.c:5:1: internal compiler error: in curr_insn_transform, at lra-constraints.cc:4294
+0x7eee43 _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+        /repo/gcc-trunk/gcc/rtl-error.cc:108
+0x7a8d79 curr_insn_transform
+        /repo/gcc-trunk/gcc/lra-constraints.cc:4294
+0x12cea56 lra_constraints(bool)
+        /repo/gcc-trunk/gcc/lra-constraints.cc:5497
+0x12b7ae4 lra(_IO_FILE*)
+        /repo/gcc-trunk/gcc/lra.cc:2419
+0x1266d99 do_reload
+        /repo/gcc-trunk/gcc/ira.cc:5973
+0x1266d99 execute
+        /repo/gcc-trunk/gcc/ira.cc:6161
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-4813-20231021102502-g57cbb1d3344-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-4813-20231021102502-g57cbb1d3344-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20231021 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2023-11-04 22:34:31 UTC
+  Text: Simplified testcase:
+```
+_Float128
+foo (_Float128 d, _Float128 e)
+{
+  return __builtin_copysignf128 (d, e);
+}
+```
+
+Just use `-mavx512f -mno-evex512` . No reason for the `-mbionic` here (which changes `long double` into the IEEE128 bit long double rather than the 90bit long double.
+
+- User: Andrew Pinski | Time: 2023-11-04 22:34:39 UTC
+  Text: .
+
+- User: Andrew Pinski | Time: 2023-11-04 22:44:23 UTC
+  Text: Something is not being disabled correctly with -mno-evex512 or something is not being enabled correctly.
+
+TF mode is valid for SSE ...
+
+- User: Haochen Jiang | Time: 2023-11-06 02:54:14 UTC
+  Text: I guess it is caused by "*andnot<mode>3", not confirmed yet.
+The isa for the last constraint changed to avx512f_512, which will make the pattern disabled under -mavx512f -mno-evex512.
+Let me find a solution on that.
+
+- User: Haochen Jiang | Time: 2023-11-06 02:59:33 UTC
+  Text: BTW, it should be disabled since it will use zmm previously.
+
+foo(_Float128, _Float128):
+        push    rbp
+        mov     rbp, rsp
+        vmovdqa XMMWORD PTR [rbp-16], xmm0
+        vmovdqa XMMWORD PTR [rbp-32], xmm1
+        vmovdqa xmm1, XMMWORD PTR [rbp-16]
+        vmovdqa xmm2, XMMWORD PTR [rbp-32]
+        vmovdqa xmm0, XMMWORD PTR .LC0[rip]
+        vpandnq zmm1, zmm0, zmm1
+        vpand   xmm0, xmm0, xmm2
+        vpor    xmm0, xmm1, xmm0
+        pop     rbp
+        ret
+
+A straightforward solution might be trying to use its xmm version here.
+
+- User: Haochen Jiang | Time: 2023-11-07 02:28:19 UTC
+  Text: Proposed patch:https://gcc.gnu.org/pipermail/gcc-patches/2023-November/635410.html
+
+- User: GCC Commits | Time: 2023-11-08 05:51:35 UTC
+  Text: The master branch has been updated by Haochen Jiang <jianghc@gcc.gnu.org>:https://gcc.gnu.org/g:078087d1605060da4f993af83b1bfa351b278d38commitr14-5238-g078087d1605060da4f993af83b1bfa351b278d38Author: Haochen Jiang <haochen.jiang@intel.com>
+Date:   Mon Nov 6 14:34:01 2023 +0800
+
+    i386: Fix isa attribute for TI/TF andnot mode
+    
+    gcc/ChangeLog:PR target/111907* config/i386/i386.md (avx_noavx512vl): New definition for isa
+            attribute.
+            * config/i386/sse.md (*andnot<mode>3): Change isa attribute from
+            avx_noavx512f to avx_noavx512vl.
+    
+    gcc/testsuite/ChangeLog:PR target/111907* gcc.target/i386/pr111907.c: New test.
+
+- User: Haochen Jiang | Time: 2023-11-08 05:52:22 UTC
+  Text: Should be fixed on trunk now.
+
+- User: Hongtao Liu | Time: 2023-11-30 10:45:34 UTC
+  Text: .
+

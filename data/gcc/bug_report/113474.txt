@@ -1,0 +1,133 @@
+Bug Summary: RISC-V: Fail to use vmerge.vim for constant vector
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2024-01-18 10:55:28 UTC
+  Text: void
+foo (int n, int **__restrict a)
+{
+  int b;
+  int c;
+  int d;
+  for (b = 0; b < n; b++)
+    for (long e = 8; e > 0; e--)
+      a[b][e] = a[b][e] == 15;
+}
+
+ASM:
+
+foo:
+	ble	a0,zero,.L5
+	slli	a3,a0,3
+	add	a3,a1,a3
+	vsetivli	zero,4,e32,m1,ta,ma
+	vmv.v.i	v3,1                        -> redundant
+	vmv.v.i	v2,0
+.L3:
+	ld	a5,0(a1)
+	addi	a4,a5,4
+	addi	a5,a5,20
+	vle32.v	v1,0(a5)
+	vle32.v	v0,0(a4)
+	vmseq.vi	v0,v0,15
+	vmerge.vvm	v4,v2,v3,v0  ----> It should be vmerge.vim
+	vse32.v	v4,0(a4)
+	vmseq.vi	v0,v1,15
+	addi	a1,a1,8
+	vmerge.vvm	v1,v2,v3,v0  ----> It should be vmerge.vim
+	vse32.v	v1,0(a5)
+	bne	a1,a3,.L3
+.L5:
+	ret
+
+
+It's odd we can generate vmseq.vi but fail to generate vmerge.vim.
+
+Look into patterns of vcond_mask:
+
+(define_insn_and_split "vcond_mask_<mode><vm>"
+  [(set (match_operand:V_VLS 0 "register_operand")
+        (if_then_else:V_VLS
+          (match_operand:<VM> 3 "register_operand")
+          (match_operand:V_VLS 1 "nonmemory_operand")   -> relax the predicate
+          (match_operand:V_VLS 2 "register_operand")))]
+
+
+Why GCC doesn't fold const_vector into operand 1 ?
+
+- User: Robin Dapp | Time: 2024-01-18 12:51:54 UTC
+  Text: Good catch.  Looks like the ifn expander always forces into a register.  That's probably necessary on all targets except riscv.
+
+diff --git a/gcc/internal-fn.cc b/gcc/internal-fn.cc
+index a07f25f3aee..e923051d540 100644
+--- a/gcc/internal-fn.cc
++++ b/gcc/internal-fn.cc
+@@ -3118,7 +3118,8 @@ expand_vec_cond_mask_optab_fn (internal_fn, gcall *stmt, convert_optab optab)
+   rtx_op2 = expand_normal (op2);
+ 
+   mask = force_reg (mask_mode, mask);
+-  rtx_op1 = force_reg (mode, rtx_op1);
++  if (!insn_operand_matches (icode, 1, rtx_op1))
++    rtx_op1 = force_reg (mode, rtx_op1);
+ 
+   rtx target = expand_expr (lhs, NULL_RTX, VOIDmode, EXPAND_WRITE);
+   create_output_operand (&ops[0], target, mode);
+
+gives me:
+
+foo:
+.LFB0:
+	.cfi_startproc
+	ble	a0,zero,.L5
+	slli	a3,a0,3
+	add	a3,a1,a3
+	vsetivli	zero,4,e32,m1,ta,ma
+	vmv.v.i	v3,15
+	vmv.v.i	v2,0
+.L3:
+	ld	a5,0(a1)
+	addi	a4,a5,4
+	addi	a5,a5,20
+	vle32.v	v1,0(a5)
+	vle32.v	v0,0(a4)
+	vmseq.vv	v0,v0,v3
+	vmerge.vim	v4,v2,1,v0
+	vse32.v	v4,0(a4)
+	vmseq.vv	v0,v1,v3
+	addi	a1,a1,8
+	vmerge.vim	v1,v2,1,v0
+	vse32.v	v1,0(a5)
+	bne	a1,a3,.L3
+.L5:
+	ret
+
+- User: JuzheZhong | Time: 2024-01-18 13:30:40 UTC
+  Text: Oh. It's pretty simple fix. I am not sure whether Richards allow it since it's stage4 but worth to have a try.
+
+Could you send a patch ?
+
+- User: GCC Commits | Time: 2024-05-17 20:46:23 UTC
+  Text: The master branch has been updated by Robin Dapp <rdapp@gcc.gnu.org>:https://gcc.gnu.org/g:7ca35f2e430081d6ec91e910002f92d9713350facommitr15-638-g7ca35f2e430081d6ec91e910002f92d9713350faAuthor: Robin Dapp <rdapp@ventanamicro.com>
+Date:   Fri May 10 12:44:44 2024 +0200
+
+    internal-fn: Do not force vcond_mask operands to reg.
+    
+    In order to directly use constants this patch removes force_regs
+    in the vcond_mask expander.
+    
+    gcc/ChangeLog:PR middle-end/113474* internal-fn.cc (expand_vec_cond_mask_optab_fn):  Remove
+            force_regs.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/pr113474.c: New test.
+
+- User: JuzheZhong | Time: 2024-05-17 22:25:41 UTC
+  Text: Fixed
+

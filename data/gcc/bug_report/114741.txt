@@ -1,0 +1,221 @@
+Bug Summary: [14 regression] aarch64 sve: unnecessary fmov for scalar int bit operations
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: N/A | Time: 2024-04-16 12:34:14 UTC
+  Text: void foo(unsigned i, unsigned *p)
+{
+    *p = i & 1;
+}
+
+with gcc -march=armv8-a+sve -O2 compiles to
+
+foo:
+        fmov    s31, w0
+        and     z31.s, z31.s, #1
+        str     s31, [x1]
+        ret
+
+instead of
+
+foo:
+        and     w0, w0, 1
+        str     w0, [x1]
+        ret
+
+it is wrong with -mcpu=generic but good e.g. with -mcpu=neoverse-v1
+
+- User: Wilco | Time: 2024-04-16 14:55:22 UTC
+  Text: This example always goes wrong:
+
+void foo2(unsigned *p)
+{
+    *p &= 1;
+}
+
+Eg. with -mcpu=neoverse-v1:
+
+        ldr     s31, [x0]
+        and     z31.s, z31.s, #1
+        str     s31, [x0]
+        ret
+
+This doesn't make any sense since there are usually fewer vector units than integer ALUs, and the typically have higher latency.
+
+- User: Wilco | Time: 2024-04-16 15:45:20 UTC
+  Text: It looks like the underlying bug is '^' being incorrectly treated like '?' in record_reg_classes (which is never used during reload). Fixing that results in the expected code being generated in all cases. It looks this issue was introduced in the original commit d1457701461d5a49ca6b5d8a6d1c83a37a6dc771
+
+- User: Andrew Pinski | Time: 2024-04-16 16:42:10 UTC
+  Text: Confirmed.
+
+- User: Andrew Pinski | Time: 2024-04-16 18:03:05 UTC
+  Text: (In reply to Wilco fromcomment #2)> It looks like the underlying bug is '^' being incorrectly treated like '?'
+> in record_reg_classes (which is never used during reload). Fixing that
+> results in the expected code being generated in all cases. It looks this
+> issue was introduced in the original commit
+> d1457701461d5a49ca6b5d8a6d1c83a37a6dc771static const struct cpu_regmove_cost generic_armv9_a_regmove_cost =
+{
+  1, /* GP2GP  */
+  /* Spilling to int<->fp instead of memory is recommended so set
+     realistic costs compared to memmov_cost.  */
+  3, /* GP2FP  */
+  2, /* FP2GP  */
+  2 /* FP2FP  */
+};
+
+
+Note these costs are broken.
+TARGET_REGISTER_MOVE_COST  has this to say about the special value 2:
+```
+If reload sees an insn consisting of a single set between two hard registers, and if TARGET_REGISTER_MOVE_COST applied to their classes returns a value of 2, reload does not check to ensure that the constraints of the insn are met. Setting a cost of other than 2 will allow reload to verify that the constraints are met. You should do this if the ‘movm’ pattern’s constraints do not allow such copying.
+```
+
+The way I implemented this for thunderx was have GP2GP being cost of 2 and then be relative from there. That gave better code generation in general and even less spilling. I know I wrote about this before too.
+
+- User: Tamar Christina | Time: 2024-04-16 19:18:38 UTC
+  Text: (In reply to Andrew Pinski fromcomment #4)> (In reply to Wilco fromcomment #2)
+> > It looks like the underlying bug is '^' being incorrectly treated like '?'
+> > in record_reg_classes (which is never used during reload). Fixing that
+> > results in the expected code being generated in all cases. It looks this
+> > issue was introduced in the original commit
+> > d1457701461d5a49ca6b5d8a6d1c83a37a6dc771
+> 
+> static const struct cpu_regmove_cost generic_armv9_a_regmove_cost =
+> {
+>   1, /* GP2GP  */
+>   /* Spilling to int<->fp instead of memory is recommended so set
+>      realistic costs compared to memmov_cost.  */
+>   3, /* GP2FP  */
+>   2, /* FP2GP  */
+>   2 /* FP2FP  */
+> };
+> 
+> 
+> Note these costs are broken.
+> TARGET_REGISTER_MOVE_COST  has this to say about the special value 2:
+> ```
+> If reload sees an insn consisting of a single set between two hard
+> registers, and if TARGET_REGISTER_MOVE_COST applied to their classes returns
+> a value of 2, reload does not check to ensure that the constraints of the
+> insn are met. Setting a cost of other than 2 will allow reload to verify
+> that the constraints are met. You should do this if the ‘movm’ pattern’s
+> constraints do not allow such copying.
+> ```
+> 
+> The way I implemented this for thunderx was have GP2GP being cost of 2 and
+> then be relative from there. That gave better code generation in general and
+> even less spilling. I know I wrote about this before too.I don't think this is related to this at all
+the old generic costs, which armv8 was taken from doesn't use 2, and is brokenhttps://github.com/gcc-mirror/gcc/blob/master/gcc/config/aarch64/tuning_models/generic.h#L42generic-armv8-a doesn't use 2 and is brokenhttps://github.com/gcc-mirror/gcc/blob/master/gcc/config/aarch64/tuning_models/generic_armv8_a.h#L43neoverse-n2 uses 2 and isn't brokenhttps://github.com/gcc-mirror/gcc/blob/master/gcc/config/aarch64/tuning_models/neoversen2.hI think the issue is what Wilco mentioned before. 
+The GCC docs claim that ^ shouldn't affect initial costing/IRA, but it clearly does.
+
+it's penalizing the r->r alternative during initial costing and not just during lra if a reload is needed.
+
+so the question to Vlad is it correct that ^ is treated the same way as ? during initial costing? i.e. it's penalizing the alternative.
+
+- User: Tamar Christina | Time: 2024-04-16 19:20:56 UTC
+  Text: and the exact armv9-a cost model you quoted, also does the right codegen.https://godbolt.org/z/obafoT6cjThere is just an inexplicable penalty being applied to the r->r alternative.
+
+- User: Wilco | Time: 2024-04-17 13:47:17 UTC
+  Text: (In reply to Tamar Christina fromcomment #6)> and the exact armv9-a cost model you quoted, also does the right codegen.
+>https://godbolt.org/z/obafoT6cj> 
+> There is just an inexplicable penalty being applied to the r->r alternative.Indeed it is not related to cost model - building SPEC shows a significant regression (~1%) with -mcpu=neoverse-v1 due to AND immediate being quite common in scalar code. The '^' incorrectly forces many cases to use the SVE alternative.
+
+- User: Tamar Christina | Time: 2024-04-17 13:49:30 UTC
+  Text: Indeed, Regtesting a patch that fixes it, so mine...
+
+It looks like ^ doesn't work well when there's a choice of multiple register files.
+
+- User: GCC Commits | Time: 2024-04-18 10:49:22 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:a2f4be3dae04fa8606d1cc8451f0b9d450f7e6e6commitr14-10014-ga2f4be3dae04fa8606d1cc8451f0b9d450f7e6e6Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Thu Apr 18 11:47:42 2024 +0100
+
+    AArch64: remove reliance on register allocator for simd/gpreg costing. [PR114741]
+    
+    InPR114741we see that we have a regression in codegen when SVE is enable where
+    the simple testcase:
+    
+    void foo(unsigned v, unsigned *p)
+    {
+        *p = v & 1;
+    }
+    
+    generates
+    
+    foo:
+            fmov    s31, w0
+            and     z31.s, z31.s, #1
+            str     s31, [x1]
+            ret
+    
+    instead of:
+    
+    foo:
+            and     w0, w0, 1
+            str     w0, [x1]
+            ret
+    
+    This causes an impact it not just codesize but also performance.  This is caused
+    by the use of the ^ constraint modifier in the pattern <optab><mode>3.
+    
+    The documentation states that this modifier should only have an effect on the
+    alternative costing in that a particular alternative is to be preferred unless
+    a non-psuedo reload is needed.
+    
+    The pattern was trying to convey that whenever both r and w are required, that
+    it should prefer r unless a reload is needed.  This is because if a reload is
+    needed then we can construct the constants more flexibly on the SIMD side.
+    
+    We were using this so simplify the implementation and to get generic cases such
+    as:
+    
+    double negabs (double x)
+    {
+       unsigned long long y;
+       memcpy (&y, &x, sizeof(double));
+       y = y | (1UL << 63);
+       memcpy (&x, &y, sizeof(double));
+       return x;
+    }
+    
+    which don't go through an expander.
+    However the implementation of ^ in the register allocator is not according to
+    the documentation in that it also has an effect during coloring.  During initial
+    register class selection it applies a penalty to a class, similar to how ? does.
+    
+    In this example the penalty makes the use of GP regs expensive enough that it no
+    longer considers them:
+    
+        r106: preferred FP_REGS, alternative NO_REGS, allocno FP_REGS
+    ;;        3--> b  0: i   9 r106=r105&0x1
+        :cortex_a53_slot_any:GENERAL_REGS+0(-1)FP_REGS+1(1)PR_LO_REGS+0(0)
+                             PR_HI_REGS+0(0):model 4
+    
+    which is not the expected behavior.  For GCC 14 this is a conservative fix.
+    
+    1. we remove the ^ modifier from the logical optabs.
+    
+    2. In order not to regress copysign we then move the copysign expansion to
+       directly use the SIMD variant.  Since copysign only supports floating point
+       modes this is fine and no longer relies on the register allocator to select
+       the right alternative.
+    
+    It once again regresses the general case, but this case wasn't optimized in
+    earlier GCCs either so it's not a regression in GCC 14.  This change gives
+    strict better codegen than earlier GCCs and still optimizes the important cases.
+    
+    gcc/ChangeLog:PR target/114741* config/aarch64/aarch64.md (<optab><mode>3): Remove ^ from alt 2.
+            (copysign<GPF:mode>3): Use SIMD version of IOR directly.
+    
+    gcc/testsuite/ChangeLog:PR target/114741* gcc.target/aarch64/fneg-abs_2.c: Update codegen.
+            * gcc.target/aarch64/fneg-abs_4.c: xfail for now.
+            * gcc.target/aarch64/pr114741.c: New test.
+
+- User: Tamar Christina | Time: 2024-04-18 10:51:02 UTC
+  Text: Fixed, thanks for the report.
+

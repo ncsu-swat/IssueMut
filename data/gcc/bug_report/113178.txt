@@ -1,0 +1,180 @@
+Bug Summary: [14 Regression] ice in find_uses_to_rename_use
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2023-12-30 10:15:20 UTC
+  Text: This C++ source code:
+
+struct PixelWeight {
+  int m_SrcStart;
+  int m_Weights[];
+};
+struct CWeightTable {
+  int *GetValueFromPixelWeight(PixelWeight *, int) const;
+};
+char ContinueStretchHorz_dest_scan;
+struct CStretchEngine {
+  bool ContinueStretchHorz();
+  CWeightTable m_WeightTable;
+};
+int *CWeightTable::GetValueFromPixelWeight(PixelWeight *pWeight,
+                                           int index) const {
+  long __trans_tmp_1;
+  if (index < pWeight->m_SrcStart)
+    return __trans_tmp_1 ? &pWeight->m_Weights[pWeight->m_SrcStart] : nullptr;
+}
+bool CStretchEngine::ContinueStretchHorz() {
+  {
+    PixelWeight pPixelWeights;
+    int dest_g_m;
+    for (int j; j; j++) {
+      int pWeight = *m_WeightTable.GetValueFromPixelWeight(&pPixelWeights, j);
+      dest_g_m += pWeight;
+    }
+    ContinueStretchHorz_dest_scan = dest_g_m;
+  }
+}
+
+when compiled by recent gcc trunk, does this:
+
+cvise $ ~/gcc/results.20231227.asan.ubsan/bin/g++ -c -O3 -wbug995.cc
+cvise $ ~/gcc/results.20231227.asan.ubsan/bin/g++ -c -O3 -w -march=znver3bug995.cc
+during GIMPLE pass: vectbug995.cc: In member function ‘bool CStretchEngine::ContinueStretchHorz()’:bug995.cc:19:6: internal compiler error: Segmentation fault
+   19 | bool CStretchEngine::ContinueStretchHorz() {
+      |      ^~~~~~~~~~~~~~
+0x11e1b39 crash_signal(int)
+	../../trunk.20210101/gcc/toplev.cc:316
+0x1381b98 find_uses_to_rename_use(basic_block_def*, tree_node*, bitmap_head**, bitmap_head*)
+	../../trunk.20210101/gcc/tree-ssa-loop-manip.cc:414
+
+- User: Andrew Pinski | Time: 2023-12-30 18:46:22 UTC
+  Text: More reduced testcase and converted into one is C code too:
+```
+struct PixelWeight {
+  int m_SrcStart;
+  int m_Weights[16];
+};
+char h;
+void f(struct PixelWeight *pPixelWeights) {
+    int dest_g_m;
+    long tt;
+    for (int j = 0; j < 16; j++) {
+      int *p = 0;
+      if (j < pPixelWeights->m_SrcStart)
+        p = tt ? &pPixelWeights->m_Weights[0] : 0;
+      int pWeight = *p;
+      dest_g_m += pWeight;
+    }
+    h = dest_g_m;
+}
+```
+
+- User: David Binderman | Time: 2023-12-30 19:38:55 UTC
+  Text: The bug first seems to occur sometime between git:514ea1df444ca7f6
+and git:f19ceb2d49afdfa5, a distance of 83 commits.
+
+- User: David Binderman | Time: 2023-12-30 20:28:17 UTC
+  Text: After some bisection, range seems to beg:2902300340928989tog:ed60b2868abdb793, a range of 21 commits.
+
+- User: David Binderman | Time: 2023-12-30 20:56:17 UTC
+  Text: Reduced range seems to beg:0994ddd86f9c3d82tog:a657c7e3518fcfc7.
+
+All commits in this range are by Tamar.
+
+- User: Tamar Christina | Time: 2024-01-02 10:09:19 UTC
+  Text: Thanks, fixed by submitted patch forhttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=113137
+
+- User: Martin Jambor | Time: 2024-01-10 18:02:00 UTC
+  Text: (In reply to David Binderman fromcomment #4)> Reduced range seems to beg:0994ddd86f9c3d82tog:a657c7e3518fcfc7.
+> 
+> All commits in this range are by Tamar.Specificallyr14-6822-g01f4251b8775c8(Tamar Christina: middle-end: Support vectorization of loops with multiple exits.)
+
+- User: GCC Commits | Time: 2024-01-12 15:32:42 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:411de96dbf2bdafc7a90ebbfc63e68afd6388d29commitr14-7195-g411de96dbf2bdafc7a90ebbfc63e68afd6388d29Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Fri Jan 12 15:25:34 2024 +0000
+
+    middle-end: maintain LCSSA form when peeled vector iterations have virtual operands
+    
+    This patch fixes several interconnected issues.
+    
+    1. When picking an exit we wanted to check for niter_desc.may_be_zero not true.
+       i.e. we want to pick an exit which we know will iterate at least once.
+       However niter_desc.may_be_zero is not a boolean.  It is a tree that encodes
+       a boolean value.  !niter_desc.may_be_zero is just checking if we have some
+       information, not what the information is.  This leads us to pick a more
+       difficult to vectorize exit more often than we should.
+    
+    2. Because we had this bug, we used to pick an alternative exit much more ofthen
+       which showed one issue, when the loop accesses memory and we "invert it" we
+       would corrupt the VUSE chain.  This is because on an peeled vector iteration
+       every exit restarts the loop (i.e. they're all early) BUT since we may have
+       performed a store, the vUSE would need to be updated.  This version maintains
+       virtual PHIs correctly in these cases.   Note that we can't simply remove all
+       of them and recreate them because we need the PHI nodes still in the right
+       order for if skip_vector.
+    
+    3. Since we're moving the stores to a safe location I don't think we actually
+       need to analyze whether the store is in range of the memref,  because if we
+       ever get there, we know that the loads must be in range, and if the loads are
+       in range and we get to the store we know the early breaks were not taken and
+       so the scalar loop would have done the VF stores too.
+    
+    4. Instead of searching for where to move stores to, they should always be in
+       exit belonging to the latch.  We can only ever delay stores and even if we
+       pick a different exit than the latch one as the main one, effects still
+       happen in program order when vectorized.  If we don't move the stores to the
+       latch exit but instead to whever we pick as the "main" exit then we can
+       perform incorrect memory accesses (luckily these are trapped by verify_ssa).
+    
+    5. We only used to analyze loads inside the same BB as an early break, and also
+       we'd never analyze the ones inside the block where we'd be moving memory
+       references to.  This is obviously bogus and to fix it this patch splits apart
+       the two constraints.  We first validate that all load memory references are
+       in bounds and only after that do we perform the alias checks for the writes.
+       This makes the code simpler to understand and more trivially correct.
+    
+    gcc/ChangeLog:PR tree-optimization/113137PR tree-optimization/113136PR tree-optimization/113172PR tree-optimization/113178* tree-vect-loop-manip.cc (slpeel_tree_duplicate_loop_to_edge_cfg):
+            Maintain PHIs on inverted loops.
+            (vect_do_peeling): Maintain virtual PHIs on inverted loops.
+            * tree-vect-loop.cc (vec_init_loop_exit_info): Pick exit closes to
+            latch.
+            (vect_create_loop_vinfo): Record all conds instead of only alt ones.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/113137PR tree-optimization/113136PR tree-optimization/113172PR tree-optimization/113178* g++.dg/vect/vect-early-break_4-pr113137.cc: New test.
+            * g++.dg/vect/vect-early-break_5-pr113137.cc: New test.
+            * gcc.dg/vect/vect-early-break_95-pr113137.c: New test.
+            * gcc.dg/vect/vect-early-break_96-pr113136.c: New test.
+            * gcc.dg/vect/vect-early-break_97-pr113172.c: New test.
+
+- User: GCC Commits | Time: 2024-01-12 15:32:51 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:e79c5855ab39d96baa7c6bec63eb97715abcf68dcommitr14-7197-ge79c5855ab39d96baa7c6bec63eb97715abcf68dAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Fri Jan 12 15:26:29 2024 +0000
+
+    middle-end: fill in reduction PHI for all alt exits [PR113178]
+    
+    When we have a loop with more than 2 exits and a reduction I forgot to fill in
+    the PHI value for all alternate exits.
+    
+    All alternate exits use the same PHI value so we should loop over the new
+    PHI elements and copy the value across since we call the reduction calculation
+    code only once for all exits.  This was normally covered up by earlier parts of
+    the compiler rejecting loops incorrectly (which has been fixed now).
+    
+    Note that while I can use the loop in all cases, the reason I separated out the
+    main and alt exit is so that if you pass the wrong edge the macro will assert.
+    
+    gcc/ChangeLog:PR tree-optimization/113178* tree-vect-loop.cc (vect_create_epilog_for_reduction): Fill in all
+            alternate exits.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/113178* gcc.dg/vect/vect-early-break_101-pr113178.c: New test.
+            * gcc.dg/vect/vect-early-break_102-pr113178.c: New test.
+
+- User: Tamar Christina | Time: 2024-01-12 15:36:25 UTC
+  Text: Fixed. Thanks for the report and let me know if there's something still broken.
+

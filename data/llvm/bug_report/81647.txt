@@ -1,0 +1,68 @@
+Issue Title: Carving out -Wformat warning about scoped enums into a subwarning
+Original Post: Android uses -Wformat by default.  Starting with https://github.com/llvm/llvm-project/commit/3632e2f517, this warning reports a lot of conversion warnings for scoped enums.  It is infeasible to fix these in our third party code.
+
+We can create a sub-warning, similar to other named diagnostics controlled by -Wformat (https://clang.llvm.org/docs/DiagnosticsReference.html#wformat), to be able to disable it selectivey for our third-party code.
+
+@AaronBallman does this option sound good?
+
+(cc: @enh-google @ZijunZhaoCCK )
+
+Comment by enh-google: (naively, it seemed from the llvm docs like this was meant to be in `-Wformat-pedantic`, not `-Wformat`?)
+Comment by pinskia: https://github.com/llvm/llvm-project/issues/38717
+Comment by dwblaikie: From some of the descriptions in https://github.com/llvm/llvm-project/issues/38717#issuecomment-981004155 it sounds pretty bad to ignore this warning (like UB bad), if I'm understanding/following correctly? So I'm not sure demoting this to `-Wformat-pedantic` matches the severity?
+
+Perhaps in the cases where the underlying type of the scoped enum /does/ do the right thing, we could demote to `-Wformat-pedantic` or some other warning subgroup? Not sure if that'd address Android's issues, but anything leftover after that is probably worth fixing to avoid sadness.
+Comment by enh-google: > From some of the descriptions in [#38717 (comment)](https://github.com/llvm/llvm-project/issues/38717#issuecomment-981004155) it sounds pretty bad to ignore this warning (like UB bad), if I'm understanding/following correctly? So I'm not sure demoting this to `-Wformat-pedantic` matches the severity?
+
+seems like it's probably accidental UB though, because no-one thought to update the relevant part of the spec? there's no reason given for this, just an absence of explicit text saying "do the right thing"?
+
+> Perhaps in the cases where the underlying type of the scoped enum /does/ do the right thing, we could demote to `-Wformat-pedantic` or some other warning subgroup?
+
+yeah, it'll be tricky to get a complete list (because we'd need to enable `-Wformat` but disable `-Werror`, neither of which will make the build happy), but hopefully @ZijunZhaoCCK can have a look and at least try to get a feel for how many are "too small to just work"? just looking by eye at one [large] project (ART), the vast majority of scoped enums were `int` or `size_t`, but they did have a handful of `uint16_t` and `uint8_t`. (no idea from grep how many of those actually get passed to varargs functions though.)
+Comment by ZijunZhaoCCK: Enable `-Wformat` and disable `-Werror` and build ART. 
+We get the result:
+
+There are 676 warnings.
+
+For 8- or 16-bit types:
+char:83 short: 231 char*:1
+total: 315
+
+For non-8- or non-16-bit types:
+int: 359  long:2
+total: 361
+
+Only 2 warnings in `external/` directory: `external/renderscript-intrinsics-replacement-toolkit/renderscript-toolkit` and they are backed by `int`.
+Comment by jwakely: > seems like it's probably accidental UB though, because no-one thought to update the relevant part of the spec? there's no reason given for this, just an absence of explicit text saying "do the right thing"?
+
+Not implicitly promoting scoped enums is intentional, see  https://cplusplus.github.io/CWG/issues/2347.html
+
+Comment by KenSykes: I would very much like to see this split out to a separate warning. We use enum class types in many places (strong typing) and this triggers many new warnings that are not present in MSVC.
+
+I'm not an expert at reading standard meeting notes but the last entry says this is "conditionally-supported with implementation-defined semantics." That does not sound like UB to me.
+
+Please move this warning to -Wformat-pedantic or similar solution. For now I have disabled format warnings because the static_cast<> cause unnecessary readability issues, and am depending on MSVC to catch format warnings. This is a shame because clang has helped us find and fix actual format issues.
+
+
+Comment by jwakely: > I'm not an expert at reading standard meeting notes but the last entry says this is "conditionally-supported with implementation-defined semantics." That does not sound like UB to me.
+
+That's describing what happens when you pass a scoped enum to a varargs function. If it's supported, then you can pass them in and get them back again with `va_arg`. But the warning is not a about passing it to  a varargs function, it's very specifically about passing it to `printf`. And that's undefined because `printf` doesn't know how to get the right type back with `va_arg`. So it's no different to `printf("%d", 0.0)` and other calls where the type doesn't match the specifier, which is UB.
+Comment by TheJCAB: > "`printf` doesn't know how to get the right type back"
+
+Nor would it know what to do with it anyway. But it does know what to do with an enum's underlying type. And I have a hard time accepting `printf("%d", 0.0)` as an argument. IANAL either but an enum's underlying type is not to the enum as a double is to an int. Not sure what the standard says, but [cppreference states](https://en.cppreference.com/w/cpp/language/enum) "An enumeration has the same [size](https://en.cppreference.com/w/cpp/language/sizeof), [value representation](https://en.cppreference.com/w/cpp/language/object#Object_representation_and_value_representation), and [alignment requirements](https://en.cppreference.com/w/cpp/language/object#Alignment) as its underlying type. Furthermore, each value of an enumeration has the same representation as the corresponding value of the underlying type." That leaves absolutely no wiggle room for the physical equivalence to be invalid.
+
+Frankly, I'd be very happy if this validation allowed also "wrapper" structs with a single member matching the format, too. For exactly the same reasons. Such structs are sometimes used (as strong enums are) to create strongly-typed numeric-like types.
+
+I'm all for moving all such "reasonably safe" validations to only get flagged by a "-Wformat-pedantic".
+Comment by porglezomp: As a further migration pain here, [Apple's `os_log` API](https://developer.apple.com/documentation/os/os_log) contains a `_Pragma("clang diagnostic error \"Wformat\"")` which means this is an insuppressible error for anyone using the platform logging APIs. Based on the fact that it is required to have the same representation, I don't know if this diagnostic is worth the pain under `-Wformat` instead of `-Wformat-pedantic`.
+
+Related issue that's not UB-level here, but the `static_cast` suggested by the diagnostic can hide other issues later on if the underlying type changes, I just filed: https://github.com/llvm/llvm-project/issues/87128
+Comment by AaronBallman: It's UB to pass a scoped enumeration to `printf` and I think "but it should be harmless UB" is a fragile way to view it. For example, an optimizer is free to entirely remove the call to `printf` from a C++ translation unit if it sees a scoped enumeration being passed (I wouldn't find that behavior to be user-friendly, but it's conforming). Also, the C committee has been extending enumerations and while I would be shocked if we did so in a way that would cause problems for scoped enumerations in C++ being passed to `printf`, the potential theoretically exists for this UB to matter.
+
+That said, having a separate subwarning to give users control over this has some appeal. We have `-Wformat-non-iso` already and this sort of feels in the same line; it's a non-standard use of a format specifier. Perhaps it would make sense to move this diagnostic under that flag?
+Comment by TheJCAB: @AaronBallman The UB argument is well understood and clang's strictness has proven to be a useful tool, at least for us, in keeping our code most portable. I don't want to discourage this sort of strictness improvement.
+
+But as discussed here the broadness of `-Wformat` makes it very disruptive. [`-Wformat-non-iso`](https://clang.llvm.org/docs/DiagnosticsReference.html#id336) sounds reasonably appropriate, but [`-Wformat-pedantic`](https://clang.llvm.org/docs/DiagnosticsReference.html#id340) strikes me as a better choice, according to the diagnostic texts listed in the documentation.
+
+Arguably the best workaround of all would be to avoid the `printf` formatting issue entirely and transition codebases to `std::format`/`fmt::format`. Unfortunately, we've found the code bloat introduced by `std::basic_format_arg` to be too much for us (even if we use `fmt`) so we haven't made the move. We're still evaluating this. But I digress...
+Comment by AaronBallman: After thinking about it some more, I think I agree that `-Wformat-pedantic` is a better place for it than `-Wformat-non-iso`. Either is defensible, but the pedantic warning is more about the argument and the non-iso warning is more about the specifier, and this issue is more about the argument than the specifier.

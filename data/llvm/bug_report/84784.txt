@@ -1,0 +1,121 @@
+Issue Title:  C23 mode: cannot compile this static initializer yet
+Original Post: In C23, clang as of trunk gives me that error on the following code
+
+```{.C}
+#include <math.h>
+_Bool const inf =  (1.0/0.0 == INFINITY);
+```
+
+This is maybe transitional and known (all my apologies) but it is suspicious that it only appears in with the combination of trunk and C23, were normally this should be valid code, regardless of the C version.
+
+Thanks
+Jens
+
+
+Comment by Sirraide: That error sounds like it’s being issued during codegen; I don’t see why we shouldn’t be able to do something with that code, but even if it was invalid, we probably shouldn’t error in codegen.
+Comment by llvmbot: 
+@llvm/issue-subscribers-clang-codegen
+
+Author: Jens Gustedt (gustedt)
+
+<details>
+In C23, clang as of trunk gives me that error on the following code
+
+```{.C}
+#include &lt;math.h&gt;
+_Bool const inf =  (1.0/0.0 == INFINITY);
+```
+
+This is maybe transitional and known (all my apologies) but it is suspicious that it only appears in with the combination of trunk and C23, were normally this should be valid code, regardless of the C version.
+
+Thanks
+Jens
+
+</details>
+
+Comment by Sirraide: Reduced (https://godbolt.org/z/bEfGsKEcW):
+```c
+bool const inf =  (1.0/0.0);
+```
+This gives this error:
+```
+<source>:1:12: error: cannot compile this static initializer yet
+    1 | bool const inf =  (1.0/0.0);
+      |            ^
+```
+Comment by Sirraide: @AaronBallman Is this valid in C23? The problem here is the division by zero. We’re hitting a code path in codegen in `VarDecl::evaluateValueImpl` where we check for `IsConstantInitialization && (Ctx.getLangOpts().CPlusPlus || Ctx.getLangOpts().C23)`, and if that is the case and we emitted any notes, constant evaluation fails, and as a result, codegen issues this error.
+
+This entire situation seems odd to me. From what I can tell, this check also fails for C++, but ostensibly, it still manages to constant-initialise the variable through some other means. Replacing `Ctx.getLangOpts().C23` with `(isConstexpr() && Ctx.getLangOpts().C23)` ‘fixes’ the problem, but this seems more like fixing symptoms rahter than the underlying cause...
+Comment by Sirraide: In other words, it seems like codegen for C is more or less treating global `const` variables as though they were `constexpr`.
+Comment by gustedt: For the status of this in C23 and before, my understanding is that if `FE_DIVBYZERO` exists a floating division by zero that is evaluated at execution time raises this exception and if `INFINITY` exists the result of the operation should be exactly that. Now, if such an expression is evaluated at compile time, the result should be the same, but not flag should be raised at runtime. 
+
+Whether or not anything changes for C23's `constexpr` should be irrelevant, here, this part of the standard did not change for other static variables.
+
+And in any case, this is a regression, it worked previously and doesn't work now. If such a regression is intended, it should at least be documented. 
+Comment by Sirraide: > my understanding is that if `FE_DIVBYZERO` exists a floating division by zero that is evaluated at execution time raises this exception and if `INFINITY` exists the result of the operation should be exactly that
+
+The standard also states that the behaviour is undefined if the RHS operand of `/` is `0`, though.
+Comment by gustedt: > > my understanding is that if `FE_DIVBYZERO` exists a floating division by zero that is evaluated at execution time raises this exception and if `INFINITY` exists the result of the operation should be exactly that
+> 
+> The standard also states that the behaviour is undefined if the RHS operand of `/` is `0`, though.
+
+Such a provision is always "unless more specific clauses apply". And floating point exceptions are ruled by specific clauses. (I agree that this is all fuzzy and there seems not even to be a real description what `FE_DIVBYZERO` even means ;-)
+Comment by AaronBallman: 6.7.11p5: "All the expressions in an initializer for an object that has static or thread storage duration or is declared with the constexpr storage-class specifier shall be constant expressions or string literals."
+
+6.6p4: "Each constant expression shall evaluate to a constant that is in the range of representable values for its type."
+
+6.6p17: "The semantic rules for the evaluation of a constant expression are the same as for nonconstant expressions."
+
+F.2.2p1: "Since negative and positive infinity are representable in ISO/IEC 60559 formats, all real numbers lie within the range of representable values."
+
+F.8.5p: "An arithmetic constant expression of floating type, other than one in an initializer for an object that has static or thread storage duration or that is declared with storage-class specifier constexpr, is evaluated (as if) during execution; thus, it is affected by any operative floating-point control modes and raises floating-point exceptions as required by ISO/IEC 60559 (provided the state for the FENV_ACCESS pragma is "on")."
+
+F.8.6p1: "All computation for automatic initialization is done (as if) at execution time; thus, it is affected by any operative modes and raises floating-point exceptions as required by ISO/IEC 60559 (provided the state for the FENV_ACCESS pragma is "on"). All computation for initialization of objects that have static or thread storage duration, or that are declared with storage-class specifier constexpr, is done (as if) at translation time."
+
+(We aim for conformance to Annex F though how conforming we are to it is still a question mark.)
+
+So yes, I agree with @gustedt that this code should be accepted. This regressed on trunk: https://godbolt.org/z/jxa7z64nx
+Comment by Sirraide: In that case, the question is where to best fix that, because checking for `isConstexpr()` in `VarDecl::evaluateValueImpl` does fix the issue, but I’m not sure how much sense it makes to put that there, because to me at least it seems like we’re hitting code paths meant for `constexpr` variables even though the variable is only `const`, so I’m not sure we should be getting there in the first place, but I can open a pr for this and we can continue looking into that there, I suppose.
+Comment by AaronBallman: CodeGen has its own little constant evaluator that I suspect needs to be updated: https://github.com/llvm/llvm-project/blob/b5a16b6d8ad51df7c14cd696f3dc1f98b6984905/clang/lib/CodeGen/CGExprConstant.cpp#L1676
+
+CC @rjmccall @efriedma-quic 
+Comment by Sirraide: I’ve stepped through this function, and from what I can tell, `ConstExprEmitter(*this).Visit`, which it tries to call first, specifically does not handle this case; further down in that function, we then do this:
+https://github.com/llvm/llvm-project/blob/b5a16b6d8ad51df7c14cd696f3dc1f98b6984905/clang/lib/CodeGen/CGExprConstant.cpp#L1703-L1706
+
+That `evaluateValue()` call eventually leads to `VarDecl::evaluateValueImpl`, which then fails as I pointed out above; so either that or `tryEmitPrivateForMemory()` (or maybe the `ConstExprEmitter`?) needs to be updated, but I’m candidly not familiar enough w/ codegen to know which one; just wanted to share what I’ve discovered so far in case it helps.
+Comment by Sirraide: > either that or tryEmitPrivateForMemory()
+
+Actually, that doesn’t make sense, because `tryEmitPrivateForMemory` takes an `APValue`, so it can’t be doing any actual evaluation.
+Comment by efriedma-quic: The evaluator in CGExprConstant doesn't know anything about floating-point; we ultimately use the one from lib/AST/ExprConstant.cpp.
+
+The reason C23 is special is because of constexpr.  See #73099.  CC @Fznamznon @to268 .
+
+The reason the error message is weird is that Sema::CheckForConstantInitializer isn't using the same rules as CodeGen for determining whether an initializer is "constant".
+Comment by Fznamznon: Since CodeGen is using `lib/AST/ExprConstant.cpp` for FP and there was no intention to update it for non-constexpr variables, I wonder if we should just update it this way:
+
+> We’re hitting a code path in codegen in VarDecl::evaluateValueImpl where we check for IsConstantInitialization && (Ctx.getLangOpts().CPlusPlus || Ctx.getLangOpts().C23). Replacing Ctx.getLangOpts().C23 with (isConstexpr() && Ctx.getLangOpts().C23) ‘fixes’ the problem.
+Comment by Sirraide: I have that implemented and can open a pr for that if we decide to do it that way. It doesn’t seem to break any tests.
+Comment by to268: @Sirraide Open the PR and make sure to reference this issue.
+Comment by Sirraide: Alright, I’ve opened a pr for this: #84981.
+Comment by gustedt: Hi,
+many thanks for such a quick reactivity! 
+For constexpr it is a pity that this would not be allowed, but I would really be unsure what we have decided what the result should. (It was merely the floating-point SG that designed the behavior for these borderline cases.)
+Even for constexpr it might be good if the error message could be a bit more explicit on what went wrong, if that is possible. Something like "exceptional floating-point arithmetic" or so.
+Thanks 
+Jens
+-- 
+Jens Gustedt - INRIA & ICube, Strasbourg, France 
+Comment by Sirraide: > Even for constexpr it might be good if the error message could be a bit more explicit on what went wrong
+
+For `constexpr` variables, the error is a lot more helpful:
+```
+<source>:1:22: error: constexpr initializer for type 'const bool' is of type 'double'
+    1 | constexpr bool inf = 1./0.;
+      |                      ^
+<source>:1:16: error: constexpr variable 'inf' must be initialized by a constant expression
+    1 | constexpr bool inf = 1./0.;
+      |                ^     ~~~~~
+<source>:1:24: note: division by zero
+    1 | constexpr bool inf = 1./0.;
+      |  
+```

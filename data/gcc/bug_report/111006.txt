@@ -1,0 +1,124 @@
+Bug Summary: [SVE] Extra neg for storing to short from int comparison
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2023-08-12 20:11:26 UTC
+  Text: Take:
+```
+void __attribute__ ((noipa))
+f0 (unsigned short *__restrict r,
+   int *__restrict a,
+   int *__restrict pred)
+{
+  for (int i = 0; i < 1024; ++i)
+  {
+    int p = pred[i]?-1:0;
+    r[i] = p ;
+  }
+}
+```
+Compile with `-march=armv8.5+sve2 -O3`.
+
+Currently we get:
+```
+.L2:
+        ld1w    z31.s, p7/z, [x2, x1, lsl 2]
+        cmpne   p15.s, p6/z, z31.s, #0
+        mov     z31.s, p15/z, #1
+        neg     z31.h, p6/m, z31.h
+        st1h    z31.s, p7, [x0, x1, lsl 1]
+        incw    x1
+        whilelo p7.s, w1, w3
+        b.any   .L2
+```
+But we should just get:
+```
+.L2:
+        ld1w    z31.s, p7/z, [x2, x1, lsl 2]
+        cmpne   p15.s, p6/z, z31.s, #0
+        mov     z31.s, p15/z, #-1
+        st1h    z31.s, p7, [x0, x1, lsl 1]
+        incw    x1
+        whilelo p7.s, w1, w3
+        b.any   .L2
+```
+
+- User: Andrew Pinski | Time: 2023-08-12 20:48:38 UTC
+  Text: We have:
+  vect_patt_30.10_67 = VEC_COND_EXPR <mask__16.9_64, { 1, ... }, { 0, ... }>;
+  vect_patt_29.11_68 = (vector([4,4]) signed short) vect_patt_30.10_67;
+  vect_patt_28.12_69 = -vect_patt_29.11_68;
+
+So:
+/* Sink convert to branches, but only if we do fold both and @0 is the thurth type for the new version too. */
+(simplify
+ (convert (vec_cond:s @0 @1 @2))
+ (if (is_truth_type_for (type, TREE_TYPE (@0)))
+  (vec_cond @0 (convert! @1) (convert! @2))))
+
+- User: Andrew Pinski | Time: 2023-08-12 20:54:09 UTC
+  Text: Note the non-SVE code generation can be improved too.
+With:
+
+(simplify
+ (negate
+  (vec_pack_trunc:s
+   (vec_cond:s @0 uniform_integer_cst_p@1 uniform_integer_cst_p@2)
+   (vec_cond:s @3 @1 @2)))
+  (with {
+   tree outer_mask_type = truth_type_for (type);
+   tree allones = build_minus_one_cst (type);
+   tree zeros = build_zero_cst (type);
+  }
+  (if (integer_onep (@1) && integer_zerop (@2))
+   (vec_cond (vec_pack_trunc:outer_mask_type @0 @3) { allones; } { zeros; } )
+   (if (integer_onep (@2) && integer_zerop (@1))
+    (vec_cond (vec_pack_trunc:outer_mask_type @0 @3) { zeros; } { allones; } )))))
+
+
+I will submit both later next week.
+
+- User: Andrew Pinski | Time: 2023-08-15 22:03:49 UTC
+  Text: Createdattachment 55740[details]The patch which fixes the SVE part
+
+It took me longer to come up with this due to failures which I didn't know about expand_vec_cond_expr_p, I was just thinking is_truth_type_for would have worked here but nope that crashes for types with BLKmode .
+
+- User: GCC Commits | Time: 2023-08-20 07:27:10 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:70c50c87273d940918225d5c6b03f1ccfb6f978ecommitr14-3337-g70c50c87273d940918225d5c6b03f1ccfb6f978eAuthor: Andrew Pinski <apinski@marvell.com>
+Date:   Mon Aug 14 18:35:53 2023 -0700
+
+    MATCH: Sink convert for vec_cond
+    
+    Convert be sinked into a vec_cond if both sides
+    fold. Unlike other unary operations, we need to check that we still can handle
+    this vec_cond's first operand is the same as the new truth type.
+    
+    I tried a few different versions of this patch:
+    view_convert to the new truth_type but that does not work as we always support all vec_cond
+    afterwards.
+    using expand_vec_cond_expr_p; but that would allow too much.
+    
+    I also tried to see if view_convert can be handled here but we end up with:
+      _3 = VEC_COND_EXPR <_2, {  Nan(-1),  Nan(-1),  Nan(-1),  Nan(-1) }, { 0.0, 0.0, 0.0, 0.0 }>;
+    Which isel does not know how to handle as just being a view_convert from `vector(4) <signed-boolean:32>`
+    to `vector(4) float` and causes a regression with `g++.target/i386/pr88152.C`
+    
+    Note, in the case of the SVE testcase, we will sink negate after the convert and be able
+    to remove a few extra instructions in the end.
+    Also with this change gcc.target/aarch64/sve/cond_unary_5.c will now pass.
+    
+    Committed as approved after a bootstrapped and tested on x86_64-linux-gnu and aarch64-linux-gnu.
+    
+    gcc/ChangeLog:PR tree-optimization/111006PR tree-optimization/110986* match.pd: (op(vec_cond(a,b,c))): Handle convert for op.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/111006* gcc.target/aarch64/sve/cond_convert_7.c: New test.
+
+- User: Andrew Pinski | Time: 2023-08-20 07:27:42 UTC
+  Text: Fixed.
+

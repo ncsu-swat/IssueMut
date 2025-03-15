@@ -1,0 +1,139 @@
+Bug Summary: Missed optimization in FRE because of weak TBAA
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: alias, diagnostic, missed-optimization
+Known to Work: 14.0
+Known to Fail: 13.2.1
+
+Comments:
+- User: Richard Biener | Time: 2023-10-06 15:06:51 UTC
+  Text: Jakub reports a spurious diagnostic with tree-affine.cc with the wide-int patches:> ./cc1plus  -quiet -O2 -Wall -fno-exceptions /tmp/t.iiIn file included from ../../gcc/coretypes.h:465,
+                 from ../../gcc/tree-affine.cc:22:
+In member function 'void widest_int_storage<N>::set_len(unsigned int, bool) [with int N = 576]',
+    inlined from 'void wi::copy(T1&, const T2&) [with T1 = widest_int_storage<576>; T2 = generic_wide_int<wide_int_ref_storage<true, true> >]' at ../../gcc/wide-int.h:2407:13,
+    inlined from 'widest_int_storage<N>& widest_int_storage<N>::operator=(const T&) [with T = int; int N = 576]' at ../../gcc/wide-int.h:1805:12,
+    inlined from 'generic_wide_int<storage>& generic_wide_int<T>::operator=(const T&) [with T = int; storage = widest_int_storage<576>]' at ../../gcc/wide-int.h:1018:23,
+    inlined from 'void aff_combination_remove_elt(aff_tree*, unsigned int)' at ../../gcc/tree-affine.cc:596:34:
+../../gcc/wide-int.h:1856:14: warning: 'void* memcpy(void*, const void*, size_t)' offset [0, 7] is out of the bounds [0, 0] [-Warray-bounds=]
+../../gcc/wide-int.h:1857:12: warning: 'void free(void*)' called on a pointer to an unallocated object '1' [-Wfree-nonheap-object]
+In member function 'void widest_int_storage<N>::set_len(unsigned int, bool) [with int N = 576]',
+    inlined from 'void wi::copy(T1&, const T2&) [with T1 = widest_int_storage<576>; T2 = generic_wide_int<wide_int_ref_storage<true, true> >]' at ../../gcc/wide-int.h:2407:13,
+    inlined from 'widest_int_storage<N>& widest_int_storage<N>::operator=(const T&) [with T = int; int N = 576]' at ../../gcc/wide-int.h:1805:12,
+    inlined from 'generic_wide_int<storage>& generic_wide_int<T>::operator=(const T&) [with T = int; storage = widest_int_storage<576>]' at ../../gcc/wide-int.h:1018:23,
+    inlined from 'void aff_combination_convert(aff_tree*, tree)' at ../../gcc/tree-affine.cc:256:34:
+../../gcc/wide-int.h:1856:14: warning: 'void* memcpy(void*, const void*, size_t)' offset [0, 7] is out of the bounds [0, 0] [-Warray-bounds=]
+../../gcc/wide-int.h:1857:12: warning: 'void free(void*)' called on a pointer to an unallocated object '1' [-Wfree-nonheap-object]
+
+that's caused by failing to CSE in
+
+  MEM <struct aff_tree> [(struct widest_int_storage *)comb_13(D)].elts[_6].coef.D.132464.len = 1;
+  _49 = (sizetype) _6;
+  _50 = _49 * 88;
+  _101 = _50 + 104;
+  _74 = comb_13(D) + _101;
+  *_74 = 1;
+  _80 = MEM <struct aff_tree> [(struct widest_int_storage *)comb_13(D)].elts[_6].coef.D.132464.len;
+
+where the view-convert pun in the MEM_REF makes it get the alias set of
+wide-int storage which conflicts with the *_74 store of a 'long'.  We
+fail to pick up the store to an 'int' (the len) and possible disambiguation
+with TBAA.
+
+That's somewhat by design since we are faced with a lot of address-taking
+and dereferencing of pointers as part of C++ abstraction.  But the
+"tail" is still a valid access.
+
+- User: Richard Biener | Time: 2023-10-06 15:07:28 UTC
+  Text: Createdattachment 56068[details]preprocessed source
+
+- User: Richard Biener | Time: 2023-10-06 15:09:49 UTC
+  Text: Createdattachment 56069[details]more aggressive TBAA, prototype patch
+
+This is a prototype patch to get_alias_set to recognize a proper tail of the access path on the object we have punned to.  I'm not sure it will work out
+this way.
+
+For better understanding a smaller testcase is required.
+
+- User: Richard Biener | Time: 2023-10-09 11:12:09 UTC
+  Text: Reduced testcase:
+
+struct B {
+   struct { int len; } l;
+   long n;
+};
+struct A {
+   struct B elts[8];
+};
+
+static void
+set_len (struct B *b, int len)
+{
+  b->l.len = len;
+}
+
+static int
+get_len (struct B *b)
+{
+  return b->l.len;
+}
+
+int foo (struct A *a, int i, long *q)
+{
+  set_len (&a->elts[i], 1);
+  *q = 2;
+  return get_len (&a->elts[i]);
+}
+
+with the patch we end up doing the following in FRE1.  I think the path
+based disambiguation is unaffected by assigning a different alias set.
+
+ int foo (struct A * a, int i, long int * q)
+ {
+   int D.2787;
+-  int _9;
+ 
+   <bb 2> :
+   MEM <struct A> [(struct B *)a_3(D)].elts[i_4(D)].l.len = 1;
+   *q_7(D) = 2;
+-  _9 = MEM <struct A> [(struct B *)a_3(D)].elts[i_4(D)].l.len;
+-  return _9;
++  return 1;
+
+- User: GCC Commits | Time: 2023-10-09 13:20:04 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:11b8cf1685bb40af5b86653e492e350983025957commitr14-4510-g11b8cf1685bb40af5b86653e492e350983025957Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Oct 9 13:05:10 2023 +0200
+
+    tree-optimization/111715 - improve TBAA for access paths with pun
+    
+    The following improves basic TBAA for access paths formed by
+    C++ abstraction where we are able to combine a path from an
+    address-taking operation with a path based on that access using
+    a pun to avoid memory access semantics on the address-taking part.
+    
+    The trick is to identify the point the semantic memory access path
+    starts which allows us to use the alias set of the outermost access
+    instead of only that of the base of this path.PR tree-optimization/111715* alias.cc (reference_alias_ptr_type_1): When we have
+            a type-punning ref at the base search for the access
+            path part that's still semantically valid.
+    
+            * gcc.dg/tree-ssa/ssa-fre-102.c: New testcase.
+
+- User: Richard Biener | Time: 2023-10-09 13:20:31 UTC
+  Text: Fixed on trunk.
+
+- User: Sam James | Time: 2023-10-09 21:34:39 UTC
+  Text: I started hitting the original warning Jakub hit with 13.2.1 20231007 but I've not tried to figure out which backported change caused it to appear.
+
+- User: Richard Biener | Time: 2023-10-10 06:46:34 UTC
+  Text: (In reply to Sam James fromcomment #6)> I started hitting the original warning Jakub hit with 13.2.1 20231007 but
+> I've not tried to figure out which backported change caused it to appear.With what configuration?
+
+- User: Sam James | Time: 2023-10-10 06:58:43 UTC
+  Text: (In reply to Richard Biener fromcomment #7)> (In reply to Sam James fromcomment #6)
+> > I started hitting the original warning Jakub hit with 13.2.1 20231007 but
+> > I've not tried to figure out which backported change caused it to appear.
+> 
+> With what configuration?I was a bit wrong - not quite the same warning, filedPR111752for it.
+

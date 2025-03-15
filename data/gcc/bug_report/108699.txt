@@ -1,0 +1,255 @@
+Bug Summary: gcc.c-torture/execute/builtin-bitops-1.c fails on power 9 BE
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: N/A | Time: 2023-02-07 15:01:13 UTC
+  Text: This fails for 32 bits powerpc64 BE on a power 9 (only) and it fails for trunk and gcc 12, 11, and 10.
+
+make  -k check-gcc RUNTESTFLAGS="--target_board=unix'{-m32}' execute.exp=gcc.c-torture/execute/builtin-bitops-1.c"
+FAIL: gcc.c-torture/execute/builtin-bitops-1.c   -Os  execution test
+# of expected passes		15
+# of unexpected failures	1
+
+spawn -ignore SIGHUP 
+^M
+PASS: gcc.c-torture/execute/builtin-bitops-1.c   -Os  (test for excess errors)
+Setting LD_LIBRARY_PATH to :/home/seurer/gcc/git/build/gcc-test/gcc:/home/seurer/gcc/git/build/gcc-test/gcc/32::/home/seurer/gcc/git/build/gcc-test/gcc:/home/seurer/gcc/git/build/gcc-test/gcc/32:/home/seurer/gcc/git/build/gcc-test/./gmp/.libs:/home/seurer/gcc/git/build/gcc-test/./prev-gmp/.libs:/home/seurer/gcc/git/build/gcc-test/./mpfr/src/.libs:/home/seurer/gcc/git/build/gcc-test/./prev-mpfr/src/.libs:/home/seurer/gcc/git/build/gcc-test/./mpc/src/.libs:/home/seurer/gcc/git/build/gcc-test/./prev-mpc/src/.libs:/home/seurer/gcc/git/build/gcc-test/./isl/.libs:/home/seurer/gcc/git/build/gcc-test/./prev-isl/.libs
+Execution timeout is: 300
+spawn [open ...]^M
+FAIL: gcc.c-torture/execute/builtin-bitops-1.c   -Os  execution test
+
+
+(gdb) run
+Starting program: /home/seurer/gcc/git/build/gcc-test/builtin-bitops-1.exe 
+Program received signal SIGABRT, Aborted.
+0x0fd737a0 in ?? () from /lib32/libc.so.6
+(gdb) where
+#0  0x0fd737a0 in ?? () from /lib32/libc.so.6
+#1  0x0fd15424 in raise () from /lib32/libc.so.6
+#2  0x0fcfa428 in abort () from /lib32/libc.so.6
+#3  0x10000408 in main () at /home/seurer/gcc/git/gcc-test/gcc/testsuite/gcc.c-torture/execute/builtin-bitops-1.c:182
+
+
+There are a bunch of aborts in this test but the reported line # must be off.
+
+- User: Kewen Lin | Time: 2023-02-14 12:12:54 UTC
+  Text: Confirmed.
+
+This is due to one latent bug. When specifying -Os, it doesn't try to use SImode parity any more, but tries to use wider mode TImode parity instead, it resulted in the wrong result.
+
+The current vector parity (including TImode) support is wrong:
+
+;; Vector parity
+(define_insn "*p9v_parity<mode>2"
+  [(set (match_operand:VParity 0 "register_operand" "=v")
+        (parity:VParity (match_operand:VParity 1 "register_operand" "v")))]
+  "TARGET_P9_VECTOR"
+  "vprtyb<wd> %0,%1"
+  [(set_attr "type" "vecsimple")])
+
+The vprtyb[dwq] is for byte parity, it doesn't match the RTL parity semantic directly.
+
+- User: Segher Boessenkool | Time: 2023-02-14 17:39:35 UTC
+  Text: Right, it needs a vpopcntb or similar first.
+
+- User: Kewen Lin | Time: 2023-02-15 02:34:59 UTC
+  Text: One more test case fail with abort on both LE & BE (with -Ofast -mcpu=power9):
+
+----
+
+#define N 16
+
+unsigned long long vals[N];
+unsigned int res[N];
+unsigned int expects[N] = {0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+unsigned long long inputs[N]
+  = {0x0000000000000000ULL, 0x0000000000000001ULL, 0x8000000000000000ULL,
+     0x0000000000000002ULL, 0x4000000000000000ULL, 0x0000000100000000ULL,
+     0x0000000080000000ULL, 0xa5a5a5a5a5a5a5a5ULL, 0x5a5a5a5a5a5a5a5aULL,
+     0xcafecafe00000000ULL, 0x0000cafecafe0000ULL, 0x00000000cafecafeULL,
+     0x8070600000000000ULL, 0xffffffffffffffffULL};
+
+__attribute__ ((noipa)) void
+init ()
+{
+  for (int i = 0; i < N; i++)
+    vals[i] = inputs[i];
+}
+
+__attribute__ ((noipa)) void
+do_parity ()
+{
+  for (int i = 0; i < N; i++)
+    res[i] = __builtin_parityll (vals[i]);
+}
+
+int
+main (void)
+{
+  init ();
+  do_parity ();
+  for (int i = 0; i < N; i++)
+    if (res[i] != expects[i])
+      __builtin_abort();
+
+  return 0;
+}
+
+----
+
+- User: GCC Commits | Time: 2023-04-04 05:13:37 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:cdd2d6643f7fef40e335a7027edfea7276cde608commitr13-6993-gcdd2d6643f7fef40e335a7027edfea7276cde608Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Mon Apr 3 21:47:44 2023 -0500
+
+    rs6000: Fix vector parity support [PR108699]
+    
+    The failures on the original failed case builtin-bitops-1.c
+    and the associated test casepr108699.c here show that the
+    current support of parity vector mode is wrong on Power.
+    The hardware insns vprtyb[wdq] which operate on the least
+    significant bit of each byte per element, they doesn't match
+    what RTL opcode parity needs, but the current implementation
+    expands it with them wrongly.
+    
+    This patch is to fix the handling with one more insn vpopcntb.PR target/108699gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (*p9v_parity<mode>2): Rename to ...
+            (rs6000_vprtyb<mode>2): ... this.
+            * config/rs6000/rs6000-builtins.def (VPRTYBD): Replace parityv2di2 with
+            rs6000_vprtybv2di2.
+            (VPRTYBW): Replace parityv4si2 with rs6000_vprtybv4si2.
+            (VPRTYBQ): Replace parityv1ti2 with rs6000_vprtybv1ti2.
+            * config/rs6000/vector.md (parity<mode>2 with VEC_IP): Expand with
+            popcountv16qi2 and the corresponding rs6000_vprtyb<mode>2.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/p9-vparity.c: Add scan-assembler-not for vpopcntb
+            to distinguish parity byte from parity.
+            * gcc.target/powerpc/pr108699.c: New test.
+
+- User: GCC Commits | Time: 2023-04-17 09:06:45 UTC
+  Text: The releases/gcc-12 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:de8f86e151d29c6c2ebb224b5587284714cd6cfacommitr12-9406-gde8f86e151d29c6c2ebb224b5587284714cd6cfaAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Mon Apr 3 21:47:44 2023 -0500
+
+    rs6000: Fix vector parity support [PR108699]
+    
+    The failures on the original failed case builtin-bitops-1.c
+    and the associated test casepr108699.c here show that the
+    current support of parity vector mode is wrong on Power.
+    The hardware insns vprtyb[wdq] which operate on the least
+    significant bit of each byte per element, they doesn't match
+    what RTL opcode parity needs, but the current implementation
+    expands it with them wrongly.
+    
+    This patch is to fix the handling with one more insn vpopcntb.PR target/108699gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (*p9v_parity<mode>2): Rename to ...
+            (rs6000_vprtyb<mode>2): ... this.
+            * config/rs6000/rs6000-builtins.def (VPRTYBD): Replace parityv2di2 with
+            rs6000_vprtybv2di2.
+            (VPRTYBW): Replace parityv4si2 with rs6000_vprtybv4si2.
+            (VPRTYBQ): Replace parityv1ti2 with rs6000_vprtybv1ti2.
+            * config/rs6000/vector.md (parity<mode>2 with VEC_IP): Expand with
+            popcountv16qi2 and the corresponding rs6000_vprtyb<mode>2.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/p9-vparity.c: Add scan-assembler-not for vpopcntb
+            to distinguish parity byte from parity.
+            * gcc.target/powerpc/pr108699.c: New test.
+    
+    (cherry picked from commit cdd2d6643f7fef40e335a7027edfea7276cde608)
+
+- User: GCC Commits | Time: 2023-04-17 09:08:09 UTC
+  Text: The releases/gcc-11 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:6872f055d7d4fd36b804bdd9b5a8a128b01aacbccommitr11-10628-g6872f055d7d4fd36b804bdd9b5a8a128b01aacbcAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Sun Apr 16 22:31:01 2023 -0500
+
+    rs6000: Fix vector parity support [PR108699]
+    
+    The failures on the original failed case builtin-bitops-1.c
+    and the associated test casepr108699.c here show that the
+    current support of parity vector mode is wrong on Power.
+    The hardware insns vprtyb[wdq] which operate on the least
+    significant bit of each byte per element, they doesn't match
+    what RTL opcode parity needs, but the current implementation
+    expands it with them wrongly.
+    
+    This patch is to fix the handling with one more insn vpopcntb.PR target/108699gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (*p9v_parity<mode>2): Rename to ...
+            (rs6000_vprtyb<mode>2): ... this.
+            * config/rs6000/rs6000-builtin.def (VPRTYBD): Replace parityv2di2 with
+            rs6000_vprtybv2di2.
+            (VPRTYBW): Replace parityv4si2 with rs6000_vprtybv4si2.
+            (VPRTYBQ): Replace parityv1ti2 with rs6000_vprtybv1ti2.
+            * config/rs6000/vector.md (parity<mode>2 with VEC_IP): Expand with
+            popcountv16qi2 and the corresponding rs6000_vprtyb<mode>2.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/p9-vparity.c: Add scan-assembler-not for vpopcntb
+            to distinguish parity byte from parity.
+            * gcc.target/powerpc/pr108699.c: New test.
+    
+    (cherry picked from commit cdd2d6643f7fef40e335a7027edfea7276cde608)
+
+- User: GCC Commits | Time: 2023-04-17 09:09:10 UTC
+  Text: The releases/gcc-10 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:d88e488ec9321e44291fcaf2a3b14333f64aac01commitr10-11291-gd88e488ec9321e44291fcaf2a3b14333f64aac01Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Mon Apr 3 21:47:44 2023 -0500
+
+    rs6000: Fix vector parity support [PR108699]
+    
+    The failures on the original failed case builtin-bitops-1.c
+    and the associated test casepr108699.c here show that the
+    current support of parity vector mode is wrong on Power.
+    The hardware insns vprtyb[wdq] which operate on the least
+    significant bit of each byte per element, they doesn't match
+    what RTL opcode parity needs, but the current implementation
+    expands it with them wrongly.
+    
+    This patch is to fix the handling with one more insn vpopcntb.PR target/108699gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (*p9v_parity<mode>2): Rename to ...
+            (rs6000_vprtyb<mode>2): ... this.
+            * config/rs6000/rs6000-builtin.def (VPRTYBD): Replace parityv2di2 with
+            rs6000_vprtybv2di2.
+            (VPRTYBW): Replace parityv4si2 with rs6000_vprtybv4si2.
+            (VPRTYBQ): Replace parityv1ti2 with rs6000_vprtybv1ti2.
+            * config/rs6000/vector.md (parity<mode>2 with VEC_IP): Expand with
+            popcountv16qi2 and the corresponding rs6000_vprtyb<mode>2.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/p9-vparity.c: Add scan-assembler-not for vpopcntb
+            to distinguish parity byte from parity.
+            * gcc.target/powerpc/pr108699.c: New test.
+    
+    (cherry picked from commit cdd2d6643f7fef40e335a7027edfea7276cde608)
+
+- User: Peter Bergner | Time: 2023-06-02 04:15:41 UTC
+  Text: Can this be marked as FIXED or is there more to do?
+
+- User: Kewen Lin | Time: 2023-06-02 04:42:25 UTC
+  Text: (In reply to Peter Bergner fromcomment #8)> Can this be marked as FIXED or is there more to do?Yeah, the issue should be fixed everywhere, thanks for reminding!
+
+- User: GCC Commits | Time: 2024-07-22 01:37:20 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:913bab282d95e842907fec5a552a74ef64a6d4f6commitr15-2190-g913bab282d95e842907fec5a552a74ef64a6d4f6Author: Sam James <sam@gentoo.org>
+Date:   Sun Jul 21 20:36:08 2024 -0500
+
+    testsuite: powerpc: fix dg-do run typo
+    
+    'dg-run' is not a valid dejagnu directive, 'dg-do run' is needed here
+    for the test to be executed.PR target/108699gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr108699.c: Fix 'dg-run' typo.
+    
+    Signed-off-by: Sam James <sam@gentoo.org>
+

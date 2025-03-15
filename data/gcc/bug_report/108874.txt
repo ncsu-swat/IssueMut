@@ -1,0 +1,255 @@
+Bug Summary: [10/11/12/13 Regression] Missing bswap detection
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization, patch
+Known to Work: 13.0
+Known to Fail: 10.3.0, 11.3.0, 12.2.0, 6.4.0, 7.5.0, 8.5.0, 9.3.0
+
+Comments:
+- User: N/A | Time: 2023-02-21 16:30:04 UTC
+  Text: If we look at the arm testcases in gcc.target/arm/rev16.c
+typedef unsigned int __u32;
+
+__u32
+__rev16_32_alt (__u32 x)
+{
+  return (((__u32)(x) & (__u32)0xff00ff00UL) >> 8)
+         | (((__u32)(x) & (__u32)0x00ff00ffUL) << 8);
+}
+
+__u32
+__rev16_32 (__u32 x)
+{
+  return (((__u32)(x) & (__u32)0x00ff00ffUL) << 8)
+         | (((__u32)(x) & (__u32)0xff00ff00UL) >> 8);
+}
+
+we should be able to generate rev16 instructions for aarch64 (and arm) i.e. recognise a __builtin_bswap16 essentially.
+GCC fails to do so and generates:
+__rev16_32_alt:
+        lsr     w1, w0, 8
+        lsl     w0, w0, 8
+        and     w1, w1, 16711935
+        and     w0, w0, -16711936
+        orr     w0, w1, w0
+        ret
+__rev16_32:
+        lsl     w1, w0, 8
+        lsr     w0, w0, 8
+        and     w1, w1, -16711936
+        and     w0, w0, 16711935
+        orr     w0, w1, w0
+        ret
+
+whereas clang manages to recognise it all into:
+__rev16_32_alt:                         // @__rev16_32_alt
+        rev16   w0, w0
+        ret
+__rev16_32:                             // @__rev16_32
+        rev16   w0, w0
+        ret
+
+does the bswap pass need some tweaking perhaps?
+
+Looks like this worked fine with GCC 5 but broke in the GCC 6 timeframe so marking as a regression
+
+- User: N/A | Time: 2023-02-21 16:53:42 UTC
+  Text: (In reply to ktkachov fromcomment #0)> If we look at the arm testcases in gcc.target/arm/rev16.c
+> typedef unsigned int __u32;
+> 
+> __u32
+> __rev16_32_alt (__u32 x)
+> {
+>   return (((__u32)(x) & (__u32)0xff00ff00UL) >> 8)
+>          | (((__u32)(x) & (__u32)0x00ff00ffUL) << 8);
+> }
+> 
+> __u32
+> __rev16_32 (__u32 x)
+> {
+>   return (((__u32)(x) & (__u32)0x00ff00ffUL) << 8)
+>          | (((__u32)(x) & (__u32)0xff00ff00UL) >> 8);
+> }
+>this isn't a simple __builtin_bswap16 as that returns a uint16_t, this is sort of a __builtin_swap16 in each of the half-words of the u32
+
+- User: Richard Biener | Time: 2023-02-22 08:37:42 UTC
+  Text: The regression is probably rtl-optimization/target specific since we never had this kind of pattern detected on the tree/GIMPLE level and there's no builtin or IFN for this shuffling on u32.
+
+- User: N/A | Time: 2023-02-22 10:39:00 UTC
+  Text: (In reply to Richard Biener fromcomment #2)> The regression is probably rtl-optimization/target specific since we never
+> had this kind of pattern detected on the tree/GIMPLE level and there's no
+> builtin or IFN for this shuffling on u32.FWIW a colleague reported that he bisected the failure tog:98e30e515f184bd63196d4d500a682fbfeb9635ethough I haven't tried it myself.
+We do have patterns for these in aarch64 and arm, but combine would need to match about 5 insns to get there and that's beyond its current limit of 4
+
+- User: Richard Biener | Time: 2023-02-22 10:53:37 UTC
+  Text: (In reply to ktkachov fromcomment #3)> (In reply to Richard Biener fromcomment #2)
+> > The regression is probably rtl-optimization/target specific since we never
+> > had this kind of pattern detected on the tree/GIMPLE level and there's no
+> > builtin or IFN for this shuffling on u32.
+> 
+> FWIW a colleague reported that he bisected the failure to
+>g:98e30e515f184bd63196d4d500a682fbfeb9635ethough I haven't tried it myself.There's a slight difference in before/after since GENERIC folding only
+applied the (X & C2) << C1 into (X << C1) & (C2 << C1) transform
+when the new BIT_AND "simplified":
+
+-         tem = fold_binary_loc (loc, BIT_AND_EXPR, type, shift, mask);
+-         if (tem)
+-           return tem;
+
+The transform was added inr0-84712-g22164c3db76535for some rotate
+patterns, tested by gcc.dg/fold-rotate-1.c, the pattern was meanwhile
+extended to cover other bit operations as well.> We do have patterns for these in aarch64 and arm, but combine would need to
+> match about 5 insns to get there and that's beyond its current limit of 4maybe some helper patterns no longer catch the differently canonicalized forms?
+
+- User: Andrew Pinski | Time: 2023-02-23 23:32:43 UTC
+  Text: How it worked before because of the following combine, removing 1 instruction and then doing the 4->1 matching:
+
+Trying 7 -> 10:
+
+(set (reg:SI 80 [ D.3188 ])
+    (ior:SI (lshiftrt:SI (reg:SI 81 [ D.3187 ])
+            (const_int 8 [0x8]))
+        (reg:SI 84 [ D.3187 ])))
+
+
+
+So we could match add a pattern/split that matching this combine:
+Trying 6, 7 -> 10:
+    6: r99:SI=r97:SI 0>>0x8
+    7: r100:SI=r99:SI&0xff00ff
+      REG_DEAD r99:SI
+   10: r98:SI=r100:SI|r102:SI
+      REG_DEAD r102:SI
+      REG_DEAD r100:SI
+Failed to match this instruction:
+(set (reg:SI 98)
+    (ior:SI (and:SI (lshiftrt:SI (reg/v:SI 97 [ x ])
+                (const_int 8 [0x8]))
+            (const_int 16711935 [0xff00ff]))
+        (reg:SI 102)))
+
+into two, pushing the and before the shift right.
+
+Note this would require modifying both the arm and aarch64 backends but it seems doable.
+
+- User: Andrew Pinski | Time: 2023-02-25 19:51:11 UTC
+  Text: I split out the arm version toPR 108933since I am going to implement the aarch64 backend change I recommended incomment #5.
+
+- User: Hongtao.liu | Time: 2023-02-27 03:24:23 UTC
+  Text: Can we recognize it as bswap32 + roatate 16 in match.pd when backend supports boths, and then it should be easy for aarch64/arm to tranform bswap + ratate into rev16 at rtl level.
+
+- User: Andrew Pinski | Time: 2023-02-27 04:39:17 UTC
+  Text: (In reply to Hongtao.liu fromcomment #7)> Can we recognize it as bswap32 + roatate 16 in match.pd when backend
+> supports boths, and then it should be easy for aarch64/arm to tranform bswap
+> + ratate into rev16 at rtl level.That definitely would be better in the general case (note it might not be in match.pd though) though doing:
+(set (reg:SI 98)
+    (ior:SI (and:SI (lshiftrt:SI (reg/v:SI 97 [ x ])
+                (const_int 8 [0x8]))
+            (const_int 16711935 [0xff00ff]))
+        (reg:SI 102)))
+
+as
+(set (reg:SI 98)
+     (ior:SI
+      (lshiftrt:SI
+       (and:SI (reg/v:SI 97 [ x ])  (const_int 0xff00ff00) )
+       (const_int 8 [0x8]))
+      (reg:SI 102)))
+
+in the aarch64 backend would produce better code for some other examples too and not just rev16 generation really.
+Take:
+```
+unsigned f(unsigned x, unsigned b)
+{
+  return ((x & 0xff00ff00U) >> 8) | b;
+}
+```
+
+GCC 5 used to produce:
+        and     w0, w0, -16711936
+        orr     w0, w1, w0, lsr 8
+        ret
+
+While the tunk does:
+        lsr     w0, w0, 8
+        and     w0, w0, 16711935
+        orr     w0, w0, w1
+        ret
+
+Note xor and addition should be handled in a similar way too.
+That is these has a similar regression:
+unsigned f(unsigned x, unsigned b)
+{
+  return ((x & 0xff00ff00U) >> 8) ^ b;
+}
+unsigned f1(unsigned x, unsigned b)
+{
+  return ((x & 0xff00ff00U) >> 8) + b;
+}
+
+- User: Andrew Pinski | Time: 2023-03-09 23:03:24 UTC
+  Text: (In reply to Andrew Pinski fromcomment #8)> (set (reg:SI 98)
+>     (ior:SI (and:SI (lshiftrt:SI (reg/v:SI 97 [ x ])
+>                 (const_int 8 [0x8]))
+>             (const_int 16711935 [0xff00ff]))
+>         (reg:SI 102)))
+> 
+> as
+> (set (reg:SI 98)
+>      (ior:SI
+>       (lshiftrt:SI
+>        (and:SI (reg/v:SI 97 [ x ])  (const_int 0xff00ff00) )
+>        (const_int 8 [0x8]))
+>       (reg:SI 102)))Note there are some similar define_split already in the aarch64 backend around lines 4688. For shift left, but not for shift right.
+
+- User: Andrew Pinski | Time: 2023-03-10 00:39:45 UTC
+  Text: Createdattachment 54629[details]Patch but need to add testcases
+
+here is the patch which adds the define_split to aarch64 md file that helps combine and we produce the rev16 again for the original testcase and fixes the testcases incomment #8too.
+
+- User: Andrew Pinski | Time: 2023-03-10 01:04:55 UTC
+  Text: Createdattachment 54630[details]Patch with testcases
+
+Testing this patch now and will submit it once to finishes building/running the testsuite.
+
+- User: Andrew Pinski | Time: 2023-03-10 06:04:27 UTC
+  Text: Patch submitted here:https://gcc.gnu.org/pipermail/gcc-patches/2023-March/613696.htmlNote I had made a few mistakes in the testcase in the patch which was attached but fixed them before submitting it.
+
+- User: GCC Commits | Time: 2023-03-10 17:52:16 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:fcbc5c190c40b51c82f827830ce403c07d628960commitr13-6591-gfcbc5c190c40b51c82f827830ce403c07d628960Author: Andrew Pinski <apinski@marvell.com>
+Date:   Fri Mar 10 00:53:39 2023 +0000
+
+    FixPR 108874: aarch64 code regression with shift and ands
+    
+    Afterr6-2044-g98e30e515f184b, code like "((x & 0xff00ff00U) >> 8)"
+    would be optimized like (x >> 8) & 0xff00ffU which is normally better
+    except on aarch64, the shift right could be combined with another
+    operation in some cases. So we need to add a few define_splits
+    to the aarch64 backends that match "((x >> shift) & CST0) OP Y"
+    and splits it to:
+    TMP = X & CST1
+    (TMP >> shift) OP Y
+    
+    Note this also gets us to matching rev16 back too so I added a
+    testcase to make sure we don't lose that matching any more.
+    Note when the generic patch to recognize those as bswap ROT 16,
+    we might regress again and need to add a few more patterns to
+    the aarch64 backend but will deal with that once that happens.
+    
+    Committed as approved after a bootstrapp/test on aarch64-linux-gnu with no regressions.
+    
+    gcc/ChangeLog:
+    
+            * config/aarch64/aarch64.md: Add a new define_split
+            to help combine.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/rev16_2.c: New test.
+            * gcc.target/aarch64/shift_and_operator-1.c: New test.
+
+- User: Andrew Pinski | Time: 2023-03-10 17:54:19 UTC
+  Text: Fixed on the trunk, this can be backported if anyone wants to do that testing but since it took over 5 years to notice it because there was no testcase for it, I am not going to do the backporting.
+

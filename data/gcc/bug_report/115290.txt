@@ -1,0 +1,172 @@
+Bug Summary: [12 Regression] tree check fail in c_tree_printer, at c/c-objc-common.cc:330
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: diagnostic, ice-checking, ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2024-05-30 07:50:38 UTC
+  Text: For this C code:
+
+$ morebug1029.c
+typedef enum { SERVER_HELLO_DONE } message_type_t;
+message_type_t handshakes[256][32], tls13_handshakes[256][32];
+void main() { (0 ? tls13_handshakes : handshakes) == tls13_handshakes; }
+$ 
+
+compiled as follows:
+
+$ ~/gcc/results/bin/gcc -c -Wallbug1029.c 
+
+does this:bug1029.c:3:6: warning: return type of ‘main’ is not ‘int’ [-Wmain]
+    3 | void main() { (0 ? tls13_handshakes : handshakes) == tls13_handshakes; }
+      |      ^~~~bug1029.c: In function ‘main’:bug1029.c:3:51: warning: comparison between two arrays [-Warray-compare]
+    3 | void main() { (0 ? tls13_handshakes : handshakes) == tls13_handshakes; }
+      |                                                   ^~
+
+tree check: expected tree that contains ‘decl minimal’ structure, have ‘cond_exp
+r’ in c_tree_printer, at c/c-objc-common.cc:330
+    3 | void main() { (0 ? tls13_handshakes : handshakes) == tls13_handshakes; }
+      | ^~~~
+0x81bb1e tree_contains_struct_check_failed(tree_node const*, tree_node_structure
+_enum, char const*, int, char const*)
+	../../trunk.20210101/gcc/tree.cc:9169
+0x6e18a8 contains_struct_check(tree_node*, tree_node_structure_enum, char const*
+, int, char const*)
+	../../trunk.20210101/gcc/tree.h:3770
+0x6e18a8 c_tree_printer
+	../../trunk.20210101/gcc/c/c-objc-common.cc:330
+
+The bug first appeared sometime before git hash 28b508233a12c132.
+
+- User: Andrew Pinski | Time: 2024-05-30 14:50:16 UTC
+  Text: <source>:4:50: note: use '&\204[0] == &tls13_handshakes[0]' to compare the addresses
+
+I think it was introduced withr12-4148-g2dda00b734888dwhich also introduced the warning. Since the diagnostic looks broken with release checking.
+
+
++       inform (location, "use %<&%D[0] %s &%D[0]%> to compare the addresses",
++               op0, op_symbol_code (code), op1);
+
+
+%D here is expecting a decl but we have an expression.
+
+- User: Jakub Jelinek | Time: 2024-06-17 13:20:38 UTC
+  Text: Createdattachment 58449[details]gcc15-pr115290.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-06-17 17:24:57 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:b63c7d92012f92e0517190cf263d29bbef8a06bfcommitr15-1381-gb63c7d92012f92e0517190cf263d29bbef8a06bfAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Jun 17 19:24:05 2024 +0200
+
+    c-family: Fix -Warray-compare warning ICE [PR115290]
+    
+    The warning code uses %D to print the ARRAY_REF first operands.
+    That works in the most common case where those operands are decls, but
+    as can be seen on the following testcase, they can be other expressions
+    with array type.
+    Just changing %D to %E isn't enough, because then the diagnostics can
+    suggest something like
+    note: use '&(x) != 0 ? (int (*)[32])&a : (int (*)[32])&b[0] == &(y) != 0 ? (int (*)[32])&a : (int (*)[32])&b[0]' to compare the addresses
+    which is a bad suggestion, the %E printing doesn't know that the
+    warning code will want to add & before it and [0] after it.
+    So, the following patch adds ()s around the operand as well, but does
+    that only for non-decls, for decls keeps it as &arr[0] like before.
+    
+    2024-06-17  Jakub Jelinek  <jakub@redhat.com>PR c/115290* c-warn.cc (do_warn_array_compare): Use %E rather than %D for
+            printing op0 and op1; if those operands aren't decls, also print
+            parens around them.
+    
+            * c-c++-common/Warray-compare-3.c: New test.
+
+- User: GCC Commits | Time: 2024-06-17 17:27:07 UTC
+  Text: The releases/gcc-14 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:922648759b034c356e7d5c1ae530bdb6f3d00c62commitr14-10322-g922648759b034c356e7d5c1ae530bdb6f3d00c62Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Jun 17 19:24:05 2024 +0200
+
+    c-family: Fix -Warray-compare warning ICE [PR115290]
+    
+    The warning code uses %D to print the ARRAY_REF first operands.
+    That works in the most common case where those operands are decls, but
+    as can be seen on the following testcase, they can be other expressions
+    with array type.
+    Just changing %D to %E isn't enough, because then the diagnostics can
+    suggest something like
+    note: use '&(x) != 0 ? (int (*)[32])&a : (int (*)[32])&b[0] == &(y) != 0 ? (int (*)[32])&a : (int (*)[32])&b[0]' to compare the addresses
+    which is a bad suggestion, the %E printing doesn't know that the
+    warning code will want to add & before it and [0] after it.
+    So, the following patch adds ()s around the operand as well, but does
+    that only for non-decls, for decls keeps it as &arr[0] like before.
+    
+    2024-06-17  Jakub Jelinek  <jakub@redhat.com>PR c/115290* c-warn.cc (do_warn_array_compare): Use %E rather than %D for
+            printing op0 and op1; if those operands aren't decls, also print
+            parens around them.
+    
+            * c-c++-common/Warray-compare-3.c: New test.
+    
+    (cherry picked from commit b63c7d92012f92e0517190cf263d29bbef8a06bf)
+
+- User: GCC Commits | Time: 2024-06-17 17:28:55 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:be14e6cf7f2dc23012dfced0a4aff0894fd6ff57commitr13-8854-gbe14e6cf7f2dc23012dfced0a4aff0894fd6ff57Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Jun 17 19:24:05 2024 +0200
+
+    c-family: Fix -Warray-compare warning ICE [PR115290]
+    
+    The warning code uses %D to print the ARRAY_REF first operands.
+    That works in the most common case where those operands are decls, but
+    as can be seen on the following testcase, they can be other expressions
+    with array type.
+    Just changing %D to %E isn't enough, because then the diagnostics can
+    suggest something like
+    note: use '&(x) != 0 ? (int (*)[32])&a : (int (*)[32])&b[0] == &(y) != 0 ? (int (*)[32])&a : (int (*)[32])&b[0]' to compare the addresses
+    which is a bad suggestion, the %E printing doesn't know that the
+    warning code will want to add & before it and [0] after it.
+    So, the following patch adds ()s around the operand as well, but does
+    that only for non-decls, for decls keeps it as &arr[0] like before.
+    
+    2024-06-17  Jakub Jelinek  <jakub@redhat.com>PR c/115290* c-warn.cc (do_warn_array_compare): Use %E rather than %D for
+            printing op0 and op1; if those operands aren't decls, also print
+            parens around them.
+    
+            * c-c++-common/Warray-compare-3.c: New test.
+    
+    (cherry picked from commit b63c7d92012f92e0517190cf263d29bbef8a06bf)
+
+- User: Jakub Jelinek | Time: 2024-06-17 17:30:35 UTC
+  Text: Should be fixed for 13.4+/14.2+/15.1+ for now, 12 branch is frozen right now, so it will need to wait for 12.5.
+
+- User: GCC Commits | Time: 2024-06-20 08:54:48 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:8f612e6559b39569747894ec0f8b4694b96492a7commitr12-10568-g8f612e6559b39569747894ec0f8b4694b96492a7Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Jun 17 19:24:05 2024 +0200
+
+    c-family: Fix -Warray-compare warning ICE [PR115290]
+    
+    The warning code uses %D to print the ARRAY_REF first operands.
+    That works in the most common case where those operands are decls, but
+    as can be seen on the following testcase, they can be other expressions
+    with array type.
+    Just changing %D to %E isn't enough, because then the diagnostics can
+    suggest something like
+    note: use '&(x) != 0 ? (int (*)[32])&a : (int (*)[32])&b[0] == &(y) != 0 ? (int (*)[32])&a : (int (*)[32])&b[0]' to compare the addresses
+    which is a bad suggestion, the %E printing doesn't know that the
+    warning code will want to add & before it and [0] after it.
+    So, the following patch adds ()s around the operand as well, but does
+    that only for non-decls, for decls keeps it as &arr[0] like before.
+    
+    2024-06-17  Jakub Jelinek  <jakub@redhat.com>PR c/115290* c-warn.cc (do_warn_array_compare): Use %E rather than %D for
+            printing op0 and op1; if those operands aren't decls, also print
+            parens around them.
+    
+            * c-c++-common/Warray-compare-3.c: New test.
+    
+    (cherry picked from commit b63c7d92012f92e0517190cf263d29bbef8a06bf)
+
+- User: Richard Biener | Time: 2024-06-20 09:15:43 UTC
+  Text: GCC 12.4 is being released, retargeting bugs to GCC 12.5.
+
+- User: Jakub Jelinek | Time: 2024-06-20 09:32:55 UTC
+  Text: Fixed for 12.5 as well.
+

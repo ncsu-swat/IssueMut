@@ -1,0 +1,263 @@
+Bug Summary: runtime SIGFPE with _BitInt() division
+Product: gcc
+Component: libgcc
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-01-25 20:18:39 UTC
+  Text: Createdattachment 57217[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc testcase.c
+$ valgrind -q ./a.out 
+==6365== 
+==6365== Process terminating with default action of signal 8 (SIGFPE)
+==6365==  Integer divide by zero at address 0x1002C76A28
+==6365==    at 0x4016DF: __divmodbitint4 (libgcc2.c:1868)
+==6365==    by 0x4011CF: foo (in a.out)
+==6365==    by 0x401254: main (in a.out)
+Floating point exception
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-8419-20240125172014-gc6c2a1d79eb-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-8419-20240125172014-gc6c2a1d79eb-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240125 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-01-25 22:29:08 UTC
+  Text: Confirmed.
+
+1869                      udiv_qrnnd (qhat, rhat, uv1, uv0, vv1);
+
+- User: Andrew Pinski | Time: 2024-01-25 22:32:57 UTC
+  Text: x86 in include/longlong.h defines udiv_qrnnd as:
+
+#define udiv_qrnnd(q, r, n1, n0, dv) \
+  __asm__ ("div{l} %4"                                                  \
+           : "=a" ((USItype) (q)),                                      \
+             "=d" ((USItype) (r))                                       \
+           : "0" ((USItype) (n0)),                                      \
+             "1" ((USItype) (n1)),                                      \
+             "rm" ((USItype) (dv)))
+
+(gdb) p/x uv1
+$2 = 0xffffffffffffffff
+(gdb) p/x uv0
+$3 = 0xffff800003e00001
+(gdb) p/x vv1
+$4 = 0xffffffffffffffff
+
+
+I have no idea why we are getting a FP exception here though.
+
+- User: Jakub Jelinek | Time: 2024-01-25 23:03:05 UTC
+  Text: longlong.h documents that
+   HIGH_NUMERATOR must be less
+   than DENOMINATOR for correct operation.  If, in addition, the most
+   significant bit of DENOMINATOR must be 1, then the pre-processor symbol
+   UDIV_NEEDS_NORMALIZATION is defined to 1.
+While UDIV_NEEDS_NORMALIZATION is 1 only on sh32 and arches which don't define their udiv_qrnnd and fallback to C, the first requirement is there for all arches.
+0xffffffff'ffffffff'ffff8000'03e00001uwb / 0xffffffff'ffffffffuwb
+is 0x1'00000000'00000000uwb and
+0xffffffff'ffffffff'ffff8000'03e00001uwb % 0xffffffff'ffffffffuwb
+is 0xffff8000'03e00001uwb, so the quotient isn't representable in 64-bit number, which is why SIGFPE is triggered.
+
+- User: Jakub Jelinek | Time: 2024-01-26 10:17:51 UTC
+  Text: Createdattachment 57221[details]gcc14-pr113604.patch
+
+Untested fix.  I've tried to explain what's going on in the large comment.
+
+- User: Zdenek Sojka | Time: 2024-01-27 10:27:31 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #4)> Createdattachment 57221[details]> gcc14-pr113604.patch
+> 
+> Untested fix.  I've tried to explain what's going on in the large comment.I can confirm this fixes the testcase and other 3 testcases I have locally.
+
+- User: Jakub Jelinek | Time: 2024-01-27 11:15:40 UTC
+  Text: (In reply to Zdenek Sojka fromcomment #5)> (In reply to Jakub Jelinek fromcomment #4)
+> > Createdattachment 57221[details]> > gcc14-pr113604.patch
+> > 
+> > Untested fix.  I've tried to explain what's going on in the large comment.
+> 
+> I can confirm this fixes the testcase and other 3 testcases I have locally.If you could upload those 3 (even when not reduced), I'd appreciate it, so that we get better divmod coverage; I could turn it just into a single test checking all 3 or how many divisions (or modulo operations).
+
+- User: Zdenek Sojka | Time: 2024-01-27 13:56:49 UTC
+  Text: Createdattachment 57239[details]testcase2 (not beautified)
+
+- User: Zdenek Sojka | Time: 2024-01-27 13:57:08 UTC
+  Text: Createdattachment 57240[details]testcase3 (not beautified)
+
+- User: Zdenek Sojka | Time: 2024-01-27 13:58:08 UTC
+  Text: Createdattachment 57241[details]testcase4 (not beautified)
+
+- User: Zdenek Sojka | Time: 2024-01-27 13:58:40 UTC
+  Text: Createdattachment 57242[details]testcase5 (not beautified)
+
+- User: Jakub Jelinek | Time: 2024-01-27 17:12:38 UTC
+  Text: Thanks, I'll add
+--- gcc/testsuite/gcc.dg/torture/bitint-55.c.jj	2024-01-27 18:08:50.291929969 +0100
++++ gcc/testsuite/gcc.dg/torture/bitint-55.c	2024-01-27 18:07:59.266636007 +0100
+@@ -0,0 +1,50 @@
++/*PR libgcc/113604*/
++/* { dg-do run { target bitint } } */
++/* { dg-options "-std=c23 -pedantic-errors" } */
++/* { dg-skip-if "" { ! run_expensive_tests }  { "*" } { "-O0" "-O2" } } */
++/* { dg-skip-if "" { ! run_expensive_tests } { "-flto" } { "" } } */
++
++#if __BITINT_MAXWIDTH__ >= 513
++signed _BitInt(513)
++foo (signed _BitInt(513) x, signed _BitInt(513) y)
++{
++  return x % y;
++}
++#endif
++
++#if __BITINT_MAXWIDTH__ >= 512
++unsigned _BitInt(512)
++bar (unsigned _BitInt(512) x, unsigned _BitInt(512) y)
++{
++  return x % y;
++}
++#endif
++
++#if __BITINT_MAXWIDTH__ >= 256
++unsigned _BitInt(256)
++baz (unsigned _BitInt(256) x, unsigned _BitInt(256) y)
++{
++  return x % y;
++}
++#endif
++
++int
++main ()
++{
++#if __BITINT_MAXWIDTH__ >= 513
++  if (foo (11155754932722990178552651944728825929130437979239421228991532051555943675wb,
++	   32783817256434357484609367438786815wb) != 0wb)
++    __builtin_abort ();
++#endif
++#if __BITINT_MAXWIDTH__ >= 512
++  if (bar (6703903964971298549787012499102923063739682910296196688861780721860882015036773488400937149083451713845015929093243025426876941405973284973216824503042048uwb,
++	   170141183460469231731687303715884105735uwb) != 19208uwb)
++    __builtin_abort ();
++#endif
++#if __BITINT_MAXWIDTH__ >= 256
++  if (baz (115792089237316195423570985008687907853269984665640564039457584007913129639926uwb,
++	   68056473384187692692674921486353642292uwb) != 6uwb)
++    __builtin_abort ();
++#endif
++  return 0;
++}
+
+to the patch then.
+
+- User: GCC Commits | Time: 2024-02-02 21:16:22 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:fbb569315a291d2d5b32ad0fdaf0c42da9f5e93bcommitr14-8761-gfbb569315a291d2d5b32ad0fdaf0c42da9f5e93bAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Feb 2 22:14:33 2024 +0100
+
+    libgcc: Fix up _BitInt division [PR113604]
+    
+    The following testcase ends up with SIGFPE in __divmodbitint4.
+    The problem is a thinko in my attempt to implement Knuth's algorithm.
+    
+    The algorithm does (where b is 65536, i.e. one larger than what
+    fits in their unsigned short word):
+            // Compute estimate qhat of q[j].
+            qhat = (un[j+n]*b + un[j+n-1])/vn[n-1];
+            rhat = (un[j+n]*b + un[j+n-1]) - qhat*vn[n-1];
+          again:
+            if (qhat >= b || qhat*vn[n-2] > b*rhat + un[j+n-2])
+            { qhat = qhat - 1;
+              rhat = rhat + vn[n-1];
+              if (rhat < b) goto again;
+            }
+    The problem is that it uses a double-word / word -> double-word
+    division (and modulo), while all we have is udiv_qrnnd unless
+    we'd want to do further library calls, and udiv_qrnnd is a
+    double-word / word -> word division and modulo.
+    Now, as the algorithm description says, it can produce at most
+    word bits + 1 bit quotient.  And I believe that actually the
+    highest qhat the original algorithm can produce is
+    (1 << word_bits) + 1.  The algorithm performs earlier canonicalization
+    where both the divisor and dividend are shifted left such that divisor
+    has msb set.  If it has msb set already before, no shifting occurs but
+    we start with added 0 limb, so in the first uv1:uv0 double-word uv1
+    is 0 and so we can't get too high qhat, if shifting occurs, the first
+    limb of dividend is shifted right by UWtype bits - shift count into
+    a new limb, so again in the first iteration in the uv1:uv0 double-word
+    uv1 doesn't have msb set while vv1 does and qhat has to fit into word.
+    In the following iterations, previous iteration should guarantee that
+    the previous quotient digit is correct.  Even if the divisor was the
+    maximal possible vv1:all_ones_in_all_lower_limbs, if the old uv0:lower_limbs
+    would be larger or equal to the divisor, the previous quotient digit
+    would increase and another divisor would be subtracted, which I think
+    implies that in the next iteration in uv1:uv0 double-word uv1 <= vv1,
+    but uv0 could be up to all ones, e.g. in case of all lower limbs
+    of divisor being all ones and at least one dividend limb below uv0
+    being not all ones.  So, we can e.g. for 64-bit UWtype see
+    uv1:uv0 / vv1 0x8000000000000000UL:0xffffffffffffffffUL / 0x8000000000000000UL
+    or 0xffffffffffffffffUL:0xffffffffffffffffUL / 0xffffffffffffffffUL
+    In all these cases (when uv1 == vv1 && uv0 >= uv1), qhat is
+    0x10000000000000001UL, i.e. 2 more than fits into UWtype result,
+    if uv1 == vv1 && uv0 < uv1 it would be 0x10000000000000000UL, i.e.
+    1 more than fits into UWtype result.
+    Because we only have udiv_qrnnd which can't deal with those too large
+    cases (SIGFPEs or otherwise invokes undefined behavior on those), I've
+    tried to handle the uv1 >= vv1 case separately, but for one thing
+    I thought it would be at most 1 larger than what fits, and for two
+    have actually subtracted vv1:vv1 from uv1:uv0 instead of subtracting
+    0:vv1 from uv1:uv0.
+    For the uv1 < vv1 case, the implementation already performs roughly
+    what the algorithm does.
+    Now, let's see what happens with the two possible extra cases in
+    the original algorithm.
+    If uv1 == vv1 && uv0 < uv1, qhat above would be b, so we take
+    if (qhat >= b, decrement qhat by 1 (it becomes b - 1), add
+    vn[n-1] aka vv1 to rhat and goto again if rhat < b (but because
+    qhat already fits we can goto to the again label in the uv1 < vv1
+    code).  rhat in this case is uv0 and rhat + vv1 can but doesn't
+    have to overflow, say for uv0 42UL and vv1 0x8000000000000000UL
+    it will not (and so we should goto again), while for uv0
+    0x8000000000000000UL and vv1 0x8000000000000001UL it will (and
+    we shouldn't goto again).
+    If uv1 == vv1 && uv0 >= uv1, qhat above would be b + 1, so we
+    take if (qhat >= b, decrement qhat by 1 (it becomes b), add
+    vn[n-1] aka vv1 to rhat. But because vv1 has msb set and
+    rhat in this case is uv0 - vv1, the rhat + vv1 addition
+    certainly doesn't overflow, because (uv0 - vv1) + vv1 is uv0,
+    so in the algorithm we goto again, again take if (qhat >= b and
+    decrement qhat so it finally becomes b - 1, and add vn[n-1]
+    aka vv1 to rhat again.  But this time I believe it must always
+    overflow, simply because we added (uv0 - vv1) + vv1 + vv1 and
+    vv1 has msb set, so already vv1 + vv1 must overflow.  And
+    because it overflowed, it will not goto again.
+    So, I believe the following patch implements this correctly, by
+    subtracting vv1 from uv1:uv0 double-word once, then comparing
+    again if uv1 >= vv1.  If that is true, subtract vv1 from uv1:uv0
+    again and add 2 * vv1 to rhat, no __builtin_add_overflow is needed
+    as we know it always overflowed and so won't goto again.
+    If after the first subtraction uv1 < vv1, use __builtin_add_overflow
+    when adding vv1 to rhat, because it can but doesn't have to overflow.
+    
+    I've added an extra testcase which tests the behavior of all the changed
+    cases, so it has a case where uv1:uv0 / vv1 is 1:1, where it is
+    1:0 and rhat + vv1 overflows and where it is 1:0 and rhat + vv1 does not
+    overflow, and includes tests also from Zdenek's other failing tests.
+    
+    2024-02-02  Jakub Jelinek  <jakub@redhat.com>PR libgcc/113604* libgcc2.c (__divmodbitint4): If uv1 >= vv1, subtract
+            vv1 from uv1:uv0 once or twice as needed, rather than
+            subtracting vv1:vv1.
+    
+            * gcc.dg/torture/bitint-53.c: New test.
+            * gcc.dg/torture/bitint-55.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-02 21:42:52 UTC
+  Text: Should be fixed now, thanks for the report.
+

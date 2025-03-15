@@ -1,0 +1,215 @@
+Bug Summary: Very trivial address calculation does not fold
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Manolis Tsamis | Time: 2023-04-03 17:57:46 UTC
+  Text: The following function
+
+int func(int *a, int j) {
+  int k = j - 1;
+  return a[j - 1] == a[k];
+}
+
+surprisingly does not fold to `return 1;` at -O2 or higher (with any GCC version). It can also be seen here:https://godbolt.org/z/cqr43q7fqThere are a lot of variants for this behaviour but this is the most apparent. As can be seen in the godbolt link, the issue seems to be a combination of:
+
+  1) The -1 in a[j - 1] is turned into GIMPLE equivalent with *((a + (ulong) j) + (ulong) -1) but a[k] is turned into *(a + (ulong) (j - 1)).
+  2) The -1 is never propagated outside of the (long unsigned int) casts even if it's completely legal/possible.
+
+I feel that I'm missing something here about pointer rules / historical context of these choices and I would appreciate if someone more knowlegable could explain this combination to me.
+
+There are a lot of cases where this can lead to inefficient codegen but most prominently this is the reason for a additional redundant load in a hot loop of SPEC2017's nab in the function downheap_pairs and similar missed optimizations in omnetpp's shiftup function.
+
+Hence this issue can both cause very unexpected missed optimization (as in the example) and also decreases the performance of important benchmarks.
+
+Note: The testcase is not optimized even with -fno-wrapv or -fstrict-overflow, but does optimize with -fwrapv which is the reverse of what I would expect since -fno-wrapv should be more permissive?
+
+- User: Andrew Pinski | Time: 2023-04-03 18:07:43 UTC
+  Text: Note sometimes -fwrapv will optimize things because it can assume that overflow is defined as wrapping and this is one case that is true. Yes it sounds counter intuitive but it is true. Even re-association happens more with -fwrapv :).
+
+- User: Manolis Tsamis | Time: 2023-04-04 12:12:50 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> Note sometimes -fwrapv will optimize things because it can assume that
+> overflow is defined as wrapping and this is one case that is true. Yes it
+> sounds counter intuitive but it is true. Even re-association happens more
+> with -fwrapv :).Yes it is truly counter intuitive :)
+
+Yet, leaving this wrapv behaviour aside, isn't this something that should be always optimized regardless of wrap/overflow flags?
+
+- User: Richard Biener | Time: 2023-04-11 12:16:50 UTC
+  Text: It's probably a mismatch of GENERIC/GIMPLE folding.  In this case it's
+pointer_int_sum prematurely distributing the multiplication:
+
+/* Return a tree for the sum or difference (RESULTCODE says which)
+   of pointer PTROP and integer INTOP.  */
+
+tree  
+pointer_int_sum (location_t loc, enum tree_code resultcode,
+                 tree ptrop, tree intop, bool complain)
+{     
+...
+  /* If what we are about to multiply by the size of the elements
+     contains a constant term, apply distributive law
+     and multiply that constant term separately.
+     This helps produce common subexpressions.  */
+
+but this kind of stuff shouldn't be done by the frontends these days.
+
+Gating this fixes the issue.  I think this piece of code should be axed
+(after careful evaluation of its effect)
+
+- User: Manolis Tsamis | Time: 2023-05-10 12:55:11 UTC
+  Text: (In reply to Richard Biener fromcomment #3)> It's probably a mismatch of GENERIC/GIMPLE folding.  In this case it's
+> pointer_int_sum prematurely distributing the multiplication:
+> 
+> /* Return a tree for the sum or difference (RESULTCODE says which)
+>    of pointer PTROP and integer INTOP.  */
+> 
+> tree  
+> pointer_int_sum (location_t loc, enum tree_code resultcode,
+>                  tree ptrop, tree intop, bool complain)
+> {     
+> ...
+>   /* If what we are about to multiply by the size of the elements
+>      contains a constant term, apply distributive law
+>      and multiply that constant term separately.
+>      This helps produce common subexpressions.  */
+> 
+> but this kind of stuff shouldn't be done by the frontends these days.
+> 
+> Gating this fixes the issue.  I think this piece of code should be axed
+> (after careful evaluation of its effect)I have been testing this change and by looking at some tests that it causes to fail, there is a regression on testcases like this (taken from copy-headers-5.c, there are some similar fails):
+
+int is_sorted(int *a, int n)
+{
+  for (int i = 0; i < n - 1; i++)
+    if (a[i] > a[i + 1])
+      return 0;
+  return 1;
+}
+
+The gimple code for gcc currently is (taken from dump-tree-ch2):
+  _1 = (long unsigned int) i_18;
+  _2 = _1 * 4;
+  _3 = a_13(D) + _2;
+  _4 = *_3;
+  _5 = _1 + 1;
+  _6 = _5 * 4;
+  _7 = a_13(D) + _6;
+  _8 = *_7;
+
+While with this change the result is:
+  _1 = (long unsigned int) i_11;
+  _2 = _1 * 4;
+  _3 = a_14(D) + _2;
+  _4 = *_3;
+  _5 = i_11 + 1;
+  _6 = (long unsigned int) _5;
+  _7 = _6 * 4;
+  _8 = a_14(D) + _7;
+  _9 = *_8;
+
+As a result the generated code has two loads per loop instead of one. 
+
+The same holds if e.g. a[i + 1] > a[i + 2] is used because the constant addition is done before the cast to long unsigned int. I believe this is because the logic to distribute the constant is missing as a GIMPLE pattern? Given the original transform it should be valid to propagate the constant addition through the cast?
+
+- User: Richard Biener | Time: 2023-05-11 12:47:57 UTC
+  Text: (In reply to manolis.tsamis fromcomment #4)> Given the original transform it should be valid to propagate the constant
+> addition through the cast?Yes.  Note doing so loses information, we know i + 1 doesn't overflow
+(undefined behavior).  Widening preserves this knowledge I think, but if
+just an unsigned conversion would be propagated it would be lost.
+
+- User: Manolis Tsamis | Time: 2023-05-11 12:59:46 UTC
+  Text: (In reply to Richard Biener fromcomment #5)> (In reply to manolis.tsamis fromcomment #4)
+> > Given the original transform it should be valid to propagate the constant
+> > addition through the cast?
+> 
+> Yes.  Note doing so loses information, we know i + 1 doesn't overflow
+> (undefined behavior).  Widening preserves this knowledge I think, but if
+> just an unsigned conversion would be propagated it would be lost.So, is that the reason that this transform isn't already implemented as an optimisation?
+
+But then again isn't this information also lost in the code currently produced by GCC, where the constant is already propagated? Although I can see how it is different to do the propagation of constants in the front-end only vs doing it anywhere while transforming the code; maybe that's the difference that matters. But hopefully doing better canonicalization/constant folding on address calculations and constants should also result in better optimisation opportunities overall.
+
+- User: Manolis Tsamis | Time: 2023-09-04 11:38:49 UTC
+  Text: After some attempts to improve on this, my current solution is:
+  1) Do not change pointer_int_sum in c-common (otherwise codegen regressions are observed)
+  2) Introduce a pattern that folds (unsigned type) (x + CONST_INT_1) * CONST_INT_2 to (unsigned type) (x * CONST_INT_2) + (unsigned type) (CONST_INT_1 * CONST_INT_1) under the right circumstances.
+
+This combination improves codegen (including the testcase provided) and also doesn't cause any regressions on the GCC testsuite or benchmarks that I have tried so far.
+
+Given that a[(ulong) i +- C] in GIMPLE is quite common, I believe this change helps with folding / canonicalization in many cases.
+
+My current match.pd pattern to do that is below; any feedback or improvements are welcome.
+
+(simplify
+ (mult (convert@3 (plus @0 INTEGER_CST@1)) INTEGER_CST@2)
+  (with { tree tt = TREE_TYPE(@3); }
+   (if (INTEGRAL_TYPE_P (type)
+        && !TYPE_SATURATING (type)
+        && !TYPE_OVERFLOW_TRAPS (type)
+        && !TYPE_OVERFLOW_SANITIZED (type)
+        && !TYPE_OVERFLOW_WRAPS (TREE_TYPE (@0)))
+    (plus (mult (convert:tt @0) @2) (mult (convert:tt @1) @2)))))
+
+- User: N/A | Time: 2023-09-04 13:06:47 UTC
+  Text: On Mon, 4 Sept 2023 at 13:38, manolis.tsamis at vrull dot eu <gcc-bugzilla@gcc.gnu.org> wrote:> My current match.pd pattern to do that is below; any feedback or
+> improvements
+> are welcome.>> (simplify
+>  (mult (convert@3 (plus @0 INTEGER_CST@1)) INTEGER_CST@2)
+>   (with { tree tt = TREE_TYPE(@3); }
+>    (if (INTEGRAL_TYPE_P (type)
+>         && !TYPE_SATURATING (type)
+>         && !TYPE_OVERFLOW_TRAPS (type)
+>         && !TYPE_OVERFLOW_SANITIZED (type)
+>         && !TYPE_OVERFLOW_WRAPS (TREE_TYPE (@0)))
+>     (plus (mult (convert:tt @0) @2) (mult (convert:tt @1) @2)))))>
+
+Please attach a current .patch to this ticket to make sure that there are
+no surprises in reproducing.
+
+- User: Manolis Tsamis | Time: 2023-09-08 13:14:20 UTC
+  Text: Createdattachment 55856[details]Address calculation pattern v1
+
+- User: GCC Commits | Time: 2024-09-25 13:47:31 UTC
+  Text: The master branch has been updated by Philipp Tomsich <ptomsich@gcc.gnu.org>:https://gcc.gnu.org/g:08b8341f209be7c7e301853bdbbcad4f8e1695f5commitr15-3862-g08b8341f209be7c7e301853bdbbcad4f8e1695f5Author: Konstantinos Eleftheriou <konstantinos.eleftheriou@vrull.eu>
+Date:   Thu Sep 5 15:59:59 2024 +0200
+
+    match: Change (A * B) + (-C) to (B - C/A) * A, if C multiple of A [PR109393]
+    
+    The following function:
+    
+    int foo(int *a, int j)
+    {
+      int k = j - 1;
+      return a[j - 1] == a[k];
+    }
+    
+    does not fold to `return 1;` using -O2 or higher. The cause of this is that
+    the expression `4 * j + (-4)` for the index computation is not folded to
+    `4 * (j - 1)`. Existing simplifications that handle similar cases are applied
+    when A == C, which is not the case in this instance.
+    
+    A previous attempt to address this issue ishttps://gcc.gnu.org/pipermail/gcc-patches/2024-April/649896.htmlThis patch adds the following simplification in match.pd:
+    (A * B) + (-C) -> (B - C/A) * A, if C a multiple of A
+    
+    which also handles cases where the index is j - 2, j - 3, etc.
+    
+    Bootstrapped for all languages and regression tested on x86-64 and aarch64.PR tree-optimization/109393gcc/ChangeLog:
+    
+            * match.pd: (A * B) + (-C) -> (B - C/A) * A, if C a multiple of A.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr109393.c: New test.
+    
+    Tested-by: Christoph Müllner <christoph.muellner@vrull.eu>
+    Signed-off-by: Philipp Tomsich <philipp.tomsich@vrull.eu>
+    Signed-off-by: Konstantinos Eleftheriou <konstantinos.eleftheriou@vrull.eu>
+
+- User: Christoph Müllner | Time: 2024-09-25 14:16:23 UTC
+  Text: Patch has been fixed upstream.
+

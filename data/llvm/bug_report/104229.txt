@@ -1,0 +1,198 @@
+Issue Title: [analyzer] FP caused by invalid reasoning about atomics
+Original Post: In our project we use a lot of object with intrusive refcounting. So following (very simplified) pattern occurs a lot:
+
+```c
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdatomic.h>
+#include <assert.h>
+
+struct SomeData {
+	size_t i;
+	_Atomic int ref;
+};
+
+static struct SomeData *alloc_data(void)
+{
+	struct SomeData *data = calloc(sizeof(*data), 1);
+	assert(data);
+
+	atomic_store(&data->ref, 2);
+	return data;
+}
+
+static void put_data(struct SomeData *data)
+{
+	if (atomic_fetch_sub(&data->ref, 1) == 1)
+		free(data);
+}
+
+void test(void)
+{
+	struct SomeData *data = alloc_data();
+
+	put_data(data);
+	printf("%lx\n", data->i); // <-- Warns here about UAF
+	put_data(data);
+}
+```
+
+CSA warns about UAF, even tho it does not happen, since refcounter will be equal to 1 after first `put_data`. 
+
+I do understand limitations of static analysis and how it's hard to model concurrent code. My question is how to suppress such warnings? It's possible to add `suppress`  attribute to all FP occurrences, but it would trash the source, since we really see a lot of them.
+
+Maybe it would be possible to implement a new flag like `dont-warn-on-atomic-conditions``? Or smth like that...
+
+Comment by llvmbot: 
+@llvm/issue-subscribers-clang-static-analyzer
+
+Author: Pavel Skripkin (pskrgag)
+
+<details>
+In our project we use a lot of object with intrusive refcounting. So following (very simplified) pattern occurs a lot:
+
+```c
+#include &lt;stddef.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;stdatomic.h&gt;
+#include &lt;assert.h&gt;
+
+struct SomeData {
+	size_t i;
+	_Atomic int ref;
+};
+
+static struct SomeData *alloc_data(void)
+{
+	struct SomeData *data = calloc(sizeof(*data), 1);
+	assert(data);
+
+	atomic_store(&amp;data-&gt;ref, 2);
+	return data;
+}
+
+static void put_data(struct SomeData *data)
+{
+	if (atomic_fetch_sub(&amp;data-&gt;ref, 1) == 1)
+		free(data);
+}
+
+void test(void)
+{
+	struct SomeData *data = alloc_data();
+
+	put_data(data);
+	printf("%lx\n", data-&gt;i); // &lt;-- Warns here about UAF
+	put_data(data);
+}
+```
+
+CSA warns about UAF, even tho it does not happen, since refcounter will be equal to 1 after first `put_data`. 
+
+I do understand limitations of static analysis and how it's hard to model concurrent code. My question is how to suppress such warnings? It's possible to add `suppress`  attribute to all FP occurrences, but it would trash the source, since we really see a lot of them.
+
+Maybe it would be possible to implement a new flag like `dont-warn-on-atomic-conditions``? Or smth like that...
+</details>
+
+Comment by steakhal: Actually we have a similar suppression heuristic for smart pointers. Check the SmartPtrChecker, and look for "atomic".
+
+So far I havent seen mass FPs for other checkers, so I guess we never thought of generalizing the suppression.
+We should revisit this on a case by case basis.
+
+I guess, we could allowlist the MallocChecker reports in some way.
+Basically, we could have a separate BugReport visitor for handling atomic suppressions, and we should just add that visitor for the reports from SmartPtrChecker and MallocChecker.
+Comment by pskrgag: Hm, I cannot find any "atomic" in checkers for smart pointers:
+
+````
+ > rg -i "atomic" clang/lib/StaticAnalyzer | rg -i "ptr|pointer.*:"
+clang/lib/StaticAnalyzer/Checkers/WebKit/PtrTypesSemantics.cpp:  bool VisitAtomicExpr(const AtomicExpr *E) { return VisitChildren(E); }
+````
+Comment by steakhal: > Hm, I cannot find any "atomic" in checkers for smart pointers:
+> 
+> ```
+>  > rg -i "atomic" clang/lib/StaticAnalyzer | rg -i "ptr|pointer.*:"
+> clang/lib/StaticAnalyzer/Checkers/WebKit/PtrTypesSemantics.cpp:  bool VisitAtomicExpr(const AtomicExpr *E) { return VisitChildren(E); }
+> ```
+
+I misremembered.
+It's inside the [MallocChecker](https://github.com/llvm/llvm-project/blob/main/clang/lib/StaticAnalyzer/Checkers/MallocChecker.cpp#L3578) already.
+
+This makes me wonder, how is this report not suppressed by that?
+Comment by pskrgag: Aha, I see. It's not supressed because of 
+
+```c
+  if (ReleaseDestructorLC && (ReleaseDestructorLC == CurrentLC ||
+                              ReleaseDestructorLC->isParentOf(CurrentLC))) {
+```
+
+`ReleaseDestructorLC` is set only for `CXXDestructorDecl`
+Comment by pskrgag: (Sorry for previous comment)
+
+Following seems to work. I think, it makes sense to suspect all functions, not just C++ destructors.
+
+```diff
+diff --git a/clang/lib/StaticAnalyzer/Checkers/MallocChecker.cpp b/clang/lib/StaticAnalyzer/Checkers/MallocChecker.cpp
+index 3ddcb7e94ae5..5ea216297599 100644
+--- a/clang/lib/StaticAnalyzer/Checkers/MallocChecker.cpp
++++ b/clang/lib/StaticAnalyzer/Checkers/MallocChecker.cpp
+@@ -3648,35 +3648,38 @@ PathDiagnosticPieceRef MallocBugVisitor::VisitNode(const ExplodedNode *N,
+           return nullptr;
+         }
+ 
+-      // See if we're releasing memory while inlining a destructor
+-      // (or one of its callees). This turns on various common
+-      // false positive suppressions.
+-      bool FoundAnyDestructor = false;
+-      for (const LocationContext *LC = CurrentLC; LC; LC = LC->getParent()) {
+-        if (const auto *DD = dyn_cast<CXXDestructorDecl>(LC->getDecl())) {
+-          if (isReferenceCountingPointerDestructor(DD)) {
+-            // This immediately looks like a reference-counting destructor.
+-            // We're bad at guessing the original reference count of the object,
+-            // so suppress the report for now.
+-            BR.markInvalid(getTag(), DD);
+-          } else if (!FoundAnyDestructor) {
++        // See if we're releasing memory while inlining a destructor or
++        // functions that decrement reference counters (or one of its callees).
++        // This turns on various common false positive suppressions.
++        bool FoundAnyDestructor = false;
++        for (const LocationContext *LC = CurrentLC; LC; LC = LC->getParent()) {
++          if (const auto *DD = dyn_cast<CXXDestructorDecl>(LC->getDecl())) {
++            if (isReferenceCountingPointerDestructor(DD)) {
++              // This immediately looks like a reference-counting destructor.
++              // We're bad at guessing the original reference count of the
++              // object, so suppress the report for now.
++              BR.markInvalid(getTag(), DD);
++              continue;
++            }
++          }
++
++          if (!FoundAnyDestructor) {
+             assert(!ReleaseDestructorLC &&
+                    "There can be only one release point!");
+-            // Suspect that it's a reference counting pointer destructor.
+-            // On one of the next nodes might find out that it has atomic
+-            // reference counting operations within it (see the code above),
+-            // and if so, we'd conclude that it likely is a reference counting
+-            // pointer destructor.
++            // Suspect that it's a reference counting pointer
++            // destructor/function. On one of the next nodes might find out that
++            // it has atomic reference counting operations within it (see the
++            // code above), and if so, we'd conclude that it likely is a
++            // reference counting pointer destructor.
+             ReleaseDestructorLC = LC->getStackFrame();
+             // It is unlikely that releasing memory is delegated to a destructor
+             // inside a destructor of a shared pointer, because it's fairly hard
+             // to pass the information that the pointer indeed needs to be
+             // released into it. So we're only interested in the innermost
+-            // destructor.
++            // destructor or function.
+             FoundAnyDestructor = true;
+           }
+         }
+-      }
+     } else if (isRelinquished(RSCurr, RSPrev, S)) {
+       Msg = "Memory ownership is transferred";
+       StackHint = std::make_unique<StackHintGeneratorForSymbol>(Sym, "");
+```

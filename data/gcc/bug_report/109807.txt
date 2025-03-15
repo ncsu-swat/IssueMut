@@ -1,0 +1,209 @@
+Bug Summary: [14 Regression] sse2-mmx-pmaddwd.c met ICE after commit r14-666-g608e7f3ab47 with march=cascadelake
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Haochen Jiang | Time: 2023-05-11 06:25:42 UTC
+  Text: After that commit in the testcase with command:
+
+/export/users/haochenj/env/build_no_bootstrap_master/gcc/xgcc -B/export/users/haochenj/env/build_no_bootstrap_master/gcc/ /export/users/haochenj/src/gcc/master/gcc/testsuite/gcc.
+target/i386/sse2-mmx-pmaddwd.c -m64 -march=cascadelake -fdiagnostics-plain-output -O2 -fno-strict-aliasing -msse2 -mno-mmx -lm -o ./sse2-mmx-pmaddwd.exe
+
+We met an ICE:
+
+In file included from /export/users/haochenj/src/gcc/master/gcc/testsuite/gcc.target/i386/sse2-mmx-pmaddwd.c:5:
+/export/users/haochenj/src/gcc/master/gcc/testsuite/gcc.target/i386/sse2-check.h: In function ‘do_test’:                                                                                                       /export/users/haochenj/src/gcc/master/gcc/testsuite/gcc.target/i386/sse2-check.h:10:1: internal compiler error: in ix86_widen_mult_cost, at config/i386/i386.cc:20442
+0x1a57e23 ix86_widen_mult_cost                                                                                                                                                                                         /export/users/haochenj/src/gcc/master/./gcc/config/i386/i386.cc:20442
+0x1a62835 ix86_vector_costs::add_stmt_cost(int, vect_cost_for_stmt, _stmt_vec_info*, _slp_tree*, tree_node*, int, vect_cost_model_location)
+        /export/users/haochenj/src/gcc/master/./gcc/config/i386/i386.cc:23479
+0x18dc317 add_stmt_cost(vector_costs*, int, vect_cost_for_stmt, _stmt_vec_info*, _slp_tree*, tree_node*, int, vect_cost_model_location)
+        /export/users/haochenj/src/gcc/master/./gcc/tree-vectorizer.h:1779
+0x190fa68 add_stmt_cost(vector_costs*, stmt_info_for_cost*)
+        /export/users/haochenj/src/gcc/master/./gcc/tree-vectorizer.h:1801
+0x190567f vect_bb_vectorization_profitable_p
+        /export/users/haochenj/src/gcc/master/./gcc/tree-vect-slp.cc:6928
+0x1907bec vect_slp_region
+        /export/users/haochenj/src/gcc/master/./gcc/tree-vect-slp.cc:7441
+0x19087dc vect_slp_bbs
+        /export/users/haochenj/src/gcc/master/./gcc/tree-vect-slp.cc:7611
+0x1908d6c vect_slp_function(function*)
+        /export/users/haochenj/src/gcc/master/./gcc/tree-vect-slp.cc:7712
+0x192d9b5 execute
+        /export/users/haochenj/src/gcc/master/./gcc/tree-vectorizer.cc:1529
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+I took a quick look, it seems that V2SImode is not handled in function ix86_widen_mult_cost.
+
+- User: Haochen Jiang | Time: 2023-05-11 06:52:12 UTC
+  Text: I further checked the reason, V2SI should never dropped into that function because we have no pattern under V2SI.
+
+I suppose it is because -march=cascadelake will open SSE4.1, with the new pattern, it wrongly dropped into that.
+
+-m32 will not ICE since TARGET_MMX_WITH_SSE need 64 bit and won't enable the new pattern.
+
+- User: Uroš Bizjak | Time: 2023-05-11 07:25:50 UTC
+  Text: (In reply to Haochen Jiang fromcomment #1)> I further checked the reason, V2SI should never dropped into that function
+> because we have no pattern under V2SI.
+> 
+> I suppose it is because -march=cascadelake will open SSE4.1, with the new
+> pattern, it wrongly dropped into that.
+> 
+> -m32 will not ICE since TARGET_MMX_WITH_SSE need 64 bit and won't enable the
+> new pattern.V2SI mul was introduced inr14-493(AKA partial fix forPR109690).
+
+- User: David Binderman | Time: 2023-05-11 07:51:09 UTC
+  Text: I see the same for this C code on znver1:
+
+typedef struct MonitorInfo MonitorInfo;
+char *decode_edid_edid;
+struct MonitorInfo {
+  int width_mm;
+  int height_mm
+} decode_edid() {
+  MonitorInfo info;
+  MonitorInfo *__trans_tmp_3 = &info;
+  {
+    MonitorInfo *info = __trans_tmp_3;
+    info->width_mm = 10 * decode_edid_edid[5];
+    info->height_mm = 10 * decode_edid_edid[6];
+  }
+  decode_headerdecode_vendor_and_product_identificationdecode_edid_version(
+      info);
+}
+
+$ ~/gcc/results.20230511.asan.ubsan/bin/gcc -c -O2 -march=znver1 -wbug919.c
+during GIMPLE pass: slpbug919.c: In function ‘decode_edid’:bug919.c:6:3: internal compiler error: in ix86_widen_mult_cost, at config/i386/i386.cc:20442
+    6 | } decode_edid() {
+      |   ^~~~~~~~~~~
+
+It was ok yesterday:
+
+$ ~/gcc/results.20230510.asan.ubsan/bin/gcc -c -O2 -march=znver1 -wbug919.c
+$
+
+- User: Haochen Jiang | Time: 2023-05-11 07:53:00 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #2)> (In reply to Haochen Jiang fromcomment #1)
+> > I further checked the reason, V2SI should never dropped into that function
+> > because we have no pattern under V2SI.
+> > 
+> > I suppose it is because -march=cascadelake will open SSE4.1, with the new
+> > pattern, it wrongly dropped into that.
+> > 
+> > -m32 will not ICE since TARGET_MMX_WITH_SSE need 64 bit and won't enable the
+> > new pattern.
+> 
+> V2SI mul was introduced inr14-493(AKA partial fix forPR109690).I see. So we might need to add cost for that right?
+
+- User: Uroš Bizjak | Time: 2023-05-11 08:06:22 UTC
+  Text: (In reply to Haochen Jiang fromcomment #4)> (In reply to Uroš Bizjak fromcomment #2)
+> > (In reply to Haochen Jiang fromcomment #1)
+> > > I further checked the reason, V2SI should never dropped into that function
+> > > because we have no pattern under V2SI.
+> > > 
+> > > I suppose it is because -march=cascadelake will open SSE4.1, with the new
+> > > pattern, it wrongly dropped into that.
+> > > 
+> > > -m32 will not ICE since TARGET_MMX_WITH_SSE need 64 bit and won't enable the
+> > > new pattern.
+> > 
+> > V2SI mul was introduced inr14-493(AKA partial fix forPR109690).
+> 
+> I see. So we might need to add cost for that right?Adding "case V2SImode:" above "case V4SImode:" in ix86_widen_mult_cost will fix this issue. Probably V4HImode is also needed above V8HImode, we have had a mulv4hi3 pattern for some time now.
+
+- User: Uroš Bizjak | Time: 2023-05-11 15:42:49 UTC
+  Text: Createdattachment 55053[details]Proposed patch.
+
+Patch in testing.
+
+- User: GCC Commits | Time: 2023-05-11 18:55:31 UTC
+  Text: The master branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:10a0d98356680a387b69f8659099450f7af86d9fcommitr14-713-g10a0d98356680a387b69f8659099450f7af86d9fAuthor: Uros Bizjak <ubizjak@gmail.com>
+Date:   Thu May 11 20:54:24 2023 +0200
+
+    i386: Handle V4HI and V2SImode in ix86_widen_mult_cost [PR109807]
+    
+    Do not crash when asking ix86_widen_mult_cost for the cost of
+    a widening mul operation to V4HI or V2SImode.
+    
+    gcc/ChangeLog:PR target/109807* config/i386/i386.cc (ix86_widen_mult_cost):
+            Handle V4HImode and V2SImode.
+    
+    gcc/testsuite/ChangeLog:PR target/109807* gcc.target/i386/pr109807.c: New test.
+
+- User: Uroš Bizjak | Time: 2023-05-11 18:57:32 UTC
+  Text: Fixed.
+
+- User: Uroš Bizjak | Time: 2023-05-13 08:31:25 UTC
+  Text: *** This bug has been marked as a duplicate ofbug 109825***
+
+- User: David Binderman | Time: 2023-05-13 10:44:37 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #8)> Fixed.I don't think so. The code I gave seems still to crash the compiler:
+
+$ ~/gcc/results/bin/gcc -v
+Using built-in specs.
+COLLECT_GCC=/home/dcb38/gcc/results/bin/gcc
+COLLECT_LTO_WRAPPER=/home/dcb38/gcc/results.20230513.asan.ubsan/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../trunk.year/configure --prefix=/home/dcb38/gcc/results.20230513.asan.ubsan --disable-multilib --disable-bootstrap --with-build-config=bootstrap-asan --with-build-config=bootstrap-ubsan --with-pkgversion=1d339ce8d002920f --enable-checking=df,extra,fold,rtl,yes --enable-languages=c,c++,fortran
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20230513 (experimental) (1d339ce8d002920f)
+ 
+
+$ ~/gcc/results/bin/gcc -c -O2 -march=znver1bug919.c
+during GIMPLE pass: slp
+edid-parse.c: In function ‘decode_edid’:
+edid-parse.c:521:14: internal compiler error: in ix86_widen_mult_cost, at config
+/i386/i386.cc:20444
+0x11f3ab1 ix86_widen_mult_cost(processor_costs const*, machine_mode, bool)
+	../../trunk.year/gcc/config/i386/i386.cc:20444
+
+I thought at first I hadn't picked up Uros's change, but:
+
+$ git log | fgrep V4HI
+fgrep: warning: fgrep is obsolescent; using grep -F
+    i386: Handle V4HI and V2SImode in ix86_widen_mult_cost [PR109807]
+    a widening mul operation to V4HI or V2SImode.
+            Handle V4HImode and V2SImode.
+    The operation ADDHN on V4SI, for example, is represented as (truncate:V4HI ((src1:V4SI + src2:V4SI) >> 16))
+    and RADDHN as (truncate:V4HI ((src1:V4SI + src2:V4SI + (1 << 15)) >> 16)).
+$
+
+- User: Uroš Bizjak | Time: 2023-05-13 10:50:31 UTC
+  Text: (In reply to David Binderman fromcomment #10)> (In reply to Uroš Bizjak fromcomment #8)
+> > Fixed.
+> 
+> I don't think so. The code I gave seems still to crash the compiler:Yes, the cost function is ICEing on unhandled modes (that is *not* a good approach). Please look at thePR109825how it will be solved.
+
+- User: GCC Commits | Time: 2023-05-14 19:53:51 UTC
+  Text: The master branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:aed51e2051b24a6a2127c6626f451641557a571acommitr14-812-gaed51e2051b24a6a2127c6626f451641557a571aAuthor: Uros Bizjak <ubizjak@gmail.com>
+Date:   Sun May 14 21:53:17 2023 +0200
+
+    i386: Handle unsupported modes from ix86_widen_mult_cost [PR109807]
+    
+    Revert my previous change that faked handling of V4HI and V2SImodes
+    in ix86_widen_mult_cost and rather return arbitrary high value
+    for unsupported modes. This should prevent cost estimator from
+    selecting non-existent vector widen multiply operation.
+    
+    gcc/ChangeLog:PR target/109807* config/i386/i386.cc: Revert the 2023-05-11 change.
+            (ix86_widen_mult_cost): Return high value instead of
+            ICEing for unsupported modes.
+    
+    gcc/testsuite/ChangeLog:PR target/109807* gcc.target/i386/pr109825.c: New test.
+
+- User: Uroš Bizjak | Time: 2023-05-14 19:56:19 UTC
+  Text: Fixed.
+
+- User: Uroš Bizjak | Time: 2023-05-14 19:57:33 UTC
+  Text: ***Bug 109838has been marked as a duplicate of this bug. ***
+
+- User: Uroš Bizjak | Time: 2023-05-14 19:59:17 UTC
+  Text: ***Bug 109825has been marked as a duplicate of this bug. ***
+

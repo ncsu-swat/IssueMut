@@ -1,0 +1,141 @@
+Bug Summary: [11 Regression] ICE building mariadb on i686 since r8-470
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 12.4.0, 13.2.1, 14.0
+Known to Fail: 11.5.0, 12.3.0, 13.2.0
+
+Comments:
+- User: Jakub Jelinek | Time: 2023-09-20 14:35:07 UTC
+  Text: The following testcase ICEs on x86_64-linux with
+-m32 -march=i686 -mtune=generic -fPIC -O2 -g
+starting withr8-470-g973dfbb4a63ba7c580e4The error is:
+during RTL pass: pro_and_epilogue
+item.ii: In constructor ‘G::G(A*, const B&, const B&, const B&)’:
+item.ii:19:1: internal compiler error: in find_oldest_value_reg, at regcprop.cc:465
+   19 | }
+      | ^
+0x10304d0 find_oldest_value_reg
+	../../gcc/regcprop.cc:465
+0x10307eb replace_oldest_value_reg
+	../../gcc/regcprop.cc:512
+0x1030fe0 replace_oldest_value_addr
+	../../gcc/regcprop.cc:671
+0x10311c3 replace_oldest_value_mem
+	../../gcc/regcprop.cc:704
+and it is apparently due to LRA leaving a reference to a pseudo register in a DEBUG_INSN:
+(debug_insn 28 27 29 2 (var_location:SI x (mem/f:SI (reg:SI 110) [1 *y_10(D).b1+0 S4 A32])) "item.ii":4:39 -1
+     (nil))
+in *.reload dump and forward.
+
+Vlad, could you please have a look?
+
+- User: Jakub Jelinek | Time: 2023-09-20 14:36:10 UTC
+  Text: Testcase:
+class A;
+struct B { const char *b1; int b2; };
+struct C : B { C (const char *x, int y) { b1 = x; b2 = y; } };
+struct D : C { D (B x) : C (x.b1, x.b2) {} };
+struct E { E (A *); };
+struct F : E { D f1, f2, f3, f4, f5, f6; F (A *, const B &, const B &, const B &); };
+struct G : F { G (A *, const B &, const B &, const B &); };
+struct H { int h; };
+struct I { H i; };
+struct J { I *j; };
+struct A : J {};
+inline F::F (A *x, const B &y, const B &z, const B &w)
+  : E(x), f1(y), f2(z), f3(w), f4(y), f5(z), f6(w) {}
+G::G (A *x, const B &y, const B &z, const B &w) : F(x, y, z, w)
+{
+  H *h = &x->j->i;
+  if (h)
+    h->h++;
+}
+
+- User: Jakub Jelinek | Time: 2023-09-20 14:41:28 UTC
+  Text: Though, there are no differences in -fdump-tree-optimized-vops-alias-details dump, so it might be some glitch in our bisect seed.
+The neighboringr8-469-g8ffa3150d30b90a11aba7d7brevision looks much more related.
+
+- User: Jakub Jelinek | Time: 2023-09-20 14:55:46 UTC
+  Text: When comparing RTL dump files betweenr247719andr247721, ira dump is pretty much the same (just printed compiler pointers in the dump change), while reload dump has lots of changes including this pseudo in the debug insn.
+
+- User: Vladimir Makarov | Time: 2023-09-22 19:50:07 UTC
+  Text: I've reproduced the bug. The problem is in combination of splitting pseudo live range and sharing rtl.
+
+I hope to fix this on the next Monday or Tuesday.
+
+- User: GCC Commits | Time: 2023-09-25 20:20:24 UTC
+  Text: The master branch has been updated by Vladimir Makarov <vmakarov@gcc.gnu.org>:https://gcc.gnu.org/g:3c23defed384cf17518ad6c817d94463a445d21bcommitr14-4256-g3c23defed384cf17518ad6c817d94463a445d21bAuthor: Vladimir N. Makarov <vmakarov@redhat.com>
+Date:   Mon Sep 25 16:19:50 2023 -0400
+
+    [PR111497][LRA]: Copy substituted equivalence
+    
+    When we substitute the equivalence and it becomes shared, we can fail
+    to correctly update reg info used by LRA.  This can result in wrong
+    code generation, e.g. because of incorrect live analysis.  It can also
+    result in compiler crash as the pseudo survives RA.  This is what
+    exactly happened for the PR.  This patch solves this problem by
+    unsharing substituted equivalences.
+    
+    gcc/ChangeLog:PR middle-end/111497* lra-constraints.cc (lra_constraints): Copy substituted
+            equivalence.
+            * lra.cc (lra): Change comment for calling unshare_all_rtl_again.
+    
+    gcc/testsuite/ChangeLog:PR middle-end/111497* g++.target/i386/pr111497.C: new test.
+
+- User: Jakub Jelinek | Time: 2023-11-13 16:17:51 UTC
+  Text: Is this backportable to release branches or too risky?
+
+- User: Vladimir Makarov | Time: 2023-11-13 18:27:20 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #6)> Is this backportable to release branches or too risky?I don't think it is risky.  LRA was designed to have unshared rtl.  So copying rtl in LRA is not risky.
+
+- User: Richard Biener | Time: 2023-11-30 08:23:40 UTC
+  Text: Fixed on trunk sofar, will test on the 13 branch now.
+
+- User: GCC Commits | Time: 2023-11-30 11:44:56 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:741743c028dc00f27b9c8b1d5211c1f602f2fdddcommitr13-8109-g741743c028dc00f27b9c8b1d5211c1f602f2fdddAuthor: Vladimir N. Makarov <vmakarov@redhat.com>
+Date:   Mon Sep 25 16:19:50 2023 -0400
+
+    [PR111497][LRA]: Copy substituted equivalence
+    
+    When we substitute the equivalence and it becomes shared, we can fail
+    to correctly update reg info used by LRA.  This can result in wrong
+    code generation, e.g. because of incorrect live analysis.  It can also
+    result in compiler crash as the pseudo survives RA.  This is what
+    exactly happened for the PR.  This patch solves this problem by
+    unsharing substituted equivalences.
+    
+    gcc/ChangeLog:PR middle-end/111497* lra-constraints.cc (lra_constraints): Copy substituted
+            equivalence.
+            * lra.cc (lra): Change comment for calling unshare_all_rtl_again.
+    
+    gcc/testsuite/ChangeLog:PR middle-end/111497* g++.target/i386/pr111497.C: new test.
+    
+    (cherry picked from commit 3c23defed384cf17518ad6c817d94463a445d21b)
+
+- User: GCC Commits | Time: 2024-06-12 12:33:58 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:959cef942508b818c7dcb8df0f3c7bf4968d406acommitr12-10554-g959cef942508b818c7dcb8df0f3c7bf4968d406aAuthor: Vladimir N. Makarov <vmakarov@redhat.com>
+Date:   Mon Sep 25 16:19:50 2023 -0400
+
+    [PR111497][LRA]: Copy substituted equivalence
+    
+    When we substitute the equivalence and it becomes shared, we can fail
+    to correctly update reg info used by LRA.  This can result in wrong
+    code generation, e.g. because of incorrect live analysis.  It can also
+    result in compiler crash as the pseudo survives RA.  This is what
+    exactly happened for the PR.  This patch solves this problem by
+    unsharing substituted equivalences.
+    
+    gcc/ChangeLog:PR middle-end/111497* lra-constraints.cc (lra_constraints): Copy substituted
+            equivalence.
+            * lra.cc (lra): Change comment for calling unshare_all_rtl_again.
+    
+    gcc/testsuite/ChangeLog:PR middle-end/111497* g++.target/i386/pr111497.C: new test.
+    
+    (cherry picked from commit 3c23defed384cf17518ad6c817d94463a445d21b)
+
+- User: Richard Biener | Time: 2024-07-19 12:20:37 UTC
+  Text: Fixed in GCC 12.4
+

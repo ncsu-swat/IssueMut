@@ -1,0 +1,151 @@
+Bug Summary: vector version of `x == MIN & x > y` is not optimized
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2023-08-05 17:11:12 UTC
+  Text: Example:
+```
+#include <limits.h>
+
+#define vector __attribute__((vector_size(sizeof(unsigned)*2)))
+
+vector signed fs(vector signed x, vector signed y)
+{
+  vector signed t = x == INT_MIN;
+  vector signed t1 = x > y;
+  return t & t1;
+}
+vector signed fu(vector unsigned x, vector unsigned y)
+{
+  vector signed t = x == 0;
+  vector signed t1 = x > y;
+  return t & t1;
+}
+
+ signed f2_1( signed x,  signed y)
+{
+   signed t = x == INT_MIN;
+   signed t1 = x > y;
+  return t & t1;
+}
+```
+
+I am filing this as I am fixing the pointer version (PR 96695) and don't want to lose track of this either.
+
+- User: Andrew Pinski | Time: 2023-08-05 17:25:28 UTC
+  Text: These should work, I think, will try after finishing up the pointer:
+(match min_value
+ VECTOR_CST
+ (with { tree inner = uniform_integer_cst_p (t); }
+  (if (inner
+       && INTEGRAL_TYPE_P (TREE_TYPE (inner))
+       && wi::eq_p (wi::to_wide (inner), wi::min_value (TREE_TYPE (inner))))
+  )
+ )
+)
+
+(match max_value
+ VECTOR_CST
+ (with { tree inner = uniform_integer_cst_p (t); }
+  (if (inner
+       && INTEGRAL_TYPE_P (TREE_TYPE (inner))
+       && wi::eq_p (wi::to_wide (inner), wi::max_value (TREE_TYPE (inner))))
+  )
+ )
+)
+
+- User: Andrew Pinski | Time: 2023-08-21 20:13:59 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> These should work, I think, will try after finishing up the pointer:This is better version, it replaces the current min_value/max_value even:
+(match min_value
+ uniform_integer_cst_p
+ (with { tree int_cst = uniform_integer_cst_p (t); }
+  (if ((INTEGRAL_TYPE_P (TREE_TYPE (int_cst))
+        || POINTER_TYPE_P (TREE_TYPE (int_cst)))
+       && wi::eq_p (wi::to_wide (int_cst),
+                    wi::min_value (TREE_TYPE (int_cst))))
+ )
+)
+
+(match max_value
+ uniform_integer_cst_p
+ (with { tree int_cst = uniform_integer_cst_p (t); }
+  (if ((INTEGRAL_TYPE_P (TREE_TYPE (int_cst))
+        || POINTER_TYPE_P (TREE_TYPE (int_cst)))
+       && wi::eq_p (wi::to_wide (int_cst),
+                    wi::max_value (TREE_TYPE (int_cst))))
+ )
+)
+
+That is INTEGER_CST replace with uniform_integer_cst_p and type with TREE_TYPE (int_cst) and t with int_cst.
+
+- User: Andrew Pinski | Time: 2023-08-30 22:27:19 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2023-August/628869.html
+
+- User: GCC Commits | Time: 2023-08-31 17:26:27 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:16a268785f646b3d641acd8634ab487b24f51c33commitr14-3603-g16a268785f646b3d641acd8634ab487b24f51c33Author: Andrew Pinski <apinski@marvell.com>
+Date:   Wed Aug 30 12:27:06 2023 -0700
+
+    MATCH: extend min_value/max_value match to vectors
+    
+    This simple patch extends the min_value/max_value match to vector integer types.
+    Using uniform_integer_cst_p makes this easy.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu with no regressions.
+    
+    The testcasespr110915-*.c are the same aspr88784-*.c except using vector
+    types instead.PR tree-optimization/110915gcc/ChangeLog:
+    
+            * match.pd (min_value, max_value): Extend to vector constants.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr110915-1.c: New test.
+            * gcc.dg/pr110915-10.c: New test.
+            * gcc.dg/pr110915-11.c: New test.
+            * gcc.dg/pr110915-12.c: New test.
+            * gcc.dg/pr110915-2.c: New test.
+            * gcc.dg/pr110915-3.c: New test.
+            * gcc.dg/pr110915-4.c: New test.
+            * gcc.dg/pr110915-5.c: New test.
+            * gcc.dg/pr110915-6.c: New test.
+            * gcc.dg/pr110915-7.c: New test.
+            * gcc.dg/pr110915-8.c: New test.
+            * gcc.dg/pr110915-9.c: New test.
+
+- User: Andrew Pinski | Time: 2023-08-31 17:27:58 UTC
+  Text: Fixed.
+
+- User: GCC Commits | Time: 2023-09-01 12:19:23 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:b8df57b3221aac70f22fb5c93d0b95bf22fded90commitr14-3622-gb8df57b3221aac70f22fb5c93d0b95bf22fded90Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Sep 1 14:17:06 2023 +0200
+
+    testsuite: Fix uppr110915* tests on i686-linux [PR110915]
+    
+    These tests FAIL on i686-linux, with
+    .../gcc/testsuite/gcc.dg/pr110915-1.c:8:1: warning: MMX vector return without MMX enabled changes the ABI [-Wpsabi]
+    .../gcc/testsuite/gcc.dg/pr110915-1.c:7:15: warning: MMX vector argument without MMX enabled changes the ABI [-Wpsabi]
+    excess warnings.  I've added -Wno-psabi to quiet that up, plus I think
+    it is undesirable to define macros like vector before including C library
+    headers in case the header would use that identifier in non-obfuscated
+    form somewhere.
+    
+    2023-09-01  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/110915* gcc.dg/pr110915-1.c: Add -Wno-psabi to dg-options.  Move vector
+            macro definition after limits.h inclusion.
+            * gcc.dg/pr110915-2.c: Likewise.
+            * gcc.dg/pr110915-3.c: Likewise.
+            * gcc.dg/pr110915-4.c: Likewise.
+            * gcc.dg/pr110915-5.c: Likewise.
+            * gcc.dg/pr110915-6.c: Likewise.
+            * gcc.dg/pr110915-7.c: Likewise.
+            * gcc.dg/pr110915-8.c: Likewise.
+            * gcc.dg/pr110915-9.c: Likewise.
+            * gcc.dg/pr110915-10.c: Likewise.
+            * gcc.dg/pr110915-11.c: Likewise.
+            * gcc.dg/pr110915-12.c: Likewise.
+

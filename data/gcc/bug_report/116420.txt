@@ -1,0 +1,96 @@
+Bug Summary: [15 Regression] wrong code at -O{2,3} with "-fno-forward-propagate -fno-tree-ch" on x86_64-linux-gnu
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2024-08-19 20:13:08 UTC
+  Text: It appears to be a recent regression as it doesn't reproduce with 14.* and earlier. 
+
+Compiler Explorer:https://godbolt.org/z/zfssY8K95[524] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240819 (experimental) (GCC) 
+[525] % 
+[525] % gcctk -O2 small.c; ./a.out
+[526] % 
+[526] % gcctk -O2 -fno-forward-propagate -fno-tree-ch small.c
+[527] % ./a.out
+Aborted
+[528] % cat small.c
+int a, d, e;
+char b = -1, c, f;
+int main() {
+  int g;
+  for (; d < 1; d++) {
+    g = b;
+    for (; c; c = g)
+      ;
+  }
+  f = g;
+  for (; e < 1; e++)
+    if (g >= a)
+      __builtin_abort();
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2024-08-19 21:19:52 UTC
+  Text: Confirmed. -fno-ext-dce makes the failure go away.
+
+- User: Jeffrey A. Law | Time: 2024-08-22 14:07:53 UTC
+  Text: So what's really interesting here is it appears that we're not queuing preds of the current block for reprocessing during the liveness computation.  But it seems to be specific to a particular pred/succ in a given loop -- the other loop seems to iterate and reach a fixed point just fine.  Weird.  But definitely mine.
+
+- User: Jeffrey A. Law | Time: 2024-08-22 14:42:38 UTC
+  Text: Fun.
+
+The DF framework provides us a way to run dataflow problems on sub-graphs.  Naturally a bitmap of interesting blocks is passed into those routines.   At a confluence point, the DF framework will not mark a block for re-processing if it's not in that set of interesting blocks.
+
+When ext-dce sets up that set of interesting blocks it's using the wrong counter.  ie, it's using n_basic_blocks rather than last_basic_block.  If there are holes in the block indices, some number of blocks won't get marked as interesting.
+
+In this case the block needing reprocessing has an index higher than n_basic_blocks.  It never gets reprocessed and the newly found live chunks don't propagate further up the CFG -- ultimately resulting in a pseudo appearing to have only the low 8 bits live, when in fact the low 32 bits are actually live.
+
+Testing a pretty obvious fix.
+
+- User: GCC Commits | Time: 2024-08-22 19:14:37 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:c9377734b798d8d311dfd3a5618dc49407703b93commitr15-3095-gc9377734b798d8d311dfd3a5618dc49407703b93Author: Jeff Law <jlaw@ventanamicro.com>
+Date:   Thu Aug 22 12:48:49 2024 -0600
+
+    [PR rtl-optimization/116420] Fix interesting block bitmap DF dataflow
+    
+    The DF framework provides us a way to run dataflow problems on sub-graphs.
+    Naturally a bitmap of interesting blocks is passed into those routines.   At a
+    confluence point, the DF framework will not mark a block for re-processing if
+    it's not in that set of interesting blocks.
+    
+    When ext-dce sets up that set of interesting blocks it's using the wrong
+    counter.  ie, it's using n_basic_blocks rather than last_basic_block.  If there
+    are holes in the block indices, some number of blocks won't get marked as
+    interesting.
+    
+    In this case the block needing reprocessing has an index higher than
+    n_basic_blocks.  It never gets reprocessed and the newly found live chunks
+    don't propagate further up the CFG -- ultimately resulting in a pseudo
+    appearing to have only the low 8 bits live, when in fact the low 32 bits are
+    actually live.
+    
+    Fixed in the obvious way, by using last_basic_block instead.
+    
+    Bootstrapped and regression tested on x86_64.  Pushing to the trunk.PR rtl-optimization/116420gcc/
+            * ext-dce.cc (ext_dce_init): Fix loop iteration when setting up the
+            interesting block for DF to analyze.
+    
+    gcc/testsuite
+            * gcc.dg/torture/pr116420.c: New test.
+
+- User: Jeffrey A. Law | Time: 2024-08-22 19:29:17 UTC
+  Text: Fixed on the trunk.
+

@@ -1,0 +1,202 @@
+Bug Summary: RISC-V: Failed to fold VEC_COND_EXPR and COND_LEN_ADD
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2023-09-26 02:31:44 UTC
+  Text: Consider this following case:
+
+
+#include <stdint.h>
+
+void single_loop_with_if_condition(uint64_t * restrict a, 
+uint64_t * restrict b,
+int loop_size) {
+  uint64_t result = 0;
+
+  for (int i = 0; i < loop_size; i++) {
+    if (b[i] <= a[i]) {
+      result += a[i];
+    }
+  }
+
+  a[0] = result;
+}
+
+In ARM SVE:
+
+vect__ifc__33.15_48 = VEC_COND_EXPR <mask__18.14_46, vect__7.13_45, { 0, ... }>;
+vect__34.16_49 = .COND_ADD (loop_mask_41, vect_result_19.7_38, vect__ifc__33.15_48, vect_result_19.7_38);
+
+will be folded into:
+
+vect__34.16_49 = .COND_ADD (_50, vect_result_19.7_38, vect__7.13_45, vect_result_19.7_38);
+
+However, for RVV, if failed to fold VEC_COND_EXPR + COND_LEN_ADD.
+
+vect__ifc__44.30_96 = VEC_COND_EXPR <mask__43.29_94, vect__42.28_93, { 0, ... }>;
+  vect__45.31_97 = .COND_LEN_ADD ({ -1, ... }, vect_result_35.22_78, vect__ifc__44.30_96, vect_result_35.22_78, _104, 0);
+
+I am not sure where to do this optimization?
+
+- User: Andrew Pinski | Time: 2023-09-26 02:46:11 UTC
+  Text: The SVE one was added withr12-4402-g62b505a4d5fc89:
+```
+/* Detect simplication for a conditional reduction where
+
+   a = mask1 ? b : 0
+   c = mask2 ? d + a : d
+
+   is turned into
+
+   c = mask1 && mask2 ? d + b : d.  */
+(simplify
+  (IFN_COND_ADD @0 @1 (vec_cond @2 @3 integer_zerop) @1)
+   (IFN_COND_ADD (bit_and @0 @2) @1 @3 @1))
+```
+Most likely should do the similar thing for IFN_COND_LEN_ADD too.
+
+- User: JuzheZhong | Time: 2023-09-26 03:02:26 UTC
+  Text: Oh, I see. Thanks a lot! I will have a try.
+
+- User: JuzheZhong | Time: 2023-09-26 03:42:57 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> The SVE one was added withr12-4402-g62b505a4d5fc89:
+> ```
+> /* Detect simplication for a conditional reduction where
+> 
+>    a = mask1 ? b : 0
+>    c = mask2 ? d + a : d
+> 
+>    is turned into
+> 
+>    c = mask1 && mask2 ? d + b : d.  */
+> (simplify
+>   (IFN_COND_ADD @0 @1 (vec_cond @2 @3 integer_zerop) @1)
+>    (IFN_COND_ADD (bit_and @0 @2) @1 @3 @1))
+> ```
+> Most likely should do the similar thing for IFN_COND_LEN_ADD too.Hi, I saw ARM SVE failed to fold VEC_COND + COND_ADD into COND_ADD on
+float vector since it can't satisfy integer_zerop.
+
+Is is reasonable the same optimization should also work for float vector ?
+
+- User: Andrew Pinski | Time: 2023-09-26 03:59:52 UTC
+  Text: (In reply to JuzheZhong fromcomment #3)> (In reply to Andrew Pinski fromcomment #1)
+> > The SVE one was added withr12-4402-g62b505a4d5fc89:
+> > ```
+> > /* Detect simplication for a conditional reduction where
+> > 
+> >    a = mask1 ? b : 0
+> >    c = mask2 ? d + a : d
+> > 
+> >    is turned into
+> > 
+> >    c = mask1 && mask2 ? d + b : d.  */
+> > (simplify
+> >   (IFN_COND_ADD @0 @1 (vec_cond @2 @3 integer_zerop) @1)
+> >    (IFN_COND_ADD (bit_and @0 @2) @1 @3 @1))
+> > ```
+> > Most likely should do the similar thing for IFN_COND_LEN_ADD too.
+> 
+> Hi, I saw ARM SVE failed to fold VEC_COND + COND_ADD into COND_ADD on
+> float vector since it can't satisfy integer_zerop.
+> 
+> Is is reasonable the same optimization should also work for float vector ?I suspect it would only be valid if `!HONOR_NANS (type) && !HONOR_SIGNED_ZEROS (type)` is true. So it could use (match on) zerop instead but would need to check the above conditional too.
+
+- User: GCC Commits | Time: 2023-09-26 12:20:52 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:dd0197fb4cdee8cd5f78fea9a965c96d7ca47229commitr14-4277-gdd0197fb4cdee8cd5f78fea9a965c96d7ca47229Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Tue Sep 26 17:50:37 2023 +0800
+
+    MATCH: Optimize COND_ADD_LEN reduction pattern
+    
+    This patch leverage this commit:https://gcc.gnu.org/git/gitweb.cgi?p=gcc.git;h=62b505a4d5fc89to optimize COND_LEN_ADD reduction pattern.
+    
+    We are doing optimization of VEC_COND_EXPR + COND_LEN_ADD -> COND_LEN_ADD.
+    
+    Consider thsi following case:
+    
+    voidpr11594(uint64_t *restrict a, uint64_t *restrict b, int loop_size)
+    {
+      uint64_t result = 0;
+    
+      for (int i = 0; i < loop_size; i++)
+        {
+          if (b[i] <= a[i])
+            {
+              result += a[i];
+            }
+        }
+    
+      a[0] = result;
+    }
+    
+    Before this patch:
+            vsetvli a7,zero,e64,m1,ta,ma
+            vmv.v.i v2,0
+            vmv1r.v v3,v2                    --- redundant
+    .L3:
+            vsetvli a5,a2,e64,m1,ta,ma
+            vle64.v v1,0(a3)
+            vle64.v v0,0(a1)
+            slli    a6,a5,3
+            vsetvli a7,zero,e64,m1,ta,ma
+            sub     a2,a2,a5
+            vmsleu.vv       v0,v0,v1
+            add     a1,a1,a6
+            vmerge.vvm      v1,v3,v1,v0     ---- redundant.
+            add     a3,a3,a6
+            vsetvli zero,a5,e64,m1,tu,ma
+            vadd.vv v2,v2,v1
+            bne     a2,zero,.L3
+            li      a5,0
+            vsetvli a4,zero,e64,m1,ta,ma
+            vmv.s.x v1,a5
+            vredsum.vs      v2,v2,v1
+            vmv.x.s a5,v2
+            sd      a5,0(a0)
+            ret
+    
+    After this patch:
+    
+            vsetvli a6,zero,e64,m1,ta,ma
+            vmv.v.i v1,0
+    .L3:
+            vsetvli a5,a2,e64,m1,ta,ma
+            vle64.v v2,0(a4)
+            vle64.v v0,0(a1)
+            slli    a3,a5,3
+            vsetvli a6,zero,e64,m1,ta,ma
+            sub     a2,a2,a5
+            vmsleu.vv       v0,v0,v2
+            add     a1,a1,a3
+            vsetvli zero,a5,e64,m1,tu,mu
+            add     a4,a4,a3
+            vadd.vv v1,v1,v2,v0.t
+            bne     a2,zero,.L3
+            li      a5,0
+            vsetivli        zero,1,e64,m1,ta,ma
+            vmv.s.x v2,a5
+            vsetvli a5,zero,e64,m1,ta,ma
+            vredsum.vs      v1,v1,v2
+            vmv.x.s a5,v1
+            sd      a5,0(a0)
+            ret
+    
+    Bootstrap && Regression is running.
+    
+    Ok for trunk when testing passes ?PR tree-optimization/111594PR tree-optimization/110660gcc/ChangeLog:
+    
+            * match.pd: Optimize COND_LEN_ADD reduction.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/cond/cond_reduc-1.c: New test.
+            * gcc.target/riscv/rvv/autovec/cond/pr111594.c: New test.
+
+- User: JuzheZhong | Time: 2023-09-26 12:29:39 UTC
+  Text: Fixed
+

@@ -1,0 +1,75 @@
+Issue Title: `LINE_MAX` is missing from `limits.h`
+Original Post: Compiling a recent Linux kernel release in Android's hermetic environment culminates in the following error:
+
+```
+tools/testing/selftests/filesystems/binderfs/binderfs_test.c:24:
+common/tools/testing/selftests/filesystems/binderfs/../../kselftest_harness.h:1159:17: error: use of undeclared identifier 'LINE_MAX'
+ 1159 |         char test_name[LINE_MAX];
+      |                        ^
+```
+
+Comment by nickdesaulniers: The only definition of this on my glibc host is in /usr/include/x86_64-linux-gnu/bits/posix2_lim.h 
+```c
+47:#define	_POSIX2_LINE_MAX		2048
+80:#ifndef	LINE_MAX
+81:#define	LINE_MAX		_POSIX2_LINE_MAX
+```
+
+llvm-project/clang/lib/Headers/ does not provide this, but neither does GCC (/usr/lib/gcc/x86_64-linux-gnu/13/include).
+Comment by enh-google: yeah, it's horrific nonsense that should be removed from POSIX:
+
+""" {LINE_MAX} Unless otherwise noted, the maximum length, in bytes, of a utility's input line (either standard input or another file), when the utility is described as processing text files. The length includes room for the trailing <newline>. Minimum Acceptable Value: {_POSIX2_LINE_MAX} """
+
+i've argued that it makes no sense for libc to claim to know the answer to this, but it makes even less sense for the compiler to claim that it knows!
+
+maybe we should just add it to bionic... i see there's already one place in the AOSP tree (ltp) that's working around the fact we don't. (and we _do_ define the equally stupid `_POSIX2_LINE_MAX`.)
+
+at the point where we have _two_ hacks in the tree, i should probably just swallow back the bile and add the turd to our headers...
+Comment by enh-google: ugh, looking at the code in ltp, it's exactly the kind of code i don't want to encourage:
+```
+		while (fgets(target, LINE_MAX, fp) != NULL)
+			num_line++;
+```
+am i going to encourage more fgets() rather than getline() stupidity if i add this?
+Comment by enh-google: unsurprisingly, the new use case is bad too:
+```
+	char test_name[LINE_MAX];
+...
+	snprintf(test_name, sizeof(test_name), "%s%s%s.%s",
+		 f->name, variant->name[0] ? "." : "", variant->name, t->name);
+```
+that should either be asprintf() if they don't intend to restrict the length, or based on tcgetwinsize() if they're trying to fit the terminal.
+Comment by enh-google: on the bright side, it looks like everyone (bionic, glibc, iOS, macOS, musl) has the same 2048 value so at least it'll be consistently stupid.
+
+https://android-review.googlesource.com/c/platform/bionic/+/3034152
+Comment by enh-google: this is probably the worst i've found (either it's too early in the morning for me, or this should just be using `fscanf()`), but they just `#define`'d their own `LINE_MAX`, so bionic not having `LINE_MAX` didn't help prevent this:
+```
+static int proc_get_size(int pid) {
+    char path[PATH_MAX];
+    char line[LINE_MAX];
+    int fd;
+    int rss = 0;
+    int total;
+    ssize_t ret;
+
+    /* gid containing AID_READPROC required */
+    snprintf(path, PATH_MAX, "/proc/%d/statm", pid);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd == -1)
+        return -1;
+
+    ret = read_all(fd, line, sizeof(line) - 1);
+    if (ret < 0) {
+        close(fd);
+        return -1;
+    }
+    line[ret] = '\0';
+
+    sscanf(line, "%d %d ", &total, &rss);
+    close(fd);
+    return rss;
+}
+```
+Comment by enh-google: https://android-review.googlesource.com/c/platform/system/memory/lmkd/+/3034232 is the only build fix needed, but surenb's ooo until next week (and is the only person in OWNERS). let me know if you're actually blocked by this and we can get a global approver instead.
+Comment by edliaw: @enh-google I sent https://lore.kernel.org/linux-kselftest/20240411231954.62156-1-edliaw@google.com/T/#u and https://lore.kernel.org/ltp/20240411181838.4157368-1-edliaw@google.com/T/#u to remove the use of LINE_MAX in selftests and LTP
+Comment by enh-google: awesome, thanks!

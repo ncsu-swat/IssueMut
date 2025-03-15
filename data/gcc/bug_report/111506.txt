@@ -1,0 +1,145 @@
+Bug Summary: RISC-V: Failed to vectorize conversion from INT64 -> _Float16
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2023-09-21 01:23:14 UTC
+  Text: #include <stdint.h>
+
+void foo (int64_t *__restrict a, _Float16 * b, int n)
+{
+    for (int i = 0; i < n; i++) {
+        b[i] = (_Float16)a[i];
+    }
+}
+
+-march=rv64gcv_zvfh_zfh -O3  -fno-trapping-math -fopt-info-vec-missed
+-march=rv64gcv_zvfh_zfh -O3  -ffast-math -fopt-info-vec-missed
+
+<source>:5:23: missed: couldn't vectorize loop
+<source>:6:27: missed: not vectorized: no vectype for stmt: _4 = *_3;
+ scalar_type: int64_t
+Compiler returned: 0https://godbolt.org/z/orevoq7E1Consider LLVM can vectorize with -fno-trapping-math.
+However, LLVM can not vectorize when -ftrapping-math.
+
+So, we need an explicit patterns from INT64 -> _Float16 with !flag_trapping_math
+
+- User: GCC Commits | Time: 2023-09-28 14:23:43 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:88d8829e4f435bfc844db5a9df730e20faf7c2c7commitr14-4310-g88d8829e4f435bfc844db5a9df730e20faf7c2c7Author: Pan Li <pan2.li@intel.com>
+Date:   Thu Sep 28 13:51:07 2023 +0800
+
+    RISC-V: Support {U}INT64 to FP16 auto-vectorization
+    
+    Update in v2:
+    
+    * Add math trap check.
+    * Adjust some test cases.
+    
+    Original logs:
+    
+    This patch would like to support the auto-vectorization from
+    the INT64 to FP16. We take below steps for the conversion.
+    
+    * INT64 to FP32.
+    * FP32 to FP16.
+    
+    Given sample code as below:
+    void
+    test_func (int64_t * __restrict a, _Float16 *b, unsigned n)
+    {
+      for (unsigned i = 0; i < n; i++)
+        b[i] = (_Float16) (a[i]);
+    }
+    
+    Before this patch:
+    test.c:6:26: missed: couldn't vectorize loop
+    test.c:6:26: missed: not vectorized: unsupported data-type
+            ld      a0,0(s0)
+            call    __floatdihf
+            fsh     fa0,0(s1)
+            addi    s0,s0,8
+            addi    s1,s1,2
+            bne     s2,s0,.L3
+            ld      ra,24(sp)
+            ld      s0,16(sp)
+            ld      s1,8(sp)
+            ld      s2,0(sp)
+            addi    sp,sp,32
+    
+    After this patch:
+            vsetvli a5,a2,e8,mf8,ta,ma
+            vle64.v v1,0(a0)
+            vsetvli a4,zero,e32,mf2,ta,ma
+            vfncvt.f.x.w    v1,v1
+            vsetvli zero,zero,e16,mf4,ta,ma
+            vfncvt.f.f.w    v1,v1
+            vsetvli zero,a2,e16,mf4,ta,ma
+            vse16.v v1,0(a1)
+    
+    Please note VLS mode is also involved in this patch and covered by the
+    test cases.PR target/111506gcc/ChangeLog:
+    
+            * config/riscv/autovec.md (<float_cvt><mode><vnnconvert>2):
+            New pattern.
+            * config/riscv/vector-iterators.md: New iterator.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/unop/cvt-0.c: New test.
+            * gcc.target/riscv/rvv/autovec/unop/cvt-1.c: New test.
+            * gcc.target/riscv/rvv/autovec/vls/cvt-0.c: New test.
+    
+    Signed-off-by: Pan Li <pan2.li@intel.com>
+
+- User: JuzheZhong | Time: 2023-09-28 14:24:12 UTC
+  Text: Fixed
+
+- User: Robin Dapp | Time: 2023-10-02 07:48:22 UTC
+  Text: I just got back.
+
+The problem with this is not -fno-trapping-math - it will vectorize just fine with -ftrapping-math (and the vectorizer doesn't depend on it either).  We also already have tests for this in rvv/autovec/conversions.
+
+However, not all int64 values can be represented in the intermediate type int32 which is why we don't vectorize unless the range of a[i] is know to be inside int32's range.  If I'm reading the C standard correctly it says such cases are implementation-defined behavior and I'm not sure we should work around the vectorizer by defining an expander that essentially hides the intermediate type.
+If that's an OK thing to do then I won't complain, though.
+
+CC'ing jmyers and rsandi because they would know best.  
+
+From what I can tell aarch64 also does not vectorize this and I wonder why LLVM's behavior is dependent on -fno-trapping-math.
+
+We have the same issue with the reversed conversion from _Float16 to int64.  In that case trapping math is relevant, though, but we could apply the same logic as in this patch and circumvent it by an expander.  To me this doesn't seem right.
+
+- User: jsm-csl@polyomino.org.uk | Time: 2023-10-02 17:29:09 UTC
+  Text: Conversion from 64-bit integers for _Float16 is fully defined, it produces 
+the correctly rounded result according to the current rounding direction 
+(round-to-nearest may be assumed in the absence of -frounding-math), which 
+may be an infinity (depending on the rounding mode) in case of overflow 
+(and in particular, anything not representable in a 32-bit integer 
+certainly overflows on conversion to _Float16).  That's just the same as 
+for any integer-to-floating conversions.
+
+- User: Robin Dapp | Time: 2023-10-02 18:35:02 UTC
+  Text: Ah, thanks Joseph, so this at least means that we do not need !flag_trapping_math here.
+
+However, the vectorizer emulates the 64-bit integer to _Float16 conversion via an intermediate int32_t and now the riscv expander does the same just without the same restrictions.
+
+I'm assuming the restrictions currently imposed on two-step vectorizing conversions are correct.  For e.g. int64_t -> _Float16 we require the value range of the source fit in int32_t (first step int64_t -> int32_t).  For _Float16 -> int64_t we require -fno-trapping-math (first step _Float16 -> int32_t).  The latter follows from Annex F of the C standard.
+
+Therefore, my general question would rather be:
+- Is it OK to circumvent either restriction by pretending to have an instruction that performs the conversion in two steps but doesn't actually do the checks?  I.e. does "implementation-defined behavior" cover the vectorizer checking one thing and one target not doing it?
+
+In our case the int64_t -> int32_t conversion is implementation defined when the source doesn't fit the target.
+
+- User: jsm-csl@polyomino.org.uk | Time: 2023-10-02 22:30:55 UTC
+  Text: On Mon, 2 Oct 2023, rdapp at gcc dot gnu.org via Gcc-bugs wrote:> In our case the int64_t -> int32_t conversion is implementation defined when
+> the source doesn't fit the target.GCC documents the implementation-defined semantics it uses for 
+out-of-range conversions from an integer type to a signed integer type.  
+That does not depend on whether the conversion is vectorized or not.  And 
+for conversions between floating and integer types in either direction, 
+there is no conversion between two integer types involved in the abstract 
+machine.
+

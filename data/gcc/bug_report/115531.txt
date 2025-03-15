@@ -1,0 +1,269 @@
+Bug Summary: vectorizer generates inefficient code for masked conditional update loops
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Tamar Christina | Time: 2024-06-18 03:14:47 UTC
+  Text: The following code:
+
+void __attribute__((noipa))
+foo (char *restrict a, int *restrict b, int *restrict c, int n, int stride)
+{
+  if (stride <= 1)
+    return;
+
+  for (int i = 0; i < n; i++)
+    {
+      int res = c[i];
+      int t = b[i+stride];
+      if (a[i] != 0)
+        res = t;
+      c[i] = res;
+    }
+}
+
+generates at -O3 -g0 -mcpu=generic+sve:
+
+.L3:
+        ld1b    z29.s, p7/z, [x0, x5]
+        ld1w    z31.s, p7/z, [x2, x5, lsl 2]
+        ld1w    z30.s, p7/z, [x1, x5, lsl 2]
+        cmpne   p15.b, p6/z, z29.b, #0
+        sel     z30.s, p15, z30.s, z31.s
+        st1w    z30.s, p7, [x2, x5, lsl 2]
+        add     x5, x5, x4
+        whilelo p7.s, w5, w3
+        b.any   .L3
+.L1:
+
+and makes vectorization unprofitable until very high iterations of n.
+This is because the vector code has more instructions than needed.
+
+Since it's a masked store, whenever a value is being conditionally set we don't need the intermediate VEC_COND_EXPR.  This loop can be vectorized as:
+
+.L3:
+        ld1b    z29.s, p7/z, [x0, x5]
+        ld1w    z31.s, p7/z, [x2, x5, lsl 2]
+        cmpne   p4.b, p6/z, z29.b, #0
+        st1w    z31.s, p4, [x2, x5, lsl 2]
+        add     x5, x5, x4
+        whilelo p7.s, w5, w3
+        b.any   .L3
+.L1:
+
+I currently prototyped a load-to-store forward optimization in forwprop but looking to move it into the vectorizer to cost it properly, however I'm not entirely sure what the best way to do so is.
+
+I can certainly fix it up during codegen but to cost it I need to do so during analysis. I could detect it during vectorizable_condition but then the dead load is still costed. Or I could maybe use a pattern, but unsure how to represent the mask into the load.
+
+Is it valid to produce a pattern with .IFN_MASK_STORE?
+
+- User: Andrew Pinski | Time: 2024-06-18 03:18:51 UTC
+  Text: I suspectPR 20999would fix this ...
+but we have to be careful since without masked stores, you could still vectorize this unlike the transformed version.
+
+Maybe ifcvt can produce a masked store version if this pattern ...
+
+- User: Andrew Pinski | Time: 2024-06-18 03:22:33 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> Maybe ifcvt can produce a masked store version if this pattern ...Maybe add another argument to .MASK_STORE to say it was originally unconditional store? Or something like that.
+
+- User: Tamar Christina | Time: 2024-06-18 03:30:45 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> I suspectPR 20999would fix this ...
+> but we have to be careful since without masked stores, you could still
+> vectorize this unlike the transformed version.
+> 
+> Maybe ifcvt can produce a masked store version if this pattern ...doing so during ifcvt forces you to commit to a masked operation. So you loose the ability to not vectorize for non-fully masked architectures.
+
+So it's too early.  A vector pattern doesn't have this problem. This question was mostly to what degree the vectorizer has support for MASK_STORE as an input. vect_get_vector_types_for_stmt seems to have support for it so it looks like it may work.
+
+- User: Richard Biener | Time: 2024-06-18 06:44:16 UTC
+  Text: AVX512 produces
+
+.L3:
+        vmovdqu8        (%rsi), %zmm9{%k1}
+        kshiftrq        $32, %k1, %k5
+        kshiftrq        $48, %k1, %k4
+        movl    %r9d, %eax
+        vmovdqu32       128(%rcx), %zmm7{%k5}
+        subl    %esi, %eax
+        movl    $64, %edi
+        vmovdqu32       128(%rdx), %zmm3{%k5}
+        kshiftrq        $16, %k1, %k6
+        addl    %r10d, %eax
+        vmovdqu32       192(%rcx), %zmm8{%k4}
+        cmpl    %edi, %eax
+        vmovdqu32       192(%rdx), %zmm4{%k4}
+        cmova   %edi, %eax
+        addq    $64, %rsi
+        addq    $256, %rcx
+        vmovdqu32       -256(%rcx), %zmm5{%k1}
+        vmovdqu32       (%rdx), %zmm1{%k1}
+        vmovdqu32       -192(%rcx), %zmm6{%k6}
+        vmovdqu32       64(%rdx), %zmm2{%k6}
+        vpcmpb  $4, %zmm14, %zmm9, %k2
+        kshiftrq        $32, %k2, %k3
+        vpblendmd       %zmm7, %zmm3, %zmm10{%k3}
+        kshiftrd        $16, %k3, %k3
+        vpblendmd       %zmm8, %zmm4, %zmm0{%k3}
+        vpblendmd       %zmm5, %zmm1, %zmm12{%k2}
+        vmovdqu32       %zmm10, 128(%rdx){%k5}
+        kshiftrd        $16, %k2, %k2
+        vmovdqu32       %zmm0, 192(%rdx){%k4}
+        vpblendmd       %zmm6, %zmm2, %zmm11{%k2}
+        vpbroadcastb    %eax, %zmm0
+        movl    %r9d, %eax
+        vmovdqu32       %zmm12, (%rdx){%k1}
+        subl    %esi, %eax
+        addl    %r8d, %eax
+        vmovdqu32       %zmm11, 64(%rdx){%k6}
+        addq    $256, %rdx
+        vpcmpub $6, %zmm13, %zmm0, %k1
+        cmpl    $64, %eax
+        ja      .L3
+
+
+The vectorizer sees
+
+  <bb 4> [local count: 955630225]:
+  # i_26 = PHI <i_23(9), 0(16)>
+  _1 = (long unsigned int) i_26;
+  _2 = _1 * 4;
+  _3 = c_17(D) + _2;
+  res_18 = *_3;
+  _4 = stride_14(D) + i_26;
+  _5 = (long unsigned int) _4;
+  _6 = _5 * 4;
+  _7 = b_19(D) + _6;
+  t_20 = *_7;
+  _8 = a_21(D) + _1;
+  _9 = *_8;
+  _34 = _9 != 0;
+  res_11 = _34 ? t_20 : res_18;
+  *_3 = res_11;
+  i_23 = i_26 + 1;
+  if (n_16(D) > i_23)
+
+I believe that to get proper vectorizer costing we want to have an
+optimization phase that can take into account whether we use a masked
+loop or not.  Note that your intended transform relies on identifying
+the open-coded "conditional store"
+
+      int res = c[i];
+      if (a[i] != 0)
+        res = t;
+      c[i] = res;
+
+As Andrew says when that's a .MASK_STORE it's going to be easier to
+identify the opportunity.  So yeah, if-conversion could recognize
+this pattern and produce a .MASK_STORE from it as a first step.
+
+- User: GCC Commits | Time: 2024-07-22 09:29:22 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:af792f0226e479b165a49de5e8f9e1d16a4b26c0commitr15-2191-gaf792f0226e479b165a49de5e8f9e1d16a4b26c0Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Mon Jul 22 10:26:14 2024 +0100
+
+    middle-end: Implement conditonal store vectorizer pattern [PR115531]
+    
+    This adds a conditional store optimization for the vectorizer as a pattern.
+    The vectorizer already supports modifying memory accesses because of the pattern
+    based gather/scatter recognition.
+    
+    Doing it in the vectorizer allows us to still keep the ability to vectorize such
+    loops for architectures that don't have MASK_STORE support, whereas doing this
+    in ifcvt makes us commit to MASK_STORE.
+    
+    Concretely for this loop:
+    
+    void foo1 (char *restrict a, int *restrict b, int *restrict c, int n, int stride)
+    {
+      if (stride <= 1)
+        return;
+    
+      for (int i = 0; i < n; i++)
+        {
+          int res = c[i];
+          int t = b[i+stride];
+          if (a[i] != 0)
+            res = t;
+          c[i] = res;
+        }
+    }
+    
+    today we generate:
+    
+    .L3:
+            ld1b    z29.s, p7/z, [x0, x5]
+            ld1w    z31.s, p7/z, [x2, x5, lsl 2]
+            ld1w    z30.s, p7/z, [x1, x5, lsl 2]
+            cmpne   p15.b, p6/z, z29.b, #0
+            sel     z30.s, p15, z30.s, z31.s
+            st1w    z30.s, p7, [x2, x5, lsl 2]
+            add     x5, x5, x4
+            whilelo p7.s, w5, w3
+            b.any   .L3
+    
+    which in gimple is:
+    
+      vect_res_18.9_68 = .MASK_LOAD (vectp_c.7_65, 32B, loop_mask_67);
+      vect_t_20.12_74 = .MASK_LOAD (vectp.10_72, 32B, loop_mask_67);
+      vect__9.15_77 = .MASK_LOAD (vectp_a.13_75, 8B, loop_mask_67);
+      mask__34.16_79 = vect__9.15_77 != { 0, ... };
+      vect_res_11.17_80 = VEC_COND_EXPR <mask__34.16_79, vect_t_20.12_74, vect_res_18.9_68>;
+      .MASK_STORE (vectp_c.18_81, 32B, loop_mask_67, vect_res_11.17_80);
+    
+    A MASK_STORE is already conditional, so there's no need to perform the load of
+    the old values and the VEC_COND_EXPR.  This patch makes it so we generate:
+    
+      vect_res_18.9_68 = .MASK_LOAD (vectp_c.7_65, 32B, loop_mask_67);
+      vect__9.15_77 = .MASK_LOAD (vectp_a.13_75, 8B, loop_mask_67);
+      mask__34.16_79 = vect__9.15_77 != { 0, ... };
+      .MASK_STORE (vectp_c.18_81, 32B, mask__34.16_79, vect_res_18.9_68);
+    
+    which generates:
+    
+    .L3:
+            ld1b    z30.s, p7/z, [x0, x5]
+            ld1w    z31.s, p7/z, [x1, x5, lsl 2]
+            cmpne   p7.b, p7/z, z30.b, #0
+            st1w    z31.s, p7, [x2, x5, lsl 2]
+            add     x5, x5, x4
+            whilelo p7.s, w5, w3
+            b.any   .L3
+    
+    gcc/ChangeLog:PR tree-optimization/115531* tree-vect-patterns.cc (vect_cond_store_pattern_same_ref): New.
+            (vect_recog_cond_store_pattern): New.
+            (vect_vect_recog_func_ptrs): Use it.
+            * target.def (conditional_operation_is_expensive): New.
+            * doc/tm.texi: Regenerate.
+            * doc/tm.texi.in: Document it.
+            * targhooks.cc (default_conditional_operation_is_expensive): New.
+            * targhooks.h (default_conditional_operation_is_expensive): New.
+
+- User: GCC Commits | Time: 2024-07-22 09:29:27 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:0c5c0c959c2e592b84739f19ca771fa69eb8dfeecommitr15-2192-g0c5c0c959c2e592b84739f19ca771fa69eb8dfeeAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Mon Jul 22 10:28:19 2024 +0100
+
+    AArch64: implement TARGET_VECTORIZE_CONDITIONAL_OPERATION_IS_EXPENSIVE  [PR115531].
+    
+    This implements the new target hook indicating that for AArch64 when possible
+    we prefer masked operations for any type vs doing LOAD + SELECT or
+    SELECT + STORE.
+    
+    Thanks,
+    Tamar
+    
+    gcc/ChangeLog:PR tree-optimization/115531* config/aarch64/aarch64.cc
+            (aarch64_conditional_operation_is_expensive): New.
+            (TARGET_VECTORIZE_CONDITIONAL_OPERATION_IS_EXPENSIVE): New.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/115531* gcc.dg/vect/vect-conditional_store_1.c: New test.
+            * gcc.dg/vect/vect-conditional_store_2.c: New test.
+            * gcc.dg/vect/vect-conditional_store_3.c: New test.
+            * gcc.dg/vect/vect-conditional_store_4.c: New test.
+
+- User: Tamar Christina | Time: 2024-07-22 09:30:43 UTC
+  Text: Fixed on trunk
+

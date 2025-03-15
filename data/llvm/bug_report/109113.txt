@@ -1,0 +1,98 @@
+Issue Title: [SystemZ] Bad Codegen for vec_gfmsum_accum_128
+Original Post: Recently the dotnet team started seeing Compression test case failures. These tests fail when zlib-ng is compiled with clang.
+on deeper inspection I have managed to extract a test program from zlib-ng ([Link](https://github.com/zlib-ng/zlib-ng/blob/c939498c7f2a1d645833a98251365e2c814fd736/arch/s390/crc32-vx.c#L91))
+
+```
+#include "stdio.h"
+#include <vecintrin.h>
+typedef unsigned char uv16qi __attribute__((vector_size(16)));
+typedef unsigned int uv4si __attribute__((vector_size(16)));
+typedef unsigned long long uv2di __attribute__((vector_size(16)));
+
+int main()
+{
+        const uv2di r2r1 = {0x1C6E41596, 0x154442BD4};
+        uv2di v1 = {7381244131595332141, 2315514454429938015};
+        uv16qi part1 = {97, 116, 115, 32, 109, 111, 114, 102, 32, 115, 101, 110, 105, 108, 32, 100};
+        uv2di result = (uv2di)vec_gfmsum_accum_128(r2r1, v1, part1);
+        printf("value 1: %llu\n value 2: %llu\n", result[0],result[1]);
+        return 0;
+}
+```
+The results are as follows with gcc and clang:
+
+```
+[sanjam@s390x ~]$ gcc -g bug-clang.c -march=z15 -mzvector -o b.out
+[sanjam@s390x ~]$ ./b.out 
+value 1: 7022364300429628393
+ value 2: 4831923049869144086
+ 
+ 
+[sanjam@s390x ~]$ clang -g bug-clang.c -march=z15 -fzvector
+[sanjam@s390x ~]$ ./a.out 
+value 1: 1591483802437686806
+ value 2: 1591483802437686806
+
+```
+now on inspecting the disassembly I see this:
+
+```
+static inline __ATTRS_o_ai __vector unsigned char
+vec_gfmsum_accum_128(__vector unsigned long long __a,
+                     __vector unsigned long long __b,
+                     __vector unsigned char __c) {
+  return (__vector unsigned char)
+         __builtin_s390_vgfmag(__a, __b, (unsigned __int128)__c);
+    1258:       e7 00 b1 08 30 06       vl      %v0,264(%r11),3
+    125e:       e7 10 b0 f8 30 06       vl      %v1,248(%r11),3
+    1264:       e7 20 b0 e8 30 06       vl      %v2,232(%r11),3
+    126a:       e7 00 13 00 20 bc       vgfmag  %v0,%v0,%v1,%v2
+    1270:       e7 00 00 03 20 21       vlgvf   %r0,%v0,3
+  return (__vector unsigned char)
+    1276:       e7 00 00 00 00 62       vlvgp   %v0,%r0,%r0
+    127c:       e7 00 00 07 00 4d       vrepb   %v0,%v0,7
+    1282:       e7 00 b0 a0 30 0e       vst     %v0,160(%r11),3
+```
+here the sequence 
+```
+    1270:       e7 00 00 03 20 21       vlgvf   %r0,%v0,3
+    1276:       e7 00 00 00 00 62       vlvgp   %v0,%r0,%r0
+    127c:       e7 00 00 07 00 4d       vrepb   %v0,%v0,7
+```
+looks strange, I believe this should be directly doing a `vst` after the `vgfmag`?
+
+clang version:
+```
+clang version 20.0.0git (https://github.com/llvm/llvm-project a26ec542371652e1d774696e90016fd5b0b1c191)
+Target: s390x-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /home/sanjam/llvm-project/build/bin
+```
+   cc: @uweigand @JonPsson 
+
+Comment by uweigand: Good catch, this does indeed look wrong.  It appears I introduced a regression here: https://github.com/llvm/llvm-project/pull/74625 due to a misinterpretation of the type casting rules:
+```
+static inline __ATTRS_o_ai __vector unsigned char
+vec_gfmsum_accum_128(__vector unsigned long long __a,
+                     __vector unsigned long long __b,
+                     __vector unsigned char __c) {
+  return (__vector unsigned char)
+         __builtin_s390_vgfmag(__a, __b, (unsigned __int128)__c);
+}
+```
+
+I assumed that casts between a vector and a scalar of the same size (i.e. any Z vector type and __int128) would be just a bitcast.  However, this is only true for the vector -> int128 conversion.  A int128 -> vector conversion actually triggers the AltiVec splat rule, which is not what we want here.
+
+I'll come up with a fix.
+
+Comment by johnplatts: I had raised a similar issue (involving the same bug in the Clang vecintrin.h header) in issue #102911.
+Comment by uweigand: > I had raised a similar issue (involving the same bug in the Clang vecintrin.h header) in issue #102911.
+
+Ah, sorry, I didn't see that.  Do you still need a backport to LLVM 19?   Note that LLVM 18 unfortunately also has the same bug.
+Comment by uweigand: /cherry-pick https://github.com/llvm/llvm-project/commit/baf9b7da81025c1e3b0704d7ecf667e06f95642b
+Comment by llvmbot: <!--IGNORE-->
+>/cherry-pick https://github.com/llvm/llvm-project/commit/baf9b7da81025c1e3b0704d7ecf667e06f95642b
+
+Error: Command failed due to missing milestone.
+Comment by uweigand: /cherry-pick https://github.com/llvm/llvm-project/commit/baf9b7da81025c1e3b0704d7ecf667e06f95642b
+Comment by llvmbot: /pull-request llvm/llvm-project#111376

@@ -1,0 +1,305 @@
+Bug Summary: [14 Regression] ICE in compute_live_loop_exits, at tree-ssa-loop-manip.cc:250 since r14-4786-gd118738e71c
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Shaohua Li | Time: 2023-10-24 07:15:38 UTC
+  Text: gcc at -O3 crashes on the test case.
+
+Bisected tor14-4786-gd118738e71cCompiler explorer:https://godbolt.org/z/Pe5cPqo7s$ cat a.c
+int a, b, d;
+int c[4];
+unsigned e;
+void f() {
+  char g;
+  for (; d; d++) {
+    g = 1;
+    for (; g >= 0; g--) {
+      e = b >= 2 || a >> b ?: a;
+      c[g] = e;
+    }
+  }
+}
+int main() {}
+$
+$ gcc -O3 a.c
+during GIMPLE pass: vect
+a.c: In function ‘f’:
+a.c:4:6: internal compiler error: in compute_live_loop_exits, at tree-ssa-loop-manip.cc:250
+    4 | void f() {
+      |      ^
+0x7f4266496082 __libc_start_main
+        ../csu/libc-start.c:308
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+$
+
+- User: Richard Biener | Time: 2023-10-24 07:50:18 UTC
+  Text: I will have a look.
+
+- User: Richard Biener | Time: 2023-10-27 14:14:03 UTC
+  Text: For the epilog LC-SSA we lack the correct SSA name for the skip edge:
+
+
+<bb 38> [local count: 16140304]:
+# prephitmp_78 = PHI <prephitmp_61(35), prephitmp_64(32)>
+# c_I_lsm.18_79 = PHI <c_I_lsm.18_60(35), c_I_lsm.18_60(32)>
+# iftmp.0_80 = PHI <iftmp.0_59(35), iftmp.0_66(32)>
+
+see how c_I_lsm.18_60 is used for both args but the name is defined in
+the epilog only.
+
+Though it looks like the original reduction variable isn't computed
+at all for the loop which means the reduction vectorization is wrong.
+
+if-conversion turns
+
+<bb 11> [local count: 146730041]:
+# d.12_13 = PHI <d.12_5(18), _37(15)>
+_1 = a.3_23 >> b.2_22;
+if (_1 != 0)
+  goto <bb 13>; [50.00%]
+else
+  goto <bb 14>; [50.00%]
+
+<bb 14> [local count: 146730041]:
+
+# iftmp.0_9 = PHI <1(13), iftmp.0_39(11)>
+# c_I_lsm.18_38 = PHI <1(13), a.3_23(11)>
+# prephitmp_43 = PHI <1(13), a.3_23(11)>
+_37 = d.12_13 + 1;
+if (_37 != 0)
+  goto <bb 15>; [89.00%]
+else
+  goto <bb 19>; [11.00%]
+
+into
+
+<bb 11> [local count: 146730041]:
+# d.12_13 = PHI <_37(15), d.12_5(26)>
+iftmp.0_9 = _32 ? 1 : iftmp.0_39;
+c_I_lsm.18_38 = _32 ? 1 : a.3_23;
+_37 = d.12_13 + 1;
+if (_37 != 0)
+  goto <bb 15>; [89.00%]
+else
+  goto <bb 19>; [11.00%]
+
+turning c_I_lsm.18_38 into a fully invariant reduction def which likely isn't
+supported - we had bugs here in the past with not relevant but live stmts.
+But if-conversion also performs the (now valid) hoisting, this is maybe
+why it was triggered by that rev.
+
+- User: Tamar Christina | Time: 2023-10-27 14:29:31 UTC
+  Text: (In reply to Richard Biener fromcomment #2)> For the epilog LC-SSA we lack the correct SSA name for the skip edge:
+> 
+> 
+> <bb 38> [local count: 16140304]:
+> # prephitmp_78 = PHI <prephitmp_61(35), prephitmp_64(32)>
+> # c_I_lsm.18_79 = PHI <c_I_lsm.18_60(35), c_I_lsm.18_60(32)>
+> # iftmp.0_80 = PHI <iftmp.0_59(35), iftmp.0_66(32)>
+>FWIW I just fixed a similar bug in my early break rebasing branch.
+I can check if it fixes this one too.
+
+- User: Tamar Christina | Time: 2023-10-27 16:02:53 UTC
+  Text: > turning c_I_lsm.18_38 into a fully invariant reduction def which likely isn'tsupported - we had bugs here in the past with not relevant but live stmts.
+But if-conversion also performs the (now valid) hoisting, this is maybe
+why it was triggered by that rev.
+
+Ah yeah this is something different from what I just fixed.
+
+Indeed, this causes find_guard_arg to no longer find the tie to the original PHI.
+
+It's trying to match 
+
+  # c_I_lsm.18_60 = PHI <a.3_23(33), 1(36)>
+
+and
+
+  # c_I_lsm.18_79 = PHI <c_I_lsm.18_60(35)>
+
+after it adds the edge. Normally loop invariant values are left in the the guard block for this.  In this case we've left
+
+ # c_I_lsm.18_65 = PHI <c_I_lsm.18_38(11)>
+
+Normally instead of 
+
+  # c_I_lsm.18_60 = PHI <a.3_23(33), 1(36)>
+
+we'd find c_I_lsm.18_65 here.  The value is as you mentioned loop invariant.
+
+but since c_I_lsm.18_38 is no longer a PHI node the link was broken.
+
+I don't think we can really recover this in the vectorizer can we?
+
+Would the proper fix perhaps be to have ifconvert fully convert things?
+
+It seems to have missed that
+
+  # c_I_lsm.18_60 = PHI <a.3_23(33), 1(36)>
+
+is just
+
+  c_I_lsm.18_60 = _58 ? 1 : a.3_23;
+
+that would prevent the PHI node confusion
+
+- User: Richard Biener | Time: 2023-11-03 12:02:15 UTC
+  Text: t.c:6:10: note:   init: stmt relevant? iftmp.0_9 = _32 ? 1 : iftmp.0_39;
+t.c:6:10: note:   vec_stmt_relevant_p: used out of loop.
+t.c:6:10: note:   vect_is_simple_use: operand _1 != 0, type of def: external
+t.c:6:10: note:   vect_is_simple_use: operand (unsigned int) a.3_23, type of def: external
+t.c:6:10: note:   mark relevant 0, live 1: iftmp.0_9 = _32 ? 1 : iftmp.0_39;
+t.c:6:10: note:   last stmt in pattern. don't mark relevant/live.
+t.c:6:10: note:   vec_stmt_relevant_p: forcing live pattern stmt relevant.
+t.c:6:10: note:   mark relevant 1, live 1: patt_43 = _32 != 0 ? 1 : iftmp.0_39;
+t.c:6:10: note:   init: stmt relevant? c_I_lsm.18_38 = _32 ? 1 : a.3_23;
+t.c:6:10: note:   vec_stmt_relevant_p: used out of loop.
+t.c:6:10: note:   vec_stmt_relevant_p: used out of loop.
+t.c:6:10: note:   vect_is_simple_use: operand _1 != 0, type of def: external
+t.c:6:10: note:   vect_is_simple_use: operand a, type of def: external
+t.c:6:10: note:   mark relevant 0, live 1: c_I_lsm.18_38 = _32 ? 1 : a.3_23;
+t.c:6:10: note:   last stmt in pattern. don't mark relevant/live.
+t.c:6:10: note:   vec_stmt_relevant_p: forcing live pattern stmt relevant.
+t.c:6:10: note:   mark relevant 1, live 1: patt_41 = _32 != 0 ? 1 : a.3_23;
+t.c:6:10: note:   init: stmt relevant? _37 = d.12_13 + 1;
+t.c:6:10: note:   init: stmt relevant? if (_37 != 0)
+t.c:6:10: note:   worklist: examine stmt: patt_41 = _32 != 0 ? 1 : a.3_23;
+t.c:6:10: note:   vect_is_simple_use: operand _1 != 0, type of def: external
+t.c:6:10: note:   vect_is_simple_use: operand 0, type of def: constant
+t.c:6:10: note:   vect_is_simple_use: operand a, type of def: external
+t.c:6:10: note:   worklist: examine stmt: patt_43 = _32 != 0 ? 1 : iftmp.0_39;
+t.c:6:10: note:   vect_is_simple_use: operand _1 != 0, type of def: external
+t.c:6:10: note:   vect_is_simple_use: operand 0, type of def: constant
+t.c:6:10: note:   vect_is_simple_use: operand (unsigned int) a.3_23, type of def: external
+
+now, if-conversion managed to CSE the LC PHI node:
+
+  <bb 19> [local count: 16140304]:
+  # prephitmp_40 = PHI <c_I_lsm.18_38(11), prephitmp_34(23)>
+  # c_I_lsm.18_24 = PHI <c_I_lsm.18_38(11), c_I_lsm.18_33(23)>
+  # iftmp.0_21 = PHI <iftmp.0_9(11), iftmp.0_8(23)>
+
+that triggers "interesting" behavior in vectorizable_live_operation which
+inserts a PHI for the vectorized c_I_lsm.18_38.  It will remove the
+_first_ PHI node using the old scalar (prephitmp_40) and insert a copy
+for that.  It leaves the second around, but will then, running into the
+remaining USE, replace all uses of c_I_lsm.18_24 with the vectorized
+result:
+
+<bb 32> [local count: 14526274]:
+# c_I_lsm.18_59 = PHI <c_I_lsm.18_38(11)>
+# d.12_61 = PHI <_37(11)>
+# vect_patt_43.28_82 = PHI <vect_patt_43.28_81(11)>
+# vect_patt_41.29_91 = PHI <vect_patt_41.29_90(11)>
+_92 = BIT_FIELD_REF <vect_patt_41.29_91, 32, 96>;
+prephitmp_58 = _92;
+_83 = BIT_FIELD_REF <vect_patt_43.28_82, 32, 96>;
+iftmp.0_60 = _83;
+niters_vector_mult_vf.26_68 = bnd.25_67 << 2;
+_70 = (int) niters_vector_mult_vf.26_68;
+tmp.27_69 = d.12_5 + _70;
+if (niters.24_48 == niters_vector_mult_vf.26_68)
+
+this all doesn't make much sense to me ... doing the "obvious" doesn't fix
+this bug.  It seems things are wrong already when the epilog peeling happens
+where for the merge PHI after the epilog we somehow failed to update
+the PHI node for c_I_lsm.18_73.
+
+Looks like we didn't get rid of 'find_guard_arg' ... and it relies on
+get_current_def which in turn relies on "copying" that info from
+the scalar copy to the original loop (the magic in
+slpeel_duplicate_current_defs_from_edges).  That was all fragile
+in the past, I guess it's now simply broken, at least for the special
+case we have here.
+
+- User: Richard Biener | Time: 2023-11-03 13:27:13 UTC
+  Text: Createdattachment 56500[details]patch
+
+Some of the "fixup"s done earlier get in the way of simplifying things.  Specifically
+
+          /* If the PHI node dominates the loop then we shouldn't create
+              a new LC-SSSA PHI for it in the intermediate block.  Unless the
+              the loop has been versioned.  If it has then we need the PHI
+              node such that later when the loop guard is added the original
+              dominating PHI can be found.  */
+          basic_block def_bb = gimple_bb (SSA_NAME_DEF_STMT (new_arg));
+          if (loop == scalar_loop
+              && (!def_bb || !flow_bb_inside_loop_p (loop, def_bb)))
+            {
+              auto gsi = gsi_for_stmt (phi);
+              remove_phi_node (&gsi, true);
+            }
+
+gets the LC PHI nodes out-of-sync where we usually expect a 1:1 mapping
+across all loop copies (also for the removed virtual PHI, but that's way
+easier to detect as missing).  I wonder if the above is still needed.
+At least vect.exp succeeds without it (not that this means much).
+
+I'm giving the attached some more testing (I'll split out the
+vectorizable_live_operation changes, they are not required for fixing this bug)
+
+- User: Richard Biener | Time: 2023-11-03 14:14:18 UTC
+  Text: Bootstrap & regtest is fine but CPU 2017 has two ICEs I'm reducing right now.  Testing the vectorizable_live_operation simplification right now, will push new test-coverage and defer the rest until next week (or later).
+
+- User: Richard Biener | Time: 2023-11-03 14:57:21 UTC
+  Text: Createdattachment 56502[details]patch
+
+Remaining and polished patch.  Will ICE the following testcases I added:
+
+FAIL: gfortran.dg/20231103-1.f90   -O  (internal compiler error: verify_gimple failed)
+FAIL: gfortran.dg/20231103-1.f90   -O   2 blank line(s) in output
+FAIL: gfortran.dg/20231103-1.f90   -O  (test for excess errors)
+FAIL: gfortran.dg/20231103-2.f90   -O  (internal compiler error: verify_gimple failed)
+FAIL: gfortran.dg/20231103-2.f90   -O   2 blank line(s) in output
+FAIL: gfortran.dg/20231103-2.f90   -O  (test for excess errors)
+
+
+ICE like the following, investigation pending.
+
+Error: incompatible types in 'PHI' argument 1
+real(kind=4)
+
+integer(kind=8)
+
+prephitmp_91 = PHI <_21(56), S.4_130(55)>
+during GIMPLE pass: vect
+
+- User: Tamar Christina | Time: 2023-11-03 15:58:32 UTC
+  Text: Right, I've tried to apply that patch to my early break patch series and many of the tests fail, all the same way in compute_live_loop_exits.
+
+I guess we'll have a conflict here. So I'll post my patches without taking this change into account and we can sort it out upstream,
+
+- User: Richard Biener | Time: 2023-11-06 09:51:55 UTC
+  Text: Createdattachment 56514[details]patch
+
+Ah, simple error on my side.
+
+- User: GCC Commits | Time: 2023-11-06 13:16:27 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:bf72d50d16f0c1fa8102ca2544d2a05772f8c273commitr14-5155-gbf72d50d16f0c1fa8102ca2544d2a05772f8c273Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Nov 3 14:24:10 2023 +0100
+
+    tree-optimization/111950 - vectorizer loop copying
+    
+    The following simplifies LC-PHI arg population during epilog peeling,
+    thereby fixing the testcase in this PR.PR tree-optimization/111950* tree-vect-loop-manip.cc (slpeel_duplicate_current_defs_from_edges):
+            Remove.
+            (find_guard_arg): Likewise.
+            (slpeel_update_phi_nodes_for_guard2): Likewise.
+            (slpeel_tree_duplicate_loop_to_edge_cfg): Remove calls to
+            slpeel_duplicate_current_defs_from_edges, do not elide
+            LC-PHIs for invariant values.
+            (vect_do_peeling): Materialize PHI arguments for the edge
+            around the epilog from the PHI defs of the main loop exit.
+    
+            * gcc.dg/torture/pr111950.c: New testcase.
+
+- User: Richard Biener | Time: 2023-11-06 13:18:36 UTC
+  Text: Fixed.
+

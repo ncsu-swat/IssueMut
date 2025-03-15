@@ -1,0 +1,245 @@
+Bug Summary: [14/15 Regression] Conditional move regressions after r14-53-g675b1a7f113adb1d737adaf78b4fd90be7a0ed1a
+Product: gcc
+Component: testsuite
+
+  (show other bugs)
+Keywords: testsuite-fail
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Haochen Jiang | Time: 2023-04-19 06:27:37 UTC
+  Text: After commitr14-53-g675b1a7f113adb1d737adaf78b4fd90be7a0ed1awith the fix of removing @gol fix, we got a scan asm fail for gcc.target/i386/cmov6.c.
+
+We can reproduce that by command:
+
+make check-gcc RUNTESTFLAGS="i386.exp=cmov6.c --target_board='unix{-m32,}'"
+
+The previous codegen is:
+
+foo:
+.LFB0:
+        .cfi_startproc
+        movl    4(%esp), %eax
+        movl    $20, %edx
+        testl   %eax, %eax
+        movl    $10, %eax
+        cmovne  8(%esp), %edx
+        cmove   12(%esp), %eax
+        movl    %edx, 8(%esp)
+        movl    %eax, 4(%esp)
+        jmp     bar
+        .cfi_endproc
+
+The current codegen is:
+
+foo:
+.LFB0:
+        .cfi_startproc
+        movl    4(%esp), %ecx
+        movl    8(%esp), %edx
+        movl    12(%esp), %eax
+        testl   %ecx, %ecx
+        je      .L3
+        movl    $10, %eax
+        movl    %edx, 8(%esp)
+        movl    %eax, 4(%esp)
+        jmp     bar
+        .p2align 4,,7
+        .p2align 3
+.L3:
+        movl    $20, %edx
+        movl    %eax, 4(%esp)
+        movl    %edx, 8(%esp)
+        jmp     bar
+        .cfi_endproc
+
+BTW, I saw Andrew's patch fixing cmov:https://gcc.gnu.org/pipermail/gcc-patches/2023-April/616088.htmlIs that related?
+
+- User: Andrew Pinski | Time: 2023-04-19 06:37:25 UTC
+  Text: > BTW, I saw Andrew's patch fixing cmov:It is unrelated. This is a cost model issue of the x86 backend I think.
+
+- User: Andrew Pinski | Time: 2023-04-19 06:38:55 UTC
+  Text: Note for some x86 cores having 2 or more cmove back to back is worse than a conditional jump so maybe the testcase is now catching what it should happen ...
+
+- User: Jakub Jelinek | Time: 2023-04-19 08:10:30 UTC
+  Text: I see both
++FAIL: gcc.target/i386/cmov6.c scan-assembler cmov[^6]
++FAIL: gcc.target/i386/pr45685.c scan-assembler-times cmov 6
+on x86_64-linux, while only the former on i686-linux.
+
+- User: Jeffrey A. Law | Time: 2023-04-19 13:06:15 UTC
+  Text: x86's tuning does have some support for avoiding multiple cmovs in a single if-converted sequence.  I'll double check if that's kicking in here.
+
+- User: Jeffrey A. Law | Time: 2023-04-19 13:37:36 UTC
+  Text: Yea, that's exactly what's kicking in here.  The converted sequence looks like this:
+
+(insn 29 0 28 (set (reg:SI 86)
+        (const_int 10 [0xa])) 83 {*movsi_internal}
+     (nil))
+
+(insn 28 29 30 (set (reg:CCZ 17 flags)
+        (compare:CCZ (reg/v:SI 83 [ c ])
+            (const_int 0 [0]))) 7 {*cmpsi_ccno_1}
+     (nil))
+
+(insn 30 28 32 (set (reg/v:SI 85 [ e ])
+        (if_then_else:SI (eq (reg:CCZ 17 flags)
+                (const_int 0 [0]))
+            (reg/v:SI 85 [ e ])
+            (reg:SI 86))) 1318 {*movsicc_noc}
+     (nil))
+
+(insn 32 30 31 (set (reg:SI 87)
+        (const_int 20 [0x14])) 83 {*movsi_internal}
+     (nil))
+
+(insn 31 32 33 (set (reg:CCZ 17 flags)
+        (compare:CCZ (reg/v:SI 83 [ c ])
+            (const_int 0 [0]))) 7 {*cmpsi_ccno_1}
+     (nil))
+
+(insn 33 31 0 (set (reg/v:SI 84 [ d ])
+        (if_then_else:SI (ne (reg:CCZ 17 flags)
+                (const_int 0 [0]))
+            (reg/v:SI 84 [ d ])
+            (reg:SI 87))) 1318 {*movsicc_noc}
+     (nil))
+
+
+Note the two movsicc_* patterns.
+
+So the question now is what to do about it.  It looks like things are behaving as expected, so my first inclination would be to adjust the test.  Actually splitting it into two would likely be even better.  One would verify that by default we do not generate a pair of cmovs for this code, the other would turn the tuning bit off and verify that we do generate the pair of cmovs.
+
+Happy to do whatever the x86 maintainers want here.
+
+- User: Jeffrey A. Law | Time: 2023-04-19 15:29:10 UTC
+  Text: And just an FYI, the tester is flagging conditional move failures for mips64-* rx-elf and s390-linux-gnu.  Most likely these are additional cases where the hook is indicating the transformation isn't profitable, but the target tests are expecting the transformation to happen.
+
+I'll debug those other targets and take appropriate action.  At this point I don't see anything that would strongly suggest reversion of the patch, just that we need a bit of testsuite adjustment.
+
+- User: Uroš Bizjak | Time: 2023-04-20 09:50:24 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> Note for some x86 cores having 2 or more cmove back to back is worse than a
+> conditional jump so maybe the testcase is now catching what it should happen
+> ...Please seePR85559meta bug andPR56309. Some heuristic should be developed when to use CMOV insn. Some analysis is at:https://gcc.gnu.org/bugzilla/show_bug.cgi?id=54073#c16
+
+- User: GCC Commits | Time: 2023-04-21 18:24:28 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:f1f18198b069f461155191ecba41bc87bf5689ddcommitr14-156-gf1f18198b069f461155191ecba41bc87bf5689ddAuthor: Jeff Law <jlaw@ventanamicro>
+Date:   Fri Apr 21 12:22:24 2023 -0600
+
+    Adjust x86 testsuite for recent if-conversion cost checking
+    
+    gcc/testsuitePR testsuite/109549* gcc.target/i386/cmov6.c: No longer expect this test to
+            generate 'cmov' instructions.
+
+- User: Jeffrey A. Law | Time: 2023-04-29 14:09:20 UTC
+  Text: WRT the s390 failures:
+
+gcc.target/s390/arch13/sel-1.c scan-assembler-times \tselgr(?:h|le)\t 1
+gcc.target/s390/arch13/sel-1.c scan-assembler-times \tselr(?:h|le)\t 1
+gcc.target/s390/ifcvt-one-insn-bool.c scan-assembler lochinh\t%r.?,1
+gcc.target/s390/ifcvt-one-insn-char.c scan-assembler locrnh\t%r.?,%r.?
+gcc.target/s390/loc-1.c scan-assembler \tlochine\t%r2,-1
+gcc.target/s390/loc-1.c scan-assembler \tlocrne\t%r2,%r4
+gcc.target/s390/vector/vec-scalar-cmp-1.c scan-assembler eq:\n[^:]*\twfcdb\t%v[0-9]*,%v[0-9]*\n\t[^:]+\tlochie\t%r2,1
+gcc.target/s390/vector/vec-scalar-cmp-1.c scan-assembler ge:\n[^:]*\twfkdb\t%v[0-9]*,%v[0-9]*\n\t[^:]+\tlochihe\t%r2,1
+gcc.target/s390/vector/vec-scalar-cmp-1.c scan-assembler gt:\n[^:]*\twfkdb\t%v[0-9]*,%v[0-9]*\n\t[^:]+\tlochih\t%r2,1
+gcc.target/s390/vector/vec-scalar-cmp-1.c scan-assembler le:\n[^:]*\twfkdb\t%v[0-9]*,%v[0-9]*\n\t[^:]+\tlochile\t%r2,1
+gcc.target/s390/vector/vec-scalar-cmp-1.c scan-assembler lt:\n[^:]*\twfkdb\t%v[0-9]*,%v[0-9]*\n\t[^:]+\tlochil\t%r2,1
+gcc.target/s390/vector/vec-scalar-cmp-1.c scan-assembler ne:\n[^:]*\twfcdb\t%v[0-9]*,%v[0-9]*\n\t[^:]+\tlochine\t%r2,1
+
+These are also cases where the s390 cost model says these particular if-conversion opportunities aren't profitable.   Basically the backend has no costing model for (set (if_then_else ...))  so it recursively computes the cost of all the sub-rtxs which ultimately turns out to be higher than the cost of the branchy code.
+
+I'm not qualified to address this problem as I have no sense of s390 costing.  I'm going to have the tester regenerate new baselines for s390, but I'm not going to actively try to fix this problem.  Also note my testing was s390, not s390x which may be behaving differently.
+
+- User: Richard Biener | Time: 2024-01-12 10:25:49 UTC
+  Text: https://gcc.gnu.org/pipermail/gcc-testresults/2024-January/805164.htmlshows them also on s390x.
+
+- User: Stefan Schulze Frielinghaus | Time: 2024-03-01 12:18:41 UTC
+  Text: I will have a look at those s390x failures and come up with a TARGET_NOCE_CONVERSION_PROFITABLE_P implementation.
+
+- User: Sam James | Time: 2024-03-23 09:33:47 UTC
+  Text: Changing back to NEW, although stefansf may want to take it(?)
+
+- User: Stefan Schulze Frielinghaus | Time: 2024-03-25 07:07:09 UTC
+  Text: I will take it and I've already prepared a patch.  Currently, I'm still testing the patch.  I hope I get enough compute resources in order to make it into GCC 14.
+
+Anyhow, you can assign the issue to me (I think I don't have permissions to do it myself).
+
+- User: Sam James | Time: 2024-03-25 09:23:10 UTC
+  Text: Hi Stefan, you should be able to change your email on bugzilla to <yoursourcewareusername>@gcc.gnu.org and gain permissions.
+
+- User: Stefan Schulze Frielinghaus | Time: 2024-03-25 11:02:52 UTC
+  Text: Hi Sam, thanks for the pointer. Taking it now.
+
+- User: Richard Biener | Time: 2024-05-07 07:40:16 UTC
+  Text: GCC 14.1 is being released, retargeting bugs to GCC 14.2.
+
+- User: GCC Commits | Time: 2024-05-08 07:48:32 UTC
+  Text: The master branch has been updated by Kong Lingling <konglin1@gcc.gnu.org>:https://gcc.gnu.org/g:d826f7945609046f922732b138fb90795d5b1985commitr15-313-gd826f7945609046f922732b138fb90795d5b1985Author: konglin1 <lingling.kong@intel.com>
+Date:   Wed May 8 15:46:10 2024 +0800
+
+    x86: Fix cmov cost model issue [PR109549]
+    
+    (if_then_else:SI (eq (reg:CCZ 17 flags)
+            (const_int 0 [0]))
+        (reg/v:SI 101 [ e ])
+        (reg:SI 102))
+    The cost is 8 for the rtx, the cost for
+    (eq (reg:CCZ 17 flags) (const_int 0 [0])) is 4,
+    but this is just an operator do not need to compute it's cost in cmov.
+    
+    gcc/ChangeLog:PR target/109549* config/i386/i386.cc (ix86_rtx_costs): The XEXP (x, 0) for cmov
+            is an operator do not need to compute cost.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/cmov6.c: Fixed.
+
+- User: kong lingling | Time: 2024-05-08 07:51:12 UTC
+  Text: Fixed.
+
+- User: GCC Commits | Time: 2024-05-23 06:44:23 UTC
+  Text: The master branch has been updated by Stefan Schulze Frielinghaus <stefansf@gcc.gnu.org>:https://gcc.gnu.org/g:57e04879389f9c0d5d53f316b468ce1bddbab350commitr15-787-g57e04879389f9c0d5d53f316b468ce1bddbab350Author: Stefan Schulze Frielinghaus <stefansf@linux.ibm.com>
+Date:   Thu May 23 08:43:35 2024 +0200
+
+    s390: Implement TARGET_NOCE_CONVERSION_PROFITABLE_P [PR109549]
+    
+    Consider a NOCE conversion as profitable if there is at least one
+    conditional move.
+    
+    gcc/ChangeLog:PR target/109549* config/s390/s390.cc (TARGET_NOCE_CONVERSION_PROFITABLE_P):
+            Define.
+            (s390_noce_conversion_profitable_p): Implement.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/s390/ccor.c: Order of loads are reversed, now, as a
+            consequence the condition has to be reversed.
+
+- User: GCC Commits | Time: 2024-06-17 06:53:01 UTC
+  Text: The releases/gcc-14 branch has been updated by Stefan Schulze Frielinghaus <stefansf@gcc.gnu.org>:https://gcc.gnu.org/g:8f124e6b79daa43618dbb1e67c09629676d07396commitr14-10316-g8f124e6b79daa43618dbb1e67c09629676d07396Author: Stefan Schulze Frielinghaus <stefansf@linux.ibm.com>
+Date:   Mon Jun 17 08:52:20 2024 +0200
+
+    s390: Implement TARGET_NOCE_CONVERSION_PROFITABLE_P [PR109549]
+    
+    Consider a NOCE conversion as profitable if there is at least one
+    conditional move.
+    
+    gcc/ChangeLog:PR target/109549* config/s390/s390.cc (TARGET_NOCE_CONVERSION_PROFITABLE_P):
+            Define.
+            (s390_noce_conversion_profitable_p): Implement.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/s390/ccor.c: Order of loads are reversed, now, as a
+            consequence the condition has to be reversed.
+    
+    (cherry picked from commit 57e04879389f9c0d5d53f316b468ce1bddbab350)
+
+- User: Stefan Schulze Frielinghaus | Time: 2024-06-17 07:06:48 UTC
+  Text: Fixed for GCC 14 and 15 for s390.
+
+- User: Stefan Schulze Frielinghaus | Time: 2024-06-17 07:10:02 UTC
+  Text: Changing state to fixed.  Feel free to reopen if this has to be fixed for a different target.
+

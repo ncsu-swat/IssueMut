@@ -1,0 +1,369 @@
+Bug Summary: [11/12 Regression] Wrong-code because of wide-int division since r5-424
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 11.4.0, 12.3.0
+
+Comments:
+- User: Jakub Jelinek | Time: 2023-07-19 07:18:50 UTC
+  Text: Sincer5-424-g807e902eea17f313(merge of wide-int) we miscompile following testcase
+(noticed it first with _BitInt(119)):
+
+__int128
+foo (void)
+{
+  struct S { __int128 f : 119; } s = { ((__int128) -18014398509481984) << 64 };
+  return s.f / 2;
+}
+
+int
+main ()
+{
+  if (foo () != (((__int128) -9007199254740992) << 64))
+    __builtin_abort ();
+}
+
+The result of dividing (-332306998946228968225951765070086143wb - 1) by 2 is
+-166153499473114484112975882535043072wb but we return
+166153499473114484112975882535043072wb instead (in hex that is
+0, 0xffc0000000000000 signed 119 pair divided by 2 resulting in
+0, 0x0020000000000000 signed 119 pair rather than
+0, 0xffe0000000000000.
+
+- User: Andrew Pinski | Time: 2023-07-19 07:39:15 UTC
+  Text: This should have done the negative (in the original patch):
+
+1796       /* The quotient is neg if exactly one of the divisor or dividend is
+1797          neg.  */
+1798       if (dividend_neg != divisor_neg)
+1799         quotient_len = wi::sub_large (quotient, zeros, 1, quotient,
+1800                                       quotient_len, dividend_prec,
+1801                                       UNSIGNED, 0);
+
+
+That is you do -((332306998946228968225951765070086143wb + 1)/2)
+
+- User: Jakub Jelinek | Time: 2023-07-19 07:56:40 UTC
+  Text: I think the problem is earlier.
+If I divide the same values unsigned, while the representation of the wide_int values
+is the same, i.e.
+val = {0, -18014398509481984}, len = 2, precision = 119
+for x, when divmod_internal_2 is called, in the signed case it sees
+x/4wx b_dividend
+0x7fffffffc0b0:	0x00000000	0x00000000	0x00000000	0xffc00000
+while in the unsigned one
+x/4wx b_dividend
+0x7fffffffc0b0:	0x00000000	0x00000000	0x00000000	0x00400000
+and I think the latter is what should be used in both cases, divmod_internal_2 performs
+unsigned division.
+
+So, I think the right fix is:
+--- gcc/wide-int.cc.jj	2023-06-12 15:47:22.461502821 +0200
++++ gcc/wide-int.cc	2023-07-19 09:52:40.241661869 +0200
+@@ -1911,9 +1911,9 @@ wi::divmod_internal (HOST_WIDE_INT *quot
+     }
+ 
+   wi_unpack (b_dividend, dividend.get_val (), dividend.get_len (),
+-	     dividend_blocks_needed, dividend_prec, sgn);
++	     dividend_blocks_needed, dividend_prec, UNSIGNED);
+   wi_unpack (b_divisor, divisor.get_val (), divisor.get_len (),
+-	     divisor_blocks_needed, divisor_prec, sgn);
++	     divisor_blocks_needed, divisor_prec, UNSIGNED);
+ 
+   m = dividend_blocks_needed;
+   b_dividend[m] = 0;
+because at this point we are after the
+  /* Make the divisor and dividend positive and remember what we
+     did.  */
+  if (sgn == SIGNED)
+    {
+      if (wi::neg_p (dividend))
+        {
+          neg_dividend = -dividend;
+          dividend = neg_dividend;
+          dividend_neg = true;
+        }
+      if (wi::neg_p (divisor))
+        {
+          neg_divisor = -divisor;
+          divisor = neg_divisor;
+          divisor_neg = true;
+        }
+    }
+hunk.  Of course, this makes a difference only if either the dividend or divisor are the smallest negative value of a type.
+
+- User: GCC Commits | Time: 2023-07-19 11:50:10 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:ece799607c841676f4e00c2fea98bbec6976da3fcommitr14-2642-gece799607c841676f4e00c2fea98bbec6976da3fAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Jul 19 13:48:53 2023 +0200
+
+    wide-int: Fix up wi::divmod_internal [PR110731]
+    
+    As the following testcase shows, wi::divmod_internal doesn't handle
+    correctly signed division with precision > 64 when the dividend (and likely
+    divisor as well) is the type's minimum and the precision isn't divisible
+    by 64.
+    
+    A few lines above what the patch hunk changes is:
+      /* Make the divisor and dividend positive and remember what we
+         did.  */
+      if (sgn == SIGNED)
+        {
+          if (wi::neg_p (dividend))
+            {
+              neg_dividend = -dividend;
+              dividend = neg_dividend;
+              dividend_neg = true;
+            }
+          if (wi::neg_p (divisor))
+            {
+              neg_divisor = -divisor;
+              divisor = neg_divisor;
+              divisor_neg = true;
+            }
+        }
+    i.e. we negate negative dividend or divisor and remember those.
+    But, after we do that, when unpacking those values into b_dividend and
+    b_divisor we need to always treat the wide_ints as UNSIGNED,
+    because divmod_internal_2 performs an unsigned division only.
+    Now, if precision <= 64, we don't reach here at all, earlier code
+    handles it.  If dividend or divisor aren't the most negative values,
+    the negation clears their most significant bit, so it doesn't really
+    matter if we unpack SIGNED or UNSIGNED.  And if precision is multiple
+    of HOST_BITS_PER_WIDE_INT, there is no difference in behavior, while
+    -0x80000000000000000000000000000000 negates to
+    -0x80000000000000000000000000000000 the unpacking of it as SIGNED
+    or UNSIGNED works the same.
+    In the testcase, we have signed precision 119 and the dividend is
+    val = { 0, 0xffc0000000000000 }, len = 2, precision = 119
+    both before and after negation.
+    Divisor is
+    val = { 2 }, len = 1, precision = 119
+    But we really want to divide 0x400000000000000000000000000000 by 2
+    unsigned and then negate at the end.
+    If it is unsigned precision 119 division
+    0x400000000000000000000000000000 by 2
+    dividend is
+    val = { 0, 0xffc0000000000000 }, len = 2, precision = 119
+    but as we unpack it UNSIGNED, it is unpacked into
+    0, 0, 0, 0x00400000
+    
+    The following patch fixes it by always using UNSIGNED unpacking
+    because we've already negated negative values at that point if
+    sgn == SIGNED and so most negative constants should be treated as
+    positive.
+    
+    2023-07-19  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/110731* wide-int.cc (wi::divmod_internal): Always unpack dividend and
+            divisor as UNSIGNED regardless of sgn.
+    
+            * gcc.dg/pr110731.c: New test.
+
+- User: GCC Commits | Time: 2023-07-19 12:24:14 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:f76f411f2cdb62122322e709d503edd2f8e8a530commitr13-7589-gf76f411f2cdb62122322e709d503edd2f8e8a530Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Jul 19 13:48:53 2023 +0200
+
+    wide-int: Fix up wi::divmod_internal [PR110731]
+    
+    As the following testcase shows, wi::divmod_internal doesn't handle
+    correctly signed division with precision > 64 when the dividend (and likely
+    divisor as well) is the type's minimum and the precision isn't divisible
+    by 64.
+    
+    A few lines above what the patch hunk changes is:
+      /* Make the divisor and dividend positive and remember what we
+         did.  */
+      if (sgn == SIGNED)
+        {
+          if (wi::neg_p (dividend))
+            {
+              neg_dividend = -dividend;
+              dividend = neg_dividend;
+              dividend_neg = true;
+            }
+          if (wi::neg_p (divisor))
+            {
+              neg_divisor = -divisor;
+              divisor = neg_divisor;
+              divisor_neg = true;
+            }
+        }
+    i.e. we negate negative dividend or divisor and remember those.
+    But, after we do that, when unpacking those values into b_dividend and
+    b_divisor we need to always treat the wide_ints as UNSIGNED,
+    because divmod_internal_2 performs an unsigned division only.
+    Now, if precision <= 64, we don't reach here at all, earlier code
+    handles it.  If dividend or divisor aren't the most negative values,
+    the negation clears their most significant bit, so it doesn't really
+    matter if we unpack SIGNED or UNSIGNED.  And if precision is multiple
+    of HOST_BITS_PER_WIDE_INT, there is no difference in behavior, while
+    -0x80000000000000000000000000000000 negates to
+    -0x80000000000000000000000000000000 the unpacking of it as SIGNED
+    or UNSIGNED works the same.
+    In the testcase, we have signed precision 119 and the dividend is
+    val = { 0, 0xffc0000000000000 }, len = 2, precision = 119
+    both before and after negation.
+    Divisor is
+    val = { 2 }, len = 1, precision = 119
+    But we really want to divide 0x400000000000000000000000000000 by 2
+    unsigned and then negate at the end.
+    If it is unsigned precision 119 division
+    0x400000000000000000000000000000 by 2
+    dividend is
+    val = { 0, 0xffc0000000000000 }, len = 2, precision = 119
+    but as we unpack it UNSIGNED, it is unpacked into
+    0, 0, 0, 0x00400000
+    
+    The following patch fixes it by always using UNSIGNED unpacking
+    because we've already negated negative values at that point if
+    sgn == SIGNED and so most negative constants should be treated as
+    positive.
+    
+    2023-07-19  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/110731* wide-int.cc (wi::divmod_internal): Always unpack dividend and
+            divisor as UNSIGNED regardless of sgn.
+    
+            * gcc.dg/pr110731.c: New test.
+    
+    (cherry picked from commit ece799607c841676f4e00c2fea98bbec6976da3f)
+
+- User: Jakub Jelinek | Time: 2023-07-19 17:56:52 UTC
+  Text: Fixed for 13.2+ so far.
+
+- User: GCC Commits | Time: 2023-12-16 00:37:32 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:9a93c334865af18ce2fd50cd77a9e90939f3c231commitr12-10046-g9a93c334865af18ce2fd50cd77a9e90939f3c231Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Jul 19 13:48:53 2023 +0200
+
+    wide-int: Fix up wi::divmod_internal [PR110731]
+    
+    As the following testcase shows, wi::divmod_internal doesn't handle
+    correctly signed division with precision > 64 when the dividend (and likely
+    divisor as well) is the type's minimum and the precision isn't divisible
+    by 64.
+    
+    A few lines above what the patch hunk changes is:
+      /* Make the divisor and dividend positive and remember what we
+         did.  */
+      if (sgn == SIGNED)
+        {
+          if (wi::neg_p (dividend))
+            {
+              neg_dividend = -dividend;
+              dividend = neg_dividend;
+              dividend_neg = true;
+            }
+          if (wi::neg_p (divisor))
+            {
+              neg_divisor = -divisor;
+              divisor = neg_divisor;
+              divisor_neg = true;
+            }
+        }
+    i.e. we negate negative dividend or divisor and remember those.
+    But, after we do that, when unpacking those values into b_dividend and
+    b_divisor we need to always treat the wide_ints as UNSIGNED,
+    because divmod_internal_2 performs an unsigned division only.
+    Now, if precision <= 64, we don't reach here at all, earlier code
+    handles it.  If dividend or divisor aren't the most negative values,
+    the negation clears their most significant bit, so it doesn't really
+    matter if we unpack SIGNED or UNSIGNED.  And if precision is multiple
+    of HOST_BITS_PER_WIDE_INT, there is no difference in behavior, while
+    -0x80000000000000000000000000000000 negates to
+    -0x80000000000000000000000000000000 the unpacking of it as SIGNED
+    or UNSIGNED works the same.
+    In the testcase, we have signed precision 119 and the dividend is
+    val = { 0, 0xffc0000000000000 }, len = 2, precision = 119
+    both before and after negation.
+    Divisor is
+    val = { 2 }, len = 1, precision = 119
+    But we really want to divide 0x400000000000000000000000000000 by 2
+    unsigned and then negate at the end.
+    If it is unsigned precision 119 division
+    0x400000000000000000000000000000 by 2
+    dividend is
+    val = { 0, 0xffc0000000000000 }, len = 2, precision = 119
+    but as we unpack it UNSIGNED, it is unpacked into
+    0, 0, 0, 0x00400000
+    
+    The following patch fixes it by always using UNSIGNED unpacking
+    because we've already negated negative values at that point if
+    sgn == SIGNED and so most negative constants should be treated as
+    positive.
+    
+    2023-07-19  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/110731* wide-int.cc (wi::divmod_internal): Always unpack dividend and
+            divisor as UNSIGNED regardless of sgn.
+    
+            * gcc.dg/pr110731.c: New test.
+    
+    (cherry picked from commit ece799607c841676f4e00c2fea98bbec6976da3f)
+
+- User: GCC Commits | Time: 2023-12-17 13:55:01 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:9e30ca09c01124333dc97e8c2cb704b74d3c7b60commitr11-11148-g9e30ca09c01124333dc97e8c2cb704b74d3c7b60Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Jul 19 13:48:53 2023 +0200
+
+    wide-int: Fix up wi::divmod_internal [PR110731]
+    
+    As the following testcase shows, wi::divmod_internal doesn't handle
+    correctly signed division with precision > 64 when the dividend (and likely
+    divisor as well) is the type's minimum and the precision isn't divisible
+    by 64.
+    
+    A few lines above what the patch hunk changes is:
+      /* Make the divisor and dividend positive and remember what we
+         did.  */
+      if (sgn == SIGNED)
+        {
+          if (wi::neg_p (dividend))
+            {
+              neg_dividend = -dividend;
+              dividend = neg_dividend;
+              dividend_neg = true;
+            }
+          if (wi::neg_p (divisor))
+            {
+              neg_divisor = -divisor;
+              divisor = neg_divisor;
+              divisor_neg = true;
+            }
+        }
+    i.e. we negate negative dividend or divisor and remember those.
+    But, after we do that, when unpacking those values into b_dividend and
+    b_divisor we need to always treat the wide_ints as UNSIGNED,
+    because divmod_internal_2 performs an unsigned division only.
+    Now, if precision <= 64, we don't reach here at all, earlier code
+    handles it.  If dividend or divisor aren't the most negative values,
+    the negation clears their most significant bit, so it doesn't really
+    matter if we unpack SIGNED or UNSIGNED.  And if precision is multiple
+    of HOST_BITS_PER_WIDE_INT, there is no difference in behavior, while
+    -0x80000000000000000000000000000000 negates to
+    -0x80000000000000000000000000000000 the unpacking of it as SIGNED
+    or UNSIGNED works the same.
+    In the testcase, we have signed precision 119 and the dividend is
+    val = { 0, 0xffc0000000000000 }, len = 2, precision = 119
+    both before and after negation.
+    Divisor is
+    val = { 2 }, len = 1, precision = 119
+    But we really want to divide 0x400000000000000000000000000000 by 2
+    unsigned and then negate at the end.
+    If it is unsigned precision 119 division
+    0x400000000000000000000000000000 by 2
+    dividend is
+    val = { 0, 0xffc0000000000000 }, len = 2, precision = 119
+    but as we unpack it UNSIGNED, it is unpacked into
+    0, 0, 0, 0x00400000
+    
+    The following patch fixes it by always using UNSIGNED unpacking
+    because we've already negated negative values at that point if
+    sgn == SIGNED and so most negative constants should be treated as
+    positive.
+    
+    2023-07-19  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/110731* wide-int.cc (wi::divmod_internal): Always unpack dividend and
+            divisor as UNSIGNED regardless of sgn.
+    
+            * gcc.dg/pr110731.c: New test.
+    
+    (cherry picked from commit ece799607c841676f4e00c2fea98bbec6976da3f)
+
+- User: Richard Biener | Time: 2024-06-12 11:58:09 UTC
+  Text: Fixed.
+

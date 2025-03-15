@@ -1,0 +1,226 @@
+Bug Summary: Miscompilation of __m128 ne comparison on LoongArch
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: patch, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jiajie Chen | Time: 2023-12-15 17:56:09 UTC
+  Text: Compile and run the following code:
+
+```
+#include <lsxintrin.h>
+#include <stdio.h>
+__m128i unord_vec(__m128 a, __m128 b) { return (a != a) | (b != b); }
+
+int unord_float(float a, float b) { return (a != a) | (b != b); }
+
+int main() {
+  float nan = 0.0 / 0.0; // nan
+  __m128 nan_vec = {nan, nan};
+  int res_float = unord_float(nan, nan);
+  __m128i res_vec = unord_vec(nan_vec, nan_vec);
+  printf("%d %ld %ld\n", res_float, res_vec[0], res_vec[1]);
+  return 0;
+}
+```
+
+Compile commands: `gcc-14 -mlsx test.c -O -o test`. GCC version is 14.0.0 202231203 snapshot.
+
+It does the `unordered` comparison between two floats. The expected output:
+
+```
+1 1 1
+```
+
+Actual output:
+
+```
+1 0 0
+```
+
+Reading the assembly, the `unord_vec` is implemented wrongly as `vfcmp.cne.s`:
+
+```
+unord_vec:
+.LFB538 = .
+        .cfi_startproc
+        vinsgr2vr.d     $vr0,$r4,0
+        vinsgr2vr.d     $vr0,$r5,1
+        vinsgr2vr.d     $vr1,$r6,0
+        vinsgr2vr.d     $vr1,$r7,1
+        vfcmp.cne.s     $vr0,$vr0,$vr0
+        vfcmp.cne.s     $vr1,$vr1,$vr1
+        vor.v   $vr0,$vr0,$vr1
+        vpickve2gr.du   $r4,$vr0,0
+        vpickve2gr.du   $r5,$vr0,1
+        jr      $r1
+        .cfi_endproc
+```
+
+Whereas `unord_float` is correctly implemented as `fcmp.cune.s`:
+
+```
+unord_float:
+.LFB539 = .
+        .cfi_startproc
+        addi.w  $r4,$r0,1                       # 0x1
+        fcmp.cune.s     $fcc0,$f0,$f0
+        bcnez   $fcc0,.L3
+        or      $r4,$r0,$r0
+.L3:
+        addi.w  $r12,$r0,1                      # 0x1
+        fcmp.cune.s     $fcc1,$f1,$f1
+        bcnez   $fcc1,.L4
+        or      $r12,$r0,$r0
+.L4:
+        or      $r4,$r4,$r12
+        andi    $r4,$r4,1
+        jr      $r1
+        .cfi_endproc
+```
+
+So there is a mismatch on the `unordered` case. Besides, these functions can be optimized to use `vfcmp.cun.s` and `fcmp.cun.s`.
+
+- User: Jiajie Chen | Time: 2023-12-16 04:07:09 UTC
+  Text: As pointed out by @lrzlin, the expected output should be:
+
+```
+1 -1 0
+```
+
+- User: Xi Ruoyao | Time: 2023-12-16 08:23:06 UTC
+  Text: Confirmed.
+
+- User: Xi Ruoyao | Time: 2023-12-16 08:34:10 UTC
+  Text: (define_code_iterator vfcond [unordered ordered eq ne le lt uneq unle unlt])
+
+(define_code_attr fcc
+  [(unordered "cun")
+   (ordered   "cor")
+   (eq        "ceq")
+   (ne        "cne")
+   (uneq      "cueq")
+   (unle      "cule")
+   (unlt      "cult")
+   (le        "cle")
+   (lt        "clt")])
+
+This just looks wrong: not only "cne" should be "cune", but also "clt"/"cle" should be "slt"/"sle" instead (per C23 Annex F).  It seems we should use the same thing as fcond in loongarch.md.
+
+- User: Xi Ruoyao | Time: 2023-12-16 09:22:27 UTC
+  Text: I'm working on it.
+
+- User: Xi Ruoyao | Time: 2023-12-17 15:14:14 UTC
+  Text: Patch:https://gcc.gnu.org/pipermail/gcc-patches/2023-December/640808.html
+
+- User: GCC Commits | Time: 2023-12-20 12:02:53 UTC
+  Text: The master branch has been updated by Xi Ruoyao <xry111@gcc.gnu.org>:https://gcc.gnu.org/g:c5651e9bc057f08bad3297cc2fe3eafffa31c95ecommitr14-6745-gc5651e9bc057f08bad3297cc2fe3eafffa31c95eAuthor: Xi Ruoyao <xry111@xry111.site>
+Date:   Sun Dec 17 01:09:20 2023 +0800
+
+    LoongArch: Fix FP vector comparsons [PR113034]
+    
+    We had the following mappings between <x>vfcmp submenmonics and RTX
+    codes:
+    
+        (define_code_attr fcc
+          [(unordered "cun")
+           (ordered   "cor")
+           (eq       "ceq")
+           (ne       "cne")
+           (uneq      "cueq")
+           (unle      "cule")
+           (unlt      "cult")
+           (le       "cle")
+           (lt       "clt")])
+    
+    This is inconsistent with scalar code:
+    
+        (define_code_attr fcond [(unordered "cun")
+                                 (uneq "cueq")
+                                 (unlt "cult")
+                                 (unle "cule")
+                                 (eq "ceq")
+                                 (lt "slt")
+                                 (le "sle")
+                                 (ordered "cor")
+                                 (ltgt "sne")
+                                 (ne "cune")
+                                 (ge "sge")
+                                 (gt "sgt")
+                                 (unge "cuge")
+                                 (ungt "cugt")])
+    
+    For every RTX code for which the LSX/LASX code is different from the
+    scalar code, the scalar code is correct and the LSX/LASX code is wrong.
+    Most seriously, the RTX code NE should be mapped to "cneq", not "cne".
+    Rewrite <x>vfcmp define_insns in simd.md using the same mapping as
+    scalar fcmp.
+    
+    Note that GAS does not support [x]vfcmp.{c/s}[u]{ge/gt} (pseudo)
+    instruction (although fcmp.{c/s}[u]{ge/gt} is supported), so we need to
+    switch the order of inputs and use [x]vfcmp.{c/s}[u]{le/lt} instead.
+    
+    The <x>vfcmp.{sult/sule/clt/cle}.{s/d} instructions do not have a single
+    RTX code, but they can be modeled as an inversed RTX code following a
+    "not" operation.  Doing so allows the compiler to optimized vectorized
+    __builtin_isless etc. to a single instruction.  This optimization should
+    be added for scalar code too and I'll do it later.
+    
+    Tests are added for mapping between C code, IEC 60559 operations, and
+    vfcmp instructions.
+    
+    [1]:https://gcc.gnu.org/pipermail/gcc-patches/2023-December/640713.htmlgcc/ChangeLog:PR target/113034* config/loongarch/lasx.md (UNSPEC_LASX_XVFCMP_*): Remove.
+            (lasx_xvfcmp_caf_<flasxfmt>): Remove.
+            (lasx_xvfcmp_cune_<FLASX:flasxfmt>): Remove.
+            (FSC256_UNS): Remove.
+            (fsc256): Remove.
+            (lasx_xvfcmp_<vfcond:fcc>_<FLASX:flasxfmt>): Remove.
+            (lasx_xvfcmp_<fsc256>_<FLASX:flasxfmt>): Remove.
+            * config/loongarch/lsx.md (UNSPEC_LSX_XVFCMP_*): Remove.
+            (lsx_vfcmp_caf_<flsxfmt>): Remove.
+            (lsx_vfcmp_cune_<FLSX:flsxfmt>): Remove.
+            (vfcond): Remove.
+            (fcc): Remove.
+            (FSC_UNS): Remove.
+            (fsc): Remove.
+            (lsx_vfcmp_<vfcond:fcc>_<FLSX:flsxfmt>): Remove.
+            (lsx_vfcmp_<fsc>_<FLSX:flsxfmt>): Remove.
+            * config/loongarch/simd.md
+            (fcond_simd): New define_code_iterator.
+            (<simd_isa>_<x>vfcmp_<fcond:fcond_simd>_<simdfmt>):
+            New define_insn.
+            (fcond_simd_rev): New define_code_iterator.
+            (fcond_rev_asm): New define_code_attr.
+            (<simd_isa>_<x>vfcmp_<fcond:fcond_simd_rev>_<simdfmt>):
+            New define_insn.
+            (fcond_inv): New define_code_iterator.
+            (fcond_inv_rev): New define_code_iterator.
+            (fcond_inv_rev_asm): New define_code_attr.
+            (<simd_isa>_<x>vfcmp_<fcond_inv>_<simdfmt>): New define_insn.
+            (<simd_isa>_<x>vfcmp_<fcond_inv:fcond_inv_rev>_<simdfmt>):
+            New define_insn.
+            (UNSPEC_SIMD_FCMP_CAF, UNSPEC_SIMD_FCMP_SAF,
+            UNSPEC_SIMD_FCMP_SEQ, UNSPEC_SIMD_FCMP_SUN,
+            UNSPEC_SIMD_FCMP_SUEQ, UNSPEC_SIMD_FCMP_CNE,
+            UNSPEC_SIMD_FCMP_SOR, UNSPEC_SIMD_FCMP_SUNE): New unspecs.
+            (SIMD_FCMP): New define_int_iterator.
+            (fcond_unspec): New define_int_attr.
+            (<simd_isa>_<x>vfcmp_<fcond_unspec>_<simdfmt>): New define_insn.
+            * config/loongarch/loongarch.cc (loongarch_expand_lsx_cmp):
+            Remove unneeded special cases.
+    
+    gcc/testsuite/ChangeLog:PR target/113034* gcc.target/loongarch/vfcmp-f.c: New test.
+            * gcc.target/loongarch/vfcmp-d.c: New test.
+            * gcc.target/loongarch/xvfcmp-f.c: New test.
+            * gcc.target/loongarch/xvfcmp-d.c: New test.
+            * gcc.target/loongarch/vector/lasx/lasx-vcond-2.c: Scan for cune
+            instead of cne.
+            * gcc.target/loongarch/vector/lsx/lsx-vcond-2.c: Likewise.
+
+- User: Xi Ruoyao | Time: 2023-12-20 12:06:37 UTC
+  Text: Fixed.
+

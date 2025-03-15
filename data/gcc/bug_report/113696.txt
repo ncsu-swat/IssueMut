@@ -1,0 +1,227 @@
+Bug Summary: RISC-V: ineffective vsetvl behavior
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Li Pan | Time: 2024-02-01 01:48:26 UTC
+  Text: Given we have a sample code, build with '-march=rv64gcv -O3 -g0'.
+
+
+#include "riscv_vector.h"
+
+void f (int32_t * restrict in, int32_t * restrict out, size_t n, size_t cond, size_t cond2)
+{
+  for (size_t i = 0; i < n; i++)
+    {
+      if (i == cond) {
+        vint8mf8_t v = *(vint8mf8_t*)(in + i + 100);
+        *(vint8mf8_t*)(out + i + 100) = v;
+      } else if (i == cond2) {
+        vfloat32mf2_t v = *(vfloat32mf2_t*)(in + i + 200);
+        *(vfloat32mf2_t*)(out + i + 200) = v;
+      } else if (i == (cond2 - 1)) {
+        vuint16mf2_t v = *(vuint16mf2_t*)(in + i + 300);
+        *(vuint16mf2_t*)(out + i + 300) = v;
+      } else {
+        vint8mf4_t v = *(vint8mf4_t*)(in + i + 400);
+        *(vint8mf4_t*)(out + i + 400) = v;
+      }
+    }
+}
+
+when we have asm code as below, the vsetvl insn is somehow ineffective and can be refined up to a point.
+
+f:
+.LFB0:
+        .cfi_startproc
+        beq     a2,zero,.L12
+        addi    a7,a0,400
+        addi    a6,a1,400
+        addi    a0,a0,1600
+        addi    a1,a1,1600
+        li      a5,0
+        addi    t6,a4,-1
+        vsetvli t3,zero,e8,mf8,ta,ma
+.L7:
+        beq     a3,a5,.L15
+        beq     a4,a5,.L16
+        beq     t6,a5,.L17
+        vsetvli t1,zero,e8,mf4,ta,ma
+        vle8.v  v1,0(a0)
+        vse8.v  v1,0(a1)
+        vsetvli t3,zero,e8,mf8,ta,ma
+.L4:
+        addi    a5,a5,1
+        addi    a7,a7,4
+        addi    a6,a6,4
+        addi    a0,a0,4
+        addi    a1,a1,4
+        bne     a2,a5,.L7
+.L12:
+        ret
+.L15:
+        vle8.v  v1,0(a7)
+        vse8.v  v1,0(a6)
+        j       .L4
+.L17:
+        vsetvli t1,zero,e8,mf4,ta,ma
+        addi    t5,a0,-400
+        addi    t4,a1,-400
+        vle16.v v1,0(t5)
+        vse16.v v1,0(t4)
+        vsetvli t3,zero,e8,mf8,ta,ma
+        j       .L4
+.L16:
+        addi    t5,a0,-800
+        addi    t4,a1,-800
+        vle32.v v1,0(t5)
+        vse32.v v1,0(t4)
+        j       .L4
+
+- User: GCC Commits | Time: 2024-02-19 08:20:09 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:6082024891e421bfd81d8f708a7411f4019d0d97commitr14-9060-g6082024891e421bfd81d8f708a7411f4019d0d97Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Thu Feb 1 17:02:52 2024 +0800
+
+    RISC-V: Suppress the vsetvl fusion for conflict successors
+    
+    Update in v2: Add dump information.
+    
+    This patch fixes the following ineffective vsetvl insertion:
+    
+    void f (int32_t * restrict in, int32_t * restrict out, size_t n, size_t cond, size_t cond2)
+    {
+      for (size_t i = 0; i < n; i++)
+        {
+          if (i == cond) {
+            vint8mf8_t v = *(vint8mf8_t*)(in + i + 100);
+            *(vint8mf8_t*)(out + i + 100) = v;
+          } else if (i == cond2) {
+            vfloat32mf2_t v = *(vfloat32mf2_t*)(in + i + 200);
+            *(vfloat32mf2_t*)(out + i + 200) = v;
+          } else if (i == (cond2 - 1)) {
+            vuint16mf2_t v = *(vuint16mf2_t*)(in + i + 300);
+            *(vuint16mf2_t*)(out + i + 300) = v;
+          } else {
+            vint8mf4_t v = *(vint8mf4_t*)(in + i + 400);
+            *(vint8mf4_t*)(out + i + 400) = v;
+          }
+        }
+    }
+    
+    Before this patch:
+    
+    f:
+    .LFB0:
+            .cfi_startproc
+            beq     a2,zero,.L12
+            addi    a7,a0,400
+            addi    a6,a1,400
+            addi    a0,a0,1600
+            addi    a1,a1,1600
+            li      a5,0
+            addi    t6,a4,-1
+            vsetvli t3,zero,e8,mf8,ta,ma     ---> ineffective uplift
+    .L7:
+            beq     a3,a5,.L15
+            beq     a4,a5,.L16
+            beq     t6,a5,.L17
+            vsetvli t1,zero,e8,mf4,ta,ma
+            vle8.v  v1,0(a0)
+            vse8.v  v1,0(a1)
+            vsetvli t3,zero,e8,mf8,ta,ma
+    .L4:
+            addi    a5,a5,1
+            addi    a7,a7,4
+            addi    a6,a6,4
+            addi    a0,a0,4
+            addi    a1,a1,4
+            bne     a2,a5,.L7
+    .L12:
+            ret
+    .L15:
+            vle8.v  v1,0(a7)
+            vse8.v  v1,0(a6)
+            j       .L4
+    .L17:
+            vsetvli t1,zero,e8,mf4,ta,ma
+            addi    t5,a0,-400
+            addi    t4,a1,-400
+            vle16.v v1,0(t5)
+            vse16.v v1,0(t4)
+            vsetvli t3,zero,e8,mf8,ta,ma
+            j       .L4
+    .L16:
+            addi    t5,a0,-800
+            addi    t4,a1,-800
+            vle32.v v1,0(t5)
+            vse32.v v1,0(t4)
+            j       .L4
+    
+    It's obvious that we are hoisting the e8mf8 vsetvl to the top. It's ineffective since e8mf8 comes from
+    low probability block which is if (i == cond).
+    
+    For this case, we disable such fusion.
+    
+    After this patch:
+    
+    f:
+            beq     a2,zero,.L12
+            addi    a7,a0,400
+            addi    a6,a1,400
+            addi    a0,a0,1600
+            addi    a1,a1,1600
+            li      a5,0
+            addi    t6,a4,-1
+    .L7:
+            beq     a3,a5,.L15
+            beq     a4,a5,.L16
+            beq     t6,a5,.L17
+            vsetvli t1,zero,e8,mf4,ta,ma
+            vle8.v  v1,0(a0)
+            vse8.v  v1,0(a1)
+    .L4:
+            addi    a5,a5,1
+            addi    a7,a7,4
+            addi    a6,a6,4
+            addi    a0,a0,4
+            addi    a1,a1,4
+            bne     a2,a5,.L7
+    .L12:
+            ret
+    .L15:
+            vsetvli t3,zero,e8,mf8,ta,ma
+            vle8.v  v1,0(a7)
+            vse8.v  v1,0(a6)
+            j       .L4
+    .L17:
+            addi    t5,a0,-400
+            addi    t4,a1,-400
+            vsetvli t1,zero,e8,mf4,ta,ma
+            vle16.v v1,0(t5)
+            vse16.v v1,0(t4)
+            j       .L4
+    .L16:
+            addi    t5,a0,-800
+            addi    t4,a1,-800
+            vsetvli t3,zero,e32,mf2,ta,ma
+            vle32.v v1,0(t5)
+            vse32.v v1,0(t4)
+            j       .L4
+    
+    Tested on both RV32/RV64 no regression. Ok for trunk ?PR target/113696gcc/ChangeLog:
+    
+            * config/riscv/riscv-vsetvl.cc (pre_vsetvl::earliest_fuse_vsetvl_info):
+            Suppress vsetvl fusion.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/vsetvl/pr113696.c: New test.
+
+- User: Li Pan | Time: 2024-02-19 08:23:47 UTC
+  Text: Fixed.
+

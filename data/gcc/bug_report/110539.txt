@@ -1,0 +1,232 @@
+Bug Summary: [14 Regression] Dead Code Elimination Regression at since r14-338-g1dd154f6407
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Theodoros Theodoridis | Time: 2023-07-04 09:38:04 UTC
+  Text: https://godbolt.org/z/h9vrrj5jeGiven the following code:
+
+void foo(void);
+static int a, c = 1;
+static short b;
+static int *d = &c, *e = &a;
+static int **f = &d;
+void __assert_fail() __attribute__((__noreturn__));
+static void g(short h) {
+    if (*d)
+        ;
+    else {
+        if (e) __assert_fail();
+        if (a) {
+            __builtin_unreachable();
+        } else
+            __assert_fail();
+    }
+    if ((((0, 0) || h) == h) + b) *f = 0;
+}
+int main() {
+    int i = 0 != 10 & a;
+    g(i);
+    *e = 9;
+    e = 0;
+    if (d == 0)
+        ;
+    else
+        foo();
+    ;
+}
+
+gcc-trunk -O2 does not eliminate the call to foo:
+
+main:
+	subq	$8, %rsp
+	movq	d(%rip), %rax
+	movq	e(%rip), %rdx
+	movl	(%rax), %edi
+	testl	%edi, %edi
+	jne	.L2
+	xorl	%eax, %eax
+	call	__assert_fail
+.L2:
+	xorl	%ecx, %ecx
+	xorl	%esi, %esi
+	movq	%rcx, d(%rip)
+	cmpq	$0, d(%rip)
+	movl	$9, (%rdx)
+	movq	%rsi, e(%rip)
+	je	.L3
+	call	foo
+.L3:
+	xorl	%eax, %eax
+	popq	%rdx
+	ret
+
+gcc-13.1.0 -O2 eliminates the call to foo:
+
+main:
+	movq	d(%rip), %rax
+	movq	e(%rip), %rdx
+	movl	(%rax), %esi
+	testl	%esi, %esi
+	jne	.L2
+	pushq	%rcx
+	xorl	%eax, %eax
+	call	__assert_fail
+.L2:
+	xorl	%eax, %eax
+	movq	%rax, d(%rip)
+	xorl	%eax, %eax
+	movl	$9, (%rdx)
+	xorl	%edx, %edx
+	movq	%rdx, e(%rip)
+	ret
+
+Bisects tor14-338-g1dd154f6407
+
+- User: Andrew Pinski | Time: 2023-07-06 21:20:59 UTC
+  Text: # RANGE [irange] int [0, 1] NONZERO 0x1
+  i_7 = a.0_1 & 1;
+
+  _17 = i_7 != 0;
+  _12 = (int) _17;
+  if (i_7 == _12)
+
+
+So this should have been optimized to _17 = (bool) i_7;
+and then if (1)
+
+Maybe it is an order of the stuff in match.pd ...
+
+- User: Andrew Pinski | Time: 2023-07-06 21:41:11 UTC
+  Text: So the difference comes from the order. Before in phiopt we had:
+-  /* Defer boolean x ? 0 : {1,-1} or x ? {1,-1} : 0 to
+-     match_simplify_replacement.  */
+-  if (TREE_CODE (TREE_TYPE (lhs)) == BOOLEAN_TYPE
+-      && (integer_zerop (arg0)
+-         || integer_zerop (arg1)
+-         || TREE_CODE (TREE_TYPE (arg0)) == BOOLEAN_TYPE
+-         || (TYPE_PRECISION (TREE_TYPE (arg0))
+-             <= TYPE_PRECISION (TREE_TYPE (lhs)))))
+-    return false;
+
+But now the order is such that `?0:{1,-1}`, `?{1,-1}:0` is handled first.
+
+So what we need to pattern match here is `(convert)zero_one_value_p@0!=0` and simplify that into just (convert)@0
+
+(for neeq (ne eq)
+ (simplify
+  (convert (neeq zero_one_value_p@0 integer_zerop))
+  (if (neeq == NE_EXPR))
+   (convert @0)
+   (bit_xor (convert @0) { build_one_cst (type); } ))
+
+- User: Andrew Pinski | Time: 2023-07-06 21:45:18 UTC
+  Text: Here is a testcase for the missing optimization (at -O1) which is optimized at the RTL level (for some targets but not all):
+```
+int f(int a)
+{
+        int b = a & 1;
+        int c = b != 0;
+        return c == b;
+}
+```
+
+Though it does optimize at -O2 because VRP changes: `b != 0` into `(_Bool) b_4`.
+
+- User: Andrew Pinski | Time: 2023-07-06 22:03:10 UTC
+  Text: yes adding:
+/* (convert)(zeroone != 0) into (convert)zeroone */
+/* (convert)(zeroone == 0) into ((convert)zeroone)^1 */
+(for neeq (ne eq)
+ (simplify
+  (convert (neeq zero_one_valued_p@0 integer_zerop))
+  (if (neeq == NE_EXPR)
+   (convert @0)
+   (bit_xor (convert @0) { build_one_cst (type); } ))))
+
+
+Fixes the original testcase.
+
+- User: Andrew Pinski | Time: 2023-07-06 22:44:08 UTC
+  Text: (In reply to Andrew Pinski fromcomment #4)> yes adding:
+> /* (convert)(zeroone != 0) into (convert)zeroone */
+> /* (convert)(zeroone == 0) into ((convert)zeroone)^1 */
+> (for neeq (ne eq)
+>  (simplify
+>   (convert (neeq zero_one_valued_p@0 integer_zerop))
+>   (if (neeq == NE_EXPR)
+>    (convert @0)
+>    (bit_xor (convert @0) { build_one_cst (type); } ))))
+> 
+> 
+> Fixes the original testcase.One simple regression:
+/* { dg-final { scan-tree-dump-times "Folded to: _\[0-9\]+ = 1;" 1 "dom3"} } */
+/* { dg-final { scan-tree-dump-times "Folded to: _\[0-9\]+ = 0;" 1 "dom3"} } */
+
+fail now but that is they just don't match the above on accident.
+
+Before:
+  Replaced 'bufferstep_36' with constant '0'
+gimple_simplified to _5 = 1;
+  Folded to: _5 = 1;
+After:
+  Replaced 'bufferstep_36' with constant '0'
+gimple_simplified to bufferstep_23 = 1;
+  Folded to: bufferstep_23 = 1;
+
+- User: Andrew Pinski | Time: 2023-07-08 00:33:10 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2023-July/623881.html
+
+- User: Andrew Pinski | Time: 2023-07-11 23:13:02 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)>   # RANGE [irange] int [0, 1] NONZERO 0x1
+>   i_7 = a.0_1 & 1;
+> 
+>   _17 = i_7 != 0;
+>   _12 = (int) _17;
+>   if (i_7 == _12)Wait that is:
+i_7 == (convert) (i_7 != 0);
+
+Which is basicallyPR 110293. So there is another way of fixing this is simplifying `i_7 == (convert) (i_7 != 0)` into  `(unsigned_type)i_7 <= 1` and that is always true as `(a.0_1 & 1) <= 1` is always true.
+
+Let me try fixingPR 110293as the way of fixing this one instead of the patch which I submitted but has other issues.
+
+- User: Andrew Pinski | Time: 2023-07-12 07:18:59 UTC
+  Text: Let me file a different bug for onezero stuff that I tried out ...
+
+- User: Andrew Pinski | Time: 2023-07-12 17:32:13 UTC
+  Text: New patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2023-July/624293.htmlWhich also gets rid of the call to foo at -O1 -fstrict-aliasing too (which was not done in GCC 13 either).
+
+- User: GCC Commits | Time: 2023-07-13 14:55:18 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:285c9d042e90a7425b37697edc9ec93a1b03b486commitr14-2501-g285c9d042e90a7425b37697edc9ec93a1b03b486Author: Andrew Pinski <apinski@marvell.com>
+Date:   Wed Jul 12 00:33:14 2023 -0700
+
+    Fix part ofPR 110293: `A NEEQ (A NEEQ CST)` part
+    
+    This fixes part ofPR 110293, for the outer comparison case
+    being `!=` or `==`.  In turnPR 110539is able to be optimized
+    again as the if statement for `(a&1) == ((a & 1) != 0)` gets optimized
+    to `false` early enough to allow FRE/DOM to do a CSE for memory store/load.
+    
+    OK? Bootstrapped and tested on x86_64-linux with no regressions.
+    
+    gcc/ChangeLog:PR tree-optimization/110293PR tree-optimization/110539* match.pd: Expand the `x != (typeof x)(x == 0)`
+            pattern to handle where the inner and outer comparsions
+            are either `!=` or `==` and handle other constants
+            than 0.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/pr110293-1.c: New test.
+            * gcc.dg/tree-ssa/pr110539-1.c: New test.
+            * gcc.dg/tree-ssa/pr110539-2.c: New test.
+            * gcc.dg/tree-ssa/pr110539-3.c: New test.
+            * gcc.dg/tree-ssa/pr110539-4.c: New test.
+
+- User: Andrew Pinski | Time: 2023-07-13 14:55:55 UTC
+  Text: Fixed.
+

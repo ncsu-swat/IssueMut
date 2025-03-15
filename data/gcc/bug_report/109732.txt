@@ -1,0 +1,357 @@
+Bug Summary: [14 regression] gcc miscompiles iterator comparison on nlohmann_json since r14-204-gf1f5cbaa3f716f
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: patch, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2023-05-04 12:01:21 UTC
+  Text: Initially I observed the failure as a test failure on nlohmann_json-3.11.2 against gcc-14 master (r14-395-g1adb1a653d6739):
+
+  33 - test-items_cpp11 (Failed)
+  34 - test-items_cpp17 (Failed)
+
+I extracted smaller but not yet self-contained example that seems to illustrate the problem:
+
+// $ cat unit-t.cpp
+#include <cstdio>
+#include <nlohmann/json.hpp>
+
+namespace {
+
+int seen_failures = 0;
+
+__attribute__((noinline))
+static void sne(nlohmann::json::const_reverse_iterator lhs,
+                nlohmann::json::const_reverse_iterator rhs) {
+    bool res = !(lhs == rhs);
+    if (!res) seen_failures++;
+}
+
+struct TestCase
+{
+    void (*m_test)();
+    TestCase(void (*test)()) {
+        // not used anywhere, but triggers the failure
+        m_test = test;
+    }
+};
+
+
+static void _DOCTEST_ANON_FUNC_8()
+{
+    const nlohmann::json js = "hello world";
+    const nlohmann::json js_const(js);
+
+    nlohmann::json::const_reverse_iterator sit = js_const.crbegin();
+
+    sne(sit, js_const.crend());
+}
+
+}
+
+int main() {
+    // below 3 lines look like a no-op, but afects the result:
+    TestCase ltc(&_DOCTEST_ANON_FUNC_8);
+    std::vector<const TestCase*> testArray;
+    testArray.push_back(&ltc);
+
+    _DOCTEST_ANON_FUNC_8();
+
+    puts((seen_failures > 0) ? "FAILURE!" : "SUCCESS!");
+
+    return EXIT_SUCCESS;
+}
+
+To trigger it we will need json headers-only library:
+
+    $ git clone --depth 1https://github.com/nlohmann/json.git# commit 6af826d0bdb55e4b69e3ad817576745335f243ca
+
+    $ g++-14 unit-t.cpp -O2 -Ijson/include -o a && ./a
+    FAILURE!
+
+For comparison unoptimized and older gcc does work as expcted:
+
+    $ g++-14 unit-t.cpp -O0 -Ijson/include -o a && ./a
+    SUCCESS!
+    $ g++ unit-t.cpp -O2 -Ijson/include -o a && ./a
+    SUCCESS!
+
+I'm not sure if `nlohmann::json::const_reverse_iterator` is implemented correctly according to c++ requirements. The inheritance looks fishy. At least I would expect consistent behaviour for -O0/O2.
+
+-fsanitize={address,undefined} does not uncover anything obvious. Can you help me understand if it's a gcc or json deficiency?
+
+Thank you!
+
+- User: Andrew Pinski | Time: 2023-05-04 12:05:59 UTC
+  Text: First thing to try is -O1.
+If that works try -O2 -fno-strict-aliasing.
+
+- User: Martin Liška | Time: 2023-05-04 12:10:49 UTC
+  Text: Started withr14-204-gf1f5cbaa3f716f.
+
+- User: Sergei Trofimovich | Time: 2023-05-04 12:11:54 UTC
+  Text: Both -O1 and -fno-strict-aliasing remove the bug:
+
+    $ g++-14 unit-t.cpp -O2 -Ijson/include -o a -O1 && ./a
+    SUCCESS!
+    $ g++-14 unit-t.cpp -O2 -Ijson/include -o a -fno-strict-aliasing && ./a
+    SUCCESS!
+
+- User: Martin Liška | Time: 2023-05-04 12:13:39 UTC
+  Text: Looking at optimized dump before and after the revision I see an obvious error:
+
+diff -u good bad
+--- good	2023-05-04 14:12:16.160695781 +0200
++++ bad	2023-05-04 14:11:58.516230125 +0200
+@@ -3399,9 +3399,9 @@
+   struct _Rb_tree_node_base * _77;
+   struct basic_json * _79;
+   struct binary_t * _88;
+-  long int _101;
+   void * _109;
+-  bool _148;
++  bool _116;
++  long int _117;
+   struct _Rb_tree_node_base * _181;
+ 
+   <bb 2> [local count: 1073741824]:
+@@ -3445,13 +3445,13 @@
+   goto <bb 8>; [100.00%]
+ 
+   <bb 7> [local count: 357524722]:
+-  _148 = _73 == 0;
+-  _101 = (long int) _148;
++  _116 = _73 != 0;
++  _117 = (long int) _116;
+ 
+   <bb 8> [local count: 1071716297]:
+   # SR.1026_134 = PHI <_77(5), 0B(6), 0B(7)>
+   # SR.1027_139 = PHI <0B(5), _79(6), 0B(7)>
+-  # SR.1028_138 = PHI <-9223372036854775808(5), -9223372036854775808(6), _101(7)>
++  # SR.1028_138 = PHI <-9223372036854775808(5), -9223372036854775808(6), _117(7)>
+   # sit$m_it$object_iterator$_M_node_127 = PHI <_181(5), 0B(6), 0B(7)>
+   # sit$m_it$primitive_iterator$m_it_125 = PHI <-9223372036854775808(5), -9223372036854775808(6), 1(7)>
+   # sit$m_it$array_iterator$_M_current_56 = PHI <0B(5), _75(6), 0B(7)>
+
+- User: Martin Liška | Time: 2023-05-04 12:14:16 UTC
+  Text: So (long int)(_73 == 0) is changed to (long int)(_73 != 0).
+
+- User: Andrew Pinski | Time: 2023-05-04 12:17:05 UTC
+  Text: I know what the issue is.
+
+1058   /* We need to know which is the true edge and which is the false
+1059      edge so that we know when to invert the condition below.  *
+
+Is wrong for diamond forms.
+
+- User: Martin Liška | Time: 2023-05-04 12:19:53 UTC
+  Text: @Andrew: Will you be able to construct a test-case or do you want me to reduce the provided one?
+
+- User: Andrew Pinski | Time: 2023-05-04 12:23:30 UTC
+  Text: I should be able to construct a gimple one.
+
+- User: Martin Liška | Time: 2023-05-04 14:21:53 UTC
+  Text: I've got a C++ reduced test-case:
+
+$ cat x.ii
+template <typename> struct is_same;
+template <bool, typename _Tp> using enable_if_t = _Tp;
+template <typename _Iterator> struct reverse_iterator {
+  _Iterator current;
+  typedef _Iterator iterator_type;
+  reverse_iterator(iterator_type __x) : current(__x) {}
+  iterator_type base() { return current; }
+};
+template <typename _Iterator>
+bool operator==(reverse_iterator<_Iterator> __x,
+                reverse_iterator<_Iterator> __y) {
+  return __x.base() == __y.base();
+}
+struct __normal_iterator {
+  int _M_current;
+};
+template <typename> struct __new_allocator;
+template <typename> struct allocator_traits;
+template <typename _Tp> struct allocator_traits<__new_allocator<_Tp>> {
+  using const_pointer = _Tp *;
+};
+template <typename> struct vector {
+  typedef __normal_iterator iterator;
+};
+namespace {
+enum value_t { null, object, array, string };
+template <template <typename, typename...> class = vector,
+          template <typename> class = __new_allocator>
+class basic_json;
+struct external_constructor {
+  template <
+      typename BasicJsonType, typename CompatibleStringType,
+      enable_if_t<is_same<typename BasicJsonType::string_t>::value, int> = 0>
+  static void construct(BasicJsonType &j, CompatibleStringType) {
+    j.m_type = string;
+  }
+} to_json_s;
+void to_json(basic_json<> &j) { external_constructor::construct(j, to_json_s); }
+long begin_value;
+long end_value = 1;
+struct primitive_iterator_t {
+  long m_it;
+  void set_begin() { m_it = begin_value; }
+  void set_end() { m_it = end_value; }
+  friend bool operator==(primitive_iterator_t, primitive_iterator_t rhs) {
+    return rhs.m_it;
+  }
+};
+template <typename BasicJsonType> struct internal_iterator {
+  typename BasicJsonType::array_t::iterator array_iterator;
+  primitive_iterator_t primitive_iterator;
+};
+template <typename BasicJsonType> struct iter_impl {
+  using array_t = typename BasicJsonType::array_t;
+  typedef typename BasicJsonType::const_pointer pointer;
+  iter_impl(pointer object) : m_object(object) {
+    switch (m_object->m_type)
+    case ::object:
+    case array:
+      m_it.array_iterator = typename array_t::iterator();
+  }
+  void set_begin() {
+    switch (m_object->m_type) {
+    case object:
+    case array:
+      break;
+    case null:
+      m_it.primitive_iterator.set_end();
+      break;
+    default:
+      m_it.primitive_iterator.set_begin();
+    }
+  }
+  template <typename IterImpl> bool operator==(IterImpl other) {
+    return m_it.primitive_iterator == other.m_it.primitive_iterator;
+  }
+  pointer m_object;
+  internal_iterator<BasicJsonType> m_it;
+};
+template <typename Base> struct json_reverse_iterator : reverse_iterator<Base> {
+  json_reverse_iterator(Base it) : reverse_iterator<Base>(it) {}
+};
+template <template <typename, typename...> class ArrayType,
+          template <typename> class AllocatorType>
+struct basic_json {
+  using const_pointer =
+      typename allocator_traits<AllocatorType<basic_json>>::const_pointer;
+  using const_iterator = iter_impl<basic_json>;
+  using const_reverse_iterator = json_reverse_iterator<const_iterator>;
+  using array_t = ArrayType<basic_json>;
+  template <typename CompatibleType> basic_json(CompatibleType) {
+    to_json(*this);
+  }
+  const_iterator cbegin() {
+    const_iterator result(this);
+    result.set_begin();
+    return result;
+  }
+  const_iterator cend() {
+    const_iterator result(this);
+    return result;
+  }
+  const_reverse_iterator crbegin() { return cend(); }
+  const_reverse_iterator crend() { return cbegin(); }
+  value_t m_type;
+};
+} // namespace
+int seen_failures;
+__attribute__((noinline)) void sne(basic_json<>::const_reverse_iterator lhs,
+                                   basic_json<>::const_reverse_iterator rhs) {
+  bool res = !(lhs == rhs);
+  if (!res)
+    seen_failures++;
+}
+basic_json main_js = "";
+
+int
+main() {
+  basic_json js_const(main_js);
+  basic_json<>::const_reverse_iterator sit = js_const.crbegin(),
+                                       __trans_tmp_1 = js_const.crend();
+  sne(sit, __trans_tmp_1);
+  return seen_failures;
+}
+
+- User: Andrew Pinski | Time: 2023-05-04 16:40:16 UTC
+  Text: Createdattachment 54998[details]Gimple testcase that fails at runtime too
+
+-O1 -fgimple -fdisable-tree-ethread -fdisable-tree-fre1
+
+
+The thing is you need the false edge to be the first successor edge of BB2. So you have to get forwprop to swap the edges from being true and false. Also gimple front-end does not like bool constants that well.
+
+- User: Andrew Pinski | Time: 2023-05-04 17:15:22 UTC
+  Text: Createdattachment 54999[details]Patch which needs a message/changelog
+
+- User: Sergei Trofimovich | Time: 2023-05-04 20:38:35 UTC
+  Text: (In reply to Andrew Pinski fromcomment #11)> Createdattachment 54999[details]> Patch which needs a message/changelogI confirm the patch fixes real test failures on nlohmann_json-3.11.2 as well.
+
+I also had untriaged mysterious aws-sdk-cpp-1.11.37 test failures. The failures are gone as well with your patch.
+
+Thank you!
+
+- User: Andrew Pinski | Time: 2023-05-04 21:57:58 UTC
+  Text: Patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2023-May/617492.html
+
+- User: Andrew Pinski | Time: 2023-05-04 22:59:22 UTC
+  Text: Figured out a C testcase:
+```
+[[gnu::noipa]]
+_Bool f3(_Bool a)
+{
+        if (a==0)
+          return 0;
+        else
+          return a;
+}
+```
+Still need: `-fdisable-tree-fre1` though because fre is able to figure out that the return value is always a. We don't need to disable ethread any more since cfgcleanup will not remove the forwarding BB as it has a predict statement in it.
+
+There are actually two conditions that need to happen to get the wrong code. First is the order of the phi and then also the order of the edges. The above is enough to get both.
+
+- User: GCC Commits | Time: 2023-05-05 06:25:25 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:2e4e899641c0c558eabf0128ee72cb8d3999c990commitr14-489-g2e4e899641c0c558eabf0128ee72cb8d3999c990Author: Andrew Pinski <apinski@marvell.com>
+Date:   Thu May 4 10:07:50 2023 -0700
+
+    PHIOPT: Fix diamond case of match_simplify_replacement
+    
+    So it turns out I messed checking which edge was true/false for the diamond
+    form. The edges, e0 and e1 here are edges from the merge block but the
+    true/false edges are from the conditional block and with diamond/threeway,
+    there is a bb inbetween on both edges.
+    Most of the time, the check that was in match_simplify_replacement would
+    happen to be correct for diamond form as most of the time the first edge in
+    the conditional is the edge for the true side of the conditional.
+    This is why I didn't see the issue during bootstrap/testing.
+    
+    I added a fragile gimple testcase which exposed the issue. Since there is
+    no way to specify the order of the edges in the gimple fe, we have to
+    have forwprop to swap the false/true edges (not order of them, just swapping
+    true/false flags) and hope not to do cleanupcfg inbetween forwprop and the
+    first phiopt pass. This is the fragile part really, it is not that we will
+    produce wrong code, just we won't hit what was the failing case.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu.PR tree-optimization/109732gcc/ChangeLog:
+    
+            * tree-ssa-phiopt.cc (match_simplify_replacement): Fix the selection
+            of the argtrue/argfalse.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr109732.c: New test.
+            * gcc.dg/pr109732-1.c: New test.
+
+- User: Andrew Pinski | Time: 2023-05-05 06:25:45 UTC
+  Text: Fixed.
+

@@ -1,0 +1,233 @@
+Bug Summary: [13/14/15 Regression] RISC-V: Miscompile at -O2 with zbb
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 12.0
+Known to Fail: 13.0, 14.0, 15.0
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-07-25 06:41:53 UTC
+  Text: There may be a way to show the bug using a single file but I hadn't had success in merging them yet.
+
+Testcase:
+
+driver.c:
+int a = 2;
+unsigned b = 0x80000000;
+int arr_5[2][23];
+void test(int, unsigned, int);
+int main() {
+  test(a, b, 1);
+  __builtin_printf("%d\n", arr_5[1][0]);
+}
+
+
+func.c:
+extern int arr_5[2][23];
+#define c(a, b)                                                                \
+  ({                                                                           \
+    long d = a;                                                                \
+    long e = b;                                                                \
+    d > e ? d : e;                                                             \
+  })
+void test(int f, unsigned g, int h) {
+  for (int i = 0; i < h; i = f)
+    arr_5[1][i] = h ? c(g, 7) : 0;
+}
+
+
+Commands:> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64id_zbb -O2 -c func.c -o func.o
+> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -c driver.c -o driver.o
+> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc func.o driver.o -o user-config.out
+> QEMU_CPU=rv64,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true,v=true,vext_spec=v1.0,zve32f=true,zve64f=true,zbb=true timeout --verbose -k 0.1 4 /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/qemu-riscv64 user-config.out7> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -O2 -c func.c -o func.o
+> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -c driver.c -o driver.o
+> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc func.o driver.o -o user-config.out
+> QEMU_CPU=rv64,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true,v=true,vext_spec=v1.0,zve32f=true,zve64f=true,zbb=true timeout --verbose -k 0.1 4 /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/qemu-riscv64 user-config.out-2147483648
+
+Found via fuzzer.
+
+- User: Patrick O'Neill | Time: 2024-07-25 06:44:28 UTC
+  Text: Tested usingr15-2276-gd2fc64c8578
+
+- User: Xi Ruoyao | Time: 2024-07-25 10:11:33 UTC
+  Text: (In reply to Patrick O'Neill fromcomment #0)> There may be a way to show the bug using a single file but I hadn't had
+> success in merging them yet.Maybe add __attribute__((noipa)) for test() and merge the files.
+
+- User: Patrick O'Neill | Time: 2024-07-25 14:58:35 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #2)> Maybe add __attribute__((noipa)) for test() and merge the files.That worked, thanks!
+
+Testcase:
+int a = 2;
+unsigned b = 0x80000000;
+int arr_5[2][23];
+void test(int, unsigned, int);
+int main() {
+  test(a, b, 1);
+  __builtin_printf("%d\n", arr_5[1][0]);
+}
+
+#define c(a, b)                                                                \
+  ({                                                                           \
+    long d = a;                                                                \
+    long e = b;                                                                \
+    d > e ? d : e;                                                             \
+  })
+__attribute__((noipa))
+void test(int f, unsigned g, int h) {
+  for (int i = 0; i < h; i = f)
+    arr_5[1][i] = h ? c(g, 7) : 0;
+}
+
+Commands:> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64id_zbb -O2 red.c -o user-config.out
+> QEMU_CPU=rv64,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true,v=true,vext_spec=v1.0,zve32f=true,zve64f=true,zbb=true timeout --verbose -k 0.1 4 /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/qemu-riscv64 user-config.out7> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64id_zbb -O1 red.c -o user-config.out
+> QEMU_CPU=rv64,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true,v=true,vext_spec=v1.0,zve32f=true,zve64f=true,zbb=true timeout --verbose -k 0.1 4 /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/qemu-riscv64 user-config.out-2147483648
+
+- User: Jeffrey A. Law | Time: 2024-07-25 19:03:16 UTC
+  Text: Not ext-dce as far as I can tell.  A nice chance of pace..  Might still be mine.  Investigating.
+
+- User: Jeffrey A. Law | Time: 2024-07-25 19:51:20 UTC
+  Text: Bisection landed on this change from 2022:
+
+commit 3142265dedd84c2f3dbf824f2d1b0c182e3c8b3c
+Author: Philipp Tomsich <philipp.tomsich@vrull.eu>
+Date:   Sun Oct 16 10:51:47 2022 +0200
+
+    RISC-V: No extensions for SImode min/max against safe constant
+    
+    Optimize the common case of a SImode min/max against a constant
+    that is safe both for sign- and zero-extension.
+    E.g., consider the case
+      int f(unsigned int* a)
+      {
+        const int C = 1000;
+        return *a * 3 > C ? C : *a * 3;
+      }
+    where the constant C will yield the same result in DImode whether
+    sign- or zero-extended.
+    
+    This should eventually go away once the lowering to RTL smartens up
+    and considers the precision/signedness and the value-ranges of the
+    operands to MIN_EXPR and MAX_EXPR.
+    
+    gcc/ChangeLog:
+    
+            * config/riscv/bitmanip.md (*minmax): Additional pattern for
+              min/max against constants that are extension-invariant.
+            * config/riscv/iterators.md (minmax_optab): Add an iterator
+              that has only min and max rtl.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/zbb-min-max-02.c: New test.
+
+diff --git a/gcc/config/riscv/bitmanip.md b/gcc/config/riscv/bitmanip.md
+index 58bac7231e3..d17133d58c1 100644
+--- a/gcc/config/riscv/bitmanip.md
++++ b/gcc/config/riscv/bitmanip.md
+@@ -368,6 +368,24 @@ (define_insn "<bitmanip_optab><mode>3"
+   "<bitmanip_insn>\t%0,%1,%2"
+   [(set_attr "type" "bitmanip")])
+ 
++;; Optimize the common case of a SImode min/max against a constant
++;; that is safe both for sign- and zero-extension.
++(define_insn_and_split "*minmax"
++  [(set (match_operand:DI 0 "register_operand" "=r")
++       (sign_extend:DI
++         (subreg:SI
++           (bitmanip_minmax:DI (zero_extend:DI (match_operand:SI 1 "register_operand" "r"))
++                                               (match_operand:DI 2 "immediate_operand" "i"))
++          0)))
++   (clobber (match_scratch:DI 3 "=&r"))
++   (clobber (match_scratch:DI 4 "=&r"))]
++  "TARGET_64BIT && TARGET_ZBB && sext_hwi (INTVAL (operands[2]), 32) >= 0"
++  "#"
++  "&& reload_completed"
++  [(set (match_dup 3) (sign_extend:DI (match_dup 1)))
++   (set (match_dup 4) (match_dup 2))
++   (set (match_dup 0) (<minmax_optab>:DI (match_dup 3) (match_dup 4)))])
+
+
+
+Note carefully the sign_extend in the split code.  That looks wrong to me at first glance.
+
+- User: Jeffrey A. Law | Time: 2024-07-25 22:31:37 UTC
+  Text: So I think Philipp's code would work if it transformed the resulting min/max into a minu/maxu.  And I think there's some room for improvement here.
+
+The core bug is that we're sign-extending the non-constant operand.  If that operand has a negative value in SImode, then it's going to have a negative value in DImode.   If the original code was smax, we must change it to umax to preserve semantics of the comparison (the constant operand always have a positive value).  Similarly for smin->umin.
+
+Philipp's code appears to a 4->3 combination.  We're combining the zero extension of the nonconstant operand, loading the constant operand into a register, a min/max and sign extension of result into sign extension of the nonconstant operand, loading the constant operand into a register and the min/max.  A define_split would be better for this scenario.
+
+It's also the case that if we know the nonconstant operand is a sign promoted subreg, then we can eliminate the sign extension step in the new RTL.  In that case it's a 4->2 combination.
+
+And fun tidbit.  ext-dce removes an extension in this code before combine and as a result the faulty pattern doesn't trigger and makes this instance of the bug go latent!
+
+- User: GCC Commits | Time: 2024-07-26 23:31:54 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:6e5aae47e3b910f9af6983f744d7a3e2dcecba1dcommitr15-2352-g6e5aae47e3b910f9af6983f744d7a3e2dcecba1dAuthor: Jeff Law <jlaw@ventanamicro.com>
+Date:   Fri Jul 26 17:30:08 2024 -0600
+
+    [RISC-V][target/116085] Fix rv64 minmax extension avoidance splitter
+    
+    A patch introduced a pattern to avoid unnecessary extensions when doing a
+    min/max operation where one of the values is a 32 bit positive constant.
+    
+    > (define_insn_and_split "*minmax"
+    >   [(set (match_operand:DI 0 "register_operand" "=r")
+    >         (sign_extend:DI
+    >           (subreg:SI
+    >             (bitmanip_minmax:DI (zero_extend:DI (match_operand:SI 1 "register_operand" "r"))
+    >                                                 (match_operand:DI 2 "immediate_operand" "i"))
+    >            0)))
+    >    (clobber (match_scratch:DI 3 "=&r"))
+    >    (clobber (match_scratch:DI 4 "=&r"))]
+    >   "TARGET_64BIT && TARGET_ZBB && sext_hwi (INTVAL (operands[2]), 32) >= 0"
+    >   "#"
+    >   "&& reload_completed"
+    >   [(set (match_dup 3) (sign_extend:DI (match_dup 1)))
+    >    (set (match_dup 4) (match_dup 2))
+    >    (set (match_dup 0) (<minmax_optab>:DI (match_dup 3) (match_dup 4)))]
+    
+    Lots going on in here.  The key is the nonconstant value is zero extended from
+    SI to DI in the original RTL and we know the constant value is unchanged if we
+    were to sign extend it from 32 to 64 bits.
+    
+    We change the extension of the nonconstant operand from zero to sign extension.
+    I'm pretty confident the goal there is take advantage of the fact that SI
+    values are kept sign extended and will often be optimized away.
+    
+    The problem occurs when the nonconstant operand has the SI sign bit set.  As an
+    example:
+    
+    smax (0x8000000, 0x7)  resulting in 0x80000000
+    
+    The split RTL will generate
+    smax (sign_extend (0x80000000), 0x7))
+    
+    smax (0xffffffff80000000, 0x7) resulting in 0x7
+    
+    Opps.
+    
+    We really needed to change the opcode to umax for this transformation to work.
+    That's easy enough.  But there's further improvements we can make.
+    
+    First the pattern is a define_and_split with a post-reload split condition.  It
+    would be better implemented as a 4->3 define_split so that the costing model
+    just works.  Second, if operands[1] is a suitably promoted subreg, then we can
+    elide the sign extension when we generate the split code, so often it'll be a
+    4->2 split, again with the cost model working with no adjustments needed.
+    
+    Tested on rv32 and rv64 in my tester.  I'll wait for the pre-commit tester to
+    spin it as well.PR target/116085gcc/
+            * config/riscv/bitmanip.md (minmax extension avoidance splitter):
+            Rewrite as a simpler define_split.  Adjust the opcode appropriately.
+            Avoid emitting sign extension if it's clearly not needed.
+            * config/riscv/iterators.md (minmax_optab): Rename to uminmax_optab
+            and map everything to unsigned variants.
+    
+    gcc/testsuite/
+            * gcc.target/riscv/pr116085.c: New test.
+
+- User: Jeffrey A. Law | Time: 2024-07-26 23:32:28 UTC
+  Text: Fixed on the trunk.
+

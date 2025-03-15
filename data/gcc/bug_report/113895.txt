@@ -1,0 +1,259 @@
+Bug Summary: [14 Regression] ice in in copy_reference_ops_from_ref, at tree-ssa-sccvn.cc:1144
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-checking, ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2024-02-12 22:21:29 UTC
+  Text: This C source code:
+
+int main_i;
+void transparent_crc();
+#pragma pack(1)
+struct {
+  signed : 17;
+  signed : 6;
+  unsigned : 13;
+  unsigned f6 : 12
+} g_20[];
+void main() { transparent_crc(g_20[main_i].f6); }
+
+when compiled by recent gcc, does this:
+
+cvise $ ~/gcc/results/bin/gcc -c -O1bug1011.cbug1011.c:9:1: warning: no semicolon at end of struct or union
+    9 | } g_20[];
+      | ^bug1011.c:9:3: warning: array ‘g_20’ assumed to have one element
+    9 | } g_20[];
+      |   ^~~~
+during GIMPLE pass: frebug1011.c: In function ‘main’:bug1011.c:10:1: internal compiler error: in copy_reference_ops_from_ref, at tree-ssa-sccvn.cc:1144
+   10 | void main() { transparent_crc(g_20[main_i].f6); }
+      | ^~~~
+0x10e922a copy_reference_ops_from_ref(tree_node*, vec<vn_reference_op_struct, va_heap, vl_ptr>*)
+	/home/dcb38/gcc/working/gcc/../../trunk.20210101/gcc/tree-ssa-sccvn.cc:1144
+
+The bug first seems to appear sometime betweeng:48207a5f00d6ae7candg:39d989022dd0eacf.
+
+- User: Andrew Pinski | Time: 2024-02-12 22:40:26 UTC
+  Text: I am 99% sure this was caused byr14-8929-g938a419182f8c4as it was not reproducible inr14-8924.
+
+- User: Zhendong Su | Time: 2024-02-13 07:19:29 UTC
+  Text: Another related test:
+
+[534] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/home/suz/suz-local/software/local/gcc-trunk/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.1 20240213 (experimental) (GCC) 
+[535] % 
+[535] % gcctk -O1 small.c
+during GIMPLE pass: cunroll
+small.c: In function ‘main’:
+small.c:3:5: internal compiler error: in copy_reference_ops_from_ref, at tree-ssa-sccvn.cc:1156
+    3 | int main() {
+      |     ^~~~
+0x86357f copy_reference_ops_from_ref
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:1156
+0x1298c4a valueize_shared_reference_ops_from_ref
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:1837
+0x1298c4a valueize_shared_reference_ops_from_ref
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:1832
+0x1298c4a vn_reference_lookup(tree_node*, tree_node*, vn_lookup_kind, vn_reference_s**, bool, tree_node**, tree_node*, bool)
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:4042
+0x129d574 visit_reference_op_load
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:5831
+0x129d574 visit_stmt
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:6352
+0x129dc1f process_bb
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:8124
+0x129f4de do_rpo_vn_1
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:8725
+0x12a0e53 do_rpo_vn(function*, edge_def*, bitmap_head*, bool, bool, bool, vn_lookup_kind)
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:8829
+0x11f6529 tree_unroll_loops_completely
+	../../gcc-trunk/gcc/tree-ssa-loop-ivcanon.cc:1554
+0x11f6663 execute
+	../../gcc-trunk/gcc/tree-ssa-loop-ivcanon.cc:1673
+0x11f6663 execute
+	../../gcc-trunk/gcc/tree-ssa-loop-ivcanon.cc:1663
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+[536] % 
+[536] % cat small.c
+extern void d(int);
+int a[2][4], b;
+int main() {
+  while (b) {
+    int c;
+    d(a[b][c]);
+    for (c = 0; c < 7; c++)
+      ;
+  }
+  return 0;
+}
+
+- User: Richard Biener | Time: 2024-02-13 08:41:33 UTC
+  Text: I will have a look.
+
+- User: Richard Biener | Time: 2024-02-13 09:52:02 UTC
+  Text: _1 = a[b.1_14][7];
+
+we "correctly" resolve b.1_14 to 1 based on range info which is
+[-INF,-1] [1, +INF].  The thing is, the get_ref_base_and_extent code
+cannot do anything with this range but adjusting max_size to 32
+by taking [7] and the overall size of a[] (8 elements) into account.
+
+The reverse-engineering of a constant array index falls apart when facing
+with this kind of undefined behavior - and it's the checking code trying
+to verify both implementations against each other that fails.
+
+That said, it's
+
+                tree asize = TYPE_SIZE (TREE_TYPE (TREE_OPERAND (exp, 0)));
+                /* We need to adjust maxsize to the whole array bitsize.
+                   But we can subtract any constant offset seen so far,
+                   because that would get us outside of the array otherwise.  */
+                if (known_size_p (maxsize)
+                    && asize
+                    && poly_int_tree_p (asize))
+                  maxsize = wi::to_poly_offset (asize) - bit_offset;
+
+that ends up constraining the access, but the resulting offset is
+to a[1][3], and VN comes up with a[1][7].
+
+- User: Richard Biener | Time: 2024-02-13 10:06:49 UTC
+  Text: For the first testcase the issue is bitfields and 'off' being tracked in bytes.
+ao_ref_init_from_vn_reference handles this by not using 'off'.
+
+- User: GCC Commits | Time: 2024-02-13 12:42:31 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:94225dfb5623725fa519eac69338f7a632a509aecommitr14-8956-g94225dfb5623725fa519eac69338f7a632a509aeAuthor: Richard Biener <rguenther@suse.de>
+Date:   Tue Feb 13 11:10:57 2024 +0100
+
+    tree-optimization/113895 - copy_reference_ops_from_ref vs. bitfields
+    
+    The recent enhancement to discover constant array indices by range
+    info used by get_ref_base_and_extent doesn't work when the outermost
+    component reference is to a bitfield because we track the running
+    offset in the reference ops as bytes.  The following does as
+    ao_ref_init_from_vn_reference and recovers that manually, tracking
+    the offset for the purpose of discovering the constant array index
+    in bits instead.PR tree-optimization/113895* tree-ssa-sccvn.cc (copy_reference_ops_from_ref): Track
+            offset to discover constant array indices in bits, handle
+            COMPONENT_REF to bitfields.
+    
+            * gcc.dg/torture/pr113895-1.c: New testcase.
+
+- User: Richard Biener | Time: 2024-02-13 12:47:08 UTC
+  Text: The issue for thecomment#2testcase remains.
+
+- User: Zhendong Su | Time: 2024-02-13 15:06:43 UTC
+  Text: Another likely related one (though ICE during a different pass and at a different location):
+
+[519] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/home/suz/suz-local/software/local/gcc-trunk/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.1 20240213 (experimental) (GCC) 
+[520] % 
+[520] % gcctk -O1 small.c
+during GIMPLE pass: fre
+small.c: In function ‘main’:
+small.c:8:1: internal compiler error: in copy_reference_ops_from_ref, at tree-ssa-sccvn.cc:1165
+    8 | }
+      | ^
+0x863773 copy_reference_ops_from_ref
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:1165
+0x1298f9a valueize_shared_reference_ops_from_ref
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:1858
+0x1298f9a valueize_shared_reference_ops_from_ref
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:1853
+0x1298f9a vn_reference_lookup(tree_node*, tree_node*, vn_lookup_kind, vn_reference_s**, bool, tree_node**, tree_node*, bool)
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:4063
+0x129d8b4 visit_reference_op_load
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:5852
+0x129d8b4 visit_stmt
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:6373
+0x129df5f process_bb
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:8145
+0x129f81e do_rpo_vn_1
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:8746
+0x12a1253 execute
+	../../gcc-trunk/gcc/tree-ssa-sccvn.cc:8907
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+[521] % 
+[521] % cat small.c
+extern void f();
+char a[1][1], b;
+int main() {
+  int c = -1U;
+  if (b)
+    f(a[c][b]);
+  return 0;
+}
+
+- User: Richard Biener | Time: 2024-02-16 08:30:04 UTC
+  Text: Other testcase with -O3:
+
+long a, b, c;
+int d;
+long e[2][1];
+int f() {
+  if (c == a)
+    c = b;
+}
+void g() {
+  int h, i = 0;
+  for (; f() + d + i; i++)
+    e[h][i] = 4;
+}
+void main() {}
+
+- User: Richard Biener | Time: 2024-02-16 09:08:26 UTC
+  Text: (In reply to Zhendong Su fromcomment #8)> extern void f();
+> char a[1][1], b;
+> int main() {
+>   int c = -1U;
+>   if (b)
+>     f(a[c][b]);
+>   return 0;
+> }for this case, while it's also out-of-bounds, we run into the issue that
+we compute op.off to -1 but that's also used as the special value for
+"unknown".
+
+- User: GCC Commits | Time: 2024-02-16 11:52:31 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:5fd1cbfd65ef2b6dd87cd78ce6509e7d561981accommitr14-9029-g5fd1cbfd65ef2b6dd87cd78ce6509e7d561981acAuthor: Richard Biener <rguenther@suse.de>
+Date:   Fri Feb 16 10:08:43 2024 +0100
+
+    tree-optimization/113895 - consistency check fails in copy_reference_ops_from_ref
+    
+    The following addresses consistency check fails in copy_reference_ops_from_ref
+    when we are handling out-of-bound array accesses (it's almost impossible
+    to identically mimic the get_ref_base_and_extent behavior).  It also
+    addresses the case where an out-of-bound constant offset computes to a
+    -1 off which is the special value for "unknown".  This patch basically
+    turns off verification in those cases.PR tree-optimization/113895* tree-ssa-sccvn.cc (copy_reference_ops_from_ref): Disable
+            consistency checking when there are out-of-bound array
+            accesses.  Allow -1 off when from an array reference with
+            constant index.
+    
+            * gcc.dg/torture/pr113895-2.c: New testcase.
+            * gcc.dg/torture/pr113895-3.c: Likewise.
+            * gcc.dg/torture/pr113895-4.c: Likewise.
+
+- User: Richard Biener | Time: 2024-02-16 11:52:44 UTC
+  Text: This should now be fixed.
+

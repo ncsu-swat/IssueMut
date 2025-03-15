@@ -1,0 +1,369 @@
+Bug Summary: [15 Regression] wrong code at -Os (missing zero extension)
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 14.1.1
+Known to Fail: 15.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-07-11 18:55:58 UTC
+  Text: Createdattachment 58636[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -Os testcase.c
+$ ./a.out
+Aborted
+
+Diff between gcc-14 and gcc-15 asm shows the issue:
+--- a-testcase-14.s  2024-07-11 20:52:55.198377811 +0200
++++ a-testcase.s     2024-07-11 20:53:00.808377734 +0200
+@@ -8,7 +8,6 @@
+        .cfi_startproc
+        mov     ax, WORD PTR u[rip]
+        not     eax
+-   movzx   eax, ax
+        sub     edi, eax
+        movzx   eax, di
+        mov     BYTE PTR a[rax], 1
+
+
+
+
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r15-1975-20240711091856-g4e0aa05f67c-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r15-1975-20240711091856-g4e0aa05f67c-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 15.0.0 20240711 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-07-11 19:02:48 UTC
+  Text: Looks like ext_dce is doing something wrong:
+
+Processing insn:
+    8: r107:SI=zero_extend(r105:HI)
+      REG_DEAD r105:HI
+Trying to simplify pattern:
+(zero_extend:SI (reg:HI 105 [ _2 ]))
+rescanning insn with uid = 8.
+Successfully transformed to:
+(subreg:SI (reg:HI 105 [ _2 ]) 0)
+
+
+I am not sure if that is valid.
+
+Note 105 is defined as:
+(insn 7 6 8 2 (set (reg:HI 105 [ _2 ])
+        (not:HI (reg:HI 106 [ uD.2773 ]))) "/app/example.cpp":7:8 933 {*one_cmplhi2_1}
+     (expr_list:REG_DEAD (reg:HI 106 [ uD.2773 ])
+        (expr_list:REG_EQUAL (not:HI (mem/c:HI (symbol_ref:DI ("u") [flags 0x2]  <var_decl 0x78f8cd010cf0 u>) [1 uD.2773+0 S2 A16]))
+            (nil))))
+
+- User: Jeffrey A. Law | Time: 2024-07-12 19:59:51 UTC
+  Text: Fairly sure the root cause is the TImode assignments.  Based on what I'm seeing, we may have a problem with vectors as well -- worth keeping mind if there's additional bug reports against ext-dce.
+
+- User: Andreas Schwab | Time: 2024-07-14 19:01:54 UTC
+  Text: dup
+
+*** This bug has been marked as a duplicate ofbug 115916***
+
+- User: Sam James | Time: 2024-07-14 19:03:27 UTC
+  Text: (In reply to Andreas Schwab fromcomment #3)> dup
+> 
+> *** This bug has been marked as a duplicate ofbug 115916***This came first and it has a smaller testcase? The other is fine too, of course though.
+
+- User: Sam James | Time: 2024-07-14 23:10:20 UTC
+  Text: ... actually, this can't be a dupe, as the UBSAN fixup wasn't committed then?
+
+- User: Andrew Pinski | Time: 2024-07-14 23:14:06 UTC
+  Text: But it is very similar toPR 115927.
+
+- User: Jeffrey A. Law | Time: 2024-07-15 23:13:49 UTC
+  Text: ***Bug 115927has been marked as a duplicate of this bug. ***
+
+- User: Jeffrey A. Law | Time: 2024-07-17 22:27:17 UTC
+  Text: So testing my fix for this bug has exposed another secondary issue.  Assuming there's not something else lurking, then plan is to address that secondary issue, then come back to this one, then dive into the harfbuzz bug.
+
+- User: GCC Commits | Time: 2024-07-21 13:37:36 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:91e468b72dafc9dcd5dcf7915f1d0ef172264d53commitr15-2185-g91e468b72dafc9dcd5dcf7915f1d0ef172264d53Author: Jeff Law <jlaw@ventanamicro.com>
+Date:   Sun Jul 21 07:36:37 2024 -0600
+
+    [PR rtl-optimization/115877] Fix livein computation for ext-dce
+    
+    So I'm not yet sure how I'm going to break everything down, but this is easy
+    enough to break out as 1/N of ext-dce fixes/improvements.
+    
+    When handling uses in an insn, we first determine what bits are set in the
+    destination which is represented in DST_MASK.  Then we use that to refine what
+    bits are live in the source operands.
+    
+    In the source operand handling section we *modify* DST_MASK if the source
+    operand is a SUBREG (ugh!).  So if the first operand is a SUBREG, then we can
+    incorrectly compute which bit groups are live in the second operand, especially
+    if it is a SUBREG as well.
+    
+    This was seen when testing a larger set of patches on the rl78 port
+    (builtin-arith-overflow-p-7 &pr71631execution failures), so no new test for
+    this bugfix.
+    
+    Run through my tester (in conjunction with other ext-dce changes) on the
+    various cross targets.  Run individually through a bootstrap and regression
+    test cycle on x86_64 as well.
+    
+    Pushing to the trunk.PR rtl-optimization/115877gcc/
+            * ext-dce.cc (ext_dce_process_uses): Restore the value of DST_MASK
+            for reach operand.
+
+- User: GCC Commits | Time: 2024-07-21 14:42:16 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:9d8ef2711dfecd093077aef6123d9e93ea23454ecommitr15-2186-g9d8ef2711dfecd093077aef6123d9e93ea23454eAuthor: Jeff Law <jlaw@ventanamicro.com>
+Date:   Sun Jul 21 08:41:28 2024 -0600
+
+    [PR rtl-optimization/115877][2/n] Improve liveness computation for constant initialization
+    
+    While debuggingpr115877, I noticed we were failing to remove the destination
+    register from LIVENOW bitmap when it was set to a constant value.  ie  (set
+    (dest) (const_int)).  This was a trivial oversight in
+    safe_for_live_propagation.
+    
+    I don't have an example of this affecting code generation, but it certainly
+    could.  More importantly, by making LIVENOW more accurate it's easier to debug
+    when LIVENOW differs from expectations.
+    
+    As with the prior patch this has been tested as part of a larger patchset with
+    the crosses as well as individually on x86_64.
+    
+    Pushing to the trunk,PR rtl-optimization/115877gcc/
+            * ext-dce.cc (safe_for_live_propagation): Handle RTX_CONST_OBJ.
+
+- User: GCC Commits | Time: 2024-07-22 14:46:16 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:88d16194d0c8a6bdc2896c8944bfbf3e6038c9d2commitr15-2196-g88d16194d0c8a6bdc2896c8944bfbf3e6038c9d2Author: Jeff Law <jlaw@ventanamicro.com>
+Date:   Mon Jul 22 08:45:10 2024 -0600
+
+    [NFC][PR rtl-optimization/115877] Avoid setting irrelevant bit groups as live in ext-dce
+    
+    Another patch to refine liveness computations.  This should be NFC and is
+    designed to help debugging.
+    
+    In simplest terms the patch avoids setting bit groups outside the size of a
+    pseudo as live.  Consider a HImode pseudo, bits 16..63 for such a pseudo don't
+    really have meaning, yet we often set bit groups related to bits 16.63 on in
+    the liveness bitmaps.
+    
+    This makes debugging harder than it needs to be by simply having larger bitmaps
+    to verify when walking through the code in a debugger.
+    
+    This has been bootstrapped and regression tested on x86_64.  It's also been
+    tested on the crosses in my tester without regressions.
+    
+    Pushing to the trunk,PR rtl-optimization/115877gcc/
+            * ext-dce.cc (group_limit): New function.
+            (mark_reg_live): Likewise.
+            (ext_dce_process_sets): Use new functions.
+            (ext_dce_process_uses): Likewise.
+            (ext_dce_init): Likewise.
+
+- User: GCC Commits | Time: 2024-07-22 16:13:48 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:ab7c0aed52054976d0b5e12c52e82239d4277b98commitr15-2203-gab7c0aed52054976d0b5e12c52e82239d4277b98Author: Jeff Law <jlaw@ventanamicro.com>
+Date:   Mon Jul 22 10:11:57 2024 -0600
+
+    [4/n][PR rtl-optimization/115877] Correct SUBREG handling in a destination
+    
+    If we encounter something during SET handling that we can not handle, the safe
+    thing to do is to ignore the destination and continue the loop.
+    
+    We've actually been trying to do slightly better with SUBREG destinations by
+    iterating into SUBREG_REG.  It turns out that wasn't working as expected.
+    
+    The problem is once we "continue" we lose the state that we were inside the SET
+    and thus we ended up ignoring the destination completely rather than tracking
+    the SUBREG_REG object.  This could be fixed by restarting SET processing, but I
+    just don't see this as all that important to handle.  So rather than leave the
+    code as-is, not working per design, I'm twiddling it to use the common 'skip
+    subrtxs and continue' idiom used elsewhere.
+    
+    This is a prerequisite for another patch in this series.  Specifically I have a
+    patch that explicitly tracks if we skipped a destination rather than trying to
+    imply it from the state of LIVE_TMP.  So this is probably NFC right now, but
+    that's a short-lived NFC.
+    
+    Bootstrapped and regression tested on x86 and also run as part of a larger kit
+    on the crosses in my tester.PR rtl-optimization/115877gcc/
+            * ext-dce.cc (ext_dce_process_sets): More correctly handle SUBREG
+            destinations.
+
+- User: GCC Commits | Time: 2024-07-23 03:49:39 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:ad642d2c950657539777ea436b787e7fff4ec09ecommitr15-2212-gad642d2c950657539777ea436b787e7fff4ec09eAuthor: Jeff Law <jlaw@ventanamicro.com>
+Date:   Mon Jul 22 21:48:28 2024 -0600
+
+    [5/n][PR rtl-optimization/115877] Fix handling of input/output operands
+    
+    So in this patch we're correcting a failure to mark objects live in scenarios
+    like
+    
+    (set (dest) (plus (dest) (src))
+    
+    When handling set pseudos, we transfer the liveness information from LIVENOW
+    into LIVE_TMP.  LIVE_TMP is subsequently used to narrow what bit groups are
+    live for the inputs.
+    
+    The first time we process the block we may not have DEST in the LIVENOW set (it
+    may be live across the loop, but not live after the loop).  Thus we can totally
+    miss making certain objects live, resulting in incorrect code.
+    
+    The fix is pretty simple.  If LIVE_TMP is empty, then we should go ahead and
+    mark all the bit groups for the set object in LIVE_TMP.  This also removes an
+    invalid gcc_assert on the state of the liveness bitmaps.
+    
+    This showed up on pru, rl78 and/or msp430 in the testsuite.  So no new test.
+    
+    Bootstrapped and regression tested on x86_64 and also run through my tester on
+    all the cross platforms.
+    
+    Pushing to the trunk.PR rtl-optimization/115877gcc/
+            * ext-dce.cc (ext_dce_process_sets): Reasonably handle input/output
+            operands.
+            (ext_dce_rd_transfer_n): Drop bogus assertion.
+
+- User: Xi Ruoyao | Time: 2024-07-23 13:51:22 UTC
+  Text: When I'm testing a LoongArch patch, ext_dce seems removing a zero extension in libcpp/expr.cc, causing stage 2 GCC miscompiled.  Before ext_dce:
+
+(insn 110 108 115 14 (set (reg:DI 91 [ num$17 ])
+        (zero_extend:DI (subreg:QI (reg:SI 134) 0))) "../../gcc/libcpp/expr.cc":1968:17 discrim 6 129 {zero_extendqidi2}
+     (expr_list:REG_DEAD (reg:SI 134)
+        (nil)))
+
+(insn 3472 1254 1255 145 (set (reg:DI 1530)
+        (reg:DI 294 [ num$17 ])) "../../gcc/libcpp/expr.cc":1565:33 158 {*movdi_64bit}
+     (nil))
+
+(insn 1259 1258 134 145 (set (reg:DI 329 [ prephitmp_444 ])
+        (zero_extend:DI (subreg/s/v:QI (reg:DI 1530) 0))) "../../gcc/libcpp/expr.cc":1681:22 129 {zero_extendqidi2}
+     (expr_list:REG_DEAD (reg:DI 1530)
+        (nil))) 
+
+But during ext_dce:
+
+Processing insn:
+  110: r91:DI=zero_extend(r134:SI#0)
+      REG_DEAD r134:SI
+Trying to simplify pattern:
+(zero_extend:DI (subreg:QI (reg:SI 134) 0))
+rescanning insn with uid = 110.
+Successfully transformed to:
+(subreg:DI (reg:SI 134) 0)
+
+So insn 110 becomes:
+
+(insn 110 108 115 14 (set (reg:DI 91 [ num$17 ])
+        (subreg:DI (reg:SI 134) 0)) "../../gcc/libcpp/expr.cc":1968:17 discrim 6 158 {*movdi_64bit}
+     (expr_list:REG_DEAD (reg:SI 134)
+        (nil)))
+
+But insn 3472 and 1259 are not changed (i.e. in 1259 the SUBREG_PROMOTED_VAR_P, printed as "/s" isn't removed).  Subsequently the combine pass optimizes 1259 to:
+
+(insn 1259 1258 134 145 (set (reg:DI 329 [ prephitmp_444 ])
+        (reg:DI 294 [ num$17 ])) "../../gcc/libcpp/expr.cc":1681:22 158 {*movdi_64bit}
+     (expr_list:REG_DEAD (reg:DI 294 [ num$17 ])
+        (nil)))
+
+And now we are doomed.  Either insn 110 shouldn't be changed or SUBREG_PROMOTED_VAR_P in 1259 should be removed.  I see some code in ext-dce.cc removing SUBREG_PROMOTED_VAR_P but it seems this case isn't caught.
+
+I tried to make a reduced test case but failed.
+
+- User: Jeffrey A. Law | Time: 2024-07-24 01:01:40 UTC
+  Text: Xi, please file a distinct bug for the loongarch bootstrap failure.  If in the end it turns out to be the same failure as this one, when we'll close it as a dup.  Please assign that new bug to me.
+
+While I don't have loongarch hardware, I do have enough bits in place that I can bootstrap it a QEMU chroot (and in fact do so weekly).
+
+- User: Jeffrey A. Law | Time: 2024-07-24 01:06:17 UTC
+  Text: And WRT SUBREG_PROMOTED_P. We already clear it for any pseudo we optimize.  See the call to reset_subreg_promoted_p.
+
+In general I suspect we're more likely to be incorrectly computing lifetime information somewhere.  I was nearly ready to throw away much of Joern's initial rtl iterator based approach and use note_uses/note_stores last year.  And I'm even more inclined to do it now.
+
+- User: GCC Commits | Time: 2024-07-24 01:11:51 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:f9a60d575f02822852aa22513c636be38f9c63eacommitr15-2240-gf9a60d575f02822852aa22513c636be38f9c63eaAuthor: Jeff Law <jlaw@ventanamicro.com>
+Date:   Tue Jul 23 19:11:04 2024 -0600
+
+    [PR rtl-optimization/115877][6/n] Add testcase frompr115877This just adds the testcase frompr115877.  It's working now on the trunk.  I'm
+    not done with cleanups/bugfixing, but there's no reason to not have the
+    testcase installed at this point.PR rtl-optimization/115877gcc/testsuite
+            * gcc.dg/torture/pr115877.c: New test.
+
+- User: Xi Ruoyao | Time: 2024-07-24 04:08:57 UTC
+  Text: (In reply to Jeffrey A. Law fromcomment #15)> Xi, please file a distinct bug for the loongarch bootstrap failure.  If in
+> the end it turns out to be the same failure as this one, when we'll close it
+> as a dup.  Please assign that new bug to me.There's not a bootstrap failure but the miscompilation of libcpp/expr.cc causes incorrect "integer overflow in preprocessor expression" warning on
+
+#if -0
+#endif
+
+And to reproduce the issue one of my local patches is needed.  I'll gather more info before submitting a new report...
+
+- User: Xi Ruoyao | Time: 2024-07-24 06:05:05 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #14)> When I'm testing a LoongArch patch, ext_dce seems removing a zero extension
+> in libcpp/expr.cc, causing stage 2 GCC miscompiled.  Before ext_dce:
+> 
+> (insn 110 108 115 14 (set (reg:DI 91 [ num$17 ])
+>         (zero_extend:DI (subreg:QI (reg:SI 134) 0)))
+> "../../gcc/libcpp/expr.cc":1968:17 discrim 6 129 {zero_extendqidi2}
+>      (expr_list:REG_DEAD (reg:SI 134)
+>         (nil)))
+> 
+> (insn 3472 1254 1255 145 (set (reg:DI 1530)
+>         (reg:DI 294 [ num$17 ])) "../../gcc/libcpp/expr.cc":1565:33 158
+> {*movdi_64bit}
+>      (nil))
+> 
+> (insn 1259 1258 134 145 (set (reg:DI 329 [ prephitmp_444 ])
+>         (zero_extend:DI (subreg/s/v:QI (reg:DI 1530) 0)))
+> "../../gcc/libcpp/expr.cc":1681:22 129 {zero_extendqidi2}
+>      (expr_list:REG_DEAD (reg:DI 1530)
+>         (nil))) 
+> 
+> But during ext_dce:
+> 
+> Processing insn:
+>   110: r91:DI=zero_extend(r134:SI#0)
+>       REG_DEAD r134:SI
+> Trying to simplify pattern:
+> (zero_extend:DI (subreg:QI (reg:SI 134) 0))
+> rescanning insn with uid = 110.
+> Successfully transformed to:
+> (subreg:DI (reg:SI 134) 0)
+> 
+> So insn 110 becomes:
+> 
+> (insn 110 108 115 14 (set (reg:DI 91 [ num$17 ])
+>         (subreg:DI (reg:SI 134) 0)) "../../gcc/libcpp/expr.cc":1968:17
+> discrim 6 158 {*movdi_64bit}
+>      (expr_list:REG_DEAD (reg:SI 134)
+>         (nil)))
+> 
+> But insn 3472 and 1259 are not changed (i.e. in 1259 the
+> SUBREG_PROMOTED_VAR_P, printed as "/s" isn't removed).  Subsequently the
+> combine pass optimizes 1259 to:
+> 
+> (insn 1259 1258 134 145 (set (reg:DI 329 [ prephitmp_444 ])
+>         (reg:DI 294 [ num$17 ])) "../../gcc/libcpp/expr.cc":1681:22 158
+> {*movdi_64bit}
+>      (expr_list:REG_DEAD (reg:DI 294 [ num$17 ])
+>         (nil)))
+> 
+> And now we are doomed.  Either insn 110 shouldn't be changed or
+> SUBREG_PROMOTED_VAR_P in 1259 should be removed.  I see some code in
+> ext-dce.cc removing SUBREG_PROMOTED_VAR_P but it seems this case isn't
+> caught.
+> 
+> I tried to make a reduced test case but failed.
+
+- User: Jeffrey A. Law | Time: 2024-08-04 20:25:10 UTC
+  Text: This is now fixed on the trunk.
+
+- User: Jeffrey A. Law | Time: 2024-08-04 23:27:53 UTC
+  Text: ***Bug 115912has been marked as a duplicate of this bug. ***
+

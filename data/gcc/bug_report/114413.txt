@@ -1,0 +1,121 @@
+Bug Summary: BB SLP sub-graph merging fails to CSE nodes
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Richard Biener | Time: 2024-03-21 10:13:08 UTC
+  Text: The gcc.dg/vect/bb-slp-32.c shows that while we now discover both the store
+and the reduction as BB vectorization opportunities we merge the SLP
+instances into the same graph because they overlap but fail to unify
+nodes within them so both costing and code-generation is off duplicating
+the load and the adds:
+
+  <bb 2> [local count: 1073741824]:
+  _36 = {a_12(D), b_15(D), b_15(D), a_12(D)};
+  _30 = {a_12(D), b_15(D), b_15(D), a_12(D)};
+  p_10 = __builtin_assume_aligned (p_9(D), 16);
+  vectp.4_27 = p_10;
+  vect__1.5_28 = MEM <vector(4) int> [(int *)vectp.4_27];
+  vect__2.6_29 = vect__1.5_28 + { 1, 2, 3, 4 };
+  vect_tem0_13.7_31 = vect__2.6_29 + _30;
+  vectp.11_33 = p_10;
+  vect__7.12_34 = MEM <vector(4) int> [(int *)vectp.11_33];
+  vect__8.13_35 = vect__7.12_34 + { 1, 2, 3, 4 };
+  vect_tem3_22.14_37 = vect__8.13_35 + _36;
+  _1 = *p_10;
+  _2 = _1 + 1;
+  tem0_13 = _2 + a_12(D);
+  _3 = MEM[(int *)p_10 + 4B];
+  _4 = _3 + 2;
+  tem1_16 = _4 + b_15(D); 
+  sum_17 = tem0_13 + tem1_16;
+  _5 = MEM[(int *)p_10 + 8B];
+  _6 = _5 + 3;
+  tem2_19 = _6 + b_15(D);
+  sum_20 = sum_17 + tem2_19;
+  _7 = MEM[(int *)p_10 + 12B];
+  _8 = _7 + 4;
+  tem3_22 = _8 + a_12(D);
+  _38 = VIEW_CONVERT_EXPR<vector(4) unsigned int>(vect_tem3_22.14_37);
+  _39 = .REDUC_PLUS (_38);
+  _40 = (int) _39;
+  sum_23 = _40;
+  MEM <vector(4) int> [(int *)&x] = vect_tem0_13.7_31;
+  bar (&x);
+  x ={v} {CLOBBER(eos)};
+
+but the vectorization should be profitable, we CSE this to
+
+foo:
+.LFB0:
+        .cfi_startproc
+        pushq   %rbx
+        .cfi_def_cfa_offset 16
+        .cfi_offset 3, -16
+        movd    %edx, %xmm2
+        movd    %esi, %xmm0
+        movdqa  %xmm2, %xmm3
+        punpckldq       %xmm0, %xmm3
+        punpckldq       %xmm2, %xmm0
+        subq    $16, %rsp
+        .cfi_def_cfa_offset 32
+        movdqa  .LC0(%rip), %xmm1
+        paddd   (%rdi), %xmm1
+        punpcklqdq      %xmm3, %xmm0
+        movq    %rsp, %rdi
+        paddd   %xmm0, %xmm1
+        movdqa  %xmm1, %xmm0
+        movaps  %xmm1, (%rsp)
+        psrldq  $8, %xmm0
+        paddd   %xmm1, %xmm0
+        movdqa  %xmm0, %xmm2
+        psrldq  $4, %xmm2
+        paddd   %xmm2, %xmm0
+        movd    %xmm0, %ebx
+        call    bar
+        addq    $16, %rsp
+        .cfi_def_cfa_offset 16
+        movl    %ebx, %eax
+        popq    %rbx
+        .cfi_def_cfa_offset 8
+        ret
+
+in the end.
+
+- User: GCC Commits | Time: 2024-06-20 06:48:01 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:46bb4ce4d30ab749d40f6f4cef6f1fb7c7813452commitr15-1467-g46bb4ce4d30ab749d40f6f4cef6f1fb7c7813452Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Jun 19 12:57:27 2024 +0200
+
+    tree-optimization/114413 - SLP CSE after permute optimization
+    
+    We currently fail to re-CSE SLP nodes after optimizing permutes
+    which results in off cost estimates.  For gcc.dg/vect/bb-slp-32.c
+    this shows in not re-using the SLP node with the load and arithmetic
+    for both the store and the reduction.  The following implements
+    CSE by re-bst-mapping nodes as finalization part of vect_optimize_slp.
+    
+    I've tried to make the CSE part of permute materialization but it
+    isn't a very good fit there.  I've not bothered to implement something
+    more complete, also handling external defs or defs without
+    SLP_TREE_SCALAR_STMTS.
+    
+    I realize this might result in more BB SLP which in turn might slow
+    down code given costing for BB SLP is difficult (even that we now
+    vectorize gcc.dg/vect/bb-slp-32.c on x86_64 might be not a good idea).
+    This is nevertheless feeding more accurate info to costing which is
+    good.PR tree-optimization/114413* tree-vect-slp.cc (release_scalar_stmts_to_slp_tree_map):
+            New function, split out from ...
+            (vect_analyze_slp): ... here.  Call it.
+            (vect_cse_slp_nodes): New function.
+            (vect_optimize_slp): Call it.
+    
+            * gcc.dg/vect/bb-slp-32.c: Expect CSE and vectorization on x86.
+
+- User: Richard Biener | Time: 2024-06-20 07:05:04 UTC
+  Text: This should be largely fixed now, the missing piece that might be important in some cases is CSE of permutes (or two-operator nodes) and of extern CTORs.
+

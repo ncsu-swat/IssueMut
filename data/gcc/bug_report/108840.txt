@@ -1,0 +1,138 @@
+Bug Summary: Aarch64 doesn't optimize away shift counter masking
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jakub Jelinek | Time: 2023-02-17 17:59:00 UTC
+  Text: As mentioned inhttps://gcc.gnu.org/pipermail/gcc-patches/2023-February/612214.htmlaarch64 doesn't optimize away and instructions masking shift count if there is more than one shift with the same count.  Consider -O2 -fno-tree-vectorize:
+int
+foo (int x, int y)
+{
+  return x << (y & 31);
+}
+
+void
+bar (int x[3], int y)
+{
+  x[0] <<= (y & 31);
+  x[1] <<= (y & 31);
+  x[2] <<= (y & 31);
+}
+
+void
+baz (int x[3], int y)
+{
+  y &= 31;
+  x[0] <<= y;
+  x[1] <<= y;
+  x[2] <<= y;
+}
+
+void corge (int, int, int);
+
+void
+qux (int x, int y, int z, int n)
+{
+  n &= 31;
+  corge (x << n, y << n, z >> n);
+}
+
+foo is optimized correctly, combine matches the shift with masking, but in the rest of cases due to costs the desirable combination is rejected.  Shift with embedded masking of the count should have rtx_cost the same as normal shift when it is actually under the hood the shift itself.
+
+- User: Andrew Pinski | Time: 2023-02-17 18:08:44 UTC
+  Text: Confirmed:
+
+Trying 8 -> 10:
+    8: r93:SI=r108:SI&0x1f
+      REG_DEAD r108:SI
+   10: r101:SI=r102:SI<<r93:SI#0
+      REG_DEAD r102:SI
+Failed to match this instruction:
+(parallel [
+        (set (reg:SI 101)
+            (ashift:SI (reg:SI 102 [ *x_9(D) ])
+                (subreg:QI (and:SI (reg:SI 108)
+                        (const_int 31 [0x1f])) 0)))
+        (set (reg:SI 93 [ _2 ])
+            (and:SI (reg:SI 108)
+                (const_int 31 [0x1f])))
+    ])
+Failed to match this instruction:
+(parallel [
+        (set (reg:SI 101)
+            (ashift:SI (reg:SI 102 [ *x_9(D) ])
+                (subreg:QI (and:SI (reg:SI 108)
+                        (const_int 31 [0x1f])) 0)))
+        (set (reg:SI 93 [ _2 ])
+            (and:SI (reg:SI 108)
+                (const_int 31 [0x1f])))
+    ])
+Successfully matched this instruction:
+(set (reg:SI 93 [ _2 ])
+    (and:SI (reg:SI 108)
+        (const_int 31 [0x1f])))
+Successfully matched this instruction:
+(set (reg:SI 101)
+    (ashift:SI (reg:SI 102 [ *x_9(D) ])
+        (subreg:QI (and:SI (reg:SI 108)
+                (const_int 31 [0x1f])) 0)))
+rejecting combination of insns 8 and 10
+original costs 4 + 4 = 8
+replacement costs 4 + 8 = 12
+
+The replacement cost should be still 8.
+
+- User: N/A | Time: 2023-02-21 12:24:58 UTC
+  Text: I have a patch to simplify and fix the aarch64 rtx costs for this case. I'll aim it for GCC 14 as it's not a regression.
+
+- User: N/A | Time: 2023-02-24 15:37:13 UTC
+  Text: Createdattachment 54531[details]Candidate patch
+
+Candidate patch attached.
+
+- User: GCC Commits | Time: 2023-04-19 08:35:50 UTC
+  Text: The master branch has been updated by Kyrylo Tkachov <ktkachov@gcc.gnu.org>:https://gcc.gnu.org/g:136330bf637b50a4f10ace017a4316541386b9c0commitr14-62-g136330bf637b50a4f10ace017a4316541386b9c0Author: Kyrylo Tkachov <kyrylo.tkachov@arm.com>
+Date:   Wed Apr 19 09:34:40 2023 +0100
+
+    aarch64:PR target/108840Simplify register shift RTX costs and eliminate shift amount masking
+    
+    In this PR we fail to eliminate explicit &31 operations for variable shifts such as in:
+    void
+    bar (int x[3], int y)
+    {
+      x[0] <<= (y & 31);
+      x[1] <<= (y & 31);
+      x[2] <<= (y & 31);
+    }
+    
+    This is rejected by RTX costs that end up giving too high a cost for:
+    (set (reg:SI 96)
+        (ashift:SI (reg:SI 98)
+            (subreg:QI (and:SI (reg:SI 99)
+                    (const_int 31 [0x1f])) 0)))
+    
+    There is code to handle the AND-31 case in rtx costs, but it gets confused by the subreg.
+    It's easy enough to fix by looking inside the subreg when costing the expression.
+    While doing that I noticed that the ASHIFT case and the other shift-like cases are almost identical
+    and we should just merge them. This code will only be used for valid insns anyway, so the code after this
+    patch should do the Right Thing (TM) for all such shift cases.
+    
+    With this patch there are no more "and wn, wn, 31" instructions left in the testcase.
+    
+    Bootstrapped and tested on aarch64-none-linux-gnu.PR target/108840gcc/ChangeLog:
+    
+            * config/aarch64/aarch64.cc (aarch64_rtx_costs): Merge ASHIFT and
+            ROTATE, ROTATERT, LSHIFTRT, ASHIFTRT cases.  Handle subregs in op1.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/pr108840.c: New test.
+
+- User: N/A | Time: 2023-04-19 08:37:21 UTC
+  Text: Fixed for GCC 14.
+

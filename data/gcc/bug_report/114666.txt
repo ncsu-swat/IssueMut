@@ -1,0 +1,157 @@
+Bug Summary: [14 Regression] Signed single bit comparison miscompile at -O2
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-04-09 20:10:03 UTC
+  Text: Testcase:
+struct {
+  signed a : 1;
+} b = {-1};
+char c;
+int main()
+{
+  if ((b.a ^ 1UL) < 3)
+    __builtin_abort();
+}
+
+Commands:> /scratch/tc-testing/tc-apr-9/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -O2 red.c -o red.out
+> /scratch/tc-testing/tc-apr-9/build-rv64gcv/bin/qemu-riscv64 red.outzsh: IOT instruction (core dumped)  /scratch/tc-testing/tc-apr-9/build-rv64gcv/bin/qemu-riscv64 red.out> /scratch/tc-testing/tc-apr-9/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -O1 red.c -o red.out
+> /scratch/tc-testing/tc-apr-9/build-rv64gcv/bin/qemu-riscv64 red.out
+> echo $?0
+
+Godbolt showing the same issue on x86:https://godbolt.org/z/1dx8YKG3eDiscovered/tested usingr14-9877-g1f719aa7c0d(not bisected)
+
+Found via fuzzer.
+
+- User: Andrew Pinski | Time: 2024-04-09 20:16:04 UTC
+  Text: Confirmed, semi looking it into further. it has some match vs VRP going on here ...
+
+- User: Andrew Pinski | Time: 2024-04-09 20:35:35 UTC
+  Text: Folding statement: _3 = _2 ^ 1;
+Matching expression match.pd:2835, gimple-match-2.cc:35
+Matching expression match.pd:2838, gimple-match-1.cc:66
+Matching expression match.pd:2845, gimple-match-2.cc:96
+Matching expression match.pd:2243, gimple-match-5.cc:20
+Matching expression match.pd:2835, gimple-match-2.cc:35
+Matching expression match.pd:2838, gimple-match-1.cc:66
+Matching expression match.pd:2845, gimple-match-2.cc:96
+Applying pattern match.pd:6795, gimple-match-4.cc:1721
+Matching expression match.pd:2243, gimple-match-5.cc:20
+Matching expression match.pd:2286, gimple-match-3.cc:23
+Matching expression match.pd:2255, gimple-match-4.cc:67
+Matching expression match.pd:2243, gimple-match-5.cc:20
+Applying pattern match.pd:7103, gimple-match-8.cc:47279
+Applying pattern match.pd:5898, gimple-match-8.cc:47191
+gimple_simplified to _7 = (long unsigned int) _1;
+_8 = -_7;
+_3 = _8 ^ 1;
+
+That is wrong.
+
+I can't figure out how we got there though. 
+match.pd:6795 is the pattern which does `(convert)a CMP b` into `a CMP (convert)b` which I assume VRP does `_3 == 0 ? 1 : -2u` which then we get `_1 == 0 ? 1 : -2u` (which seems reasonable) and then we apply match.pd:5898 which gets us to `_1 ? -2u : 1` which seems wrong as not a boolean  type nor an one bit unsigned integer.
+
+So the problem is with:
+ /* !A ? B : C -> A ? C : B.  */
+ (simplify
+  (cnd (logical_inverted_value truth_valued_p@0) @1 @2)
+  (cnd @0 @2 @1)))
+
+which does not check the types correctly for gimple. Note this pattern has been there since 2014.
+Just been exposed the issue when I added match.pd:7103 inr14-3110-g7fb65f10285124.
+
+Let me try to figure out what to do here to fix the issue.
+
+- User: Andrew Pinski | Time: 2024-04-09 20:49:17 UTC
+  Text: With match.pd:7103 disable we get:
+
+Folding statement: _2 = (long unsigned int) _1;
+Global Exported: _2 = [irange] long unsigned int [0, 0][+INF, +INF]
+Not folded
+Folding statement: _3 = _2 ^ 1;
+Matching expression match.pd:2835, gimple-match-2.cc:35
+Matching expression match.pd:2838, gimple-match-1.cc:66
+Matching expression match.pd:2845, gimple-match-2.cc:96
+Matching expression match.pd:2243, gimple-match-5.cc:20
+Matching expression match.pd:2835, gimple-match-2.cc:35
+Matching expression match.pd:2838, gimple-match-1.cc:66
+Matching expression match.pd:2845, gimple-match-2.cc:96
+Applying pattern match.pd:6795, gimple-match-4.cc:1721
+Matching expression match.pd:2243, gimple-match-5.cc:20
+Matching expression match.pd:2286, gimple-match-3.cc:23
+Matching expression match.pd:2255, gimple-match-4.cc:67
+Matching expression match.pd:2243, gimple-match-5.cc:20
+Applying pattern match.pd:5898, gimple-match-7.cc:51777
+gimple_simplified to _3 = _1 ? 18446744073709551614 : 1;
+Global Exported: _3 = [irange] long unsigned int [1, 1][18446744073709551614, 18446744073709551614]
+Folded into: _3 = _1 ? 18446744073709551614 : 1;
+
+
+But _1 here is an 1bit signed integer which I am 100% sure is really invalid gimple but we don't reject it.
+
+We don't check the operand 0 for COND_EXPR in verify_gimple_assign_ternary at all .....
+
+- User: Andrew Pinski | Time: 2024-04-09 21:03:02 UTC
+  Text: Note the other pattern which uses logical_inverted_value where it depends on the type does:
+
+/* -(type)!A -> (type)A - 1.  */
+(simplify
+ (negate (convert?:s (logical_inverted_value:s @0)))
+ (if (INTEGRAL_TYPE_P (type)
+      && TREE_CODE (type) != BOOLEAN_TYPE
+      && TYPE_PRECISION (type) > 1
+      && TREE_CODE (@0) == SSA_NAME
+      && ssa_name_has_boolean_range (@0))
+  (plus (convert:type @0) { build_all_ones_cst (type); })))
+
+But that is ok because of the check of >1 for precision. The other one dealing with cond is a problem there.
+
+- User: Andrew Pinski | Time: 2024-04-09 21:11:58 UTC
+  Text: Send out an email on the issue of COND_EXPR:https://gcc.gnu.org/pipermail/gcc/2024-April/243709.htmlTomorrow I will fix post a fix for this (maybe both fixes for folks to select from).
+
+Note I think this is a P1 even though signed 1bit integer bitfields are less likely to show up in the wild this is a miscompile which was reported before the release ...
+
+- User: Andrew Pinski | Time: 2024-04-09 22:58:08 UTC
+  Text: Note fixing the `!A ? B : C` pattern generates worse code in this case but that is a different issue where we don't convert `a <= 2` into `a == 1` if we know only 1 could be the value that works (I have a patch which I need to work on for GCC 15).
+
+- User: Andrew Pinski | Time: 2024-04-10 22:04:02 UTC
+  Text: Createdattachment 57925[details]Patch which I am testing
+
+- User: Andrew Pinski | Time: 2024-04-11 01:10:43 UTC
+  Text: (In reply to Andrew Pinski fromcomment #7)> Createdattachment 57925[details]> Patch which I am testingLooks like I need a small tweak as gcc.dg/torture/builtin-isinf_sign-1.c fails due to the converts being added :).
+
+- User: GCC Commits | Time: 2024-04-12 17:57:27 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:245595d72818526e2ca857848831e8afa87ae2decommitr14-9941-g245595d72818526e2ca857848831e8afa87ae2deAuthor: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Wed Apr 10 13:39:01 2024 -0700
+
+    match: Fix `!a?b:c` and `a?~t:t` patterns for signed 1 bit types [PR114666]
+    
+    The problem is `!a?b:c` pattern will create a COND_EXPR with an 1bit signed integer
+    which breaks patterns like `a?~t:t`. This rejects when we have a signed operand for
+    both patterns.
+    
+    Note for GCC 15, I am going to look at the canonicalization of `a?~t:t` where t
+    was a constant since I think keeping it a COND_EXPR might be more canonical and
+    is what VPR produces from the same IR; if anything expand should handle which one
+    is better.
+    
+    Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/114666gcc/ChangeLog:
+    
+            * match.pd (`!a?b:c`): Reject signed types for the condition.
+            (`a?~t:t`): Likewise.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/execute/bitfld-signed1-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-04-12 17:57:46 UTC
+  Text: Fixed.
+

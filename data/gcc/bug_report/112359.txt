@@ -1,0 +1,116 @@
+Bug Summary: [14 Regression] ICE: in expand_fn_using_insn, at internal-fn.cc:215 with -O -ftree-loop-if-convert -mavx512fp16
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 13.2.1
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-11-03 06:00:17 UTC
+  Text: Createdattachment 56498[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O -ftree-loop-if-convert -mavx512fp16 testcase.c
+during RTL pass: expand
+testcase.c: In function 'foo':
+testcase.c:5:1: internal compiler error: in expand_fn_using_insn, at internal-fn.cc:215
+    5 | foo (void)
+      | ^~~
+0x788f3f expand_fn_using_insn
+        /repo/gcc-trunk/gcc/internal-fn.cc:215
+0xf4bbcf expand_call_stmt
+        /repo/gcc-trunk/gcc/cfgexpand.cc:2737
+0xf4bbcf expand_gimple_stmt_1
+        /repo/gcc-trunk/gcc/cfgexpand.cc:3880
+0xf4bbcf expand_gimple_stmt
+        /repo/gcc-trunk/gcc/cfgexpand.cc:4044
+0xf5218e expand_gimple_basic_block
+        /repo/gcc-trunk/gcc/cfgexpand.cc:6100
+0xf53e67 execute
+        /repo/gcc-trunk/gcc/cfgexpand.cc:6835
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-5093-20231103113523-gc3847ca0571-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-5093-20231103113523-gc3847ca0571-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20231103 (experimental) (GCC)
+
+- User: Richard Biener | Time: 2023-11-03 08:11:13 UTC
+  Text: Confirmed.  We get
+
+_ifc__24 = .COND_IOR (_30, u_lsm.8_6, ivtmp.16_8, u_lsm.8_6);
+
+we shouldn't have generated these outside of if (vectorized) versions or when
+not vectorizing.  I see we discover this opportunities "late", after deciding
+whether to version the loop or not.  We have to refrain from taking the
+opportunity when we didn't version.
+
+- User: Robin Dapp | Time: 2023-11-06 12:03:31 UTC
+  Text: Would something like
+
++  bool allow_cond_op = flag_tree_loop_vectorize
++    && !gimple_bb (phi)->loop_father->dont_vectorize;
+
+in convert_scalar_cond_reduction be sufficient or are the more conditions to check still?  Testing with the above and the reduced testcase worked FWIW.
+
+- User: rguenther@suse.de | Time: 2023-11-06 12:35:05 UTC
+  Text: On Mon, 6 Nov 2023, rdapp at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=112359> 
+> ---Comment #2from Robin Dapp <rdapp at gcc dot gnu.org> ---
+> Would something like
+> 
+> +  bool allow_cond_op = flag_tree_loop_vectorize
+> +    && !gimple_bb (phi)->loop_father->dont_vectorize;
+> 
+> in convert_scalar_cond_reduction be sufficient or are the more conditions to
+> check still?  Testing with the above and the reduced testcase worked FWIW.You want, in tree_if_conversion (), remember whether we versioned the
+loop as part of
+
+  if (need_to_lower_bitfields
+      || need_to_predicate
+      || any_complicated_phi
+      || flag_tree_loop_if_convert != 1)
+    {
+...
+
+and pass that as flag to combine_blocks and down to
+predicate_all_scalar_phis (or add a new global flag).  Ideally we'd
+do the convert_scalar_cond_reduction analysis beforehand and force
+versioning for the case we'd generate a .COND_* instead of deciding
+at code-generation only (when it's too late to do the required
+versioning).
+
+- User: GCC Commits | Time: 2023-11-07 21:38:02 UTC
+  Text: The master branch has been updated by Robin Dapp <rdapp@gcc.gnu.org>:https://gcc.gnu.org/g:fd940d248bfccb6994794152681dc4c693160919commitr14-5231-gfd940d248bfccb6994794152681dc4c693160919Author: Robin Dapp <rdapp@ventanamicro.com>
+Date:   Mon Nov 6 11:24:37 2023 +0100
+
+    vect/ifcvt: Add vec_cond fallback and check for vector versioning.
+    
+    This restricts tree-ifcvt to only create COND_OPs when we versioned the
+    loop for vectorization.  Apart from that it re-creates a VEC_COND_EXPR
+    in vect_expand_fold_left if we emitted a COND_OP.
+    
+    gcc/ChangeLog:PR tree-optimization/112361PR target/112359PR middle-end/112406* tree-if-conv.cc (convert_scalar_cond_reduction): Remember if
+            loop was versioned and only then create COND_OPs.
+            (predicate_scalar_phi): Do not create COND_OP when not
+            vectorizing.
+            * tree-vect-loop.cc (vect_expand_fold_left): Re-create
+            VEC_COND_EXPR.
+            (vectorize_fold_left_reduction): Pass mask to
+            vect_expand_fold_left.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr112359.c: New test.
+
+- User: Richard Biener | Time: 2023-11-08 06:59:44 UTC
+  Text: Fixed.
+

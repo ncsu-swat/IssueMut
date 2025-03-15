@@ -1,0 +1,154 @@
+Bug Summary: [14 Regression] vectorizer is introducing out of bounds memory access
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 13.1.0
+Known to Fail: 14.0
+
+Comments:
+- User: Krister Walfridsson | Time: 2023-11-27 22:30:36 UTC
+  Text: The following function (from gcc.dg/torture/pr68379.c)
+
+  int a, b[3], c[3][5];
+
+  void
+  fn1 ()
+  {
+    int e;
+    for (a = 2; a >= 0; a--)
+      for (e = 0; e < 4; e++)
+        c[a][e] = b[a];
+  }
+
+generates out of bound memory access (where the three movdqu instructions read 1, 2, and 3 elements before b) when compiled as -O3 for x86_64:
+
+  fn1:
+    movdqu  b-4(%rip), %xmm1
+    movdqu  b-8(%rip), %xmm2
+    movl    $-1, a(%rip)
+    movdqu  b-12(%rip), %xmm3
+    pshufd  $255, %xmm1, %xmm0
+    movups  %xmm0, c+40(%rip)
+    pshufd  $255, %xmm2, %xmm0
+    movups  %xmm0, c+20(%rip)
+    pshufd  $255, %xmm3, %xmm0
+    movaps  %xmm0, c(%rip)
+    ret
+
+The vector operations were introduced by the "vect" pass.
+
+- User: Andrew Pinski | Time: 2023-11-27 22:44:15 UTC
+  Text: vect__14.12_2 = MEM <vector(4) int> [(int *)&b + -4B];
+  vect__14.14_16 = VEC_PERM_EXPR <vect__14.12_2, vect__14.12_2, { 3, 3, 3, 3 }>;
+
+
+This might be ok, unless before b is unaligned and what is before is unmapped.
+
+  # vectp_b.10_23 = PHI <vectp_b.10_13(5), &MEM <int[3]> [(void *)&b + -4B](2)>
+  vect__14.12_1 = MEM <vector(4) int> [(int *)vectp_b.10_23];
+  vect__14.13_10 = VEC_PERM_EXPR <vect__14.12_1, vect__14.12_1, { 3, 2, 1, 0 }>;
+  vectp_b.10_11 = vectp_b.10_23 + 12;
+  vect__14.14_12 = VEC_PERM_EXPR <vect__14.13_10, vect__14.13_10, { 0, 0, 0, 0 }>;
+
+
+Note GCC 13 was ok:
+  _1 = b[2];
+  _2 = {_1, _1, _1, _1};
+  MEM <vector(4) int> [(int *)&c + 40B] = _2;
+
+- User: Richard Biener | Time: 2023-11-28 12:10:06 UTC
+  Text: The vectorizer sees
+
+  <bb 3> [local count: 214748368]:
+  # a.3_5 = PHI <_2(5), 2(2)>
+  # ivtmp_9 = PHI <ivtmp_3(5), 3(2)>
+  _14 = b[a.3_5];
+  c[a.3_5][0] = _14;
+  c[a.3_5][1] = _14;
+  c[a.3_5][2] = _14;
+  c[a.3_5][3] = _14;
+  _2 = a.3_5 + -1;
+  ivtmp_3 = ivtmp_9 - 1;
+  if (ivtmp_3 != 0)
+    goto <bb 5>; [89.00%]
+  else
+    goto <bb 4>; [11.00%]
+
+  <bb 5> [local count: 191126048]:
+  goto <bb 3>; [100.00%]
+
+and uses SLP, this is likely caused by my patch to allow non-grouped-loads
+there.
+
+t.c:7:17: note:   node 0x4637048 (max_nunits=4, refcnt=1) vector(4) int
+t.c:7:17: note:   op template: _14 = b[a.3_5];
+t.c:7:17: note:         stmt 0 _14 = b[a.3_5];
+t.c:7:17: note:         stmt 1 _14 = b[a.3_5];
+t.c:7:17: note:         stmt 2 _14 = b[a.3_5];
+t.c:7:17: note:         stmt 3 _14 = b[a.3_5];
+t.c:7:17: note:         load permutation { 0 0 0 0 }
+
+I think we need to force strided-SLP for them.
+
+- User: Richard Biener | Time: 2023-12-11 13:43:40 UTC
+  Text: Runtime testcase:
+
+#include <sys/mman.h>
+#include <unistd.h>
+
+int a, c[3][5];
+
+void __attribute__((noipa))
+fn1 (int * __restrict b)
+{
+  int e;
+  for (a = 2; a >= 0; a--)
+    for (e = 0; e < 4; e++)
+      c[a][e] = b[a];
+}
+
+int main()
+{
+  long pgsz = sysconf (_SC_PAGESIZE);
+  void *p = mmap (NULL, pgsz * 2, PROT_READ|PROT_WRITE,
+     MAP_ANONYMOUS|MAP_PRIVATE, 0, 0);
+  if (p == MAP_FAILED)
+    return 0;
+  mprotect (p, pgsz, PROT_NONE);
+  fn1 (p + pgsz);
+  return 0;
+}
+
+- User: GCC Commits | Time: 2023-12-12 14:26:55 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:6d0b0806eb638447c3184c59d996c2f178553d45commitr14-6459-g6d0b0806eb638447c3184c59d996c2f178553d45Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Dec 11 14:39:48 2023 +0100
+
+    tree-optimization/112736 - avoid overread with non-grouped SLP load
+    
+    The following aovids over/under-read of storage when vectorizing
+    a non-grouped load with SLP.  Instead of forcing peeling for gaps
+    use a smaller load for the last vector which might access excess
+    elements.  This builds upon the existing optimization avoiding
+    peeling for gaps, generalizing it to all gap widths leaving a
+    power-of-two remaining number of elements (but it doesn't replace
+    or improve that particular case at this point).
+    
+    I wonder if the poly relational compares I set up are good enough
+    to guarantee /* remain should now be > 0 and < nunits.  */.
+    
+    There is existing test coverage that runs into /* DR will be unused.  */
+    always when the gap is wider than nunits.  Compared to the
+    existing gap == nunits/2 case this only adjusts the load that will
+    cause the overrun at the end, not every load.  Apart from the
+    poly relational compares it should reliably cover these cases but
+    I'll leave it for stage1 to remove.PR tree-optimization/112736* tree-vect-stmts.cc (vectorizable_load): Extend optimization
+            to avoid peeling for gaps to handle single-element non-groups
+            we now allow with SLP.
+    
+            * gcc.dg/torture/pr112736.c: New testcase.
+
+- User: Richard Biener | Time: 2023-12-12 14:27:29 UTC
+  Text: Fixed.
+

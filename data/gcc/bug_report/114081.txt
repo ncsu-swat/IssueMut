@@ -1,0 +1,114 @@
+Bug Summary: [14 regression] ICE in verify_dominators when building php-8.3.3 (error: dominator of 16 should be 111, not 3) since r14-6822
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sam James | Time: 2024-02-23 16:14:46 UTC
+  Text: Createdattachment 57513[details]filter.i.xz
+
+(I need to work around another problem with broken unwinding, so someone else will need to post a proper bt here.)
+
+```
+$ x86_64-pc-linux-gnu-cc -Iext/filter/ -I/var/tmp/portage/dev-lang/php-8.3.3/work/sapis-build/cli/ext/filter/ -I/var/tmp/portage/dev-lang/php-8.3.3/work/sapis-build/cli/include -I/var/tmp/portage/dev-lang/php-8.3.3/work/sapis-build/cli/main -I/var/tmp/portage/dev-lang/php-8.3.3/work/sapis-build/cli -I/usr/include/valgrind -I/var/tmp/portage/dev-lang/php-8.3.3/work/sapis-build/cli/ext/date/lib -I/usr/include/libxml2 -I/var/tmp/portage/dev-lang/php-8.3.3/work/sapis-build/cli/ext/mbstring/libmbfl -I/var/tmp/portage/dev-lang/php-8.3.3/work/sapis-build/cli/ext/mbstring/libmbfl/mbfl -I/usr/include/pspell -I/var/tmp/portage/dev-lang/php-8.3.3/work/sapis-build/cli/TSRM -I/var/tmp/portage/dev-lang/php-8.3.3/work/sapis-build/cli/Zend  -D_GNU_SOURCE  -fno-common -Wstrict-prototypes -Wformat-truncation -Wlogical-op -Wduplicated-cond -Wno-clobbered -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -O3 -march=native -mtls-dialect=gnu2 -fno-semantic-interposition -pipe -fno-vect-cost-model -Wa,-O2 -Wa,-mtune=znver2 -fdiagnostics-color=always -fdiagnostics-urls=never -frecord-gcc-switches -Wreturn-type -Walloc-size -Wfree-nonheap-object -Wstrict-aliasing=2 -Wbuiltin-declaration-mismatch -Wformat -Wformat-security -Waddress -Warray-bounds -Wfree-nonheap-object -Wint-to-pointer-cast -Wmain -Wnonnull -Wodr -Wreturn-type -Wsizeof-pointer-memaccess -Wstrict-aliasing -Wstring-compare -Wuninitialized -Wvarargs -fvisibility=hidden -Wimplicit-fallthrough=1 -DZEND_SIGNALS   -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -c /var/tmp/portage/dev-lang/php-8.3.3/work/sapis-build/cli/ext/filter/filter.c -o ext/filter/filter.lo  -MMD -MF ext/filter/filter.dep -MT ext/filter/filter.lo -save-temps
+x86_64-pc-linux-gnu-cc: warning: ‘-pipe’ ignored because ‘-save-temps’ specified
+/var/tmp/portage/dev-lang/php-8.3.3/work/sapis-build/cli/ext/filter/filter.c: In function ‘php_zval_filter.constprop’:
+/var/tmp/portage/dev-lang/php-8.3.3/work/sapis-build/cli/ext/filter/filter.c:247:13: error: dominator of 16 should be 111, not 3
+  247 | static void php_zval_filter(zval *value, zend_long filter, zend_long flags, zval *options, char* charset, bool copy) /* {{{ */
+      |             ^~~~~~~~~~~~~~~
+during GIMPLE pass: vect
+/var/tmp/portage/dev-lang/php-8.3.3/work/sapis-build/cli/ext/filter/filter.c:247:13: internal compiler error: in verify_dominators, at dominance.cc:1194
+0x563590c8a390 verify_dominators(cdi_direction) [clone .constprop.0]
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/dominance.cc:1194
+
+/var/tmp/portage/dev-lang/php-8.3.3/work/sapis-build/cli/ext/filter/filter.c:247:13: internal compiler error: Segmentation fault
+```
+
+- User: Sam James | Time: 2024-02-23 16:15:28 UTC
+  Text: I can reproduce with: gcc -c ./ext/filter/filter.i -march=znver2 -fno-vect-cost-model -O3.
+
+- User: Andrew Pinski | Time: 2024-02-23 18:18:19 UTC
+  Text: Createdattachment 57515[details]Reduced
+
+- User: Andrew Pinski | Time: 2024-02-23 18:18:36 UTC
+  Text: Confirmed.
+
+- User: Andrew Pinski | Time: 2024-02-23 18:21:04 UTC
+  Text: (In reply to Sam James fromcomment #1)> I can reproduce with: gcc -c ./ext/filter/filter.i -march=znver2
+> -fno-vect-cost-model -O3.`-O3 -fno-vect-cost-model -mavx2` is enough with my reduced testcase.
+
+- User: Jakub Jelinek | Time: 2024-02-23 18:28:24 UTC
+  Text: Bisected tor14-6822-g01f4251b8775c832a92d55e2df57c9ac72eaceef
+
+- User: Tamar Christina | Time: 2024-02-23 19:04:39 UTC
+  Text: slightly cleaned up testcase
+
+---
+typedef struct filter_list_entry {
+  const char *name;
+  int id;
+  void (*function)();
+} filter_list_entry;
+
+static const filter_list_entry filter_list[9] = {0};
+
+void php_zval_filter(int filter, int id1) {
+  filter_list_entry filter_func;
+
+  int size = 9;
+  for (int i = 0; i < size; ++i) {
+    if (filter_list[i].id == filter) {
+      filter_func = filter_list[i];
+      goto done;
+    }
+  }
+
+#pragma GCC novector
+  for (int i = 0; i < size; ++i) {
+    if (filter_list[i].id == 0x0204) {
+      filter_func = filter_list[i];
+      goto done;
+    }
+  }
+done:
+  if (!filter_func.id)
+    filter_func.function();
+}
+---
+
+seems to happen because it's doing an inner loop vect with two loops that have early exits to the same destination.
+
+      if (multiple_exits_p)
+	{
+	  update_loop = new_loop;
+	  doms = get_all_dominated_blocks (CDI_DOMINATORS, loop->header);
+	  for (unsigned i = 0; i < doms.length (); ++i)
+	    if (flow_bb_inside_loop_p (loop, doms[i]))
+	      doms.unordered_remove (i);
+	}
+
+was supposed to update the dominators but something goes wrong.
+
+Mine, but for monday..
+
+- User: GCC Commits | Time: 2024-02-27 08:12:16 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:8a5d9409584aeb777b06f9c19c7d1a3552d496adcommitr14-9191-g8a5d9409584aeb777b06f9c19c7d1a3552d496adAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Feb 26 15:17:43 2024 +0100
+
+    tree-optimization/114081 - dominator update for prologue peeling
+    
+    The following implements manual update for multi-exit loop prologue
+    peeling during vectorization.PR tree-optimization/114081* tree-vect-loop-manip.cc (slpeel_tree_duplicate_loop_to_edge_cfg):
+            Perform manual dominator update for prologue peeling.
+            (vect_do_peeling): Properly update dominators after adding the
+            prologue-around guard.
+    
+            * gcc.dg/vect/vect-early-break_121-pr114081.c: New testcase.
+
+- User: Richard Biener | Time: 2024-02-27 08:12:34 UTC
+  Text: The testcase is now fixed for me.
+

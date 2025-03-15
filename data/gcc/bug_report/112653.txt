@@ -1,0 +1,234 @@
+Bug Summary: PTA should handle correctly escape information of values returned by a function
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: alias, missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jan Hubicka | Time: 2023-11-21 15:11:46 UTC
+  Text: In this testcase (losely based on libstdc++ implementation of vectors)
+I we should be able to turn memmove to memcpy because we know that the two parameters can not alias
+#include <stdlib.h>
+#include <string.h>
+char *test;
+char *
+copy_test ()
+{
+        char *test2 = malloc (1000);
+        memmove (test2, test, 1000);
+        return test2;
+}
+
+- User: Andrew Pinski | Time: 2023-11-21 21:14:50 UTC
+  Text: Confirmed, I had thought that this was recorded before too ...
+
+- User: Sam James | Time: 2023-11-21 21:28:21 UTC
+  Text: SeePR82898especially...
+
+- User: Jan Hubicka | Time: 2023-11-21 21:44:35 UTC
+  Text: PR82898testcases seems to be about type based alias analysis. However PTA should be useable here.
+
+- User: Richard Biener | Time: 2023-11-22 10:46:04 UTC
+  Text: We do use the alias oracle in folding memmove:
+
+          /* If the destination and source do not alias optimize into
+             memcpy as well.  */
+          if ((is_gimple_min_invariant (dest)
+               || TREE_CODE (dest) == SSA_NAME)
+              && (is_gimple_min_invariant (src)
+                  || TREE_CODE (src) == SSA_NAME))
+            {
+              ao_ref destr, srcr;
+              ao_ref_init_from_ptr_and_size (&destr, dest, len);
+              ao_ref_init_from_ptr_and_size (&srcr, src, len);
+              if (!refs_may_alias_p_1 (&destr, &srcr, false))
+                {
+                  tree fn;
+                  fn = builtin_decl_implicit (BUILT_IN_MEMCPY);
+                  if (!fn)
+                    return false;
+
+but the issue is that test2 escapes which makes this conflict:
+
+  # PT = null { D.2775 } (escaped, escaped heap)
+  # ALIGN = 8, MISALIGN = 0
+  # USE = nonlocal escaped
+  # CLB = nonlocal escaped
+  test2_4 = __builtin_malloc (1000);
+  # PT = nonlocal escaped null
+  test.0_1 = test;
+  __builtin_memmove (test2_4, test.0_1, 1000);
+
+it works for
+
+char *test, *test3;
+void
+copy_test ()
+{
+        char *test2 = __builtin_malloc (1000);
+        __builtin_memmove (test2, test, 1000);
+        __builtin_memmove (test3, test2, 1000);
+  __builtin_free (test2);
+}
+
+where both memmove calls become memcpy.  So this isn't asking for better
+folding but for better pointer analysis I guess.
+
+- User: Jan Hubicka | Time: 2023-11-22 13:27:11 UTC
+  Text: > but the issue is that test2 escapes which makes this conflict:It is passed to memmove which is noescape and returned.  Why local PTA
+considers returned values to escape?
+
+- User: Richard Biener | Time: 2023-11-22 14:29:58 UTC
+  Text: (In reply to Jan Hubicka fromcomment #5)> > but the issue is that test2 escapes which makes this conflict:
+> 
+> It is passed to memmove which is noescape and returned.  Why local PTA
+> considers returned values to escape?The pointed to memory escapes which means that stores to it are not dead.
+Mind we do not have a separate points-to set for escaped via return
+(some functions can also "return" like via EH or longjmp, and we can't
+really know the latter w/o IPA analysis).  Pointers can also escape to
+global memory.
+
+Special-casing the regular return path is sth that's possible (also IPA
+points-to doesn't compute a "local" escaped at all but preserves the
+non-IPA solution for that), but in the end it didn't seem important
+enough for me to try doing that ...
+
+We have the function entry state which is NONLOAL, ESCAPED is what
+determines "global memory" for all sorts of optimizations.  If we
+split out RETURN_ESCAPED then that would be ESCAPED | RETURN_ESCAPED
+and alias disambiguation could avoid RETURN_ESCAPED.
+
+But ESCAPED handling is complicated already ...
+
+- User: Jan Hubicka | Time: 2023-11-23 15:10:02 UTC
+  Text: Thanks for explanation.  I think it is quite common pattern that new object is construted and worked on and later returned, so I think we ought to handle this correctly.
+
+Another example just came up inhttps://gcc.gnu.org/pipermail/gcc-patches/2023-November/637878.htmlWe should gnerate same code for the following two functions:
+
+#include <vector>
+
+auto
+f()
+{
+  std::vector<int> x;
+  x.reserve(10);
+  for (int i = 0; i < 10; ++i)
+    x.push_back(0);
+  return x;
+}
+
+auto
+g()
+{ return std::vector<int>(10, 0); }
+
+
+but we don't since we lose track of values stored in x after every call to new.
+
+- User: Jan Hubicka | Time: 2023-11-24 23:25:05 UTC
+  Text: On ARM32 and other targets methods returns this pointer.  Togher with making return value escape this probably completely disables any chance for IPA tracking of C++ data types...
+
+- User: rguenther@suse.de | Time: 2023-11-27 07:27:25 UTC
+  Text: On Fri, 24 Nov 2023, hubicka at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=112653> 
+> ---Comment #8from Jan Hubicka <hubicka at gcc dot gnu.org> ---
+> On ARM32 and other targets methods returns this pointer.  Togher with making
+> return value escape this probably completely disables any chance for IPA
+> tracking of C++ data types...Note that all call and global var escapes would also go to
+"return escape", so the only extra bit you get is the reverse,
+what escapes the explicit return doesn't escape through calls.
+We'd have
+
+RETURN_ESCAPE = ESCAPED
+
+And handle return by adding to RETURN_ESCAPED but not ESCAPED.
+Then for example DSE needs to properly query whether sth escaped
+through function return (ptr_deref_may_alias_global_p & friends).
+
+The cost is an extra bitmap in struct function.
+
+I will have a look if it's reasonably easy to implement.
+
+- User: Richard Biener | Time: 2023-11-27 07:27:46 UTC
+  Text: Mine.
+
+- User: Richard Biener | Time: 2023-11-27 09:02:32 UTC
+  Text: (In reply to Jan Hubicka fromcomment #8)> On ARM32 and other targets methods returns this pointer.  Togher with making
+> return value escape this probably completely disables any chance for IPA
+> tracking of C++ data types...Note 'this' is "escaped" anyway since it points to incoming memory.  Improving
+handling of 'return' really _only_ helps function-local allocated storage,
+_nothing_ else.  Which is why it wasn't priority at all as it didn't look
+to be enabling any (important) transforms.
+
+- User: Richard Biener | Time: 2023-11-27 09:23:15 UTC
+  Text: Hmm,r10-900-ged315c041f48f4contained related work(?), but a typo(?):
+
+@@ -4976,7 +5002,12 @@ find_func_aliases (struct function *fn, gimple *origt)
+       greturn *return_stmt = as_a <greturn *> (t);
+       fi = NULL;
+       if (!in_ipa_mode
+-         || !(fi = get_vi_for_tree (fn->decl)))
++         && SSA_VAR_P (gimple_return_retval (return_stmt)))
++       {
++         /* We handle simple returns by post-processing the solutions.  */
++         ;
++       }
++      if (!(fi = get_vi_for_tree (fn->decl)))
+        make_escape_constraint (gimple_return_retval (return_stmt));
+
+the 2nd 'if' should be an 'else if', otherwise the code is dead.  It doesn't
+really help the testcase since 'test2' is still marked escaped but 2nd
+level points-to effects of making the var escaped would be not there.
+
+So instead of full-blown tracking of return_escaped one could fix the above
+(will test for negative impact separately ...) and then compute
+return_escaped during post-processing only.  But I first have to understand
+the post-processing code.
+
+- User: GCC Commits | Time: 2023-11-27 14:39:21 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:f7884f7673444b8a2c10ea0981d480f2e82dd16acommitr14-5879-gf7884f7673444b8a2c10ea0981d480f2e82dd16aAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Nov 27 10:20:02 2023 +0100
+
+    tree-optimization/112653 - PTA and return
+    
+    The following separates the escape solution for return stmts not
+    only during points-to solving but also for later querying.  This
+    requires adjusting the points-to-global tests to include escapes
+    through returns.  Technically the patch replaces the existing
+    post-processing which computes the transitive closure of the
+    returned value solution by a proper artificial variable with
+    transitive closure constraints.  Instead of adding the solution
+    to escaped we track it separately.PR tree-optimization/112653* gimple-ssa.h (gimple_df): Add escaped_return solution.
+            * tree-ssa.cc (init_tree_ssa): Reset it.
+            (delete_tree_ssa): Likewise.
+            * tree-ssa-structalias.cc (escaped_return_id): New.
+            (find_func_aliases): Handle non-IPA return stmts by
+            adding to ESCAPED_RETURN.
+            (set_uids_in_ptset): Adjust HEAP escaping to also cover
+            escapes through return.
+            (init_base_vars): Initialize ESCAPED_RETURN.
+            (compute_points_to_sets): Replace ESCAPED post-processing
+            with recording the ESCAPED_RETURN solution.
+            * tree-ssa-alias.cc (ref_may_alias_global_p_1): Check
+            the ESCAPED_RETUNR solution.
+            (dump_alias_info): Dump it.
+            * cfgexpand.cc (update_alias_info_with_stack_vars): Update it.
+            * ipa-icf.cc (sem_item_optimizer::fixup_points_to_sets):
+            Likewise.
+            * tree-inline.cc (expand_call_inline): Reset it.
+            * tree-parloops.cc (parallelize_loops): Likewise.
+            * tree-sra.cc (maybe_add_sra_candidate): Check it.
+    
+            * gcc.dg/tree-ssa/pta-return-1.c: New testcase.
+
+- User: Richard Biener | Time: 2023-11-27 14:39:44 UTC
+  Text: Fixed.
+
+- User: Jan Hubicka | Time: 2023-11-27 17:53:27 UTC
+  Text: Thanks a lot for working on this!  I think it is quite importnat part of
+the puzzle of making libstdc++ vector working reasonably well.
+
+- User: Thomas Schwinge | Time: 2024-03-19 15:25:49 UTC
+  Text: By means of facilitating an additional '-Wuninitialized' diagnostic, this commitr14-5879-gf7884f7673444b8a2c10ea0981d480f2e82dd16a"tree-optimization/112653 - PTA and return" found a bug in GCC/Rust front end C++ constructor code: see <https://github.com/Rust-GCC/gccrs/pull/2916> "`Block.Rust::AST::ExprWithoutBlock::Rust::AST::Expr.Rust::AST::Expr::node_id’ is used uninitialized [-Werror=uninitialized]`".  :-)
+

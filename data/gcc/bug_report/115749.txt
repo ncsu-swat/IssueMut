@@ -1,0 +1,368 @@
+Bug Summary: Non optimal assembly for integer modulo by a constant on x86-64 CPUs
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: N/A | Time: 2024-07-02 09:31:17 UTC
+  Text: Hi,
+
+I have debugged a performance issue in one of my C++ applications on x86-64 CPUs where GCC produces noticeably slower code (using all GCC versions) than Clang. I was able to find that the performance issue was caused by GCC not using the mulx instruction from BMI2 even when compiling with -mbmi2. Clang on the other hand used the mulx instruction producing a shorter and faster assembly sequence. For this particular code sequence Clang used up to 30% fewer instructions than GCC.
+
+Here is a minimal C/C++ code snippet that reproduces the issue:
+
+
+extern const unsigned long array[240];
+
+unsigned long func(unsigned long x)
+{
+    unsigned long index = x / 240;
+    return array[index % 240];
+}
+
+
+
+GCC trunk produces the following 15 instruction assembly sequence (without mulx) when compiled using -O3 -mbmi2:
+
+func(unsigned long):
+        movabs  rcx, -8608480567731124087
+        mov     rax, rdi
+        mul     rcx
+        mov     rdi, rdx
+        shr     rdi, 7
+        mov     rax, rdi
+        mul     rcx
+        shr     rdx, 7
+        mov     rax, rdx
+        sal     rax, 4
+        sub     rax, rdx
+        sal     rax, 4
+        sub     rdi, rax
+        mov     rax, QWORD PTR array[0+rdi*8]
+        ret
+
+
+Clang trunk produces the following shorter and faster 12 instruction assembly sequence (with mulx) when compiled using -O3 -mbmi2:
+
+func(unsigned long):                               # @func(unsigned long)
+        movabs  rax, -8608480567731124087
+        mov     rdx, rdi
+        mulx    rdx, rdx, rax
+        shr     rdx, 7
+        movabs  rax, 153722867280912931
+        mulx    rax, rax, rax
+        shr     eax
+        imul    eax, eax, 240
+        sub     edx, eax
+        mov     rax, qword ptr [rip + array@GOTPCREL]
+        mov     rax, qword ptr [rax + 8*rdx]
+        ret
+
+- User: N/A | Time: 2024-07-02 11:36:46 UTC
+  Text: I played a bit more with my C/C++ code snippet and managed to further simplify it. The GCC performance issue seems to be mostly caused by GCC producing worse assembly than Clang for the integer modulo by a constant on x86-64 CPUs:
+
+unsigned long func(unsigned long x)
+{
+    return x % 240;
+}
+
+
+GCC trunk produces the following 11 instruction assembly sequence (without mulx) when compiled using -O3 -mbmi2:
+
+func:
+        movabs  rax, -8608480567731124087
+        mul     rdi
+        mov     rax, rdx
+        shr     rax, 7
+        mov     rdx, rax
+        sal     rdx, 4
+        sub     rdx, rax
+        mov     rax, rdi
+        sal     rdx, 4
+        sub     rax, rdx
+        ret
+
+Clang trunk produces the following shorter and faster 8 instruction assembly sequence (with mulx) when compiled using -O3 -mbmi2:
+
+func:
+        mov     rax, rdi
+        movabs  rcx, -8608480567731124087
+        mov     rdx, rdi
+        mulx    rcx, rcx, rcx
+        shr     rcx, 7
+        imul    rcx, rcx, 240
+        sub     rax, rcx
+        ret
+
+In my first post one can see that Clang uses mulx for both the integer division by a constant and the integer modulo by a constant, while GCC does not use mulx. However, for the integer division by a constant GCC uses the same number of instructions as Clang (even without GCC using mulx) but for the integer modulo by a constant GCC uses up to 30% more instructions and is noticeably slower.
+
+Please note that Clang's assembly is also shorter (8 asm instructions) than GCC's assembly for the integer modulo by a constant on x86-64 CPUs when compiling without -mbmi2 e.g. with just -O3:
+
+func:
+        movabs  rcx, -8608480567731124087
+        mov     rax, rdi
+        mul     rcx
+        shr     rdx, 7
+        imul    rax, rdx, 240
+        sub     rdi, rax
+        mov     rax, rdi
+        ret
+
+- User: Andrew Pinski | Time: 2024-07-02 11:44:49 UTC
+  Text: This seems like a tuning issue. In that gcc thinks the shifts and stuff is faster than mulx.
+
+What happens if you do -march=native?
+
+Does it use mulx?
+
+- User: N/A | Time: 2024-07-02 11:59:50 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> This seems like a tuning issue. In that gcc thinks the shifts and stuff is
+> faster than mulx.
+> 
+> What happens if you do -march=native?
+> 
+> Does it use mulx?I tried using g++-14 using both -march=native and -march=x86-64-v4 (on a 12th Gen Intel Core i5-12600K which supports BMI2 and AVX2) but GCC always produces that same 11 instruction assembly sequence without mulx for the integer modulo by a constant.
+
+- User: N/A | Time: 2024-07-02 12:17:46 UTC
+  Text: One possible explanation for why GCC's current integer division by a constant assembly sequence was chosen back in the day (I guess one or two decades ago) is that GCC's current assembly sequence uses only 1 mul instruction whereas Clang uses 2 mul instructions.
+
+Historically, multiplication instructions used to be slower than add, sub and shift instructions on nearly all CPU architectures and so it made sense to avoid mul instructions whenever possible. However in the past decade this performance gap has narrowed and now it is more important to avoid long instruction dependency chains which GCC's current integer modulo by a constant assembly sequence suffers from.
+
+- User: Andrew Pinski | Time: 2024-07-02 17:21:53 UTC
+  Text: For the original testcase, the imul vs shift can be reduced down to just:
+```
+unsigned long func(unsigned long x)
+{
+  return x * 240;
+}
+
+```
+
+GCC produces:
+```
+        movq    %rdi, %rax
+        salq    $4, %rax
+        subq    %rdi, %rax
+        salq    $4, %rax
+```
+vs:
+```
+        imulq   $240, %rdi, %rax
+```
+
+-mtune=skylake  produces the imul.
+
+The mulx issue can be reduced down to just:
+```
+unsigned long func(unsigned long x)
+{
+  __uint128_t t = x;
+  return (t * 123)>>64;
+}
+
+
+__uint128_t func1(unsigned long x, unsigned long y)
+{
+  __uint128_t t = x;
+  return (t * 123);
+}
+
+```
+
+It only happens with constants it seems.
+
+- User: Andrew Pinski | Time: 2024-07-02 17:58:59 UTC
+  Text: (In reply to Andrew Pinski fromcomment #5)> The mulx issue can be reduced down to just:
+> ```
+> unsigned long func(unsigned long x)
+> {
+>   __uint128_t t = x;
+>   return (t * 123)>>64;
+> }
+> 
+> 
+> __uint128_t func1(unsigned long x, unsigned long y)
+> {
+>   __uint128_t t = x;
+>   return (t * 123);
+> }
+> 
+> ```
+> 
+> It only happens with constants it seems.I split that out toPR 115755.
+
+- User: Andrew Pinski | Time: 2024-07-02 18:14:28 UTC
+  Text: (In reply to Andrew Pinski fromcomment #5)> For the original testcase, the imul vs shift can be reduced down to just:
+> ```
+> unsigned long func(unsigned long x)
+> {
+>   return x * 240;
+> }
+> 
+> ```
+> 
+> GCC produces:
+> ```
+>         movq    %rdi, %rax
+>         salq    $4, %rax
+>         subq    %rdi, %rax
+>         salq    $4, %rax
+> ```
+> vs:
+> ```
+>         imulq   $240, %rdi, %rax
+> ```
+> 
+> -mtune=skylake  produces the imul.I split out the tuning issue for imul toPR 115756.
+
+- User: Andrew Pinski | Time: 2024-07-02 18:41:01 UTC
+  Text: (In reply to kim.walisch fromcomment #4)> One possible explanation for why GCC's current integer division by a
+> constant assembly sequence was chosen back in the day (I guess one or two
+> decades ago) is that GCC's current assembly sequence uses only 1 mul
+> instruction whereas Clang uses 2 mul instructions.
+> 
+> Historically, multiplication instructions used to be slower than add, sub
+> and shift instructions on nearly all CPU architectures and so it made sense
+> to avoid mul instructions whenever possible. However in the past decade this
+> performance gap has narrowed and now it is more important to avoid long
+> instruction dependency chains which GCC's current integer modulo by a
+> constant assembly sequence suffers from.Note the way GCC has handled mult->shift/add (and even the divide/mod expansion) is via a target independent part which querries the target on the costs of specific instructions (mult, shift, add, etc.). So if the target has the cost not modeled correctly, you get the less efficient sequence. This is why I said it was a cost model issue and whyPR 115756is asking for the changing of the default (generic) output. 
+So yes the cost might be based on the older cores and not been retuned since.
+Anyways the middle-end is doing the correct thing based on what the target is giving it.
+
+- User: N/A | Time: 2024-07-03 17:29:53 UTC
+  Text: Here I am providing some benchmark results to back up my claim that switching to the integer modulo by a constant algorithm with 2 multiplication instructions (which is the default in both Clang and MSVC) is faster than GCC's current default algorithm using only 1 multiplication but more shifts, adds and subs.
+
+Here is a simple C program that can be used to benchmark both algorithms using GCC. It computes integer modulo by a constant in a loop (10^10 iterations). While this benchmark program may not be ideal for simulating real world use cases, it is better than having no benchmark at all.
+
+-----------------------------------------------------------------------
+
+#include <stdint.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <sys/time.h>
+
+__attribute__((noinline))
+uint64_t benchmark(uint64_t x, uint64_t inc, uint64_t iters) {
+    uint64_t sum = 0;
+
+    #pragma GCC unroll 1
+    for (uint64_t i = 0; i < iters; i++, x += inc)
+        sum += x % 240;
+
+    return sum;
+}
+
+int main() {
+    struct timeval start, end;
+    long seconds, useconds;
+    double mtime;
+
+    // Start timer
+    gettimeofday(&start, NULL);
+
+    uint64_t result = benchmark(0, 11, 10000000000ull);
+
+    // End timer
+    gettimeofday(&end, NULL);
+
+    // Calculate the elapsed time in milliseconds
+    seconds  = end.tv_sec  - start.tv_sec;
+    useconds = end.tv_usec - start.tv_usec;
+
+    mtime = ((seconds) * 1000 + useconds / 1000.0);
+
+    printf("Result = %" PRIu64 "\n", result);
+    printf("The loop took %f milliseconds to execute.\n", mtime);
+
+    return 0;
+}
+
+-----------------------------------------------------------------------
+
+
+This GCC command produces the assembly sequence with only 1 multiplication instruction:
+
+gcc -O3 bench.c -o bench1
+
+This GCC command produces the assembly sequence with 2 multiplication instructions:
+
+gcc -O3 -mtune=skylake bench.c -o bench2
+
+
+And here are the benchmark results:
+
+
+CPU: AMD EPYC 9R14 (AMD Zen4 from 2023), Compiler: GCC 14 on Ubuntu 24.04.
+
+$ ./bench1
+Result = 1194999999360
+The loop took 8385.613000 milliseconds to execute.
+$ ./bench2
+Result = 1194999999360
+The loop took 5898.967000 milliseconds to execute.
+
+The algorithm with 2 multiplications is 30% faster.
+
+
+CPU: Intel i5-12600K (big.LITTLE), Performance CPU core, Compiler: GCC 13.2 (MinGW-w64)
+
+$ ./bench1.exe
+Result = 1194999999360
+The loop took 5633.360000 milliseconds to execute.
+$ ./bench2.exe
+Result = 1194999999360
+The loop took 4369.167000 milliseconds to execute.
+
+The algorithm with 2 multiplications is 23% faster.
+
+
+CPU: Intel i5-12600K (big.LITTLE), Efficiency CPU core, Compiler: GCC 13.2 (MinGW-w64)
+
+$ ./bench1.exe
+Result = 1194999999360
+The loop took 10788.097000 milliseconds to execute.
+$ ./bench2.exe
+Result = 1194999999360
+The loop took 9453.191000 milliseconds to execute.
+
+The algorithm with 2 multiplications is 12% faster.
+
+
+One of the comments inPR 115756was "I'd lean towards shift+add because for example Intel E-cores have a slow imul.". However, my benchmarks suggest that even on Intel Efficiency CPU cores the algorithm with 2 multiplication instructions is faster. (I used the Process Lasso tool on Windows 11 to force the benchmark to be run on an Efficiency CPU core).
+
+- User: Hongtao Liu | Time: 2024-07-04 01:17:39 UTC
+  Text: > One of the comments inPR 115756was "I'd lean towards shift+add because for
+> example Intel E-cores have a slow imul.". However, my benchmarks suggest
+> that even on Intel Efficiency CPU cores the algorithm with 2 multiplication
+> instructions is faster. (I used the Process Lasso tool on Windows 11 to
+> force the benchmark to be run on an Efficiency CPU core).@haocheng, could you try the benchmark on our Sierra Forest machine?
+I'm ok to adjust rtx_cost of imulq for COST_N_INSNS (4) to COST_N_INSNS (3) if the performance test looks ok.
+
+- User: kong lingling | Time: 2024-07-16 08:18:14 UTC
+  Text: After adjusted rtx_cost of imulq for COST_N_INSNS (4) to COST_N_INSNS (3), I tested the benchmark on Sierra Forest machine based on gcc trunk, and the algorithm with 2 multiplications is 2% faster. For Spec2017 performance improvement is around 0.2%  (1 copy,  -march=native -Ofast -funroll-loops -flto / -mtune=generic -O2 -march=x86-64-v3).
+
+- User: Roger Sayle | Time: 2024-07-16 21:29:29 UTC
+  Text: I owe Kim an apology.  It does appear that modern x86_64 processors perform (many) multiplications faster than the latencies given in the Intel/AMD/Agner Fog documentation.
+
+- User: GCC Commits | Time: 2024-07-25 01:45:14 UTC
+  Text: The master branch has been updated by Kong Lingling <konglin1@gcc.gnu.org>:https://gcc.gnu.org/g:bc00de070f0b9a25f68ffddbefe516543a44bd23commitr15-2295-gbc00de070f0b9a25f68ffddbefe516543a44bd23Author: Lingling Kong <lingling.kong@intel.com>
+Date:   Thu Jul 25 09:42:06 2024 +0800
+
+    i386: Adjust rtx cost for imulq and imulw [PR115749]
+    
+    gcc/ChangeLog:PR target/115749* config/i386/x86-tune-costs.h (struct processor_costs):
+            Adjust rtx_cost of imulq and imulw for COST_N_INSNS (4)
+            to COST_N_INSNS (3).
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr115749.c: New test.
+
+- User: Hongtao Liu | Time: 2024-08-15 05:35:16 UTC
+  Text: Fixed in GCC15.
+

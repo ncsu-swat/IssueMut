@@ -1,0 +1,146 @@
+Bug Summary: [13 Regression] CryptX miscompilation on power9 since r13-2107
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jakub Jelinek | Time: 2023-02-20 14:20:25 UTC
+  Text: The following testcase is miscompiled with -O2 -mcpu=power9 sincer13-2107and is not fixed withr13-5999fix:
+
+unsigned long long a[2] = { 0x04a13945d898c296ULL, 0x0000100000000fffULL };
+unsigned long long b[4] = { 0x04a13945d898c296ULL, 0, 0, 0x0000100000000fffULL };
+
+__attribute__((noipa)) unsigned __int128
+foo (int x, unsigned long long *y, unsigned long long *z)
+{
+  unsigned __int128 w = 0;
+  for (int i = 0; i < x; i++)
+    w += (unsigned __int128)*y++ * (unsigned __int128)*z--;
+  return w;
+}
+
+int
+main ()
+{
+  unsigned __int128 x = foo (1, &a[0], &a[1]);
+  unsigned __int128 y = foo (2, &b[0], &b[3]);
+  if ((unsigned long long) (x >> 64) != 0x0000004a13945dd3ULL
+      || (unsigned long long) x != 0x9b1c8443b3909d6aULL
+      || x != y)
+    __builtin_abort ();
+  return 0;
+}
+
+- User: Jakub Jelinek | Time: 2023-02-20 14:27:08 UTC
+  Text: Note, -O2 -mcpu=power9:
+__attribute__((noipa)) unsigned __int128
+foo (unsigned __int128 x, unsigned long long y, unsigned long long z)
+{
+  return x + (unsigned __int128) y * z;
+}
+
+int
+main ()
+{
+  unsigned __int128 x = foo (0, 0x04a13945d898c296ULL, 0x0000100000000fffULL);
+  if ((unsigned long long) (x >> 64) != 0x0000004a13945dd3ULL
+      || (unsigned long long) x != 0x9b1c8443b3909d6aULL)
+    __builtin_abort ();
+  return 0;
+}
+works correctly, in that case we get:
+        maddhdu 10,5,6,3
+        maddld 3,5,6,3
+        add 4,10,4
+which is correct.  But for the #c0 testcase above, e.g. with -O2 -fno-unroll-loops -mcpu=power9 we get
+.L3:
+        ldu 9,8(8)
+        ldu 10,-8(5)
+        maddld 3,9,10,3
+        maddhdu 9,9,10,3
+        add 4,9,4
+        bdnz .L3
+in the inner loop, which looks wrong because maddhdu in that case uses result of maddld as last operand rather than the low part of the 128-bit counter (w).
+
+- User: Jakub Jelinek | Time: 2023-02-20 14:36:05 UTC
+  Text: The reason is that gen_umaddditi4 is called with the same pseudo as operands[0] and operands[3] and so gen_maddlddi4 overwrites its low half before gen_umadddi4_highpart{,_le} uses it.
+We could create a temporary if some overlap is mentioned, or can create it unconditionally and let later optimizations deal with it.
+
+- User: Segher Boessenkool | Time: 2023-02-20 14:51:16 UTC
+  Text: With -fno-unroll-loops added we get
+
+foo:
+.LFB0:
+        .cfi_startproc
+        cmpwi 0,3,0
+        ble 0,.L4
+        mtctr 3
+        addi 10,4,-8
+        addi 5,5,8
+        li 3,0
+        .p2align 4,,15
+.L3:
+        ldu 4,8(10)
+        ldu 9,-8(5)
+        maddld 3,4,9,3
+        maddhdu 4,4,9,3
+        bdnz .L3
+        blr
+        .p2align 4,,15
+.L4:
+        li 3,0
+        li 4,0
+        blr
+
+(which still fails, just is easier to read).
+
+The destinations of the four inner loop insns were 131, 132, 135, 136,
+and IRA decided for those
+Disposition:
+   18:r131 l0     4
+   17:r132 l0     9
+    1:r135 l0     3
+    0:r136 l0     4
+
+and that cannot fly.
+
+- User: Jakub Jelinek | Time: 2023-02-20 14:56:01 UTC
+  Text: Createdattachment 54494[details]gcc13-pr108862.patch
+
+Untested fix.
+
+- User: Jakub Jelinek | Time: 2023-02-20 15:07:19 UTC
+  Text: Createdattachment 54495[details]gcc13-pr108862.patch
+
+Variant patch, instead of creating another temporary and moving it we can just do the highpart (which goes into temporary) first, then lowpart, then addition which depends on the highpart.
+Strangely, with this patch one gets the loop unrolled (2 handled iterations at once), while with the earlier patch it is not.
+
+- User: GCC Commits | Time: 2023-02-20 21:08:36 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:cd8b4fae52d02541c2d8bd2200caad3812f37368commitr13-6147-gcd8b4fae52d02541c2d8bd2200caad3812f37368Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Feb 20 22:07:57 2023 +0100
+
+    powerpc: Another umaddditi4 fix [PR108862]
+    
+    The following testcase is miscompiled on powerpc64le-linux with
+    -O2 -mcpu=power9.  The problem is that gen_umaddditi4 is called with
+    the same TImode register for both op0 and op3, and maddlddi4
+    overwrites the low half of op0 before the low half of op3 is read,
+    so when they are the same register it reads the result of maddlddi4.
+    
+    The following patch fixes that by swapping maddlddi4 and
+    umadddi4_highpart{,_le} during expansion, as the latter writes into
+    a temporary pseudo and so can't change anything maddlddi4 depends on.
+    
+    2023-02-20  Jakub Jelinek  <jakub2redhat.com>PR target/108862* config/rs6000/rs6000.md (umaddditi4): Swap gen_maddlddi4 with
+            gen_umadddi4_highpart{,_le}.
+    
+            * gcc.dg/pr108862.c: New test.
+            * gcc.target/powerpc/pr108862.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-02-20 21:12:21 UTC
+  Text: Fixed.
+

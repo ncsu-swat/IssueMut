@@ -1,0 +1,220 @@
+Bug Summary: [15 Regression] Incorrect 8-byte vectorization: psrlw/psraw confusion
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2024-05-18 10:06:50 UTC
+  Text: Initially observed as a test failures on highway-1.0.7 onr15-644-g7422e050f33dd9compiler:
+    HwyReverseTestGroup/HwyReverseTest.TestAllReverseLaneBytes/EMU128 FAILED
+
+Self-contained example:
+
+// $ cat bug.c
+typedef unsigned char u8;
+
+__attribute__((noipa))
+static void fill_src(u8 * src) {
+    src[0] = 0x00; src[1] = 0xff;
+}
+
+__attribute__((noipa))
+static void assert_dst(const u8 * dst) {
+    if (dst[0] != 0xff) __builtin_trap();
+    if (dst[1] != 0x00) __builtin_trap();
+}
+
+int main() {
+    u8 src[8] __attribute__((aligned(16))) = { 0 };
+    u8 dst[8] __attribute__((aligned(16))) = { 0 };
+
+    // place 0x00 into src[0] and 0xFF into src[1]
+    fill_src(src);
+
+    // swap bytes:
+    // place 0xFF into dst[0], 0x00 into dst[1]
+    for (unsigned long i = 0; i < 8; i += 2) {
+        dst[i + 0] = src[i + 1];
+        dst[i + 1] = src[i + 0];
+    }
+
+    // make sure bytes swapped
+    assert_dst(dst);
+}
+
+Triggering:
+
+$ gcc bug.c -o a -O1 && ./a
+$ gcc bug.c -o a -O2 && ./a
+Illegal instruction (core dumped)
+
+A bit of analysis:
+
+Dump of assembler code for function main:
+   0x0000000000401030 <+0>:     sub    $0x28,%rsp
+   0x0000000000401034 <+4>:     mov    %rsp,%rdi
+   0x0000000000401037 <+7>:     movq   $0x0,(%rsp)
+   0x000000000040103f <+15>:    movq   $0x0,0x10(%rsp)
+   0x0000000000401048 <+24>:    call   0x401170 <fill_src>
+   0x000000000040104d <+29>:    movq   (%rsp),%xmm0
+   0x0000000000401052 <+34>:    lea    0x10(%rsp),%rdi
+   0x0000000000401057 <+39>:    movdqa %xmm0,%xmm1
+   0x000000000040105b <+43>:    psllw  $0x8,%xmm0
+   0x0000000000401060 <+48>:    psraw  $0x8,%xmm1 ; <<<- why arithmetic shift? should be psrllw
+   0x0000000000401065 <+53>:    por    %xmm0,%xmm1
+   0x0000000000401069 <+57>:    movq   %xmm1,0x10(%rsp)
+   0x000000000040106f <+63>:    call   0x401180 <assert_dst>
+   0x0000000000401074 <+68>:    xor    %eax,%eax
+   0x0000000000401076 <+70>:    add    $0x28,%rsp
+   0x000000000040107a <+74>:    ret
+End of assembler dump.
+
+Here `psraw` should have been `psrllw` to avoid sign bit extension.
+
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=/<<NIX>>/gcc-15.0.0/bin/gcc
+COLLECT_LTO_WRAPPER=/<<NIX>>/gcc-15.0.0/libexec/gcc/x86_64-unknown-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-unknown-linux-gnu
+Configured with: ../source/configure --prefix=/<<NIX>>/gcc-15.0.0 --with-gmp-include=/<<NIX>>/gmp-6.3.0-dev/include --with-gmp-lib=/<<NIX>>/gmp-6.3.0/lib --with-mpfr-include=/<<NIX>>/mpfr-4.2.1-dev/include --with-mpfr-lib=/<<NIX>>/mpfr-4.2.1/lib --with-mpc=/<<NIX>>/libmpc-1.3.1 --with-native-system-header-dir=/<<NIX>>/glibc-2.39-52-dev/include --with-build-sysroot=/ --with-gxx-include-dir=/<<NIX>>/gcc-15.0.0/include/c++/15.0.0/ --program-prefix= --enable-lto --disable-libstdcxx-pch --without-included-gettext --with-system-zlib --enable-checking=release --enable-static --enable-languages=c,c++ --disable-multilib --enable-plugin --disable-libcc1 --with-isl=/<<NIX>>/isl-0.20 --disable-bootstrap --build=x86_64-unknown-linux-gnu --host=x86_64-unknown-linux-gnu --target=x86_64-unknown-linux-gnu
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 99999999 (experimental) (GCC)
+
+- User: Sergei Trofimovich | Time: 2024-05-18 10:10:04 UTC
+  Text: Specifically if I change original example to contain 16 bytes instead of 8:
+
+--- bug.c.orig  2024-05-18 11:07:47.426351557 +0100
++++ bug.c       2024-05-18 11:08:02.135601287 +0100
+@@ -15,2 +15,2 @@
+-    u8 src[8] __attribute__((aligned(16))) = { 0 };
+-    u8 dst[8] __attribute__((aligned(16))) = { 0 };
++    u8 src[16] __attribute__((aligned(16))) = { 0 };
++    u8 dst[16] __attribute__((aligned(16))) = { 0 };
+@@ -23 +23 @@
+-    for (unsigned long i = 0; i < 8; i += 2) {
++    for (unsigned long i = 0; i < 16; i += 2) {
+
+I get expected code:
+
+Dump of assembler code for function main:
+   0x0000000000401030 <+0>:     sub    $0x28,%rsp
+   0x0000000000401034 <+4>:     pxor   %xmm0,%xmm0
+   0x0000000000401038 <+8>:     mov    %rsp,%rdi
+   0x000000000040103b <+11>:    movaps %xmm0,(%rsp)
+   0x000000000040103f <+15>:    movaps %xmm0,0x10(%rsp)
+   0x0000000000401044 <+20>:    call   0x401170 <fill_src>
+   0x0000000000401049 <+25>:    movdqa (%rsp),%xmm0
+   0x000000000040104e <+30>:    lea    0x10(%rsp),%rdi
+   0x0000000000401053 <+35>:    movdqa %xmm0,%xmm1
+   0x0000000000401057 <+39>:    psllw  $0x8,%xmm0
+   0x000000000040105c <+44>:    psrlw  $0x8,%xmm1
+   0x0000000000401061 <+49>:    por    %xmm0,%xmm1
+   0x0000000000401065 <+53>:    movaps %xmm1,0x10(%rsp)
+   0x000000000040106a <+58>:    call   0x401180 <assert_dst>
+   0x000000000040106f <+63>:    xor    %eax,%eax
+   0x0000000000401071 <+65>:    add    $0x28,%rsp
+   0x0000000000401075 <+69>:    ret
+
+- User: Sergei Trofimovich | Time: 2024-05-18 10:19:00 UTC
+  Text: Sounds very similar tohttps://gcc.gnu.org/PR108064
+
+- User: Sergei Trofimovich | Time: 2024-05-18 11:25:23 UTC
+  Text: Bisected down tor15-498-gc6cc6d4741a880
+
+- User: Sergei Trofimovich | Time: 2024-05-18 11:25:51 UTC
+  Text: (In reply to Sergei Trofimovich fromcomment #3)> Bisected down tor15-498-gc6cc6d4741a880Sorry, should ber15-499-ga71f90c5a7ae29
+
+- User: Levy Hsu | Time: 2024-05-18 15:18:12 UTC
+  Text: switch (d->vmode)
+    {
+    case E_V8QImode:
+      if (!TARGET_MMX_WITH_SSE)
+	return false;
+      mode = V4HImode;
+      gen_shr = gen_ashrv4hi3(should be gen_lshrv4hi3);
+      gen_shl = gen_ashlv4hi3;
+      gen_or = gen_iorv4hi3;
+      break;
+    case E_V16QImode:
+      mode = V8HImode;
+      gen_shr = gen_vlshrv8hi3;
+      gen_shl = gen_vashlv8hi3;
+      gen_or = gen_iorv8hi3;
+      break;
+    default: return false;
+    }
+
+Obviously, under V8QImode it should be gen_lshrv4hi3 instead of gen_ashrv4hi3.
+
+I mistakenly used gen_ashrv4hi3 due to the similar naming conventions and failed to find out. gen_lshrv4hi3 is the correct logical shift needed.
+
+Will send a patch soon
+
+- User: H.J. Lu | Time: 2024-05-18 15:55:31 UTC
+  Text: Createdattachment 58235[details]A patch
+
+Please try this.
+
+- User: Levy Hsu | Time: 2024-05-18 16:30:54 UTC
+  Text: Createdattachment 58236[details][PR]115146
+
+- User: Uroš Bizjak | Time: 2024-05-18 18:04:43 UTC
+  Text: (In reply to Levy Hsu fromcomment #5)>     case E_V16QImode:
+>       mode = V8HImode;
+>       gen_shr = gen_vlshrv8hi3;
+>       gen_shl = gen_vashlv8hi3;Hm, why vector-by-vector shift here? Should there be a call to gen_lshrv8hi3 and gen_ashlv8hi3 instead?
+
+- User: Sergei Trofimovich | Time: 2024-05-18 23:18:54 UTC
+  Text: (In reply to Levy Hsu fromcomment #7)> Createdattachment 58236[details]> [PR]115146The change fixed `highway-1.0.7` testsuite failure for me.
+
+- User: Hongtao Liu | Time: 2024-05-20 02:01:48 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #8)> (In reply to Levy Hsu fromcomment #5)
+> >     case E_V16QImode:
+> >       mode = V8HImode;
+> >       gen_shr = gen_vlshrv8hi3;
+> >       gen_shl = gen_vashlv8hi3;
+> 
+> Hm, why vector-by-vector shift here? Should there be a call to gen_lshrv8hi3
+> and gen_lshrv8hi3instead?I think it's a typo, they should be gen_lshrv8hi3 and gen_lshrv8hi3.
+
+- User: Levy Hsu | Time: 2024-05-20 02:44:38 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #8)> (In reply to Levy Hsu fromcomment #5)
+> >     case E_V16QImode:
+> >       mode = V8HImode;
+> >       gen_shr = gen_vlshrv8hi3;
+> >       gen_shl = gen_vashlv8hi3;
+> 
+> Hm, why vector-by-vector shift here? Should there be a call to gen_lshrv8hi3
+> and gen_ashlv8hi3 instead?Yes Uros It looks like a misuse, should be 
+gen_lshrv8hi3 and gen_ashlv8hi3, 
+
+gen_vlshrv8hi3 and gen_vashlv8hi3 accidentally generated "correct" psrlw and psllw
+
+- User: GCC Commits | Time: 2024-05-27 02:42:12 UTC
+  Text: The master branch has been updated by Levy Hsu <xlwxlw7969@gcc.gnu.org>:https://gcc.gnu.org/g:0022064649d0ec40e97df24279c48842e278fedccommitr15-841-g0022064649d0ec40e97df24279c48842e278fedcAuthor: Levy Hsu <admin@levyhsu.com>
+Date:   Tue May 21 12:47:21 2024 +0930
+
+    x86: Fix Logical Shift Issue in expand_vec_perm_psrlw_psllw_por [PR115146]
+    
+    Replaced arithmetic shifts with logical shifts in expand_vec_perm_psrlw_psllw_por to avoid sign bit extension issues. Also corrected gen_vlshrv8hi3 to gen_lshrv8hi3 and gen_vashlv8hi3 to gen_ashlv8hi3.
+    
+    Co-authored-by: H.J. Lu <hjl.tools@gmail.com>
+    
+    gcc/ChangeLog:PR target/115146* config/i386/i386-expand.cc (expand_vec_perm_psrlw_psllw_por): Replace arithmatic shift
+            gen_ashrv4hi3 with logic shift gen_lshrv4hi3.
+            Replace gen_vlshrv8hi3 with gen_lshrv8hi3 and gen_vashlv8hi3 with gen_ashlv8hi3.
+    
+    gcc/testsuite/ChangeLog:PR target/115146* g++.target/i386/pr107563-a.C: Append '-mno-sse3' to compile option
+            to avoid test failure on hosts with SSE3 support.
+            * g++.target/i386/pr107563-b.C: Append '-mno-sse3' to compile option
+            to avoid test failure on hosts with SSE3 support.
+            * gcc.target/i386/pr115146.c: New test.
+
+- User: Hongtao Liu | Time: 2024-05-27 02:48:27 UTC
+  Text: Fixed.
+

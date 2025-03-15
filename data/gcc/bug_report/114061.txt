@@ -1,0 +1,135 @@
+Bug Summary: GCC fails vectorization when using __builtin_prefetch
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Tamar Christina | Time: 2024-02-22 19:04:51 UTC
+  Text: The following example:
+
+void foo(double * restrict a, double * restrict b, int n){
+  int i;
+  for(i=0; i<n; ++i){
+    a[i] = a[i] + b[i];
+    __builtin_prefetch(&(b[i+8]));
+  }
+}
+
+fails to vectorize because of the __builtin_prefetch.
+
+/app/example.c:5:5: missed:  statement clobbers memory: __builtin_prefetch (_10);
+/app/example.c:3:13: missed:  not vectorized: loop contains function calls or data references that cannot be analyzed
+
+However two things:
+
+1. prefetching are usually hints anyway and not a correctness thing.  It should be safe to elide the call and vectorizer as normal.
+2. SVE has prefetched vector operations which we can use here.  The vector prefetches are also predicated so they need to be actually codegened.
+
+Perhaps one solution here would be to have a vect-pattern which checks for COND_PREFETCH support if supported, and if not just elides the prefetch?
+
+- User: Andrew Pinski | Time: 2024-02-22 19:07:07 UTC
+  Text: I thought there was already one recorded about this.
+
+- User: Tamar Christina | Time: 2024-02-22 19:09:35 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> I thought there was already one recorded about this.I could only findhttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=103938about an ICE when prefetching a vector address.
+
+- User: Andrew Pinski | Time: 2024-02-22 19:11:39 UTC
+  Text: Confirmed.
+
+Though maybe we should drop them in the vectorized version of the loop. HW prefetchers usually do a decent job and sometimes (maybe most) SW hinted prefetches interfere with the HW prefetchers.
+
+- User: Tamar Christina | Time: 2024-02-22 19:21:47 UTC
+  Text: (In reply to Andrew Pinski fromcomment #3)> Confirmed.
+> 
+> Though maybe we should drop them in the vectorized version of the loop. HW
+> prefetchers usually do a decent job and sometimes (maybe most) SW hinted
+> prefetches interfere with the HW prefetchers.definitely agree that I'm not sure how useful they are, but some customers definitely seem to want them.
+
+- User: Richard Biener | Time: 2024-02-23 07:01:16 UTC
+  Text: I think we could try to "vectorize" them by only updating the address (the builtin doesn't specify a size) when that evolves in the scalar loop, updating
+the step with the chosen VF.
+
+Dependence shouldn't be a concern here.
+
+The main issue is a representational - how to handle this in data-ref and
+dependence analysis (or whether to just "skip" them in the vectorizer).
+
+- User: GCC Commits | Time: 2024-06-12 13:39:26 UTC
+  Text: The master branch has been updated by Victor Do Nascimento <victorldn@gcc.gnu.org>:https://gcc.gnu.org/g:adcc815a01ae009d2768b6afb546e357bd37bbd2commitr15-1211-gadcc815a01ae009d2768b6afb546e357bd37bbd2Author: Victor Do Nascimento <victor.donascimento@arm.com>
+Date:   Wed May 22 12:14:11 2024 +0100
+
+    middle-end: Drop __builtin_prefetch calls in autovectorization [PR114061]
+    
+    At present the autovectorizer fails to vectorize simple loops
+    involving calls to `__builtin_prefetch'.  A simple example of such
+    loop is given below:
+    
+    void foo(double * restrict a, double * restrict b, int n){
+      int i;
+      for(i=0; i<n; ++i){
+        a[i] = a[i] + b[i];
+        __builtin_prefetch(&(b[i+8]));
+      }
+    }
+    
+    The failure stems from two issues:
+    
+    1. Given that it is typically not possible to fully reason about a
+       function call due to the possibility of side effects, the
+       autovectorizer does not attempt to vectorize loops which make such
+       calls.
+    
+       Given the memory reference passed to `__builtin_prefetch', in the
+       absence of assurances about its effect on the passed memory
+       location the compiler deems the function unsafe to vectorize,
+       marking it as clobbering memory in `vect_find_stmt_data_reference'.
+       This leads to the failure in autovectorization.
+    
+    2. Notwithstanding the above issue, though the prefetch statement
+       would be classed as `vect_unused_in_scope', the loop invariant that
+       is used in the address of the prefetch is the scalar loop's and not
+       the vector loop's IV. That is, it still uses `i' and not `vec_iv'
+       because the instruction wasn't vectorized, causing DCE to think the
+       value is live, such that we now have both the vector and scalar loop
+       invariant actively used in the loop.
+    
+    This patch addresses both of these:
+    
+    1. About the issue regarding the memory clobber, data prefetch does
+       not generate faults if its address argument is invalid and does not
+       write to memory.  Therefore, it does not alter the internal state
+       of the program or its control flow under any circumstance.  As
+       such, it is reasonable that the function be marked as not affecting
+       memory contents.
+    
+       To achieve this, we add the necessary logic to
+       `get_references_in_stmt' to ensure that builtin functions are given
+       given the same treatment as internal functions.  If the gimple call
+       is to a builtin function and its function code is
+       `BUILT_IN_PREFETCH', we mark `clobbers_memory' as false.
+    
+    2. Finding precedence in the way clobber statements are handled,
+       whereby the vectorizer drops these from both the scalar and
+       vectorized versions of a given loop, we choose to drop prefetch
+       hints in a similar fashion.  This seems appropriate given how
+       software prefetch hints are typically ignored by processors across
+       architectures, as they seldom lead to performance gain over their
+       hardware counterparts.
+    
+    gcc/ChangeLog:PR tree-optimization/114061* tree-data-ref.cc (get_references_in_stmt): set
+            `clobbers_memory' to false for __builtin_prefetch.
+            * tree-vect-loop.cc (vect_transform_loop): Drop all
+            __builtin_prefetch calls from loops.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/vect/vect-prefetch-drop.c: New test.
+            * gcc.target/aarch64/vect-prefetch-drop.c: Likewise.
+
+- User: Andrew Pinski | Time: 2024-06-12 17:15:01 UTC
+  Text: Fixed I think.
+

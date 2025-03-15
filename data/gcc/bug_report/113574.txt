@@ -1,0 +1,149 @@
+Bug Summary: wrong code with shift and _BitInt(1) at any opt level
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-01-24 05:36:51 UTC
+  Text: Createdattachment 57200[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc testcase.c && ./a.out 
+Aborted
+
+-fsanitize=undefined fixes the problem:
+$ x86_64-pc-linux-gnu-gcc testcase.c -fsanitize=undefined && ./a.out
+(no output)
+
+At the ASM level, at -O1:
+...
+foo:
+# testcase.c:7:   ub1 += (ub16 << 2) | ub8;
+	or	dil, BYTE PTR ub8[rip]	# _1, ub8
+	and	edi, 1	# _4,
+
+it seems the shift is removed; changing the type of ub1 to "unsigned _BitInt(2)" fixes this.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64//bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-8373-20240123195900-gdbc5f1f523b-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-8373-20240123195900-gdbc5f1f523b-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240123 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-01-24 05:50:43 UTC
+  Text: Confirmed.
+
+Either fold or convert is causing the issue.
+
+Reduced testcase:
+```
+unsigned _BitInt(1)
+foo(unsigned _BitInt(16) ub16)
+{
+  unsigned _BitInt(1)  t  = (ub16 << 2);
+    // being reduced to just (unsigned _BitInt(1) ) ub16 which is wrong
+  return t;
+}
+unsigned _BitInt(1)
+foo1(unsigned _BitInt(16) ub16)
+{
+  unsigned _BitInt(16) t = (ub16 << 2);
+  return t;
+}
+
+int
+main(void)
+{
+  unsigned _BitInt(16) ub16 = 0xfef1;
+  if (foo(ub16) != foo1(ub16))
+    __builtin_abort();
+  return 0;
+}
+```
+
+Note match does the correct thing:
+```
+/* Narrow a lshift by constant.  */
+(simplify
+ (convert (lshift:s@0 @1 INTEGER_CST@2))
+ (if (INTEGRAL_TYPE_P (type)
+      && INTEGRAL_TYPE_P (TREE_TYPE (@0))
+      && !integer_zerop (@2)
+      && TYPE_PRECISION (type) <= TYPE_PRECISION (TREE_TYPE (@0)))
+  (if (TYPE_PRECISION (type) == TYPE_PRECISION (TREE_TYPE (@0))
+       || wi::ltu_p (wi::to_wide (@2), TYPE_PRECISION (type)))
+   (lshift (convert @1) @2)
+   (if (wi::ltu_p (wi::to_wide (@2), TYPE_PRECISION (TREE_TYPE (@0))))
+    { build_zero_cst (type); }))))
+
+```
+
+- User: Andrew Pinski | Time: 2024-01-24 05:54:32 UTC
+  Text: convert uses TYPE_SIZE ....
+
+
+                /* If shift count is less than the width of the truncated type,
+                   really shift.  */
+                if (tree_int_cst_lt (TREE_OPERAND (expr, 1), TYPE_SIZE (type)))
+
+
+Really??????
+
+That dates from the begining of git history too :).
+
+- User: Andrew Pinski | Time: 2024-01-24 06:52:51 UTC
+  Text: Note I was thinking I might hit this with 1 sized bit field but that seems to work:
+```
+struct f
+{
+  unsigned ub1:1;
+}t;
+void
+foo(unsigned short ub16)
+{
+  t.ub1 = (ub16 << 2);
+}
+int
+main(void)
+{
+  unsigned short t2 = 0xfef1;
+  foo(t2);
+  if (t.ub1)
+    __builtin_abort();
+  return 0;
+}
+```
+
+- User: Jakub Jelinek | Time: 2024-01-24 16:40:14 UTC
+  Text: Createdattachment 57207[details]gcc14-pr113574.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-01-25 12:16:05 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:fb1b7e2fec951ba0bf4f68fac6a16929f4f63910commitr14-8423-gfb1b7e2fec951ba0bf4f68fac6a16929f4f63910Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Jan 25 13:15:23 2024 +0100
+
+    convert: Fix test for out of bounds shift count [PR113574]
+    
+    The following patch is miscompiled, because convert_to_integer_1 for
+    LSHIFT_EXPR tests if the INTEGER_CST shift count is too high, but
+    incorrectly compares it against TYPE_SIZE rather than TYPE_PRECISION.
+    The type in question is unsigned _BitInt(1), which has TYPE_PRECISION 1,
+    TYPE_SIZE 8, and the shift count is 2 in that case.
+    
+    2024-01-25  Jakub Jelinek  <jakub@redhat.com>PR middle-end/113574* convert.cc (convert_to_integer_1) <case LSHIFT_EXPR>: Compare shift
+            count against TYPE_PRECISION rather than TYPE_SIZE.
+    
+            * gcc.dg/torture/bitint-52.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-01-25 12:16:44 UTC
+  Text: Fixed.
+

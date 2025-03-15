@@ -1,0 +1,113 @@
+Bug Summary: [14 Regression] ICE: tree check: expected none of vector_type, have vector_type in convert_to_real_1, at convert.cc:295 with invalid cast
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-checking, ice-on-invalid-code
+Known to Work: 13.2.1
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-11-19 16:37:13 UTC
+  Text: Createdattachment 56642[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc testcase.c 
+testcase.c:3:1: internal compiler error: tree check: expected none of vector_type, have vector_type in convert_to_real_1, at convert.cc:295
+    3 | V v = (float)-v;
+      | ^
+0x8825f8 tree_not_check_failed(tree_node const*, char const*, int, char const*, ...)
+        /repo/gcc-trunk/gcc/tree.cc:8989
+0x72f82a tree_not_check(tree_node*, char const*, int, char const*, tree_code)
+        /repo/gcc-trunk/gcc/tree.h:3611
+0x72f82a convert_to_real_1
+        /repo/gcc-trunk/gcc/convert.cc:295
+0xe2a8fc c_convert
+        /repo/gcc-trunk/gcc/c/c-convert.cc:175
+0xe13c8b build_c_cast(unsigned int, tree_node*, tree_node*)
+        /repo/gcc-trunk/gcc/c/c-typeck.cc:6098
+0xe14c82 c_cast_expr(unsigned int, c_type_name*, tree_node*)
+        /repo/gcc-trunk/gcc/c/c-typeck.cc:6172
+0xe3d624 c_parser_cast_expression
+        /repo/gcc-trunk/gcc/c/c-parser.cc:9677
+0xe3d7af c_parser_binary_expression
+        /repo/gcc-trunk/gcc/c/c-parser.cc:9454
+0xe3ec1b c_parser_conditional_expression
+        /repo/gcc-trunk/gcc/c/c-parser.cc:9152
+0xe3f3e4 c_parser_expr_no_commas
+        /repo/gcc-trunk/gcc/c/c-parser.cc:9066
+0xe4636c c_parser_initializer
+        /repo/gcc-trunk/gcc/c/c-parser.cc:6099
+0xe4636c c_parser_initializer
+        /repo/gcc-trunk/gcc/c/c-parser.cc:6091
+0xe5f0cb c_parser_declaration_or_fndef
+        /repo/gcc-trunk/gcc/c/c-parser.cc:2727
+0xe69a6b c_parser_external_declaration
+        /repo/gcc-trunk/gcc/c/c-parser.cc:2046
+0xe6a453 c_parser_translation_unit
+        /repo/gcc-trunk/gcc/c/c-parser.cc:1900
+0xe6a453 c_parse_file()
+        /repo/gcc-trunk/gcc/c/c-parser.cc:26392
+0xedc5c1 c_common_parse_file()
+        /repo/gcc-trunk/gcc/c-family/c-opts.cc:1295
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-5593-20231119062640-g78d132d73ec-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-5593-20231119062640-g78d132d73ec-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20231119 (experimental) (GCC)
+
+- User: Richard Biener | Time: 2023-11-20 10:32:24 UTC
+  Text: Confirmed.  It looks like it's c-typeck.cc:build_c_cast job to reject this
+conversion though c_convert also does some checks related to VECTOR_TYPE
+(but only as target, not as source).  Even the middle-end convert_to_real_1
+does some diagnostics.
+
+Note the ICE is in premature optimization as well.  An easy fix would be
+
+diff --git a/gcc/convert.cc b/gcc/convert.cc
+index ac6af7026a7..930b593fc0a 100644
+--- a/gcc/convert.cc
++++ b/gcc/convert.cc
+@@ -292,7 +292,7 @@ convert_to_real_1 (tree type, tree expr, bool fold_p)
+        case NEGATE_EXPR:
+          if (!flag_rounding_math
+              && FLOAT_TYPE_P (itype)
+-             && TYPE_PRECISION (type) < TYPE_PRECISION (itype))
++             && element_precision (type) < element_precision (itype))
+            {
+              tree arg = convert_to_real_1 (type, TREE_OPERAND (expr, 0),
+                                            fold_p);
+
+though the error message is a bit confusing:
+
+t.c:3:1: error: aggregate value used where a floating-point was expected
+    3 | V v = (float)-v;
+      | ^
+
+- User: GCC Commits | Time: 2023-11-20 14:01:47 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:b7a1b89e60c4b492f85b47e02c12b01dd8a6e28bcommitr14-5625-gb7a1b89e60c4b492f85b47e02c12b01dd8a6e28bAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Nov 20 11:29:59 2023 +0100
+
+    middle-end/112622 - convert and vector-to-float
+    
+    The following avoids ICEing when trying to convert a vector to
+    a scalar float.PR middle-end/112622* convert.cc (convert_to_real_1): Use element_precision
+            where a vector type might appear.  Provide specific
+            diagnostic for unexpected vector argument.
+    
+            * gcc.dg/pr112622.c: New testcase.
+            * gcc.dg/simd-2.c: Adjust.
+            * gcc.target/i386/vect-bfloat16-typecheck_1.c: Likewise.
+            * gcc.target/i386/vect-bfloat16-typecheck_2.c: Likewise.
+
+- User: Richard Biener | Time: 2023-11-20 14:03:18 UTC
+  Text: Fixed.
+

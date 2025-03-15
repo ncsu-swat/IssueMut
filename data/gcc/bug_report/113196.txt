@@ -1,0 +1,151 @@
+Bug Summary: [14 Regression] Failure to use ushll{,2}
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Richard Sandiford | Time: 2024-01-02 10:06:59 UTC
+  Text: For this testcase, adapted from the one forPR110625:
+
+  int test(unsigned array[4][4]);
+
+  int foo(unsigned short *a, unsigned long n)
+  {
+    unsigned array[4][4];
+
+    for (unsigned i = 0; i < 4; i++, a += 4)
+      {
+        array[i][0] = a[0] << 6;
+        array[i][1] = a[1] << 6;
+        array[i][2] = a[2] << 6;
+        array[i][3] = a[3] << 6;
+      }
+
+    return test(array);
+  }
+
+GCC now uses:
+
+        mov     x1, x0
+        stp     x29, x30, [sp, -80]!
+        movi    v30.4s, 0
+        mov     x29, sp
+        ldp     q0, q29, [x1]
+        add     x0, sp, 16
+        zip1    v1.8h, v0.8h, v30.8h
+        zip1    v31.8h, v29.8h, v30.8h
+        zip2    v0.8h, v0.8h, v30.8h
+        zip2    v29.8h, v29.8h, v30.8h
+        shl     v1.4s, v1.4s, 6
+        shl     v31.4s, v31.4s, 6
+        shl     v0.4s, v0.4s, 6
+        shl     v29.4s, v29.4s, 6
+        stp     q1, q0, [sp, 16]
+        stp     q31, q29, [sp, 48]
+        bl      test(unsigned int (*) [4])
+        ldp     x29, x30, [sp], 80
+        ret
+
+whereas previously it used USHLL{,2}:
+
+        mov     x1, x0
+        stp     x29, x30, [sp, -80]!
+        mov     x29, sp
+        ldp     q1, q0, [x1]
+        add     x0, sp, 16
+        ushll   v3.4s, v1.4h, 6
+        ushll   v2.4s, v0.4h, 6
+        ushll2  v1.4s, v1.8h, 6
+        ushll2  v0.4s, v0.8h, 6
+        stp     q3, q1, [sp, 16]
+        stp     q2, q0, [sp, 48]
+        bl      test(unsigned int (*) [4])
+        ldp     x29, x30, [sp], 80
+        ret
+
+This changed withg:f26f92b534f9, which expanded zero-extensions to ZIPs.  The patch included *ADDW patterns for the new representation, but it looks like there are several more that should be included for full coverage.
+
+AIUI, the point of lowering to ZIPs during expand was to allow the zero to be hoisted.  An alternative might be to lower during split, but forcibly hoist the zero by inserting around the FUNCTION_BEG note.  We could then cache the insn that does that for manual CSE.
+
+Godbolt link:https://godbolt.org/z/vzfnebMhb
+
+- User: Richard Sandiford | Time: 2024-01-02 10:07:53 UTC
+  Text: Testing a patch that does that.  I think it'll depend on late-combine to undo the split in cases where it isn't profitable.
+
+- User: GCC Commits | Time: 2024-01-12 12:38:25 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:74e3e839ab2d368413207455af2fdaaacc73842bcommitr14-7187-g74e3e839ab2d368413207455af2fdaaacc73842bAuthor: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Fri Jan 12 12:38:01 2024 +0000
+
+    aarch64: Rework uxtl->zip optimisation [PR113196]g:f26f92b534f9implemented unsigned extensions using ZIPs rather than
+    UXTL{,2}, since the former has a higher throughput than the latter on
+    amny cores.  The optimisation worked by lowering directly to ZIP during
+    expand, so that the zero input could be hoisted and shared.
+    
+    However, changing to ZIP means that zero extensions no longer benefit
+    from some existing combine patterns.  The patch included new patterns
+    for UADDW and USUBW, but the PR shows that other patterns were affected
+    as well.
+    
+    This patch instead introduces the ZIPs during a pre-reload split
+    and forcibly hoists the zero move to the outermost scope.  This has
+    the disadvantage of executing the move even for a shrink-wrapped
+    function, which I suppose could be a problem if it causes a kernel
+    to trap and enable Advanced SIMD unnecessarily.  In other circumstances,
+    an unused move shouldn't affect things much.
+    
+    Also, the RA should be able to rematerialise the move at an
+    appropriate point if necessary, such as if there is an intervening
+    call.
+    
+    Inhttps://gcc.gnu.org/pipermail/gcc-patches/2024-January/641948.htmlI'd then tried to allow a zero to be recombined back into a solitary
+    ZIP.  However, that relied on late-combine, which didn't make it into
+    GCC 14.  This version instead restricts the split to cases where the
+    UXTL executes more frequently as the entry block (which is where we
+    plan to put the zero).
+    
+    Also, the original optimisation contained a big-endian correction
+    that I don't think is needed/correct.  Even on big-endian targets,
+    we want the ZIP to take the low half of an element from the input
+    vector and the high half from the zero vector.  And the patterns
+    map directly to the underlying Advanced SIMD instructions: the use
+    of unspecs means that there's no need to adjust for the difference
+    between GCC and Arm lane numbering.
+    
+    gcc/PR target/113196* config/aarch64/aarch64.h (machine_function::advsimd_zero_insn):
+            New member variable.
+            * config/aarch64/aarch64-protos.h (aarch64_split_simd_shift_p):
+            Declare.
+            * config/aarch64/iterators.md (Vnarrowq2): New mode attribute.
+            * config/aarch64/aarch64-simd.md
+            (vec_unpacku_hi_<mode>, vec_unpacks_hi_<mode>): Recombine into...
+            (vec_unpack<su>_hi_<mode>): ...this.  Move the generation of
+            zip2 for zero-extends to...
+            (aarch64_simd_vec_unpack<su>_hi_<mode>): ...a split of this
+            instruction.  Fix big-endian handling.
+            (vec_unpacku_lo_<mode>, vec_unpacks_lo_<mode>): Recombine into...
+            (vec_unpack<su>_lo_<mode>): ...this.  Move the generation of
+            zip1 for zero-extends to...
+            (<optab><Vnarrowq><mode>2): ...a split of this instruction.
+            Fix big-endian handling.
+            (*aarch64_zip1_uxtl): New pattern.
+            (aarch64_usubw<mode>_lo_zip, aarch64_uaddw<mode>_lo_zip): Delete
+            (aarch64_usubw<mode>_hi_zip, aarch64_uaddw<mode>_hi_zip): Likewise.
+            * config/aarch64/aarch64.cc (aarch64_get_shareable_reg): New function.
+            (aarch64_gen_shareable_zero): Use it.
+            (aarch64_split_simd_shift_p): New function.
+    
+    gcc/testsuite/PR target/113196* gcc.target/aarch64/pr113196.c: New test.
+            * gcc.target/aarch64/simd/vmovl_high_1.c: Remove double include.
+            Expect uxtl2 rather than zip2.
+            * gcc.target/aarch64/vect_mixed_sizes_8.c: Expect zip1 rather
+            than uxtl.
+            * gcc.target/aarch64/vect_mixed_sizes_9.c: Likewise.
+            * gcc.target/aarch64/vect_mixed_sizes_10.c: Likewise.
+
+- User: Richard Sandiford | Time: 2024-01-12 12:41:42 UTC
+  Text: Fixed.
+

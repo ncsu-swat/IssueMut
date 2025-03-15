@@ -1,0 +1,149 @@
+Bug Summary: [14 Regression] Wrong code at -O2/3 on x86_64-linux-gnu since r14-1161-g5476de2618f
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Shaohua Li | Time: 2023-10-31 11:13:33 UTC
+  Text: gcc at -O2/3 produces the wrong code.
+
+Bisected tor14-1161-g5476de2618fCompiler explorer:https://godbolt.org/z/Kb4qMKE9K$ cat a.c
+int printf(const char *, ...);
+short a, b;
+static int c, d, e, f = -7;
+char g;
+int *h = &d;
+int **i = &h;
+int j;
+short(k)(int l) { return l >= 2 ? 0 : l; }
+int(m)(int l, int n) { return l < -2147483647 / n ? l : l * n; }
+void o() { &c; }
+int main() {
+  {
+    int p;
+    for (; g <= 3; g++) {
+      for (; c; c++)
+        ;
+      a = 2;
+      for (; a <= 7; a++) {
+        short *r = &b;
+        p = m(*h, 2022160547);
+        unsigned q = 2022160547;
+        e = p * q;
+        *r ^= e;
+        j = k(c + 3);
+        **i = 0;
+      }
+      *i = &f;
+    }
+  }
+  printf("%d\n", b);
+}
+$
+$ gcc -O0 a.c && ./a.out
+-3189
+$ gcc -O2 a.c && ./a.out
+0
+$
+
+- User: Richard Biener | Time: 2023-10-31 12:02:57 UTC
+  Text: Confirmed.  We hoist _4 * 2022160547, which is the signed representation.
+
+_4 = *h.4_3;
+if (_4 >= -1)
+  goto <bb 7>; [50.00%]
+else
+  goto <bb 6>; [50.00%]
+
+<bb 7> [local count: 477815112]:
+iftmp.1_43 = _4 * 2022160547;
+p.5_51 = (unsigned int) iftmp.1_43;
+_52 = p.5_51 * 2022160547;
+_53 = b_lsm.36_24;
+_54 = (short int) _52;
+_55 = _53 ^ _54;
+
+<bb 6> [local count: 477815112]:
+p.5_7 = (unsigned int) _4;
+_36 = p.5_7 * 2022160547;
+_45 = b_lsm.36_24;
+_46 = (short int) _36;
+_47 = _45 ^ _46;
+goto <bb 8>; [100.00%]
+
+- User: Richard Biener | Time: 2023-10-31 15:52:52 UTC
+  Text: So this really asks for the change to be reverted which requires us to "properly" handle virtual operands in the expression sets.  Namely in
+compute_avail populate EXP_GEN with reference expressions with the
+virtual operand live at the start of the block.  And in prune_clobbered_mems
+rewrite them as well.
+
+- User: Richard Biener | Time: 2023-11-03 09:40:18 UTC
+  Text: Hm.  It's more complicated, we cannot keep the intersection of expressions here
+as seen by the added testcase
+
+int foo (int flag, int * __restrict a, int * __restrict b)
+{
+  int res;
+  if (flag)
+    res = *a + *b;
+  else
+    {
+      res = *a;
+      *a = 1;
+      res += *b;
+    }
+  return res;
+}
+
+here we expect to hoist the *a and *b load and the addition.  But while we
+can make the loads have the same expression, the adds will inevitably
+differ as we do not have valueized operands there.
+
+So what happens is that we have multiple expressions for the same value
+we'd like to hoist, and currently byr14-1161-g5476de2618fwe're picking
+the "first".  For the case in this PR it's the "wrong" one, but we can't
+easily decide which one is correct.
+
+For the bug we have {nop_expr,iftmp.1_43} (0028) and {mult_expr,p.5_7,2022160547} (0028) where the first depends on
+{mult_expr,_4,2022160547} (0033) and the second depends on
+{nop_expr,_4} (0007) - both are not values we intended to hoist
+but we'd generate them anyway via create_expression_by_pieces.
+
+So instead of forcing the expressions to be the same on all paths as it
+was beforer14-1161-g5476de2618fwe can go and check whether the
+resulting set of expressions to hoist is self-consistent, in that it
+contains all dependent expressions we'd have to hoist.
+
+That also ensures we can truly eliminate the whole computation on both
+paths (consider the dependent expressions to be live).
+
+Ideally we'd keep the union of the expressions from both paths like
+compute_antic does and then we can pick the representation that
+fulfills the constraints.
+
+- User: GCC Commits | Time: 2023-11-03 10:35:37 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:2266f7cbc78dfcf7c0739466644e0a6b9966553ccommitr14-5095-g2266f7cbc78dfcf7c0739466644e0a6b9966553cAuthor: Richard Biener <rguenther@suse.de>
+Date:   Fri Nov 3 10:45:18 2023 +0100
+
+    tree-optimization/112310 - code hoisting undefined behavior
+    
+    The following avoids hoisting expressions that may invoke undefined
+    behavior and are not computed on all paths.  This is realized by
+    noting that we have to avoid materializing expressions as part
+    of hoisting that are not part of the set of expressions we have
+    found eligible for hoisting.  Instead of picking the expression
+    corresponding to the hoistable values from the first successor
+    we now keep a union of the expressions so that hoisting can pick
+    the expression that has its dependences fully hoistable.PR tree-optimization/112310* tree-ssa-pre.cc (do_hoist_insertion): Keep the union
+            of expressions, validate dependences are contained within
+            the hoistable set before hoisting.
+    
+            * gcc.dg/torture/pr112310.c: New testcase.
+
+- User: Richard Biener | Time: 2023-11-03 10:35:47 UTC
+  Text: Fixed.
+

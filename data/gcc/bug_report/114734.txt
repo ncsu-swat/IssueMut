@@ -1,0 +1,346 @@
+Bug Summary: [11 regression] RISC-V rv64gcv_zvl256b miscompile with -flto -O3 -mrvv-vector-bits=zvl since r8-6047-g65dd1346027bb5
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 12.3.1, 13.2.1, 14.0, 15.0
+Known to Fail: 12.3.0, 13.2.0
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-04-16 05:14:47 UTC
+  Text: Testcase: 
+int f[18];
+int g[18];
+int h[18][18][18];
+int a[324];
+long b[18];
+int *i = g;
+int (*j)[18][18] = h;
+int z;
+int main() {
+  for (int m = 0; m < 18; ++m)
+    f[m] = 3;
+  for (int m = 0; m < 18; m += 1)
+    for (int n = 0; n < 18; n += 3) {
+      a[m * 8 + n] = j[m][m][0] ? i[n] : 0;
+      b[n] = f[n] ? -i[m] : 0;
+    }
+  for (long n = 0; n < 8; ++n)
+    z = a[n];
+  __builtin_printf("%ld\n", b[15]);
+}
+
+Commands:> /scratch/tc-testing/tc-apr-15/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv_zvl256b -flto -O3 -mrvv-vector-bits=zvl red.c -o red.out
+> /scratch/tc-testing/tc-apr-15/build-rv64gcv/bin/qemu-riscv64 red.out-3> /scratch/tc-testing/tc-apr-15/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc red.c -o red.out
+> /scratch/tc-testing/tc-apr-15/build-rv64gcv/bin/qemu-riscv64 red.out0
+
+Result is not affected by -fno-strict-aliasing.
+
+Tested usingr14-9976-gf8409c3109d(not bisected)
+
+Found via fuzzer.
+
+- User: Robin Dapp | Time: 2024-04-16 07:47:47 UTC
+  Text: Confirmed.
+
+- User: Richard Biener | Time: 2024-04-16 11:50:05 UTC
+  Text: probably -fwhole-program is enough, -flto not needed(?)
+
+  # vectp_g.248_1401 = PHI <vectp_g.248_1402(32), &g(143)>
+...
+  _1411 = .SELECT_VL (ivtmp_1409, POLY_INT_CST [2, 2]);
+..
+  vect__193.250_1403 = .MASK_LEN_LOAD (vectp_g.248_1401, 32B, { -1, ... }, _1411, 0);
+  vect__194.251_1404 = -vect__193.250_1403;
+  vect_iftmp.252_1405 = (vector([2,2]) long int) vect__194.251_1404;
+
+  # vect_iftmp.252_1406 = PHI <vect_iftmp.252_1405(5)>
+  # loop_len_1427 = PHI <_1411(5)>
+...
+  _1407 = loop_len_1427 + 18446744073709551615;
+  _1408 = .VEC_EXTRACT (vect_iftmp.252_1406, _1407);
+  iftmp.3_1204 = _1408;
+
+is stored to b[15].  Doesn't look too odd to me.
+
+- User: Robin Dapp | Time: 2024-04-16 12:58:07 UTC
+  Text: > probably -fwhole-program is enough, -flto not needed(?)Yes, -fwhole-program is sufficient.> 
+>   # vectp_g.248_1401 = PHI <vectp_g.248_1402(32), &g(143)>
+> ...
+>   _1411 = .SELECT_VL (ivtmp_1409, POLY_INT_CST [2, 2]);
+> ..
+>   vect__193.250_1403 = .MASK_LEN_LOAD (vectp_g.248_1401, 32B, { -1, ... },
+> _1411, 0);
+>   vect__194.251_1404 = -vect__193.250_1403;
+>   vect_iftmp.252_1405 = (vector([2,2]) long int) vect__194.251_1404;
+> 
+>   # vect_iftmp.252_1406 = PHI <vect_iftmp.252_1405(5)>
+>   # loop_len_1427 = PHI <_1411(5)>
+> ...
+>   _1407 = loop_len_1427 + 18446744073709551615;
+>   _1408 = .VEC_EXTRACT (vect_iftmp.252_1406, _1407);
+>   iftmp.3_1204 = _1408;
+> 
+> is stored to b[15].  Doesn't look too odd to me.At the assembly equivalent of>   vect__193.250_1403 = .MASK_LEN_LOAD (vectp_g.248_1401, 32B, { -1, ... },
+> _1411, 0);we load [3 3] (=f) instead of [0 0] (=g).  f is located after g in memory and register a3 is increased before the loop latch.  We then re-use a3 to load the last two elements of g but actually read the first two of f.
+
+- User: Robin Dapp | Time: 2024-04-16 13:14:51 UTC
+  Text: Ok, it looks like we do 5 iterations with the last one being length-masked to length 2 and then in the "live extraction" phase use "iteration 6".
+
+- User: Robin Dapp | Time: 2024-04-22 15:45:54 UTC
+  Text: What happens is that code sinking does:
+
+Sinking # VUSE <.MEM_1235>
+vect__173.251_1238 = .MASK_LEN_LOAD (_911, 32B, { -1, -1, -1, -1 }, loop_len_1064, 0);
+ from bb 3 to bb 4
+
+so we have
+
+vect__173.251_1238 = .MASK_LEN_LOAD (_911, 32B, { -1, -1, -1, -1 }, loop_len_1064, 0);
+
+after the loop.
+
+When expanding this stmt expand_call_mem_ref creates a mem reference to vectp_g.178 for _911 (== vectp_g.178_1078).  This is expanded to the same rtl as vectp_g.178_1079 (which is incremented before the latch as opposed to ...1078 which is not).
+
+Disabling sinking or expand_call_mem_ref both help but neither is correct of course :)  I don't have a solution yet but I'd hope we're a bit closer to the problem now.
+
+- User: Robin Dapp | Time: 2024-04-24 14:16:19 UTC
+  Text: This one is really a bit tricky.
+
+We have the following situation:
+
+loop:
+<bb 3>
+# vectp_g.178_1078 = PHI <vectp_g.178_1079(3), &gD.2750(2)> 
+_911 = &MEM... vectp_g.178_1078
+MASK_LEN_LOAD (_911, ...);
+vectp_g.178_1079 = vectp_g.178_1078 + 16;
+goto loop;
+
+<bb 4>:
+MASK_LEN_LOAD (_911, ...);
+
+During expand we basically convert back the _911 to vectp_g.178_1078 (reverting what we did in ivopts before).  Because _911 camouflages vectp_g.178_1078 until expand we evaded the conflict checks of outof-ssa that would catch a similar, non-camouflaged situation like:
+
+# vectp_g.178_1078 = PHI <vectp_g.178_1079(3), &gD.2750(2)> 
+MASK_LEN_LOAD (MEM... vectp_g.178_1078, ...);
+vectp_g.178_1079 = vectp_g.178_1078 + 16;
+goto loop;
+MASK_LEN_LOAD (MEM... vectp_g.178_1078, ...);
+
+and would insert a copy of the definition right before the backedge.  The MASK_LEN_LOAD after the loop would then use that copy.  By using _911 instead of the original pointer no conflict is detected and we wrongly use the incremented pointer.  Without the ivopt change for TARGET_MEM_REF
+
+Unless I'm misunderstanding some basic mechanism it's not going to work like that (and we could also have this situation on aarch64).  What could help is to enhance trivially_conflicts_p in outof-ssa to catch such TARGET_MEM_REFs here and handle them similarly to a normal conflict.  I did that locally and it
+helps for this particular case but I'd rather not post it in its current hacky state even if the riscv testsuite looks ok :)  Even if that were the correct solution I'd doubt it should land in stage 4.
+
+CC'ing Richard Sandiford as he originally introduced the ivopts and expand handling.
+
+- User: Richard Biener | Time: 2024-04-25 06:31:25 UTC
+  Text: (In reply to Robin Dapp fromcomment #6)> This one is really a bit tricky.
+> 
+> We have the following situation:
+> 
+> loop:
+> <bb 3>
+> # vectp_g.178_1078 = PHI <vectp_g.178_1079(3), &gD.2750(2)> 
+> _911 = &MEM... vectp_g.178_1078
+> MASK_LEN_LOAD (_911, ...);
+> vectp_g.178_1079 = vectp_g.178_1078 + 16;
+> goto loop;
+> 
+> <bb 4>:
+> MASK_LEN_LOAD (_911, ...);
+> 
+> During expand we basically convert back the _911 to vectp_g.178_1078
+> (reverting what we did in ivopts before).  Because _911 camouflages
+> vectp_g.178_1078 until expand we evaded the conflict checks of outof-ssa
+> that would catch a similar, non-camouflaged situation like:
+> 
+> # vectp_g.178_1078 = PHI <vectp_g.178_1079(3), &gD.2750(2)> 
+> MASK_LEN_LOAD (MEM... vectp_g.178_1078, ...);
+> vectp_g.178_1079 = vectp_g.178_1078 + 16;
+> goto loop;
+> MASK_LEN_LOAD (MEM... vectp_g.178_1078, ...);
+> 
+> and would insert a copy of the definition right before the backedge.  The
+> MASK_LEN_LOAD after the loop would then use that copy.  By using _911
+> instead of the original pointer no conflict is detected and we wrongly use
+> the incremented pointer.  Without the ivopt change for TARGET_MEM_REFSo you say we coalesce _1079 and _1078 but then apply TER to _911 which
+makes that coalescing invalid because now their lifetimes overlap?
+
+There must be some mechanisms to avoid this kind of situation so I do
+wonder whether it's not TER but some invalid SSA def stmt lookup that
+is happening upon expansion _not_ honoring the TER constaints here?
+
+That is, how do we exactly put the definition of _911 into the uses?  Can
+you attach the RTL expansion dump?
+
+- User: Robin Dapp | Time: 2024-04-25 08:15:23 UTC
+  Text: Createdattachment 58037[details]Expand dump
+
+Dump attached.  Insn 209 is the problematic one.
+The changing from _911 to 1078 happens in internal-fn.cc:expand_call_mem_ref (and not via TER).
+The lookup there is simple and I was also wondering if there is some single_imm_use or so missing.
+
+- User: Richard Biener | Time: 2024-04-25 13:28:35 UTC
+  Text: (In reply to Robin Dapp fromcomment #8)> Createdattachment 58037[details]> Expand dump
+> 
+> Dump attached.  Insn 209 is the problematic one.
+> The changing from _911 to 1078 happens in internal-fn.cc:expand_call_mem_ref
+> (and not via TER).
+> The lookup there is simple and I was also wondering if there is some
+> single_imm_use or so missing.Nah, it's invalid to do that.  You have to use get_gimple_for_ssa_name instead
+and handle a NULL return.  Alternatively the code could check for
+no SSA use on the def (to catch _1 = &a).
+
+So the error is inr8-6047-g65dd1346027bb5which makes it a quite old
+wrong-code issue.  And yes, Richard S. wrote that.
+
+Can you check if the following fixes the issue?  (untested besides compiling it)
+
+diff --git a/gcc/internal-fn.cc b/gcc/internal-fn.cc
+index 2c764441cde..0a7053c2286 100644
+--- a/gcc/internal-fn.cc
++++ b/gcc/internal-fn.cc
+@@ -53,6 +53,8 @@ along with GCC; see the file COPYING3.  If not see
+ #include "rtl-iter.h"
+ #include "gimple-range.h"
+ #include "fold-const-call.h"
++#include "tree-ssa-live.h"
++#include "tree-outof-ssa.h"
+ 
+ /* For lang_hooks.types.type_for_mode.  */
+ #include "langhooks.h"
+@@ -2964,8 +2966,8 @@ expand_call_mem_ref (tree type, gcall *stmt, int index)
+   tree tmp = addr;
+   if (TREE_CODE (tmp) == SSA_NAME)
+     {
+-      gimple *def = SSA_NAME_DEF_STMT (tmp);
+-      if (gimple_assign_single_p (def))
++      gimple *def = get_gimple_for_ssa_name (tmp);
++      if (def && gimple_assign_single_p (def))
+        tmp = gimple_assign_rhs1 (def);
+     }
+
+- User: Robin Dapp | Time: 2024-04-25 13:52:48 UTC
+  Text: Yes it helps.  Great that get_gimple_for_ssa_name is right below get_rtx_for_ssa_name that I stepped through several times while debugging and I didn't realize the connection, grrrr.
+
+But thanks!  Good thing it can be solved like that.
+
+I cannot do a bootstrap/regtest for aarch64 because cfarm185 is almost out of disk space.  As the bug is old and very unlikely to trigger it can surely wait for GCC15?
+
+- User: Richard Biener | Time: 2024-04-26 13:52:32 UTC
+  Text: posted the patch so the arm CI picks it up.
+
+- User: GCC Commits | Time: 2024-04-30 06:46:27 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:4d3a5618de5a949c61605f545f90e81bc0000502commitr15-60-g4d3a5618de5a949c61605f545f90e81bc0000502Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Apr 26 15:47:13 2024 +0200
+
+    middle-end/114734 - wrong code with expand_call_mem_ref
+    
+    When expand_call_mem_ref looks at the definition of the address
+    argument to eventually expand a &TARGET_MEM_REF argument together
+    with a masked load it fails to honor constraints imposed by SSA
+    coalescing decisions.  The following fixes this.PR middle-end/114734* internal-fn.cc (expand_call_mem_ref): Use
+            get_gimple_for_ssa_name to get at the def stmt of the address
+            argument to honor SSA coalescing constraints.
+
+- User: Richard Biener | Time: 2024-04-30 06:47:24 UTC
+  Text: Fixed on trunk sofar.  Can you prepare a testcase for gcc.target/riscv?
+
+- User: Patrick O'Neill | Time: 2024-04-30 14:50:28 UTC
+  Text: I'll send a patch with the testcase in a few hours. Testing it now.
+
+- User: GCC Commits | Time: 2024-05-02 16:22:00 UTC
+  Text: The master branch has been updated by Patrick O'Neill <poneill@gcc.gnu.org>:https://gcc.gnu.org/g:ff4dc8b10a421cdb0c56f7f8c238609de4f9fbe2commitr15-116-gff4dc8b10a421cdb0c56f7f8c238609de4f9fbe2Author: Patrick O'Neill <patrick@rivosinc.com>
+Date:   Tue Apr 30 13:26:45 2024 -0700
+
+    RISC-V: Add testcase forpr114734gcc/testsuite/ChangeLog:PR middle-end/114734* gcc.target/riscv/rvv/autovec/pr114734.c: New test.
+    
+    Signed-off-by: Patrick O'Neill <patrick@rivosinc.com>
+
+- User: GCC Commits | Time: 2024-05-03 12:51:39 UTC
+  Text: The releases/gcc-14 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:5c42872b2a08a742f061809c7650e0c62dd7a9f3commitr14-10161-g5c42872b2a08a742f061809c7650e0c62dd7a9f3Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Apr 26 15:47:13 2024 +0200
+
+    middle-end/114734 - wrong code with expand_call_mem_ref
+    
+    When expand_call_mem_ref looks at the definition of the address
+    argument to eventually expand a &TARGET_MEM_REF argument together
+    with a masked load it fails to honor constraints imposed by SSA
+    coalescing decisions.  The following fixes this.PR middle-end/114734* internal-fn.cc (expand_call_mem_ref): Use
+            get_gimple_for_ssa_name to get at the def stmt of the address
+            argument to honor SSA coalescing constraints.
+    
+    (cherry picked from commit 4d3a5618de5a949c61605f545f90e81bc0000502)
+
+- User: GCC Commits | Time: 2024-05-03 12:51:45 UTC
+  Text: The releases/gcc-14 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:796319476e4fd6813e8319061bc3a8f19b355e35commitr14-10162-g796319476e4fd6813e8319061bc3a8f19b355e35Author: Patrick O'Neill <patrick@rivosinc.com>
+Date:   Tue Apr 30 13:26:45 2024 -0700
+
+    RISC-V: Add testcase forpr114734gcc/testsuite/ChangeLog:PR middle-end/114734* gcc.target/riscv/rvv/autovec/pr114734.c: New test.
+    
+    Signed-off-by: Patrick O'Neill <patrick@rivosinc.com>
+    (cherry picked from commit ff4dc8b10a421cdb0c56f7f8c238609de4f9fbe2)
+
+- User: Richard Biener | Time: 2024-05-03 12:52:08 UTC
+  Text: We're getting a new RC, so pushed to 14 now as well.
+
+- User: GCC Commits | Time: 2024-05-06 13:15:19 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:20ebcaf826c91ddaf2aac35417ec1e5e6d31ad50commitr13-8695-g20ebcaf826c91ddaf2aac35417ec1e5e6d31ad50Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Apr 26 15:47:13 2024 +0200
+
+    middle-end/114734 - wrong code with expand_call_mem_ref
+    
+    When expand_call_mem_ref looks at the definition of the address
+    argument to eventually expand a &TARGET_MEM_REF argument together
+    with a masked load it fails to honor constraints imposed by SSA
+    coalescing decisions.  The following fixes this.PR middle-end/114734* internal-fn.cc (expand_call_mem_ref): Use
+            get_gimple_for_ssa_name to get at the def stmt of the address
+            argument to honor SSA coalescing constraints.
+    
+    (cherry picked from commit 4d3a5618de5a949c61605f545f90e81bc0000502)
+
+- User: GCC Commits | Time: 2024-05-06 13:15:25 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:4c3011ec4825bf06c9d268361a53f8239bf9564acommitr13-8696-g4c3011ec4825bf06c9d268361a53f8239bf9564aAuthor: Patrick O'Neill <patrick@rivosinc.com>
+Date:   Tue Apr 30 13:26:45 2024 -0700
+
+    RISC-V: Add testcase forpr114734gcc/testsuite/ChangeLog:PR middle-end/114734* gcc.target/riscv/rvv/autovec/pr114734.c: New test.
+    
+    Signed-off-by: Patrick O'Neill <patrick@rivosinc.com>
+    (cherry picked from commit ff4dc8b10a421cdb0c56f7f8c238609de4f9fbe2)
+
+- User: GCC Commits | Time: 2024-05-16 09:56:13 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:46b2e98983ebc62440c43217f2b3bbe72f8b0191commitr12-10447-g46b2e98983ebc62440c43217f2b3bbe72f8b0191Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Apr 26 15:47:13 2024 +0200
+
+    middle-end/114734 - wrong code with expand_call_mem_ref
+    
+    When expand_call_mem_ref looks at the definition of the address
+    argument to eventually expand a &TARGET_MEM_REF argument together
+    with a masked load it fails to honor constraints imposed by SSA
+    coalescing decisions.  The following fixes this.PR middle-end/114734* internal-fn.cc (expand_call_mem_ref): Use
+            get_gimple_for_ssa_name to get at the def stmt of the address
+            argument to honor SSA coalescing constraints.
+    
+    (cherry picked from commit 20ebcaf826c91ddaf2aac35417ec1e5e6d31ad50)
+
+- User: GCC Commits | Time: 2024-06-21 09:21:54 UTC
+  Text: The releases/gcc-11 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:a43c9bea7bd80af33ae116e7197f814ad911857ecommitr11-11519-ga43c9bea7bd80af33ae116e7197f814ad911857eAuthor: Richard Biener <rguenther@suse.de>
+Date:   Fri Apr 26 15:47:13 2024 +0200
+
+    middle-end/114734 - wrong code with expand_call_mem_ref
+    
+    When expand_call_mem_ref looks at the definition of the address
+    argument to eventually expand a &TARGET_MEM_REF argument together
+    with a masked load it fails to honor constraints imposed by SSA
+    coalescing decisions.  The following fixes this.PR middle-end/114734* internal-fn.c (expand_call_mem_ref): Use
+            get_gimple_for_ssa_name to get at the def stmt of the address
+            argument to honor SSA coalescing constraints.
+    
+    (cherry picked from commit 20ebcaf826c91ddaf2aac35417ec1e5e6d31ad50)
+
+- User: Richard Biener | Time: 2024-06-21 09:36:19 UTC
+  Text: Fixed.
+

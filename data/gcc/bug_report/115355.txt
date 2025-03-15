@@ -1,0 +1,1118 @@
+Bug Summary: [12/13/14/15 Regression] vectorization exposes wrong code on P9 LE starting from r12-4496
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 11.0
+Known to Fail: 12.0, 13.0, 14.0, 15.0
+
+Comments:
+- User: Jens Seifert | Time: 2024-06-05 10:39:34 UTC
+  Text: Input setToIdentity.C:
+
+#include <stdlib.h>
+#include <memory.h>
+#include <stdio.h>
+
+void setToIdentityGOOD(unsigned long long *mVec, unsigned int mLen)
+{
+  for (unsigned long long i = 0; i < mLen; i++)
+  {
+    mVec[i] = i;
+  }
+}
+
+void setToIdentityBAD(unsigned long long *mVec, unsigned int mLen)
+{
+  for (unsigned int i = 0; i < mLen; i++)
+  {
+    mVec[i] = i;
+  }
+}
+
+unsigned long long vec1[100];
+unsigned long long vec2[100];
+
+int main(int argc, char *argv[])
+{
+  unsigned int l = argc > 1 ? atoi(argv[1]) : 29;
+  setToIdentityGOOD(vec1, l);
+  setToIdentityBAD(vec2, l);
+
+  if (memcmp(vec1, vec2, l*sizeof(vec1[0])) != 0)
+  {
+     for (unsigned int i = 0; i < l; i++)
+     {
+        printf("%llu %llu\n", vec1[i], vec2[i]);
+     }
+  }
+  else
+  {
+     printf("match\n");
+  }
+  return 0;
+}
+
+
+Fails
+gcc -O3 -mcpu=power9 -m64 setToIdentity.C -save-temps -fverbose-asm -o pwr9.exe -mno-isel
+
+
+Good:
+gcc -O3 -mcpu=power8 -m64 setToIdentity.C -save-temps -fverbose-asm -o pwr8.exe -mno-isel
+
+"-mno-isel" is only specified to reduce the diff.
+
+
+Failing output:
+
+pwr9.exe
+0 0
+1 1
+2 0
+3 4294967296
+4 4
+5 5
+6 6
+7 7
+8 8
+9 9
+10 10
+11 11
+12 12
+13 13
+14 14
+15 15
+16 16
+17 17
+18 18
+19 19
+20 20
+21 21
+22 22
+23 23
+24 24
+25 25
+26 26
+27 27
+28 28
+
+4th element contains wrong data.
+
+- User: Jens Seifert | Time: 2024-06-05 11:55:13 UTC
+  Text: Same issue with gcc 13.2.1
+
+- User: Richard Biener | Time: 2024-06-05 12:30:05 UTC
+  Text: wild guess - store-with-len with bogus initial len/bias value?
+
+- User: Peter Bergner | Time: 2024-06-05 13:03:48 UTC
+  Text: I'll find someone to look into this.  Thanks for the test case!
+
+- User: Kewen Lin | Time: 2024-06-05 13:43:40 UTC
+  Text: Thanks for reporting, I'll have a look first.
+
+- User: Peter Bergner | Time: 2024-06-05 14:59:24 UTC
+  Text: FYI, fails for me with gcc 12 and later and works with gcc 11.  It also fails with -O3 -mcpu=power10.
+
+- User: Peter Bergner | Time: 2024-06-05 21:05:00 UTC
+  Text: Createdattachment 58361[details]setToIdentityBAD-char.s
+
+Code generated for setToIdentityBAD.c when using unsigned char for the index variable.
+
+- User: Peter Bergner | Time: 2024-06-05 21:05:28 UTC
+  Text: The test fails when setToIdentityBAD's index var is unsigned int.  It passes when using unsigned long long, unsigned long, unsigned short and unsigned char.  When using unsigned long long/unsigned long, we do no vectorize the loop.  We vectorize the loop when using unsigned int/short/char.  The vectorized code is a little strange, in that the smaller the integer type we use for the index var, the more code we generate.  
+
+The vectorized code for unsigned char is truly huge!  ...although it does seem to work correctly.  I'm attaching the "unsigned char i" code gen for setToIdentityBAD for people to examine.  Even though it gives "correct" results, it can't really be the code we want to generate, correct???
+
+- User: Kewen Lin | Time: 2024-06-06 04:36:13 UTC
+  Text: (In reply to Peter Bergner fromcomment #5)> FYI, fails for me with gcc 12 and later and works with gcc 11.  It also
+> fails with -O3 -mcpu=power10.Thanks for the information, bisection showsr12-4496is the culprit commit, I just tested and confirmed Xionghu's latest patch forPR106069also fixed this one.
+
+  - latest rev. for his fix:https://inbox.sourceware.org/gcc-patches/20230210025952.1887696-1-xionghuluo@tencent.com/, which was resent fromhttps://inbox.sourceware.org/gcc-patches/37b57a54-f98e-96a3-edff-866c8aae4c7d@gmail.com/- original thread and some discussions:https://inbox.sourceware.org/gcc-patches/20220808034247.2618809-1-xionghuluo@tencent.com/The latest rev. looked to me as (https://inbox.sourceware.org/gcc-patches/e8e69f0c-7f36-e671-6c3b-74401e4d8c48@linux.ibm.com/), still looking forward to Segher's review and approval on this.
+
+- User: Kewen Lin | Time: 2024-06-06 06:35:59 UTC
+  Text: (In reply to Peter Bergner fromcomment #7)> The test fails when setToIdentityBAD's index var is unsigned int.  It passes
+> when using unsigned long long, unsigned long, unsigned short and unsigned
+> char.  When using unsigned long long/unsigned long, we do no vectorize theunsigned {long ,}long fails to vectorize due to cost modeling:
+
+  missed:  cost model: the vector iteration cost = 2 divided by the scalar iteration cost = 1 is greater or equal to the vectorization factor = 2.
+  missed:  not vectorized: vectorization not profitable.
+
+it can be forced with -fno-vect-cost-model.> loop.  We vectorize the loop when using unsigned int/short/char.  The
+> vectorized code is a little strange, in that the smaller the integer type we
+> use for the index var, the more code we generate.  
+> 
+> The vectorized code for unsigned char is truly huge!  ...although it does
+> seem to work correctly.  I'm attaching the "unsigned char i" code gen for
+> setToIdentityBAD for people to examine.  Even though it gives "correct"
+> results, it can't really be the code we want to generate, correct???It's due to aggressive unrolling, as it has one early check on the loop bound between 16 and 255, then cunroll completely unrolls it for each 16 multiples (totally 15 loops). A compact version of code can be generated with -fdisable-tree-cunroll.
+
+- User: Jens Seifert | Time: 2024-06-07 06:53:56 UTC
+  Text: Does this affect loop vectorize and slp vectorize ?
+
+-fno-tree-loop-vectorize avoids loop vectorization to be performed and workarounds this issue. Does the same problems also affect SLP vectorization, which does not take place in this sample.
+
+In other words, do I need
+-fno-tree-loop-vectorize
+or
+-fno-tree-vectorize
+to workaround this bug ?
+
+- User: Kewen Lin | Time: 2024-06-07 08:14:53 UTC
+  Text: (In reply to Jens Seifert fromcomment #10)> Does this affect loop vectorize and slp vectorize ?
+> 
+> -fno-tree-loop-vectorize avoids loop vectorization to be performed and
+> workarounds this issue. Does the same problems also affect SLP
+> vectorization, which does not take place in this sample.
+> 
+> In other words, do I need
+> -fno-tree-loop-vectorize
+> or
+> -fno-tree-vectorize
+> to workaround this bug ?Since it's an issue on vector merge insn patterns in target code and vectorization just exposes it, it's hard to workaround this bug completely just by disabling both loop and slp vectorization, as its related bugPR106069shows, even without vectorization but using some vec merge built-ins, it's still possible to hit this issue.  But I'd expect disabling both loop and slp vectorization (-fno-tree-vectorize) can greatly reduce the possibility of encountering it.
+
+- User: Richard Biener | Time: 2024-06-20 09:15:50 UTC
+  Text: GCC 12.4 is being released, retargeting bugs to GCC 12.5.
+
+- User: GCC Commits | Time: 2024-06-21 01:27:36 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:52c112800d9f44457c4832309a48c00945811313commitr15-1504-g52c112800d9f44457c4832309a48c00945811313Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Thu Jun 20 20:23:56 2024 -0500
+
+    rs6000: Fix wrong RTL patterns for vector merge high/low word on LE
+    
+    Commitr12-4496changes some define_expands and define_insns
+    for vector merge high/low word, which are altivec_vmrg[hl]w,
+    vsx_xxmrg[hl]w_<VSX_W:mode>.  These defines are mainly for
+    built-in function vec_merge{h,l}, __builtin_vsx_xxmrghw,
+    __builtin_vsx_xxmrghw_4si and some internal gen function
+    needs.  These functions should consider endianness, taking
+    vec_mergeh as example, as PVIPR defines, vec_mergeh "Merges
+    the first halves (in element order) of two vectors", it does
+    note it's in element order.  So it's mapped into vmrghw on
+    BE while vmrglw on LE respectively.  Although the mapped
+    insns are different, as the discussion inPR106069, the RTL
+    pattern should be still the same, it is conformed before
+    commitr12-4496, define_expand altivec_vmrghw got expanded
+    into:
+    
+      (vec_select:VSX_W
+         (vec_concat:<VS_double>
+            (match_operand:VSX_W 1 "register_operand" "wa,v")
+            (match_operand:VSX_W 2 "register_operand" "wa,v"))
+            (parallel [(const_int 0) (const_int 4)
+                       (const_int 1) (const_int 5)])))]
+    
+    on both BE and LE then.  But commitr12-4496changed it to
+    expand into:
+    
+      (vec_select:VSX_W
+         (vec_concat:<VS_double>
+            (match_operand:VSX_W 1 "register_operand" "wa,v")
+            (match_operand:VSX_W 2 "register_operand" "wa,v"))
+            (parallel [(const_int 0) (const_int 4)
+                       (const_int 1) (const_int 5)])))]
+    
+    on BE, and
+    
+      (vec_select:VSX_W
+         (vec_concat:<VS_double>
+            (match_operand:VSX_W 1 "register_operand" "wa,v")
+            (match_operand:VSX_W 2 "register_operand" "wa,v"))
+            (parallel [(const_int 2) (const_int 6)
+                       (const_int 3) (const_int 7)])))]
+    
+    on LE, although the mapped insn are still vmrghw on BE and
+    vmrglw on LE, the associated RTL pattern is completely
+    wrong and inconsistent with the mapped insn.  If optimization
+    passes leave this pattern alone, even if its pattern doesn't
+    represent its mapped insn, it's still fine, that's why simple
+    testing on bif doesn't expose this issue.  But once some
+    optimization pass such as combine does some changes basing
+    on this wrong pattern, because the pattern doesn't match the
+    semantics that the expanded insn is intended to represent,
+    it would cause the unexpected result.
+    
+    So this patch is to fix the wrong RTL pattern, ensure the
+    associated RTL patterns become the same as before which can
+    have the same semantic as their mapped insns.  With the
+    proposed patch, the expanders like altivec_vmrghw expands
+    into altivec_vmrghb_direct_be or altivec_vmrglb_direct_le
+    depending on endianness, "direct" can easily show which
+    insn would be generated, _be and _le are mainly for the
+    different RTL patterns as endianness.
+    
+    Co-authored-by: Xionghu Luo <xionghuluo@tencent.com>PR target/106069PR target/115355gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (altivec_vmrghw_direct_<VSX_W:mode>): Rename
+            to ...
+            (altivec_vmrghw_direct_<VSX_W:mode>_be): ... this.  Add the condition
+            BYTES_BIG_ENDIAN.
+            (altivec_vmrghw_direct_<VSX_W:mode>_le): New define_insn.
+            (altivec_vmrglw_direct_<VSX_W:mode>): Rename to ...
+            (altivec_vmrglw_direct_<VSX_W:mode>_be): ... this.  Add the condition
+            BYTES_BIG_ENDIAN.
+            (altivec_vmrglw_direct_<VSX_W:mode>_le): New define_insn.
+            (altivec_vmrghw): Adjust by calling gen_altivec_vmrghw_direct_v4si_be
+            for BE and gen_altivec_vmrglw_direct_v4si_le for LE.
+            (altivec_vmrglw): Adjust by calling gen_altivec_vmrglw_direct_v4si_be
+            for BE and gen_altivec_vmrghw_direct_v4si_le for LE.
+            (vec_widen_umult_hi_v8hi): Adjust the call to
+            gen_altivec_vmrghw_direct_v4si by gen_altivec_vmrghw for BE
+            and by gen_altivec_vmrglw for LE.
+            (vec_widen_smult_hi_v8hi): Likewise.
+            (vec_widen_umult_lo_v8hi): Adjust the call to
+            gen_altivec_vmrglw_direct_v4si by gen_altivec_vmrglw for BE
+            and by gen_altivec_vmrghw for LE
+            (vec_widen_smult_lo_v8hi): Likewise.
+            * config/rs6000/rs6000.cc (altivec_expand_vec_perm_const): Replace
+            CODE_FOR_altivec_vmrghw_direct_v4si by
+            CODE_FOR_altivec_vmrghw_direct_v4si_be for BE and
+            CODE_FOR_altivec_vmrghw_direct_v4si_le for LE.  And replace
+            CODE_FOR_altivec_vmrglw_direct_v4si by
+            CODE_FOR_altivec_vmrglw_direct_v4si_be for BE and
+            CODE_FOR_altivec_vmrglw_direct_v4si_le for LE.
+            * config/rs6000/vsx.md (vsx_xxmrghw_<VSX_W:mode>): Adjust by calling
+            gen_altivec_vmrghw_direct_v4si_be for BE and
+            gen_altivec_vmrglw_direct_v4si_le for LE.
+            (vsx_xxmrglw_<VSX_W:mode>): Adjust by calling
+            gen_altivec_vmrglw_direct_v4si_be for BE and
+            gen_altivec_vmrghw_direct_v4si_le for LE.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/powerpc/pr106069.C: New test.
+            * gcc.target/powerpc/pr115355.c: New test.
+
+- User: GCC Commits | Time: 2024-06-26 07:17:50 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:62520e4e9f7e2fe8a16ee57a4bd35da2e921ae22commitr15-1644-g62520e4e9f7e2fe8a16ee57a4bd35da2e921ae22Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Wed Jun 26 02:16:17 2024 -0500
+
+    rs6000: Fix wrong RTL patterns for vector merge high/low char on LE
+    
+    Commitr12-4496changes some define_expands and define_insns
+    for vector merge high/low char, which are altivec_vmrg[hl]b.
+    These defines are mainly for built-in function vec_merge{h,l}
+    and some internal gen function needs.  These functions should
+    consider endianness, taking vec_mergeh as example, as PVIPR
+    defines, vec_mergeh "Merges the first halves (in element order)
+    of two vectors", it does note it's in element order.  So it's
+    mapped into vmrghb on BE while vmrglb on LE respectively.
+    Although the mapped insns are different, as the discussion inPR106069, the RTL pattern should be still the same, it is
+    conformed before commitr12-4496, but gets changed into
+    different patterns on BE and LE starting from commitr12-4496.
+    Similar to 32-bit element case in commit log ofr15-1504, this
+    8-bit element pattern on LE doesn't actually match what the
+    underlying insn is intended to represent, once some optimization
+    like combine does some changes basing on it, it would cause
+    the unexpected consequence.  The newly constructed test casepr106069-1.c is a typical example for this issue.
+    
+    So this patch is to fix the wrong RTL pattern, ensure the
+    associated RTL patterns become the same as before which can
+    have the same semantic as their mapped insns.  With the
+    proposed patch, the expanders like altivec_vmrghb expands
+    into altivec_vmrghb_direct_be or altivec_vmrglb_direct_le
+    depending on endianness, "direct" can easily show which
+    insn would be generated, _be and _le are mainly for the
+    different RTL patterns as endianness.
+    
+    Co-authored-by: Xionghu Luo <xionghuluo@tencent.com>PR target/106069PR target/115355gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (altivec_vmrghb_direct): Rename to ...
+            (altivec_vmrghb_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrghb_direct_le): New define_insn.
+            (altivec_vmrglb_direct): Rename to ...
+            (altivec_vmrglb_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrglb_direct_le): New define_insn.
+            (altivec_vmrghb): Adjust by calling gen_altivec_vmrghb_direct_be
+            for BE and gen_altivec_vmrglb_direct_le for LE.
+            (altivec_vmrglb): Adjust by calling gen_altivec_vmrglb_direct_be
+            for BE and gen_altivec_vmrghb_direct_le for LE.
+            * config/rs6000/rs6000.cc (altivec_expand_vec_perm_const): Replace
+            CODE_FOR_altivec_vmrghb_direct by
+            CODE_FOR_altivec_vmrghb_direct_be for BE and
+            CODE_FOR_altivec_vmrghb_direct_le for LE.  And replace
+            CODE_FOR_altivec_vmrglb_direct by
+            CODE_FOR_altivec_vmrglb_direct_be for BE and
+            CODE_FOR_altivec_vmrglb_direct_le for LE.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr106069-1.c: New test.
+
+- User: GCC Commits | Time: 2024-06-26 07:17:58 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:812c70bf4981958488331d4ea5af8709b5321da1commitr15-1645-g812c70bf4981958488331d4ea5af8709b5321da1Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Wed Jun 26 02:16:17 2024 -0500
+
+    rs6000: Fix wrong RTL patterns for vector merge high/low short on LE
+    
+    Commitr12-4496changes some define_expands and define_insns
+    for vector merge high/low short, which are altivec_vmrg[hl]h.
+    These defines are mainly for built-in function vec_merge{h,l}
+    and some internal gen function needs.  These functions should
+    consider endianness, taking vec_mergeh as example, as PVIPR
+    defines, vec_mergeh "Merges the first halves (in element order)
+    of two vectors", it does note it's in element order.  So it's
+    mapped into vmrghh on BE while vmrglh on LE respectively.
+    Although the mapped insns are different, as the discussion inPR106069, the RTL pattern should be still the same, it is
+    conformed before commitr12-4496, but gets changed into
+    different patterns on BE and LE starting from commitr12-4496.
+    Similar to 32-bit element case in commit log ofr15-1504, this
+    16-bit element pattern on LE doesn't actually match what the
+    underlying insn is intended to represent, once some optimization
+    like combine does some changes basing on it, it would cause
+    the unexpected consequence.  The newly constructed test casepr106069-2.c is a typical example for this issue on element type
+    short.
+    
+    So this patch is to fix the wrong RTL pattern, ensure the
+    associated RTL patterns become the same as before which can
+    have the same semantic as their mapped insns.  With the
+    proposed patch, the expanders like altivec_vmrghh expands
+    into altivec_vmrghh_direct_be or altivec_vmrglh_direct_le
+    depending on endianness, "direct" can easily show which
+    insn would be generated, _be and _le are mainly for the
+    different RTL patterns as endianness.
+    
+    Co-authored-by: Xionghu Luo <xionghuluo@tencent.com>PR target/106069PR target/115355gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (altivec_vmrghh_direct): Rename to ...
+            (altivec_vmrghh_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrghh_direct_le): New define_insn.
+            (altivec_vmrglh_direct): Rename to ...
+            (altivec_vmrglh_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrglh_direct_le): New define_insn.
+            (altivec_vmrghh): Adjust by calling gen_altivec_vmrghh_direct_be
+            for BE and gen_altivec_vmrglh_direct_le for LE.
+            (altivec_vmrglh): Adjust by calling gen_altivec_vmrglh_direct_be
+            for BE and gen_altivec_vmrghh_direct_le for LE.
+            (vec_widen_umult_hi_v16qi): Adjust the call to
+            gen_altivec_vmrghh_direct by gen_altivec_vmrghh for BE
+            and by gen_altivec_vmrglh for LE.
+            (vec_widen_smult_hi_v16qi): Likewise.
+            (vec_widen_umult_lo_v16qi): Adjust the call to
+            gen_altivec_vmrglh_direct by gen_altivec_vmrglh for BE
+            and by gen_altivec_vmrghh for LE.
+            (vec_widen_smult_lo_v16qi): Likewise.
+            * config/rs6000/rs6000.cc (altivec_expand_vec_perm_const): Replace
+            CODE_FOR_altivec_vmrghh_direct by
+            CODE_FOR_altivec_vmrghh_direct_be for BE and
+            CODE_FOR_altivec_vmrghh_direct_le for LE.  And replace
+            CODE_FOR_altivec_vmrglh_direct by
+            CODE_FOR_altivec_vmrglh_direct_be for BE and
+            CODE_FOR_altivec_vmrglh_direct_le for LE.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr106069-2.c: New test.
+
+- User: GCC Commits | Time: 2024-06-28 01:13:18 UTC
+  Text: The releases/gcc-12 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:96ef3367067219c8e3eb88c0474a1090cc7749b4commitr12-10587-g96ef3367067219c8e3eb88c0474a1090cc7749b4Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Thu Jun 20 20:23:56 2024 -0500
+
+    rs6000: Fix wrong RTL patterns for vector merge high/low word on LE
+    
+    Commitr12-4496changes some define_expands and define_insns
+    for vector merge high/low word, which are altivec_vmrg[hl]w,
+    vsx_xxmrg[hl]w_<VSX_W:mode>.  These defines are mainly for
+    built-in function vec_merge{h,l}, __builtin_vsx_xxmrghw,
+    __builtin_vsx_xxmrghw_4si and some internal gen function
+    needs.  These functions should consider endianness, taking
+    vec_mergeh as example, as PVIPR defines, vec_mergeh "Merges
+    the first halves (in element order) of two vectors", it does
+    note it's in element order.  So it's mapped into vmrghw on
+    BE while vmrglw on LE respectively.  Although the mapped
+    insns are different, as the discussion inPR106069, the RTL
+    pattern should be still the same, it is conformed before
+    commitr12-4496, define_expand altivec_vmrghw got expanded
+    into:
+    
+      (vec_select:VSX_W
+         (vec_concat:<VS_double>
+            (match_operand:VSX_W 1 "register_operand" "wa,v")
+            (match_operand:VSX_W 2 "register_operand" "wa,v"))
+            (parallel [(const_int 0) (const_int 4)
+                       (const_int 1) (const_int 5)])))]
+    
+    on both BE and LE then.  But commitr12-4496changed it to
+    expand into:
+    
+      (vec_select:VSX_W
+         (vec_concat:<VS_double>
+            (match_operand:VSX_W 1 "register_operand" "wa,v")
+            (match_operand:VSX_W 2 "register_operand" "wa,v"))
+            (parallel [(const_int 0) (const_int 4)
+                       (const_int 1) (const_int 5)])))]
+    
+    on BE, and
+    
+      (vec_select:VSX_W
+         (vec_concat:<VS_double>
+            (match_operand:VSX_W 1 "register_operand" "wa,v")
+            (match_operand:VSX_W 2 "register_operand" "wa,v"))
+            (parallel [(const_int 2) (const_int 6)
+                       (const_int 3) (const_int 7)])))]
+    
+    on LE, although the mapped insn are still vmrghw on BE and
+    vmrglw on LE, the associated RTL pattern is completely
+    wrong and inconsistent with the mapped insn.  If optimization
+    passes leave this pattern alone, even if its pattern doesn't
+    represent its mapped insn, it's still fine, that's why simple
+    testing on bif doesn't expose this issue.  But once some
+    optimization pass such as combine does some changes basing
+    on this wrong pattern, because the pattern doesn't match the
+    semantics that the expanded insn is intended to represent,
+    it would cause the unexpected result.
+    
+    So this patch is to fix the wrong RTL pattern, ensure the
+    associated RTL patterns become the same as before which can
+    have the same semantic as their mapped insns.  With the
+    proposed patch, the expanders like altivec_vmrghw expands
+    into altivec_vmrghb_direct_be or altivec_vmrglb_direct_le
+    depending on endianness, "direct" can easily show which
+    insn would be generated, _be and _le are mainly for the
+    different RTL patterns as endianness.
+    
+    Co-authored-by: Xionghu Luo <xionghuluo@tencent.com>PR target/106069PR target/115355gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (altivec_vmrghw_direct_<VSX_W:mode>): Rename
+            to ...
+            (altivec_vmrghw_direct_<VSX_W:mode>_be): ... this.  Add the condition
+            BYTES_BIG_ENDIAN.
+            (altivec_vmrghw_direct_<VSX_W:mode>_le): New define_insn.
+            (altivec_vmrglw_direct_<VSX_W:mode>): Rename to ...
+            (altivec_vmrglw_direct_<VSX_W:mode>_be): ... this.  Add the condition
+            BYTES_BIG_ENDIAN.
+            (altivec_vmrglw_direct_<VSX_W:mode>_le): New define_insn.
+            (altivec_vmrghw): Adjust by calling gen_altivec_vmrghw_direct_v4si_be
+            for BE and gen_altivec_vmrglw_direct_v4si_le for LE.
+            (altivec_vmrglw): Adjust by calling gen_altivec_vmrglw_direct_v4si_be
+            for BE and gen_altivec_vmrghw_direct_v4si_le for LE.
+            (vec_widen_umult_hi_v8hi): Adjust the call to
+            gen_altivec_vmrghw_direct_v4si by gen_altivec_vmrghw for BE
+            and by gen_altivec_vmrglw for LE.
+            (vec_widen_smult_hi_v8hi): Likewise.
+            (vec_widen_umult_lo_v8hi): Adjust the call to
+            gen_altivec_vmrglw_direct_v4si by gen_altivec_vmrglw for BE
+            and by gen_altivec_vmrghw for LE
+            (vec_widen_smult_lo_v8hi): Likewise.
+            * config/rs6000/rs6000.cc (altivec_expand_vec_perm_const): Replace
+            CODE_FOR_altivec_vmrghw_direct_v4si by
+            CODE_FOR_altivec_vmrghw_direct_v4si_be for BE and
+            CODE_FOR_altivec_vmrghw_direct_v4si_le for LE.  And replace
+            CODE_FOR_altivec_vmrglw_direct_v4si by
+            CODE_FOR_altivec_vmrglw_direct_v4si_be for BE and
+            CODE_FOR_altivec_vmrglw_direct_v4si_le for LE.
+            * config/rs6000/vsx.md (vsx_xxmrghw_<VSX_W:mode>): Adjust by calling
+            gen_altivec_vmrghw_direct_v4si_be for BE and
+            gen_altivec_vmrglw_direct_v4si_le for LE.
+            (vsx_xxmrglw_<VSX_W:mode>): Adjust by calling
+            gen_altivec_vmrglw_direct_v4si_be for BE and
+            gen_altivec_vmrghw_direct_v4si_le for LE.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/powerpc/pr106069.C: New test.
+            * gcc.target/powerpc/pr115355.c: New test.
+    
+    (cherry picked from commit 52c112800d9f44457c4832309a48c00945811313)
+
+- User: GCC Commits | Time: 2024-06-28 01:14:31 UTC
+  Text: The releases/gcc-13 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:361bfcec901ca882130e338aebaa2ebc6ea2dc3bcommitr13-8876-g361bfcec901ca882130e338aebaa2ebc6ea2dc3bAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Thu Jun 20 20:23:56 2024 -0500
+
+    rs6000: Fix wrong RTL patterns for vector merge high/low word on LE
+    
+    Commitr12-4496changes some define_expands and define_insns
+    for vector merge high/low word, which are altivec_vmrg[hl]w,
+    vsx_xxmrg[hl]w_<VSX_W:mode>.  These defines are mainly for
+    built-in function vec_merge{h,l}, __builtin_vsx_xxmrghw,
+    __builtin_vsx_xxmrghw_4si and some internal gen function
+    needs.  These functions should consider endianness, taking
+    vec_mergeh as example, as PVIPR defines, vec_mergeh "Merges
+    the first halves (in element order) of two vectors", it does
+    note it's in element order.  So it's mapped into vmrghw on
+    BE while vmrglw on LE respectively.  Although the mapped
+    insns are different, as the discussion inPR106069, the RTL
+    pattern should be still the same, it is conformed before
+    commitr12-4496, define_expand altivec_vmrghw got expanded
+    into:
+    
+      (vec_select:VSX_W
+         (vec_concat:<VS_double>
+            (match_operand:VSX_W 1 "register_operand" "wa,v")
+            (match_operand:VSX_W 2 "register_operand" "wa,v"))
+            (parallel [(const_int 0) (const_int 4)
+                       (const_int 1) (const_int 5)])))]
+    
+    on both BE and LE then.  But commitr12-4496changed it to
+    expand into:
+    
+      (vec_select:VSX_W
+         (vec_concat:<VS_double>
+            (match_operand:VSX_W 1 "register_operand" "wa,v")
+            (match_operand:VSX_W 2 "register_operand" "wa,v"))
+            (parallel [(const_int 0) (const_int 4)
+                       (const_int 1) (const_int 5)])))]
+    
+    on BE, and
+    
+      (vec_select:VSX_W
+         (vec_concat:<VS_double>
+            (match_operand:VSX_W 1 "register_operand" "wa,v")
+            (match_operand:VSX_W 2 "register_operand" "wa,v"))
+            (parallel [(const_int 2) (const_int 6)
+                       (const_int 3) (const_int 7)])))]
+    
+    on LE, although the mapped insn are still vmrghw on BE and
+    vmrglw on LE, the associated RTL pattern is completely
+    wrong and inconsistent with the mapped insn.  If optimization
+    passes leave this pattern alone, even if its pattern doesn't
+    represent its mapped insn, it's still fine, that's why simple
+    testing on bif doesn't expose this issue.  But once some
+    optimization pass such as combine does some changes basing
+    on this wrong pattern, because the pattern doesn't match the
+    semantics that the expanded insn is intended to represent,
+    it would cause the unexpected result.
+    
+    So this patch is to fix the wrong RTL pattern, ensure the
+    associated RTL patterns become the same as before which can
+    have the same semantic as their mapped insns.  With the
+    proposed patch, the expanders like altivec_vmrghw expands
+    into altivec_vmrghb_direct_be or altivec_vmrglb_direct_le
+    depending on endianness, "direct" can easily show which
+    insn would be generated, _be and _le are mainly for the
+    different RTL patterns as endianness.
+    
+    Co-authored-by: Xionghu Luo <xionghuluo@tencent.com>PR target/106069PR target/115355gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (altivec_vmrghw_direct_<VSX_W:mode>): Rename
+            to ...
+            (altivec_vmrghw_direct_<VSX_W:mode>_be): ... this.  Add the condition
+            BYTES_BIG_ENDIAN.
+            (altivec_vmrghw_direct_<VSX_W:mode>_le): New define_insn.
+            (altivec_vmrglw_direct_<VSX_W:mode>): Rename to ...
+            (altivec_vmrglw_direct_<VSX_W:mode>_be): ... this.  Add the condition
+            BYTES_BIG_ENDIAN.
+            (altivec_vmrglw_direct_<VSX_W:mode>_le): New define_insn.
+            (altivec_vmrghw): Adjust by calling gen_altivec_vmrghw_direct_v4si_be
+            for BE and gen_altivec_vmrglw_direct_v4si_le for LE.
+            (altivec_vmrglw): Adjust by calling gen_altivec_vmrglw_direct_v4si_be
+            for BE and gen_altivec_vmrghw_direct_v4si_le for LE.
+            (vec_widen_umult_hi_v8hi): Adjust the call to
+            gen_altivec_vmrghw_direct_v4si by gen_altivec_vmrghw for BE
+            and by gen_altivec_vmrglw for LE.
+            (vec_widen_smult_hi_v8hi): Likewise.
+            (vec_widen_umult_lo_v8hi): Adjust the call to
+            gen_altivec_vmrglw_direct_v4si by gen_altivec_vmrglw for BE
+            and by gen_altivec_vmrghw for LE
+            (vec_widen_smult_lo_v8hi): Likewise.
+            * config/rs6000/rs6000.cc (altivec_expand_vec_perm_const): Replace
+            CODE_FOR_altivec_vmrghw_direct_v4si by
+            CODE_FOR_altivec_vmrghw_direct_v4si_be for BE and
+            CODE_FOR_altivec_vmrghw_direct_v4si_le for LE.  And replace
+            CODE_FOR_altivec_vmrglw_direct_v4si by
+            CODE_FOR_altivec_vmrglw_direct_v4si_be for BE and
+            CODE_FOR_altivec_vmrglw_direct_v4si_le for LE.
+            * config/rs6000/vsx.md (vsx_xxmrghw_<VSX_W:mode>): Adjust by calling
+            gen_altivec_vmrghw_direct_v4si_be for BE and
+            gen_altivec_vmrglw_direct_v4si_le for LE.
+            (vsx_xxmrglw_<VSX_W:mode>): Adjust by calling
+            gen_altivec_vmrglw_direct_v4si_be for BE and
+            gen_altivec_vmrghw_direct_v4si_le for LE.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/powerpc/pr106069.C: New test.
+            * gcc.target/powerpc/pr115355.c: New test.
+    
+    (cherry picked from commit 52c112800d9f44457c4832309a48c00945811313)
+
+- User: GCC Commits | Time: 2024-06-28 01:17:26 UTC
+  Text: The releases/gcc-14 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:ef8b60dd48faeaf2b4e28c35401fa10d2a3e53fbcommitr14-10355-gef8b60dd48faeaf2b4e28c35401fa10d2a3e53fbAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Thu Jun 20 20:23:56 2024 -0500
+
+    rs6000: Fix wrong RTL patterns for vector merge high/low word on LE
+    
+    Commitr12-4496changes some define_expands and define_insns
+    for vector merge high/low word, which are altivec_vmrg[hl]w,
+    vsx_xxmrg[hl]w_<VSX_W:mode>.  These defines are mainly for
+    built-in function vec_merge{h,l}, __builtin_vsx_xxmrghw,
+    __builtin_vsx_xxmrghw_4si and some internal gen function
+    needs.  These functions should consider endianness, taking
+    vec_mergeh as example, as PVIPR defines, vec_mergeh "Merges
+    the first halves (in element order) of two vectors", it does
+    note it's in element order.  So it's mapped into vmrghw on
+    BE while vmrglw on LE respectively.  Although the mapped
+    insns are different, as the discussion inPR106069, the RTL
+    pattern should be still the same, it is conformed before
+    commitr12-4496, define_expand altivec_vmrghw got expanded
+    into:
+    
+      (vec_select:VSX_W
+         (vec_concat:<VS_double>
+            (match_operand:VSX_W 1 "register_operand" "wa,v")
+            (match_operand:VSX_W 2 "register_operand" "wa,v"))
+            (parallel [(const_int 0) (const_int 4)
+                       (const_int 1) (const_int 5)])))]
+    
+    on both BE and LE then.  But commitr12-4496changed it to
+    expand into:
+    
+      (vec_select:VSX_W
+         (vec_concat:<VS_double>
+            (match_operand:VSX_W 1 "register_operand" "wa,v")
+            (match_operand:VSX_W 2 "register_operand" "wa,v"))
+            (parallel [(const_int 0) (const_int 4)
+                       (const_int 1) (const_int 5)])))]
+    
+    on BE, and
+    
+      (vec_select:VSX_W
+         (vec_concat:<VS_double>
+            (match_operand:VSX_W 1 "register_operand" "wa,v")
+            (match_operand:VSX_W 2 "register_operand" "wa,v"))
+            (parallel [(const_int 2) (const_int 6)
+                       (const_int 3) (const_int 7)])))]
+    
+    on LE, although the mapped insn are still vmrghw on BE and
+    vmrglw on LE, the associated RTL pattern is completely
+    wrong and inconsistent with the mapped insn.  If optimization
+    passes leave this pattern alone, even if its pattern doesn't
+    represent its mapped insn, it's still fine, that's why simple
+    testing on bif doesn't expose this issue.  But once some
+    optimization pass such as combine does some changes basing
+    on this wrong pattern, because the pattern doesn't match the
+    semantics that the expanded insn is intended to represent,
+    it would cause the unexpected result.
+    
+    So this patch is to fix the wrong RTL pattern, ensure the
+    associated RTL patterns become the same as before which can
+    have the same semantic as their mapped insns.  With the
+    proposed patch, the expanders like altivec_vmrghw expands
+    into altivec_vmrghb_direct_be or altivec_vmrglb_direct_le
+    depending on endianness, "direct" can easily show which
+    insn would be generated, _be and _le are mainly for the
+    different RTL patterns as endianness.
+    
+    Co-authored-by: Xionghu Luo <xionghuluo@tencent.com>PR target/106069PR target/115355gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (altivec_vmrghw_direct_<VSX_W:mode>): Rename
+            to ...
+            (altivec_vmrghw_direct_<VSX_W:mode>_be): ... this.  Add the condition
+            BYTES_BIG_ENDIAN.
+            (altivec_vmrghw_direct_<VSX_W:mode>_le): New define_insn.
+            (altivec_vmrglw_direct_<VSX_W:mode>): Rename to ...
+            (altivec_vmrglw_direct_<VSX_W:mode>_be): ... this.  Add the condition
+            BYTES_BIG_ENDIAN.
+            (altivec_vmrglw_direct_<VSX_W:mode>_le): New define_insn.
+            (altivec_vmrghw): Adjust by calling gen_altivec_vmrghw_direct_v4si_be
+            for BE and gen_altivec_vmrglw_direct_v4si_le for LE.
+            (altivec_vmrglw): Adjust by calling gen_altivec_vmrglw_direct_v4si_be
+            for BE and gen_altivec_vmrghw_direct_v4si_le for LE.
+            (vec_widen_umult_hi_v8hi): Adjust the call to
+            gen_altivec_vmrghw_direct_v4si by gen_altivec_vmrghw for BE
+            and by gen_altivec_vmrglw for LE.
+            (vec_widen_smult_hi_v8hi): Likewise.
+            (vec_widen_umult_lo_v8hi): Adjust the call to
+            gen_altivec_vmrglw_direct_v4si by gen_altivec_vmrglw for BE
+            and by gen_altivec_vmrghw for LE
+            (vec_widen_smult_lo_v8hi): Likewise.
+            * config/rs6000/rs6000.cc (altivec_expand_vec_perm_const): Replace
+            CODE_FOR_altivec_vmrghw_direct_v4si by
+            CODE_FOR_altivec_vmrghw_direct_v4si_be for BE and
+            CODE_FOR_altivec_vmrghw_direct_v4si_le for LE.  And replace
+            CODE_FOR_altivec_vmrglw_direct_v4si by
+            CODE_FOR_altivec_vmrglw_direct_v4si_be for BE and
+            CODE_FOR_altivec_vmrglw_direct_v4si_le for LE.
+            * config/rs6000/vsx.md (vsx_xxmrghw_<VSX_W:mode>): Adjust by calling
+            gen_altivec_vmrghw_direct_v4si_be for BE and
+            gen_altivec_vmrglw_direct_v4si_le for LE.
+            (vsx_xxmrglw_<VSX_W:mode>): Adjust by calling
+            gen_altivec_vmrglw_direct_v4si_be for BE and
+            gen_altivec_vmrghw_direct_v4si_le for LE.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/powerpc/pr106069.C: New test.
+            * gcc.target/powerpc/pr115355.c: New test.
+    
+    (cherry picked from commit 52c112800d9f44457c4832309a48c00945811313)
+
+- User: GCC Commits | Time: 2024-07-03 03:21:25 UTC
+  Text: The releases/gcc-14 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:0e495e8e3fde11e430a77db6b477319ed0ae0b7ccommitr14-10371-g0e495e8e3fde11e430a77db6b477319ed0ae0b7cAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Wed Jun 26 02:16:17 2024 -0500
+
+    rs6000: Fix wrong RTL patterns for vector merge high/low char on LE
+    
+    Commitr12-4496changes some define_expands and define_insns
+    for vector merge high/low char, which are altivec_vmrg[hl]b.
+    These defines are mainly for built-in function vec_merge{h,l}
+    and some internal gen function needs.  These functions should
+    consider endianness, taking vec_mergeh as example, as PVIPR
+    defines, vec_mergeh "Merges the first halves (in element order)
+    of two vectors", it does note it's in element order.  So it's
+    mapped into vmrghb on BE while vmrglb on LE respectively.
+    Although the mapped insns are different, as the discussion inPR106069, the RTL pattern should be still the same, it is
+    conformed before commitr12-4496, but gets changed into
+    different patterns on BE and LE starting from commitr12-4496.
+    Similar to 32-bit element case in commit log ofr15-1504, this
+    8-bit element pattern on LE doesn't actually match what the
+    underlying insn is intended to represent, once some optimization
+    like combine does some changes basing on it, it would cause
+    the unexpected consequence.  The newly constructed test casepr106069-1.c is a typical example for this issue.
+    
+    So this patch is to fix the wrong RTL pattern, ensure the
+    associated RTL patterns become the same as before which can
+    have the same semantic as their mapped insns.  With the
+    proposed patch, the expanders like altivec_vmrghb expands
+    into altivec_vmrghb_direct_be or altivec_vmrglb_direct_le
+    depending on endianness, "direct" can easily show which
+    insn would be generated, _be and _le are mainly for the
+    different RTL patterns as endianness.
+    
+    Co-authored-by: Xionghu Luo <xionghuluo@tencent.com>PR target/106069PR target/115355gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (altivec_vmrghb_direct): Rename to ...
+            (altivec_vmrghb_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrghb_direct_le): New define_insn.
+            (altivec_vmrglb_direct): Rename to ...
+            (altivec_vmrglb_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrglb_direct_le): New define_insn.
+            (altivec_vmrghb): Adjust by calling gen_altivec_vmrghb_direct_be
+            for BE and gen_altivec_vmrglb_direct_le for LE.
+            (altivec_vmrglb): Adjust by calling gen_altivec_vmrglb_direct_be
+            for BE and gen_altivec_vmrghb_direct_le for LE.
+            * config/rs6000/rs6000.cc (altivec_expand_vec_perm_const): Replace
+            CODE_FOR_altivec_vmrghb_direct by
+            CODE_FOR_altivec_vmrghb_direct_be for BE and
+            CODE_FOR_altivec_vmrghb_direct_le for LE.  And replace
+            CODE_FOR_altivec_vmrglb_direct by
+            CODE_FOR_altivec_vmrglb_direct_be for BE and
+            CODE_FOR_altivec_vmrglb_direct_le for LE.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr106069-1.c: New test.
+    
+    (cherry picked from commit 62520e4e9f7e2fe8a16ee57a4bd35da2e921ae22)
+
+- User: GCC Commits | Time: 2024-07-03 03:21:38 UTC
+  Text: The releases/gcc-14 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:052f78d010d224c7289f1cf6eec784ac4eeed351commitr14-10372-g052f78d010d224c7289f1cf6eec784ac4eeed351Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Wed Jun 26 02:16:17 2024 -0500
+
+    rs6000: Fix wrong RTL patterns for vector merge high/low short on LE
+    
+    Commitr12-4496changes some define_expands and define_insns
+    for vector merge high/low short, which are altivec_vmrg[hl]h.
+    These defines are mainly for built-in function vec_merge{h,l}
+    and some internal gen function needs.  These functions should
+    consider endianness, taking vec_mergeh as example, as PVIPR
+    defines, vec_mergeh "Merges the first halves (in element order)
+    of two vectors", it does note it's in element order.  So it's
+    mapped into vmrghh on BE while vmrglh on LE respectively.
+    Although the mapped insns are different, as the discussion inPR106069, the RTL pattern should be still the same, it is
+    conformed before commitr12-4496, but gets changed into
+    different patterns on BE and LE starting from commitr12-4496.
+    Similar to 32-bit element case in commit log ofr15-1504, this
+    16-bit element pattern on LE doesn't actually match what the
+    underlying insn is intended to represent, once some optimization
+    like combine does some changes basing on it, it would cause
+    the unexpected consequence.  The newly constructed test casepr106069-2.c is a typical example for this issue on element type
+    short.
+    
+    So this patch is to fix the wrong RTL pattern, ensure the
+    associated RTL patterns become the same as before which can
+    have the same semantic as their mapped insns.  With the
+    proposed patch, the expanders like altivec_vmrghh expands
+    into altivec_vmrghh_direct_be or altivec_vmrglh_direct_le
+    depending on endianness, "direct" can easily show which
+    insn would be generated, _be and _le are mainly for the
+    different RTL patterns as endianness.
+    
+    Co-authored-by: Xionghu Luo <xionghuluo@tencent.com>PR target/106069PR target/115355gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (altivec_vmrghh_direct): Rename to ...
+            (altivec_vmrghh_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrghh_direct_le): New define_insn.
+            (altivec_vmrglh_direct): Rename to ...
+            (altivec_vmrglh_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrglh_direct_le): New define_insn.
+            (altivec_vmrghh): Adjust by calling gen_altivec_vmrghh_direct_be
+            for BE and gen_altivec_vmrglh_direct_le for LE.
+            (altivec_vmrglh): Adjust by calling gen_altivec_vmrglh_direct_be
+            for BE and gen_altivec_vmrghh_direct_le for LE.
+            (vec_widen_umult_hi_v16qi): Adjust the call to
+            gen_altivec_vmrghh_direct by gen_altivec_vmrghh for BE
+            and by gen_altivec_vmrglh for LE.
+            (vec_widen_smult_hi_v16qi): Likewise.
+            (vec_widen_umult_lo_v16qi): Adjust the call to
+            gen_altivec_vmrglh_direct by gen_altivec_vmrglh for BE
+            and by gen_altivec_vmrghh for LE.
+            (vec_widen_smult_lo_v16qi): Likewise.
+            * config/rs6000/rs6000.cc (altivec_expand_vec_perm_const): Replace
+            CODE_FOR_altivec_vmrghh_direct by
+            CODE_FOR_altivec_vmrghh_direct_be for BE and
+            CODE_FOR_altivec_vmrghh_direct_le for LE.  And replace
+            CODE_FOR_altivec_vmrglh_direct by
+            CODE_FOR_altivec_vmrglh_direct_be for BE and
+            CODE_FOR_altivec_vmrglh_direct_le for LE.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr106069-2.c: New test.
+    
+    (cherry picked from commit 812c70bf4981958488331d4ea5af8709b5321da1)
+
+- User: GCC Commits | Time: 2024-07-03 03:23:08 UTC
+  Text: The releases/gcc-13 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:ffdd377fc07cdc7b62669d354e23f30940eaaffecommitr13-8885-gffdd377fc07cdc7b62669d354e23f30940eaaffeAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Wed Jun 26 02:16:17 2024 -0500
+
+    rs6000: Fix wrong RTL patterns for vector merge high/low char on LE
+    
+    Commitr12-4496changes some define_expands and define_insns
+    for vector merge high/low char, which are altivec_vmrg[hl]b.
+    These defines are mainly for built-in function vec_merge{h,l}
+    and some internal gen function needs.  These functions should
+    consider endianness, taking vec_mergeh as example, as PVIPR
+    defines, vec_mergeh "Merges the first halves (in element order)
+    of two vectors", it does note it's in element order.  So it's
+    mapped into vmrghb on BE while vmrglb on LE respectively.
+    Although the mapped insns are different, as the discussion inPR106069, the RTL pattern should be still the same, it is
+    conformed before commitr12-4496, but gets changed into
+    different patterns on BE and LE starting from commitr12-4496.
+    Similar to 32-bit element case in commit log ofr15-1504, this
+    8-bit element pattern on LE doesn't actually match what the
+    underlying insn is intended to represent, once some optimization
+    like combine does some changes basing on it, it would cause
+    the unexpected consequence.  The newly constructed test casepr106069-1.c is a typical example for this issue.
+    
+    So this patch is to fix the wrong RTL pattern, ensure the
+    associated RTL patterns become the same as before which can
+    have the same semantic as their mapped insns.  With the
+    proposed patch, the expanders like altivec_vmrghb expands
+    into altivec_vmrghb_direct_be or altivec_vmrglb_direct_le
+    depending on endianness, "direct" can easily show which
+    insn would be generated, _be and _le are mainly for the
+    different RTL patterns as endianness.
+    
+    Co-authored-by: Xionghu Luo <xionghuluo@tencent.com>PR target/106069PR target/115355gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (altivec_vmrghb_direct): Rename to ...
+            (altivec_vmrghb_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrghb_direct_le): New define_insn.
+            (altivec_vmrglb_direct): Rename to ...
+            (altivec_vmrglb_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrglb_direct_le): New define_insn.
+            (altivec_vmrghb): Adjust by calling gen_altivec_vmrghb_direct_be
+            for BE and gen_altivec_vmrglb_direct_le for LE.
+            (altivec_vmrglb): Adjust by calling gen_altivec_vmrglb_direct_be
+            for BE and gen_altivec_vmrghb_direct_le for LE.
+            * config/rs6000/rs6000.cc (altivec_expand_vec_perm_const): Replace
+            CODE_FOR_altivec_vmrghb_direct by
+            CODE_FOR_altivec_vmrghb_direct_be for BE and
+            CODE_FOR_altivec_vmrghb_direct_le for LE.  And replace
+            CODE_FOR_altivec_vmrglb_direct by
+            CODE_FOR_altivec_vmrglb_direct_be for BE and
+            CODE_FOR_altivec_vmrglb_direct_le for LE.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr106069-1.c: New test.
+    
+    (cherry picked from commit 62520e4e9f7e2fe8a16ee57a4bd35da2e921ae22)
+
+- User: GCC Commits | Time: 2024-07-03 03:23:13 UTC
+  Text: The releases/gcc-13 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:bab38d9271ce3f26cb64b8cb712351eb3fedd559commitr13-8886-gbab38d9271ce3f26cb64b8cb712351eb3fedd559Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Wed Jun 26 02:16:17 2024 -0500
+
+    rs6000: Fix wrong RTL patterns for vector merge high/low short on LE
+    
+    Commitr12-4496changes some define_expands and define_insns
+    for vector merge high/low short, which are altivec_vmrg[hl]h.
+    These defines are mainly for built-in function vec_merge{h,l}
+    and some internal gen function needs.  These functions should
+    consider endianness, taking vec_mergeh as example, as PVIPR
+    defines, vec_mergeh "Merges the first halves (in element order)
+    of two vectors", it does note it's in element order.  So it's
+    mapped into vmrghh on BE while vmrglh on LE respectively.
+    Although the mapped insns are different, as the discussion inPR106069, the RTL pattern should be still the same, it is
+    conformed before commitr12-4496, but gets changed into
+    different patterns on BE and LE starting from commitr12-4496.
+    Similar to 32-bit element case in commit log ofr15-1504, this
+    16-bit element pattern on LE doesn't actually match what the
+    underlying insn is intended to represent, once some optimization
+    like combine does some changes basing on it, it would cause
+    the unexpected consequence.  The newly constructed test casepr106069-2.c is a typical example for this issue on element type
+    short.
+    
+    So this patch is to fix the wrong RTL pattern, ensure the
+    associated RTL patterns become the same as before which can
+    have the same semantic as their mapped insns.  With the
+    proposed patch, the expanders like altivec_vmrghh expands
+    into altivec_vmrghh_direct_be or altivec_vmrglh_direct_le
+    depending on endianness, "direct" can easily show which
+    insn would be generated, _be and _le are mainly for the
+    different RTL patterns as endianness.
+    
+    Co-authored-by: Xionghu Luo <xionghuluo@tencent.com>PR target/106069PR target/115355gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (altivec_vmrghh_direct): Rename to ...
+            (altivec_vmrghh_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrghh_direct_le): New define_insn.
+            (altivec_vmrglh_direct): Rename to ...
+            (altivec_vmrglh_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrglh_direct_le): New define_insn.
+            (altivec_vmrghh): Adjust by calling gen_altivec_vmrghh_direct_be
+            for BE and gen_altivec_vmrglh_direct_le for LE.
+            (altivec_vmrglh): Adjust by calling gen_altivec_vmrglh_direct_be
+            for BE and gen_altivec_vmrghh_direct_le for LE.
+            (vec_widen_umult_hi_v16qi): Adjust the call to
+            gen_altivec_vmrghh_direct by gen_altivec_vmrghh for BE
+            and by gen_altivec_vmrglh for LE.
+            (vec_widen_smult_hi_v16qi): Likewise.
+            (vec_widen_umult_lo_v16qi): Adjust the call to
+            gen_altivec_vmrglh_direct by gen_altivec_vmrglh for BE
+            and by gen_altivec_vmrghh for LE.
+            (vec_widen_smult_lo_v16qi): Likewise.
+            * config/rs6000/rs6000.cc (altivec_expand_vec_perm_const): Replace
+            CODE_FOR_altivec_vmrghh_direct by
+            CODE_FOR_altivec_vmrghh_direct_be for BE and
+            CODE_FOR_altivec_vmrghh_direct_le for LE.  And replace
+            CODE_FOR_altivec_vmrglh_direct by
+            CODE_FOR_altivec_vmrglh_direct_be for BE and
+            CODE_FOR_altivec_vmrglh_direct_le for LE.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr106069-2.c: New test.
+    
+    (cherry picked from commit 812c70bf4981958488331d4ea5af8709b5321da1)
+
+- User: GCC Commits | Time: 2024-07-03 03:23:53 UTC
+  Text: The releases/gcc-12 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:13f0528c782c3732052973a5d340769af8182c8fcommitr12-10594-g13f0528c782c3732052973a5d340769af8182c8fAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Wed Jun 26 02:16:17 2024 -0500
+
+    rs6000: Fix wrong RTL patterns for vector merge high/low char on LE
+    
+    Commitr12-4496changes some define_expands and define_insns
+    for vector merge high/low char, which are altivec_vmrg[hl]b.
+    These defines are mainly for built-in function vec_merge{h,l}
+    and some internal gen function needs.  These functions should
+    consider endianness, taking vec_mergeh as example, as PVIPR
+    defines, vec_mergeh "Merges the first halves (in element order)
+    of two vectors", it does note it's in element order.  So it's
+    mapped into vmrghb on BE while vmrglb on LE respectively.
+    Although the mapped insns are different, as the discussion inPR106069, the RTL pattern should be still the same, it is
+    conformed before commitr12-4496, but gets changed into
+    different patterns on BE and LE starting from commitr12-4496.
+    Similar to 32-bit element case in commit log ofr15-1504, this
+    8-bit element pattern on LE doesn't actually match what the
+    underlying insn is intended to represent, once some optimization
+    like combine does some changes basing on it, it would cause
+    the unexpected consequence.  The newly constructed test casepr106069-1.c is a typical example for this issue.
+    
+    So this patch is to fix the wrong RTL pattern, ensure the
+    associated RTL patterns become the same as before which can
+    have the same semantic as their mapped insns.  With the
+    proposed patch, the expanders like altivec_vmrghb expands
+    into altivec_vmrghb_direct_be or altivec_vmrglb_direct_le
+    depending on endianness, "direct" can easily show which
+    insn would be generated, _be and _le are mainly for the
+    different RTL patterns as endianness.
+    
+    Co-authored-by: Xionghu Luo <xionghuluo@tencent.com>PR target/106069PR target/115355gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (altivec_vmrghb_direct): Rename to ...
+            (altivec_vmrghb_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrghb_direct_le): New define_insn.
+            (altivec_vmrglb_direct): Rename to ...
+            (altivec_vmrglb_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrglb_direct_le): New define_insn.
+            (altivec_vmrghb): Adjust by calling gen_altivec_vmrghb_direct_be
+            for BE and gen_altivec_vmrglb_direct_le for LE.
+            (altivec_vmrglb): Adjust by calling gen_altivec_vmrglb_direct_be
+            for BE and gen_altivec_vmrghb_direct_le for LE.
+            * config/rs6000/rs6000.cc (altivec_expand_vec_perm_const): Replace
+            CODE_FOR_altivec_vmrghb_direct by
+            CODE_FOR_altivec_vmrghb_direct_be for BE and
+            CODE_FOR_altivec_vmrghb_direct_le for LE.  And replace
+            CODE_FOR_altivec_vmrglb_direct by
+            CODE_FOR_altivec_vmrglb_direct_be for BE and
+            CODE_FOR_altivec_vmrglb_direct_le for LE.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr106069-1.c: New test.
+    
+    (cherry picked from commit 62520e4e9f7e2fe8a16ee57a4bd35da2e921ae22)
+
+- User: GCC Commits | Time: 2024-07-03 03:23:59 UTC
+  Text: The releases/gcc-12 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:ca6eea0eb33de8b2e23e0bef3466575bb14ab63fcommitr12-10595-gca6eea0eb33de8b2e23e0bef3466575bb14ab63fAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Wed Jun 26 02:16:17 2024 -0500
+
+    rs6000: Fix wrong RTL patterns for vector merge high/low short on LE
+    
+    Commitr12-4496changes some define_expands and define_insns
+    for vector merge high/low short, which are altivec_vmrg[hl]h.
+    These defines are mainly for built-in function vec_merge{h,l}
+    and some internal gen function needs.  These functions should
+    consider endianness, taking vec_mergeh as example, as PVIPR
+    defines, vec_mergeh "Merges the first halves (in element order)
+    of two vectors", it does note it's in element order.  So it's
+    mapped into vmrghh on BE while vmrglh on LE respectively.
+    Although the mapped insns are different, as the discussion inPR106069, the RTL pattern should be still the same, it is
+    conformed before commitr12-4496, but gets changed into
+    different patterns on BE and LE starting from commitr12-4496.
+    Similar to 32-bit element case in commit log ofr15-1504, this
+    16-bit element pattern on LE doesn't actually match what the
+    underlying insn is intended to represent, once some optimization
+    like combine does some changes basing on it, it would cause
+    the unexpected consequence.  The newly constructed test casepr106069-2.c is a typical example for this issue on element type
+    short.
+    
+    So this patch is to fix the wrong RTL pattern, ensure the
+    associated RTL patterns become the same as before which can
+    have the same semantic as their mapped insns.  With the
+    proposed patch, the expanders like altivec_vmrghh expands
+    into altivec_vmrghh_direct_be or altivec_vmrglh_direct_le
+    depending on endianness, "direct" can easily show which
+    insn would be generated, _be and _le are mainly for the
+    different RTL patterns as endianness.
+    
+    Co-authored-by: Xionghu Luo <xionghuluo@tencent.com>PR target/106069PR target/115355gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (altivec_vmrghh_direct): Rename to ...
+            (altivec_vmrghh_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrghh_direct_le): New define_insn.
+            (altivec_vmrglh_direct): Rename to ...
+            (altivec_vmrglh_direct_be): ... this.  Add condition BYTES_BIG_ENDIAN.
+            (altivec_vmrglh_direct_le): New define_insn.
+            (altivec_vmrghh): Adjust by calling gen_altivec_vmrghh_direct_be
+            for BE and gen_altivec_vmrglh_direct_le for LE.
+            (altivec_vmrglh): Adjust by calling gen_altivec_vmrglh_direct_be
+            for BE and gen_altivec_vmrghh_direct_le for LE.
+            (vec_widen_umult_hi_v16qi): Adjust the call to
+            gen_altivec_vmrghh_direct by gen_altivec_vmrghh for BE
+            and by gen_altivec_vmrglh for LE.
+            (vec_widen_smult_hi_v16qi): Likewise.
+            (vec_widen_umult_lo_v16qi): Adjust the call to
+            gen_altivec_vmrglh_direct by gen_altivec_vmrglh for BE
+            and by gen_altivec_vmrghh for LE.
+            (vec_widen_smult_lo_v16qi): Likewise.
+            * config/rs6000/rs6000.cc (altivec_expand_vec_perm_const): Replace
+            CODE_FOR_altivec_vmrghh_direct by
+            CODE_FOR_altivec_vmrghh_direct_be for BE and
+            CODE_FOR_altivec_vmrghh_direct_le for LE.  And replace
+            CODE_FOR_altivec_vmrglh_direct by
+            CODE_FOR_altivec_vmrglh_direct_be for BE and
+            CODE_FOR_altivec_vmrglh_direct_le for LE.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr106069-2.c: New test.
+    
+    (cherry picked from commit 812c70bf4981958488331d4ea5af8709b5321da1)
+
+- User: Kewen Lin | Time: 2024-07-03 03:27:40 UTC
+  Text: Should be fixed on trunk and affected release branches now.
+

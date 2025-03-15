@@ -1,0 +1,216 @@
+Bug Summary: [14 Regression] ICE compiling gcc.c-torture/execute/pr59643.cwith -mabi=ilp32; in try_promote_writeback aarch64-ldp-fusion.cc
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code, patch, testsuite-fail
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Filip Kastl | Time: 2023-12-22 13:52:34 UTC
+  Text: While compiling the GCC testcase gcc.c-torture/execute/pr59643.c using an aarch64 crosscompiler with these options
+
+aarch64-linux-gnu-gcc /home/worker/buildworker/tiber-option-juggler/build/gcc/testsuite/gcc.c-torture/execute/pr59643.c -mabi=ilp32 -O2
+
+the compiler runs into an ICE
+
+during RTL pass: ldp_fusion
+/home/worker/buildworker/tiber-option-juggler/build/gcc/testsuite/gcc.c-torture/execute/pr59643.c: In function ‘foo’:
+/home/worker/buildworker/tiber-option-juggler/build/gcc/testsuite/gcc.c-torture/execute/pr59643.c:11:1: internal compiler error: in try_promote_writeback, at config/aarch64/aarch64-ldp-fusion.cc:2604
+   11 | }
+      | ^
+0x789ba3 try_promote_writeback
+	/home/worker/buildworker/tiber-gcc-trunk-aarch64/build/gcc/config/aarch64/aarch64-ldp-fusion.cc:2604
+0x789ba3 ldp_fusion_bb(rtl_ssa::bb_info*)
+	/home/worker/buildworker/tiber-gcc-trunk-aarch64/build/gcc/config/aarch64/aarch64-ldp-fusion.cc:2635
+0x11bc4a7 ldp_fusion()
+	/home/worker/buildworker/tiber-gcc-trunk-aarch64/build/gcc/config/aarch64/aarch64-ldp-fusion.cc:2655
+0x11bc528 execute
+	/home/worker/buildworker/tiber-gcc-trunk-aarch64/build/gcc/config/aarch64/aarch64-ldp-fusion.cc:2705
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+
+Configuration of the compiler:
+
+Using built-in specs.
+COLLECT_GCC=/home/worker/cross/bin/aarch64-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/home/worker/cross/libexec/gcc/aarch64-linux-gnu/14.0.0/lto-wrapper
+Target: aarch64-linux-gnu
+Configured with: /home/worker/buildworker/tiber-gcc-trunk-aarch64/build/configure --enable-languages=c,c++,fortran,rust,m2 --disable-bootstrap --disable-libsanitizer --disable-multilib --enable-checking=release --prefix=/home/worker/cross --target=aarch64-linux-gnu --with-as=/usr/bin/aarch64-suse-linux-as
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20231221 (experimental) ec2ec24a4d4d1175f72641a95010c2312eb38ccd (GCC)
+
+- User: Andrew Pinski | Time: 2023-12-22 16:59:05 UTC
+  Text: Most likelyr14-6605-gc0911c6b357ba9when aarch64-ldp-fusion.cc was introduced.
+
+- User: Alex Coplan | Time: 2024-01-02 14:45:01 UTC
+  Text: Confirmed, I can take a look.
+
+- User: Alex Coplan | Time: 2024-01-17 15:54:25 UTC
+  Text: The following ICEs in the same way without ILP32 (reduced from a testsuite run with -funroll-loops):
+
+$ cat t.c
+float val[128];
+float x;
+void bar() {
+  int i = 55;
+  for (; i >= 0; --i)
+    x += val[i];
+}
+$ gcc/xgcc -B gcc -c t.c -O -funroll-loops -mearly-ldp-fusion -mlate-ldp-fusion
+during RTL pass: ldp_fusion
+t.c: In function ‘bar’:
+t.c:7:1: internal compiler error: in try_promote_writeback, at config/aarch64/aarch64-ldp-fusion.cc:2675
+    7 | }
+      | ^
+0x14671b3 try_promote_writeback
+        /home/alecop01/toolchain/src/other_gcc/gcc/config/aarch64/aarch64-ldp-fusion.cc:2675
+0x14671b3 ldp_fusion_bb(rtl_ssa::bb_info*)
+        /home/alecop01/toolchain/src/other_gcc/gcc/config/aarch64/aarch64-ldp-fusion.cc:2706
+0x1467307 ldp_fusion()
+        /home/alecop01/toolchain/src/other_gcc/gcc/config/aarch64/aarch64-ldp-fusion.cc:2726
+0x146737b execute
+        /home/alecop01/toolchain/src/other_gcc/gcc/config/aarch64/aarch64-ldp-fusion.cc:2776
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+I'll investigate.  Probably we just shouldn't assert that recog succeeds here, but I'll take a closer look at what's going on.
+
+- User: Alex Coplan | Time: 2024-01-17 15:57:32 UTC
+  Text: (The above was reduced from gcc/testsuite/gcc.dg/torture/pr45720.c FWIW).
+
+- User: Alex Coplan | Time: 2024-01-17 16:31:32 UTC
+  Text: Hmm, so initially (with the testcase in c3) we have:
+
+ldp s30, s29, [x0, #-4]
+...
+add x0, x0, #-4
+
+and we try to form:
+
+ldp s30, s29, [x0, #-4]!
+
+with this RTL:
+
+(rr) call debug (pair_change.m_insn->rtl ())
+(insn 47 18 20 3 (parallel [
+            (set (reg:DI 0 x0 [119])
+                (plus:DI (reg:DI 0 x0 [orig:101 ivtmp.12 ] [101])
+                    (const_int -4 [0xfffffffffffffffc])))
+            (set (reg:SF 62 v30 [orig:122 MEM[(float *)_18] ] [122])
+                (mem:SF (plus:DI (reg:DI 0 x0 [orig:101 ivtmp.12 ] [101])
+                        (const_int -4 [0xfffffffffffffffc])) [0 +0 S4 A32]))
+            (set (reg:SF 61 v29 [orig:116 MEM[(float *)_18] ] [116])
+                (mem:SF (reg:DI 0 x0 [orig:101 ivtmp.12 ] [101]) [0 +4 S4 A32]))
+        ]) "t.c":6:7 -1
+     (nil))
+
+but the problem is that we're expecting to match this pattern:
+
+;; Load pair with pre-index writeback.
+(define_insn "*loadwb_pre_pair_<ldst_sz>"
+  [(set (match_operand 0 "pmode_register_operand")
+        (match_operator 8 "pmode_plus_operator" [
+          (match_operand 1 "pmode_register_operand")
+          (match_operand 4 "const_int_operand")]))
+   (set (match_operand:GPI 2 "aarch64_ldp_reg_operand")
+        (match_operator 6 "memory_operand" [
+          (match_operator 9 "pmode_plus_operator" [
+            (match_dup 1)
+            (match_dup 4)
+          ])]))
+   (set (match_operand:GPI 3 "aarch64_ldp_reg_operand")
+        (match_operator 7 "memory_operand" [
+          (match_operator 10 "pmode_plus_operator" [
+             (match_dup 1)
+             (match_operand 5 "const_int_operand")
+          ])]))]
+  "aarch64_mem_pair_offset (operands[4], <MODE>mode)
+   && known_eq (INTVAL (operands[5]),
+                INTVAL (operands[4]) + GET_MODE_SIZE (<MODE>mode))"
+  {@ [cons: =&0, 1, =2, =3; attrs: type     ]
+     [       rk, 0,  r,  r; load_<ldpstp_sz>] ldp\t%<w>2, %<w>3, [%0, %4]!
+     [       rk, 0,  w,  w; neon_load1_2reg ] ldp\t%<v>2, %<v>3, [%0, %4]!
+  }
+)
+
+which simply doesn't match due to the shape of the RTL: that is, the pattern hard-codes two plus operands, but due to the offset of -4 here we end up with the second operand accessing memory directly at (the initial value of) x0.
+
+We could add a second pattern to handle this specific case, or we could just adjust try_promote_writeback to not assert that recog succeeds and accept the missed optimization for the time being.
+
+- User: Alex Coplan | Time: 2024-01-18 16:32:32 UTC
+  Text: Hmm, it's worth noting that the ILP32 case is a bit different, though, in that we have:
+
+(rr) call debug (insn->rtl ())
+(insn 16 21 19 3 (parallel [
+            (set (reg:DF 62 v30)
+                (unspec:DF [
+                        (mem:V2x8QI (reg/v/f:DI 0 x0 [orig:123 a ] [123]) [0 +0 S16 A64])
+                    ] UNSPEC_LDP_FST))
+            (set (reg:DF 63 v31)
+                (unspec:DF [
+                        (mem:V2x8QI (reg/v/f:DI 0 x0 [orig:123 a ] [123]) [0 +0 S16 A64])
+                    ] UNSPEC_LDP_SND))
+        ]) 88 {*load_pair_8}
+     (nil))
+(rr) call debug (trailing_add->rtl ())
+(insn 20 18 41 3 (set (reg:SI 0 x0 [orig:118 ivtmp.22 ] [118])
+        (plus:SI (reg:SI 0 x0 [orig:123 a ] [123])
+            (const_int 8 [0x8]))) 119 {*addsi3_aarch64}
+     (nil))
+
+i.e. x0 appears as DImode in the load pair addresses but the trailing update is done in SImode, which means we end up not matching when forming the final pattern.
+
+I don't think either case is particularly interesting, so I'm leaning towards just bailing out if recog fails in the pass (in which case both of these just become missed-optimizations).
+
+- User: Alex Coplan | Time: 2024-01-19 10:16:27 UTC
+  Text: Testing a fix.
+
+- User: Alex Coplan | Time: 2024-01-19 14:03:00 UTC
+  Text: Patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2024-January/643460.html
+
+- User: GCC Commits | Time: 2024-01-23 10:58:37 UTC
+  Text: The master branch has been updated by Alex Coplan <acoplan@gcc.gnu.org>:https://gcc.gnu.org/g:20e18106fac2d11ee43683291ff11d76da41d50bcommitr14-8353-g20e18106fac2d11ee43683291ff11d76da41d50bAuthor: Alex Coplan <alex.coplan@arm.com>
+Date:   Thu Jan 18 17:53:01 2024 +0000
+
+    aarch64: Don't assert recog success in ldp/stp pass [PR113114]
+    
+    The PR shows two different cases where try_promote_writeback produces an
+    RTL pattern which isn't recognized.  Currently this leads to an ICE, as
+    we assert recog success, but I think it's better just to back out of the
+    changes gracefully if recog fails (as we do in the main fuse_pair case).
+    
+    In theory since we check the ranges here recog shouldn't fail (which is
+    why I had the assert in the first place), but the PR shows an edge case
+    in the patterns where if we form a pre-writeback pair where the
+    writeback offset is exactly -S, where S is the size in bytes of one
+    transfer register, we fail to match the expected pattern as the patterns
+    look explicitly for plus operands in the mems.  I think fixing this
+    would require adding at least four new special-case patterns to
+    aarch64.md for what doesn't seem to be a particularly useful variant of
+    the insns.  Even if we were to do that, I think it would be GCC 15
+    material, and it's better to just punt for GCC 14.
+    
+    The ILP32 case in the PR is a bit different, as that shows us trying to
+    combine a pair with DImode base register operands in the mems together
+    with an SImode trailing update of the base register.  This leads to us
+    forming an RTL pattern which references the base register in both SImode
+    and DImode, which also fails to recog.  Again, I think it's best just to
+    take the missed optimization for now.  If we really want to make this
+    (try_promote_writeback) work for ILP32, we can try to do it for GCC 15.
+    
+    gcc/ChangeLog:PR target/113114* config/aarch64/aarch64-ldp-fusion.cc (try_promote_writeback):
+            Don't assert recog success, just punt if the writeback pair
+            isn't recognized.
+    
+    gcc/testsuite/ChangeLog:PR target/113114* gcc.c-torture/compile/pr113114.c: New test.
+            * gcc.target/aarch64/pr113114.c: New test.
+
+- User: Alex Coplan | Time: 2024-01-23 10:59:12 UTC
+  Text: Should be fixed, thanks for the report.
+

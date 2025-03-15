@@ -1,0 +1,307 @@
+Bug Summary: RVV vectorization ICE in vect_get_loop_mask, at tree-vect-loop.cc:11037
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2023-11-09 01:14:27 UTC
+  Text: int a, b, d, e;
+short c;
+void f() {
+  for (; e; e++) {
+    int g = 6;
+    for (; g > 2; g--) {
+      int i = -8;
+      while (i < 20) {
+        i += 5;
+        a += b;
+      }
+      c *= d;
+    }
+    b--;
+  }
+}
+
+-O2 --param=riscv-autovec-lmul=m8 -fno-vect-cost-model
+
+during GIMPLE pass: vect
+<source>: In function 'f':
+<source>:3:6: internal compiler error: in vect_get_loop_mask, at tree-vect-loop.cc:11037
+    3 | void f() {
+      |      ^
+0x7fa31fe47082 __libc_start_main
+	???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+Compiler returned: 1https://gcc.godbolt.org/z/sda87oaW5The ICE looks pretty odd. For partial vectorization with length, we should never
+reach 'vect_get_loop_mask' which is supposed by used by partial vectorization with mask.
+
+And it also reaches condition:
+
+LOOP_VINFO_PARTIAL_VECTORS_STYLE (loop_vinfo) == vect_partial_vectors_avx512
+
+which should be unlikely for RVV.
+
+- User: JuzheZhong | Time: 2023-11-09 03:04:18 UTC
+  Text: Oh. I see we have cond_xxx pattern for VLS modes.
+
+like V64HImdoe. But we don't support partial vectorization for VLS modes.
+
+VLS modes are supposed to used as SIMD GNU vectorization.
+
+As long as COND_XXX is enabled, loop vectorizer considers target support partial
+vectorization with mask and since no while_ult, then go through AVX512 partial vectorization.
+
+It seems that for conditional operations, I should use backend RTL PASS to walk around that.
+
+- User: JuzheZhong | Time: 2023-11-09 03:15:38 UTC
+  Text: if (loop_vinfo
+	  && LOOP_VINFO_CAN_USE_PARTIAL_VECTORS_P (loop_vinfo)
+	  && mask_out_inactive)
+	{
+	  if (cond_len_fn != IFN_LAST
+	      && direct_internal_fn_supported_p (cond_len_fn, vectype,
+						 OPTIMIZE_FOR_SPEED))
+	    vect_record_loop_len (loop_vinfo, lens, ncopies * vec_num, vectype,
+				  1);
+	  else if (cond_fn != IFN_LAST
+		   && direct_internal_fn_supported_p (cond_fn, vectype,
+						      OPTIMIZE_FOR_SPEED))
+	    vect_record_loop_mask (loop_vinfo, masks, ncopies * vec_num,
+				   vectype, NULL);
+	  else
+	    {
+	      if (dump_enabled_p ())
+		dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
+				 "can't use a fully-masked loop because no"
+				 " conditional operation is available.\n");
+	      LOOP_VINFO_CAN_USE_PARTIAL_VECTORS_P (loop_vinfo) = false;
+	    }
+	}
+
+go through second condition with
+vect_record_loop_mask here.
+
+Seems that we can't differentiate RVV VLS mode with cond_xxx.
+
+RVV VLS mode just want to support COND_XXX to support
+
+for (int i < N)
+cond[i]? a[i] + b[i] : c[i]
+
+N is known iterations.
+
+- User: JuzheZhong | Time: 2023-11-09 07:53:52 UTC
+  Text: Add cond_len pattern for VLS mode can work around this bug.
+Even though COND_LEN_xxx is not eventually....
+
+Testing a patch to fix it.
+
+- User: Richard Biener | Time: 2023-11-09 08:00:17 UTC
+  Text: (In reply to JuzheZhong fromcomment #1)> Oh. I see we have cond_xxx pattern for VLS modes.
+> 
+> like V64HImdoe. But we don't support partial vectorization for VLS modes.
+> 
+> VLS modes are supposed to used as SIMD GNU vectorization.
+> 
+> As long as COND_XXX is enabled, loop vectorizer considers target support
+> partial
+> vectorization with mask and since no while_ult, then go through AVX512
+> partial vectorization.I think the bug is in the AVX512 code where it probably lacks some guards.
+But in theory even with RVV you can do mask based vectorization of
+partial loops, the AVX512 code doesn't require .WHILE_ULT but instead
+uses regular compares.
+
+I don't think you should work around this by disabling RVV patterns here.
+
+I can have a look later what happens.> It seems that for conditional operations, I should use backend RTL PASS to
+> walk around that.
+
+- User: JuzheZhong | Time: 2023-11-09 08:10:06 UTC
+  Text: (In reply to Richard Biener fromcomment #4)> (In reply to JuzheZhong fromcomment #1)
+> > Oh. I see we have cond_xxx pattern for VLS modes.
+> > 
+> > like V64HImdoe. But we don't support partial vectorization for VLS modes.
+> > 
+> > VLS modes are supposed to used as SIMD GNU vectorization.
+> > 
+> > As long as COND_XXX is enabled, loop vectorizer considers target support
+> > partial
+> > vectorization with mask and since no while_ult, then go through AVX512
+> > partial vectorization.
+> 
+> I think the bug is in the AVX512 code where it probably lacks some guards.
+> But in theory even with RVV you can do mask based vectorization of
+> partial loops, the AVX512 code doesn't require .WHILE_ULT but instead
+> uses regular compares.
+> 
+> I don't think you should work around this by disabling RVV patterns here.
+> 
+> I can have a look later what happens.
+> 
+> > It seems that for conditional operations, I should use backend RTL PASS to
+> > walk around that.Thanks a lot Richi.
+
+I was about to add disable cond_xxx pattern or add cond_len_xxx pattern to walk around this issue.
+
+Actually, we always apply partial vectorization on VLA modes.
+We always use VLS modes on SIMD GNU vectorization.
+
+We enable cond_xxx for VLS modes to handle conditional operation which 
+makes use of match.pd vectorizations.
+
+Here is the example:https://godbolt.org/z/csx995anEYou can see with cond_div on VLS modes, we can have much better codegen.
+
+Anyway, really appreciate you take care of this issue!
+
+- User: Richard Biener | Time: 2023-11-09 09:55:29 UTC
+  Text: So in fact RVV with it's single-bit element mask and the ability to
+produce it from a V64QImode unsigned LT compare (but not from V64SImode?)
+is supposed to be able to handle the "AVX512" style masking as far as
+checking in vect_verify_full_masking_avx512 is concerned.
+
+What I failed to implement (and check) is that the mask types have an
+integer mode, thus we run into
+
+      if (known_eq (TYPE_VECTOR_SUBPARTS (rgm->type),
+                    TYPE_VECTOR_SUBPARTS (vectype)))
+        return rgm->controls[index];
+
+      /* Split the vector if needed.  Since we are dealing with integer mode
+         masks with AVX512 we can operate on the integer representation
+         performing the whole vector shifting.  */
+      unsigned HOST_WIDE_INT factor;
+      bool ok = constant_multiple_p (TYPE_VECTOR_SUBPARTS (rgm->type),
+                                     TYPE_VECTOR_SUBPARTS (vectype), &factor);
+      gcc_assert (ok);
+      gcc_assert (GET_MODE_CLASS (TYPE_MODE (rgm->type)) == MODE_INT);
+
+it would be fine if we didn't need to split the 64 element mask into
+two halves for a V32SImode vector op we need to mask here.
+
+We try to look at the subset of the mask by converting it to a same
+size integer type, right-rshift it, truncate and covert back to the
+mask type.  That might or might not be possible with RVV masks (might
+or might not be the "optimal" way to do things).
+
+We can "fix" this by doing
+
+diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
+index a544bc9b059..c7a92354578 100644
+--- a/gcc/tree-vect-loop.cc
++++ b/gcc/tree-vect-loop.cc
+@@ -11034,24 +11034,24 @@ vect_get_loop_mask (loop_vec_info loop_vinfo,
+       bool ok = constant_multiple_p (TYPE_VECTOR_SUBPARTS (rgm->type),
+                                     TYPE_VECTOR_SUBPARTS (vectype), &factor);
+       gcc_assert (ok);
+-      gcc_assert (GET_MODE_CLASS (TYPE_MODE (rgm->type)) == MODE_INT);
+       tree mask_type = truth_type_for (vectype);
+-      gcc_assert (GET_MODE_CLASS (TYPE_MODE (mask_type)) == MODE_INT);
+       unsigned vi = index / factor;
+       unsigned vpart = index % factor;
+       tree vec = rgm->controls[vi];
+       gimple_seq seq = NULL;
+       vec = gimple_build (&seq, VIEW_CONVERT_EXPR,
+-                         lang_hooks.types.type_for_mode
+-                               (TYPE_MODE (rgm->type), 1), vec);
++                         lang_hooks.types.type_for_size
++                           (GET_MODE_BITSIZE (TYPE_MODE (rgm->type))
++                             .to_constant (), 1), vec);
+       /* For integer mode masks simply shift the right bits into position.  */
+       if (vpart != 0)
+        vec = gimple_build (&seq, RSHIFT_EXPR, TREE_TYPE (vec), vec,
+                            build_int_cst (integer_type_node,
+                                           (TYPE_VECTOR_SUBPARTS (vectype)
+                                            * vpart)));
+-      vec = gimple_convert (&seq, lang_hooks.types.type_for_mode
+-                                   (TYPE_MODE (mask_type), 1), vec);
++      vec = gimple_convert (&seq, lang_hooks.types.type_for_size
++                                   (GET_MODE_BITSIZE (TYPE_MODE (mask_type))
++                                     .to_constant (), 1), vec);
+       vec = gimple_build (&seq, VIEW_CONVERT_EXPR, mask_type, vec);
+       if (seq)
+        gsi_insert_seq_before (gsi, seq, GSI_SAME_STMT);
+
+which then generates the "expected" partial vector code.  If you don't
+want partial vectors for VLS modes then I guess we could also enhance
+the vector_modes "iteration" to allow the target to override
+--param vect-partial-vector-usage on a per-mode base.
+
+Or I can simply not "fix" the code above but instead add an integer mode
+check to vect_verify_full_masking_avx512.  But as said, in principle this
+scheme works.  That fix would be
+
+diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
+index a544bc9b059..0b364ac1c6e 100644
+--- a/gcc/tree-vect-loop.cc
++++ b/gcc/tree-vect-loop.cc
+@@ -1462,7 +1462,10 @@ vect_verify_full_masking_avx512 (loop_vec_info loop_vinfo
+)
+       if (!mask_type)
+        continue;
+ 
+-      if (TYPE_PRECISION (TREE_TYPE (mask_type)) != 1)
++      /* For now vect_get_loop_mask only supports integer mode masks
++        when we need to split it.  */
++      if (GET_MODE_CLASS (TYPE_MODE (mask_type)) != MODE_INT
++         || TYPE_PRECISION (TREE_TYPE (mask_type)) != 1)
+        {
+          ok = false;
+          break;
+
+- User: JuzheZhong | Time: 2023-11-09 10:03:47 UTC
+  Text: breakpoint.                vect_record_loop_mask (loop_vinfo, masks, ncopies * vec_num,
+(gdb) p vectype->type_common.mode
+$1 = E_V64HImode
+
+
+Form my observation. It seems to be V64HImode.
+
+
+I tried you patch locally, it fixes the ICE now.
+
+Thanks!
+
+- User: JuzheZhong | Time: 2023-11-09 10:10:40 UTC
+  Text: I think RVV won't use vec_pack/vec_unpack for mask.
+Since we always uses len as the loop control.
+
+I think it's fine just disable it when target doesn't support split mask operations like RVV.
+
+- User: Richard Biener | Time: 2023-11-09 10:49:36 UTC
+  Text: OK, I'll include it in my next round of testing.
+
+- User: Richard Biener | Time: 2023-11-09 11:37:42 UTC
+  Text: commit 8863a7990e9f0cd49c8900605a2c75a0e8886e85 (origin/master, origin/HEAD)
+Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Nov 9 11:44:07 2023 +0100
+
+    tree-optimization/112450 - avoid AVX512 style masking for BImode masks
+    
+    The following avoids running into the AVX512 style masking code for
+    RVV which would theoretically be able to handle it if I were not
+    relying on integer mode maskness in vect_get_loop_mask.  While that's
+    easy to fix (patch in PR), the preference is to not have AVX512 style
+    masking for RVV, thus the following.
+    
+            * tree-vect-loop.cc (vect_verify_full_masking_avx512):
+            Check we have integer mode masks as required by
+            vect_get_loop_mask.
+
+- User: GCC Commits | Time: 2023-11-09 12:32:39 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:83f66d90af69837f7c8fc88f8afb7074d4555394commitr14-5278-g83f66d90af69837f7c8fc88f8afb7074d4555394Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Thu Nov 9 20:00:38 2023 +0800
+
+    RISC-V: AddPR112450test to avoid regression
+    
+    ICE has been fixed by Richard:https://gcc.gnu.org/bugzilla/show_bug.cgi?id=112450.
+    
+    Add test to avoid future regression. Committed.PR target/112450gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/pr112450.c: New test.
+

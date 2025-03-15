@@ -1,0 +1,218 @@
+Bug Summary: _mm512_ternarylogic_epi64 generates unnecessary operations
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Fabio Cannizzo | Time: 2023-06-10 10:37:34 UTC
+  Text: Consider the following two alternative implementations of a bitwise complement of an avx512 register.
+
+#include <immintrin.h>
+
+__m512i negate1(const __m512i *a)
+{
+    __m512i res;
+    res = c(res, res, *a, 0x55);
+    return res;
+}
+
+__m512i negate2(const __m512i *a)
+{
+    __m512i res;
+    res = _mm512_xor_si512(*a, _mm512_set1_epi32(-1));
+    return res;
+}
+
+which compiled with "-O3 -mavx512f" generates the asm listings (see godbolt:https://godbolt.org/z/jvrxEjW65)
+
+negate1(long long __vector(8) const*):
+        vpxor   xmm0, xmm0, xmm0
+        vpternlogq      zmm0, zmm0, ZMMWORD PTR [rdi], 85
+        ret
+negate2(long long __vector(8) const*):
+        vpternlogd      zmm0, zmm0, ZMMWORD PTR [rdi], 0x55
+        ret
+
+negate1 introduces an unnecessary xor operation. Probably this is because it does not recognize that, when vpternlogd is used with code 0x55, it only uses the third zmm argument.
+
+- User: Andrew Pinski | Time: 2023-06-10 16:07:07 UTC
+  Text: Createdattachment 55299[details]Corrected testcase
+
+- User: Andrew Pinski | Time: 2023-06-10 16:14:01 UTC
+  Text: Note you get a warning in your negate1 case
+
+
+<source>: In function '__m512i negate1(const __m512i*)':
+<source>:7:36: warning: 'res' is used uninitialized [-Wuninitialized]
+    7 |     res = _mm512_ternarylogic_epi64(res, res, *a, 0x55);
+      |           ~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~
+<source>:6:13: note: 'res' was declared here
+    6 |     __m512i res;
+      |             ^~~
+
+
+But even doing this:
+__m512i negate1(const __m512i *a)
+{
+    __m512i res = _mm512_undefined_si512 ();
+    res = _mm512_ternarylogic_epi64(res, res, *a, 0x55);
+    return res;
+}
+
+
+Will cause an extra zeroing.
+
+- User: Jakub Jelinek | Time: 2023-06-10 18:36:46 UTC
+  Text: Well, there is nothing magic on exactly 0x55 immediate, there are 256 possible immediates, most of them use all of A, B, C, some of them use just A, B, others just B, C, others just A, C, others just A, others just B, others just C, others none of them.
+And I must say I don't immediately see easy rules how to find out from the immediate value which set is which, so unless we find some easy rule for that, we'd need to hardcode the mapping between the 256 values to a bitmask which inputs are actually used.
+And then the question is how to represent that in RTL to make it clear that some operands are mentioned but their value isn't really used.
+
+- User: Andrew Pinski | Time: 2023-06-10 21:10:24 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #3)> Well, there is nothing magic on exactly 0x55 immediate, there are 256
+> possible immediates, most of them use all of A, B, C, some of them use just
+> A, B, others just B, C, others just A, C, others just A, others just B,
+> others just C, others none of them.
+> And I must say I don't immediately see easy rules how to find out from the
+> immediate value which set is which, so unless we find some easy rule for
+> that, we'd need to hardcode the mapping between the 256 values to a bitmask
+> which inputs are actually used.
+> And then the question is how to represent that in RTL to make it clear that
+> some operands are mentioned but their value isn't really used.In the case of 0x55, an idea might be to split (or expand) it into how ~ is represented.
+
+That is:
+(insn:TI 6 3 12 2 (set (reg:V8DI 20 xmm0 [85])
+        (xor:V8DI (mem:V8DI (reg/v/f:DI 5 di [orig:84 a ] [84]) [0 *a_3(D)+0 S64 A512])
+            (const_vector:V8DI [
+                    (const_int -1 [0xffffffffffffffff]) repeated x8
+                ]))) "/app/example.cpp":21:14 6764 {*one_cmplv8di2}
+     (expr_list:REG_DEAD (reg/v/f:DI 5 di [orig:84 a ] [84])
+        (nil)))
+
+- User: Fabio Cannizzo | Time: 2023-06-12 17:14:52 UTC
+  Text: > Well, there is nothing magic on exactly 0x55 immediate, there are 256
+> possible immediates, most of them use all of A, B, C, some of them use just
+> A, B, others just B, C, others just A, C, others just A, others just B,
+> others just C, others none of them.Indeed I meant 0x55 just as an example.
+
+- User: Alexander Monakov | Time: 2023-06-12 19:04:26 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #3)> And I must say I don't immediately see easy rules how to find out from the
+> immediate value which set is which, so unless we find some easy rule for
+> that, we'd need to hardcode the mapping between the 256 values to a bitmask
+> which inputs are actually used.Well, that's really easy. The immediate is just a eight-entry look-up table from any possible input bit triple to the output bit. The leftmost operand corresponds to the most significant bit in the triple, so to check if the operation vpternlog(A, B, C, I) is invariant w.r.t A you check if nibbles of I are equal. Here we have 0x55, equal nibbles, and the operation is invariant w.r.t A.
+
+Similarly, to check if it's invariant w.r.t B we check if two-bit groups in I come in pairs, or in code: (I & 0x33) == ((I >> 2) & 0x33). For 0x55 both sides evaluate to 0x11, so again, invariant w.r.t B.
+
+Finally, checking invariantness w.r.t C is (I & 0x55) == ((I >> 1) & 0x55).
+
+- User: Alexander Monakov | Time: 2023-06-27 17:59:43 UTC
+  Text: Note that vpxor serves as a dependency-breaking instruction (seePR 110438). So in negate1 we do the right thing for the wrong reasons, and in negate2 we can cause a substantial stall if the previous computation of xmm0 has a non-trivial dependency chain.
+
+- User: Hongtao.liu | Time: 2023-06-28 00:47:14 UTC
+  Text: (In reply to Alexander Monakov fromcomment #7)> Note that vpxor serves as a dependency-breaking instruction (seePR 110438).
+> So in negate1 we do the right thing for the wrong reasons, and in negate2 we
+> can cause a substantial stall if the previous computation of xmm0 has a
+> non-trivial dependency chain.For this one, we can load *a into %zmm0 to avoid false_dependence.
+
+vmovdqau ZMMWORD PTR [rdi], zmm0
+vpternlogq      zmm0, zmm0, zmm0, 85
+
+- User: Alexander Monakov | Time: 2023-06-28 05:07:29 UTC
+  Text: (In reply to Hongtao.liu fromcomment #8)> 
+> For this one, we can load *a into %zmm0 to avoid false_dependence.
+> 
+> vmovdqau ZMMWORD PTR [rdi], zmm0
+> vpternlogq      zmm0, zmm0, zmm0, 85Yes, since ternlog with memory operand needs two fused-domain uops on Intel CPUs, breaking out the load would be more efficient for both negate1 and negate2.
+
+- User: GCC Commits | Time: 2023-07-12 07:51:46 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:13c556d6ae84be3ee2bc245a56eafa58221de86acommitr14-2447-g13c556d6ae84be3ee2bc245a56eafa58221de86aAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Jun 29 14:25:28 2023 +0800
+
+    Break false dependence for vpternlog by inserting vpxor or setting constraint of input operand to '0'
+    
+    False dependency happens when destination is only updated by
+    pternlog. There is no false dependency when destination is also used
+    in source. So either a pxor should be inserted, or input operand
+    should be set with constraint '0'.
+    
+    gcc/ChangeLog:PR target/110438PR target/110202* config/i386/predicates.md
+            (int_float_vector_all_ones_operand): New predicate.
+            * config/i386/sse.md (*vmov<mode>_constm1_pternlog_false_dep): New
+            define_insn.
+            (*<avx512>_cvtmask2<ssemodesuffix><mode>_pternlog_false_dep):
+            Ditto.
+            (*<avx512>_cvtmask2<ssemodesuffix><mode>_pternlog_false_dep):
+            Ditto.
+            (*<avx512>_cvtmask2<ssemodesuffix><mode>): Adjust to
+            define_insn_and_split to avoid false dependence.
+            (*<avx512>_cvtmask2<ssemodesuffix><mode>): Ditto.
+            (<mask_codefor>one_cmpl<mode>2<mask_name>): Adjust constraint
+            of operands 1 to '0' to avoid false dependence.
+            (*andnot<mode>3): Ditto.
+            (iornot<mode>3): Ditto.
+            (*<nlogic><mode>3): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110438.c: New test.
+            * gcc.target/i386/pr100711-6.c: Adjust testcase.
+
+- User: GCC Commits | Time: 2023-08-04 16:44:28 UTC
+  Text: The master branch has been updated by Alexander Monakov <amonakov@gcc.gnu.org>:https://gcc.gnu.org/g:567d06bb357a39ece865cef67ada44124f227e45commitr14-2999-g567d06bb357a39ece865cef67ada44124f227e45Author: Yan Simonaytes <simonaytes.yan@ispras.ru>
+Date:   Tue Jul 25 20:43:19 2023 +0300
+
+    i386: eliminate redundant operands of VPTERNLOG
+    
+    As mentioned inPR 110202, GCC may be presented with input where control
+    word of the VPTERNLOG intrinsic implies that some of its operands do not
+    affect the result.  In that case, we can eliminate redundant operands
+    of the instruction by substituting any other operand in their place.
+    This removes false dependencies.
+    
+    For instance, instead of (252 = 0xfc = _MM_TERNLOG_A | _MM_TERNLOG_B)
+    
+            vpternlogq      $252, %zmm2, %zmm1, %zmm0
+    
+    emit
+    
+            vpternlogq      $252, %zmm0, %zmm1, %zmm0
+    
+    When VPTERNLOG is invariant w.r.t first and second operands, and the
+    third operand is memory, load memory into the output operand first, i.e.
+    instead of (85 = 0x55 = ~_MM_TERNLOG_C)
+    
+            vpternlogq      $85, (%rdi), %zmm1, %zmm0
+    
+    emit
+    
+            vmovdqa64       (%rdi), %zmm0
+            vpternlogq      $85, %zmm0, %zmm0, %zmm0
+    
+    gcc/ChangeLog:PR target/110202* config/i386/i386-protos.h
+            (vpternlog_redundant_operand_mask): Declare.
+            (substitute_vpternlog_operands): Declare.
+            * config/i386/i386.cc
+            (vpternlog_redundant_operand_mask): New helper.
+            (substitute_vpternlog_operands): New function.  Use them...
+            * config/i386/sse.md: ... here in new VPTERNLOG define_splits.
+    
+    gcc/testsuite/ChangeLog:PR target/110202* gcc.target/i386/invariant-ternlog-1.c: New test.
+            * gcc.target/i386/invariant-ternlog-2.c: New test.
+
+- User: Alexander Monakov | Time: 2023-08-05 15:32:06 UTC
+  Text: We now generate
+
+negate1:
+        vmovdqa64       zmm0, ZMMWORD PTR [rdi]
+        vpternlogq      zmm0, zmm0, zmm0, 85
+        ret
+negate2:
+        vmovdqa32       zmm0, ZMMWORD PTR [rdi]
+        vpternlogd      zmm0, zmm0, zmm0, 0x55
+        ret
+
+Fixed for gcc-14.
+

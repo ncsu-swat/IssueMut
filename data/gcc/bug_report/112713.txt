@@ -1,0 +1,140 @@
+Bug Summary: RISC-V: Trunk GCC regression on VSETVL PASS comparing with GCC-13
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2023-11-26 00:37:46 UTC
+  Text: https://godbolt.org/z/qePhcxd5z#include "riscv_vector.h"
+
+size_t
+foo (char const *buf, size_t len)
+{
+	size_t sum = 0;
+	size_t vl = __riscv_vsetvlmax_e8m8();
+	size_t step = vl * 4;
+	const char *it = buf, *end = buf + len;
+	for(; it + step <= end; ) {
+		it += vl;
+		vint8m8_t v3 = __riscv_vle8_v_i8m8((void*)it, vl); it += vl;
+		vbool1_t m3 = __riscv_vmsgt_vx_i8m8_b1(v3, -65, vl);
+		sum += __riscv_vcpop_m_b1(m3, vl);
+	}
+	return sum;
+}
+
+GCC-14 ASM:
+
+foo:
+        vsetvli a4,zero,e8,m8,ta,ma
+        slli    a5,a4,2
+        add     a1,a0,a1
+        add     a5,a0,a5
+        bltu    a1,a5,.L4
+        slli    a6,a4,1
+        add     a5,a0,a4
+        add     t1,a6,a4
+        li      a0,0
+        li      a7,-65
+        vsetvli zero,zero,e8,m8,ta,ma   ----------> redundant
+.L3:
+        vle8.v  v8,0(a5)
+        add     a5,a5,a6
+        add     a3,t1,a5
+        vmsgt.vx        v8,v8,a7
+        vcpop.m a2,v8
+        add     a0,a0,a2
+        bgeu    a1,a3,.L3
+        ret
+.L4:
+        li      a0,0
+        ret
+
+GCC-13 ASM:
+
+foo:
+        vsetvli a4,zero,e8,m8,ta,ma
+        slli    a5,a4,2
+        add     a1,a0,a1
+        add     a5,a0,a5
+        bltu    a1,a5,.L4
+        slli    a6,a4,1
+        add     a5,a0,a4
+        add     t1,a6,a4
+        li      a0,0
+        li      a7,-65
+.L3:
+        vle8.v  v8,0(a5)
+        add     a5,a5,a6
+        add     a3,t1,a5
+        vmsgt.vx        v24,v8,a7
+        vcpop.m a2,v24
+        add     a0,a0,a2
+        bgeu    a1,a3,.L3
+        ret
+.L4:
+        li      a0,0
+        ret
+
+Trunk GCC-14 has a regression that cause a redundant vsetvl.
+
+Such regression need to be fixed and I will take a look at it.
+
+- User: GCC Commits | Time: 2023-11-28 02:11:12 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:9c16ca93641ad460a576a9ed7daf2aadf596193ccommitr14-5897-g9c16ca93641ad460a576a9ed7daf2aadf596193cAuthor: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Mon Nov 27 21:24:12 2023 +0800
+
+    RISC-V: Fix VSETVL PASS regression
+    
+    This patch is regression fix patch, not an optimization patch.
+    Since trunk GCC generates redundant vsetvl than GCC-13.
+    
+    This is the case:
+    
+    bb 2:
+      def a2 (vsetvl a2, zero)
+    bb 3:
+      use a2
+    bb 4:
+      use a2 (vle)
+    
+    before this patch:
+    
+    bb 2:
+    vsetvl a2 zero
+    bb 3:
+    vsetvl zero, zero ----> should be eliminated.
+    bb 4:
+    vle.v
+    
+    The root cause is we didn't set bb 3 as transparent since the incorrect codes.
+    bb 3 didn't modify "a2" just use it, the VSETVL status from bb 2 can be available to bb 3 and bb 4:
+    
+    bb 2 -> bb 3 -> bb4.
+    
+    Another regression fix is anticipation calculation:
+    
+    bb 4:
+    use a5 (sub)
+    use a5 (vle)
+    
+    The vle VSETVL status should be considered as anticipated as long as both sub and vle a5 def are coming from same def.
+    
+    Tested on zvl128b no regression.
+    
+    I am going to test on zvl256/zvl512/zvl1024PR target/112713gcc/ChangeLog:
+    
+            * config/riscv/riscv-vsetvl.cc (pre_vsetvl::compute_lcm_local_properties): Fix regression.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/vsetvl/pr112713-1.c: New test.
+            * gcc.target/riscv/rvv/vsetvl/pr112713-2.c: New test.
+
+- User: JuzheZhong | Time: 2023-11-28 06:40:59 UTC
+  Text: Fixed
+

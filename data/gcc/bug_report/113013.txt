@@ -1,0 +1,186 @@
+Bug Summary: [12/13/14 regression] ICE in fold_convert_loc with -fsanitize=undefined
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-invalid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sam James | Time: 2023-12-14 03:10:31 UTC
+  Text: Createdattachment 56876[details]reduced.i
+
+Hit this when reducingPR113012.
+
+```
+$ gcc -c /tmp/foo.c -O2 -fsanitize=undefined
+during GIMPLE pass: objsz
+/tmp/foo.c: In function ‘miZeroLine_list_len’:
+/tmp/foo.c:9:6: internal compiler error: in fold_convert_loc, at fold-const.cc:2602
+    9 | void miZeroLine_list_len() {
+      |      ^~~~~~~~~~~~~~~~~~~
+0x55eb4274eca3 fold_convert_loc(unsigned int, tree_node*, tree_node*)
+        /usr/src/debug/sys-devel/gcc-14.0.0_pre20231210/gcc-14-20231210/gcc/fold-const.cc:2602
+0x55eb446f7d13 alloc_object_size
+        /usr/src/debug/sys-devel/gcc-14.0.0_pre20231210/gcc-14-20231210/gcc/tree-object-size.cc:811
+0x55eb446f7d13 call_object_size
+        /usr/src/debug/sys-devel/gcc-14.0.0_pre20231210/gcc-14-20231210/gcc/tree-object-size.cc:1339
+0x55eb446f7d13 collect_object_sizes_for
+        /usr/src/debug/sys-devel/gcc-14.0.0_pre20231210/gcc-14-20231210/gcc/tree-object-size.cc:1779
+0x55eb4418920f compute_builtin_object_size(tree_node*, int, tree_node**)
+        /usr/src/debug/sys-devel/gcc-14.0.0_pre20231210/gcc-14-20231210/gcc/tree-object-size.cc:1194
+0x55eb43fab777 fold_builtin_object_size
+        /usr/src/debug/sys-devel/gcc-14.0.0_pre20231210/gcc-14-20231210/gcc/builtins.cc:11556
+0x55eb43fab777 fold_builtin_2
+        /usr/src/debug/sys-devel/gcc-14.0.0_pre20231210/gcc-14-20231210/gcc/builtins.cc:10575
+0x55eb43fab777 fold_builtin_n(unsigned int, tree_node*, tree_node*, tree_node**, int, bool) [clone .isra.0]
+        /usr/src/debug/sys-devel/gcc-14.0.0_pre20231210/gcc-14-20231210/gcc/builtins.cc:10687
+0x55eb440cd22d dynamic_object_sizes_execute_one
+        /usr/src/debug/sys-devel/gcc-14.0.0_pre20231210/gcc-14-20231210/gcc/tree-object-size.cc:2078
+0x55eb440cd22d object_sizes_execute
+        /usr/src/debug/sys-devel/gcc-14.0.0_pre20231210/gcc-14-20231210/gcc/tree-object-size.cc:2140
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://bugs.gentoo.org/> for instructions.
+```
+
+- User: Andrew Pinski | Time: 2023-12-14 03:17:11 UTC
+  Text: Reduced slightly more:
+```
+struct _xPoint {
+  short x;
+} xPoint;
+void *reallocarray() __attribute__((__alloc_size__(1)));
+struct _xPoint * miZeroLine_pspanInit;
+void miZeroLine_list_len(void) {
+  miZeroLine_pspanInit = reallocarray(xPoint);
+  miZeroLine_pspanInit->x = 0;
+}
+``
+
+- User: Andrew Pinski | Time: 2023-12-14 03:18:56 UTC
+  Text: Most likelyr12-6479-g404c787e2bfe8cae666b075ed903990ea452220eorr12-6482-g06bc1b0c539e3a60692d7432d15e701c38610f80.
+
+- User: Andrew Pinski | Time: 2023-12-14 03:20:19 UTC
+  Text: The use of __alloc_size__ here is definitely not well defined but GCC should NOT crash.
+
+- User: Siddhesh Poyarekar | Time: 2023-12-14 12:52:19 UTC
+  Text: Agreed, the attribute is invalid and maybe the frontend needs to flag it early and flag an error.
+
+- User: Jakub Jelinek | Time: 2023-12-15 13:28:51 UTC
+  Text: Createdattachment 56885[details]gcc14-pr113013.patch
+
+I don't see how FEs could do anything, especially on declarations like this
+where the argument types aren't specified.
+For attributes like this, it is generally responsibility of the function
+using those to use it only if they are sane, and after all, even the tree-object-size.cc code does that (e.g. verify that such argument exists at all).  Just doesn't check that it is convertible to sizetype.
+
+- User: Siddhesh Poyarekar | Time: 2023-12-15 13:54:32 UTC
+  Text: Sorry I misread the reproducer as void *reallocarray(void) __attribute__((__alloc_size__(1)));
+
+Your fix looks fine to me, thanks.
+
+- User: GCC Commits | Time: 2023-12-18 09:00:08 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:5347263b347d02e875879ca40ca6e289ac178919commitr14-6654-g5347263b347d02e875879ca40ca6e289ac178919Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Dec 18 09:59:28 2023 +0100
+
+    tree-object-size: Robustify alloc_size attribute handling [PR113013]
+    
+    The following testcase ICEs because we aren't careful enough with
+    alloc_size attribute.  We do check that such an argument exists
+    (although wouldn't handle correctly functions with more than INT_MAX
+    arguments), but didn't check that it is scalar integer, the ICE is
+    trying to fold_convert a structure to sizetype.
+    
+    Given that the attribute can also appear on non-prototyped functions
+    where the arguments aren't known, I don't see how the FE could diagnose
+    that and because we already handle the case where argument doesn't exist,
+    I think we should also verify the argument is scalar integer convertible
+    to sizetype.  Furthermore, given this is not just in diagnostics but
+    used for code generation, I think it is better to punt on arguments with
+    larger precision then sizetype, the upper bits are then truncated.
+    
+    The patch also fixes some formatting issues and avoids duplication of the
+    fold_convert, plus removes unnecessary check for if (arg1 >= 0), that is
+    always the case after if (arg1 < 0) return ...;
+    
+    2023-12-18  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113013* tree-object-size.cc (alloc_object_size): Return size_unknown if
+            corresponding argument(s) don't have integral type or have integral
+            type with higher precision than sizetype.  Don't check arg1 >= 0
+            uselessly.  Compare argument indexes against gimple_call_num_args
+            in unsigned type rather than int.  Formatting fixes.
+    
+            * gcc.dg/pr113013.c: New test.
+
+- User: GCC Commits | Time: 2023-12-18 09:14:01 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:2ea5a22b3e594cdf88e916b3df774883ce9dbc3acommitr13-8165-g2ea5a22b3e594cdf88e916b3df774883ce9dbc3aAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Dec 18 09:59:28 2023 +0100
+
+    tree-object-size: Robustify alloc_size attribute handling [PR113013]
+    
+    The following testcase ICEs because we aren't careful enough with
+    alloc_size attribute.  We do check that such an argument exists
+    (although wouldn't handle correctly functions with more than INT_MAX
+    arguments), but didn't check that it is scalar integer, the ICE is
+    trying to fold_convert a structure to sizetype.
+    
+    Given that the attribute can also appear on non-prototyped functions
+    where the arguments aren't known, I don't see how the FE could diagnose
+    that and because we already handle the case where argument doesn't exist,
+    I think we should also verify the argument is scalar integer convertible
+    to sizetype.  Furthermore, given this is not just in diagnostics but
+    used for code generation, I think it is better to punt on arguments with
+    larger precision then sizetype, the upper bits are then truncated.
+    
+    The patch also fixes some formatting issues and avoids duplication of the
+    fold_convert, plus removes unnecessary check for if (arg1 >= 0), that is
+    always the case after if (arg1 < 0) return ...;
+    
+    2023-12-18  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113013* tree-object-size.cc (alloc_object_size): Return size_unknown if
+            corresponding argument(s) don't have integral type or have integral
+            type with higher precision than sizetype.  Don't check arg1 >= 0
+            uselessly.  Compare argument indexes against gimple_call_num_args
+            in unsigned type rather than int.  Formatting fixes.
+    
+            * gcc.dg/pr113013.c: New test.
+    
+    (cherry picked from commit 5347263b347d02e875879ca40ca6e289ac178919)
+
+- User: GCC Commits | Time: 2023-12-18 09:26:43 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:febb86b366047e0ea48da85c9b52ee03878cb5bfcommitr12-10059-gfebb86b366047e0ea48da85c9b52ee03878cb5bfAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Dec 18 09:59:28 2023 +0100
+
+    tree-object-size: Robustify alloc_size attribute handling [PR113013]
+    
+    The following testcase ICEs because we aren't careful enough with
+    alloc_size attribute.  We do check that such an argument exists
+    (although wouldn't handle correctly functions with more than INT_MAX
+    arguments), but didn't check that it is scalar integer, the ICE is
+    trying to fold_convert a structure to sizetype.
+    
+    Given that the attribute can also appear on non-prototyped functions
+    where the arguments aren't known, I don't see how the FE could diagnose
+    that and because we already handle the case where argument doesn't exist,
+    I think we should also verify the argument is scalar integer convertible
+    to sizetype.  Furthermore, given this is not just in diagnostics but
+    used for code generation, I think it is better to punt on arguments with
+    larger precision then sizetype, the upper bits are then truncated.
+    
+    The patch also fixes some formatting issues and avoids duplication of the
+    fold_convert, plus removes unnecessary check for if (arg1 >= 0), that is
+    always the case after if (arg1 < 0) return ...;
+    
+    2023-12-18  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113013* tree-object-size.cc (alloc_object_size): Return size_unknown if
+            corresponding argument(s) don't have integral type or have integral
+            type with higher precision than sizetype.  Don't check arg1 >= 0
+            uselessly.  Compare argument indexes against gimple_call_num_args
+            in unsigned type rather than int.  Formatting fixes.
+    
+            * gcc.dg/pr113013.c: New test.
+    
+    (cherry picked from commit 5347263b347d02e875879ca40ca6e289ac178919)
+
+- User: Jakub Jelinek | Time: 2023-12-18 09:38:25 UTC
+  Text: Should be fixed now.
+

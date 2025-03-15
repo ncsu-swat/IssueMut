@@ -1,0 +1,156 @@
+Bug Summary: [15 Regression] ICE with TCVC_2 build since r15-1053-g28edeb1409a7b8
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 14.1.0
+Known to Fail: 15.0
+
+Comments:
+- User: N/A | Time: 2024-06-07 08:58:15 UTC
+  Text: Patch [PATCH 1/4] Relax COND_EXPR reduction vectorization SLP restriction  seem to cause ICE while building TSVC_2
+
+Reduced test:
+
+cat tsvc_vec.i
+void dummy();
+void s331() {
+  int j;
+  for (int i; i; i++)
+    if ((float)i < 00.)
+      j = i;
+  dummy(j);
+}
+
+
+gcc options used:
+gcc  -std=c99 -O3 -march=native -flto -Wl,--sort-section=name -mcpu=neoverse-v2 -msve-vector-bits=128
+gcc -v:
+Using built-in specs.
+COLLECT_GCC=/proj/grco/gcc/Linux_aarch64/upstream-main/latest/bin/gcc
+COLLECT_LTO_WRAPPER=/proj/grco/gcc/Linux_aarch64/upstream-main/20240606024711346f33e2/libexec/gcc/aarch64-unknown-linux-gnu/15.0.0/lto-wrapper
+Target: aarch64-unknown-linux-gnu
+Configured with: /var/jenkins/workspace/GCC_Nightly/configure --enable-multiarch=yes --enable-languages=c,c++,fortran,lto --prefix=/proj/grco/gcc/Linux_aarch64/upstream-main/20240606024711346f33e2
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240606 (experimental) (GCC)
+
+- User: N/A | Time: 2024-06-07 09:29:41 UTC
+  Text: Confirmed. -O3 -msve-vector-bits=128 -mcpu=neoverse-v2 is enough to trigger it:
+ice.c:2:6: internal compiler error: Segmentation fault
+    2 | void s331() {
+      |      ^~~~
+0xf4b59b crash_signal
+        $TOP/gcc/gcc/toplev.cc:319
+0xb7f518 phi_nodes_ptr(basic_block_def*)
+        $TOP/gcc/gcc/gimple.h:4701
+0xb7f518 gsi_start_phis(basic_block_def*)
+        $TOP/gcc/gcc/gimple-iterator.cc:937
+0xb7f518 gsi_for_stmt(gimple*)
+        $TOP/gcc/gcc/gimple-iterator.cc:621
+0x1fa982f vectorizable_condition
+        $TOP/gcc/gcc/tree-vect-stmts.cc:12577
+0x1fc4627 vect_transform_stmt(vec_info*, _stmt_vec_info*, gimple_stmt_iterator*, _slp_tree*, _slp_instance*)
+        $TOP/gcc/gcc/tree-vect-stmts.cc:13467
+0x1261733 vect_schedule_slp_node
+        $TOP/gcc/gcc/tree-vect-slp.cc:9729
+0x1276837 vect_schedule_slp_node
+        $TOP/gcc/gcc/tree-vect-slp.cc:9522
+0x1276837 vect_schedule_scc
+        $TOP/gcc/gcc/tree-vect-slp.cc:10017
+0x12776df vect_schedule_slp(vec_info*, vec<_slp_instance*, va_heap, vl_ptr> const&)
+        $TOP/gcc/gcc/tree-vect-slp.cc:10110
+0x1244837 vect_transform_loop(_loop_vec_info*, gimple*)
+        $TOP/gcc/gcc/tree-vect-loop.cc:12114
+0x1287d5f vect_transform_loops
+        $TOP/gcc/gcc/tree-vectorizer.cc:1007
+0x12883e7 try_vectorize_loop_1
+        $TOP/gcc/gcc/tree-vectorizer.cc:1153
+0x12883e7 try_vectorize_loop
+        $TOP/gcc/gcc/tree-vectorizer.cc:1183
+0x128875b execute
+        $TOP/gcc/gcc/tree-vectorizer.cc:1299
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: Richard Biener | Time: 2024-06-07 09:47:58 UTC
+  Text: I can reproduce.
+
+- User: Richard Biener | Time: 2024-06-07 10:09:30 UTC
+  Text: So we're now doing a EXTRACT_LAST_REDUCTION with multiple stmt copies which
+is disallowed for non-SLP (by accident?).  It shows it of course doesn't
+work since we end up removing the scalar reduction stmt multiple times.
+
+  <bb 3> [local count: 860067202]:
+  # j_12 = PHI <j_2(8), j_5(D)(28)>
+  # i_14 = PHI <i_9(8), i_6(D)(28)>
+  # vect_vec_iv_.9_45 = PHI <_46(8), _47(28)>
+  _46 = vect_vec_iv_.9_45 + { 16, 16, 16, 16 };
+  _48 = vect_vec_iv_.9_45 + { 4, 4, 4, 4 };
+  _49 = _48 + { 4, 4, 4, 4 };
+  _50 = _49 + { 4, 4, 4, 4 };
+  vect__1.10_51 = (vector(4) float) vect_vec_iv_.9_45;
+  vect__1.10_52 = (vector(4) float) _48;
+  vect__1.10_53 = (vector(4) float) _49;
+  vect__1.10_54 = (vector(4) float) _50;
+  mask__3.11_55 = vect__1.10_51 < { 0.0, 0.0, 0.0, 0.0 };
+  mask__3.11_56 = vect__1.10_52 < { 0.0, 0.0, 0.0, 0.0 };
+  mask__3.11_57 = vect__1.10_53 < { 0.0, 0.0, 0.0, 0.0 };
+  mask__3.11_58 = vect__1.10_54 < { 0.0, 0.0, 0.0, 0.0 };
+  j_2 = .FOLD_EXTRACT_LAST (j_12, mask__3.11_55, vect_vec_iv_.9_45);
+
+and we removed the old
+
+  j_2 = _3 ? i_14 : j_12;
+
+we are about to insert
+
+  j_2 = .FOLD_EXTRACT_LAST (j_12, mask__3.11_56, _48);
+
+I think correct would be
+
+  j_59 = .FOLD_EXTRACT_LAST (j_12, mask__3.11_55, vect_vec_iv_.9_45);
+  j_60 = .FOLD_EXTRACT_LAST (j_59, mask__3.11_56, _48);
+  j_61 = .FOLD_EXTRACT_LAST (j_60, mask__3.11_57, _49);
+  j_2 = .FOLD_EXTRACT_LAST (j_61, mask__3.11_58, _50);
+
+I'm testing a patch.
+
+- User: Richard Biener | Time: 2024-06-07 10:17:56 UTC
+  Text: Createdattachment 58378[details]patch
+
+I'm testing this, but I do not have hardware to test correctness (and qemu not set up).
+
+- User: N/A | Time: 2024-06-07 22:26:54 UTC
+  Text: (In reply to Richard Biener fromcomment #4)> Createdattachment 58378[details]> patch
+> 
+> I'm testing this, but I do not have hardware to test correctness (and qemu
+> not set up).Thanks. I will test this on aarch64.
+
+- User: N/A | Time: 2024-06-08 03:35:35 UTC
+  Text: (In reply to kugan fromcomment #5)> (In reply to Richard Biener fromcomment #4)
+> > Createdattachment 58378[details]> > patch
+> > 
+> > I'm testing this, but I do not have hardware to test correctness (and qemu
+> > not set up).
+> 
+> Thanks. I will test this on aarch64.bootstrap and regression test passes. TSVC_2 also builds without any issues.
+
+- User: GCC Commits | Time: 2024-06-10 06:27:50 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:c1429e3a8da0cdfe9391e1e9b2c7228d896a3a87commitr15-1126-gc1429e3a8da0cdfe9391e1e9b2c7228d896a3a87Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Jun 7 12:15:31 2024 +0200
+
+    tree-optimization/115383 - EXTRACT_LAST_REDUCTION with multiple stmt copies
+    
+    The EXTRACT_LAST_REDUCTION code isn't ready to deal with multiple stmt
+    copies but SLP no longer checks for this.  The following adjusts
+    code generation to handle the situation.PR tree-optimization/115383* tree-vect-stmts.cc (vectorizable_condition): Handle
+            generating a chain of .FOLD_EXTRACT_LAST.
+    
+            * gcc.dg/vect/pr115383.c: New testcase.
+
+- User: Richard Biener | Time: 2024-06-10 06:28:12 UTC
+  Text: Should be fixed now.
+

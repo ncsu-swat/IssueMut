@@ -1,0 +1,229 @@
+Bug Summary: [14 Regression] MVE vector load intrinsic miscompiled since r14-5622-g4d7647edfd7d98
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Alex Coplan | Time: 2024-03-13 11:42:23 UTC
+  Text: The following testcase:
+
+#include <arm_mve.h>
+
+uint32x4_t foo (void) {
+  uint32x4_t V0 = vld1q_u32(((const uint32_t[4]){1, 2, 3, 4}));
+  return V0;
+}
+
+is miscompiled with -O2 -march=armv8.1-m.main+mve -mfloat-abi=hard on arm-none-eabi.  Sincer14-5622-g4d7647edfd7d985fbefe13de03c8bc2e3a74fc61we generate:
+
+foo:
+        sub     sp, sp, #16
+        vldrw.32        q0, [sp]
+        add     sp, sp, #16
+        bx      lr
+
+i.e. we do a vector load from uninitialized stack memory.  GCC 13 used to give:
+
+foo:
+        sub     sp, sp, #16
+        mov     ip, sp
+        ldr     r3, .L4
+        ldm     r3, {r0, r1, r2, r3}
+        stm     ip, {r0, r1, r2, r3}
+        vldrw.32        q0, [ip]
+        add     sp, sp, #16
+        bx      lr
+        .align  2
+.L4:
+        .word   .LANCHOR0
+        .size   foo, .-foo
+        .section        .rodata
+        .align  2
+        .set    .LANCHOR0,. + 0
+        .word   1
+        .word   2
+        .word   3
+        .word   4
+
+which, while not optimal, is at least correct.  Here is a full executable testcase for the testsuite:
+
+#include <arm_mve.h>
+
+__attribute__((noipa))
+uint32x4_t foo (void) {
+  uint32x4_t V0 = vld1q_u32(((const uint32_t[4]){1, 2, 3, 4}));
+  return V0;
+}
+
+int main(void)
+{
+  uint32_t buf[4];
+  vst1q_u32 (buf, foo());
+
+  for (int i = 0; i < 4; i++)
+    if (buf[i] != i+1)
+      __builtin_abort ();
+}
+
+- User: Alex Coplan | Time: 2024-03-13 12:03:12 UTC
+  Text: Hmm, so in 043t.mergephi1 we have:
+
+uint32x4_t foo ()
+{
+  const uint32_t D.13439[4];
+  uint32x4_t V0;
+
+  <bb 2> :
+  D.13439 = *.LC0;
+  V0_3 = vld1q_u32 (&D.13439);
+  D.13439 ={v} {CLOBBER(eos)};
+  return V0_3;
+
+}
+
+but then 044t.dse1 says:
+
+  Deleted dead store: D.13439 = *.LC0;
+
+leaving us with a load of uninitialized memory.
+
+- User: Christophe Lyon | Time: 2024-03-14 07:44:53 UTC
+  Text: Tried a similar testcase for aarch64 (the intrinsics framework for MVE is very close to SVE's), and noticed that when running dse_classify_store() it sees a use of the initialized memory:
+
+svuint32_t foo ()  
+{
+  const uint32_t D.11583[4];
+  svuint32_t V0;
+
+<bb 2> : 
+ D.11583[0] = 1; 
+ D.11583[1] = 2; 
+ D.11583[2] = 3; 
+ D.11583[3] = 4; 
+ V0_7 = svld1_u32 ({ -1, 0, 0, 0, ... }, &D.11583);
+ D.11583 ={v} {CLOBBER(eol)};
+ return V0_7;
+}
+
+# .MEM_6 = VDEF <.MEM_
+D.11583[3] = 4;
+# VUSE <.MEM_6>
+V0_7 = svld1_u32 ({ -1, 0, 0, 0, ... }, &D.11583);
+
+
+
+dse_classify_store() on arm/MVE does not see such a use and decides the initialization is a dead store.
+
+- User: N/A | Time: 2024-03-15 05:59:27 UTC
+  Text: Just to expand on previous comments:
+Before patch, input to dse is:
+
+  uint32x4_t D.13560;
+  const uint32_t D.13545[4];
+  uint32x4_t V0;
+  __simd128_uint32_t _7;
+
+  <bb 2> :
+  # .MEM_2 = VDEF <.MEM_1(D)>
+  D.13545 = *.LC0;
+  # .MEM_8 = VDEF <.MEM_2>
+  _7 = __builtin_mve_vld1q_uv4si (&D.13545);
+  # .MEM_6 = VDEF <.MEM_8>
+  D.13545 ={v} {CLOBBER(eos)};
+  # VUSE <.MEM_6>
+  return _7;
+
+In this case, we have following virtual def-use chain:
+.MEM_1(D) -> .MEM_2 -> .MEM_8 -> .MEM_6
+
+
+However after patch, input to dse is:
+  const uint32_t D.13539[4];
+  uint32x4_t V0;
+
+  <bb 2> :
+  # .MEM_2 = VDEF <.MEM_1(D)>
+  D.13539 = *.LC0;
+  V0_3 = vld1q_u32 (&D.13539);
+  # .MEM_5 = VDEF <.MEM_2>
+  D.13539 ={v} {CLOBBER(eos)};
+  # VUSE <.MEM_5>
+  return V0_3;
+
+There's a missing use of MEM_2 in call to vld1q_u32, and
+since the only use of MEM_2 now is in clobber statement,
+dse considers it as a dead store, and simplifies it to:
+
+  <bb 2> :
+  V0_3 = vld1q_u32 (&D.13539);
+  # .MEM_5 = VDEF <.MEM_1(D)>
+  D.13539 ={v} {CLOBBER(eos)};
+  # VUSE <.MEM_5>
+  return V0_3;
+
+thus passing uninitialized pointer to vld1q_u32.
+
+Thanks,
+Prathamesh
+
+- User: Alex Coplan | Time: 2024-03-15 11:17:46 UTC
+  Text: I think the problem is that the arm backend incorrectly sets the const attribute on this builtin, but it can't be const because it reads memory (it should be pure instead):
+
+ <function_decl 0x7f9943be0900 vld1q_u32
+    type <function_type 0x7f9943be1348
+        type <vector_type 0x7f9943ef69d8 uint32x4_t type <integer_type 0x7f9943f647e0 long unsigned int>
+            sizes-gimplified unsigned V4SI
+            size <integer_cst 0x7f9943f60408 constant 128>
+            unit-size <integer_cst 0x7f9943f60420 constant 16>
+            align:64 warn_if_not_align:0 symtab:0 alias-set -1 structural-equality
+            attributes <tree_list 0x7f994406ec30
+                purpose <identifier_node 0x7f99440708c0 Advanced SIMD type>
+                value <tree_list 0x7f994406ec08
+                    value <identifier_node 0x7f9944076050 18__simd128_uint32_t>>> nunits:4>
+        HI
+        size <integer_cst 0x7f9943f602a0 constant 16>
+        unit-size <integer_cst 0x7f9943f602b8 constant 2>
+        align:16 warn_if_not_align:0 symtab:0 alias-set -1 structural-equality
+        arg-types <tree_list 0x7f9943bdfcd0 value <pointer_type 0x7f9943be12a0>
+            chain <tree_list 0x7f9943f5d7a8 value <void_type 0x7f9943f6c0a8 void>>>
+        pointer_to_this <pointer_type 0x7f9943f799d8>>
+    readonly addressable used nothrow public external built-in decl_5 decl_6 SI t.c:2:9
+    align:16 warn_if_not_align:0 built-in: BUILT_IN_MD:3923 context <translation_unit_decl 0x7f9943ec27f8 t.c>
+    attributes <tree_list 0x7f9943bdfeb0
+        purpose <identifier_node 0x7f9943f618c0 const tree_0
+            rid 0x7f9943f618c0 "const">
+        chain <tree_list 0x7f9943bdfe88
+            purpose <identifier_node 0x7f9943f73730 nothrow>
+            chain <tree_list 0x7f9943bdfe60
+                purpose <identifier_node 0x7f9943f73780 leaf>>>> chain <function_decl 0x7f9943be0a00 __arm_vmaxaq_m>>
+
+- User: Christophe Lyon | Time: 2024-03-15 11:31:12 UTC
+  Text: Exactly. I have a (one-line) patch.
+
+- User: GCC Commits | Time: 2024-03-19 08:19:34 UTC
+  Text: The master branch has been updated by Christophe Lyon <clyon@gcc.gnu.org>:https://gcc.gnu.org/g:167ec6df7fd8deb67759acd5dbe72c1982a55873commitr14-9537-g167ec6df7fd8deb67759acd5dbe72c1982a55873Author: Christophe Lyon <christophe.lyon@linaro.org>
+Date:   Fri Mar 15 19:55:43 2024 +0000
+
+    arm: [MVE intrinsics] Fix support for loads [PR target/114323]
+    
+    The testcase in this PR shows that we would load from an uninitialized
+    location, because the vld1 instrinsics are reported as "const". This
+    is because function_instance::reads_global_state_p() does not take
+    CP_READ_MEMORY into account.  Fixing this gives vld1 the "pure"
+    attribute instead, and solves the problem.
+    
+    2024-03-15  Christophe Lyon  <christophe.lyon@linaro.org>PR target/114323gcc/
+            * config/arm/arm-mve-builtins.cc
+            (function_instance::reads_global_state_p): Take CP_READ_MEMORY
+            into account.
+    
+            gcc/testsuite/
+            * gcc.target/arm/mve/pr114323.c: New.
+
+- User: Christophe Lyon | Time: 2024-03-19 08:20:21 UTC
+  Text: Fixed.
+

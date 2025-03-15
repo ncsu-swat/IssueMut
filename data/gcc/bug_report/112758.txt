@@ -1,0 +1,422 @@
+Bug Summary: [13 Regression] Inconsistent Bitwise AND Operation Result between int and long long int
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: needs-bisection, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: gyumin | Time: 2023-11-29 06:05:24 UTC
+  Text: Dear GCC Development Team,
+
+I would like to report an inconsistency observed in the GCC RISC-V 64 version 14.0.0 when compiling code involving bitwise AND operations between an `int` and a `long long int` variable under different optimization levels. The issue appears when both operands are negative, with results varying significantly between non-optimized and optimized compilations.
+
+The proof of concept (PoC) code provided below demonstrates this issue. The code performs a bitwise AND operation between a 32-bit integer with its high bit set (`globalVar`) and a 64-bit long long integer (`localVar`), both containing negative values. The expected result of the operation seems to differ based on the optimization level used during compilation.
+
+PoC Code:
+
+```c
+#include <stdio.h>
+
+int globalVar = 0x80000000; // 32-bit int with high bit set
+
+int main () {
+    long long int localVar = 0xffFF00ffffffffff; // 64-bit long long int
+    printf("localVar: 0x%llx\\n", localVar);
+    printf("globalVar: 0x%llx\\n", (long long int)globalVar);
+    printf("Result: 0x%llx\\n", ((localVar) & ((long long int) (globalVar))));
+    return 0;
+}
+```
+
+Observed Results:
+
+- With **`O0`** optimization, the result of the bitwise AND operation is as expected (**`0xffff00ff80000000`**).
+- With **`O1`**, **`O2`**, **`O3`**, **`Os`**, **`Oz`** optimizations, the result changes to **`0x80000000`**.
+
+Assembly Output:
+The assembly output for -O0 and -O1 can be viewed at the following Compiler Explorer link:https://godbolt.org/z/fb33vWT7o- The **`O0`** output shows the expected behavior with explicit casting and AND operation.
+- The **`O1`** output, however, omits the casting and AND operation, leading to an unexpected result.
+
+I suspect this might be related to how the compiler handles casting or the bitwise operation under different optimization levels. This inconsistency could potentially lead to unintended behavior in applications that rely on such operations, especially when negative values are involved.
+
+I appreciate your attention to this matter and look forward to any insights or potential solutions you might provide.
+
+Best regards,
+[Gyumin Baek]
+
+- User: Andrew Pinski | Time: 2023-11-29 18:18:06 UTC
+  Text: Trying 21, 18 -> 22:
+   21: r149:DI=0xffff00ffffffffff
+   18: r147:DI=sign_extend([r143:DI+low(`globalVar')])
+      REG_DEAD r143:DI
+   22: r148:DI=r147:DI&r149:DI
+      REG_DEAD r149:DI
+      REG_DEAD r147:DI
+      REG_EQUAL r147:DI&0xffff00ffffffffff
+Successfully matched this instruction:
+(set (reg:DI 148)
+    (zero_extend:DI (mem/c:SI (lo_sum:DI (reg/f:DI 143)
+                (symbol_ref:DI ("globalVar") [flags 0x86]  <var_decl 0x7f79b69e8090 globalVar>)) [1 globalVarD.2927+0 S4 A32])))
+allowing combination of insns 18, 21 and 22
+original costs 32 + 4 + 4 = 40
+replacement cost 32
+
+
+That is almost definitely wrong.
+
+Was working in GCC 12 but started to go wrong in GCC 13.
+
+- User: gyumin | Time: 2023-12-08 02:57:15 UTC
+  Text: Dear GCC Development Team,
+
+I recently reported an inconsistency in the GCC compiler (RISC-V 64 version 14.0.0) involving bitwise AND operations between int and long long int variables. This issue, which occurs under different optimization levels, has been acknowledged, and I appreciate your response.
+
+Given the nature of this bug, I am curious about its potential impact on open-source projects. Specifically, I am concerned that the unexpected behavior in bitwise operations under different optimization levels might introduce vulnerabilities or other issues in open-source software that relies on precise bitwise manipulations.
+
+Could you please provide some insights on whether this bug might have security implications for open-source projects? Also, are there any recommended guidelines or best practices for developers to mitigate potential risks arising from this issue in their projects?
+
+Thank you for your attention to this matter.
+
+Best regards,
+[Gyumin Baek]
+
+- User: Jakub Jelinek | Time: 2023-12-08 17:01:22 UTC
+  Text: Seems expand_compound_operation is called on
+(sign_extend:DI (mem/c:SI (lo_sum:DI (reg/f:DI 144)
+            (symbol_ref:DI ("globalVar") [flags 0x86] <var_decl 0x7fffea1f9b40 globalVar>)) [1 globalVar+0 S4 A32]))
+and takes the
+7336	      tem = gen_lowpart (mode, XEXP (x, 0));
+7337	      if (!tem || GET_CODE (tem) == CLOBBER)
+7338		return x;
+7339	      tem = simplify_shift_const (NULL_RTX, ASHIFT, mode,
+7340					  tem, modewidth - pos - len);
+7341	      tem = simplify_shift_const (NULL_RTX, unsignedp ? LSHIFTRT : ASHIFTRT,
+7342					  mode, tem, modewidth - len);
+path on it, mode being DImode, modewidth 64, pos 0, len 32.
+The second simplify_shift_const is then called with
+(ashift:DI (subreg:DI (mem/c:SI (lo_sum:DI (reg/f:DI 144)
+                (symbol_ref:DI ("globalVar") [flags 0x86] <var_decl 0x7fffea1f9b40 globalVar>)) [1 globalVar+0 S4 A32]) 0)
+    (const_int 32 [0x20]))
+and triggers the
+10810		      /* If this was (ashiftrt (ashift foo C1) C2) and FOO has more
+10811			 than C1 high-order bits equal to the sign bit, we can convert
+10812			 this to either an ASHIFT or an ASHIFTRT depending on the
+10813			 two counts.
+10814	
+10815			 We cannot do this if VAROP's mode is not SHIFT_UNIT_MODE.  */
+10816	
+10817		      if (code == ASHIFTRT && first_code == ASHIFT
+10818			  && int_varop_mode == shift_unit_mode
+10819			  && (num_sign_bit_copies (XEXP (varop, 0), shift_unit_mode)
+10820			      > first_count))
+10821			{
+10822			  varop = XEXP (varop, 0);
+10823			  count -= first_count;
+10824			  if (count < 0)
+10825			    {
+10826			      count = -count;
+10827			      code = ASHIFT;
+10828			    }
+10829	
+10830			  continue;
+10831			}
+optimization in there.
+As RISC V is WORD_REGISTER_OPERATIONS target with load_extend_op (E_SImode) == SIGN_EXTEND, it triggers the:
+5444		  /* For paradoxical SUBREGs on machines where all register operations
+5445		     affect the entire register, just look inside.  Note that we are
+5446		     passing MODE to the recursive call, so the number of sign bit
+5447		     copies will remain relative to that mode, not the inner mode.
+5448	
+5449		     This works only if loads sign extend.  Otherwise, if we get a
+5450		     reload for the inner part, it may be loaded from the stack, and
+5451		     then we lose all sign bit copies that existed before the store
+5452		     to the stack.  */
+5453		  if (WORD_REGISTER_OPERATIONS
+5454		      && load_extend_op (inner_mode) == SIGN_EXTEND
+5455		      && paradoxical_subreg_p (x)
+5456		      && MEM_P (SUBREG_REG (x)))
+5457		    return cached_num_sign_bit_copies (SUBREG_REG (x), mode,
+5458						       known_x, known_mode, known_ret);
+path and so the sign-extension in the end folds into just a paradoxical subreg of the MEM.  But probably something in the combiner then just sees a paradoxical SUBREG and thinks that all the bits above the SUBREG_REG are undefined and picks ZERO_EXTEND.
+I'm afraid I don't know enough about WORD_REGISTER_OPERATIONS to know what is right and what is not.
+
+- User: Segher Boessenkool | Time: 2023-12-08 17:37:57 UTC
+  Text: WORD_REGISTER_OPERATIONS is extremely ill-defined.  Or, it is used for other
+things than what it stands for, whichever way you want to look at it.
+
+A backend that defines the macro to non-zero promises that for *any* operation
+on any values in a smaller than full-register mode, the compiler can instead
+do the operation in that full-register mode, and all the resulting bits will
+be well-defined.  This is not true for most real non-trivial backends.
+
+There is word_register_operation_p to filter out the most obvious and egregious
+cases where WORD_REGISTER_OPERATIONS is just a foolish thing, but this function
+isn't used nearly enough, and it doesn't filter out enough either.
+
+- User: Jakub Jelinek | Time: 2023-12-08 19:33:24 UTC
+  Text: Oh, and the reason why given the above 
+(and:DI (subreg:DI (mem/c:SI (lo_sum:DI (reg/f:DI 144)
+                (symbol_ref:DI ("globalVar") [flags 0x86] <var_decl 0x7fffea1f9b40 globalVar>)) [1 globalVar+0 S4 A32]) 0)
+    (const_int -280375465082881 [0xffff00ffffffffff]))
+is optimized into the zero extension is the following in combine.cc:
+      /* If the one operand is a paradoxical subreg of a register or memory and
+         the constant (limited to the smaller mode) has only zero bits where
+         the sub expression has known zero bits, this can be expressed as
+         a zero_extend.  */
+      else if (GET_CODE (XEXP (x, 0)) == SUBREG)
+        {
+          rtx sub;
+
+          sub = XEXP (XEXP (x, 0), 0);
+          machine_mode sub_mode = GET_MODE (sub);
+          int sub_width;
+          if ((REG_P (sub) || MEM_P (sub))
+              && GET_MODE_PRECISION (sub_mode).is_constant (&sub_width)
+              && sub_width < mode_width)
+            {
+              unsigned HOST_WIDE_INT mode_mask = GET_MODE_MASK (sub_mode);
+              unsigned HOST_WIDE_INT mask;
+
+              /* original AND constant with all the known zero bits set */
+              mask = UINTVAL (XEXP (x, 1)) | (~nonzero_bits (sub, sub_mode));
+              if ((mask & mode_mask) == mode_mask)
+                {
+                  new_rtx = make_compound_operation (sub, next_code);
+                  new_rtx = make_extraction (mode, new_rtx, 0, 0, sub_width,
+                                             true, false, in_code == COMPARE);
+                }
+            }
+        }
+clearly, if the sign_bit_copies stuff is right for wordmode paradoxical SUBREGs of smaller MEMs with load_extend_op (MEM_mode) == SIGN_EXTEND, then this optimization
+needs to punt if those conditions are met and sub is a MEM.
+
+Will defer this to people actually using WORD_REGISTER_OPERATIONS arches, fortunately
+none of the ones I'm involved with on a daily basis is.
+
+- User: Jakub Jelinek | Time: 2023-12-08 19:36:10 UTC
+  Text: I must say I have no idea what WORD_REGISTER_OPERATION says about the upper bits of a paradoxical SUBREG if it is a MEM and load_extend_op (inner_mode) is ZERO_EXTEND (zeros then?  Then this optimization is ok), or something else?  And what it says on REGs.
+
+- User: Eric Botcazou | Time: 2023-12-09 08:51:16 UTC
+  Text: > I must say I have no idea what WORD_REGISTER_OPERATION says about the upper
+> bits of a paradoxical SUBREG if it is a MEM and load_extend_op (inner_mode)
+> is ZERO_EXTEND (zeros then?Yes.> Then this optimization is ok), or something else?  And what it says on REGs.That it contains the result of the operation that was applied to the SUBREG as if it was applied to the entire REG, provided that word_register_operation_p is true.  Otherwise, it's undefined.
+
+- User: Jakub Jelinek | Time: 2023-12-09 09:11:51 UTC
+  Text: (In reply to Eric Botcazou fromcomment #7)> > I must say I have no idea what WORD_REGISTER_OPERATION says about the upper
+> > bits of a paradoxical SUBREG if it is a MEM and load_extend_op (inner_mode)
+> > is ZERO_EXTEND (zeros then?
+> 
+> Yes.
+> 
+> > Then this optimization is ok), or something else?  And what it says on REGs.
+> 
+> That it contains the result of the operation that was applied to the SUBREG
+> as if it was applied to the entire REG, provided that
+> word_register_operation_p is true.  Otherwise, it's undefined.But if we see a REG in there, we don't really know what operation it was.
+Sure, if the operation is visible, we know it, but say PLUS can be extended either way.
+
+Which means punt on this optimization for WORD_REGISTER_OPERATIONS if the outer mode is word_mode, except when sub is a MEM and load_extend_op (inner_mode) == ZERO_EXTEND?
+
+- User: Eric Botcazou | Time: 2023-12-09 11:00:04 UTC
+  Text: > Which means punt on this optimization for WORD_REGISTER_OPERATIONS if the
+> outer mode is word_mode, except when sub is a MEM and load_extend_op
+> (inner_mode) == ZERO_EXTEND?Yes, this sounds like a sensible approach.
+
+- User: Segher Boessenkool | Time: 2023-12-09 19:25:24 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #6)> I must say I have no idea what WORD_REGISTER_OPERATION says about the upper
+> bits of a paradoxical SUBREG if it is a MEM and load_extend_op (inner_mode)
+> is ZERO_EXTEND (zeros then?  Then this optimization is ok), or something
+> else?  And what it says on REGs.It says those upper bits are well-defined, i.e. whatever MD pattern is used for
+it eventually will emit machine code that has the exact same result for those
+upper bits.  This is almost impossible to prove for any non-trivial target, and
+certainly extremely fragile.
+
+- User: Eric Botcazou | Time: 2023-12-09 22:06:50 UTC
+  Text: > It says those upper bits are well-defined, i.e. whatever MD pattern is used
+> for it eventually will emit machine code that has the exact same result for
+> those upper bits.No, that's not true, the set of "register operations" is restricted.
+
+- User: Segher Boessenkool | Time: 2023-12-10 12:16:12 UTC
+  Text: (In reply to Eric Botcazou fromcomment #11)> > It says those upper bits are well-defined, i.e. whatever MD pattern is used
+> > for it eventually will emit machine code that has the exact same result for
+> > those upper bits.
+> 
+> No, that's not true, the set of "register operations" is restricted.Who what where?  That is not how it is documented.  There is
+word_register_operation_p as a bandaid to make it *somewhat* work, added decades
+later, but it still won't fly :-(
+
+Different parts of the compiler think it has much more stringent semantics btw.
+
+- User: Andrew Pinski | Time: 2023-12-13 22:06:22 UTC
+  Text: ***Bug 113010has been marked as a duplicate of this bug. ***
+
+- User: Greg McGary | Time: 2023-12-16 18:43:35 UTC
+  Text: I bisected to here for the commit that broke the non-Zbs case:https://github.com/gcc-mirror/gcc/commit/2e886eef7f2b5aadb00171af868f0895b647c3a4... and here for Zbs case:https://github.com/gcc-mirror/gcc/commit/4e1e0d79ecbe8727cb69d4cd97b20c71caaefafcNote that the Zbs break happens with the commit that introduces Zbs handling, i.e., it never worked with Zbs from the beginning.
+
+In the non-Zbs case, it was the introduction of the insn_and_split pattern for single-insn materialization of negative constants that allows the combiner to create the problematic insn.
+
+- User: Greg McGary | Time: 2023-12-21 20:04:37 UTC
+  Text: I have a simple patch for this which I will submit soon. The idea is to do nothing in expand_compound_operation() when the pattern is (sign_extend (mem ...) ).
+
+- User: Jakub Jelinek | Time: 2023-12-21 20:06:56 UTC
+  Text: Here is what I'd propose, but I can't really test it on any WORD_REGISTER_OPERATIONS
+target.
+
+2023-12-21  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/112758* combine.cc (make_compopund_operation_int): Optimize AND of a SUBREG
+	based on nonzero_bits of SUBREG_REG and constant mask on
+	WORD_REGISTER_OPERATIONS targets only if it is a zero extending
+	MEM load.
+
+	* gcc.c-torture/execute/pr112758.c: New test.
+
+--- gcc/combine.cc.jj	2023-12-11 23:52:03.528513943 +0100
++++ gcc/combine.cc	2023-12-21 20:25:45.461737423 +0100
+@@ -8227,12 +8227,20 @@ make_compound_operation_int (scalar_int_
+ 	  int sub_width;
+ 	  if ((REG_P (sub) || MEM_P (sub))
+ 	      && GET_MODE_PRECISION (sub_mode).is_constant (&sub_width)
+-	      && sub_width < mode_width)
++	      && sub_width < mode_width
++	      && (!WORD_REGISTER_OPERATIONS
++		  || sub_width >= BITS_PER_WORD
++		  /* On WORD_REGISTER_OPERATIONS targets the bits
++		     beyond sub_mode aren't considered undefined,
++		     so optimize only if it is a MEM load when MEM loads
++		     zero extend, because then the upper bits are all zero.  */
++		  || (MEM_P (sub)
++		      && load_extend_op (sub_mode) == ZERO_EXTEND)))
+ 	    {
+ 	      unsigned HOST_WIDE_INT mode_mask = GET_MODE_MASK (sub_mode);
+ 	      unsigned HOST_WIDE_INT mask;
+ 
+-	      /* original AND constant with all the known zero bits set */
++	      /* Original AND constant with all the known zero bits set.  */
+ 	      mask = UINTVAL (XEXP (x, 1)) | (~nonzero_bits (sub, sub_mode));
+ 	      if ((mask & mode_mask) == mode_mask)
+ 		{
+--- gcc/testsuite/gcc.c-torture/execute/pr112758.c.jj	2023-12-21 21:01:43.780755959 +0100
++++ gcc/testsuite/gcc.c-torture/execute/pr112758.c	2023-12-21 21:01:30.521940358 +0100
+@@ -0,0 +1,15 @@
++/*PR rtl-optimization/112758*/
++
++int a = -__INT_MAX__ - 1;
++
++int
++main ()
++{
++  if (-__INT_MAX__ - 1U == 0x80000000ULL)
++    {
++      unsigned long long b = 0xffff00ffffffffffULL;
++      if ((b & a) != 0xffff00ff80000000ULL)
++	__builtin_abort ();
++    }
++  return 0;
++}
+
+- User: GCC Commits | Time: 2023-12-22 11:30:39 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:cefae511ed7fa34ef6d24b67a7bc305459bf10e8commitr14-6806-gcefae511ed7fa34ef6d24b67a7bc305459bf10e8Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Dec 22 12:29:34 2023 +0100
+
+    combine: Don't optimize paradoxical SUBREG AND CONST_INT on WORD_REGISTER_OPERATIONS targets [PR112758]
+    
+    As discussed in the PR, the following testcase is miscompiled on RISC-V
+    64-bit, because num_sign_bit_copies in one spot pretends the bits in
+    a paradoxical SUBREG beyond SUBREG_REG SImode are all sign bit copies:
+    5444              /* For paradoxical SUBREGs on machines where all register operations
+    5445                 affect the entire register, just look inside.  Note that we are
+    5446                 passing MODE to the recursive call, so the number of sign bit
+    5447                 copies will remain relative to that mode, not the inner mode.
+    5448
+    5449                 This works only if loads sign extend.  Otherwise, if we get a
+    5450                 reload for the inner part, it may be loaded from the stack, and
+    5451                 then we lose all sign bit copies that existed before the store
+    5452                 to the stack.  */
+    5453              if (WORD_REGISTER_OPERATIONS
+    5454                  && load_extend_op (inner_mode) == SIGN_EXTEND
+    5455                  && paradoxical_subreg_p (x)
+    5456                  && MEM_P (SUBREG_REG (x)))
+    and then optimizes based on that in one place, but then ther7-1077optimization triggers in and treats all the upper bits in
+    paradoxical SUBREG as undefined and performs based on that another
+    optimization.  Ther7-1077optimization is done only if SUBREG_REG
+    is either a REG or MEM, from the discussions in the PR seems that if
+    it is a REG, the upper bits in paradoxical SUBREG on
+    WORD_REGISTER_OPERATIONS targets aren't really undefined, but we can't
+    tell what values they have because we don't see the operation which
+    computed that REG, and for MEM it depends on load_extend_op - if
+    it is SIGN_EXTEND, the upper bits are sign bit copies and so something
+    not really usable for the optimization, if ZERO_EXTEND, they are zeros
+    and it is usable for the optimization, for UNKNOWN I think it is better
+    to punt as well.
+    
+    So, the following patch basically disables ther7-1077optimization
+    on WORD_REGISTER_OPERATIONS unless we know it is still ok for sure,
+    which is either if sub_width is >= BITS_PER_WORD because then the
+    WORD_REGISTER_OPERATIONS rules don't apply, or load_extend_op on a MEM
+    is ZERO_EXTEND.
+    
+    2023-12-22  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/112758* combine.cc (make_compopund_operation_int): Optimize AND of a SUBREG
+            based on nonzero_bits of SUBREG_REG and constant mask on
+            WORD_REGISTER_OPERATIONS targets only if it is a zero extending
+            MEM load.
+    
+            * gcc.c-torture/execute/pr112758.c: New test.
+
+- User: GCC Commits | Time: 2024-03-02 00:37:55 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:e7c9aafd7c2c3f3b68e65ddc999808cce75a19b3commitr13-8379-ge7c9aafd7c2c3f3b68e65ddc999808cce75a19b3Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Dec 22 12:29:34 2023 +0100
+
+    combine: Don't optimize paradoxical SUBREG AND CONST_INT on WORD_REGISTER_OPERATIONS targets [PR112758]
+    
+    As discussed in the PR, the following testcase is miscompiled on RISC-V
+    64-bit, because num_sign_bit_copies in one spot pretends the bits in
+    a paradoxical SUBREG beyond SUBREG_REG SImode are all sign bit copies:
+    5444              /* For paradoxical SUBREGs on machines where all register operations
+    5445                 affect the entire register, just look inside.  Note that we are
+    5446                 passing MODE to the recursive call, so the number of sign bit
+    5447                 copies will remain relative to that mode, not the inner mode.
+    5448
+    5449                 This works only if loads sign extend.  Otherwise, if we get a
+    5450                 reload for the inner part, it may be loaded from the stack, and
+    5451                 then we lose all sign bit copies that existed before the store
+    5452                 to the stack.  */
+    5453              if (WORD_REGISTER_OPERATIONS
+    5454                  && load_extend_op (inner_mode) == SIGN_EXTEND
+    5455                  && paradoxical_subreg_p (x)
+    5456                  && MEM_P (SUBREG_REG (x)))
+    and then optimizes based on that in one place, but then ther7-1077optimization triggers in and treats all the upper bits in
+    paradoxical SUBREG as undefined and performs based on that another
+    optimization.  Ther7-1077optimization is done only if SUBREG_REG
+    is either a REG or MEM, from the discussions in the PR seems that if
+    it is a REG, the upper bits in paradoxical SUBREG on
+    WORD_REGISTER_OPERATIONS targets aren't really undefined, but we can't
+    tell what values they have because we don't see the operation which
+    computed that REG, and for MEM it depends on load_extend_op - if
+    it is SIGN_EXTEND, the upper bits are sign bit copies and so something
+    not really usable for the optimization, if ZERO_EXTEND, they are zeros
+    and it is usable for the optimization, for UNKNOWN I think it is better
+    to punt as well.
+    
+    So, the following patch basically disables ther7-1077optimization
+    on WORD_REGISTER_OPERATIONS unless we know it is still ok for sure,
+    which is either if sub_width is >= BITS_PER_WORD because then the
+    WORD_REGISTER_OPERATIONS rules don't apply, or load_extend_op on a MEM
+    is ZERO_EXTEND.
+    
+    2023-12-22  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/112758* combine.cc (make_compopund_operation_int): Optimize AND of a SUBREG
+            based on nonzero_bits of SUBREG_REG and constant mask on
+            WORD_REGISTER_OPERATIONS targets only if it is a zero extending
+            MEM load.
+    
+            * gcc.c-torture/execute/pr112758.c: New test.
+    
+    (cherry picked from commit cefae511ed7fa34ef6d24b67a7bc305459bf10e8)
+
+- User: Jeffrey A. Law | Time: 2024-03-04 01:09:11 UTC
+  Text: Fixed by Jakub's patch on the trunk.
+
+- User: Jakub Jelinek | Time: 2024-03-04 12:07:10 UTC
+  Text: Should be now fixed for GCC 13 too.
+

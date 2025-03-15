@@ -1,0 +1,131 @@
+Bug Summary: [14 Regression] avx512f-reduce-op-1.c miscompiled since r14-5076
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jakub Jelinek | Time: 2023-11-03 07:20:16 UTC
+  Text: Sincer14-5076-g01c18f58d37865d5f3bbe93e666183b54ec608c7I see gcc.target/i386/avx512f-reduce-op-1.c execution failure.
+Reduced -O2 -mavx512f:
+__attribute__((noipa)) float
+foo (void)
+{
+  float a[16] = { 1, 2, 3, 4, 5, 6, 6, 5, 4, 3, 2, 1, 7, 6, 5, 4 };
+  float r3 = 0.0f;
+  for (int i = 0; i < 16; i++)
+    if ((1 << i) & 0xA6BA)
+      r3 = r3 + a[i];
+  return r3;
+}
+
+int
+main ()
+{
+  if (foo () != 37.0f)
+    __builtin_abort ();
+}
+where beforer14-5076r3 has been correctly computed as 37.0f, but starting withr14-5076it is 64.0f, i.e. the masking is ignored and all elements are added, not just the ones under the mask.
+The ifcvt dump has
+  _1 = 42682 >> i_31;
+  _2 = _1 & 1;
+  _24 = _2 != 0;
+  _3 = a[i_31];
+  _ifc__43 = .COND_ADD (_24, r3_29, _3, r3_29);
+which I assume is correct, and vect dump shows computation of the mask but then instead of using masked addition and at the end of loop reduction (well, can we vectorize it at all without -ffast-math?) it scalarizes the addition but doesn't actually conditionalize it.  Note, with -O2 -mavx512f -ffast-math the .COND_ADD is actually vectorized and so correctly returns 37.0f.
+
+- User: Andrew Pinski | Time: 2023-11-03 07:22:08 UTC
+  Text: Confirmed by me too:https://gcc.gnu.org/pipermail/gcc-patches/2023-November/635063.html
+
+- User: Robin Dapp | Time: 2023-11-03 07:51:38 UTC
+  Text: I can have a look.  Of course I tested it but neither the compile farm machine (gcc188) I used nor my local device have AVX512 run capability.  Anywhere else I can test it?
+
+- User: Richard Biener | Time: 2023-11-03 08:13:56 UTC
+  Text: You can use SDE (the simulator from Intel), but I suppose just inspecting the
+vectorized code should work fine as well.  I suspect we fail to fail
+vectorization when we have a masked op but no native masked_fold_left as
+we cannot open-code that variant.
+
+- User: Jakub Jelinek | Time: 2023-11-03 08:14:29 UTC
+  Text: You can just look at the dumps.
+Generally, I'd expect that we shouldn't be creating .COND_ADD etc. calls for conditional reductions for SCALAR_FLOAT_TYPE_P if !flag_associative_math, but probably
+also the fold left reduction code needs to either assert it isn't conditional or needs to handle it.
+E.g. needs_fold_left_reduction_p returns true if it has to do an in-order reduction.
+But guess Richard will know the details much better.
+
+- User: Andrew Pinski | Time: 2023-11-04 05:24:17 UTC
+  Text: The patch that caused this one, also causes a bootstrap comparison failure with --with-arch=skylake-avx512, seePR 112374.
+
+- User: Robin Dapp | Time: 2023-11-06 09:51:54 UTC
+  Text: So "before" we created
+
+  vect__3.12_55 = MEM <vector(16) float> [(float *)vectp_a.10_53];
+  vect__ifc__43.13_57 = VEC_COND_EXPR <mask__24.9_52, vect__3.12_55, { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }>;
+//  _ifc__43 = _24 ? _3 : 0.0;
+  stmp__44.14_58 = BIT_FIELD_REF <vect__ifc__43.13_57, 32, 0>;
+  stmp__44.14_59 = r3_29 + stmp__44.14_58;
+  ...
+
+in vect_expand_fold_left.
+
+Now, as intended, there is no VEC_COND anymore and we just create the bit-field reduction over the unmasked vector.
+
+We could refrain from creating the COND_OP in the first place as Jakub mentioned (I guess we know already in if-conv that we shouldn't), re-insert a VEC_COND or create a COND_OP chain (instead of an OP chain) in vect_expand_fold_left by passing it the mask (and is_cond_op).
+Having several COND_OPs here might make analysis of subsequent passes more difficult?
+
+- User: rguenther@suse.de | Time: 2023-11-06 10:06:38 UTC
+  Text: On Mon, 6 Nov 2023, rdapp at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=112361> 
+> ---Comment #6from Robin Dapp <rdapp at gcc dot gnu.org> ---
+> So "before" we created
+> 
+>   vect__3.12_55 = MEM <vector(16) float> [(float *)vectp_a.10_53];
+>   vect__ifc__43.13_57 = VEC_COND_EXPR <mask__24.9_52, vect__3.12_55, { 0.0,
+> 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }>;
+> //  _ifc__43 = _24 ? _3 : 0.0;
+>   stmp__44.14_58 = BIT_FIELD_REF <vect__ifc__43.13_57, 32, 0>;
+>   stmp__44.14_59 = r3_29 + stmp__44.14_58;
+>   ...
+> 
+> in vect_expand_fold_left.Note that this wasn't correct in all cases (wrt signed zeros and
+sign-dependent rounding).> Now, as intended, there is no VEC_COND anymore and we just create the bit-field
+> reduction over the unmasked vector.That's invalid for a COND_OP.  We either have to emulate that COND_OP
+by materializing a VEC_COND_EXPR as before when that's semantically
+valid, or refrain from vectorizing (I don't think we want to emit
+N compare & jump to scalarize the mask effect).> We could refrain from creating the COND_OP in the first place as Jakub
+> mentioned (I guess we know already in if-conv that we shouldn't), re-insert a
+> VEC_COND or create a COND_OP chain (instead of an OP chain) in
+> vect_expand_fold_left by passing it the mask (and is_cond_op).
+> Having several COND_OPs here might make analysis of subsequent passes more
+> difficult?pass in the mask and is_cond_op and create the VEC_COND_EXPR in
+vect_expand_fold_left.  But make sure to disallow vectorizing the
+invalid cases.
+
+- User: GCC Commits | Time: 2023-11-07 21:38:02 UTC
+  Text: The master branch has been updated by Robin Dapp <rdapp@gcc.gnu.org>:https://gcc.gnu.org/g:fd940d248bfccb6994794152681dc4c693160919commitr14-5231-gfd940d248bfccb6994794152681dc4c693160919Author: Robin Dapp <rdapp@ventanamicro.com>
+Date:   Mon Nov 6 11:24:37 2023 +0100
+
+    vect/ifcvt: Add vec_cond fallback and check for vector versioning.
+    
+    This restricts tree-ifcvt to only create COND_OPs when we versioned the
+    loop for vectorization.  Apart from that it re-creates a VEC_COND_EXPR
+    in vect_expand_fold_left if we emitted a COND_OP.
+    
+    gcc/ChangeLog:PR tree-optimization/112361PR target/112359PR middle-end/112406* tree-if-conv.cc (convert_scalar_cond_reduction): Remember if
+            loop was versioned and only then create COND_OPs.
+            (predicate_scalar_phi): Do not create COND_OP when not
+            vectorizing.
+            * tree-vect-loop.cc (vect_expand_fold_left): Re-create
+            VEC_COND_EXPR.
+            (vectorize_fold_left_reduction): Pass mask to
+            vect_expand_fold_left.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr112359.c: New test.
+
+- User: Richard Biener | Time: 2023-11-08 07:01:24 UTC
+  Text: Fixed.
+

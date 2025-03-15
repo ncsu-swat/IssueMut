@@ -1,0 +1,291 @@
+Issue Title: [flang][mlir] complex arithmetic dialect conversion for absolute value is incorrect in face of underflow
+Original Post: Test program:
+```console
+$ cat check.f90
+program complex_arithmetic
+  implicit none
+
+  integer, parameter :: dp = selected_real_kind(15, 307)
+  complex(dp) :: z1, z2, z3
+  real(dp) :: abs_z1, abs_z2
+
+  z1 = (1.0_dp, 1.0_dp)
+  z2 = (1.0e-300_dp, 1.0e-300_dp)
+
+  ! Divide z1 by z2
+  z3 = z1 / z2
+  write(*,*) "Result of z1 / z2: ", z3
+
+  ! Calculate absolute values of z1 and z2
+  abs_z1 = abs(z1)
+  abs_z2 = abs(z2)
+  write(*,*) "Absolute value of z1: ", abs_z1
+  write(*,*) "Absolute value of z2: ", abs_z2
+
+  ! Check for overflow or underflow in absolute value calculation
+  if (abs_z1 == huge(abs_z1)) then
+    write(*,*) "Overflow occurred in absolute value calculation of z1"
+  endif
+
+  if (abs_z2 == 0.0_dp) then
+    write(*,*) "Underflow occurred in absolute value calculation of z2"
+  endif
+
+end program complex_arithmetic
+```
+
+flang-new vs gfortran (see the result of "Absolute value of z2")
+```console
+$ flang-new -flang-experimental-exec check.f90
+$ ./a.out
+ Result of z1 / z2:  (9.999999999999999E+299,0.)
+ Absolute value of z1:  1.4142135623730951
+ Absolute value of z2:  0.
+ Underflow occurred in absolute value calculation of z2
+$ gfortran check.f90
+$ ./a.out
+ Result of z1 / z2:          (9.99999999999999904E+299,0.0000000000000000)
+ Absolute value of z1:    1.4142135623730951
+ Absolute value of z2:    1.4142135623730950E-300
+```
+
+Comment by kiranchandramohan: The complex dialect conversion to standard is not precise and does not consider underflows.
+https://github.com/llvm/llvm-project/blob/b58a58c3b1c0dbaf75b00899a0db42a62c8f58e1/mlir/lib/Conversion/ComplexToStandard/ComplexToStandard.cpp#L29
+
+Use `-mmlir --math-runtime=precise` or `-mmlir -disable-mlir-complex` to workaround the issue.
+
+Note: Adding the `mlir` label.
+
+
+Comment by llvmbot: @llvm/issue-subscribers-mlir
+Comment by joker-eph: Can you provide an MLIR minimal reproducer? (just the IR before and after would be nice)
+Comment by k-arrows: First of all, I would like to note that the program I presented at the beginning was not appropriate for overflow.
+Both overflow and underflow can occur.
+
+Overflow:
+```console
+$ cat overflow.f90
+program overflow
+  implicit none
+
+  integer, parameter :: dp = selected_real_kind(15, 307)
+  complex(dp) :: z = (1.0e300_dp, 1.0e300_dp)
+
+  write(*,*) "Absolute value of z: ", abs(z)
+
+end program overflow
+$ gfortran overflow.f90
+$ ./a.out
+ Absolute value of z:    1.4142135623730952E+300
+$ flang-new -flang-experimental-exec overflow.f90
+$ ./a.out
+ Absolute value of z:  Inf
+```
+
+Underflow:
+```console
+$ cat underflow.f90
+program underflow
+  implicit none
+
+  integer, parameter :: dp = selected_real_kind(15, 307)
+  complex(dp) :: z = (1.0e-300_dp, 1.0e-300_dp)
+
+  write(*,*) "Absolute value of z: ", abs(z)
+
+end program underflow
+$ gfortran underflow.f90
+$ ./a.out
+ Absolute value of z:    1.4142135623730950E-300
+$ flang-new -flang-experimental-exec underflow.f90
+$ ./a.out
+ Absolute value of z:  0.
+```
+
+I'm not familiar with MLIR, so it is difficult for me to respond to the following request:
+
+> Can you provide an MLIR minimal reproducer? (just the IR before and after would be nice)
+
+Can anyone handle this?
+Comment by kiranchandramohan: IR for the underflow example is given below. The important bit is in `func @_QQmain()` where `complex.abs` is converted to the following:
+```
+    %10 = complex.re %9 : complex<f64>
+    %11 = complex.im %9 : complex<f64>
+    %12 = arith.mulf %10, %10 : f64
+    %13 = arith.mulf %11, %11 : f64
+    %14 = arith.addf %12, %13 : f64
+    %15 = math.sqrt %14 : f64
+```
+
+// -----// IR Dump Before ConvertComplexToStandard (convert-complex-to-standard) //----- //
+
+```
+module attributes {dlti.dl_spec = #dlti.dl_spec<#dlti.dl_entry<i32, dense<32> : vector<2xi32>>, #dlti.dl_entry<f16, dense<16> : vector<2xi32>>, #dlti.dl_entry<i1, dense<8> : vector<2xi32>>, #dlti.dl_entry<f64, dense<64> : vector<2xi32>>, #dlti.dl_entry<f128, dense<128> : vector<2xi32>>, #dlti.dl_entry<!llvm.ptr, dense<64> : vector<4xi32>>, #dlti.dl_entry<i128, dense<128> : vector<2xi32>>, #dlti.dl_entry<i64, dense<64> : vector<2xi32>>, #dlti.dl_entry<i16, dense<[16, 32]> : vector<2xi32>>, #dlti.dl_entry<i8, dense<[8, 32]> : vector<2xi32>>, #dlti.dl_entry<"dlti.stack_alignment", 128 : i32>, #dlti.dl_entry<"dlti.endianness", "little">>, fir.defaultkind = "a1c4d8i4l4r4", fir.kindmap = "", llvm.data_layout = "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128", llvm.target_triple = "aarch64-unknown-linux-gnu"} {
+  func.func @_QQmain() attributes {fir.bindc_name = "underflow"} {
+    %c21 = arith.constant 21 : index
+    %c7_i32 = arith.constant 7 : i32
+    %c-1_i32 = arith.constant -1 : i32
+    %0 = fir.address_of(@_QFEz) : !fir.ref<!fir.complex<8>>
+    %1 = fir.address_of(@_QQcl.2F686F6D652F6B697263686130322F756E646572666C6F772E66393000) : !fir.ref<!fir.char<1,29>>
+    %2 = fir.convert %1 : (!fir.ref<!fir.char<1,29>>) -> !fir.ref<i8>
+    %3 = fir.call @_FortranAioBeginExternalListOutput(%c-1_i32, %2, %c7_i32) fastmath<contract> : (i32, !fir.ref<i8>, i32) -> !fir.ref<i8>
+    %4 = fir.address_of(@_QQcl.4162736F6C7574652076616C7565206F66207A3A20) : !fir.ref<!fir.char<1,21>>
+    %5 = fir.convert %4 : (!fir.ref<!fir.char<1,21>>) -> !fir.ref<i8>
+    %6 = fir.convert %c21 : (index) -> i64
+    %7 = fir.call @_FortranAioOutputAscii(%3, %5, %6) fastmath<contract> : (!fir.ref<i8>, !fir.ref<i8>, i64) -> i1
+    %8 = fir.load %0 : !fir.ref<!fir.complex<8>>
+    %9 = fir.convert %8 : (!fir.complex<8>) -> complex<f64>
+    %10 = complex.abs %9 : complex<f64>
+    %11 = fir.call @_FortranAioOutputReal64(%3, %10) fastmath<contract> : (!fir.ref<i8>, f64) -> i1
+    %12 = fir.call @_FortranAioEndIoStatement(%3) fastmath<contract> : (!fir.ref<i8>) -> i32
+    return
+  }
+  fir.global internal @_QFECdp constant : i32 {
+    %c8_i32 = arith.constant 8 : i32
+    fir.has_value %c8_i32 : i32
+  }
+  fir.global internal @_QFEz : !fir.complex<8> {
+    %cst = arith.constant 1.000000e-300 : f64
+    %0 = fir.undefined !fir.complex<8>
+    %1 = fir.insert_value %0, %cst, [0 : index] : (!fir.complex<8>, f64) -> !fir.complex<8>
+    %2 = fir.insert_value %1, %cst, [1 : index] : (!fir.complex<8>, f64) -> !fir.complex<8>
+    fir.has_value %2 : !fir.complex<8>
+  }
+  func.func private @_FortranAioBeginExternalListOutput(i32, !fir.ref<i8>, i32) -> !fir.ref<i8> attributes {fir.io, fir.runtime}
+  fir.global linkonce @_QQcl.2F686F6D652F6B697263686130322F756E646572666C6F772E66393000 constant : !fir.char<1,29> {
+    %0 = fir.string_lit "/home/kircha02/underflow.f90\00"(29) : !fir.char<1,29>
+    fir.has_value %0 : !fir.char<1,29>
+  }
+  func.func private @_FortranAioOutputAscii(!fir.ref<i8>, !fir.ref<i8>, i64) -> (i1 {llvm.zeroext}) attributes {fir.io, fir.runtime}
+  fir.global linkonce @_QQcl.4162736F6C7574652076616C7565206F66207A3A20 constant : !fir.char<1,21> {
+    %0 = fir.string_lit "Absolute value of z: "(21) : !fir.char<1,21>
+    fir.has_value %0 : !fir.char<1,21>
+  }
+  func.func private @_FortranAioOutputReal64(!fir.ref<i8>, f64) -> (i1 {llvm.zeroext}) attributes {fir.io, fir.runtime}
+  func.func private @_FortranAioEndIoStatement(!fir.ref<i8>) -> i32 attributes {fir.io, fir.runtime}
+  fir.global @_QQEnvironmentDefaults constant : !fir.ref<tuple<i32, !fir.ref<!fir.array<0xtuple<!fir.ref<i8>, !fir.ref<i8>>>>>> {
+    %0 = fir.zero_bits !fir.ref<tuple<i32, !fir.ref<!fir.array<0xtuple<!fir.ref<i8>, !fir.ref<i8>>>>>>
+    fir.has_value %0 : !fir.ref<tuple<i32, !fir.ref<!fir.array<0xtuple<!fir.ref<i8>, !fir.ref<i8>>>>>>
+  }
+}
+```
+// -----// IR Dump After ConvertComplexToStandard (convert-complex-to-standard) //----- //
+```
+module attributes {dlti.dl_spec = #dlti.dl_spec<#dlti.dl_entry<i32, dense<32> : vector<2xi32>>, #dlti.dl_entry<f16, dense<16> : vector<2xi32>>, #dlti.dl_entry<i1, dense<8> : vector<2xi32>>, #dlti.dl_entry<f64, dense<64> : vector<2xi32>>, #dlti.dl_entry<f128, dense<128> : vector<2xi32>>, #dlti.dl_entry<!llvm.ptr, dense<64> : vector<4xi32>>, #dlti.dl_entry<i128, dense<128> : vector<2xi32>>, #dlti.dl_entry<i64, dense<64> : vector<2xi32>>, #dlti.dl_entry<i16, dense<[16, 32]> : vector<2xi32>>, #dlti.dl_entry<i8, dense<[8, 32]> : vector<2xi32>>, #dlti.dl_entry<"dlti.stack_alignment", 128 : i32>, #dlti.dl_entry<"dlti.endianness", "little">>, fir.defaultkind = "a1c4d8i4l4r4", fir.kindmap = "", llvm.data_layout = "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128", llvm.target_triple = "aarch64-unknown-linux-gnu"} {
+  func.func @_QQmain() attributes {fir.bindc_name = "underflow"} {
+    %c21 = arith.constant 21 : index
+    %c7_i32 = arith.constant 7 : i32
+    %c-1_i32 = arith.constant -1 : i32
+    %0 = fir.address_of(@_QFEz) : !fir.ref<!fir.complex<8>>
+    %1 = fir.address_of(@_QQcl.2F686F6D652F6B697263686130322F756E646572666C6F772E66393000) : !fir.ref<!fir.char<1,29>>
+    %2 = fir.convert %1 : (!fir.ref<!fir.char<1,29>>) -> !fir.ref<i8>
+    %3 = fir.call @_FortranAioBeginExternalListOutput(%c-1_i32, %2, %c7_i32) fastmath<contract> : (i32, !fir.ref<i8>, i32) -> !fir.ref<i8>
+    %4 = fir.address_of(@_QQcl.4162736F6C7574652076616C7565206F66207A3A20) : !fir.ref<!fir.char<1,21>>
+    %5 = fir.convert %4 : (!fir.ref<!fir.char<1,21>>) -> !fir.ref<i8>
+    %6 = fir.convert %c21 : (index) -> i64
+    %7 = fir.call @_FortranAioOutputAscii(%3, %5, %6) fastmath<contract> : (!fir.ref<i8>, !fir.ref<i8>, i64) -> i1
+    %8 = fir.load %0 : !fir.ref<!fir.complex<8>>
+    %9 = fir.convert %8 : (!fir.complex<8>) -> complex<f64>
+    %10 = complex.re %9 : complex<f64>
+    %11 = complex.im %9 : complex<f64>
+    %12 = arith.mulf %10, %10 : f64
+    %13 = arith.mulf %11, %11 : f64
+    %14 = arith.addf %12, %13 : f64
+    %15 = math.sqrt %14 : f64
+    %16 = fir.call @_FortranAioOutputReal64(%3, %15) fastmath<contract> : (!fir.ref<i8>, f64) -> i1
+    %17 = fir.call @_FortranAioEndIoStatement(%3) fastmath<contract> : (!fir.ref<i8>) -> i32
+    return
+  }
+  fir.global internal @_QFECdp constant : i32 {
+    %c8_i32 = arith.constant 8 : i32
+    fir.has_value %c8_i32 : i32
+  }
+  fir.global internal @_QFEz : !fir.complex<8> {
+    %cst = arith.constant 1.000000e-300 : f64
+    %0 = fir.undefined !fir.complex<8>
+    %1 = fir.insert_value %0, %cst, [0 : index] : (!fir.complex<8>, f64) -> !fir.complex<8>
+    %2 = fir.insert_value %1, %cst, [1 : index] : (!fir.complex<8>, f64) -> !fir.complex<8>
+    fir.has_value %2 : !fir.complex<8>
+  }
+  func.func private @_FortranAioBeginExternalListOutput(i32, !fir.ref<i8>, i32) -> !fir.ref<i8> attributes {fir.io, fir.runtime}
+  fir.global linkonce @_QQcl.2F686F6D652F6B697263686130322F756E646572666C6F772E66393000 constant : !fir.char<1,29> {
+    %0 = fir.string_lit "/home/kircha02/underflow.f90\00"(29) : !fir.char<1,29>
+    fir.has_value %0 : !fir.char<1,29>
+  }
+  func.func private @_FortranAioOutputAscii(!fir.ref<i8>, !fir.ref<i8>, i64) -> (i1 {llvm.zeroext}) attributes {fir.io, fir.runtime}
+  fir.global linkonce @_QQcl.4162736F6C7574652076616C7565206F66207A3A20 constant : !fir.char<1,21> {
+    %0 = fir.string_lit "Absolute value of z: "(21) : !fir.char<1,21>
+    fir.has_value %0 : !fir.char<1,21>
+  }
+  func.func private @_FortranAioOutputReal64(!fir.ref<i8>, f64) -> (i1 {llvm.zeroext}) attributes {fir.io, fir.runtime}
+  func.func private @_FortranAioEndIoStatement(!fir.ref<i8>) -> i32 attributes {fir.io, fir.runtime}
+  fir.global @_QQEnvironmentDefaults constant : !fir.ref<tuple<i32, !fir.ref<!fir.array<0xtuple<!fir.ref<i8>, !fir.ref<i8>>>>>> {
+    %0 = fir.zero_bits !fir.ref<tuple<i32, !fir.ref<!fir.array<0xtuple<!fir.ref<i8>, !fir.ref<i8>>>>>>
+    fir.has_value %0 : !fir.ref<tuple<i32, !fir.ref<!fir.array<0xtuple<!fir.ref<i8>, !fir.ref<i8>>>>>>
+  } 
+}
+```
+Comment by Leporacanthicus: To produce MLIR from flang-new, you can use `flang-new -fc1 -emit-mlir source.f90`.
+Comment by k-arrows: See "ALGORITHM 312 ABSOLUTE VALUE AND SQUARE ROOT OF A COMPLEX NUMBER" in the following:
+https://dl.acm.org/doi/pdf/10.1145/363717.363780
+
+`SqrtOpConversion` follows this but `AbsOpConversion` does not.
+The following mock shows that we can avoid (unnecessary) overflow and underflow.
+```c
+#include <iostream>
+#include <cmath>
+
+void myabs1(double real, double imag)
+{
+    std::cout << sqrt(real * real + imag * imag) << std::endl;
+}
+
+void myabs2(double real, double imag)
+{
+    if(real == 0)
+    {
+        std::cout << imag << std::endl;
+    }
+    else if(imag == 0)
+    {
+        std::cout << real << std::endl;
+    }
+    else
+    {
+        if(real > imag)
+        {
+            imag /= real;
+            std::cout << real * sqrt(1 + imag * imag) << std::endl;
+        }
+        else
+        {
+            real /= imag;
+            std::cout << imag * sqrt(1 + real * real) << std::endl;
+        }
+    }
+}
+
+int main(void)
+{
+   double x = 1.0e300;
+   double y = 1.0e-300;
+
+   myabs1(x, x);
+   myabs1(y, y);
+   myabs2(x, x);
+   myabs2(y, y);
+}
+```
+
+```console
+$ clang++ -Wall -Wextra myabs.cpp
+$ ./a.out
+inf
+0
+1.41421e+300
+1.41421e-300
+```
+Comment by k-arrows: I will close this issue since https://github.com/llvm/llvm-project/pull/76316 has been merged.
+Comment by k-arrows: > I will close this issue since #76316 has been merged.
+
+The patch was reverted but I won't reopen this issue, because the Fortran example I gave at the beginning has been working as expected for a long time already. If this implementation of MLIR is a problem, I think it should be filed as a separate issue.

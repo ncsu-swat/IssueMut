@@ -1,0 +1,180 @@
+Bug Summary: [13/14/15 Regression] wrong code at -O3 with "-fno-tree-fre -fno-tree-dominator-opts -fno-tree-loop-im" on x86_64-linux-gnu since r13-455
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2024-05-18 20:22:51 UTC
+  Text: This appears to be a regression from 12.*, and affects 13.* and later. 
+
+Compiler Explorer:https://godbolt.org/z/cvM1TYd7h[598] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240516 (experimental) (GCC) 
+[599] % 
+[599] % gcctk -O3 small.c; ./a.out
+[600] % 
+[600] % gcctk -O3 -fno-tree-fre -fno-tree-dominator-opts -fno-tree-loop-im small.c
+[601] % ./a.out
+Aborted
+[602] % 
+[602] % cat small.c
+int a, b, c, d;
+char e[1] = {1};
+int main() {
+  for (a = 0; a < 3; a++)
+    for (b = 0; b < 2; b++)
+      c = e[0] = e[0] ^ d;
+  if (!c)
+    __builtin_abort();
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2024-05-18 21:40:46 UTC
+  Text: Confirmed.
+
+- User: Andrew Pinski | Time: 2024-05-18 21:53:04 UTC
+  Text: The bug is in strlen1:
+```
+maybe_invalidate called for MEM[(char *)&e] = vect_pretmp_76.13_77;
+maybe_invalidate returns 1
+maybe_invalidate called for MEM[(char *)&e] = vect_pretmp_89.18_79;
+maybe_invalidate returns 1
+Optimizing: pretmp_34 = e[0];
+into: pretmp_34 = 0;
+maybe_invalidate called for e[0] = pretmp_34;
+  statement may clobber object &e 0 bytes in size
+maybe_invalidate returns 1
+maybe_invalidate called for c = _5;
+maybe_invalidate returns 0
+maybe_invalidate called for a = _54;
+maybe_invalidate returns 0
+maybe_invalidate called for b = 2;
+maybe_invalidate returns 0
+maybe_invalidate called for __builtin_abort ();
+maybe_invalidate returns 0
+pointer_query counters:
+  index cache size:   0
+  index entries:      0
+  access cache size:  0
+  access entries:     0
+  hits:               0
+  misses:             0
+  failures:           0
+  max_depth:          0
+```
+
+- User: Andrew Pinski | Time: 2024-05-18 21:54:01 UTC
+  Text: That is it looks like a bad interaction between `Vector(1) char` stores and reads from char. BUT I don't understand how it gets that badly wrong.
+
+- User: Jakub Jelinek | Time: 2024-05-20 18:27:15 UTC
+  Text: Started withr13-455-g1fe04c497d5a16baee6af48a0b08ca99b75724e4Will have a look.
+
+- User: Jakub Jelinek | Time: 2024-05-20 18:36:10 UTC
+  Text: Ugh, slp creates here V1QImode vectors?  Why?  That can't be ever faster than just scalar QImode, no?
+
+- User: Richard Biener | Time: 2024-05-21 06:38:07 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #5)> Ugh, slp creates here V1QImode vectors?  Why?  That can't be ever faster
+> than just scalar QImode, no?We do not reject single-lane vectors iff the target happily supports them.
+It definitely would have avoided some bugs if we did - but it's also good
+we fix those.
+
+- User: Jakub Jelinek | Time: 2024-05-21 09:20:40 UTC
+  Text: GCC 13.3 is being released, retargeting bugs to GCC 13.4.
+
+- User: Jakub Jelinek | Time: 2024-05-21 11:57:21 UTC
+  Text: Createdattachment 58262[details]gcc15-pr115152.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-05-22 07:14:33 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:dbc9b45a3c2468ad134b3a9bd4961f7ae6bc1e67commitr15-766-gdbc9b45a3c2468ad134b3a9bd4961f7ae6bc1e67Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 22 09:13:50 2024 +0200
+
+    strlen: Fix up !si->full_string_p handling in count_nonzero_bytes_addr [PR115152]
+    
+    The following testcase is miscompiled because
+    strlen_pass::count_nonzero_bytes_addr doesn't handle correctly
+    the !si->full_string_p case.
+    If si->full_string_p, it correctly computes minlen and maxlen as
+    minimum and maximum length of the '\0' terminated stgring and
+    clears *nulterm (ie. makes sure !full_string_p in the ultimate
+    caller) if minlen is equal or larger than nbytes and so
+    '\0' isn't guaranteed to be among those bytes.
+    But in the !si->full_string_p case, all we know is that there
+    are [minlen,maxlen] non-zero bytes followed by unknown bytes,
+    so effectively the maxlen is infinite (but caller cares about only
+    the first nbytes bytes) and furthermore, we never know if there is
+    any '\0' char among those, so *nulterm needs to be always cleared.
+    
+    2024-05-22  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/115152* tree-ssa-strlen.cc (strlen_pass::count_nonzero_bytes_addr): If
+            !si->full_string_p, clear *nulterm and set maxlen to nbytes.
+    
+            * gcc.dg/pr115152.c: New test.
+
+- User: GCC Commits | Time: 2024-05-22 07:19:59 UTC
+  Text: The releases/gcc-14 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:fc9fb69ad624fd4cc89ff31ad0a7b8d88481c1f7commitr14-10231-gfc9fb69ad624fd4cc89ff31ad0a7b8d88481c1f7Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 22 09:13:50 2024 +0200
+
+    strlen: Fix up !si->full_string_p handling in count_nonzero_bytes_addr [PR115152]
+    
+    The following testcase is miscompiled because
+    strlen_pass::count_nonzero_bytes_addr doesn't handle correctly
+    the !si->full_string_p case.
+    If si->full_string_p, it correctly computes minlen and maxlen as
+    minimum and maximum length of the '\0' terminated stgring and
+    clears *nulterm (ie. makes sure !full_string_p in the ultimate
+    caller) if minlen is equal or larger than nbytes and so
+    '\0' isn't guaranteed to be among those bytes.
+    But in the !si->full_string_p case, all we know is that there
+    are [minlen,maxlen] non-zero bytes followed by unknown bytes,
+    so effectively the maxlen is infinite (but caller cares about only
+    the first nbytes bytes) and furthermore, we never know if there is
+    any '\0' char among those, so *nulterm needs to be always cleared.
+    
+    2024-05-22  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/115152* tree-ssa-strlen.cc (strlen_pass::count_nonzero_bytes_addr): If
+            !si->full_string_p, clear *nulterm and set maxlen to nbytes.
+    
+            * gcc.dg/pr115152.c: New test.
+    
+    (cherry picked from commit dbc9b45a3c2468ad134b3a9bd4961f7ae6bc1e67)
+
+- User: GCC Commits | Time: 2024-05-22 07:35:21 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:53bc98f5355ada17d1629a2d0e96aebd397780c6commitr13-8792-g53bc98f5355ada17d1629a2d0e96aebd397780c6Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 22 09:13:50 2024 +0200
+
+    strlen: Fix up !si->full_string_p handling in count_nonzero_bytes_addr [PR115152]
+    
+    The following testcase is miscompiled because
+    strlen_pass::count_nonzero_bytes_addr doesn't handle correctly
+    the !si->full_string_p case.
+    If si->full_string_p, it correctly computes minlen and maxlen as
+    minimum and maximum length of the '\0' terminated stgring and
+    clears *nulterm (ie. makes sure !full_string_p in the ultimate
+    caller) if minlen is equal or larger than nbytes and so
+    '\0' isn't guaranteed to be among those bytes.
+    But in the !si->full_string_p case, all we know is that there
+    are [minlen,maxlen] non-zero bytes followed by unknown bytes,
+    so effectively the maxlen is infinite (but caller cares about only
+    the first nbytes bytes) and furthermore, we never know if there is
+    any '\0' char among those, so *nulterm needs to be always cleared.
+    
+    2024-05-22  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/115152* tree-ssa-strlen.cc (strlen_pass::count_nonzero_bytes_addr): If
+            !si->full_string_p, clear *nulterm and set maxlen to nbytes.
+    
+            * gcc.dg/pr115152.c: New test.
+    
+    (cherry picked from commit dbc9b45a3c2468ad134b3a9bd4961f7ae6bc1e67)
+
+- User: Jakub Jelinek | Time: 2024-05-22 11:11:27 UTC
+  Text: Fixed for 13.4+/14.2+/15.1+.
+

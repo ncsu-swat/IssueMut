@@ -1,0 +1,158 @@
+Issue Title: Clang: Putting a function in a special `__TEXT,__foo` section results in underalignment
+Original Post: To reproduce (on macOS):
+
+```
+// section_test.cpp
+struct Class {
+	__attribute__((section("__TEXT,__foo,regular,pure_instructions")))
+	static int test(int x, int y)
+	{
+		return x + y;
+	}
+};
+
+int main(int argc, const char*[])
+{
+	return Class::test(argc, argc);
+}
+
+// clang -c -o section_test.o section_test.cpp
+// otool -l section_test.o
+```
+
+Output is:
+
+```
+Section
+  sectname __foo
+   segname __TEXT
+      addr 0x0000000000000030
+      size 0x0000000000000020
+    offset 520
+     align 2^1 (2)   <<<<<<<<<<< underaligned section
+```
+
+I would have hoped for an alignment of 4 because that is the (sub)target's `getMinFunctionAlignment()`.
+
+Analysis so far:
+
+- Section alignment comes from the most-aligned object in it - MCObjectStreamer
+- the `llvm::Function` has an alignment of 2 (comments say: for C++ ABI reasons)
+- the `MachineFunction` has an alignment of 4 (for arm64)
+- normally the `MachineFunction`'s alignment is used, but because `hasSection()` is true for the Function, the alignment of 2 wins (logic in `AsmPrinter::getGVAlignment`)
+- the `MCSection` remains aligned to 2 because all of its functions are aligned to 2
+- the normal text section's alignment is 4 because the `MachineFunction`s are 4-byte-aligned and not overridden by AsmPrinter
+
+This seems like a catch-22: the `MachineFunction` alignment should win, but is getting overridden by the section's alignment, yet the section's alignment comes from the llvm::Function, which doesn't know anything at all (would use 1 except for a C++ ABI reason making it 2).
+
+Interestingly, a function that is not a C++ method declared inline in its class, if it has a section attribute, is aligned correctly.
+
+Comment by dougsonos: This fixes the immediate issue:
+
+```
+diff --git a/llvm/lib/CodeGen/AsmPrinter/AsmPrinter.cpp b/llvm/lib/CodeGen/AsmPrinter/AsmPrinter.cpp
+index f85af2b73308..b028f5eeb57b 100644
+--- a/llvm/lib/CodeGen/AsmPrinter/AsmPrinter.cpp
++++ b/llvm/lib/CodeGen/AsmPrinter/AsmPrinter.cpp
+@@ -2967,9 +2968,15 @@ void AsmPrinter::emitAlignment(Align Alignment, const GlobalObject *GV,
+ 
+   if (getCurrentSection()->getKind().isText()) {
+     const MCSubtargetInfo *STI = nullptr;
+-    if (this->MF)
+-      STI = &getSubtargetInfo();
+-    else
++    if (this->MF) {
++      const TargetSubtargetInfo *STI2 = &MF->getSubtarget();
++      const Align MinAlign = STI2->getTargetLowering()->getMinFunctionAlignment();
++      if (Alignment < MinAlign) {
++        Alignment = MinAlign;
++      }
++
++      STI = STI2;
++    } else
+       STI = TM.getMCSubtargetInfo();
+     OutStreamer->emitCodeAlignment(Alignment, STI, MaxBytesToEmit);
+   } else
+```
+
+but I don't know if this is quite the right place for the fix.
+Comment by dougsonos: Comparing the cases of 2 C++ methods, one with an explicit section attribute, one without:
+
+- `AsmPrinter::emitAlignment` receives an alignment of 4 in both cases (from MachineFunction).
+- it passes 4 to getGVAlignment
+- in both cases, the GV has an alignment of 2 (because C++ ABI)
+- but when there is no special section, the MachineFunction's alignment of 4 wins
+- when there is a specific section, the GV's alignment of 2 wins
+
+Because (in `getGVAlignment`):
+```
+  // If the GVAlign is larger than NumBits, or if we are required to obey
+  // NumBits because the GV has an assigned section, obey it.
+  if (*GVAlign > Alignment || GV->hasSection())
+    Alignment = *GVAlign;
+```
+
+Since the GV here is not necessarily code, it's probably not the right place for a fix.  The place I outlined in the earlier seems correct, unless there is a legitimate case where text should be aligned to something less than the `MachineFunction`'s alignment.
+
+I considered not looking at `getMinFunctionAlignment()` since the incoming alignment here is already that of the `MachineFunction` -- but that can be increased from the target's minimum:
+```
+  // FIXME: Shouldn't use pref alignment if explicit alignment is set on F.
+  // FIXME: Use Function::hasOptSize().
+  if (!F.hasFnAttribute(Attribute::OptimizeForSize))
+    Alignment = std::max(Alignment,
+                         STI->getTargetLowering()->getPrefFunctionAlignment());
+```
+Comment by llvmbot: 
+@llvm/issue-subscribers-backend-aarch64
+
+Author: Doug Wyatt (dougsonos)
+
+<details>
+To reproduce (on macOS):
+
+```
+// section_test.cpp
+struct Class {
+	__attribute__((section("__TEXT,__foo,regular,pure_instructions")))
+	static int test(int x, int y)
+	{
+		return x + y;
+	}
+};
+
+int main(int argc, const char*[])
+{
+	return Class::test(argc, argc);
+}
+
+// clang -c -o section_test.o section_test.cpp
+// otool -l section_test.o
+```
+
+Output is:
+
+```
+Section
+  sectname __foo
+   segname __TEXT
+      addr 0x0000000000000030
+      size 0x0000000000000020
+    offset 520
+     align 2^1 (2)   &lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt; underaligned section
+```
+
+I would have hoped for an alignment of 4 because that is the (sub)target's `getMinFunctionAlignment()`.
+
+Analysis so far:
+
+- Section alignment comes from the most-aligned object in it - MCObjectStreamer
+- the `llvm::Function` has an alignment of 2 (comments say: for C++ ABI reasons)
+- the `MachineFunction` has an alignment of 4 (for arm64)
+- normally the `MachineFunction`'s alignment is used, but because `hasSection()` is true for the Function, the alignment of 2 wins (logic in `AsmPrinter::getGVAlignment`)
+- the `MCSection` remains aligned to 2 because all of its functions are aligned to 2
+- the normal text section's alignment is 4 because the `MachineFunction`s are 4-byte-aligned and not overridden by AsmPrinter
+
+This seems like a catch-22: the `MachineFunction` alignment should win, but is getting overridden by the section's alignment, yet the section's alignment comes from the llvm::Function, which doesn't know anything at all (would use 1 except for a C++ ABI reason making it 2).
+
+Interestingly, a function that is not a C++ method declared inline in its class, if it has a section attribute, is aligned correctly.
+</details>

@@ -1,0 +1,119 @@
+Bug Summary: [14 Regression] wrong code on llvm-16 around 'a |= a == 0'
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: patch, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2023-07-18 19:09:19 UTC
+  Text: This week's gccr14-2600-g3a407070b610a8fails llvm-16 test suite as:
+
+      Failed Tests (1):
+        LLVM-Unit :: Support/./SupportTests/BlockFrequencyTest.SaturatingRightShift
+
+It looks like the reproducer is trivial and happens even on -O0:
+
+// $ cat bug.cc
+int main(void) {
+  unsigned long long freq = 0x10080ULL;
+
+  freq >>= 2;
+  freq |= freq == 0;
+
+  if (freq != 0x4020ULL)
+      __builtin_trap();
+}
+
+$ gcc-14 bug.cc -o a && ./a
+Illegal instruction (core dumped)
+
+$ $ gcc bug.cc -o a && ./a
+<ok>
+
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=/<<NIX>>/gcc-14.0.0/bin/gcc
+COLLECT_LTO_WRAPPER=/<<NIX>>/gcc-14.0.0/libexec/gcc/x86_64-unknown-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-unknown-linux-gnu
+Configured with: ../source/configure --prefix=/<<NIX>>/gcc-14.0.0 --with-gmp-include=/<<NIX>>/gmp-6.2.1-dev/include --with-gmp-lib=/<<NIX>>/gmp-6.2.1/lib --with-mpfr-include=/<<NIX>>/mpfr-4.2.0-dev/include --with-mpfr-lib=/<<NIX>>/mpfr-4.2.0/lib --with-mpc=/<<NIX>>/libmpc-1.3.1 --with-native-system-header-dir=/<<NIX>>/glibc-2.37-8-dev/include --with-build-sysroot=/ --program-prefix= --enable-lto --disable-libstdcxx-pch --without-included-gettext --with-system-zlib --enable-checking=release --enable-static --enable-languages=c,c++ --disable-multilib --enable-plugin --disable-libcc1 --with-isl=/<<NIX>>/isl-0.20 --disable-bootstrap --build=x86_64-unknown-linux-gnu --host=x86_64-unknown-linux-gnu --target=x86_64-unknown-linux-gnu
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 99999999 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2023-07-18 19:29:28 UTC
+  Text: I think this will be fixed with -momit-leaf-frame-pointer patch at :https://gcc.gnu.org/pipermail/gcc-patches/2023-July/624752.html
+
+- User: Andrew Pinski | Time: 2023-07-18 19:29:40 UTC
+  Text: Whoops wrong bug report.
+
+- User: Andrew Pinski | Time: 2023-07-18 19:36:06 UTC
+  Text: It worked atr14-2547-g71a907abdb4c03d4a3419190d.
+
+Mine, looks liker14-2556-g0407ae8a7732d9caused it ...
+
+- User: Andrew Pinski | Time: 2023-07-18 19:39:56 UTC
+  Text: /* a | (a == b)  -->  a | (b^1) (boolean version of the above). */
+(simplify
+ (bit_ior:c @0 (nop_convert? (eq:c @0 @1)))
+ (bit_ior @0 (bit_xor @1 { build_one_cst (type); })))
+
+
+So I guess the issue is eq on generic has an integer type rather than boolean type ...
+
+- User: Andrew Pinski | Time: 2023-07-18 20:04:05 UTC
+  Text: Createdattachment 55575[details]Patch which should fix this
+
+So I didn't realize I need the check for "INTEGRAL_TYPE_P (TREE_TYPE (@0))
+      && TYPE_PRECISION (TREE_TYPE (@0)) == 1" On these.
+
+- User: Andrew Pinski | Time: 2023-07-18 20:31:10 UTC
+  Text: Createdattachment 55576[details]Full testcase
+
+- User: Sergei Trofimovich | Time: 2023-07-18 21:37:24 UTC
+  Text: Silly question: I would expect -O0 not to perform any simplifications like that.  Does `gcc` have a knob to disable `match.pd` templates? Or some of them are crucial for correctness?
+
+- User: Andrew Pinski | Time: 2023-07-18 21:42:26 UTC
+  Text: (In reply to Sergei Trofimovich fromcomment #7)> Silly question: I would expect -O0 not to perform any simplifications like
+> that.  Does `gcc` have a knob to disable `match.pd` templates? Or some of
+> them are crucial for correctness?Some are crucial for correctness usually dealing with c++. you could always use dbg_cnt to try to narrow down which one is failing.
+
+
+Seehttps://gcc.gnu.org/git/?p=gcc.git;a=blob;f=gcc/dbgcnt.def;h=9e2f1d857b49c6c331cc7d1c419eafa0f2403e96;hb=HEADFor on how to use dbg_cnt
+
+match is the counter here.
+
+Also for generic folding -fdump-tree-original-folding will have the debug info on what match pattern was applied during "fold" (of generic).
+
+- User: Andrew Pinski | Time: 2023-07-19 02:02:56 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2023-July/624847.html
+
+- User: Sergei Trofimovich | Time: 2023-07-19 06:13:12 UTC
+  Text: (In reply to Andrew Pinski fromcomment #5)> Createdattachment 55575[details]> Patch which should fix thisThis fixed llvm-16 test suite for me. Thank you!
+
+- User: GCC Commits | Time: 2023-07-19 16:16:29 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:bf20b770d9aabb15faf2644b5e3106249cb175f3commitr14-2648-gbf20b770d9aabb15faf2644b5e3106249cb175f3Author: Andrew Pinski <apinski@marvell.com>
+Date:   Tue Jul 18 21:11:46 2023 +0000
+
+    FixPR110726: a | (a == b) can sometimes produce wrong code
+    
+    So I had missed/forgot that EQ_EXPR could have an non boolean
+    type for generic when I implementedr14-2556-g0407ae8a7732d9.
+    This patch adds check for one bit precision intergal type
+    which fixes the problem.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/110726gcc/ChangeLog:
+    
+            * match.pd ((a|b)&(a==b),a|(a==b),(a&b)|(a==b)):
+            Add checks to make sure the type was one bit precision
+            intergal type.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/execute/bitops-1.c: New test.
+
+- User: Andrew Pinski | Time: 2023-07-19 16:17:00 UTC
+  Text: Fixed.
+

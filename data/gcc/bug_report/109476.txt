@@ -1,0 +1,364 @@
+Bug Summary: Missing optimization for 8bit/8bit multiplication / regression
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 4.6.4
+Known to Fail: 5.4.0
+
+Comments:
+- User: Wilhelm M | Time: 2023-04-11 19:19:16 UTC
+  Text: For avr-gcc > 4.6.4 the follwing function
+
+uint16_t mul(const uint8_t a, const uint16_t b) {
+    return static_cast<uint8_t>((b >> 8) + 0) * a ;
+}
+
+produces suboptimal
+
+mul(unsigned char, unsigned int):
+        mov r18,r23
+        ldi r19,0
+        mov r20,r24
+        mul r20,r18
+        movw r24,r0
+        mul r20,r19
+        add r25,r0
+        clr __zero_reg__
+        ret
+
+whereas avr-gcc 4.6.4 produces optimal
+
+mul(unsigned char, unsigned int):
+        mul r23,r24
+        movw r24,r0
+        clr r1
+        ret
+
+- User: Wilhelm M | Time: 2023-04-11 19:27:28 UTC
+  Text: Inetristingly changing the function to 
+
+
+uint16_t mul(const uint8_t a, const uint16_t b) {
+    return static_cast<uint8_t>((b >> 8) + 1) * a ;
+}
+
+produces optimal
+
+mul(unsigned char, unsigned int):
+        subi r23,lo8(-(1))
+        mul r23,r24
+        movw r24,r0
+        clr __zero_reg__
+        ret
+
+- User: Richard Biener | Time: 2023-04-12 11:14:28 UTC
+  Text: I get
+
+_Z3mulhj:
+/* prologue: function */
+/* frame size = 0 */
+/* stack size = 0 */
+.L__stack_usage = 0
+        mov r22,r24
+        mov r24,r23
+        ldi r23,0
+        ldi r25,0
+        rcall __mulhi3
+
+but probably because you didn't specify the actual command to compile and
+I'm using the wrong subarchitecture.
+
+What probably regressed is that we're promoting the multiplication to
+'int'.  The same happens for the + 1 variant for me though.
+
+Can you share the -march required to have 16bit multiplication?
+
+- User: Wilhelm M | Time: 2023-04-12 11:33:39 UTC
+  Text: Sorry, I forgot to mention the flags: -Os -mmcu=atmega328 
+
+Maybe CompilerExplorer ist also usefull:https://godbolt.org/z/zsq6PT1xb
+
+- User: Richard Biener | Time: 2023-04-12 12:21:45 UTC
+  Text: In the good case (with + 1) combine succeeds:
+
+Trying 9 -> 11:
+    9: r55:HI=zero_extend(r54:QI)
+      REG_DEAD r54:QI
+   11: r52:HI=r55:HI*r56:HI
+      REG_DEAD r56:HI
+      REG_DEAD r55:HI
+Successfully matched this instruction:
+(set (reg:HI 52)
+    (mult:HI (zero_extend:HI (reg:QI 54))
+        (reg:HI 56 [ a ])))
+allowing combination of insns 9 and 11
+original costs 4 + 28 = 32
+replacement cost 20
+deferring deletion of insn with uid = 9.
+modifying insn i3    11: r52:HI=zero_extend(r54:QI)*r56:HI
+      REG_DEAD r54:QI
+      REG_DEAD r56:HI
+deferring rescan insn with uid = 11.
+
+and then
+
+Trying 10 -> 11:
+   10: r56:HI=zero_extend(r61:QI)
+      REG_DEAD r61:QI
+   11: r52:HI=zero_extend(r54:QI)*r56:HI
+      REG_DEAD r54:QI
+      REG_DEAD r56:HI
+Successfully matched this instruction:
+(set (reg:HI 52)
+    (mult:HI (zero_extend:HI (reg:QI 54))
+        (zero_extend:HI (reg:QI 61))))
+allowing combination of insns 10 and 11
+original costs 4 + 20 = 24
+replacement cost 12
+deferring deletion of insn with uid = 10.
+modifying insn i3    11: r52:HI=zero_extend(r54:QI)*zero_extend(r61:QI)
+      REG_DEAD r61:QI
+      REG_DEAD r54:QI
+deferring rescan insn with uid = 11.
+
+
+in the bad case instead
+
+Trying 8 -> 9:
+    8: r52:HI=zero_extend(r55:QI)
+      REG_DEAD r55:QI
+    9: r50:HI=r51:HI*r52:HI
+      REG_DEAD r52:HI
+      REG_DEAD r51:HI
+Successfully matched this instruction:
+(set (reg:HI 50)
+    (mult:HI (zero_extend:HI (reg:QI 55))
+        (reg:HI 51 [ b+1 ])))
+allowing combination of insns 8 and 9
+original costs 4 + 28 = 32
+replacement cost 20
+deferring deletion of insn with uid = 8.
+modifying insn i3     9: r50:HI=zero_extend(r55:QI)*r51:HI
+      REG_DEAD r55:QI
+      REG_DEAD r51:HI
+deferring rescan insn with uid = 9.
+
+Trying 20 -> 9:
+   20: r51:HI#1=0
+    9: r50:HI=zero_extend(r55:QI)*r51:HI
+      REG_DEAD r55:QI
+      REG_DEAD r51:HI
+Can't combine i2 into i3
+
+that's because the RTL into combine in the bad case is
+
+(insn 19 22 20 2 (set (subreg:QI (reg:HI 51 [ b+1 ]) 0)
+        (reg:QI 54 [ b+1 ])) "t.ii":4:36 86 {movqi_insn_split}
+     (expr_list:REG_DEAD (reg:QI 54 [ b+1 ])
+        (nil)))
+(insn 20 19 8 2 (set (subreg:QI (reg:HI 51 [ b+1 ]) 1)
+        (const_int 0 [0])) "t.ii":4:36 86 {movqi_insn_split}
+     (nil))
+(insn 8 20 9 2 (set (reg:HI 52 [ a ])
+        (zero_extend:HI (reg/v:QI 48 [ a ]))) "t.ii":4:49 635 {zero_extendqihi2}
+     (expr_list:REG_DEAD (reg/v:QI 48 [ a ])
+        (nil)))
+(insn 9 8 14 2 (set (reg:HI 50)
+        (mult:HI (reg:HI 51 [ b+1 ])
+            (reg:HI 52 [ a ]))) "t.ii":4:47 328 {*mulhi3_enh_split}
+     (expr_list:REG_DEAD (reg:HI 52 [ a ])
+        (expr_list:REG_DEAD (reg:HI 51 [ b+1 ])
+            (nil))))
+
+so the 'b' operand of the multiplication is now not a zero_extend:HI
+but instead a two instruction set.  The first subreg pass produces
+this IL, turning
+
+(insn 3 2 4 2 (set (reg/v:HI 49 [ b ])
+        (reg:HI 22 r22 [ b ])) "t.ii":3:49 101 {*movhi_split}
+     (nil))
+(insn 7 4 8 2 (set (reg:HI 51)
+        (lshiftrt:HI (reg/v:HI 49 [ b ])
+            (const_int 8 [0x8]))) "t.ii":4:36 557 {lshrhi3}
+     (nil))
+
+into
+
+(insn 17 2 18 2 (set (reg:QI 53 [ b ])
+        (reg:QI 22 r22 [ b ])) "t.ii":3:49 86 {movqi_insn_split}
+     (nil))
+(insn 18 17 4 2 (set (reg:QI 54 [ b+1 ])
+        (reg:QI 23 r23 [ b+1 ])) "t.ii":3:49 86 {movqi_insn_split}
+     (nil))
+(insn 19 4 20 2 (set (subreg:QI (reg:HI 51) 0)
+        (reg:QI 54 [ b+1 ])) "t.ii":4:36 86 {movqi_insn_split}
+     (nil))
+(insn 20 19 8 2 (set (subreg:QI (reg:HI 51) 1)
+        (const_int 0 [0])) "t.ii":4:36 86 {movqi_insn_split}
+     (nil))
+
+with -fno-split-wide-types the rotate doesn't get a zero_extend so the
+multiplication pattern doesn't match either.
+
+I think that possibly the lower subreg pass should more optimally
+handle the situation, creating
+
+(insn ... (set (zero_extend:HI (reg:QI 54 [ b + 1])))
+
+here.  I'm quite sure combine/forwprop cannot combine the seemingly
+unrelated subreg sets.  resolve_shift_zext seems to be supposed to
+handle this and it receives
+
+(insn 7 4 8 2 (set (reg:HI 51)
+        (lshiftrt:HI (concatn/v:HI [
+                    (reg:QI 53 [ b ])
+                    (reg:QI 54 [ b+1 ])
+                ])
+            (const_int 8 [0x8]))) "t.ii":4:36 557 {lshrhi3}
+     (nil))
+
+maybe for GET_CODE (op) != ASHIFTRT && offset1 == 0 && shift_count <= BITS_PER_WORD this can be directly emitted as zero_extend (if supported
+by the target).
+
+- User: Segher Boessenkool | Time: 2023-04-12 15:43:47 UTC
+  Text: Correct, this certainly can not be done by combine, it see two independent
+pseudos here.  For hard registers it *can* do many tricks, but not for
+pseudos like this.
+
+- User: Wilhelm M | Time: 2023-04-12 16:48:56 UTC
+  Text: The following "solution"
+
+constexpr uint16_t mul(const uint8_t a, const uint16_t b) {
+    const auto aa = std::bit_cast<std::array<uint8_t, 2>>(b);
+    return aa[1] * a;
+}
+
+or 
+
+constexpr uint16_t mul(const uint8_t a, const uint16_t b) {
+    uint8_t aa[2];
+    std::memcpy(aa, &b, 2);
+    return aa[1] * a;
+}
+
+gives optimal result ;-)
+
+- User: Roger Sayle | Time: 2023-04-12 18:43:06 UTC
+  Text: Createdattachment 54843[details]proposed patch
+
+Proposed patch.  Does this look reasonable?
+
+- User: Wilhelm M | Time: 2023-04-12 20:20:19 UTC
+  Text: Yes. Looks like the patch does its job.
+
+- User: Segher Boessenkool | Time: 2023-04-12 20:56:35 UTC
+  Text: That patch looks fine :-)
+
+- User: Richard Biener | Time: 2023-04-13 07:01:07 UTC
+  Text: (In reply to Roger Sayle fromcomment #7)> Createdattachment 54843[details]> proposed patch
+> 
+> Proposed patch.  Does this look reasonable?Yes, but doesn't this work for all GET_CODE (op) != ASHIFTRT?
+
+- User: Wilhelm M | Time: 2023-04-13 12:55:11 UTC
+  Text: After testing some more code, I got this ICE:
+
+/home/lmeier/Projekte/wmucpp/boards/rcfoc/gimbal_sbus_01.cc: In static member function 'static void GlobalFsm<BusDevs>::ratePeriodic() [with BusDevs =BusDevs<External::Bus::NoBus<Devices<0> > >]':
+/home/lmeier/Projekte/wmucpp/boards/rcfoc/gimbal_sbus_01.cc:426:5: error: unrecognizable insn:
+426 |     }
+|     ^
+(insn 1584 1583 25 3 (set (concatn:HI [
+(reg:QI 800)
+(reg:QI 801 [+1 ])
+])
+(reg:HI 826)) "../../include0/external/sbus/sbus.h":226:69 -1
+(nil))
+during RTL pass: subreg1
+/home/lmeier/Projekte/wmucpp/boards/rcfoc/gimbal_sbus_01.cc:426:5: internal compiler error: in extract_insn, at recog.cc:2791
+0x79f2cb _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+../../gcc/rtl-error.cc:108
+0x79f2e7 _fatal_insn_not_found(rtx_def const*, char const*, int, char const*)
+../../gcc/rtl-error.cc:116
+0x79dc77 extract_insn(rtx_insn*)
+../../gcc/recog.cc:2791
+0x1a43d91 decompose_multiword_subregs
+../../gcc/lower-subreg.cc:1651
+0x1a447ca execute
+../../gcc/lower-subreg.cc:1790
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+
+- User: Segher Boessenkool | Time: 2023-04-13 15:19:47 UTC
+  Text: With the modified compiler?  Does it ICE with an unmodified compiler as well?
+
+- User: Wilhelm M | Time: 2023-04-13 17:57:20 UTC
+  Text: Yes, the ICE is with the patch. I'm pretty sure that this does not happen without the patch, but I will that check again.
+
+- User: Roger Sayle | Time: 2023-04-13 21:49:22 UTC
+  Text: My apologies for the delay/issues.  My bootstrap and regression testing of this patch (on x86_64-pc-linux-gnu) revealed an issue or two (including the reported ICE).  My plan was to fix/resolve all these before posting a concrete submission to gcc-patches.  The general approach is solid (thanks to everyone that agreed this was the correct place to fix things) but it's the corner cases (such as RTL sharing) that all need to be addressed prior to a reviewable submission.
+
+- User: Wilhelm M | Time: 2023-04-14 07:42:40 UTC
+  Text: Just checked actual gcc 13.0.1 without the patch: then no ICE accurs.
+
+- User: Wilhelm M | Time: 2023-04-14 07:46:14 UTC
+  Text: (In reply to Roger Sayle fromcomment #14)> My apologies for the delay/issues.  My bootstrap and regression testing of
+> this patch (on x86_64-pc-linux-gnu) revealed an issue or two (including the
+> reported ICE).  My plan was to fix/resolve all these before posting a
+> concrete submission to gcc-patches.We all appreciate your great effort in this case! Please don't hesitate to send here some patches to test with. I'll be happy to test your patches!
+
+- User: Roger Sayle | Time: 2023-04-23 20:22:49 UTC
+  Text: I've submitted an improved version of my patch for review:https://gcc.gnu.org/pipermail/gcc-patches/2023-April/616527.html
+
+- User: GCC Commits | Time: 2023-04-28 13:22:40 UTC
+  Text: The master branch has been updated by Roger Sayle <sayle@gcc.gnu.org>:https://gcc.gnu.org/g:650c36ec461a722d9c65e82512b4c3aeec2ffee1commitr14-335-g650c36ec461a722d9c65e82512b4c3aeec2ffee1Author: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Fri Apr 28 14:21:53 2023 +0100PR rtl-optimization/109476: Use ZERO_EXTEND instead of zeroing a SUBREG.
+    
+    This patch fixesPR rtl-optimization/109476, which is a code quality
+    regression affecting AVR.  The cause is that the lower-subreg pass is
+    sometimes overly aggressive, lowering the LSHIFTRT below:
+    
+    (insn 7 4 8 2 (set (reg:HI 51)
+            (lshiftrt:HI (reg/v:HI 49 [ b ])
+                (const_int 8 [0x8]))) "t.ii":4:36 557 {lshrhi3}
+         (nil))
+    
+    into a pair of QImode SUBREG assignments:
+    
+    (insn 19 4 20 2 (set (subreg:QI (reg:HI 51) 0)
+            (reg:QI 54 [ b+1 ])) "t.ii":4:36 86 {movqi_insn_split}
+         (nil))
+    (insn 20 19 8 2 (set (subreg:QI (reg:HI 51) 1)
+            (const_int 0 [0])) "t.ii":4:36 86 {movqi_insn_split}
+         (nil))
+    
+    but this idiom, SETs of SUBREGs, interferes with combine's ability
+    to associate/fuse instructions.  The solution, on targets that
+    have a suitable ZERO_EXTEND (i.e. where the lower-subreg pass
+    wouldn't itself split a ZERO_EXTEND, so "splitting_zext" is false),
+    is to split/lower LSHIFTRT to a ZERO_EXTEND.
+    
+    To answer Richard's question incomment #10of the bugzilla PR,
+    the function resolve_shift_zext is called with one of four RTX
+    codes, ASHIFTRT, LSHIFTRT, ZERO_EXTEND and ASHIFT, but only with
+    LSHIFTRT can the setting of low_part and high_part SUBREGs be
+    replaced by a ZERO_EXTEND.  For ASHIFTRT, we require a sign
+    extension, so don't set the high_part to zero; if we're splitting
+    a ZERO_EXTEND then it doesn't make sense to replace it with a
+    ZERO_EXTEND, and for ASHIFT we've played games to swap the
+    high_part and low_part SUBREGs, so that we assign the low_part
+    to zero (for double word shifts by greater than word size bits).
+    
+    2023-04-28  Roger Sayle  <roger@nextmovesoftware.com>
+    
+    gcc/ChangeLogPR rtl-optimization/109476* lower-subreg.cc: Include explow.h for force_reg.
+            (find_decomposable_shift_zext): Pass an additional SPEED_P argument.
+            If decomposing a suitable LSHIFTRT and we're not splitting
+            ZERO_EXTEND (based on the current SPEED_P), then use a ZERO_EXTEND
+            instead of setting a high part SUBREG to zero, which helps combine.
+            (decompose_multiword_subregs): Update call to resolve_shift_zext.
+    
+    gcc/testsuite/ChangeLogPR rtl-optimization/109476* gcc.target/avr/mmcu/pr109476.c: New test case.
+
+- User: Roger Sayle | Time: 2023-05-07 08:30:51 UTC
+  Text: This should now be fixed on mainline.
+

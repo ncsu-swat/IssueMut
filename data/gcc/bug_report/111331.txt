@@ -1,0 +1,356 @@
+Bug Summary: [11/12 Regression] Wrong code at -O1 on x86_64-linux-gnu since
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: patch, wrong-code
+Known to Work: 12.3.1, 13.2.1, 14.0, 5.1.0
+Known to Fail: 12.3.0, 13.2.0, 6.1.0
+
+Comments:
+- User: Shaohua Li | Time: 2023-09-07 20:35:06 UTC
+  Text: gcc at -O1 produced the wrong code.
+
+Bisected tor9-3606-g1cab645d3e3Compiler explorer:https://godbolt.org/z/5YEv44PTa$ cat a.c
+int printf(const char *, ...);
+int a;
+int b;
+int c(int d, int e, int f) {
+  if (d < e)
+    return e;
+  if (d > f)
+    return f;
+  return d;
+}
+int main() {
+  int g = -1;
+  a = c(b + 30, 29, g + 29);
+  printf("%d\n", a);
+}
+$
+$ gcc -O0 a.c && ./a.out
+28
+$ gcc -O1 a.c && ./a.out
+29
+$
+
+- User: Andrew Pinski | Time: 2023-09-07 20:50:29 UTC
+  Text: Confirmed, note that patch just exposed a latent bug. Here is a testcase which shows the failure even in GCC 6 but works in GCC 5:
+```
+
+int a;
+int b;
+int c(int d, int e, int f) {
+  if (d < e)
+    return e;
+  return (d > f) ? f : d;
+}
+int main() {
+  int g = -1;
+  a = c(b + 30, 29, g + 29);
+  volatile int t = a;
+  if (a != 28)
+    __builtin_trap();
+}
+```
+
+- User: Andrew Pinski | Time: 2023-09-07 21:05:29 UTC
+  Text: For the trunk:
+```
+phiopt match-simplify trying:
+	_3 > 28 ? _9 : 29
+Applying pattern match.pd:5446, gimple-match-3.cc:3125
+
+phiopt match-simplify back:
+_5 = MAX_EXPR <_9, 29>;
+result: _5
+accepted the phiopt match-simplify.
+statement un-sinked:
+_9 = MIN_EXPR <_3, 28>;
+```
+IR before the first phiopt:
+```
+  if (_3 <= 28)
+    goto <bb 4>; [34.00%]
+  else
+    goto <bb 3>; [66.00%]
+
+  <bb 3> :
+  _9 = MIN_EXPR <_3, 28>;
+
+  <bb 4> :
+  # _14 = PHI <29(2), _9(3)>
+```
+There is a mix match between the 29 and the 28 here ...
+
+- User: Andrew Pinski | Time: 2023-09-07 21:11:55 UTC
+  Text: For the trunk the problem is in match (and phiopt)
+Match pattern:
+/* Optimize (a CMP CST1) ? max<a,CST2> : a */r6-7425-ga9fee7cdc3c62d0e51730b6a9814909c557d3070most likely introduced it for GCC 6.
+
+For the trunk the issue is also dealing with minmax_from_comparison .
+
+- User: Andrew Pinski | Time: 2023-09-07 21:32:28 UTC
+  Text: Reduced testcase:
+```
+int a;
+int b;
+
+int main() {
+  int d = b+30;
+  {
+        int t;
+        if (d < 29)
+          t =  29;
+        else
+          t = (d > 28) ? 28 : d;
+    a = t;
+  }
+  volatile int t = a;
+  if (a != 28)
+    __builtin_trap();
+}
+```
+
+- User: Andrew Pinski | Time: 2023-09-07 21:44:32 UTC
+  Text: here is a testcase that fails even at -O0 on the trunk due to the match patches:
+```
+int a;
+int b;
+
+int main() {
+  int d = b+30;
+  {
+    int t;
+    t = d < 29 ? 29 : ((d > 28) ? 28 : d);
+    a = t;
+  }
+  volatile int t = a;
+  if (a != 28)
+    __builtin_trap();
+}
+```
+
+- User: Andrew Pinski | Time: 2023-09-07 23:19:26 UTC
+  Text: I am going to fix this.
+
+- User: Andrew Pinski | Time: 2023-09-08 00:17:16 UTC
+  Text: Fix for the trunk -O0 issue:
+```
+diff --git a/gcc/match.pd b/gcc/match.pd
+index 8c24dae71cd..f67bb9c12e7 100644
+--- a/gcc/match.pd
++++ b/gcc/match.pd
+@@ -5435,6 +5435,16 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+    (with
+     {
+       tree_code code = minmax_from_comparison (cmp, @0, @1, @0, @4);
++      /* For LT and GT, @4 and @1 needs to be the same.\
++        For an example:
++         _3 > 28 ? MIN_EXPR <_3, 28> : 29
++        is not the same as
++         MAX_EXPR <MIN_EXPR <_3, 28>, 29>
++        But `_3 >= 28` would be. */
++      if (cmp != LE_EXPR
++          && cmp != GE_EXPR
++          && !operand_equal_p (@1, @4))
++        code = ERROR_MARK;
+     }
+     (if ((cmp == LT_EXPR || cmp == LE_EXPR)
+         && code == MIN_EXPR
+```
+
+But we still fail the original testcase at -O1 because the code in phiopt is still needs to be fixed ...
+
+- User: Andrew Pinski | Time: 2023-09-08 02:22:21 UTC
+  Text: The tree-ssa-phiopt.cc code is much more complex.
+
+But not testing arg_true/arg_false against alt_larger/alt_smaller does fix the issue.
+
+- User: Andrew Pinski | Time: 2023-09-08 05:00:14 UTC
+  Text: Actually this is the fix for the match pattern:
+```
+diff --git a/gcc/match.pd b/gcc/match.pd
+index 8c24dae71cd..c7b6db4b543 100644
+--- a/gcc/match.pd
++++ b/gcc/match.pd
+@@ -5438,11 +5438,11 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+     }
+     (if ((cmp == LT_EXPR || cmp == LE_EXPR)
+         && code == MIN_EXPR
+-         && integer_nonzerop (fold_build2 (LE_EXPR, boolean_type_node, @3, @1)))
++         && integer_nonzerop (fold_build2 (LE_EXPR, boolean_type_node, @3, @4)))
+      (min @2 @4)
+      (if ((cmp == GT_EXPR || cmp == GE_EXPR)
+          && code == MAX_EXPR
+-          && integer_nonzerop (fold_build2 (GE_EXPR, boolean_type_node, @3, @1)))
++          && integer_nonzerop (fold_build2 (GE_EXPR, boolean_type_node, @3, @4)))
+       (max @2 @4))))))
+
+ #if GIMPLE
+```
+
+- User: Andrew Pinski | Time: 2023-09-08 05:03:43 UTC
+  Text: And here is the fix for phiopt:
+```
+diff --git a/gcc/tree-ssa-phiopt.cc b/gcc/tree-ssa-phiopt.cc
+index 9993bbe5b76..9b44ca9758a 100644
+--- a/gcc/tree-ssa-phiopt.cc
++++ b/gcc/tree-ssa-phiopt.cc
+@@ -2073,7 +2073,7 @@ minmax_replacement (basic_block cond_bb, basic_block middle_bb, basic_block alt_
+
+              /* We need BOUND <= LARGER.  */
+              if (!integer_nonzerop (fold_build2 (LE_EXPR, boolean_type_node,
+-                                                 bound, larger)))
++                                                 bound, arg_false)))
+                return false;
+            }
+          else if (operand_equal_for_phi_arg_p (arg_false, smaller)
+@@ -2104,7 +2104,7 @@ minmax_replacement (basic_block cond_bb, basic_block middle_bb, basic_block alt_
+
+              /* We need BOUND >= SMALLER.  */
+              if (!integer_nonzerop (fold_build2 (GE_EXPR, boolean_type_node,
+-                                                 bound, smaller)))
++                                                 bound, arg_false)))
+                return false;
+            }
+          else
+@@ -2144,7 +2144,7 @@ minmax_replacement (basic_block cond_bb, basic_block middle_bb, basic_block alt_
+
+              /* We need BOUND >= LARGER.  */
+              if (!integer_nonzerop (fold_build2 (GE_EXPR, boolean_type_node,
+-                                                 bound, larger)))
++                                                 bound, arg_true)))
+                return false;
+            }
+          else if (operand_equal_for_phi_arg_p (arg_true, smaller)
+@@ -2171,7 +2171,7 @@ minmax_replacement (basic_block cond_bb, basic_block middle_bb, basic_block alt_
+
+              /* We need BOUND <= SMALLER.  */
+              if (!integer_nonzerop (fold_build2 (LE_EXPR, boolean_type_node,
+-                                                 bound, smaller)))
++                                                 bound, arg_true)))
+                return false;
+            }
+          else
+
+
+```
+
+Now I understand both patches even too.
+
+- User: Andrew Pinski | Time: 2023-09-08 05:24:17 UTC
+  Text: Createdattachment 55853[details]Patch which I am testing
+
+- User: Andrew Pinski | Time: 2023-09-08 12:44:13 UTC
+  Text: Trunk patch:https://gcc.gnu.org/pipermail/gcc-patches/2023-September/629701.htmlPatches for the other branches will almost the same except the match.pd part is removed since it is not there.
+
+- User: GCC Commits | Time: 2023-09-10 15:48:10 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:30e6ee074588bacefd2dfe745b188bb20c81fe5ecommitr14-3827-g30e6ee074588bacefd2dfe745b188bb20c81fe5eAuthor: Andrew Pinski <apinski@marvell.com>
+Date:   Thu Sep 7 22:13:31 2023 -0700
+
+    FixPR 111331: wrong code for `a > 28 ? MIN<a, 28> : 29`
+    
+    The problem here is afterr6-7425-ga9fee7cdc3c62d0e51730,
+    the comparison to see if the transformation could be done was using the
+    wrong value. Instead of see if the inner was LE (for MIN and GE for MAX)
+    the outer value, it was comparing the inner to the value used in the comparison
+    which was wrong.
+    The match pattern copied the same logic mistake when they were added inr14-1411-g17cca3c43e2f49.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu.
+    
+    gcc/ChangeLog:PR tree-optimization/111331* match.pd (`(a CMP CST1) ? max<a,CST2> : a`):
+            Fix the LE/GE comparison to the correct value.
+            * tree-ssa-phiopt.cc (minmax_replacement):
+            Fix the LE/GE comparison for the
+            `(a CMP CST1) ? max<a,CST2> : a` optimization.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/111331* gcc.c-torture/execute/pr111331-1.c: New test.
+            * gcc.c-torture/execute/pr111331-2.c: New test.
+            * gcc.c-torture/execute/pr111331-3.c: New test.
+
+- User: Andrew Pinski | Time: 2023-09-10 15:49:06 UTC
+  Text: Fixed on the trunk, will backport in a few days.
+
+- User: GCC Commits | Time: 2023-10-01 20:23:47 UTC
+  Text: The releases/gcc-13 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:cda1992a56779e5c60a70f251542a6f662fdfa60commitr13-7928-gcda1992a56779e5c60a70f251542a6f662fdfa60Author: Andrew Pinski <apinski@marvell.com>
+Date:   Thu Sep 7 22:13:31 2023 -0700
+
+    FixPR 111331: wrong code for `a > 28 ? MIN<a, 28> : 29`
+    
+    The problem here is afterr6-7425-ga9fee7cdc3c62d0e51730,
+    the comparison to see if the transformation could be done was using the
+    wrong value. Instead of see if the inner was LE (for MIN and GE for MAX)
+    the outer value, it was comparing the inner to the value used in the comparison
+    which was wrong.
+    
+    Committed to GCC 13 branch after bootstrapped and tested on x86_64-linux-gnu.
+    
+    gcc/ChangeLog:PR tree-optimization/111331* tree-ssa-phiopt.cc (minmax_replacement):
+            Fix the LE/GE comparison for the
+            `(a CMP CST1) ? max<a,CST2> : a` optimization.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/111331* gcc.c-torture/execute/pr111331-1.c: New test.
+            * gcc.c-torture/execute/pr111331-2.c: New test.
+            * gcc.c-torture/execute/pr111331-3.c: New test.
+    
+    (cherry picked from commit 30e6ee074588bacefd2dfe745b188bb20c81fe5e)
+
+- User: Andrew Pinski | Time: 2023-10-01 20:25:03 UTC
+  Text: Fixed on the GCC 13 branch too.
+
+- User: Andrew Pinski | Time: 2024-03-18 21:57:06 UTC
+  Text: ***Bug 114386has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2024-05-08 16:28:06 UTC
+  Text: The releases/gcc-11 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:16e27b6d03756bf1fae22607fa93107787a7b9cbcommitr11-11421-g16e27b6d03756bf1fae22607fa93107787a7b9cbAuthor: Andrew Pinski <apinski@marvell.com>
+Date:   Thu Sep 7 22:13:31 2023 -0700
+
+    FixPR 111331: wrong code for `a > 28 ? MIN<a, 28> : 29`
+    
+    The problem here is afterr6-7425-ga9fee7cdc3c62d0e51730,
+    the comparison to see if the transformation could be done was using the
+    wrong value. Instead of see if the inner was LE (for MIN and GE for MAX)
+    the outer value, it was comparing the inner to the value used in the comparison
+    which was wrong.
+    
+    Committed to GCC 13 branch after bootstrapped and tested on x86_64-linux-gnu.
+    
+    gcc/ChangeLog:PR tree-optimization/111331* tree-ssa-phiopt.c (minmax_replacement):
+            Fix the LE/GE comparison for the
+            `(a CMP CST1) ? max<a,CST2> : a` optimization.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/111331* gcc.c-torture/execute/pr111331-1.c: New test.
+            * gcc.c-torture/execute/pr111331-2.c: New test.
+            * gcc.c-torture/execute/pr111331-3.c: New test.
+    
+    (cherry picked from commit 30e6ee074588bacefd2dfe745b188bb20c81fe5e)
+
+- User: GCC Commits | Time: 2024-05-08 16:29:24 UTC
+  Text: The releases/gcc-12 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:39d56b96996dd8336652ceac97983c26fd8de4c6commitr12-10431-g39d56b96996dd8336652ceac97983c26fd8de4c6Author: Andrew Pinski <apinski@marvell.com>
+Date:   Thu Sep 7 22:13:31 2023 -0700
+
+    FixPR 111331: wrong code for `a > 28 ? MIN<a, 28> : 29`
+    
+    The problem here is afterr6-7425-ga9fee7cdc3c62d0e51730,
+    the comparison to see if the transformation could be done was using the
+    wrong value. Instead of see if the inner was LE (for MIN and GE for MAX)
+    the outer value, it was comparing the inner to the value used in the comparison
+    which was wrong.
+    
+    Committed to GCC 13 branch after bootstrapped and tested on x86_64-linux-gnu.
+    
+    gcc/ChangeLog:PR tree-optimization/111331* tree-ssa-phiopt.cc (minmax_replacement):
+            Fix the LE/GE comparison for the
+            `(a CMP CST1) ? max<a,CST2> : a` optimization.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/111331* gcc.c-torture/execute/pr111331-1.c: New test.
+            * gcc.c-torture/execute/pr111331-2.c: New test.
+            * gcc.c-torture/execute/pr111331-3.c: New test.
+    
+    (cherry picked from commit 30e6ee074588bacefd2dfe745b188bb20c81fe5e)
+
+- User: Andrew Pinski | Time: 2024-05-08 16:30:15 UTC
+  Text: Fixed everywhere.
+

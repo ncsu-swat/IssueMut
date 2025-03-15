@@ -1,0 +1,130 @@
+Bug Summary: Nested cast not optimized out in GIMPLE
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jakub Jelinek | Time: 2023-12-14 16:36:26 UTC
+  Text: +++ This bug was initially created as a clone ofBug #112941+++
+
+The above PR leads to a question, why don't we optimize:
+unsigned int
+foo (signed char x)
+{
+  unsigned long long y = x;
+  return y;
+}
+
+unsigned int
+bar (signed char x)
+{
+  return (unsigned long long) x;
+}
+
+We do optimize the bar case in convert.cc's
+          CASE_CONVERT:
+            {
+              tree argtype = TREE_TYPE (TREE_OPERAND (expr, 0));
+              /* Don't introduce a "can't convert between vector values
+                 of different size" error.  */
+              if (TREE_CODE (argtype) == VECTOR_TYPE
+                  && maybe_ne (GET_MODE_SIZE (TYPE_MODE (argtype)),
+                               GET_MODE_SIZE (TYPE_MODE (type))))
+                break;
+            }
+            /* If truncating after truncating, might as well do all at once.
+               If truncating after extending, we may get rid of wasted work.  */
+            return convert (type, get_unwidened (TREE_OPERAND (expr, 0), type));
+This is the truncating after extending case.
+Now, for
+unsigned int
+baz (unsigned char x)
+{
+  unsigned long long y = x;
+  return y;
+}
+we optimize it in the match.pd
+    /* Likewise, if the intermediate and initial types are either both
+       float or both integer, we don't need the middle conversion if the
+       former is wider than the latter and doesn't change the signedness
+       (for integers).  Avoid this if the final type is a pointer since
+       then we sometimes need the middle conversion.  */
+    (if (((inter_int && inside_int) || (inter_float && inside_float))
+         && (final_int || final_float)
+         && inter_prec >= inside_prec
+         && (inter_float || inter_unsignedp == inside_unsignedp))
+     (ocvt @0))
+case.
+
+In the foo case, we have inter_int && inside_int && final_int && inside_prec < final_prec && final_prec < inter_prec && (!inside_unsignedp) && inter_unsignedp && final_unsignedp, so don't trigger the above condition.
+Slightly later, there is a comment which describes the reason why 2 conversions would be needed:
+    /* Two conversions in a row are not needed unless:
+        - some conversion is floating-point (overstrict for now), or
+        - some conversion is a vector (overstrict for now), or
+        - the intermediate type is narrower than both initial and
+          final, or
+        - the intermediate type and innermost type differ in signedness,
+          and the outermost type is wider than the intermediate, or
+        - the initial type is a pointer type and the precisions of the
+          intermediate and final types differ, or
+        - the final type is a pointer type and the precisions of the
+          initial and intermediate types differ.  */
+and I believe none of those bullets apply here, while intermediate type and innermost type differ in signedness, the outermost type is not wider than the intermediate.
+But the actually implemented rule below it has 7 cases rather than 6.
+
+- User: Jakub Jelinek | Time: 2023-12-14 17:55:31 UTC
+  Text: Createdattachment 56880[details]gcc14-pr113024.patch
+
+Untested fix.
+
+- User: Andrew Pinski | Time: 2023-12-14 17:59:42 UTC
+  Text: Confirmed.
+
+Note if the final convert was a truncation from the original one, match is able to remove the inner cast sincer14-2890-gcc2003cd87532f(PR 93044).
+That is:
+```
+unsigned char
+foo1 (signed short x)
+{
+  unsigned long long y = x;
+  return y;
+}
+```
+Maybe that part of the pattern could be improved to catch the testcase incomment #0too.
+
+- User: GCC Commits | Time: 2023-12-15 09:14:39 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:330f1e078dae257d4f8f7b13299ececc2344e681commitr14-6580-g330f1e078dae257d4f8f7b13299ececc2344e681Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Dec 15 10:13:44 2023 +0100
+
+    match.pd: Optimize sign-extension followed by truncation [PR113024]
+    
+    While looking at a bitint ICE, I've noticed we don't optimize
+    in f1 and f5 functions below the 2 casts into just one at GIMPLE,
+    even when optimize it in convert_to_integer if it appears in the same
+    stmt.  The large match.pd simplification of two conversions in a row
+    has many complex rules and as the testcase shows, everything else from
+    the narrowest -> widest -> prec_in_between all integer conversions
+    is already handled, either because the inside_unsignedp == inter_unsignedp
+    rule kicks in, or the
+             && ((inter_unsignedp && inter_prec > inside_prec)
+                 == (final_unsignedp && final_prec > inter_prec))
+    one, but there is no reason why sign extension to from narrowest to
+    widest type followed by truncation to something in between can't be
+    done just as sign extension from narrowest to the final type.  After all,
+    if the widest type is signed rather than unsigned, regardless of the final
+    type signedness we already handle it that way.
+    And sincePR93044we also handle it if the final precision is not wider
+    than the inside precision.
+    
+    2023-12-15  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113024* match.pd (two conversions in a row): Simplify scalar integer
+            sign-extension followed by truncation.
+    
+            * gcc.dg/tree-ssa/pr113024.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-12-15 09:28:07 UTC
+  Text: Fixed.
+

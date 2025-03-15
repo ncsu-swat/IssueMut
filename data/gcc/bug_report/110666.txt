@@ -1,0 +1,166 @@
+Bug Summary: [14 Regression] wrong code at -O1 and above on x86_64-linux-gnu
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: patch, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2023-07-14 13:45:11 UTC
+  Text: This appears to be a recent regression.
+
+Compiler Explorer:https://godbolt.org/z/xG14vrs6K[501] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/home/suz/suz-local/software/local/gcc-trunk/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20230714 (experimental) (GCC) 
+[502] % 
+[502] % gcctk -O0 small.c; ./a.out
+[503] % gcctk -O1 small.c; ./a.out
+Aborted
+[504] % cat small.c
+int a;
+int main() {
+  if ((a != 2) == a)
+    __builtin_abort();
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2023-07-14 15:02:01 UTC
+  Text: Mine. Let me look at what I did wrong.
+
+- User: Andrew Pinski | Time: 2023-07-14 15:26:39 UTC
+  Text: I totally messed up the !=1/!=0 cases for the outer eq case:
+Patch
+diff --git a/gcc/match.pd b/gcc/match.pd
+index 351d9285e92..3de30df8b06 100644
+--- a/gcc/match.pd
++++ b/gcc/match.pd
+@@ -6431,8 +6431,8 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+
+ /* x != (typeof x)(x == CST) -> CST == 0 ? 1 : (CST == 1 ? (x!=0&&x!=1) : x != 0) */
+ /* x != (typeof x)(x != CST) -> CST == 1 ? 1 : (CST == 0 ? (x!=0&&x!=1) : x != 1) */
+-/* x == (typeof x)(x == CST) -> CST == 0 ? 0 : (CST == 1 ? (x==0||x==1) : x != 0) */
+-/* x == (typeof x)(x != CST) -> CST == 1 ? 0 : (CST == 0 ? (x==0||x==1) : x != 1) */
++/* x == (typeof x)(x == CST) -> CST == 0 ? 0 : (CST == 1 ? (x==0||x==1) : x == 0) */
++/* x == (typeof x)(x != CST) -> CST == 1 ? 0 : (CST == 0 ? (x==0||x==1) : x == 1) */
+ (for outer (ne eq)
+  (for inner (ne eq)
+   (simplify
+@@ -6457,9 +6457,14 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+       )
+      )
+     )
+-    (if (innereq)
+-     (ne @0 { build_zero_cst (TREE_TYPE (@0)); }))
+-    (ne @0 { build_one_cst (TREE_TYPE (@0)); }))
++    (with {
++      tree value = build_int_cst (TREE_TYPE (@0), !innereq);
++     }
++     (if (outereq)
++      (eq @0 { value; })
++      (ne @0 { value; })
++     )
++    )
+    )
+   )
+  )
+
+- User: Andrew Pinski | Time: 2023-07-14 16:38:37 UTC
+  Text: Createdattachment 55544[details]Full testcase to make sure we don't create wrong code
+
+- User: Andrew Pinski | Time: 2023-07-14 20:58:02 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2023-July/624551.html
+
+- User: Zhendong Su | Time: 2023-07-15 05:28:01 UTC
+  Text: A couple of very likely related tests (especially #2 and #3):
+
+*** (1) wrong code at -O2, -O3, and -Os
+
+[539] % gcctk -O1 small.c; ./a.out
+[540] % gcctk -O2 small.c
+[541] % timeout -s 9 5 ./a.out
+Killed
+[542] % cat small.c
+int a, b = -1, c, d = -1;
+int main() {
+  if (a)
+    goto L2;
+ L1:
+  a = 0;
+ L2:
+  b && c;
+  c = ~c * (d ^ (0 || a) || d & b);
+  if (c)
+    goto L1;
+  return 0;
+}
+
+*** (2) wrong code at -O1 and above
+
+[558] % gcctk -O0 small.c; ./a.out
+[559] % gcctk -O1 small.c
+[560] % ./a.out
+Floating point exception
+[561] % cat small.c
+int a = 1, b, c;
+void f(int d) {
+  for (; c < 2; c++) {
+    if (!a)
+      b = -1;
+    a = (d != 4) == d;
+    b = 1 % ~b;
+  }
+}
+int main() { f(1 || b); }
+
+*** (3) wrong code at -O1 and above
+
+[577] % gcctk -O0 small.c; ./a.out
+[578] % gcctk -O1 small.c
+[579] % timeout -s 9 5 ./a.out
+Killed
+[580] % cat small.c
+int a = 1, b, c, d;
+void e(int f) {
+  for (; c < 2; c++) {
+    if (b)
+      d = c;
+    c = d;
+    b = f;
+  }
+}
+int main() { e(((a != 2) != a) != 1); }
+
+- User: Andrew Pinski | Time: 2023-07-15 05:39:36 UTC
+  Text: (In reply to Zhendong Su fromcomment #5)> A couple of very likely related tests (especially #2 and #3):
+> 
+> *** (1) wrong code at -O2, -O3, and -Oscase 1 is a phiopt issue (PR 110252).> *** (2) wrong code at -O1 and aboveCase 2 is this issue.> 
+> *** (3) wrong code at -O1 and aboveCase 3 is this issue too.
+
+- User: GCC Commits | Time: 2023-07-17 06:27:26 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:d20e542ecd8cfc009b120f9e432caeb7005e7c53commitr14-2554-gd20e542ecd8cfc009b120f9e432caeb7005e7c53Author: Andrew Pinski <apinski@marvell.com>
+Date:   Fri Jul 14 09:55:57 2023 -0700
+
+    FixPR 110666: `(a != 2) == a` produces wrong code
+    
+    I had messed up the case where the outer operator is `==`.
+    The check for the resulting should have been `==` and not `!=`.
+    This patch fixes that and adds a full runtime testcase now for
+    all cases to make sure it works.
+    
+    OK? Bootstrapped and tested on x86-64-linux-gnu with no regressions.
+    
+    gcc/ChangeLog:PR tree-optimization/110666* match.pd (A NEEQ (A NEEQ CST)): Fix Outer EQ case.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/110666* gcc.c-torture/execute/pr110666-1.c: New test.
+
+- User: Andrew Pinski | Time: 2023-07-17 06:27:51 UTC
+  Text: Fixed.
+

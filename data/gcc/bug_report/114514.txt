@@ -1,0 +1,184 @@
+Bug Summary: v16qi >> 7 can be optimized with vpcmpgtb
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Hongtao Liu | Time: 2024-03-28 09:38:00 UTC
+  Text: v16qi
+foo2 (v16qi a, v16qi b)
+{
+    return a >> 7;
+}
+
+it can be optimized with
+        vpxor   xmm1, xmm1, xmm1
+        vpcmpgtb        xmm0, xmm1, xmm0
+        ret
+
+currently we generate(emulated with v16hi)
+
+        movl    $16843009, %eax
+        vpsraw  $7, %xmm0, %xmm0
+        vmovd   %eax, %xmm1
+        vpbroadcastd    %xmm1, %xmm1
+        vpandn  %xmm1, %xmm0, %xmm0
+        vpsubb  %xmm1, %xmm0, %xmm0
+
+- User: Andrew Pinski | Time: 2024-03-28 23:09:28 UTC
+  Text: Confirmed.
+
+Note non sign bit can be improved too:
+```
+#define vector __attribute__((vector_size(16)))
+
+typedef vector signed char v16qi;
+typedef vector unsigned char v16uqi;
+
+v16qi
+foo2 (v16qi a, v16qi b)
+{
+    return a >> 6;
+}
+v16uqi
+foo1 (v16uqi a, v16uqi b)
+{
+    return a >> 6;
+}
+```
+
+clang produces:
+```
+_Z4foo2Dv16_aS_:
+        psrlw   $6, %xmm0
+        pand    .LCPI0_0(%rip), %xmm0 #{3,3,3,...}
+        movdqa  .LCPI0_1(%rip), %xmm1 #{2,2,2,...}
+        pxor    %xmm1, %xmm0
+        psubb   %xmm1, %xmm0
+        retq
+_Z4foo1Dv16_hS_:
+        psrlw   $6, %xmm0
+        pand    .LCPI1_0(%rip), %xmm0 #{3,3,3,...}
+        retq
+```
+
+- User: Andrew Pinski | Time: 2024-03-28 23:14:04 UTC
+  Text: For non constant clang produces:
+```
+signedshiftright:
+        movzbl  %dil, %eax
+        movd    %eax, %xmm1
+        psrlw   %xmm1, %xmm0
+        pcmpeqd %xmm2, %xmm2
+        psrlw   %xmm1, %xmm2
+        movdqa  .LCPI0_0(%rip), %xmm3           # xmm3 = [32896,32896,32896,32896,32896,32896,32896,32896]
+        psrlw   %xmm1, %xmm3
+        psrlw   $8, %xmm2
+        punpcklbw       %xmm2, %xmm2            # xmm2 = xmm2[0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7]
+        pshuflw $0, %xmm2, %xmm1                # xmm1 = xmm2[0,0,0,0,4,5,6,7]
+        pshufd  $0, %xmm1, %xmm1                # xmm1 = xmm1[0,0,0,0]
+        pand    %xmm1, %xmm0
+        pxor    %xmm3, %xmm0
+        psubb   %xmm3, %xmm0
+        retq
+
+unsignedshiftrtight:
+        movzbl  %dil, %eax
+        movd    %eax, %xmm1
+        psrlw   %xmm1, %xmm0
+        pcmpeqd %xmm2, %xmm2
+        psrlw   %xmm1, %xmm2
+        psrlw   $8, %xmm2
+        punpcklbw       %xmm2, %xmm2            # xmm2 = xmm2[0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7]
+        pshuflw $0, %xmm2, %xmm1                # xmm1 = xmm2[0,0,0,0,4,5,6,7]
+        pshufd  $0, %xmm1, %xmm1                # xmm1 = xmm1[0,0,0,0]
+        pand    %xmm1, %xmm0
+        retq
+```
+
+I am not sure which way is faster here though.
+
+- User: Hongtao Liu | Time: 2024-03-29 01:03:04 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> Confirmed.
+> 
+> Note non sign bit can be improved too:
+> ```I assume you're talking about broadcast from imm or directly from constant pool. GCC chooses the former, with -Os we can also generate the later.
+According to microbenchmark, the former is better. I also tries to disable broadcasting from imm and test with stress-ng vecmath, the performance is similar.
+
+- User: GCC Commits | Time: 2024-05-16 00:41:14 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:0cc0956b3bb8bcbc9196075b9073a227d799e042commitr15-529-g0cc0956b3bb8bcbc9196075b9073a227d799e042Author: liuhongt <hongtao.liu@intel.com>
+Date:   Tue May 14 18:39:54 2024 +0800
+
+    Optimize ashift >> 7 to vpcmpgtb for vector int8.
+    
+    Since there is no corresponding instruction, the shift operation for
+    vector int8 is implemented using the instructions for vector int16,
+    but for some special shift counts, it can be transformed into vpcmpgtb.
+    
+    gcc/ChangeLog:PR target/114514* config/i386/i386-expand.cc
+            (ix86_expand_vec_shift_qihi_constant): Optimize ashift >> 7 to
+            vpcmpgtb.
+            (ix86_expand_vecop_qihi_partial): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr114514-shift.c: New test.
+
+- User: GCC Commits | Time: 2024-05-16 00:41:19 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:090714e6cf8029f4ff8883dce687200024adbaebcommitr15-530-g090714e6cf8029f4ff8883dce687200024adbaebAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Wed May 15 10:56:24 2024 +0800
+
+    Set d.one_operand_p to true when TARGET_SSSE3 in ix86_expand_vecop_qihi_partial.
+    
+    pshufb is available under TARGET_SSSE3, so
+    ix86_expand_vec_perm_const_1 must return true when TARGET_SSSE3.
+    
+    With the patch under -march=x86-64-v2
+    
+    v8qi
+    foo (v8qi a)
+    {
+      return a >> 5;
+    }
+    
+    <       pmovsxbw        %xmm0, %xmm0
+    <       psraw   $5, %xmm0
+    <       pshufb  .LC0(%rip), %xmm0
+    
+            vs.
+    
+    >       movdqa  %xmm0, %xmm1
+    >       pcmpeqd %xmm0, %xmm0
+    >       pmovsxbw        %xmm1, %xmm1
+    >       psrlw   $8, %xmm0
+    >       psraw   $5, %xmm1
+    >       pand    %xmm1, %xmm0
+    >       packuswb        %xmm0, %xmm0
+    
+    Although there's a memory load from constant pool, but it should be
+    better when it's inside a loop. The load from constant pool can be
+    hoist out. it's 1 instruction vs 4 instructions.
+    
+    <       pshufb  .LC0(%rip), %xmm0
+    
+    vs.
+    
+    >       pcmpeqd %xmm0, %xmm0
+    >       psrlw   $8, %xmm0
+    >       pand    %xmm1, %xmm0
+    >       packuswb        %xmm0, %xmm0
+    
+    gcc/ChangeLog:PR target/114514* config/i386/i386-expand.cc (ix86_expand_vecop_qihi_partial):
+            Set d.one_operand_p to true when TARGET_SSSE3.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr114514-shufb.c: New test.
+
+- User: Hongtao Liu | Time: 2024-05-16 00:42:51 UTC
+  Text: Fixed in GCC15.
+

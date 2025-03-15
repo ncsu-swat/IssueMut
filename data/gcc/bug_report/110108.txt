@@ -1,0 +1,143 @@
+Bug Summary: [14 Regression] Wrong code from combining VPABSB/VPBLENDVB since g:1ede03e2d0437ea9c2f7
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Benji Smith | Time: 2023-06-03 19:09:38 UTC
+  Text: Createdattachment 55249[details]A compressed preprocessed minimal repro of the issue
+
+The following code is a minimal repro showing the issue:
+
+#include <immintrin.h>
+__m128i do_stuff_128(__m128i X0, __m128i X1) {
+	__m128i AbsX0 = _mm_abs_epi8(X0);
+	__m128i Result = _mm_blendv_epi8(AbsX0, X1, AbsX0);
+	return Result;
+}
+
+A preprocessed version of the minimal repro is attached as well
+
+On GCC 13.1, when compiled with `gcc -O1 -mavx2`, it produces this assembly:
+        vpabsb  xmm0, xmm0
+        vpblendvb       xmm0, xmm0, xmm1, xmm0
+        ret
+
+However, on trunk it compiles to:
+        vpabsb  xmm0, xmm0
+        ret
+
+Godbolt link showing more details, and the difference in execution:https://godbolt.org/z/eWszWPva4What appears to be happening is it removes the blend, since VPBLENDVB uses the high bit of the mask, and it assumes the high bit will always be zero due to the abs. However, from reading the spec VPABSB will read signed-bytes as input, but will output as unsigned bytes. If an input byte is 0x80, -128, the absolute value will be 128, which as an unsigned byte is also 0x80. In that case, the high bit could be set, and the blend may use some bytes from the second operand
+
+This appears to have been introduced recently, in the last couple weeks. A bisect shows that this started happening with commit 1ede03e2d0437ea9c2f7453fcbe263505b4e0def, however that commit seems like it might just be hooking up existing functionality there may be another root cause
+
+I have confirmed this still repros on the latest trunk, dec7aaabe9651cb075ace60721b6e36864cc5140
+
+For triage/priority purposes: this issue was not from code I manually wrote, but was found by a fuzzer meant to test SIMD codegen
+
+- User: Andrew Pinski | Time: 2023-06-03 19:46:01 UTC
+  Text: So we should be using ABSU_EXPR instead of ABS for _mm_abs_epi8 I think ...
+
+That will fix the issue.
+
+- User: Andrew Pinski | Time: 2023-06-03 19:48:36 UTC
+  Text: No, there is code which ABS on a signed integer does not overflow (that includes on vector of signed integers) so `ABS<0` is always considered true. This is where ABSU_EXPR comes into play which does not cause an overflow for SCHAR_MIN and will produce SCHAR_MIN always.
+
+- User: Hongtao.liu | Time: 2023-06-05 03:39:34 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> So we should be using ABSU_EXPR instead of ABS for _mm_abs_epi8 I think ...
+> 
+> That will fix the issue.Yes, ABSU_EXPR + VIEW_CONVERT_EXPR.
+
+And also I notice a potential bug with -funsigned-char when folding _mm_blendv_epi8 into VCOND_EXPR (mask < 0, a, b), -funsigned-char will always make mask < 0 false which is not true for pblendvb, I'll submit another separate fix to fold _mm_blendv_epi8 only without -funsigned-char
+
+- User: GCC Commits | Time: 2023-06-09 01:42:17 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:07b86ab138bf8be8cb331015cd2b9775c6856ac6commitr14-1640-g07b86ab138bf8be8cb331015cd2b9775c6856ac6Author: liuhongt <hongtao.liu@intel.com>
+Date:   Mon Jun 5 11:59:33 2023 +0800
+
+    Fold _mm{,256,512}_abs_{epi8,epi16,epi32,epi64} into gimple ABSU_EXPR + VCE.r14-1145fold the intrinsics into gimple ABS_EXPR which has UB for
+    TYPE_MIN, but PABSB will store unsigned result into dst. The patch
+    uses ABSU_EXPR + VCE instead of ABS_EXPR.
+    
+    Also don't fold _mm_abs_{pi8,pi16,pi32} w/o TARGET_64BIT since 64-bit
+    vector absm2 is guarded with TARGET_MMX_WITH_SSE.
+    
+    gcc/ChangeLog:PR target/110108* config/i386/i386.cc (ix86_gimple_fold_builtin): Fold
+            _mm{,256,512}_abs_{epi8,epi16,epi32,epi64} into gimple
+            ABSU_EXPR + VCE, don't fold _mm_abs_{pi8,pi16,pi32} w/o
+            TARGET_64BIT.
+            * config/i386/i386-builtin.def: Replace CODE_FOR_nothing with
+            real codename for __builtin_ia32_pabs{b,w,d}.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110108.c: New test.
+            * gcc.target/i386/pr110108-3.c: New test.
+            * gcc.target/i386/pr109900.c: Adjust testcase.
+
+- User: GCC Commits | Time: 2023-06-09 01:42:22 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:dac73e4c64bf62be18bd5203e4e0f3e6bc64b4dccommitr14-1641-gdac73e4c64bf62be18bd5203e4e0f3e6bc64b4dcAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Mon Jun 5 12:38:41 2023 +0800
+
+    Explicitly view_convert_expr mask to signed type when folding pblendvb builtins.
+    
+    Since mask < 0 will be always false for vector char when
+    -funsigned-char, but vpblendvb needs to check the most significant
+    bit. The patch explicitly VCE to vector signed char.
+    
+    gcc/ChangeLog:PR target/110108* config/i386/i386.cc (ix86_gimple_fold_builtin): Explicitly
+            view_convert_expr mask to signed type when folding pblendvb
+            builtins.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110108-2.c: New test.
+
+- User: GCC Commits | Time: 2023-06-09 01:46:24 UTC
+  Text: The releases/gcc-13 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:5e01a590aa719d235811c1549547f736de2b5190commitr13-7430-g5e01a590aa719d235811c1549547f736de2b5190Author: liuhongt <hongtao.liu@intel.com>
+Date:   Mon Jun 5 12:38:41 2023 +0800
+
+    Explicitly view_convert_expr mask to signed type when folding pblendvb builtins.
+    
+    Since mask < 0 will be always false for vector char when
+    -funsigned-char, but vpblendvb needs to check the most significant
+    bit. The patch explicitly VCE to vector signed char.
+    
+    gcc/ChangeLog:PR target/110108* config/i386/i386.cc (ix86_gimple_fold_builtin): Explicitly
+            view_convert_expr mask to signed type when folding pblendvb
+            builtins.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110108-2.c: New test.
+
+- User: GCC Commits | Time: 2023-06-09 01:47:08 UTC
+  Text: The releases/gcc-12 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:887f903ab05ddcac498247384734efbc6cf45147commitr12-9686-g887f903ab05ddcac498247384734efbc6cf45147Author: liuhongt <hongtao.liu@intel.com>
+Date:   Mon Jun 5 12:38:41 2023 +0800
+
+    Explicitly view_convert_expr mask to signed type when folding pblendvb builtins.
+    
+    Since mask < 0 will be always false for vector char when
+    -funsigned-char, but vpblendvb needs to check the most significant
+    bit. The patch explicitly VCE to vector signed char.
+    
+    gcc/ChangeLog:PR target/110108* config/i386/i386.cc (ix86_gimple_fold_builtin): Explicitly
+            view_convert_expr mask to signed type when folding pblendvb
+            builtins.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110108-2.c: New test.
+
+- User: Hongtao.liu | Time: 2023-06-09 03:05:50 UTC
+  Text: Fixed for trunk.
+
+- User: Benji Smith | Time: 2023-06-09 11:47:40 UTC
+  Text: Yes, updated to the latest trunk (dac73e4c64bf62be18bd5203e4e0f3e6bc64b4dc) and confirmed that it no longer repros. Thanks for the fix!
+
+- User: Andrew Pinski | Time: 2023-06-09 14:44:33 UTC
+  Text: Fixed.
+

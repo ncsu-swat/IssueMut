@@ -1,0 +1,147 @@
+Bug Summary: [12 Regression] Assigning array elements in the wrong order after floating point optimization since r12-8841
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 11.4.0, 12.1.0, 12.2.0, 12.3.1, 13.1.0, 14.0
+Known to Fail: 12.3.0
+
+Comments:
+- User: N/A | Time: 2024-02-13 00:00:15 UTC
+  Text: Createdattachment 57404[details]Test program and build_and_run script
+
+/* file: f.cpp */
+extern double a1; // 1.0
+extern double a2; // 1.0
+
+void f(double K[2], bool b)
+{
+    double A[] = {
+        b ? a1 : a2,
+        0,
+        0,
+        0
+    };
+
+    double sum{};
+    for(double  a : A) sum += a;
+    for(double& a : A) a /= sum;
+
+    if (b) {
+        K[0] = A[0]; // 1.0
+        K[1] = A[1]; // 0.0
+    } else {
+        K[0] = A[0] + A[1];
+    }
+}
+
+/* file: main.cpp */
+#include <iostream>
+
+double a1 = 1.0;
+double a2 = 1.0;
+
+void f(double K[2], bool b);
+
+int main()
+{
+    double K[2]{};
+    f(K, true);
+    std::cout << K[0] << "\t" << K[1] << "\n";
+}
+
+Bug: Returns different results when compiled with different optimization settings:
+g++ -O2 -ffast-math f.cpp main.cpp -o good
+g++ -O3 -ffast-math f.cpp main.cpp -o bad
+./good outputs "1 0"
+./bad outputs "0 1"
+
+The bug is reproduced in systems:
+* Fedora-37-1.7 x64 with latest gcc autoupdate (12.3.1 20230508)
+* Debian-12.2.0 x64 with gcc-12.3.1 build from sources
+
+In the gcc-12 branch:
+* Last good commit: d127348d7711e148e5ddd205a8c3409b37fae64c (12.2.1 20221017)
+* First bad commit: fe7d74313736b8e1c30812bc49419f419bdf1c53 (12.2.1 20221017)
+* Last tested bad commit: 4ced4ca95001f1583623c801c9c3642224a2c4f0 (12.3.1 20240210)
+
+In the gcc-13 branch - There is no bug:
+* Last tested good commit: c891d8dc23e1a46ad9f3e757d09e57b500d40044 (13.2.0)
+In the gcc-14 branch - There is no bug:
+* Last tested good commit: cff174fabd6c980c09aee95db1d9d5c22421761f (14.0.1 20240210)
+
+Note: Function f() is a simplified version of the XSpline::linearCombinationFor() function from the scantailor-experimental project:https://github.com/ImageProcessing-ElectronicPublications/scantailor-experimental/blob/main/src/math/XSpline.cppNow the bug has been temporarily resolved by declaring array A volatile.
+
+- User: Andrew Pinski | Time: 2024-02-13 00:16:04 UTC
+  Text: r12-8841-gfe7d74313736b8
+
+- User: Richard Biener | Time: 2024-02-13 08:42:20 UTC
+  Text: what fixed it?
+
+- User: Richard Biener | Time: 2024-02-13 08:43:31 UTC
+  Text: Hmm, OK, it was a backport..  I'll see.
+
+- User: Richard Biener | Time: 2024-02-13 12:36:06 UTC
+  Text: I have a bit of a deja-vu here.  The SLP permute optimization phase was rewritten for GCC 13, the following fixes the latent issue for GCC 12:
+
+diff --git a/gcc/tree-vect-slp.cc b/gcc/tree-vect-slp.cc
+index af477c31aa3..b3e3d9e7009 100644
+--- a/gcc/tree-vect-slp.cc
++++ b/gcc/tree-vect-slp.cc
+@@ -4058,6 +4058,15 @@ vect_optimize_slp (vec_info *vinfo)
+                {
+                  /* Preserve the special VEC_PERM we use to shield existing
+                     vector defs from the rest.  But make it a no-op.  */
++                 auto_vec<stmt_vec_info, 64> saved;
++                 saved.create (SLP_TREE_SCALAR_STMTS (old).length ());
++                 for (unsigned i = 0;
++                      i < SLP_TREE_SCALAR_STMTS (old).length (); ++i)
++                   saved.quick_push (SLP_TREE_SCALAR_STMTS (old)[i]);
++                 for (unsigned i = 0;
++                      i < SLP_TREE_SCALAR_STMTS (old).length (); ++i)
++                   SLP_TREE_SCALAR_STMTS (old)[i]
++                     = saved[SLP_TREE_LANE_PERMUTATION (old)[i].second];
+                  unsigned i = 0;
+                  for (std::pair<unsigned, unsigned> &p
+                       : SLP_TREE_LANE_PERMUTATION (old))
+
+- User: GCC Commits | Time: 2024-02-13 12:42:36 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:4a1cd5560b9b545eb848eb1d1e06d345fb606f76commitr14-8957-g4a1cd5560b9b545eb848eb1d1e06d345fb606f76Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Feb 13 13:39:29 2024 +0100
+
+    tree-optimization/113896 - testcase for fixed PR
+    
+    The SLP permute optimization rewrite fixed this.PR tree-optimization/113896* g++.dg/torture/pr113896.C: New testcase.
+
+- User: GCC Commits | Time: 2024-02-13 12:48:56 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:8a93dc34e90cd8e2bb073f8fd48f671aea62d965commitr13-8323-g8a93dc34e90cd8e2bb073f8fd48f671aea62d965Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Feb 13 13:39:29 2024 +0100
+
+    tree-optimization/113896 - testcase for fixed PR
+    
+    The SLP permute optimization rewrite fixed this.PR tree-optimization/113896* g++.dg/torture/pr113896.C: New testcase.
+    
+    (cherry picked from commit 4a1cd5560b9b545eb848eb1d1e06d345fb606f76)
+
+- User: GCC Commits | Time: 2024-02-14 11:43:32 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:2f16c53558d01135f0f78cf78a2f722b774684d7commitr12-10155-g2f16c53558d01135f0f78cf78a2f722b774684d7Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Feb 13 13:43:44 2024 +0100
+
+    tree-optimization/113896 - reduction of permuted external vector
+    
+    The following fixes eliding of the permutation of a BB reduction
+    of an existing vector which breaks materialization of live lanes
+    as we fail to permute the SLP_TREE_SCALAR_STMTS vector.PR tree-optimization/113896* tree-vect-slp.cc (vect_optimize_slp): Permute
+            SLP_TREE_SCALAR_STMTS when eliding a permuation in a
+            VEC_PERM node we need to preserve because it wraps an
+            extern vector.
+    
+            * g++.dg/torture/pr113896.C: New testcase.
+
+- User: Richard Biener | Time: 2024-02-14 11:43:53 UTC
+  Text: Fixed.
+
+- User: N/A | Time: 2024-02-15 03:16:44 UTC
+  Text: I confirm that the original bug in the scantailor-experimental project was also fixed by commit 2f16c53558d01135f0f78cf78a2f722b774684d7.
+

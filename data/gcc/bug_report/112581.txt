@@ -1,0 +1,186 @@
+Bug Summary: [14 Regression] wrong code at -O2 and -O3 on x86_64-linux-gnu (generated code hangs) since r14-4661 due to reassoc not handling maybe_undefs
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: patch, wrong-code
+Known to Work: 13.2.1
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2023-11-17 05:07:18 UTC
+  Text: This should be a very recent regression as it does not seem to reproduce with the latest build on Compiler Explorer. 
+
+
+[530] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20231117 (experimental) (GCC) 
+[531] % 
+[531] % gcctk -Os small.c
+[532] % ./a.out
+[533] % 
+[533] % gcctk -O2 small.c
+[534] % timeout -s 9 5 ./a.out
+Killed
+[535] % 
+[535] % cat small.c
+int a = -1, b = 2501896061, c, d, e, f = 3, g;
+int main() {
+  unsigned h;
+  int i;
+  d = 0;
+  for (; d < 1; d++) {
+    int j = ~-((6UL ^ a) / b);
+    if (b)
+    L:
+      if (!f)
+        continue;
+    if (c)
+      i = 1;
+    if (j) {
+      i = 0;
+      while (e)
+        ;
+    }
+    g = -1 % b;
+    h = ~(b || h);
+    f = g || 0;
+    a = a || 0;
+    if (!a)
+      h = 0;
+    while (h > 4294967294)
+      if (i)
+        break;
+    if (c)
+      goto L;
+  }
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2023-11-17 05:13:43 UTC
+  Text: It might be one of the x86 specific target patches ...
+
+- User: Richard Biener | Time: 2023-11-17 07:15:35 UTC
+  Text: Confirmed.
+
+- User: Uroš Bizjak | Time: 2023-11-17 09:26:21 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> It might be one of the x86 specific target patches ...I don't think so, these patches deal specifically with high registers, and:
+
+$ grep %.hpr112581.s
+
+finds none.
+
+- User: Jakub Jelinek | Time: 2023-11-17 11:16:02 UTC
+  Text: Started withr14-4661-g29a4453c7b8a86d242dab89b9e4d222749fd911e
+
+- User: Andrew Pinski | Time: 2023-11-17 22:41:10 UTC
+  Text: Looking into what is going wrong.
+
+- User: Andrew Pinski | Time: 2023-11-17 23:04:17 UTC
+  Text: forwprop3 does:
+```
+  _12 = ~iftmp.7_30;
+  h_40 = (unsigned int) _12;
+...
+  if (h_40 == 4294967295)
+```
+
+into:
+```
+  _75 = (unsigned int) iftmp.7_30;
+  if (iftmp.7_30 == 0)
+```
+
+Which as far as I can tell is correct.
+
+And then reassociate2 combines:
+```
+  <bb 18> [local count: 57431765]:
+  if (iftmp.7_30 == 0)
+    goto <bb 19>; [97.17%]
+  else
+    goto <bb 20>; [2.83%]
+
+  <bb 19> [local count: 55807730]:
+  if (i_27 != 0)
+    goto <bb 20>; [100.00%]
+  else
+    goto <bb 17>; [0.00%]
+```
+into:
+```
+  <bb 18> [local count: 57431765]:
+  _75 = iftmp.7_30 | i_27;
+  _33 = _75 == 0;
+  if (_33 != 0)
+    goto <bb 17>; [97.17%]
+  else
+    goto <bb 19>; [2.83%]
+```
+
+or
+```
+if ((_30 == 0) & (i_27 == 0)) goto <17> else goto <19/20>
+```
+Which looks correct.
+I don't see anything going wrong with the patch itself ...
+
+- User: Andrew Pinski | Time: 2023-11-17 23:14:31 UTC
+  Text: Wait a minute, h might be uninitialized.
+
+
+So the issue is inside reassociate which is must not have recognized that iftmp.7_30 is defined by a maybe an uninitialized variable ...
+
+- User: Andrew Pinski | Time: 2023-11-17 23:18:14 UTC
+  Text: tree-ssa-reassoc.cc needs to call mark_ssa_maybe_undefs and checks ssa_name_maybe_undef_p similar to the way tree-ssa-ifcombine.cc does it.
+
+- User: Andrew Pinski | Time: 2023-11-17 23:25:07 UTC
+  Text: Adding -fdisable-tree-reassoc2 causes the problem not to happen so yes it is a bug in reassoc. If I get some time next week I will look into adding the support.
+
+- User: Andrew Pinski | Time: 2023-11-18 04:09:08 UTC
+  Text: I have a patch but I don't like it since it requires to touch gimple-if-to-switch.cc since that uses init_range_entry.  Maybe someone else can come up with a better patch.
+
+- User: Andrew Pinski | Time: 2023-12-21 21:07:11 UTC
+  Text: I will going to take a stab at fixing this.
+
+- User: Andrew Pinski | Time: 2023-12-23 18:36:34 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2023-December/641368.html
+
+- User: GCC Commits | Time: 2024-01-10 17:11:19 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:113475d03b0ab1ab18a509e8e5844c1a43983b24commitr14-7114-g113475d03b0ab1ab18a509e8e5844c1a43983b24Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Fri Nov 17 20:06:37 2023 -0800
+
+    reassoc vs uninitialized variable [PR112581]
+    
+    Liker14-2293-g11350734240dbaandr14-2289-gb083203f053f16,
+    reassociation can combine across a few bb and one of the usage
+    can be an uninitializated variable and if going from an conditional
+    usage to an unconditional usage can cause wrong code.
+    This uses maybe_undef_p like other passes where this can happen.
+    
+    Note if-to-switch uses the function (init_range_entry) provided
+    by ressociation so we need to call mark_ssa_maybe_undefs there;
+    otherwise we assume almost all ssa names are uninitialized.
+    
+    Bootstrapped and tested on x86_64-linux-gnu.
+    
+    gcc/ChangeLog:PR tree-optimization/112581* gimple-if-to-switch.cc (pass_if_to_switch::execute): Call
+            mark_ssa_maybe_undefs.
+            * tree-ssa-reassoc.cc (can_reassociate_op_p): Uninitialized
+            variables can not be reassociated.
+            (init_range_entry): Check for uninitialized variables too.
+            (init_reassoc): Call mark_ssa_maybe_undefs.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/112581* gcc.c-torture/execute/pr112581-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-01-10 17:11:42 UTC
+  Text: Fixed.
+

@@ -1,0 +1,195 @@
+Bug Summary: [14 regression] bizarre register dance on x86_64 for pass-by-value struct since r14-2526
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 13.2.0
+Known to Fail: 14.0
+
+Comments:
+- User: Matteo Italia | Time: 2024-03-01 09:16:52 UTC
+  Text: Sample code (+ godbolt linkhttps://godbolt.org/z/zf6e16Wcq)
+
+```
+struct P2d {
+    double x, y;
+};
+
+double sumxy(double x, double y) {
+    return x + y;
+}
+
+double sumxy_p(P2d p) {
+    return p.x + p.y;
+}
+
+double sumxy_p_ref(const P2d& p) {
+    return p.x + p.y;
+}
+```
+
+with g++ 13.2 -O3 generates a perfectly reasonable
+
+```
+sumxy(double, double):
+        addsd   xmm0, xmm1
+        ret
+sumxy_p(P2d):
+        addsd   xmm0, xmm1
+        ret
+sumxy_p_ref(P2d const&):
+        movsd   xmm0, QWORD PTR [rdi]
+        addsd   xmm0, QWORD PTR [rdi+8]
+        ret
+```
+
+instead with g++ 14 (g++ (Compiler-Explorer-Build-gcc-b05f474c8f7768dad50a99a2d676660ee4db09c6-binutils-2.40) 14.0.1 20240301 (experimental)) we get
+
+```
+sumxy(double, double):
+        addsd   xmm0, xmm1
+        ret
+sumxy_p(P2d):
+        movq    rax, xmm1
+        movq    rdx, xmm0
+        xchg    rdx, rax
+        movq    xmm0, rax
+        movq    xmm2, rdx
+        addsd   xmm0, xmm2
+        ret
+sumxy_p_ref(P2d const&):
+        movsd   xmm0, QWORD PTR [rdi]
+        addsd   xmm0, QWORD PTR [rdi+8]
+        ret
+```
+
+Notice the bizarre registers dance for sumxy_p(P2d) (p.x goes through xmm0 → rdx → rax → xmm0; p.y in turn xmm1 → rax → rdx → xmm2; then they finally get summed); sumxy(double, double) which, register-wise, should be the same, is unaffected.
+
+This exact same code (both for gcc 13 and gcc 14) is generated at all optimization levels I tested (-Og, -O1, -O2, -O3) except -O0 of course, so it doesn't seem to depend from particular optimization passes enabled only at high optimization levels. Also (as reasonable) it doesn't seem to depend on the C++ frontend, as compiling this with plain gcc (adding a typedef for the struct and changing the reference to a pointer) yields the exact same results.
+
+Most importantly, it seems something target-specific, as ARM64 builds don't exhibit particular problems, and produce pretty much the same (reasonable) code both on 14.0 and 13.2
+
+```
+sumxy(double, double):
+        fadd    d0, d0, d1
+        ret
+sumxy_p(P2d):
+        fadd    d0, d0, d1
+        ret
+sumxy_p_ref(P2d const&):
+        ldp     d0, d31, [x0]
+        fadd    d0, d0, d31
+        ret
+```
+
+(gcc 13.2 generates slightly different code for sumxy_p_ref, but in a very minor way)
+
+Fiddling around, with -march=nocona (that leaves gcc 13.2 unaffected) I get a more compact but still absurd dance:
+
+```
+sumxy_p(P2d):
+        movsd   QWORD PTR [rsp-8], xmm1
+        mov     rdx, QWORD PTR [rsp-8]
+        movq    xmm2, rdx
+        addsd   xmm0, xmm2
+        ret
+```
+
+here p.x is left in xmm0 where it should, but xmm1 goes through the stack (!), a GP register (rdx) and finally to xmm2. It feels like in general it wants to launder xmm1 through a 64 bit GP register before summing it, a bit like a light version of -ffloat-store.
+
+- User: Andrew Pinski | Time: 2024-03-01 09:27:14 UTC
+  Text: Most likely related to the TImode changes...
+
+- User: Jakub Jelinek | Time: 2024-03-01 12:53:29 UTC
+  Text: Indeed,r14-2526-g8911879415d6c2a7baad88235554a912887a1c5c
+
+- User: Roger Sayle | Time: 2024-03-01 16:08:07 UTC
+  Text: There's a missing simplification in combine:
+
+Trying 6 -> 11:
+    6: r102:TI=zero_extend(r109:DF#0)<<0x40|zero_extend(r108:DF#0)
+      REG_DEAD r108:DF
+      REG_DEAD r109:DF
+   11: r105:DF=r102:TI#0+r102:TI#8
+      REG_DEAD r102:TI
+Failed to match this instruction:
+(set (reg:DF 105 [ _4 ])
+    (plus:DF (subreg:DF (ior:TI (ashift:TI (zero_extend:TI (subreg:DI (reg:DF 109) 0))
+                    (const_int 64 [0x40]))
+                (zero_extend:TI (subreg:DI (reg:DF 108) 0))) 8)
+        (reg:DF 108)))
+
+where the lowpart is getting simplified to reg:DF 108, but the highpart isn't getting simplified to reg:DF 109.  i.e.
+
+(subreg:DF (ior:TI (ashift:TI (zero_extend:TI (subreg:DI (reg:DF 109) 0))
+                              (const_int 64 [0x40]))
+                              (zero_extend:TI (subreg:DI (reg:DF 108) 0))) 8)
+can be simplified to just (reg:DF 109).
+
+I'm looking into why this isn't happening.
+
+- User: Roger Sayle | Time: 2024-03-01 19:15:44 UTC
+  Text: Createdattachment 57587[details]proposed patch
+
+Proposed fix attached.  Currently bootstrapping and regression testing.  The problematic code (from March 2023) has an interesting history.
+
+- User: GCC Commits | Time: 2024-03-04 00:51:49 UTC
+  Text: The master branch has been updated by Roger Sayle <sayle@gcc.gnu.org>:https://gcc.gnu.org/g:d35b5b0e0a0727cfdaba5f859e44116c33648639commitr14-9287-gd35b5b0e0a0727cfdaba5f859e44116c33648639Author: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Mon Mar 4 00:47:08 2024 +0000PR target/114187: Fix ?Fmode SUBREG simplification in simplify_subreg.
+    
+    This patch fixesPR target/114187a typo/missed-optimization in simplify-rtx
+    that's exposed by (my) changes to x86_64's parameter passing.  The context
+    is that construction of double word (TImode) values now uses the idiom:
+    
+    (ior:TI (ashift:TI (zero_extend:TI (reg:DI x)) (const_int 64 [0x40]))
+            (zero_extend:TI (reg:DI y)))
+    
+    Extracting the DImode highpart and lowpart halves of this complex expression
+    is supported by simplications in simplify_subreg.  The problem is when the
+    doubleword TImode value represents two DFmode fields, there isn't a direct
+    simplification to extract the highpart or lowpart SUBREGs, but instead GCC
+    uses two steps, extract the DImode {high,low} part and then cast the result
+    back to a floating point mode, DFmode.
+    
+    The (buggy) code to do this is:
+    
+      /* If the outer mode is not integral, try taking a subreg with the equivalent
+         integer outer mode and then bitcasting the result.
+         Other simplifications rely on integer to integer subregs and we'd
+         potentially miss out on optimizations otherwise.  */
+      if (known_gt (GET_MODE_SIZE (innermode),
+                    GET_MODE_SIZE (outermode))
+          && SCALAR_INT_MODE_P (innermode)
+          && !SCALAR_INT_MODE_P (outermode)
+          && int_mode_for_size (GET_MODE_BITSIZE (outermode),
+                                0).exists (&int_outermode))
+        {
+          rtx tem = simplify_subreg (int_outermode, op, innermode, byte);
+          if (tem)
+            return simplify_gen_subreg (outermode, tem, int_outermode, byte);
+        }
+    
+    The issue/mistake is that the second call, to simplify_subreg, shouldn't
+    use "byte" as the final argument; the offset has already been handled by
+    the first call, to simplify_subreg, and this second call is just a type
+    conversion from an integer mode to floating point (from DImode to DFmode).
+    
+    Interestingly, this mistake was already spotted by Richard Sandiford when
+    the optimization was originally contributed in January 2023.https://gcc.gnu.org/pipermail/gcc-patches/2023-January/610920.html>> Richard Sandiford writes:
+    >> Also, the final line should pass 0 rather than byte.
+    
+    Unfortunately a miscommunication/misunderstanding in a later threadhttps://gcc.gnu.org/pipermail/gcc-patches/2023-February/612898.htmlresulted in this correction being undone.  Using lowpart_subreg should
+    avoid/reduce confusion in future.
+    
+    2024-03-03  Roger Sayle  <roger@nextmovesoftware.com>
+    
+    gcc/ChangeLogPR target/114187* simplify-rtx.cc (simplify_context::simplify_subreg): Call
+            lowpart_subreg to perform type conversion, to avoid confusion
+            over the offset to use in the call to simplify_reg_subreg.
+    
+    gcc/testsuite/ChangeLogPR target/114187* g++.target/i386/pr114187.C: New test case.
+
+- User: Richard Biener | Time: 2024-03-04 13:19:10 UTC
+  Text: Fixed I assume.
+

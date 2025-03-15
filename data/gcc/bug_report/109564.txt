@@ -1,0 +1,481 @@
+Bug Summary: [13/14 Regression] libkeccak miscompiled
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Richard Biener | Time: 2023-04-20 06:59:17 UTC
+  Text: It seems we started to miscompile libkeccak very recently (r13-7162-gd339e9802f758ewas OK).
+
+When you build libkeccak from its version 1.3.1.2 tarball (https://github.com/maandree/libkeccak), edit config.mk to pick the correct compiler.  Building
+with -O0 is fine, even -O1 gets things wrong.> make
+> make checkit's small, so bisection should be easily possible (will try that manually now)
+
+- User: Richard Biener | Time: 2023-04-20 07:13:17 UTC
+  Text: bisected tor13-7170-g9c2a5db997446a
+
+- User: Richard Biener | Time: 2023-04-20 07:25:39 UTC
+  Text: The only difference in .optimized is in libkeccak_degeneralise_spec.c and
+the first difference appears in 130t.dom2 (at -O1 the only ranger consumer).
+
+- User: Richard Biener | Time: 2023-04-20 07:37:56 UTC
+  Text: Createdattachment 54886[details]preprocessed source of the affected TU
+
+it contains the single affected function libkeccak_degeneralise_spec and nothing else.
+
+- User: Richard Biener | Time: 2023-04-20 07:51:07 UTC
+  Text: Createdattachment 54887[details]testcase
+
+- User: Richard Biener | Time: 2023-04-20 08:15:06 UTC
+  Text: So the failure mode is different than the previous case since there's no backedge involved at all.  Instead all of the VREL_EQ relations we add
+are for PHIs like
+
+output_73 = PHI <output_72(23), output_42(D)(37)>
+
+where we equate the result with the single (possibly) initialized argument
+(the other arg is always a default def).  Note we refrain from doing
+the similar optimization in copyprop (it's not "optimistic" in this regard,
+unlike CCP), but historically to avoid missing uninit diagnostics.
+
+A single added relation is enough to trigger the issue.  With
+
+diff --git a/gcc/gimple-range-fold.cc b/gcc/gimple-range-fold.cc
+index 429734f954a..fd97739140e 100644
+--- a/gcc/gimple-range-fold.cc
++++ b/gcc/gimple-range-fold.cc
+@@ -44,6 +44,7 @@ along with GCC; see the file COPYING3.  If not see
+ #include "value-query.h"
+ #include "gimple-range-op.h"
+ #include "gimple-range.h"
++#include "dbgcnt.h"
+ // Construct a fur_source, and set the m_query field.
+ 
+ fur_source::fur_source (range_query *q)
+@@ -814,7 +815,7 @@ fold_using_range::range_of_phi (vrange &r, gphi *phi, fur_source &src)
+                    single_arg = NULL;
+                    break;
+                  }
+-           if (single_arg)
++           if (single_arg && dbg_cnt (treepre_insert))
+              src.register_relation (phi, VREL_EQ, phi_def, single_arg);
+          }
+        else if (src.get_operand (arg_range, single_arg)
+
+and -fdbg-cnt=treepre_insert:1-1 we see
+
+***dbgcnt: lower limit 1 reached for treepre_insert.***
+***dbgcnt: upper limit 1 reached for treepre_insert.***
+ Registering value_relation (state_size_17 == _1) (bb6) at state_size_17 = PHI <state_size_35(D)(2), _1(5)>
+   GLOBAL : UPDATE cache for state_size_17 in BB 6 : successors :   : No updates!
+             TRUE : (204) range_of_stmt (state_size_17) [irange] long int [1, 1600] NONZERO 0x7ff
+
+state_size_17 : CACHE: BB 10 DOM query for state_size_17, found [irange] long int [1, 1600] NONZERO 0x7ff at BB6
+CACHE: Range for DOM returns : [irange] long int [1, 1600] NONZERO 0x7ff
+Filled from dominator! :  [irange] long int [1, 1600] NONZERO 0x7ff
+Checking Equivalence ( == ) _1
+CACHE: BB 10 DOM query for _1, found [irange] long int [-65536, -65536][1, 1600] at BB9
+
+so I _think_ what goes wrong is that when we go to see
+
+ if (_1 != -65536)
+   {
+     if (_1 in [1, 1600])
+       goto merge;
+   }
+ else
+   goto merge;
+
+merge:
+ state_size_17 = PHI <state_size_35(D)(2), _1(5)>
+
+we somehow arrive at state_size_17 _not_ considering _1 == -65536 because
+of the equivalence.  That is we somehow use equivalences to "skip"
+edges when processing PHI merges of incoming ranges?  Basically when
+computing the range for state_size_17 we merge the range of the equivalences
+but only from the edge it appears in as argument?
+
+That looks flawed.
+
+A much simplified testcase can probably be constructed.
+
+- User: Martin Liška | Time: 2023-04-20 08:35:51 UTC
+  Text: (In reply to Richard Biener fromcomment #4)> Createdattachment 54887[details]> testcaseNote the reduced test-case already started to fail withr13-1938-g87dd4c8c83768a.
+
+- User: Richard Biener | Time: 2023-04-20 08:38:22 UTC
+  Text: Createdattachment 54891[details]a bit reduced testcase
+
+I've reduced the testcase a bit manually.  I'm not 100% sure my analysis holds.
+
+- User: Richard Biener | Time: 2023-04-20 08:57:55 UTC
+  Text: We basically see
+
+ if (!have_bitrate) { 
+  state_size = (have_state_size ? state_size : (1600L));
+  output = ((state_size << 5) / 100L + 7L) & ~0x07L;
+  bitrate = output << 1;
+ }
+
+optimized to
+
+ if (!have_bitrate) { 
+  output = ((state_size << 5) / 100L + 7L) & ~0x07L;
+  bitrate = output << 1;
+ }
+
+thus the inner have_state_size gets optimized (state_size != -65536).
+
+So I wonder if when seeing
+
+  if (_1 != -65536)
+
+at a place dominated by the
+
+  # state_size_8 = PHI <state_size_17(D), _1>
+
+PHI we derive the state_size_8 == _1 equivalence relation from we're
+considering this equivalent to
+
+ if (state_size_8 != -65536)
+
+?  Again this PHI is from
+
+  <bb2>
+  if (_1 != -65536)
+    <bb3>
+    goto bb5;
+  else
+    goto bb5;
+  <bb5>
+  # state_size_8 = PHI <state_size_17(D)(2), _1(3)>
+
+so clearly state_size_8 is "optimistically" equal to _1 but _1 is _not_
+equal to state_size_8 (even optimistically).
+
+That is, the equality relation doesn't hold both ways in case there's
+UNDEFINED (or even just influenced by UNDEFINED!) ranges involved.
+
+So if VR_EQ always hold both ways I think we need to scrap the skipping
+of arg_range.undefined ().  For invariants we will of course use the
+equivalence only one-way so those are fine.
+
+The following tries to single out this case and avoids registering a
+symbolic equivalence if we've ignored any edge (but as said that might
+not be good enough because ranges might have folded in UNDEFINED
+ranges).  I fear something more fundamental is broken here and we
+possibly should play safe and not register any equivalence relation
+from PHIs.
+
+diff --git a/gcc/gimple-range-fold.cc b/gcc/gimple-range-fold.cc
+index 429734f954a..0c4ffbf3b57 100644
+--- a/gcc/gimple-range-fold.cc
++++ b/gcc/gimple-range-fold.cc
+@@ -743,6 +744,7 @@ fold_using_range::range_of_phi (vrange &r, gphi *phi, fur_source &src)
+   // Track if all executable arguments are the same.
+   tree single_arg = NULL_TREE;
+   bool seen_arg = false;
++  bool seen_undefined = false;
+ 
+   // Start with an empty range, unioning in each argument's range.
+   r.set_undefined ();
+@@ -781,6 +783,8 @@ fold_using_range::range_of_phi (vrange &r, gphi *phi, fur_source &src)
+          else if (single_arg != arg)
+            single_arg = NULL_TREE;
+        }
++      else
++       seen_undefined = true;
+ 
+       // Once the value reaches varying, stop looking.
+       if (r.varying_p () && single_arg == NULL_TREE)
+@@ -802,7 +806,8 @@ fold_using_range::range_of_phi (vrange &r, gphi *phi, fur_source &src)
+            // dominate any incoming edge for SINGLE_ARG.
+            // SeePR 108139and 109462.
+            basic_block bb = gimple_bb (phi);
+-           if (!dom_info_available_p (CDI_DOMINATORS))
++           if (seen_undefined
++               || !dom_info_available_p (CDI_DOMINATORS))
+              single_arg = NULL;
+            else
+              for (x = 0; x < gimple_phi_num_args (phi); x++)
+
+- User: Martin Liška | Time: 2023-04-20 08:59:26 UTC
+  Text: Simplified a bit more to:
+
+struct libkeccak_generalised_spec {
+  int state_size;
+  int word_size;
+} main_gspec;
+
+long gvar;
+
+int libkeccak_degeneralise_spec(struct libkeccak_generalised_spec *spec) {
+  int state_size;
+  int have_state_size = spec->state_size != -1;
+  int have_word_size = spec->word_size;
+
+  if (have_state_size)
+    state_size = spec->state_size;
+  if (have_word_size)
+    gvar = 12345;
+  if (have_state_size && state_size != spec->word_size)
+    return 1;
+  if (spec)
+    gvar++;
+  return 0;
+}
+
+int main() {
+  main_gspec.state_size = -1;
+  if (libkeccak_degeneralise_spec(&main_gspec))
+    __builtin_abort();
+}
+
+- User: Richard Biener | Time: 2023-04-20 09:19:57 UTC
+  Text: (In reply to Richard Biener fromcomment #8)> I fear something more fundamental is broken here and we
+> possibly should play safe and not register any equivalence relation
+> from PHIs.
+> 
+> diff --git a/gcc/gimple-range-fold.cc b/gcc/gimple-range-fold.cc
+> index 429734f954a..0c4ffbf3b57 100644
+> --- a/gcc/gimple-range-fold.cc
+> +++ b/gcc/gimple-range-fold.cc
+> @@ -743,6 +744,7 @@ fold_using_range::range_of_phi (vrange &r, gphi *phi,
+> fur_source &src)
+>    // Track if all executable arguments are the same.
+>    tree single_arg = NULL_TREE;
+>    bool seen_arg = false;
+> +  bool seen_undefined = false;
+>  
+>    // Start with an empty range, unioning in each argument's range.
+>    r.set_undefined ();
+> @@ -781,6 +783,8 @@ fold_using_range::range_of_phi (vrange &r, gphi *phi,
+> fur_source &src)
+>           else if (single_arg != arg)
+>             single_arg = NULL_TREE;
+>         }
+> +      else
+> +       seen_undefined = true;
+>  
+>        // Once the value reaches varying, stop looking.
+>        if (r.varying_p () && single_arg == NULL_TREE)
+> @@ -802,7 +806,8 @@ fold_using_range::range_of_phi (vrange &r, gphi *phi,
+> fur_source &src)
+>             // dominate any incoming edge for SINGLE_ARG.
+>             // SeePR 108139and 109462.
+>             basic_block bb = gimple_bb (phi);
+> -           if (!dom_info_available_p (CDI_DOMINATORS))
+> +           if (seen_undefined
+> +               || !dom_info_available_p (CDI_DOMINATORS))
+>               single_arg = NULL;
+>             else
+>               for (x = 0; x < gimple_phi_num_args (phi); x++)So on a second thought since with the above we only register equality
+for PHIs with all arguments comparing pointer equal that case should be
+OK in _all_ cases (including the backedge one).  But it's of course
+very rare in the end.
+
+It's btw similar for not executable edges in case arg_range gets undefined_p
+in that case.  So I don't think we can allow that case either.
+
+- User: Jakub Jelinek | Time: 2023-04-20 09:43:55 UTC
+  Text: Of course, it wouldn't hurt to change the libkeccak as well.
+It clearly added
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+to avoid the uninitialized warnings, but in that case they are just asking for such warnings with their bad style:
+  const int have_state_size = spec->state_size != (-65536L);
+
+  if (have_state_size)
+    {
+      state_size = spec->state_size;
+      ...
+    }
+Ugh, why?  Just do
+  state_size = spec->state_size;
+  if (have_state_size)
+    {
+      ...
+    }
+Ditto for all the others.
+
+- User: Richard Biener | Time: 2023-04-20 09:45:23 UTC
+  Text: Completely scrapping PHI equivalences will cause
+
+FAIL: gcc.dg/pr102648.c scan-tree-dump-not optimized "foo"
+FAIL: gcc.dg/pr103359.c scan-tree-dump-not evrp "c = 0"
+FAIL: gcc.dg/tree-ssa/evrp-ignore.c scan-tree-dump-not evrp "kill"
+FAIL: gcc.dg/tree-ssa/vrp06.c scan-tree-dump-times vrp1 "Folding predicate i_[0-9]+.*j_[0-9]+.* to 0" 1
+
+allowing all-equal PHI args doesn't make a difference.
+
+The vrp06.c case for example is
+
+ bb5:
+ if (0 != 0)
+   bb6: i_16 = ...;
+ bb7:
+ # i_2 = PHI <i_10(D)(5), i_16(6)>
+
+where i_16 gets undefined_p ().
+
+The equivalence looks OK in this case.  I'm not sure I completely understand
+the failure mode yet.
+
+- User: Richard Biener | Time: 2023-04-20 09:49:27 UTC
+  Text: (In reply to Martin Liška fromcomment #9)> Simplified a bit more to:
+> 
+> struct libkeccak_generalised_spec {
+>   int state_size;
+>   int word_size;
+> } main_gspec;
+> 
+> long gvar;
+> 
+> int libkeccak_degeneralise_spec(struct libkeccak_generalised_spec *spec) {
+>   int state_size;
+>   int have_state_size = spec->state_size != -1;
+>   int have_word_size = spec->word_size;
+> 
+>   if (have_state_size)
+>     state_size = spec->state_size;
+>   if (have_word_size)
+>     gvar = 12345;
+>   if (have_state_size && state_size != spec->word_size)
+>     return 1;
+>   if (spec)
+>     gvar++;
+>   return 0;
+> }
+> 
+> int main() {
+>   main_gspec.state_size = -1;
+>   if (libkeccak_degeneralise_spec(&main_gspec))
+>     __builtin_abort();
+> }One difference is that this testcase is fixed with -fno-thread-jumps while
+the attached reduced one is not (it requires -fno-tree-dominator-opts).
+
+- User: Richard Biener | Time: 2023-04-20 10:28:20 UTC
+  Text: I think the issue is a bit more involved - when
+
+ _1 = PHI <_2, _3>
+
+and _2 is UNDEFINED _on the edge!_, the equivalence _1 == _3 only holds
+when the condition making _2 UNDEFINED holds.  Trivially that's for
+all blocks dominated by that edge but that's exactly zero blocks
+(unless it's a backedge but that would likely have other issues).
+
+Now, when the edge was proven to be not executable the story is different
+I think - still the equivalence then only holds for blocks dominated by
+the PHI.  So we can replace _1 with _3 but not _3 with _1 outside of such
+region.
+
+The bottom line is equivalences derived from PHIs are conditional (not global),
+much like equivalences derived from if (_1 == _2) are.  But somehow
+they end up being used differently:
+
+Optimizing block #12
+
+1>>> STMT 1 = _3 le_expr -65536
+1>>> STMT 1 = _3 ge_expr -65536 
+1>>> STMT 1 = _3 eq_expr -65536
+1>>> STMT 0 = _3 ne_expr -65536
+0>>> COPY _3 = -65536
+Optimizing statement if (_1 != -65536)
+226      range_of_expr(_1) at stmt if (_1 != -65536)
+227        range_on_entry (_1) to BB 12
+228          range_of_stmt (_1) at stmt _1 = *spec_16(D).state_size;
+             TRUE : (228)  cached (_1) [irange] long int VARYING
+
+_1 : CACHE: BB 12 DOM query for _1, found [irange] long int [-65536, -65536][1, 1600] at BB5
+CACHE: Range for DOM returns : [irange] long int [-65536, -65536][1, 1600]
+Filled from dominator! :  [irange] long int [-65536, -65536][1, 1600]
+
+good sofar, but then:
+
+Checking Equivalence ( == ) state_size_8
+CACHE: BB 12 DOM query for state_size_8, found [irange] long int [1, 1600] NONZERO 0x7ff at BB5
+CACHE: Range for DOM returns : [irange] long int [1, 1600] NONZERO 0x7ff
+Equivalence update! :  state_size_8 has range  :  [irange] long int [1, 1600] NONZERO 0x7ff refining range to :[irange] long int [1, 1600] NONZERO 0x7ff
+
+oops.
+
+- User: Richard Biener | Time: 2023-04-20 11:03:59 UTC
+  Text: Createdattachment 54892[details]patch I am testing
+
+This is the patch I am testing which XFAILs the four testcases.  It would be
+nice to somehow recover the unexecutable edge cases and somehow distinguish
+them from UNDEFINED arguments.  I'm not sure if ranger has anything to
+track that besides relying on UNDEFINED being propagated as range across such
+edges?
+
+- User: Richard Biener | Time: 2023-04-20 11:55:57 UTC
+  Text: (In reply to Richard Biener fromcomment #15)> Createdattachment 54892[details]> patch I am testingBootstrapped and tested on x86_64-unknown-linux-gnu, the XFAILs of
+gcc.dg/pr102648.c and gcc.dg/pr103359.c are not necessary.> This is the patch I am testing which XFAILs the four testcases.  It would be
+> nice to somehow recover the unexecutable edge cases and somehow distinguish
+> them from UNDEFINED arguments.  I'm not sure if ranger has anything to
+> track that besides relying on UNDEFINED being propagated as range across such
+> edges?
+
+- User: Andrew Macleod | Time: 2023-04-20 14:22:01 UTC
+  Text: Createdattachment 54893[details]new patch
+
+Alternatively, we can simply allow undefined SSA_NAMES to also be checked or single arguments like everything else.   We were ignoring SSA_NAMEs that were UNDEFINED when it came to comparing arguments, which allows them to "ignored" basically.
+
+I kicked off a build with this patch but I am traveling today so may not be too timely.  I think its should also fully resolve this.
+
+For the next release I was thinking about adding one way equivalences for PHIs.. or at leats treating ithis situation differently.  that is looking like a better idea :-)
+
+- User: Andrew Macleod | Time: 2023-04-20 16:21:42 UTC
+  Text: (In reply to Richard Biener fromcomment #16)> (In reply to Richard Biener fromcomment #15)
+> > Createdattachment 54892[details]> > patch I am testing
+> 
+> Bootstrapped and tested on x86_64-unknown-linux-gnu, the XFAILs of
+> gcc.dg/pr102648.c and gcc.dg/pr103359.c are not necessary.
+> 
+> > This is the patch I am testing which XFAILs the four testcases.  It would be
+> > nice to somehow recover the unexecutable edge cases and somehow distinguish
+> > them from UNDEFINED arguments.  I'm not sure if ranger has anything to
+> > track that besides relying on UNDEFINED being propagated as range across such
+> > edges?btw, thanks for all the investigation/patch work.  much appreciated :-)
+
+- User: GCC Commits | Time: 2023-04-20 17:49:28 UTC
+  Text: The master branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:17aa9ddb34581855dd013745c8be27dda024de4acommitr14-122-g17aa9ddb34581855dd013745c8be27dda024de4aAuthor: Andrew MacLeod <amacleod@redhat.com>
+Date:   Thu Apr 20 13:10:40 2023 -0400
+
+    Do not ignore UNDEFINED ranges when determining PHI equivalences.
+    
+    Do not ignore UNDEFINED name arguments when registering two-way equivalences
+    from PHIs.PR tree-optimization/109564gcc/
+            * gimple-range-fold.cc (fold_using_range::range_of_phi): Do no ignore
+            UNDEFINED range names when deciding if all PHI arguments are the same,
+    
+            gcc/testsuite/
+            * gcc.dg/torture/pr109564-1.c: New testcase.
+            * gcc.dg/torture/pr109564-2.c: Likewise.
+            * gcc.dg/tree-ssa/evrp-ignore.c: XFAIL.
+            * gcc.dg/tree-ssa/vrp06.c: Likewise.
+
+- User: GCC Commits | Time: 2023-04-21 06:20:34 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:f980561c60b0446cc427595198d7f3f4f90e0924commitr13-7231-gf980561c60b0446cc427595198d7f3f4f90e0924Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Thu Apr 20 13:10:40 2023 -0400
+
+    Do not ignore UNDEFINED ranges when determining PHI equivalences.
+    
+    Do not ignore UNDEFINED name arguments when registering two-way equivalences
+    from PHIs.PR tree-optimization/109564gcc/
+            * gimple-range-fold.cc (fold_using_range::range_of_phi): Do no ignore
+            UNDEFINED range names when deciding if all PHI arguments are the same,
+    
+            gcc/testsuite/
+            * gcc.dg/torture/pr109564-1.c: New testcase.
+            * gcc.dg/torture/pr109564-2.c: Likewise.
+            * gcc.dg/tree-ssa/evrp-ignore.c: XFAIL.
+            * gcc.dg/tree-ssa/vrp06.c: Likewise.
+    
+    (cherry picked from commit 17aa9ddb34581855dd013745c8be27dda024de4a)
+
+- User: Richard Biener | Time: 2023-04-21 07:49:09 UTC
+  Text: Fixed.
+

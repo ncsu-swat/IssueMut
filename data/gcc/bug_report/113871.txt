@@ -1,0 +1,171 @@
+Bug Summary: psrlq is not used for PERM<a,{0},1,2,3,4>
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2024-02-11 05:23:04 UTC
+  Text: Take:
+```
+#define vect64 __attribute__((vector_size(8)))
+
+void f(vect64unsigned short *a)
+{
+  *a = __builtin_shufflevector(*a,(vect64 unsigned short){0}, 1,2,3, 4);
+}
+```
+
+This should just produce:
+```
+        movq   (%rdi), %xmm0
+        psrlq  $16, %xmm0, %xmm0
+        movq   %xmm0, (%rdi)
+        retq
+```
+
+But instead we get:
+```
+        movzwl  6(%rdi), %eax
+        movzwl  4(%rdi), %edx
+        salq    $16, %rax
+        orq     %rdx, %rax
+        movzwl  2(%rdi), %edx
+        salq    $16, %rax
+        orq     %rdx, %rax
+        movq    %rax, (%rdi)
+        ret
+```
+
+With AVX enabled we get slightly better:
+```
+f:
+.LFB0:
+        .cfi_startproc
+        vmovq   (%rdi), %xmm0
+        vpxor   %xmm1, %xmm1, %xmm1
+        vpshufb .LC1(%rip), %xmm1, %xmm1
+        vpshufb .LC0(%rip), %xmm0, %xmm0
+        vpor    %xmm1, %xmm0, %xmm0
+        vmovq   %xmm0, (%rdi)
+        ret
+```
+
+Note LLVM is able to catch this for x86_64 (for aarch64, GCC is able to use `ushr d31, d31, 16` while LLVM does not).
+
+I suspect vec_shr_<mode> pattern is missing and once it is added, it will just work.
+
+- User: Andrew Pinski | Time: 2024-02-11 05:32:54 UTC
+  Text: Note LLVM is not able to handle this for aarch64; filehttps://github.com/llvm/llvm-project/issues/81393for that.
+
+- User: Andrew Pinski | Time: 2024-02-11 05:56:31 UTC
+  Text: Note `PERM<{0},a,{1,2,3,4}>` should be handled too, that means defining `vec_shl_` patterns too.
+
+- User: Richard Biener | Time: 2024-02-12 08:46:49 UTC
+  Text: Confirmed.
+
+- User: Uroš Bizjak | Time: 2024-02-13 18:27:08 UTC
+  Text: Createdattachment 57417[details]Proposed patch
+
+Patch in testing.
+
+- User: Uroš Bizjak | Time: 2024-02-14 08:16:05 UTC
+  Text: Createdattachment 57419[details]Proposed v2 patch
+
+New version in testing, also handles 32-bit vectors.
+
+- User: GCC Commits | Time: 2024-02-14 19:44:51 UTC
+  Text: The master branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:2c2f57e4158924467afbf4c2fd3938e507287dabcommitr14-8989-g2c2f57e4158924467afbf4c2fd3938e507287dabAuthor: Uros Bizjak <ubizjak@gmail.com>
+Date:   Wed Feb 14 20:41:42 2024 +0100
+
+    i386: psrlq is not used for PERM<a,{0},1,2,3,4> [PR113871]
+    
+    Introduce vec_shl_<mode> and vec_shr_<mode> expanders to improve
+    
+            '*a = __builtin_shufflevector(*a, (vect64){0}, 1, 2, 3, 4);'
+    
+    and
+            '*a = __builtin_shufflevector((vect64){0}, *a, 3, 4, 5, 6);'
+    
+    shuffles.  The generated code improves from:
+    
+            movzwl  6(%rdi), %eax
+            movzwl  4(%rdi), %edx
+            salq    $16, %rax
+            orq     %rdx, %rax
+            movzwl  2(%rdi), %edx
+            salq    $16, %rax
+            orq     %rdx, %rax
+            movq    %rax, (%rdi)
+    
+    to:
+            movq    (%rdi), %xmm0
+            psrlq   $16, %xmm0
+            movq    %xmm0, (%rdi)
+    
+    and to:
+            movq    (%rdi), %xmm0
+            psllq   $16, %xmm0
+            movq    %xmm0, (%rdi)
+    
+    in the second case.
+    
+    The patch handles 32-bit vectors as well and improves generated code from:
+    
+            movd    (%rdi), %xmm0
+            pxor    %xmm1, %xmm1
+            punpcklwd       %xmm1, %xmm0
+            pshuflw $230, %xmm0, %xmm0
+            movd    %xmm0, (%rdi)
+    
+    to:
+            movd    (%rdi), %xmm0
+            psrld   $16, %xmm0
+            movd    %xmm0, (%rdi)
+    
+    and to:
+            movd    (%rdi), %xmm0
+            pslld   $16, %xmm0
+            movd    %xmm0, (%rdi)PR target/113871gcc/ChangeLog:
+    
+            * config/i386/mmx.md (V248FI): New mode iterator.
+            (V24FI_32): DItto.
+            (vec_shl_<V248FI:mode>): New expander.
+            (vec_shl_<V24FI_32:mode>): Ditto.
+            (vec_shr_<V248FI:mode>): Ditto.
+            (vec_shr_<V24FI_32:mode>): Ditto.
+            * config/i386/sse.md (vec_shl_<V_128:mode>): Simplify expander.
+            (vec_shr_<V248FI:mode>): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr113871-1a.c: New test.
+            * gcc.target/i386/pr113871-1b.c: New test.
+            * gcc.target/i386/pr113871-2a.c: New test.
+            * gcc.target/i386/pr113871-2b.c: New test.
+            * gcc.target/i386/pr113871-3a.c: New test.
+            * gcc.target/i386/pr113871-3b.c: New test.
+            * gcc.target/i386/pr113871-4a.c: New test.
+
+- User: Uroš Bizjak | Time: 2024-02-14 19:48:33 UTC
+  Text: Implemented for gcc-14.
+
+- User: GCC Commits | Time: 2024-02-27 17:42:32 UTC
+  Text: The master branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:15d1dae0d4d1be88d28ad7578a60fd3e36de36d8commitr14-9198-g15d1dae0d4d1be88d28ad7578a60fd3e36de36d8Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Tue Feb 27 18:41:24 2024 +0100
+
+    i386: psrlq is not used for PERM<a,{0},1,2,3,4> [PR113871]
+    
+    Also handle V2BF mode.PR target/113871gcc/ChangeLog:
+    
+            * config/i386/mmx.md (V248FI): Add V2BF mode.
+            (V24FI_32): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr113871-5a.c: New test.
+            * gcc.target/i386/pr113871-5b.c: New test.
+

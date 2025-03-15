@@ -1,0 +1,331 @@
+Bug Summary: wrong code with _BitInt() and -O -fgraphite-identity
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-02-22 05:29:19 UTC
+  Text: Createdattachment 57486[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -O -fgraphite-identity testcase.c
+$ ./a.out
+Aborted
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-9117-20240221083607-g5772ea772d1-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-9117-20240221083607-g5772ea772d1-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240221 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-02-22 07:34:53 UTC
+  Text: Confirmed.
+
+  if (ub4_0_17(D) > 1)
+    goto <bb 3>; [59.00%]
+  else
+    goto <bb 4>; [41.00%]
+
+is gone missing.
+
+Graphite is almost definitely not maintained either ...
+
+- User: Richard Biener | Time: 2024-02-22 10:57:24 UTC
+  Text: Maybe this is graphite thinking that __int128_t can cover all IVs, but not
+sure, I don't see anything obviously wrong but I didn't look too close.
+
+I'm sure this is a latent issue and not _BitInt specific though.
+
+- User: Jakub Jelinek | Time: 2024-02-22 11:08:35 UTC
+  Text: I thought graphite is done only after bitint lowering.
+At that point, there should be just <= MAX_FIXED_MODE_SIZE BITINT_TYPEs around in the IL, with the exception of loading SSA_NAMEs from memory in order to pass them to function calls, or undefined SSA_NAMEs, or usually TREE_ADDRESSABLE PARM_DECLs being converted to something else.
+Would be probably wise to punt on graphite optimizations on loops which have those larger SSA_NAMEs anywhere in the loop bodies.
+That said, ub4_0_17(D) is unsigned _BitInt(4).
+
+- User: rguenther@suse.de | Time: 2024-02-22 13:17:21 UTC
+  Text: On Thu, 22 Feb 2024, jakub at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=114041> 
+> ---Comment #3from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> I thought graphite is done only after bitint lowering.
+> At that point, there should be just <= MAX_FIXED_MODE_SIZE BITINT_TYPEs around
+> in the IL, with the exception of loading SSA_NAMEs from memory in order to pass
+> them to function calls, or undefined SSA_NAMEs, or usually TREE_ADDRESSABLE
+> PARM_DECLs being converted to something else.
+> Would be probably wise to punt on graphite optimizations on loops which have
+> those larger SSA_NAMEs anywhere in the loop bodies.
+> That said, ub4_0_17(D) is unsigned _BitInt(4).I think we want to understand what goes wrong, not just disable
+graphite on any BitInt.
+
+- User: Jakub Jelinek | Time: 2024-02-27 16:50:15 UTC
+  Text: Reduced testcase:
+
+unsigned a[24], b[24];
+
+__attribute__((noipa)) unsigned
+foo (unsigned _BitInt(4) x)
+{
+  for (int i = 0; i < 24; ++i)
+    a[i] = i;
+  unsigned e = __builtin_stdc_bit_ceil (x);
+  for (int i = 0; i < 24; ++i)
+    b[i] = i;
+  return e;
+}
+
+int
+main ()
+{
+  if (foo (0) != 1)
+    __builtin_abort ();
+}
+
+I have to confirm Andrew's comment, before the graphite dump there was
+  if (x_14(D) > 1)
+    goto <bb 5>; [59.00%]
+  else
+    goto <bb 11>; [41.00%]
+
+  <bb 11> [local count: 17609365]:
+  goto <bb 6>; [100.00%]
+
+  <bb 5> [local count: 25340307]:
+  _2 = x_14(D) + 15;
+  _3 = (unsigned int) _2;
+  _4 = __builtin_clz (_3);
+  _5 = 31 - _4;
+  _6 = 2 << _5;
+  iftmp.1_15 = (unsigned int) _6;
+
+  <bb 6> [local count: 42949672]:
+  # iftmp.1_10 = PHI <iftmp.1_15(5), 1(11)>
+This isn't part of any kind of loop, it is in between 2 different loops.
+Graphite hoists some of the statements to bb 2 where it is unconditional:
+  _32 = x_14(D) + 15;
+  _33 = (unsigned int) _32;
+the rest of it remains after the first loop, but is now unconditional:
+  <bb 18> [count: 0]:
+  _47 = 1;
+  _31 = __builtin_clz (_33);
+  _34 = 31 - _31;
+  _35 = 2 << _34;
+  iftmp.1_36 = (unsigned int) _35;
+  _48 = iftmp.1_36;
+  iftmp.1_37 = _48;
+In the testcase x is 0, so __builtin_stdc_bit_ceil returns 1, but when we take the > 1
+path, it is 2 << (31 - 24) instead.
+The above feels like what ifcvt would do, if that _47 in there stands for one of the phi arguments and _48 for the other.  Except __builtin_clz invokes UB when run on 0 (which is one of the reasons why it was guarded) and there is no conditional merging at the end.
+
+- User: Jakub Jelinek | Time: 2024-02-27 16:53:22 UTC
+  Text: unsigned a[24], b[24];
+
+__attribute__((noipa)) unsigned
+foo (unsigned char x)
+{
+  for (int i = 0; i < 24; ++i)
+    a[i] = i;
+  unsigned e = __builtin_stdc_bit_ceil (x);
+  for (int i = 0; i < 24; ++i)
+    b[i] = i;
+  return e;
+}
+
+int
+main ()
+{
+  if (foo (0) != 1)
+    __builtin_abort ();
+}
+
+works right, but s/unsigned char/unsigned _BitInt(8)/ does not, so it must be something in graphite that handles INTEGER_TYPE and not all integral types.
+
+- User: Jakub Jelinek | Time: 2024-02-27 18:13:55 UTC
+  Text: There is just INTEGER_TYPE test in all graphite*, so
+2024-02-27  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114041* graphite-sese-to-poly.cc (add_conditions_to_domain): Handle
+	BITINT_TYPE like INTEGER_TYPE.
+
+	* gcc.dg/graphite/run-id-pr114041.c: New test.
+
+--- gcc/graphite-sese-to-poly.cc.jj	2024-01-03 11:51:29.136764430 +0100
++++ gcc/graphite-sese-to-poly.cc	2024-02-27 18:56:06.536686265 +0100
+@@ -391,8 +391,11 @@ add_conditions_to_domain (poly_bb_p pbb)
+       {
+       case GIMPLE_COND:
+ 	  {
+-            /* Don't constrain on anything else than INTEGER_TYPE.  */
+-	    if (TREE_CODE (TREE_TYPE (gimple_cond_lhs (stmt))) != INTEGER_TYPE)
++            /* Don't constrain on anything else than INTEGER_TYPE
++	       or BITINT_TYPE.  */
++	    tree cmp_type = TREE_TYPE (gimple_cond_lhs (stmt));
++	    if (TREE_CODE (cmp_type) != INTEGER_TYPE
++		&& TREE_CODE (cmp_type) != BITINT_TYPE)
+               break;
+ 
+ 	    gcond *cond_stmt = as_a <gcond *> (stmt);
+--- gcc/testsuite/gcc.dg/graphite/run-id-pr114041.c.jj	2024-02-27 18:42:26.864025806 +0100
++++ gcc/testsuite/gcc.dg/graphite/run-id-pr114041.c	2024-02-27 18:43:07.310466262 +0100
+@@ -0,0 +1,23 @@
++/*PR tree-optimization/114041*/
++/* { dg-require-effective-target bitint } */
++/* { dg-options "-O -fgraphite-identity" } */
++
++unsigned a[24], b[24];
++
++__attribute__((noipa)) unsigned
++foo (unsigned _BitInt(8) x)
++{
++  for (int i = 0; i < 24; ++i)
++    a[i] = i;
++  unsigned e = __builtin_stdc_bit_ceil (x);
++  for (int i = 0; i < 24; ++i)
++    b[i] = i;
++  return e;
++}
++
++int
++main ()
++{
++  if (foo (0) != 1)
++    __builtin_abort ();
++}
+
+fixes it.
+
+- User: Jakub Jelinek | Time: 2024-02-27 18:21:06 UTC
+  Text: Ah, but
+unsigned a[24], b[24];
+enum E { E0 = 0, E1 = 1, E42 = 42, E56 = 56 };
+
+__attribute__((noipa)) unsigned
+foo (enum E x)
+{
+  for (int i = 0; i < 24; ++i)
+    a[i] = i;
+  unsigned e;
+  if (x >= E42)
+    e = __builtin_clz ((unsigned) x);
+  else
+    e = 42;
+  for (int i = 0; i < 24; ++i)
+    b[i] = i;
+  return e;
+}
+
+int
+main ()
+{
+  if (foo (E1) != 42 || foo (E56) != __SIZEOF_INT__ * __CHAR_BIT__ - 6)
+    __builtin_abort ();
+}
+fails as well.  So, dunno if it shouldn't be testing for INTEGRAL_TYPE_P,
+or be dropped altogether (when the check was added inr6-2239-g4bc4dd11ec8c7be528abcb75a1af715d715b4835, parameter_index_in_region
+punted on anything but INTEGER_TYPE, but that is gone from there for years).
+
+What about floating point compares, vector compares, etc.?
+Although
+unsigned a[24], b[24];
+
+__attribute__((noipa)) unsigned
+foo (float x)
+{
+  for (int i = 0; i < 24; ++i)
+    a[i] = i;
+  unsigned e;
+  if (x >= 42.0)
+    e = x;
+  else
+    e = 15;
+  for (int i = 0; i < 24; ++i)
+    b[i] = i;
+  return e;
+}
+
+int
+main ()
+{
+  if (foo (1.0f) != 15 || foo (45.0f) != 45)
+    __builtin_abort ();
+}
+doesn't fail.
+
+- User: Jakub Jelinek | Time: 2024-02-27 18:39:49 UTC
+  Text: Createdattachment 57554[details]gcc14-pr114041.patch
+
+stmt_simple_for_scop_p tests for INTEGRAL_TYPE_P (it used to test INTEGER_TYPE some years ago), so I think we should do the same here too.
+
+- User: Richard Biener | Time: 2024-02-28 08:19:07 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #9)> Createdattachment 57554[details]> gcc14-pr114041.patch
+> 
+> stmt_simple_for_scop_p tests for INTEGRAL_TYPE_P (it used to test
+> INTEGER_TYPE some years ago), so I think we should do the same here too.Yes, I think the test in add_conditions_to_domain should be an assert,
+we can, at that point, not simply "ignore" any constraint (and while
+we technically can fail this function isn't set up for that).
+
+- User: GCC Commits | Time: 2024-02-28 09:00:27 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d6479050ecef10fd5e67b4da989229e4cfac53eecommitr14-9204-gd6479050ecef10fd5e67b4da989229e4cfac53eeAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Feb 28 09:59:45 2024 +0100
+
+    graphite: Fix non-INTEGER_TYPE integral comparison handling [PR114041]
+    
+    The following testcases are miscompiled, because graphite ignores boolean,
+    enumerated or _BitInt comparisons, rewrites the code as if the comparisons
+    were always true or always false.
+    
+    The INTEGER_TYPE checks were initially added inr6-2239but at that point
+    it was both in add_conditions_to_domain and in parameter_index_in_region.
+    Later on the check was also added to stmt_simple_for_scop_p, and finallyr8-3931changed the stmt_simple_for_scop_p check to INTEGRAL_TYPE_P
+    and turned the parameter_index_in_region -> assign_parameter_index_in_region
+    into INTEGRAL_TYPE_P assertion, but the add_conditions_to_domain check
+    for INTEGER_TYPE remained.
+    
+    The following patch uses INTEGRAL_TYPE_P to complete the change.
+    
+    2024-02-28  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114041* graphite-sese-to-poly.cc (add_conditions_to_domain): Check for
+            INTEGRAL_TYPE_P check rather than INTEGER_TYPE.
+    
+            * gcc.dg/graphite/run-id-pr114041-1.c: New test.
+            * gcc.dg/graphite/run-id-pr114041-2.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-28 09:01:44 UTC
+  Text: I can change the comparison into assert, or defer that for stage1?
+
+- User: Jakub Jelinek | Time: 2024-02-28 09:02:03 UTC
+  Text: Anyway, miscompilation now fixed.
+
+- User: rguenther@suse.de | Time: 2024-02-28 09:21:30 UTC
+  Text: On Wed, 28 Feb 2024, jakub at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=114041> 
+> ---Comment #12from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> I can change the comparison into assert, or defer that for stage1?Defer I think, if you want to bother ...
+
+- User: GCC Commits | Time: 2024-03-02 00:39:22 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:ed3588982a5ce058c7b27f33c54c7118adbaf164commitr13-8395-ged3588982a5ce058c7b27f33c54c7118adbaf164Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Feb 28 09:59:45 2024 +0100
+
+    graphite: Fix non-INTEGER_TYPE integral comparison handling [PR114041]
+    
+    The following testcases are miscompiled, because graphite ignores boolean,
+    enumerated or _BitInt comparisons, rewrites the code as if the comparisons
+    were always true or always false.
+    
+    The INTEGER_TYPE checks were initially added inr6-2239but at that point
+    it was both in add_conditions_to_domain and in parameter_index_in_region.
+    Later on the check was also added to stmt_simple_for_scop_p, and finallyr8-3931changed the stmt_simple_for_scop_p check to INTEGRAL_TYPE_P
+    and turned the parameter_index_in_region -> assign_parameter_index_in_region
+    into INTEGRAL_TYPE_P assertion, but the add_conditions_to_domain check
+    for INTEGER_TYPE remained.
+    
+    The following patch uses INTEGRAL_TYPE_P to complete the change.
+    
+    2024-02-28  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114041* graphite-sese-to-poly.cc (add_conditions_to_domain): Check for
+            INTEGRAL_TYPE_P check rather than INTEGER_TYPE.
+    
+            * gcc.dg/graphite/run-id-pr114041-2.c: New test.
+    
+    (cherry picked from commit d6479050ecef10fd5e67b4da989229e4cfac53ee)
+

@@ -1,0 +1,160 @@
+Bug Summary: ICE: in expand_fn_using_insn, at internal-fn.cc:208 with _BitInt() and -O -fno-tree-dce
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-02-22 07:01:00 UTC
+  Text: Createdattachment 57489[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O -fno-tree-dce testcase.c 
+during RTL pass: expand
+testcase.c: In function 'foo':
+testcase.c:5:7: internal compiler error: in expand_fn_using_insn, at internal-fn.cc:208
+    5 |   5 | __builtin_stdc_bit_floor(ub256_0) & 4;
+      |       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+0x79b2a7 expand_fn_using_insn
+        /repo/gcc-trunk/gcc/internal-fn.cc:208
+0xf83d8f expand_call_stmt
+        /repo/gcc-trunk/gcc/cfgexpand.cc:2771
+0xf83d8f expand_gimple_stmt_1
+        /repo/gcc-trunk/gcc/cfgexpand.cc:3932
+0xf83d8f expand_gimple_stmt
+        /repo/gcc-trunk/gcc/cfgexpand.cc:4077
+0xf8a2fe expand_gimple_basic_block
+        /repo/gcc-trunk/gcc/cfgexpand.cc:6133
+0xf8bfd7 execute
+        /repo/gcc-trunk/gcc/cfgexpand.cc:6872
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-9117-20240221083607-g5772ea772d1-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-9117-20240221083607-g5772ea772d1-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240221 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-02-22 07:24:44 UTC
+  Text: Confirmed.
+
+
+ccp1 leaves around:
+.CLZ (3);
+
+So does forwprop1 (if we do -fno-tree-ccp).
+
+So does fre.
+
+So does many passes really.
+
+- User: Richard Biener | Time: 2024-02-22 12:06:35 UTC
+  Text: Only DCE removes these kind of stmts.  RTL expansion needs to be forgiving here
+but I guess it's bitint lowering failing to catch this call.
+
+- User: Jakub Jelinek | Time: 2024-02-22 17:07:54 UTC
+  Text: Smaller testcase:
+void
+foo (void)
+{
+  unsigned _BitInt(256) a = 3;
+  __builtin_clzg (a);
+}
+
+The thing is that in this testcase bitint lowering doesn't even know it should do anything.
+The whole behavior of the pass is keyed on there being any SSA_NAMEs for middle/large/huge BITINT_TYPE with some extra exceptions (it looks at virtual SSA_NAMEs to see if there isn't a memory store of a middle+ _BitInt INTEGER_CST and for scalar floating point SSA_NAMEs if they aren't computed from conversion from middle+ _BitInt INTEGER_CSTs), and even if the pass for some other reason triggers in the function,
+it will not look at statements which don't have any large+ _BitInt SSA_NAMEs, or are large+ _BitInt INTEGER_CST store or FLOAT_EXPR from large+ _BitInt INTEGER_CST or the overflow ifns with _Complex large+ _BitInt result.
+We really don't want to lower those ifns like .CLZ/.CTZ/.CLRSB/.POPCOUNT/.PARITY/.FFS
+with INTEGER_CST operands, or after all even say .ADD_OVERFLOW (0, 1) where just operands are large/huge _BitInt but say _Complex int result, those are all expected to be folded instead.
+Now, if s/^void/int;s/__builtin/return &/' above, we fold it in gimple_fold_stmt_to_constant_1:
+#0  wi::clz (x=...) at ../../gcc/wide-int.cc:2164
+#1  0x00000000008a9d9b in fold_const_call_ss (result=0x7fffffffc4e0, fn=CFN_CLZ, arg=..., precision=32, arg_type=<bitint_type 0x7fffea2db5e8>) at ../../gcc/fold-const-call.cc:1029
+#2  0x00000000008aa9a5 in fold_const_call_1 (fn=CFN_CLZ, type=<integer_type 0x7fffea14c5e8 int>, arg=<integer_cst 0x7fffea2e5c18>) at ../../gcc/fold-const-call.cc:1254
+#3  0x00000000008ab4d6 in fold_const_call (fn=CFN_CLZ, type=<integer_type 0x7fffea14c5e8 int>, arg=<integer_cst 0x7fffea2e5c18>) at ../../gcc/fold-const-call.cc:1385
+#4  0x000000000189d6e0 in gimple_resimplify1 (seq=0x0, res_op=0x7fffffffc980, valueize=0xf42f7d <valueize_op_1(tree)>) at ../../gcc/gimple-match-exports.cc:925
+#5  0x000000000189b419 in gimple_match_op::resimplify (this=0x7fffffffc980, seq=0x0, valueize=0xf42f7d <valueize_op_1(tree)>) at ../../gcc/gimple-match-exports.cc:111
+#6  0x000000000189d5b3 in gimple_simplify (stmt=<gimple_call 0x7fffea13aea0>, res_op=0x7fffffffc980, seq=0x0, valueize=0xf42f7d <valueize_op_1(tree)>, 
+    top_valueize=0xf42f41 <valueize_op(tree)>) at ../../gcc/gimple-match-exports.cc:898
+#7  0x000000000090986a in gimple_fold_stmt_to_constant_1 (stmt=<gimple_call 0x7fffea13aea0>, valueize=0xf42f41 <valueize_op(tree)>, gvalueize=0xf42f7d <valueize_op_1(tree)>)
+    at ../../gcc/gimple-fold.cc:7551
+#8  0x0000000000f4308a in ccp_fold (stmt=<gimple_call 0x7fffea13aea0>) at ../../gcc/tree-ssa-ccp.cc:1290
+#9  0x0000000000f48d1b in evaluate_stmt (stmt=<gimple_call 0x7fffea13aea0>) at ../../gcc/tree-ssa-ccp.cc:2228
+or with extra -fno-tree-ccp in:
+#0  wi::clz (x=...) at ../../gcc/wide-int.cc:2164
+#1  0x00000000008a9d9b in fold_const_call_ss (result=0x7fffffffceb0, fn=CFN_CLZ, arg=..., precision=32, arg_type=<bitint_type 0x7fffea2db5e8>) at ../../gcc/fold-const-call.cc:1029
+#2  0x00000000008aa9a5 in fold_const_call_1 (fn=CFN_CLZ, type=<integer_type 0x7fffea14c5e8 int>, arg=<integer_cst 0x7fffea2e5c18>) at ../../gcc/fold-const-call.cc:1254
+#3  0x00000000008ab4d6 in fold_const_call (fn=CFN_CLZ, type=<integer_type 0x7fffea14c5e8 int>, arg=<integer_cst 0x7fffea2e5c18>) at ../../gcc/fold-const-call.cc:1385
+#4  0x000000000189d6e0 in gimple_resimplify1 (seq=0x7fffffffd278, res_op=0x7fffffffd200, valueize=0xf811c3 <fwprop_ssa_val(tree)>) at ../../gcc/gimple-match-exports.cc:925
+#5  0x000000000189b419 in gimple_match_op::resimplify (this=0x7fffffffd200, seq=0x7fffffffd278, valueize=0xf811c3 <fwprop_ssa_val(tree)>) at ../../gcc/gimple-match-exports.cc:111
+#6  0x000000000189d5b3 in gimple_simplify (stmt=<gimple_call 0x7fffea13ae10>, res_op=0x7fffffffd200, seq=0x7fffffffd278, valueize=0xf811c3 <fwprop_ssa_val(tree)>, 
+    top_valueize=0xf811c3 <fwprop_ssa_val(tree)>) at ../../gcc/gimple-match-exports.cc:898
+#7  0x00000000009060dd in fold_stmt_1 (gsi=0x7fffffffd630, inplace=false, valueize=0xf811c3 <fwprop_ssa_val(tree)>) at ../../gcc/gimple-fold.cc:6359
+#8  0x0000000000906833 in fold_stmt (gsi=0x7fffffffd630, valueize=0xf811c3 <fwprop_ssa_val(tree)>) at ../../gcc/gimple-fold.cc:6525
+or with extra -fno-tree-ccp -fno-tree-forwprop in:
+#0  wi::clz (x=...) at ../../gcc/wide-int.cc:2164
+#1  0x00000000008a9d9b in fold_const_call_ss (result=0x7fffffffcd50, fn=CFN_CLZ, arg=..., precision=32, arg_type=<bitint_type 0x7fffea2db5e8>) at ../../gcc/fold-const-call.cc:1029
+#2  0x00000000008aa9a5 in fold_const_call_1 (fn=CFN_CLZ, type=<integer_type 0x7fffea14c5e8 int>, arg=<integer_cst 0x7fffea2e5c18>) at ../../gcc/fold-const-call.cc:1254
+#3  0x00000000008ab4d6 in fold_const_call (fn=CFN_CLZ, type=<integer_type 0x7fffea14c5e8 int>, arg=<integer_cst 0x7fffea2e5c18>) at ../../gcc/fold-const-call.cc:1385
+#4  0x000000000189d6e0 in gimple_resimplify1 (seq=0x0, res_op=0x7fffffffd1f0, valueize=0x906784 <no_follow_ssa_edges(tree_node*)>) at ../../gcc/gimple-match-exports.cc:925
+#5  0x000000000189b419 in gimple_match_op::resimplify (this=0x7fffffffd1f0, seq=0x0, valueize=0x906784 <no_follow_ssa_edges(tree_node*)>) at ../../gcc/gimple-match-exports.cc:111
+#6  0x000000000189d5b3 in gimple_simplify (stmt=<gimple_call 0x7fffea13ae10>, res_op=0x7fffffffd1f0, seq=0x0, valueize=0x906784 <no_follow_ssa_edges(tree_node*)>, 
+    top_valueize=0x106aeba <rpo_vn_valueize(tree_node*)>) at ../../gcc/gimple-match-exports.cc:898
+#7  0x000000000090986a in gimple_fold_stmt_to_constant_1 (stmt=<gimple_call 0x7fffea13ae10>, valueize=0x106aeba <rpo_vn_valueize(tree_node*)>, 
+    gvalueize=0x906784 <no_follow_ssa_edges(tree_node*)>) at ../../gcc/gimple-fold.cc:7551
+#8  0x000000000106502d in visit_stmt (stmt=<gimple_call 0x7fffea13ae10>, backedges_varying_p=false) at ../../gcc/tree-ssa-sccvn.cc:6419
+etc.
+But somehow none of that triggers if the internal fn doesn't have lhs, we just rely on DCE and DCE can be disabled.
+Dunno, shall we just ignore those during expansion if they don't have lhs?
+
+- User: Jakub Jelinek | Time: 2024-02-26 15:24:17 UTC
+  Text: Createdattachment 57543[details]gcc14-pr114044.patch
+
+Untested fix on the ifn expansion side.
+
+- User: GCC Commits | Time: 2024-02-27 08:55:59 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:c3c44c01d20b00ab5228f32596153b7f4cbc6036commitr14-9192-gc3c44c01d20b00ab5228f32596153b7f4cbc6036Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Feb 27 09:52:07 2024 +0100
+
+    expand: Add trivial folding for bit query builtins at expansion time [PR114044]
+    
+    While it seems a lot of places in various optimization passes fold
+    bit query internal functions with INTEGER_CST arguments to INTEGER_CST
+    when there is a lhs, when lhs is missing, all the removals of such dead
+    stmts are guarded with -ftree-dce, so with -fno-tree-dce those unfolded
+    ifn calls remain in the IL until expansion.  If they have large/huge
+    BITINT_TYPE arguments, there is no BLKmode optab and so expansion ICEs,
+    and bitint lowering doesn't touch such calls because it doesn't know they
+    need touching, functions only containing those will not even be further
+    processed by the pass because there are no non-small BITINT_TYPE SSA_NAMEs
+    + the 2 exceptions (stores of BITINT_TYPE INTEGER_CSTs and conversions
+    from BITINT_TYPE INTEGER_CSTs to floating point SSA_NAMEs) and when walking
+    there is no special case for calls with BITINT_TYPE INTEGER_CSTs either,
+    those are for normal calls normally handled at expansion time.
+    
+    So, the following patch adjust the expansion of these 6 ifns, by doing
+    nothing if there is no lhs, and also just in case and user disabled all
+    possible passes that would fold this handles the case of setting lhs
+    to ifn call with INTEGER_CST argument.
+    
+    2024-02-27  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/114044* internal-fn.def (CLRSB, CLZ, CTZ, FFS, PARITY): Use
+            DEF_INTERNAL_INT_EXT_FN macro rather than DEF_INTERNAL_INT_FN.
+            * internal-fn.h (expand_CLRSB, expand_CLZ, expand_CTZ, expand_FFS,
+            expand_PARITY): Declare.
+            * internal-fn.cc (expand_bitquery, expand_CLRSB, expand_CLZ,
+            expand_CTZ, expand_FFS, expand_PARITY): New functions.
+            (expand_POPCOUNT): Use expand_bitquery.
+    
+            * gcc.dg/bitint-95.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-27 09:04:24 UTC
+  Text: Fixed.
+

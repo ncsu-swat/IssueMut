@@ -1,0 +1,120 @@
+Bug Summary: [15 regression] wrong code at -O{2,3} with "-fno-ssa-phiopt -fno-tree-dce" on x86_64-linux-gnu since r15-2890-g72c9b5f438f22c
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2024-08-18 10:56:43 UTC
+  Text: This appears to be a recent regression as it doesn't reproduce with 14.* and earlier. 
+
+Compiler Explorer:https://godbolt.org/z/Tnzx45e4c[615] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240818 (experimental) (GCC) 
+[616] % 
+[616] % gcctk -O2 small.c; ./a.out
+0
+[617] % gcctk -O2 -fno-ssa-phiopt -fno-tree-dce small.c
+[618] % ./a.out
+0
+Floating point exception
+[619] % 
+[619] % cat small.c
+int printf(const char *, ...);
+int a, b = 2, c = 1;
+unsigned d, e;
+int main() {
+ L:
+  a = -1 / c;
+  d = ~(b && (c && ~e) & b);
+  printf("0\n");
+  c = 0;
+  if (d < -1)
+    goto L;
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2024-08-18 17:45:32 UTC
+  Text: Confirmed. Gimple level is the same between 14 and 15.
+
+- User: Andrew Pinski | Time: 2024-08-18 17:51:50 UTC
+  Text: The first major difference is in ce2. So most likely related toPR 116372andr15-2890-g72c9b5f438f22c.
+
+- User: Sam James | Time: 2024-08-18 18:59:57 UTC
+  Text: I'll bisect it.
+
+- User: Sam James | Time: 2024-08-19 04:42:40 UTC
+  Text: Indeedr15-2890-g72c9b5f438f22c.
+
+- User: Manolis Tsamis | Time: 2024-08-19 10:33:08 UTC
+  Text: The basic block that is if-converted and results in wrong code looks like this:
+
+if (r107 != -1) {
+  r107 = (not:SI) (r99)
+  r107 = (ior:SI) (r107) (const_int -2) 
+}
+
+Then, the if-converted code that emitted is:
+
+# sequence generated for the first insn
+r125 = (not:SI) (r99)
+r129 = (flags == 0)? r107 : r125 # Stored to a temp register r129, because the original target r107 overlaps with the condition.
+
+# sequence generated for the second insn
+r132 = (ior:SI) (r129) (const_int -2)
+flags = (compare:CCZ) (r107) (const_int -1) # compare again because r132 clobbers flags
+r107 = (flags != 0)? r132 : r107 # The result is correct up to here.
+
+# Seen in the basic block but not emitted by noce_convert_multiple_sets_1.
+r107 = r129 # ??
+
+The last and problematic instruction is emitted by this code:
+
+  /* Now fixup the assignments.  */
+  for (unsigned i = 0; i < insn_info.length (); i++)
+    if (insn_info[i]->target != insn_info[i]->temporary)
+      noce_emit_move_insn (insn_info[i]->target, insn_info[i]->temporary);
+
+Previously, due to the limited amount of supported operations, it was impossible to have multiple assignments to the same register (they would have been optimized away previously). Now we need to make sure we don't overwrite the result while fixing up temporaries.
+
+I'm preparing a fix based on this analysis.
+
+- User: Manolis Tsamis | Time: 2024-08-20 13:59:04 UTC
+  Text: I have sent the fix for this, together with the testcase from this ticket, in the lists. Link ishttps://gcc.gnu.org/pipermail/gcc-patches/2024-August/660912.html
+
+- User: GCC Commits | Time: 2024-08-23 18:20:38 UTC
+  Text: The master branch has been updated by Philipp Tomsich <ptomsich@gcc.gnu.org>:https://gcc.gnu.org/g:a9f5e23aba1a6f4ec32f1147b340a8145d827da9commitr15-3138-ga9f5e23aba1a6f4ec32f1147b340a8145d827da9Author: Manolis Tsamis <manolis.tsamis@vrull.eu>
+Date:   Tue Aug 20 09:16:29 2024 +0200
+
+    ifcvt: Do not overwrite results in noce_convert_multiple_sets [PR116372,PR116405]
+    
+    Now that more operations are allowed for noce_convert_multiple_sets,
+    it is possible that the same register appears multiple times as target
+    in a basic block.  After noce_convert_multiple_sets_1 is called we
+    potentially also emit register moves from temporaries back to the
+    original targets.  In some cases where the target registers overlap
+    with the block's condition, these register moves may overwrite
+    intermediate variables because they're emitted after the if-converted
+    code.  To address this issue we now iterate backwards and keep track
+    of seen registers when emitting these final register moves.PR rtl-optimization/116372PR rtl-optimization/116405gcc/ChangeLog:
+    
+            * ifcvt.cc (noce_convert_multiple_sets): Iterate backwards and track
+            target registers.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr116372.c: New test.
+            * gcc.dg/pr116405.c: New test.
+
+- User: Sam James | Time: 2024-08-25 10:08:58 UTC
+  Text: Fixed.
+

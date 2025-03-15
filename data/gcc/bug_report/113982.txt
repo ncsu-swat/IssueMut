@@ -1,0 +1,198 @@
+Bug Summary: Poor codegen for 64-bit add with carry widening functions
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jan Schultke | Time: 2024-02-18 19:07:41 UTC
+  Text: I was trying to get optimal codegen for a 64-bit addition with a carry, but it's tough to do with GCC:> struct add_result {
+>     unsigned long long sum;
+>     bool carry;
+> };
+> 
+> add_result add_wide_1(unsigned long long x, unsigned long long y) {
+>     auto r = (unsigned __int128) x + y;
+>     return add_result{static_cast<unsigned long long>(r), bool(r >> 64)};
+> }
+> 
+> add_result add_wide_2(unsigned long long x, unsigned long long y) {
+>     unsigned long long r;
+>     bool carry = __builtin_add_overflow(x, y, &r);
+>     return add_result{r, carry};
+> }## Expected output (clang -march=x86-64-v4 -O3)
+
+add_wide_1(unsigned long long, unsigned long long):
+        mov     rax, rdi
+        add     rax, rsi
+        setb    dl
+        ret
+add_wide_2(unsigned long long, unsigned long long):
+        mov     rax, rdi
+        add     rax, rsi
+        setb    dl
+        ret
+
+## Actual output (GCC -march=x86-64-v4 -O3) (https://godbolt.org/z/qGc9WeEvK)
+
+add_wide_1(unsigned long long, unsigned long long):
+        mov     rcx, rdi
+        lea     rax, [rdi+rsi]
+        xor     edx, edx
+        xor     edi, edi
+        add     rsi, rcx
+        adc     rdi, 0
+        mov     dl, dil
+        and     dl, 1
+        ret
+add_wide_2(unsigned long long, unsigned long long):
+        add     rdi, rsi
+        mov     edx, 0
+        mov     rax, rdi
+        setc    dl
+        ret
+
+
+The output for the 128-bit version looks pretty bad.
+It looks like GCC isn't aware that we only access the carry bit, so it doesn't need to do full 128-bit arithmetic so to speak.
+
+The add_wide_2 output also isn't optimal. Why would it output "mov edx, 0" instead of "xor edx, edx"?
+
+- User: Andrew Pinski | Time: 2024-02-18 19:20:03 UTC
+  Text: aarch64 looks fine (ok there is an one extra mov):
+```
+add_wide_1(unsigned long long, unsigned long long):
+        adds    x2, x0, x1
+        mov     x0, x2
+        cset    x1, cs
+        ret
+add_wide_2(unsigned long long, unsigned long long):
+        adds    x0, x0, x1
+        cset    x1, cs
+        ret
+
+```
+
+So we have:
+```
+  _1 = (__int128 unsigned) x_6(D);
+  _2 = (__int128 unsigned) y_7(D);
+  r_8 = _1 + _2;
+  _3 = x_6(D) + y_7(D);
+  D.2566.sum = _3;
+  _4 = r_8 >> 64;
+  _5 = (bool) _4;
+  D.2566.carry = _5;
+```
+
+So if we should convert _5 into:
+  _t = .ADD_OVERFLOW (x_3(D), y_4(D));
+  _t2 = IMAGPART_EXPR <_t>;
+  _5 = (bool) _t2;
+
+And then later on see that r_8 is REALPART_EXPR<_t>;
+It would just work ...
+
+- User: Andrew Pinski | Time: 2024-02-18 19:23:57 UTC
+  Text: Note some of this is due to return register issues.
+
+If we instead do stores:
+```
+add_wide_1(unsigned long long, unsigned long long, add_result*):
+        mov     rax, rdi
+        lea     rcx, [rdi+rsi]
+        xor     edi, edi
+        add     rsi, rax
+        mov     QWORD PTR [rdx], rcx
+        adc     rdi, 0
+        mov     BYTE PTR [rdx+8], dil
+        and     BYTE PTR [rdx+8], 1
+        ret
+```
+
+Which is better.
+
+add_wide_2 becomes:
+```
+add_wide_2(unsigned long long, unsigned long long, add_result*):
+        add     rdi, rsi
+        setc    BYTE PTR [rdx+8]
+        mov     QWORD PTR [rdx], rdi
+        and     BYTE PTR [rdx+8], 1
+        ret
+```
+
+Which is better, the extra and is filed already though I can't seem to find it.
+
+- User: Jakub Jelinek | Time: 2024-02-18 19:42:31 UTC
+  Text: We pattern recognize just something like (or r < y):
+add_result add_wide_3(unsigned long long x, unsigned long long y) {
+    auto r = x + y;
+    return add_result{r, r < x};
+}
+and not doing the addition uselessly in twice as big mode + shift + comparison against 0.
+The reason for mov edx, 0 is not to clobber flags which are live at that point, of course one could also move the clearing of edx one insn earlier and then it could be xor edx, edx.
+
+- User: Richard Biener | Time: 2024-02-19 08:16:18 UTC
+  Text: Confirmed for more pattern recog.
+
+Possibly documenting GCC recognized idoms for these kind of operations
+might be a nice thing to have.
+
+- User: Jakub Jelinek | Time: 2024-02-19 08:22:26 UTC
+  Text: With signed +- overflow not sure what exactly to pattern match, people can be really creative there.  I guess
+w = (__int128) x + y;
+r = (long long) w;
+ovf = (w >> 64) != (w >> 63);
+or
+w = (__int128) x + y;
+r = (long long) w;
+ovf = (w >> 63) + (unsigned __int128) 1 <= 1
+etc.
+
+- User: Jakub Jelinek | Time: 2024-05-10 13:02:03 UTC
+  Text: Note, sincePR95853we also recognize bool(r > ~0ULL) as the check rather than bool(r >> 64).
+
+- User: Jakub Jelinek | Time: 2024-05-10 16:27:25 UTC
+  Text: Createdattachment 58179[details]gcc15-pr113982.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-05-13 09:17:57 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:b621482296f6dec0abb22ed39cc4ce6811535d47commitr15-427-gb621482296f6dec0abb22ed39cc4ce6811535d47Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon May 13 11:15:27 2024 +0200
+
+    tree-ssa-math-opts: Pattern recognize yet another .ADD_OVERFLOW pattern [PR113982]
+    
+    We pattern recognize already many different patterns, and closest to the
+    requested one also
+       yc = (type) y;
+       zc = (type) z;
+       x = yc + zc;
+       w = (typeof_y) x;
+       if (x > max)
+    where y/z has the same unsigned type and type is a wider unsigned type
+    and max is maximum value of the narrower unsigned type.
+    But apparently people are creative in writing this in diffent ways,
+    this requests
+       yc = (type) y;
+       zc = (type) z;
+       x = yc + zc;
+       w = (typeof_y) x;
+       if (x >> narrower_type_bits)
+    
+    The following patch implements that.
+    
+    2024-05-13  Jakub Jelinek  <jakub@redhat.com>PR middle-end/113982* tree-ssa-math-opts.cc (arith_overflow_check_p): Also return 1
+            for RSHIFT_EXPR by precision of maxval if shift result is only
+            used in a cast or comparison against zero.
+            (match_arith_overflow): Handle the RSHIFT_EXPR use case.
+    
+            * gcc.dg/pr113982.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-05-13 09:25:01 UTC
+  Text: Should be fixed now.
+

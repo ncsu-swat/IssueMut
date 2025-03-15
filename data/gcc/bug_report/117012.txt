@@ -1,0 +1,200 @@
+Bug Summary: [15 Regression] incorrect RTL simplification around vector AND and shifts
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Tamar Christina | Time: 2024-10-08 08:00:42 UTC
+  Text: The following example:
+
+#include <arm_neon.h>
+#include <stdint.h>
+
+uint8x16_t f (uint8x16_t x)
+{
+  uint8x16_t mask = vreinterpretq_u8_u64(vdupq_n_u64 (0x101));
+  return vandq_u8(vcltq_s8(vreinterpretq_s8_u8(x), vdupq_n_s8(0)), mask);
+}
+
+compiled at -O3 gives the following:
+
+f:
+        ushr    v0.16b, v0.16b, 7
+        ret
+
+This is incorrect as it assumes that the value in every lane for the AND was
+0x1 where in fact only the bottom lane is.
+
+combine is matching this incorrect pattern:
+
+Trying 7, 6 -> 8:
+    7: r108:V16QI=const_vector
+    6: r107:V16QI=r109:V16QI>>const_vector
+      REG_DEAD r109:V16QI
+    8: r106:V16QI=r107:V16QI&r108:V16QI
+      REG_DEAD r108:V16QI
+      REG_DEAD r107:V16QI
+      REG_EQUAL r107:V16QI&const_vector
+Successfully matched this instruction:
+(set (reg:V16QI 106 [ _5 ])
+    (lshiftrt:V16QI (reg:V16QI 109 [ xD.22802 ])
+        (const_vector:V16QI [
+                (const_int 7 [0x7]) repeated x16
+            ])))
+
+The optimization seems to only look at the bottom lane of the vector:
+
+#include <arm_neon.h>
+#include <stdint.h>
+
+uint8x16_t f (uint8x16_t x)
+{
+  uint8x16_t mask = vreinterpretq_u8_u64(vdupq_n_u64 (0x301));
+  return vandq_u8(vcltq_s8(vreinterpretq_s8_u8(x), vdupq_n_s8(0)), mask);
+}
+
+also generates incorrect code but changing the bottom lane
+
+#include <arm_neon.h>
+#include <stdint.h>
+
+uint8x16_t f (uint8x16_t x)
+{
+  uint8x16_t mask = vreinterpretq_u8_u64(vdupq_n_u64 (0x102));
+  return vandq_u8(vcltq_s8(vreinterpretq_s8_u8(x), vdupq_n_s8(0)), mask);
+}
+
+gives the right result.
+
+- User: Tamar Christina | Time: 2024-10-08 13:43:39 UTC
+  Text: bisect landed ong:aac00d09859cc5934bd0f7493d537b8430337773is the first bad commit
+commit aac00d09859cc5934bd0f7493d537b8430337773
+Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Jun 20 12:41:13 2024 +0800
+
+    Optimize a < 0 ? -1 : 0 to (signed)a >> 31.
+
+    Try to optimize x < 0 ? -1 : 0 into (signed) x >> 31
+    and x < 0 ? 1 : 0 into (unsigned) x >> 31.
+
+    Move the optimization did in ix86_expand_int_vcond to match.pd
+
+    gcc/ChangeLog:PR target/114189* match.pd: Simplify a < 0 ? -1 : 0 to (signed) >> 31 and a <
+            0 ? 1 : 0 to (unsigned) a >> 31 for vector integer type.
+
+    gcc/testsuite/ChangeLog:
+
+            * gcc.target/i386/avx2-pr115517.c: New test.
+            * gcc.target/i386/avx512-pr115517.c: New test.
+            * g++.target/i386/avx2-pr115517.C: New test.
+            * g++.target/i386/avx512-pr115517.C: New test.
+            * g++.dg/tree-ssa/pr88152-1.C: Adjust testcase.
+
+ gcc/match.pd                                    | 30 +++++++++++
+ gcc/testsuite/g++.dg/tree-ssa/pr88152-1.C       |  2 +-
+ gcc/testsuite/g++.target/i386/avx2-pr115517.C   | 60 +++++++++++++++++++++
+ gcc/testsuite/g++.target/i386/avx512-pr115517.C | 70 +++++++++++++++++++++++++
+ gcc/testsuite/gcc.target/i386/avx2-pr115517.c   | 33 ++++++++++++
+ gcc/testsuite/gcc.target/i386/avx512-pr115517.c | 70 +++++++++++++++++++++++++
+ 6 files changed, 264 insertions(+), 1 deletion(-)
+ create mode 100644 gcc/testsuite/g++.target/i386/avx2-pr115517.C
+ create mode 100644 gcc/testsuite/g++.target/i386/avx512-pr115517.C
+ create mode 100644 gcc/testsuite/gcc.target/i386/avx2-pr115517.c
+ create mode 100644 gcc/testsuite/gcc.target/i386/avx512-pr115517.c
+
+but I guess that's just exposing the issue.
+
+- User: Andrew Pinski | Time: 2024-10-08 15:44:41 UTC
+  Text: Confirmed.
+
+Here is a testcase which shows the issue without that match patch:
+```
+#define vector16 __attribute__((vector_size(16)))
+
+vector16 unsigned char
+g (vector16 unsigned char a)
+{
+  vector16 signed char b = (vector16 signed char)a;
+  b = b >> 7;
+  vector16 unsigned char c = (vector16 unsigned char)b;
+  vector16 unsigned char d = { 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0 };
+  return c & d;
+}
+```
+
+
+But it is still only a GCC 15 regression.
+
+GCC 14 produced:
+```
+        cmlt    v0.16b, v0.16b, #0
+        adrp    x0, .LC0
+        ldr     q31, [x0, #:lo12:.LC0]
+        and     v0.16b, v0.16b, v31.16b
+```
+For the above one.
+
+- User: Andrew Pinski | Time: 2024-10-08 15:53:50 UTC
+  Text: Looks liker15-1047-g7876cde25cbd2fcaused it.
+
+- User: Roger Sayle | Time: 2024-10-08 17:50:46 UTC
+  Text: The patch forPR target/114428incorrectly uses CONST_VECTOR_DUPLICATE_P, which has slightly different semantics to what the author intended.  Instead the function const_vec_duplicate_p should be used [which additionally checks that CONST_VECTOR_NPATTERNS (x) == 1].
+
+- User: Andrew Pinski | Time: 2024-10-08 18:48:43 UTC
+  Text: (In reply to Roger Sayle fromcomment #4)> The patch forPR target/114428incorrectly uses CONST_VECTOR_DUPLICATE_P,
+> which has slightly different semantics to what the author intended.  Instead
+> the function const_vec_duplicate_p should be used [which additionally checks
+> that CONST_VECTOR_NPATTERNS (x) == 1].Just a quick audit of the uses of CONST_VECTOR_DUPLICATE_P:
+the use in simplify_const_unary_operation looks ok because it uses CONST_VECTOR_NPATTERNS .
+The use in simplify_const_binary_operation looks ok for the same reason.
+print_rtx_operand_codes_E_and_V is fine too
+may_trap_p_1 looks ok too because it uses CONST_VECTOR_ENCODED_ELT to check to see if any of the patterns were 0 or not (for the VLA case)
+
+It is just the use added byr15-104which looks broken.
+
+- User: Tamar Christina | Time: 2024-10-08 19:41:23 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> But it is still only a GCC 15 regression.
+> 
+> GCC 14 produced:
+> ```
+>         cmlt    v0.16b, v0.16b, #0
+>         adrp    x0, .LC0
+>         ldr     q31, [x0, #:lo12:.LC0]
+>         and     v0.16b, v0.16b, v31.16b
+> ```
+> For the above one.which shows the other regression, the match.md pattern de-optimizes the aarch64 codegen because it changes the shift into an unsigned shift, which means the cmlt optimization doesn't trigger anymore.
+
+In this particular case since you need the AND anyway the pattern shouldn't match.
+
+- User: Tamar Christina | Time: 2024-10-13 09:31:57 UTC
+  Text: patch is ready for posting tomorrow.
+
+- User: GCC Commits | Time: 2024-10-14 13:00:52 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:be966baa353dfcc20b76b5a5586ab2494bb0a735commitr15-4327-gbe966baa353dfcc20b76b5a5586ab2494bb0a735Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Mon Oct 14 14:00:25 2024 +0100
+
+    simplify-rtx: Fix incorrect folding of shift and AND [PR117012]
+    
+    The optimization added inr15-1047-g7876cde25cbd2fis using the wrong
+    operaiton to check for uniform constant vectors.
+    
+    The Author intended to check that all the lanes in the vector are the same and
+    so used CONST_VECTOR_DUPLICATE_P.  However this only checks that the vector
+    is created from a pattern duplication, but doesn't say how many pattern
+    alternatives make up the duplication.  Normally would would need to check this
+    separately or use const_vec_duplicate_p.
+    
+    Without this the optimization incorrectly triggers.
+    
+    gcc/ChangeLog:PR rtl-optimization/117012* simplify-rtx.cc (simplify_context::simplify_binary_operation_1): Use
+            const_vec_duplicate_p instead of CONST_VECTOR_DUPLICATE_P.
+    
+    gcc/testsuite/ChangeLog:PR rtl-optimization/117012* gcc.target/aarch64/pr117012.c: New test.
+
+- User: Tamar Christina | Time: 2024-10-14 13:04:36 UTC
+  Text: Fixed.
+

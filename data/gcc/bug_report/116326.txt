@@ -1,0 +1,228 @@
+Bug Summary: [lra] internal compiler error: in get_reload_reg, at lra-constraints.cc:755
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, patch, ra
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Georg-Johann Lay | Time: 2024-08-10 11:38:25 UTC
+  Text: Createdattachment 58898[details]GNU-C99 test case
+
+$ avr-gcc addr-space-1-0-i.c -S -mlraduring RTL pass: reload
+addr-space-1-0-i.c: In function 'main':
+addr-space-1-0-i.c:85:1: internal compiler error: in get_reload_reg, at lra-constraints.cc:755
+   85 | }
+      | ^
+
+Target: avr
+Configured with: ../../source/gcc-master/configure --target=avr --disable-nls --with-dwarf2 --with-gnu-as --with-gnu-ld --disable-shared --with-long-double=64 --enable-languages=c,c++
+
+- User: Georg-Johann Lay | Time: 2024-08-10 11:42:09 UTC
+  Text: The opening should read:
+
+$ avr-gcc addr-space-1-0-i.c -S -mlra
+during RTL pass: reload
+addr-space-1-0-i.c: In function 'main':
+...
+
+- User: Richard Sandiford | Time: 2024-08-30 11:22:39 UTC
+  Text: This is caused by the final entry in ELIMINABLE_REGS:
+
+  { FRAME_POINTER_REGNUM + 1, STACK_POINTER_REGNUM + 1 }
+
+I guess this was added to work around a reload bug involving multi-register pointers, but it shouldn't be necessary for LRA (and as this PR shows, it's actively harmful for LRA).
+
+LRA treats each entry in ELIMINABLE_REGS as a pointer of mode Pmode.  This means that (as far as LRA is concerned) the final entry above occupies FRAME_POINTER_REGNUM + 1 and FRAME_POINTER_REGNUM + 2.  But FRAME_POINTER_REGNUM + 2 is the Z register, so this takes the Z register out of action, leading to a reload loop.
+
+I'm sure there are lingering bugs around multi-register pointers :)  But I think we should remove the entry above and try to fix the bugs at source.
+
+- User: Georg-Johann Lay | Time: 2024-08-30 12:53:25 UTC
+  Text: (In reply to Richard Sandiford fromcomment #2)> This is caused by the final entry in ELIMINABLE_REGS:
+> 
+>   { FRAME_POINTER_REGNUM + 1, STACK_POINTER_REGNUM + 1 }
+> 
+> I guess this was added to work around a reload bug involving multi-register
+> pointers, but it shouldn't be necessary for LRA (and as this PR shows, it's
+> actively harmful for LRA).It was due to problems with multi-reg frame-pointer. (AFAIR, using a hard-frame-poiner besides frame-poiner didn't resolve the issues.)
+
+My problem now is that avr.h has:
+
+#define ELIMINABLE_REGS {					\
+    { ARG_POINTER_REGNUM, STACK_POINTER_REGNUM },               \
+    { ARG_POINTER_REGNUM, FRAME_POINTER_REGNUM },               \
+    { FRAME_POINTER_REGNUM, STACK_POINTER_REGNUM },             \
+    { FRAME_POINTER_REGNUM + 1, STACK_POINTER_REGNUM + 1 } }
+
+but ira.cc uses that to initialize a static const array, hence there's no way to depend that on options I guess?
+
+One solution would be to skip upper parts of multi-part pointers in elimination. (And maybe other places: TARGET_HARD_REGNO_SCRATCH_OK and HARD_REGNO_RENAME_OK assume special handling for the high part of multi-reg FP, too).
+
+- User: Richard Sandiford | Time: 2024-08-30 13:14:08 UTC
+  Text: (In reply to Georg-Johann Lay fromcomment #3)> It was due to problems with multi-reg frame-pointer. (AFAIR, using a
+> hard-frame-poiner besides frame-poiner didn't resolve the issues.)
+> 
+> My problem now is that avr.h has:
+> 
+> #define ELIMINABLE_REGS {					\
+>     { ARG_POINTER_REGNUM, STACK_POINTER_REGNUM },               \
+>     { ARG_POINTER_REGNUM, FRAME_POINTER_REGNUM },               \
+>     { FRAME_POINTER_REGNUM, STACK_POINTER_REGNUM },             \
+>     { FRAME_POINTER_REGNUM + 1, STACK_POINTER_REGNUM + 1 } }
+> 
+> but ira.cc uses that to initialize a static const array, hence there's no
+> way to depend that on options I guess?Yeah.  And I don't think it's worth adding a way to make it depend on an option, since it will only be a temporary state until LRA is fully supported.  Could you "just" remove the final entry locally while testing -mlra?> One solution would be to skip upper parts of multi-part pointers in
+> elimination. (And maybe other places: TARGET_HARD_REGNO_SCRATCH_OK and
+> HARD_REGNO_RENAME_OK assume special handling for the high part of multi-reg
+> FP, too).In backend code, or in middle-end code?
+
+But either way, I think we should start with the assumption that the entry should be removed and make everything else work to that.  Unfortunately that probably excludes reload though, if the original problem that motivated the entry was there.
+
+- User: Georg-Johann Lay | Time: 2024-08-30 13:51:48 UTC
+  Text: (In reply to Richard Sandiford fromcomment #4)> (In reply to Georg-Johann Lay fromcomment #3)
+> > It was due to problems with multi-reg frame-pointer. (AFAIR, using a
+> > hard-frame-poiner besides frame-poiner didn't resolve the issues.)
+> > 
+> > My problem now is that avr.h has:
+> > 
+> > #define ELIMINABLE_REGS {					\
+> >     { ARG_POINTER_REGNUM, STACK_POINTER_REGNUM },               \
+> >     { ARG_POINTER_REGNUM, FRAME_POINTER_REGNUM },               \
+> >     { FRAME_POINTER_REGNUM, STACK_POINTER_REGNUM },             \
+> >     { FRAME_POINTER_REGNUM + 1, STACK_POINTER_REGNUM + 1 } }
+> > 
+> > but ira.cc uses that to initialize a static const array, hence there's no
+> > way to depend that on options I guess?
+> Yeah.  And I don't think it's worth adding a way to make it depend on an
+> option, since it will only be a temporary state until LRA is fully
+> supported.  Could you "just" remove the final entry locally while testing
+> -mlra?
+> 
+> > One solution would be to skip upper parts of multi-part pointers in
+> > elimination. (And maybe other places: TARGET_HARD_REGNO_SCRATCH_OK and
+> > HARD_REGNO_RENAME_OK assume special handling for the high part of multi-reg
+> > FP, too).
+> In backend code, or in middle-end code?avr_hard_regno_rename_ok and avr_hard_regno_scratch_ok require special handling for the upper reg of FP.> But either way, I think we should start with the assumption that the entry
+> should be removed and make everything else work to that.  Unfortunately that
+> probably excludes reload though, if the original problem that motivated the
+> entry was there.With the curret state of affairs, switching avr to LRA is not a good idea; you can't even build neither libgcc nor libc.
+
+Couldn't the elimination code in IRA / LRA just skip the high part? Or let reload handle multi-reg FPs correctly, even though reload will come to an end?
+
+Or maybe make eliminable regs an array that can be accessed in the backend, so that avr.cc could adjust the entries in adjust_reg_alloc_order or init_expanders to something like:
+
+eliminables[3] = eliminables[2]
+
+having a duplicate entry shouldn't hurt?
+
+- User: Richard Sandiford | Time: 2024-08-30 14:55:24 UTC
+  Text: (In reply to Georg-Johann Lay fromcomment #5)> > But either way, I think we should start with the assumption that the entry
+> > should be removed and make everything else work to that.  Unfortunately that
+> > probably excludes reload though, if the original problem that motivated the
+> > entry was there.
+> 
+> With the curret state of affairs, switching avr to LRA is not a good idea;
+> you can't even build neither libgcc nor libc.Sure, but I meant: remove it locally while testing/working on LRA support.> Couldn't the elimination code in IRA / LRA just skip the high part? Or let
+> reload handle multi-reg FPs correctly, even though reload will come to an
+> end?
+> 
+> Or maybe make eliminable regs an array that can be accessed in the backend,
+> so that avr.cc could adjust the entries in adjust_reg_alloc_order or
+> init_expanders to something like:
+> 
+> eliminables[3] = eliminables[2]
+> 
+> having a duplicate entry shouldn't hurt?I don't think we should make any permanent changes to support this kind of manipulation, since it's only needed during the transition.
+
+- User: Georg-Johann Lay | Time: 2024-08-30 15:24:52 UTC
+  Text: (In reply to Richard Sandiford fromcomment #6)> I don't think we should make any permanent changes to support this kind of
+> manipulation, since it's only needed during the transition.What about the following line in reload1.h:
+
+// Used during roload -> LRA transition because ELIMINABLE_REGS may depend
+// on command line options.  Used in avr.h for example.
+#define IN_RELOAD1_CC
+
+and the use #ifdef IN_RELOAD1_CC in avr.h?
+
+It's still a permanent change, but a no-op (except for avr.h) because the macro is unused currently.
+
+There are places like varasm.cc and rtlanal.cc that use ELIMINABLE_REGS, but they should follow the LRA convention.
+
+- User: Richard Sandiford | Time: 2024-08-30 15:28:33 UTC
+  Text: (In reply to Georg-Johann Lay fromcomment #7)> What about the following line in reload1.h:
+> 
+> // Used during roload -> LRA transition because ELIMINABLE_REGS may depend
+> // on command line options.  Used in avr.h for example.
+> #define IN_RELOAD1_CC
+> 
+> and the use #ifdef IN_RELOAD1_CC in avr.h?
+> 
+> It's still a permanent change, but a no-op (except for avr.h) because the
+> macro is unused currently.Ah, yeah, and it keeps the change local to the code that is slated to disappear.  That sounds good to me FWIW.
+
+- User: Georg-Johann Lay | Time: 2024-08-30 15:32:44 UTC
+  Text: (In reply to Richard Sandiford fromcomment #8)> (In reply to Georg-Johann Lay fromcomment #7)
+> > What about the following line in reload1.h:
+> > 
+> > // Used during roload -> LRA transition because ELIMINABLE_REGS may depend
+> > // on command line options.  Used in avr.h for example.
+> > #define IN_RELOAD1_CC
+> > 
+> > and the use #ifdef IN_RELOAD1_CC in avr.h?
+> > 
+> > It's still a permanent change, but a no-op (except for avr.h) because the
+> > macro is unused currently.
+> Ah, yeah, and it keeps the change local to the code that is slated to
+> disappear.  That sounds good to me FWIW.I meant to place that macro in reload1.cc above all includes (not in reload1.h which does not exist).
+
+- User: Georg-Johann Lay | Time: 2024-08-31 15:49:19 UTC
+  Text: The test case passes now.  However, I see the relatively newPR116550that didn't occur with "gcc version 15.0.0 20240818".
+
+- User: Georg-Johann Lay | Time: 2024-09-11 15:57:20 UTC
+  Text: Createdattachment 59099[details]Proposed patchhttps://gcc.gnu.org/pipermail/gcc-patches/2024-September/662641.htmlreload1.cc: rtl-optimization/116326 - Use RELOAD_ELIMINABLE_REGS.
+
+The new macro is required because reload and LRA are using different
+representations for a multi-register frame pointer.  As ELIMINABLE_REGS
+is used to initialize static const objects, it can't depend on -mlra.PR rtl-optimization/116326gcc/
+	* reload1.cc (reg_eliminate_1): Initialize from
+	RELOAD_ELIMINABLE_REGS if defined.
+	* config/avr/avr.h (RELOAD_ELIMINABLE_REGS): Copy from ELIMINABLE_REGS.
+	(ELIMINABLE_REGS): Don't mention sub-regnos of the frame pointer.
+	* doc/tm.texi.in (Eliminating Frame Pointer and Arg Pointer)
+	<RELOAD_ELIMINABLE_REGS>: Add documentation.
+	* doc/tm.texi: Rebuild.
+/testsuite/
+	* gcc.target/avr/torture/lra-pr116324.c: New test.
+	* gcc.target/avr/torture/lra-pr116325.c: New test.
+
+- User: GCC Commits | Time: 2024-09-18 09:44:39 UTC
+  Text: The master branch has been updated by Georg-Johann Lay <gjl@gcc.gnu.org>:https://gcc.gnu.org/g:5bfb91c14f98f6750281217f737b3d95c4e73584commitr15-3682-g5bfb91c14f98f6750281217f737b3d95c4e73584Author: Georg-Johann Lay <avr@gjlay.de>
+Date:   Fri Sep 6 11:23:06 2024 +0200
+
+    reload1.cc: rtl-optimization/116326 - Use RELOAD_ELIMINABLE_REGS.
+    
+    The new macro is required because reload and LRA are using different
+    representations for a multi-register frame pointer.  As ELIMINABLE_REGS
+    is used to initialize static const objects, it can't depend on -mlra.PR rtl-optimization/116326gcc/
+            * reload1.cc (reg_eliminate_1): Initialize from
+            RELOAD_ELIMINABLE_REGS if defined.
+            * config/avr/avr.h (RELOAD_ELIMINABLE_REGS): Copy from ELIMINABLE_REGS.
+            (ELIMINABLE_REGS): Don't mention sub-regnos of the frame pointer.
+            * doc/tm.texi.in (Eliminating Frame Pointer and Arg Pointer)
+            <RELOAD_ELIMINABLE_REGS>: Add documentation.
+            * doc/tm.texi: Rebuild.
+    gcc/testsuite/
+            * gcc.target/avr/torture/lra-pr116324.c: New test.
+            * gcc.target/avr/torture/lra-pr116325.c: New test.
+
+- User: Georg-Johann Lay | Time: 2024-09-18 09:46:14 UTC
+  Text: Fixed.  Many thanks to Richard for his investigation.
+
+- User: Georg-Johann Lay | Time: 2024-09-18 09:48:46 UTC
+  Text: ***Bug 116324has been marked as a duplicate of this bug. ***
+
+- User: Georg-Johann Lay | Time: 2024-09-18 09:49:52 UTC
+  Text: ***Bug 116325has been marked as a duplicate of this bug. ***
+

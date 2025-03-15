@@ -1,0 +1,186 @@
+Bug Summary: [11 Regression] Wrong code at -O3 on x86_64-linux-gnu
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 11.4.1, 12.3.1, 13.2.1, 14.0, 9.5.0
+Known to Fail: 10.1.0, 11.1.0, 11.4.0, 12.1.0, 12.3.0, 13.1.0, 13.2.0
+
+Comments:
+- User: Shaohua Li | Time: 2023-10-10 20:54:27 UTC
+  Text: gcc at -O3 produced the wrong code.
+
+Bisected tor11-5965-g04bff1bbfc1Compiler explorer:https://godbolt.org/z/7vaqadYfP$ cat a.c
+int printf(const char *, ...);
+char a;
+short b, c;
+static short *d = &b, *e = &b;
+short(f)(short g, short h) { return g * h; }
+int main() {
+  *e = 2;
+  a = 1;
+  for (; a <= 9; a++) {
+    short *i = &c;
+    *i = *d = f(*e, *e);
+  }
+  printf("%d\n", c);
+}
+$
+$ gcc -O0 a.c && ./a.out
+0
+$ gcc -O3 a.c && ./a.out
+4
+%
+
+- User: Andrew Pinski | Time: 2023-10-10 20:57:50 UTC
+  Text: Noter11-5965-g04bff1bbfc1just exposed the issue, you can reproduce the issue before that with `-fno-vector-cost-model` added and it worked with that option in GCC 9.5.0 but was broken in GCC 10.1.0.
+
+
+Confirmed.
+
+- User: Andrew Pinski | Time: 2023-10-10 21:00:51 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> Noter11-5965-g04bff1bbfc1just exposed the issue, you can reproduce the
+> issue before that with `-fno-vector-cost-model` added and it worked with
+> that option in GCC 9.5.0 but was broken in GCC 10.1.0.Sorry I mean `-fno-vect-cost-model`.
+
+- User: Richard Biener | Time: 2023-10-11 13:36:33 UTC
+  Text: OK, so the vectorizer transforms
+
+ b = 2;
+ for (;;)
+   b = b * b;
+
+to
+
+ b = 1;
+ for (;;)
+   b = b * b;
+ b *= 2;
+
+which is obviously wrong(TM).
+
+- User: Richard Biener | Time: 2023-10-11 13:47:38 UTC
+  Text: /* Try to simplify the vector initialization by applying an
+                 adjustment after the reduction has been performed.  */
+              if (!reduc_info->reused_accumulator
+                  && STMT_VINFO_DEF_TYPE (stmt_info) == vect_reduction_def
+                  && !operand_equal_p (neutral_op, initial_def))
+                {
+                  STMT_VINFO_REDUC_EPILOGUE_ADJUSTMENT (reduc_info)
+                    = initial_def;
+                  initial_def = neutral_op;
+                }
+
+maybe just allow PLUS/MINUS_EXPR here.  Maybe it's all premature ...
+
+- User: Richard Biener | Time: 2023-10-12 06:49:08 UTC
+  Text: Hmm, that's not enough, the issue is this is detected as reduction at all.
+
+- User: Richard Biener | Time: 2023-10-12 07:12:14 UTC
+  Text: Shorter testcase, fails at -O2 -ftree-vectorize
+
+short b;
+int main()
+{
+  b = 2;
+  for (int a = 1; a <= 9; a++)
+    b = b * b;
+  if (b != 0)
+    __builtin_abort ();
+}
+
+it "works" with unsigned short b because the non-path reduction detection
+doesn't allow two uses of 'b':
+
+t.c:5:21: note:   Analyze phi: b_lsm.6_2 = PHI <powmult_3(7), 2(2)>
+t.c:5:21: missed:   reduction used in loop.
+t.c:5:21: missed:   Unknown def-use cycle pattern.
+
+but the path based reduction detection has
+
+            /* We want to allow x + x but not x < 1 ? x : 2.  */
+            if (is_gimple_assign (op_use_stmt)
+                && gimple_assign_rhs_code (op_use_stmt) == COND_EXPR)
+
+which also allows x * x to slip through.  Even when fixing the earlier
+issue of the initial value we end up with
+
+  vect_b.13_27 = { 2, 1, 1, 1, 1, 1, 1, 1 };
+  vect_powmult_5.14_28 = vect_b.13_27 * vect_b.13_27;
+
+allowing x + x is only OK because it's 2 * x and we will actually never
+see it as x + x.
+
+- User: GCC Commits | Time: 2023-10-12 08:22:08 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:05f98310b54da95e468d799f4a910174320cccbbcommitr14-4588-g05f98310b54da95e468d799f4a910174320cccbbAuthor: Richard Biener <rguenther@suse.de>
+Date:   Thu Oct 12 09:09:46 2023 +0200
+
+    tree-optimization/111764 - wrong reduction vectorization
+    
+    The following removes a misguided attempt to allow x + x in a reduction
+    path, also allowing x * x which isn't valid.  x + x actually never
+    arrives this way but instead is canonicalized to 2 * x.  This makes
+    reduction path handling consistent with how we handle the single-stmt
+    reduction case.PR tree-optimization/111764* tree-vect-loop.cc (check_reduction_path): Remove the attempt
+            to allow x + x via special-casing of assigns.
+    
+            * gcc.dg/vect/pr111764.c: New testcase.
+
+- User: Richard Biener | Time: 2023-10-12 08:22:35 UTC
+  Text: Fixed on trunk sofar.
+
+- User: GCC Commits | Time: 2023-11-10 14:24:34 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:db010f96743a4f289975a0432209c38ec34635e9commitr13-8043-gdb010f96743a4f289975a0432209c38ec34635e9Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Oct 12 09:09:46 2023 +0200
+
+    tree-optimization/111764 - wrong reduction vectorization
+    
+    The following removes a misguided attempt to allow x + x in a reduction
+    path, also allowing x * x which isn't valid.  x + x actually never
+    arrives this way but instead is canonicalized to 2 * x.  This makes
+    reduction path handling consistent with how we handle the single-stmt
+    reduction case.PR tree-optimization/111764* tree-vect-loop.cc (check_reduction_path): Remove the attempt
+            to allow x + x via special-casing of assigns.
+    
+            * gcc.dg/vect/pr111764.c: New testcase.
+    
+    (cherry picked from commit 05f98310b54da95e468d799f4a910174320cccbb)
+
+- User: GCC Commits | Time: 2023-11-27 13:09:48 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:bd75062cc3fc4abd19c37fae164d9764ffab2407commitr12-10012-gbd75062cc3fc4abd19c37fae164d9764ffab2407Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Oct 12 09:09:46 2023 +0200
+
+    tree-optimization/111764 - wrong reduction vectorization
+    
+    The following removes a misguided attempt to allow x + x in a reduction
+    path, also allowing x * x which isn't valid.  x + x actually never
+    arrives this way but instead is canonicalized to 2 * x.  This makes
+    reduction path handling consistent with how we handle the single-stmt
+    reduction case.PR tree-optimization/111764* tree-vect-loop.cc (check_reduction_path): Remove the attempt
+            to allow x + x via special-casing of assigns.
+    
+            * gcc.dg/vect/pr111764.c: New testcase.
+    
+    (cherry picked from commit 05f98310b54da95e468d799f4a910174320cccbb)
+
+- User: GCC Commits | Time: 2023-12-15 12:18:23 UTC
+  Text: The releases/gcc-11 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:7473b2742aa1637d14a64505e855aa09452536b1commitr11-11143-g7473b2742aa1637d14a64505e855aa09452536b1Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Oct 12 09:09:46 2023 +0200
+
+    tree-optimization/111764 - wrong reduction vectorization
+    
+    The following removes a misguided attempt to allow x + x in a reduction
+    path, also allowing x * x which isn't valid.  x + x actually never
+    arrives this way but instead is canonicalized to 2 * x.  This makes
+    reduction path handling consistent with how we handle the single-stmt
+    reduction case.PR tree-optimization/111764* tree-vect-loop.c (check_reduction_path): Remove the attempt
+            to allow x + x via special-casing of assigns.
+    
+            * gcc.dg/vect/pr111764.c: New testcase.
+    
+    (cherry picked from commit 05f98310b54da95e468d799f4a910174320cccbb)
+
+- User: Richard Biener | Time: 2023-12-15 12:22:40 UTC
+  Text: Fixed.
+

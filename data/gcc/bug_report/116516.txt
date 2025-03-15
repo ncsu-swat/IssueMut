@@ -1,0 +1,132 @@
+Bug Summary: [15 Regression] [lra] ICE in decompose_normal_address, at rtlanal.cc:6712 by r15-3213-g708ee71808ea61
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Filip Kastl | Time: 2024-08-28 11:45:34 UTC
+  Text: Compiling the gcc testsuite file gcc.dg/analyzer/pr95152-4.c with anything stronger than -O0 results in an ICE
+
+during RTL pass: reload
+/home/fkastl/gcc/src/gcc/testsuite/gcc.dg/analyzer/pr95152-4.c:13:1: internal compiler error: in decompose_normal_address, at rtlanal.cc:6712
+   13 | }
+      | ^
+0x33b9e0e internal_error(char const*, ...)
+	/home/fkastl/gcc/src/gcc/diagnostic-global-context.cc:492
+0x3397bf3 fancy_abort(char const*, int, char const*)
+	/home/fkastl/gcc/src/gcc/diagnostic.cc:1658
+0x1628109 decompose_normal_address
+	/home/fkastl/gcc/src/gcc/rtlanal.cc:6712
+0x16284a9 decompose_address(address_info*, rtx_def**, machine_mode, unsigned char, rtx_code)
+	/home/fkastl/gcc/src/gcc/rtlanal.cc:6805
+0x16284dd decompose_lea_address(address_info*, rtx_def**)
+	/home/fkastl/gcc/src/gcc/rtlanal.cc:6815
+0x1425625 process_address_1
+	/home/fkastl/gcc/src/gcc/lra-constraints.cc:3730
+0x14261c8 process_address
+	/home/fkastl/gcc/src/gcc/lra-constraints.cc:4017
+0x142685d curr_insn_transform
+	/home/fkastl/gcc/src/gcc/lra-constraints.cc:4229
+0x142acfe lra_constraints(bool)
+	/home/fkastl/gcc/src/gcc/lra-constraints.cc:5496
+0x1413956 lra(_IO_FILE*, int)
+	/home/fkastl/gcc/src/gcc/lra.cc:2445
+0x13bc8c9 do_reload
+	/home/fkastl/gcc/src/gcc/ira.cc:5976
+0x13bcdc6 execute
+	/home/fkastl/gcc/src/gcc/ira.cc:6164
+
+Maybe this is the same issue aspr63987?
+
+- User: H.J. Lu | Time: 2024-08-28 12:17:50 UTC
+  Text: It works with GCC 15 on 20240826.
+
+- User: H.J. Lu | Time: 2024-08-28 12:24:06 UTC
+  Text: This is introduced byr15-3213-g708ee71808ea61.
+
+- User: Richard Sandiford | Time: 2024-08-28 12:37:58 UTC
+  Text: Gah, mine then.
+
+- User: Andrew Pinski | Time: 2024-08-28 15:53:43 UTC
+  Text: Just for reference here is the code:
+```
+extern void my_func (int);
+typedef struct {
+  int var;
+} info_t;
+extern void *_data_offs;
+void test()
+{
+  info_t *info = (info_t *) ((void *)((void *)1) + ((unsigned int)&_data_offs));
+  my_func(info->var == 0);
+}
+
+```
+
+- User: Andrew Pinski | Time: 2024-08-28 21:34:54 UTC
+  Text: ***Bug 116523has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2024-08-29 13:01:51 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:ac6d433b02ce26a646b2a7254b1d87fcc06b0bebcommitr15-3288-gac6d433b02ce26a646b2a7254b1d87fcc06b0bebAuthor: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Thu Aug 29 14:00:23 2024 +0100
+
+    Allow subregs around constant displacements [PR116516]
+    
+    This patch fixes a regression introduced byg:708ee71808ea61758e73.
+    x86_64 allows addresses of the form:
+    
+      (zero_extend:DI (subreg:SI (symbol_ref:DI "foo") 0))
+    
+    Before the previous patch, a lax SUBREG check meant that we would
+    treat the subreg as a base and reload it into a base register.
+    But that wasn't what the target was expecting.  Instead we should
+    treat "foo" as a constant displacement, to match:
+    
+            leal foo, <dest>
+    
+    After the patch, we recognised that "foo" isn't a base register,
+    but ICEd on it rather than handling it as a displacement.
+    
+    With or without the recent patches, if the address had instead been:
+    
+      (zero_extend:DI
+        (subreg:SI (plus:DI (reg:DI R) (symbol_ref:DI "foo") 0)))
+    
+    then we would have treated "foo" as the displacement and R as the base
+    or index, as expected.  The problem was that the code that does this was
+    rejecting all subregs of objects, rather than just subregs of variable
+    objects.
+    
+    gcc/PR middle-end/116516* rtlanal.cc (strip_address_mutations): Allow subregs around
+            constant displacements.
+    
+    gcc/testsuite/PR middle-end/116516* gcc.c-torture/compile/pr116516.c: New test.
+
+- User: Richard Sandiford | Time: 2024-08-29 13:03:22 UTC
+  Text: Hopefully fixed.  Thanks for the report.
+
+- User: Sergei Trofimovich | Time: 2024-08-29 19:28:07 UTC
+  Text: The change fixed ICE on linux-6.10.6 for me.
+
+Thank you!
+
+In case it's useful `cvise` reduced kernel's arch/x86/kernel/cpu/common.c into the following:
+
+// $ cat common.c.c
+void entry_SYSENTER_compat(void)
+{
+    unsigned low = (long)entry_SYSENTER_compat;
+    asm (""::"S"((long)low));
+}
+
+Before the fix gcc crashed as:
+
+$ gcc   -O2  -c common.c.c -o bug.o
+during RTL pass: reload
+common.c.c: In function 'entry_SYSENTER_compat':
+common.c.c:5:1: internal compiler error: in decompose_normal_address, at rtlanal.cc:6712
+

@@ -1,0 +1,150 @@
+Bug Summary: riscv: asm clobbers not honored
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: inline-asm
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Michael T. Kloos | Time: 2023-11-10 15:39:32 UTC
+  Text: A recent commit (bisected): 
+
+71f906498ada9ec2780660b03bd6e27a93ad350c 
+RISC-V: far-branch: Handle far jumps and branches for functions larger than 1MB 
+
+Seems to have broken call inline asm clobbers for for the $ra register.  
+
+I attempted to build a riscv32-rv32ia3-linux-musl cross compiler on a x86_64-pc-linux-gnu system.  I succeeded in building the compiler and using it to build my target binary.  However, the target binary was crashing.  On inspection, I discovered that __muldi3 from libgcc was calling __mulsi3, but not saving the ra (link) register.  Upon return from __mulsi3, an infinate loop was entered between the reentry point and the end of the function, as the return instruction was now pointing back at the reentry point.  The intermediate code formed a loop that moved and loaded data off the stack pointer until the program segfaulted.  libgcc makes the call to __mulsi3 with inline assembly and sets ra as one of the clobbered registers.  
+
+Some of the configure options used are --disable-multilib --with-arch=rv32ia --with-abi=ilp32 --enable-checking=none
+
+--enable-checking=none is there to work around another build-time bug which I will file separately.  
+
+If you need more information, let me know.
+
+- User: Michael T. Kloos | Time: 2023-11-10 15:49:59 UTC
+  Text: Added Andrew Waterman to CC list
+
+- User: Andrew Waterman | Time: 2023-11-10 16:49:18 UTC
+  Text: Although I sketched the first draft of this patch, it’s Jeff Law who brought it to fruition. He is more suited to help than I am.
+
+- User: Michael T. Kloos | Time: 2023-11-11 17:02:27 UTC
+  Text: Createdattachment 56560[details]Sample program to reproduce the bug
+
+I have created and attached a small simple program which shows the bug.  
+
+If compiled with an earlier version of GCC, it runs fine.  If compiled with a later version, after the aforementioned commit, it goes into an infinite loop.  
+
+The problem is that the ra register clobber is not being honored.  You can see the difference in objdump disassembly of the the call_invert_and_sum() function.
+
+Here is the disassembly of the good version:
+000101e0 <call_invert_and_sum>:
+   101e0:	ff010113          	add	sp,sp,-16
+   101e4:	00112623          	sw	ra,12(sp)
+   101e8:	f21ff0ef          	jal	10108 <invert_and_sum>
+   101ec:	00c12083          	lw	ra,12(sp)
+   101f0:	01010113          	add	sp,sp,16
+   101f4:	00008067          	ret
+
+Here is the disassembly of the bad version:
+000101e0 <call_invert_and_sum>:
+   101e0:	f29ff0ef          	jal	10108 <invert_and_sum>
+   101e4:	00008067          	ret
+
+This should make it very clear why the program gets trapped in an infinite loop in the second example.
+
+- User: Jeffrey A. Law | Time: 2023-11-13 19:18:30 UTC
+  Text: You're using an ASM to implement a call.  That means your asm is responsible for dealing with all ABI issues, including saving/restoring registers around the call.
+
+Essentially GCC has no visibility into what your ASM does.  It's just a text string that gets passed through to the assembler.  The fact that it worked before was more an accident than by design.  Basically GCC doesn't know your ASM performs a call, so it thinks the function is a leaf.
+
+I would _strongly_ recommend you not implement calls via ASMs.  I've watched developers try to do that for 30+ years.  It rarely ends well.
+
+- User: Michael T. Kloos | Time: 2023-11-13 20:22:49 UTC
+  Text: I disagree.  To quote you:
+
+"You're using an ASM to implement a call.  That means your asm is responsible for dealing with all ABI issues, including saving/restoring registers around the call.
+
+Essentially GCC has no visibility into what your ASM does.  It's just a text string that gets passed through to the assembler."
+
+Exactly.  I did handle that.  I specified all register clobbers in either the outputs or clobber list of the asm statement.  The %ra register is specified in the clobber list.  GCC is not honoring that clobber.  
+
+That is a regression in GCCs behavior.  Of course, it would be possible to write an asm statement that GCC could not work around, such as if you clobbered every register so it could not track the stack pointer.  That is a known limitation, will throw an error, and is not what we are talking about.  Playing around with these ABI "special" registers inside inline asm is certainly not unheard of.  There are many posts on the internet where such tricks are discussed and GCC supports them.  If you are familiar with the ABI and are designing architecture specific code, it can be a great optimization.  This change is a regression.  It breaks any code that relies on this feature.  
+
+Even if we conceded that clobbering the link register is not supported in GCC asm clobber lists, which I don't, you still can't shift the blame to me because the package that broke is not my code.  It broke libgcc, GCC's own internals.  The sample code that I provided is just a minimal way to reproduce the bug, but it's based on these parts of your own source code:> include/longlong.h
+> libgcc/config/riscv/muldi3.S
+> libgcc/config/riscv/multi3.cOn riscv64 (The symbols get redefined on 64 vs 32 bit):> multi3 calls __muluw3()
+> __muluw3 is defined as a macro inside "include/longlong.h"
+> __muluw3 becomes an asm call statement that calls __muldi3.Beyond that, I have not attempted to further experiment with listing other registers as asm clobbers and playing around with the edge cases of this bug.  I don't know if the clobbers of anything else was broken.  I picked up on the case of ra, specifically, because it broke libgcc.  
+
+I know you don't want to take the time to work on this.  But if you are going to dismiss someone out of hand, at least take the time to read and understand their concerns.  I went over the libgcc breakage in my original post.
+
+- User: Kito Cheng | Time: 2023-11-14 02:10:04 UTC
+  Text: Oh, I guess I know what happened, I was confused by the commit you refer (but it's the root cause as you pointed out!) since I thought it may related to far jumps, but...actually not, the problem is something you describe in the title, and can be demonstrate by following small program:
+
+```c
+void foo() {
+    asm volatile("# " : ::"ra");
+}
+
+```
+
+Before that commit:
+```asm
+foo:
+        addi    sp,sp,-16
+        sd      ra,8(sp)
+ #APP
+# 2 "x.c" 1
+        # 
+# 0 "" 2
+ #NO_APP
+        ld      ra,8(sp)
+        addi    sp,sp,16
+        jr      ra
+
+```
+
+After that commit:
+```asm
+foo:
+.LFB0:
+        .cfi_startproc
+#APP
+# 2 "x.c" 1
+        # 
+# 0 "" 2
+#NO_APP
+        ret
+```
+
+But why? because ra is accidentally become caller save register by following change:https://github.com/gcc-mirror/gcc/commit/71f906498ada9ec2780660b03bd6e27a93ad350c#diff-4083cffa971a940af1d435359a45dbfd4d5934384275b0ae5e0c71dece5fd866R331So we no longer save it at prologue and epilogue longer...anyway I will take this and send a patch to fix that soon.
+
+- User: Michael T. Kloos | Time: 2023-11-14 15:22:12 UTC
+  Text: Thank you, Kito Cheng.  I really appreciate it.
+
+- User: Kito Cheng | Time: 2023-11-14 16:24:24 UTC
+  Text: Proposed fix:https://gcc.gnu.org/pipermail/gcc-patches/2023-November/636466.html
+
+- User: GCC Commits | Time: 2023-11-16 11:36:44 UTC
+  Text: The master branch has been updated by Kito Cheng <kito@gcc.gnu.org>:https://gcc.gnu.org/g:defa8681d951c6d6c43c71e3636ce4db9de04a28commitr14-5526-gdefa8681d951c6d6c43c71e3636ce4db9de04a28Author: Kito Cheng <kito.cheng@sifive.com>
+Date:   Tue Nov 14 11:17:45 2023 +0800
+
+    RISC-V: Save/restore ra register correctly [PR112478]
+    
+    We set ra to fixed register now, but we still need to save/restore that at
+    prologue/epilogue if that has used.
+    
+    gcc/ChangeLog:PR target/112478* config/riscv/riscv.cc (riscv_save_return_addr_reg_p): Check ra
+            is ever lived.
+    
+    gcc/testsuite/ChangeLog:PR target/112478* gcc.target/riscv/pr112478.c: New.
+    
+    Reviewed-by: Christoph Müllner <christoph.muellner@vrull.eu>
+    Tested-by: Christoph Müllner <christoph.muellner@vrull.eu>
+
+- User: Kito Cheng | Time: 2023-11-16 23:06:44 UTC
+  Text: Fixed on trunk :)
+

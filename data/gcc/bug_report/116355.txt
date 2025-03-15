@@ -1,0 +1,122 @@
+Bug Summary: [15 Regression] switchconv introduces new signed overflow UB since r15-2416-g2b3533cd871f62
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Krister Walfridsson | Time: 2024-08-12 23:26:55 UTC
+  Text: Consider the function below (taken from gcc.dg/tree-ssa/switch-3.c):
+
+int cipher_to_alg(int cipher)        
+{                                    
+  switch (cipher)              
+    {                            
+      case 8:   return 2;  
+      case 16:  return 3;  
+      case 32:  return 4;  
+      case 64:  return 6;  
+      case 256: return 9;  
+      case 512: return 10; 
+      case 2048: return 11;
+      case 4096: return 12;
+      case 8192: return 13;
+    }                            
+  return 0;                    
+}     
+
+Compiling this with -O2 on X86_64 introduces new UB when the switchconv pass changes the code to:
+
+  _12 = -cipher_2(D);
+  _11 = cipher_2(D) & _12;
+  _10 = _11 == cipher_2(D);
+  if (_10 != 0)
+    goto <bb 3>; [50.00%]
+  else
+    goto <bb 6>; [50.00%]
+
+Here, _12 is a signed value that overflows when cipher is INT_MIN.
+
+- User: Andrew Pinski | Time: 2024-08-12 23:44:10 UTC
+  Text: Confirmed.
+
+- User: Andrew Pinski | Time: 2024-08-12 23:59:59 UTC
+  Text: gen_pow2p is where the issue is.
+
+So there is a few ways of fixing this I think.
+
+One is to convert to an unsigned type if not already.
+But there is another way is to use __builtin_popcount{,l,ll} always and let other passes optimize it into what the target wants.
+
+Because `POPCOUNT(a) == 1` is not the same as `a & -a == a` either but rather:
+int f(int a)
+{
+  int b = a - 1;
+  return (unsigned)(b ^ a) > (unsigned)a;
+}
+
+You can see that with aarch64 code generation even:
+cipher_to_alg:
+        sub     w1, w0, #1
+        eor     w2, w0, w1
+        cmp     w2, w1
+        bls     .L3
+
+- User: Filip Kastl | Time: 2024-08-20 09:05:28 UTC
+  Text: Thanks for the report. Am currently looking into this. I'll probably use the builtin as Andrew suggested.
+
+- User: GCC Commits | Time: 2024-08-28 13:52:44 UTC
+  Text: The master branch has been updated by Filip Kastl <pheeck@gcc.gnu.org>:https://gcc.gnu.org/g:1c4b9826bd0d5ac471543c68f097d80b1969f599commitr15-3256-g1c4b9826bd0d5ac471543c68f097d80b1969f599Author: Filip Kastl <fkastl@suse.cz>
+Date:   Wed Aug 28 15:47:44 2024 +0200
+
+    gimple ssa: switchconv: Use __builtin_popcount and support more types in exp transform [PR116355]
+    
+    The gen_pow2p function generates (a & -a) == a as a fallback for
+    POPCOUNT (a) == 1.  Not only is the bitmagic not equivalent to
+    POPCOUNT (a) == 1 but it also introduces UB (consider signed
+    a = INT_MIN).
+    
+    This patch rewrites gen_pow2p to always use __builtin_popcount instead.
+    This means that what the end result GIMPLE code is gets decided by an
+    already existing machinery in a later pass.  That is a cleaner solution
+    I think.  This existing machinery also uses a ^ (a - 1) > a - 1 which is
+    the correct bitmagic.
+    
+    While rewriting gen_pow2p I had to add logic for converting the
+    operand's type to a type that __builtin_popcount accepts.  I naturally
+    also added this logic to gen_log2.  Thanks to this, exponential index
+    transform gains the capability to handle all operand types with
+    precision at most that of long long int.
+    
+    gcc/ChangeLog:PR tree-optimization/116355* tree-switch-conversion.cc (can_log2): Add capability to
+            suggest converting the operand to a different type.
+            (gen_log2): Add capability to generate a conversion in case the
+            operand is of a type incompatible with the logarithm operation.
+            (can_pow2p): New function.
+            (gen_pow2p): Rewrite to use __builtin_popcount instead of
+            manually inserting an internal fn call or bitmagic.  Also add
+            capability to generate a conversion.
+            (switch_conversion::is_exp_index_transform_viable): Call
+            can_pow2p.  Store types suggested by can_log2 and gen_log2.
+            (switch_conversion::exp_index_transform): Params of gen_pow2p
+            and gen_log2 changed so update their calls.
+            * tree-switch-conversion.h: Add m_exp_index_transform_log2_type
+            and m_exp_index_transform_pow2p_type to switch_conversion class
+            to track type conversions needed to generate the "is power of 2"
+            and logarithm operations.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/116355* gcc.target/i386/switch-exp-transform-1.c: Don't test for
+            presence of POPCOUNT internal fn after switch conversion.  Test
+            for it after __builtin_popcount has had a chance to get
+            expanded.
+            * gcc.target/i386/switch-exp-transform-3.c: Also test char and
+            short.
+    
+    Signed-off-by: Filip Kastl <fkastl@suse.cz>
+
+- User: Filip Kastl | Time: 2024-08-28 13:54:03 UTC
+  Text: Should be fixed now.
+

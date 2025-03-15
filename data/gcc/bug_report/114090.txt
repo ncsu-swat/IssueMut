@@ -1,0 +1,151 @@
+Bug Summary: [13 Regression] forwprop -fwrapv miscompilation
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Krister Walfridsson | Time: 2024-02-24 18:02:06 UTC
+  Text: The function f below returns an incorrect result for INT_MIN when compiled with -O1 -fwrapv for X86_64:
+
+
+__attribute__((noipa)) int f(int x) {
+    int w = (x >= 0 ? x : 0);
+    int y = -x;
+    int z = (y >= 0 ? y : 0);
+    return w + z;
+}
+
+int
+main ()
+{
+  if (f(0x80000000) != 0)
+    __builtin_abort ();
+  return 0;
+}
+
+
+What is happening is that forwprop has optimized
+
+  w_2 = MAX_EXPR <x_1(D), 0>;
+  y_3 = -x_1(D);
+  z_4 = MAX_EXPR <y_3, 0>;
+  _5 = w_2 + z_4;
+  return _5;
+
+to
+
+  _5 = ABS_EXPR <x_1(D)>;
+  return _5;
+
+- User: Andrew Pinski | Time: 2024-02-24 18:10:14 UTC
+  Text: The pattern:
+/* (x >= 0 ? x : 0) + (x <= 0 ? -x : 0) -> abs x.  */
+(simplify
+  (plus:c (max @0 integer_zerop) (max (negate @0) integer_zerop))
+  (abs @0))
+
+introduced byr13-1785-g633e9920589ddf.
+
+- User: Andrew Pinski | Time: 2024-02-24 18:14:04 UTC
+  Text: There most likely should be this check added:
+ANY_INTEGRAL_TYPE_P (type) && !TYPE_OVERFLOW_WRAPS (type)
+
+- User: Jakub Jelinek | Time: 2024-02-24 18:16:26 UTC
+  Text: Both the patterns look wrong for TYPE_OVERFLOW_WRAPS and the first one also for TYPE_UNSIGNED (the second one is ok for TYPE_UNSIGNED but doesn't make much sense there, we should have folded it to 0.  Of course, the first one is unlikely to trigger for TYPE_UNSIGNED because MAX <something, 0U> should have been folded to 0.
+
+- User: Jakub Jelinek | Time: 2024-02-24 18:24:08 UTC
+  Text: I'd go with
+--- gcc/match.pd.jj	2024-02-22 10:09:48.678446435 +0100
++++ gcc/match.pd	2024-02-24 19:23:32.201014245 +0100
+@@ -453,8 +453,9 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+ 
+ /* (x >= 0 ? x : 0) + (x <= 0 ? -x : 0) -> abs x.  */
+ (simplify
+-  (plus:c (max @0 integer_zerop) (max (negate @0) integer_zerop))
+-  (abs @0))
++ (plus:c (max @0 integer_zerop) (max (negate @0) integer_zerop))
++ (if (ANY_INTEGRAL_TYPE_P (type) && TYPE_OVERFLOW_UNDEFINED (type))
++  (abs @0)))
+ 
+ /* X * 1, X / 1 -> X.  */
+ (for op (mult trunc_div ceil_div floor_div round_div exact_div)
+@@ -4218,8 +4219,9 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+ 
+ /* (x <= 0 ? -x : 0) -> max(-x, 0).  */
+ (simplify
+-  (cond (le @0 integer_zerop@1) (negate@2 @0) integer_zerop@1)
+-  (max @2 @1))
++ (cond (le @0 integer_zerop@1) (negate@2 @0) integer_zerop@1)
++ (if (ANY_INTEGRAL_TYPE_P (type) && TYPE_OVERFLOW_UNDEFINED (type))
++  (max @2 @1)))
+ 
+ /* (zero_one == 0) ? y : z <op> y -> ((typeof(y))zero_one * z) <op> y */
+ (for op (bit_xor bit_ior plus)
+
+- User: Jakub Jelinek | Time: 2024-02-24 18:27:22 UTC
+  Text: && !TYPE_OVERFLOW_SANITIZED (type) is IMHO not needed, because both transformations for
+INT_MIN trigger UB before and after.
+
+- User: Jakub Jelinek | Time: 2024-02-24 18:45:32 UTC
+  Text: Createdattachment 57521[details]gcc14-pr114090.patch
+
+Full untested patch.
+
+- User: GCC Commits | Time: 2024-02-26 09:09:38 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:24aa051af7c59f37ec45aea754b48b97d210ea6dcommitr14-9175-g24aa051af7c59f37ec45aea754b48b97d210ea6dAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Feb 26 10:08:45 2024 +0100
+
+    match.pd: Guard 2 simplifications on integral TYPE_OVERFLOW_UNDEFINED [PR114090]
+    
+    These 2 patterns are incorrect on floating point, or for -fwrapv, or
+    for -ftrapv, or the first one for unsigned types (the second one is
+    mathematically correct, but we ought to just fold that to 0 instead).
+    
+    So, the following patch properly guards this.
+    
+    I think we don't need && !TYPE_OVERFLOW_SANITIZED (type) because
+    in both simplifications there would be UB before and after on
+    signed integer minimum.
+    
+    2024-02-26  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114090* match.pd ((x >= 0 ? x : 0) + (x <= 0 ? -x : 0) -> abs x):
+            Restrict pattern to ANY_INTEGRAL_TYPE_P and TYPE_OVERFLOW_UNDEFINED
+            types.
+            ((x <= 0 ? -x : 0) -> max(-x, 0)): Likewise.
+    
+            * gcc.dg/pr114090.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-26 09:27:08 UTC
+  Text: Fixed on the trunk so far.
+
+- User: GCC Commits | Time: 2024-03-02 00:39:11 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:6b8d8a8bce88981554e5ffeb66bcb6b71a869e62commitr13-8393-g6b8d8a8bce88981554e5ffeb66bcb6b71a869e62Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Feb 26 10:08:45 2024 +0100
+
+    match.pd: Guard 2 simplifications on integral TYPE_OVERFLOW_UNDEFINED [PR114090]
+    
+    These 2 patterns are incorrect on floating point, or for -fwrapv, or
+    for -ftrapv, or the first one for unsigned types (the second one is
+    mathematically correct, but we ought to just fold that to 0 instead).
+    
+    So, the following patch properly guards this.
+    
+    I think we don't need && !TYPE_OVERFLOW_SANITIZED (type) because
+    in both simplifications there would be UB before and after on
+    signed integer minimum.
+    
+    2024-02-26  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114090* match.pd ((x >= 0 ? x : 0) + (x <= 0 ? -x : 0) -> abs x):
+            Restrict pattern to ANY_INTEGRAL_TYPE_P and TYPE_OVERFLOW_UNDEFINED
+            types.
+            ((x <= 0 ? -x : 0) -> max(-x, 0)): Likewise.
+    
+            * gcc.dg/pr114090.c: New test.
+    
+    (cherry picked from commit 24aa051af7c59f37ec45aea754b48b97d210ea6d)
+
+- User: Jakub Jelinek | Time: 2024-03-04 12:13:19 UTC
+  Text: Should be now fixed for GCC 13.3+ too.
+

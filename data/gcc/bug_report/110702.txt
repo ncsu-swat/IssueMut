@@ -1,0 +1,295 @@
+Bug Summary: [12 Regression] Wrong code at -O1 on x86_64-linux-gnu (regression since GCC-12.2)
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 11.4.0, 12.1.0, 12.3.1, 13.2.1, 14.0
+Known to Fail: 12.2.0, 12.3.0, 13.1.0, 13.2.0
+
+Comments:
+- User: Shaohua Li | Time: 2023-07-17 13:26:16 UTC
+  Text: This looks like a regression since GCC-12.2.
+
+Compiler explorer:https://godbolt.org/z/655af97j7$ cat a.c
+int printf(const char *, ...);
+int a, b, c, d;
+long e[9][7][4];
+void f() {
+  for (; a >= 0; a--) {
+    b = 0;
+    for (; b <= 3; b++) {
+      c = 0;
+      for (; c <= 3; c++) {
+        int *g = &d;
+        *g = e[0][0][b] | e[a][b][a];
+      }
+    }
+  }
+}
+int main() {
+  f();
+  printf("%d\n", a);
+}
+$
+$ gcc-tk -O0 a.c && ./a.out
+-1
+$ gcc-tk -O1 a.c && ./a.out
+0
+$
+$ gcc-tk -v
+Using built-in specs.
+COLLECT_GCC=gcc-tk
+COLLECT_LTO_WRAPPER=/zdata/shaoli/compilers/ccbuilder-compilers/gcc-322d17ae51ea0137167424e0018d7fa355948f9f/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../configure --disable-multilib --disable-bootstrap --enable-languages=c,c++ --prefix=/zdata/shaoli/compilers/ccbuilder-compilers/gcc-322d17ae51ea0137167424e0018d7fa355948f9f
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20230711 (experimental) (GCC) 
+$
+
+- User: Andrew Pinski | Time: 2023-07-17 18:45:41 UTC
+  Text: Confirmed.
+
+- User: Mikael Pettersson | Time: 2023-07-18 14:09:28 UTC
+  Text: Masked at -Os/O2/O3. The regression at -O1 started with
+
+374cee99d01fceb89d0929da8b38051e6c9768f0 is the first new commit
+commit 374cee99d01fceb89d0929da8b38051e6c9768f0
+Author: Richard Biener <rguenther@suse.de>
+Date:   Tue May 17 09:45:02 2022 +0200
+
+    tree-optimization/105618 - restore load sinking
+
+- User: Shaohua Li | Time: 2023-07-30 14:57:26 UTC
+  Text: Bisect tor13-550-gebce0e9bd8d
+
+- User: Richard Biener | Time: 2023-08-03 09:32:51 UTC
+  Text: I think the bisected rev just exposes an existing issue.  Namely IVOPTs generates
+
+  _1 = MEM[(long int *)_52];
+  _3 = MEM[(long int *)0B + ivtmp.36_9 + ivtmp.28_44 * 4];
+  _4 = (int) _3;
+  _2 = (int) _1;
+  _5 = _2 | _4;
+
+with -fno-ivopts it works fine and we sink
+
+  _1 = e[0][0][b.7_29];
+  _3 = e[a.9_30][b.7_29][a.9_30];
+
+the issue is without IVOPTs the late pure-const pass correctly does nothing
+but with IVOPTs and the above MEMs we get it to produce pure because:
+
+  scanning: _1 = MEM[(long int *)_52];
+    Indirect ref read is not const
+  NULL memory access; terminating BB
+
+which is because infer_nonnull_range_by_dereference eventually does
+
+static bool
+check_loadstore (gimple *, tree op, tree, void *data)
+{
+  if (TREE_CODE (op) == MEM_REF || TREE_CODE (op) == TARGET_MEM_REF)
+    {                           
+      /* Some address spaces may legitimately dereference zero.  */
+      addr_space_t as = TYPE_ADDR_SPACE (TREE_TYPE (op));
+      if (targetm.addr_space.zero_address_valid (as))
+        return false;
+
+      return operand_equal_p (TREE_OPERAND (op, 0), (tree)data, 0);
+
+- User: Richard Biener | Time: 2023-08-03 10:59:02 UTC
+  Text: The issue for this seems to be that create_mem_ref gets
+
+  type = unsigned long
+  offset = 0
+  elements = {
+    [0] = &e * 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffd, 
+    [1] = (sizetype) a.9_30 * 232, 
+    [2] = ivtmp.28_44 * 4
+  }
+
+via get_computation_aff and addr_to_parts fills out no suitable symbol/base
+
+$113 = {symbol = <tree 0x0>, base = <plus_expr 0x7ffff73b30f0>, 
+  index = <nop_expr 0x7ffff73af9a0>, step = <integer_cst 0x7ffff71e4000>, 
+  offset = <tree 0x0>}
+
+so we hit
+
+  else /* !POINTER_TYPE_P */
+    {
+      base = build_int_cst (build_pointer_type (type), 0);
+      index2 = addr->base;
+
+in create_mem_ref_raw.
+
+But get_address_cost sees the address split as aff_inv
+
+  type = unsigned long
+  offset = 0
+  elements = {
+    [0] = &e * 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffd, 
+    [1] = (sizetype) a.9_30 * 232
+  }
+
+and aff_var
+
+  type = unsigned long
+  offset = 0
+  elements = {
+    [0] = ivtmp.28 * 4
+  }
+
+and eventually ends up with parts
+
+$108 = {symbol = <tree 0x0>, base = <integer_cst 0x7ffff71e4150>, 
+  index = <integer_cst 0x7ffff71e4150>, step = <integer_cst 0x7ffff73b05e8>, 
+  offset = <tree 0x0>}
+
+so the address we cost is different from the address we eventually generate
+(the address we cost doesn't contain all parts - we ignore aff_var).
+
+- User: GCC Commits | Time: 2023-08-03 12:22:57 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:13dfb01e5c30c3bd09333ac79d6ff96a617fea67commitr14-2951-g13dfb01e5c30c3bd09333ac79d6ff96a617fea67Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Aug 3 13:11:12 2023 +0200
+
+    tree-optimization/110702 - avoid zero-based memory references in IVOPTs
+    
+    Sometimes IVOPTs chooses a weird induction variable which downstream
+    leads to issues.  Most of the times we can fend those off during costing
+    by rejecting the candidate but it looks like the address description
+    costing synthesizes is different from what we end up generating so
+    the following fixes things up at code generation time.  Specifically
+    we avoid the create_mem_ref_raw fallback which uses a literal zero
+    address base with the actual base in index2.  For the case in question
+    we have the address
+    
+      type = unsigned long
+      offset = 0
+      elements = {
+        [0] = &e * -3,
+        [1] = (sizetype) a.9_30 * 232,
+        [2] = ivtmp.28_44 * 4
+      }
+    
+    from which we code generate the problematical
+    
+      _3 = MEM[(long int *)0B + ivtmp.36_9 + ivtmp.28_44 * 4];
+    
+    which references the object at address zero.  The patch below
+    recognizes the fallback after the fact and transforms the
+    TARGET_MEM_REF memory reference into a LEA for which this form
+    isn't problematic:
+    
+      _24 = &MEM[(long int *)0B + ivtmp.36_34 + ivtmp.28_44 * 4];
+      _3 = *_24;
+    
+    hereby avoiding the correctness issue.  We'd later conclude the
+    program terminates at the null pointer dereference and make the
+    function pure, miscompling the main function of the testcase.PR tree-optimization/110702* tree-ssa-loop-ivopts.cc (rewrite_use_address): When
+            we created a NULL pointer based access rewrite that to
+            a LEA.
+    
+            * gcc.dg/torture/pr110702.c: New testcase.
+
+- User: Richard Biener | Time: 2023-08-03 12:23:23 UTC
+  Text: Fixed on trunk sofar.
+
+- User: GCC Commits | Time: 2023-08-24 10:56:06 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:5ca9aea695396266b7eb7d2a065e6f2e9546047ecommitr13-7752-g5ca9aea695396266b7eb7d2a065e6f2e9546047eAuthor: Richard Biener <rguenther@suse.de>
+Date:   Thu Aug 3 13:11:12 2023 +0200
+
+    tree-optimization/110702 - avoid zero-based memory references in IVOPTs
+    
+    Sometimes IVOPTs chooses a weird induction variable which downstream
+    leads to issues.  Most of the times we can fend those off during costing
+    by rejecting the candidate but it looks like the address description
+    costing synthesizes is different from what we end up generating so
+    the following fixes things up at code generation time.  Specifically
+    we avoid the create_mem_ref_raw fallback which uses a literal zero
+    address base with the actual base in index2.  For the case in question
+    we have the address
+    
+      type = unsigned long
+      offset = 0
+      elements = {
+        [0] = &e * -3,
+        [1] = (sizetype) a.9_30 * 232,
+        [2] = ivtmp.28_44 * 4
+      }
+    
+    from which we code generate the problematical
+    
+      _3 = MEM[(long int *)0B + ivtmp.36_9 + ivtmp.28_44 * 4];
+    
+    which references the object at address zero.  The patch below
+    recognizes the fallback after the fact and transforms the
+    TARGET_MEM_REF memory reference into a LEA for which this form
+    isn't problematic:
+    
+      _24 = &MEM[(long int *)0B + ivtmp.36_34 + ivtmp.28_44 * 4];
+      _3 = *_24;
+    
+    hereby avoiding the correctness issue.  We'd later conclude the
+    program terminates at the null pointer dereference and make the
+    function pure, miscompling the main function of the testcase.PR tree-optimization/110702* tree-ssa-loop-ivopts.cc (rewrite_use_address): When
+            we created a NULL pointer based access rewrite that to
+            a LEA.
+    
+            * gcc.dg/torture/pr110702.c: New testcase.
+    
+    (cherry picked from commit 13dfb01e5c30c3bd09333ac79d6ff96a617fea67)
+
+- User: Richard Biener | Time: 2023-09-22 05:46:00 UTC
+  Text: ***Bug 111517has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2023-11-27 11:35:07 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:56d6989705189970b842ba1bdb1759d432b0d9e7commitr12-10009-g56d6989705189970b842ba1bdb1759d432b0d9e7Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Aug 3 13:11:12 2023 +0200
+
+    tree-optimization/110702 - avoid zero-based memory references in IVOPTs
+    
+    Sometimes IVOPTs chooses a weird induction variable which downstream
+    leads to issues.  Most of the times we can fend those off during costing
+    by rejecting the candidate but it looks like the address description
+    costing synthesizes is different from what we end up generating so
+    the following fixes things up at code generation time.  Specifically
+    we avoid the create_mem_ref_raw fallback which uses a literal zero
+    address base with the actual base in index2.  For the case in question
+    we have the address
+    
+      type = unsigned long
+      offset = 0
+      elements = {
+        [0] = &e * -3,
+        [1] = (sizetype) a.9_30 * 232,
+        [2] = ivtmp.28_44 * 4
+      }
+    
+    from which we code generate the problematical
+    
+      _3 = MEM[(long int *)0B + ivtmp.36_9 + ivtmp.28_44 * 4];
+    
+    which references the object at address zero.  The patch below
+    recognizes the fallback after the fact and transforms the
+    TARGET_MEM_REF memory reference into a LEA for which this form
+    isn't problematic:
+    
+      _24 = &MEM[(long int *)0B + ivtmp.36_34 + ivtmp.28_44 * 4];
+      _3 = *_24;
+    
+    hereby avoiding the correctness issue.  We'd later conclude the
+    program terminates at the null pointer dereference and make the
+    function pure, miscompling the main function of the testcase.PR tree-optimization/110702* tree-ssa-loop-ivopts.cc (rewrite_use_address): When
+            we created a NULL pointer based access rewrite that to
+            a LEA.
+    
+            * gcc.dg/torture/pr110702.c: New testcase.
+    
+    (cherry picked from commit 13dfb01e5c30c3bd09333ac79d6ff96a617fea67)
+
+- User: Richard Biener | Time: 2023-11-27 11:37:15 UTC
+  Text: Fixed.
+

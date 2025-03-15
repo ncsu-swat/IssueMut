@@ -1,0 +1,489 @@
+Bug Summary: [15 Regression] zlib-1.3.1 miscompilation since r15-1936-g80e446e829d818
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2024-07-10 22:23:05 UTC
+  Text: Noticed as a zlib-1.3.1 test failure on today's gccr15-1936-g80e446e829d818.
+
+The symptom is a test crash on zlib-1.3.1 testsuite on x86_64-linux:
+
+$ make && make check
+make: Nothing to be done for 'all'.
+hello world
+zlib version 1.3.1 = 0x1310, compile flags = 0xa9
+                *** zlib test FAILED ***
+make: *** [Makefile:85: teststatic] Error 1
+
+Bisect landed onr15-1936-g80e446e829d818"Match: Support form 2 for the .SAT_TRUNC"
+
+I have not extracted the self-contained example but I'm pretty sure it's compress2() from compress.c around the saturation handler:https://github.com/madler/zlib/blob/v1.3.1/compress.c#L22Will try toextract the example tomorrow until somebody beats me to it.
+
+- User: Li Pan | Time: 2024-07-10 23:11:01 UTC
+  Text: Thanks for reporting this.
+
+It should be this "stream.avail_out = left > (uLong)max ? max : (uInt)left;" which HIT the .SAT_TRUNC.  Aka below pattern.
+
++/* Unsigned saturation truncate, case 2, sizeof (WT) > sizeof (NT).
++   SAT_U_TRUNC = (NT)(MIN_EXPR (X, 255)).  */
++(match (unsigned_integer_sat_trunc @0)
++ (convert (min @0 INTEGER_CST@1))
++ (if (INTEGRAL_TYPE_P (type) && TYPE_UNSIGNED (type)
++      && TYPE_UNSIGNED (TREE_TYPE (@0)))
++ (with
++  {
++   unsigned itype_precision = TYPE_PRECISION (TREE_TYPE (@0));
++   unsigned otype_precision = TYPE_PRECISION (type);
++   wide_int trunc_max = wi::mask (otype_precision, false, itype_precision);
++   wide_int int_cst = wi::to_wide (@1, itype_precision);
++  }
++  (if (otype_precision < itype_precision && wi::eq_p (trunc_max, int_cst))))))
+
+Take a quick look but failed to find something abnormal,  will take a look into it.
+
+- User: H.J. Lu | Time: 2024-07-10 23:56:41 UTC
+  Text: See:https://gcc.gnu.org/pipermail/gcc-regression/2024-July/080225.html
+
+- User: H.J. Lu | Time: 2024-07-10 23:59:55 UTC
+  Text: This may be fixed byr15-1954.
+
+- User: Li Pan | Time: 2024-07-11 05:55:18 UTC
+  Text: (In reply to H.J. Lu fromcomment #3)> This may be fixed byr15-1954.Thank HJ, this makes much sense to me.
+
+- User: Sergei Trofimovich | Time: 2024-07-11 08:30:51 UTC
+  Text: (In reply to H.J. Lu fromcomment #3)> This may be fixed byr15-1954.Great find! That fix repairs `zlib` and `perl` for me.
+
+Here is the extracted example from zlib-1.3.1 for completeness in case it's useful to have a generic C example for test suite:
+
+// $ cat compress.c
+typedef unsigned long uLong;
+typedef unsigned int uInt;
+
+struct s {
+    unsigned int ai;
+    unsigned int ao;
+};
+__attribute__((noipa))
+static void init_struct(struct s * p) {
+    p->ai = 0;
+    p->ao = 0;
+}
+__attribute__((noipa))
+static void do_struct(struct s * p, uLong sourceLen, uLong destLen) {
+    uLong left = destLen;
+    const uInt max = (uInt)-1;
+
+    if (p->ao == 0) {
+        p->ao = left > (uLong)max ? max : (uInt)left;
+        left -= p->ao;
+    }
+    if (p->ai == 0) {
+        p->ai = sourceLen > (uLong)max ? max : (uInt)sourceLen;
+        sourceLen -= p->ai;
+    }
+}
+__attribute__((noipa))
+static void check_struct(struct s * p) {
+    if (p->ai != 0xe) __builtin_trap();
+    if (p->ao != 0xea60) __builtin_trap();
+}
+
+int main(void) {
+    struct s v;
+    init_struct(&v);
+    do_struct(&v, 0xe, 0xea60);
+    check_struct(&v);
+    return 0;
+}
+
+Crashing with gccr15-1936-g80e446e829d818:
+
+$ gcc -O2 -o bug compress.c && ./bug
+Illegal instruction (core dumped)
+$ gcc -O1 -o bug compress.c && ./bug
+<ok>
+
+- User: Uroš Bizjak | Time: 2024-07-11 10:57:33 UTC
+  Text: Please note that w/o .SAT_TRUNC the compiler is able to optimize hot loop in compress2 to:
+
+  <bb 5> [local count: 536870912]:
+  _18 = MIN_EXPR <left_8, 4294967295>;
+  iftmp.0_11 = (unsigned int) _18;
+  stream.avail_out = iftmp.0_11;
+  left_37 = left_8 - _18;
+
+while .SAT_TRUNC somehow interferes with this optimization to produce:
+
+  <bb 5> [local count: 536870912]:
+  _45 = MIN_EXPR <left_8, 4294967295>;
+  iftmp.0_11 = .SAT_TRUNC (left_8);
+  stream.avail_out = iftmp.0_11;
+  left_37 = left_8 - _45;
+
+- User: Richard Biener | Time: 2024-07-11 11:16:02 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #6)> Please note that w/o .SAT_TRUNC the compiler is able to optimize hot loop in
+> compress2 to:
+> 
+>   <bb 5> [local count: 536870912]:
+>   _18 = MIN_EXPR <left_8, 4294967295>;
+>   iftmp.0_11 = (unsigned int) _18;
+>   stream.avail_out = iftmp.0_11;
+>   left_37 = left_8 - _18;
+> 
+> while .SAT_TRUNC somehow interferes with this optimization to produce:
+> 
+>   <bb 5> [local count: 536870912]:
+>   _45 = MIN_EXPR <left_8, 4294967295>;
+>   iftmp.0_11 = .SAT_TRUNC (left_8);
+>   stream.avail_out = iftmp.0_11;
+>   left_37 = left_8 - _45;it looks like whatever recognizes .SAT_TRUNC doesn't pay attention that
+there are other uses of the MIN_EXPR and thus the MIN_EXPR stays live.
+
+IIRC :s on (match (...) is ignored (and that's good IMO) at the moment so
+the user of the match predicate has to check.
+
+- User: Li Pan | Time: 2024-07-13 04:16:34 UTC
+  Text: (In reply to Richard Biener fromcomment #7)> (In reply to Uroš Bizjak fromcomment #6)
+> > Please note that w/o .SAT_TRUNC the compiler is able to optimize hot loop in
+> > compress2 to:
+> > 
+> >   <bb 5> [local count: 536870912]:
+> >   _18 = MIN_EXPR <left_8, 4294967295>;
+> >   iftmp.0_11 = (unsigned int) _18;
+> >   stream.avail_out = iftmp.0_11;
+> >   left_37 = left_8 - _18;
+> > 
+> > while .SAT_TRUNC somehow interferes with this optimization to produce:
+> > 
+> >   <bb 5> [local count: 536870912]:
+> >   _45 = MIN_EXPR <left_8, 4294967295>;
+> >   iftmp.0_11 = .SAT_TRUNC (left_8);
+> >   stream.avail_out = iftmp.0_11;
+> >   left_37 = left_8 - _45;
+> 
+> it looks like whatever recognizes .SAT_TRUNC doesn't pay attention that
+> there are other uses of the MIN_EXPR and thus the MIN_EXPR stays live.
+> 
+> IIRC :s on (match (...) is ignored (and that's good IMO) at the moment so
+> the user of the match predicate has to check.Thanks Richard.
+Yes, the .SAT_TRUNC doesn't pay any attention the other possible use of MIN_EXPR.
+
+As your suggestion, we may need one additional check here (like
+gimple_unsigned_sat_trunc() && no_other_MIN_EXPR_use_after_sat_trunc_p ()) before we build the SAT_TRUNC call.
+Sorry I didn't get the point here why we need to do this, could you please
+help to explain a bit more about it? Like wrong code or something else in above
+sample code.
+
+- User: Uroš Bizjak | Time: 2024-07-13 04:36:44 UTC
+  Text: (In reply to Li Pan fromcomment #8)> Thanks Richard.
+> Yes, the .SAT_TRUNC doesn't pay any attention the other possible use of
+> MIN_EXPR.
+> 
+> As your suggestion, we may need one additional check here (like
+> gimple_unsigned_sat_trunc() && no_other_MIN_EXPR_use_after_sat_trunc_p ())
+> before we build the SAT_TRUNC call.
+> Sorry I didn't get the point here why we need to do this, could you please
+> help to explain a bit more about it? Like wrong code or something else in
+> above
+> sample code.The wrong-code bug is now fixed (it was x86 target-specific oversight in the expander), but while fixing the original bug, I noticed that the addition of ustrunc{m}{n}2 optab regressed compress2 loop performance wise.
+
+Without ustrunc{m}{n} the loop in compress2 looks like:
+
+  <bb 5> [local count: 536870912]:
+  _18 = MIN_EXPR <left_8, 4294967295>;
+  iftmp.0_11 = (unsigned int) _18;
+  stream.avail_out = iftmp.0_11;
+  left_37 = left_8 - _18;
+
+and when ustrunc{m}{n}2 is present in i386.md:
+
+  <bb 5> [local count: 536870912]:
+  _45 = MIN_EXPR <left_8, 4294967295>;
+  iftmp.0_11 = .SAT_TRUNC (left_8);
+  stream.avail_out = iftmp.0_11;
+  left_37 = left_8 - _45;
+
+In the first case, iftmp.0_11 is calculated with a simple truncation from unsinged long to int (i.e. "mov %eax, %edx" on x86). In the second case, it uses .SAT_TRUNC optab, which on x85 expands to a sequence of complex instructions. Performanve wise, it is universally better to have a "normal" truncation after MIN_EXPR than saturating .SAT_TRUNC truncation.
+
+- User: Uroš Bizjak | Time: 2024-07-13 05:11:27 UTC
+  Text: Createdattachment 58650[details]Testcase that illustrates performance issue
+
+- User: Uroš Bizjak | Time: 2024-07-13 05:26:25 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #10)> Createdattachment 58650[details]> Testcase that illustrates performance issueWithout ustrunc{m}{m}2 optab the loop in the testcase compiles to (gcc -O2):
+
+.L7:
+        movl    12(%rsp), %eax
+.L4:
+        testl   %eax, %eax
+        jne     .L2
+        movl    $4294967295, %eax
+        cmpq    %rax, %rbx
+        cmovbe  %rbx, %rax
+        movl    %eax, 12(%rsp)
+        subq    %rax, %rbx
+.L2:
+        leaq    12(%rsp), %rdi
+        call    deflate
+        testl   %eax, %eax
+        je      .L7
+
+where the relevant part of the _.optimized tree dump reads:
+
+  <bb 4> [local count: 536870913]:
+  _13 = MIN_EXPR <left_4, 4294967295>;
+  iftmp.0_6 = (unsigned int) _13;
+  stream.avail_out = iftmp.0_6;
+  left_15 = left_4 - _13;
+
+and when ustrunc{m}{n} is present, the same loop compiles to:
+
+.L7:
+        movl    12(%rsp), %eax
+.L4:
+        testl   %eax, %eax
+        jne     .L2
+        movl    $4294967295, %eax
+        movl    %ebp, %edx
+        cmpq    %rax, %rbx
+        cmovbe  %rbx, %rax
+        cmpq    %rbx, %rbp   <---
+        cmovnc  %ebx, %edx   <---
+        subq    %rax, %rbx
+        movl    %edx, 12(%rsp)
+.L2:
+        leaq    12(%rsp), %rdi
+        call    deflate
+        testl   %eax, %eax
+        je      .L7
+
+where the relevant part of the _.optimized tree dump reads:
+
+  <bb 4> [local count: 536870912]:
+  _12 = MIN_EXPR <left_3, 4294967295>;
+  iftmp.0_5 = .SAT_TRUNC (left_3);
+  stream.avail_out = iftmp.0_5;
+  left_14 = left_3 - _12;
+
+Please note two new instructions in the second asm dump. These are expanded from .SAT_TRUNC and are not present in the first asm dump.
+
+The problem here is that the presence of ustrunc{m}{n}2 optab in i386.md prevents some optimization involving .MIN_EXPR that would result in better code.
+
+- User: Richard Biener | Time: 2024-07-15 07:43:34 UTC
+  Text: (In reply to Li Pan fromcomment #8)> (In reply to Richard Biener fromcomment #7)
+> > (In reply to Uroš Bizjak fromcomment #6)
+> > > Please note that w/o .SAT_TRUNC the compiler is able to optimize hot loop in
+> > > compress2 to:
+> > > 
+> > >   <bb 5> [local count: 536870912]:
+> > >   _18 = MIN_EXPR <left_8, 4294967295>;
+> > >   iftmp.0_11 = (unsigned int) _18;
+> > >   stream.avail_out = iftmp.0_11;
+> > >   left_37 = left_8 - _18;
+> > > 
+> > > while .SAT_TRUNC somehow interferes with this optimization to produce:
+> > > 
+> > >   <bb 5> [local count: 536870912]:
+> > >   _45 = MIN_EXPR <left_8, 4294967295>;
+> > >   iftmp.0_11 = .SAT_TRUNC (left_8);
+> > >   stream.avail_out = iftmp.0_11;
+> > >   left_37 = left_8 - _45;
+> > 
+> > it looks like whatever recognizes .SAT_TRUNC doesn't pay attention that
+> > there are other uses of the MIN_EXPR and thus the MIN_EXPR stays live.
+> > 
+> > IIRC :s on (match (...) is ignored (and that's good IMO) at the moment so
+> > the user of the match predicate has to check.
+> 
+> Thanks Richard.
+> Yes, the .SAT_TRUNC doesn't pay any attention the other possible use of
+> MIN_EXPR.
+> 
+> As your suggestion, we may need one additional check here (like
+> gimple_unsigned_sat_trunc() && no_other_MIN_EXPR_use_after_sat_trunc_p ())
+> before we build the SAT_TRUNC call.
+> Sorry I didn't get the point here why we need to do this, could you please
+> help to explain a bit more about it? Like wrong code or something else in
+> above
+> sample code.I'd amend the captured ops, like
+
+(match (unsigned_integer_sat_trunc @0 @2)
+ (convert (min@2 @0 INTEGER_CST@1))
+
+(match (unsigned_integer_sat_trunc @0 @2)
+ (bit_ior:c (negate (convert (gt@2 @0 INTEGER_CST@1)))
+
+and in the transform do
+
+  if (gimple_unsigned_integer_sat_trunc (lhs, ops, NULL)
+    && has_single_use (ops[1])
+    && direct_internal_fn_supported_p (IFN_SAT_TRUNC,
+
+that would be the most simple way to avoid this.  Note it avoids the
+alternate use for both the MIN_EXPR and the compare (for the 2nd pattern
+it might be required to have more ops to check that, the convert and also the negate).  I think you can't do
+
+(match (unsigned_integer_sat_trunc @0 @2 @3 @4)
+ (convert (min@2@3@4 @0 INTEGER_CST@1))
+
+at the moment, but the machinery actually supports it for the case of
+(convert?@1 (op@2 ...  where @1 and @2 refer to the same object when
+the compare is not there.  So it might be a matter of amending parsing
+here - of course it's a bit ugly.
+
+Having a helper that can tell there's no external uses of a SSA chain
+denoted by two end-points, namely the match root (the first op
+you give to gimple_unsigned_integer_sat_trunc) and the "tail", the
+matched ops[0] would be a nice thing to have.  Note that ops[0] is
+the "wrong" root, so I think we want to match the real relevant
+root which would be the compare in one case and the min in the other.
+From that the requirement would be
+
+  tree op = ops[0];
+  while (single_imm_use (op, &use_p, &use_stmt))
+    {
+      auto def = single_ssa_def_operand (use_stmt, SSA_OP_USE);
+      op = DEF_FROM_PTR (def);
+      if (op == lhs)
+        return true;
+    }
+  return false;
+
+and maybe call such helper gimple_isolated_expr_p (tree def, tree leaf);
+where in principle this could support multiple leafs (just repeat the
+above for each leaf).
+
+The match.pd machinery could support this itself of course, you can
+either add single_use () conditionals yourself, implement :s on the
+individual operands or have a way to mark the whole expression in this
+way.
+
+So the easiest way is to do.  My above remarks are for some more general
+utility.
+
+(match (unsigned_integer_sat_trunc @0)
+ (convert (min@2 @0 INTEGER_CST@1))
+ (if (INTEGRAL_TYPE_P (type) && TYPE_UNSIGNED (type)
+      && TYPE_UNSIGNED (TREE_TYPE (@0))
+      && single_use (@2))
+
+- User: Li Pan | Time: 2024-07-15 10:56:49 UTC
+  Text: Thanks Richard and Bizjak.
+
+Got the point here, and let me have a try for the improvement.
+
+- User: Li Pan | Time: 2024-07-17 03:47:11 UTC
+  Text: Hi Uroš,> Please note two new instructions in the second asm dump. These are expanded
+> from .SAT_TRUNC and are not present in the first asm dump.> The problem here is that the presence of ustrunc{m}{n}2 optab in i386.md 
+> prevents some optimization involving .MIN_EXPR that would result in better code.Would like to double confirm with you if vector mode of ustrunc{m}{n}2 has similar issue like this. If not,  add single_use to match.pd may also effect on vector.
+
+For example, in RVV we may have a similar insn layout.
+
+<bb 5> [local count: 536870912]:
+_18 = MIN_EXPR <left_8, 4294967295>;  // vminu
+iftmp.0_11 = (unsigned int) _18;      // vcvt
+stream.avail_out = iftmp.0_11;        // vmv
+left_37 = left_8 - _18;               // vsub
+
+while .SAT_TRUNC somehow interferes with this optimization to produce:
+
+<bb 5> [local count: 536870912]:
+_45 = MIN_EXPR <left_8, 4294967295>;  // vminu
+iftmp.0_11 = .SAT_TRUNC (left_8);     // vnclipu
+stream.avail_out = iftmp.0_11;        // vmv
+left_37 = left_8 - _45;               // vsub
+
+- User: Uroš Bizjak | Time: 2024-07-17 06:18:52 UTC
+  Text: (In reply to Li Pan fromcomment #14)> Hi Uroš,
+> 
+> > Please note two new instructions in the second asm dump. These are expanded
+> > from .SAT_TRUNC and are not present in the first asm dump.
+> 
+> > The problem here is that the presence of ustrunc{m}{n}2 optab in i386.md 
+> > prevents some optimization involving .MIN_EXPR that would result in better code.
+> 
+> Would like to double confirm with you if vector mode of ustrunc{m}{n}2 has
+> similar issue like this. If not,  add single_use to match.pd may also effect
+> on vector.Unfortunately, x86 has no vector mode .SAT_TRUNC instruction.
+
+- User: Hongtao Liu | Time: 2024-07-17 06:52:54 UTC
+  Text: > Unfortunately, x86 has no vector mode .SAT_TRUNC instruction.No, AVX512 supports both signed and unsigned saturation
+vpmovsdb:vpmovusdb
+vpmovsdw:vpmovusdw
+vpmovsqb:vpmovusqb
+vpmovsqd:vpmovusqd
+vpmovsqw:vpmovusqw
+vpmovswb:vpmovuswb
+vpmovsdb:vpmovusdb
+
+and we're working on a patch to support that.
+
+- User: Uroš Bizjak | Time: 2024-07-17 06:58:39 UTC
+  Text: (In reply to Hongtao Liu fromcomment #16)> > Unfortunately, x86 has no vector mode .SAT_TRUNC instruction.
+> No, AVX512 supports both signed and unsigned saturationIndeed.
+
+BTW: PACKUSmn (despite the name) is not what we are looking for.
+
+- User: Hu Lin | Time: 2024-07-17 07:02:37 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #17)> (In reply to Hongtao Liu fromcomment #16)
+> > > Unfortunately, x86 has no vector mode .SAT_TRUNC instruction.
+> > No, AVX512 supports both signed and unsigned saturation
+> Indeed.
+> 
+> BTW: PACKUSmn (despite the name) is not what we are looking for.Indeed.
+
+- User: GCC Commits | Time: 2024-07-19 00:39:34 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:02cc8494745c4235890ad58e93b5acce5a89a775commitr15-2149-g02cc8494745c4235890ad58e93b5acce5a89a775Author: Pan Li <pan2.li@intel.com>
+Date:   Thu Jul 18 20:16:34 2024 +0800
+
+    Match: Only allow single use of MIN_EXPR for SAT_TRUNC form 2 [PR115863]
+    
+    The SAT_TRUNC form 2 has below pattern matching.
+    From:
+      _18 = MIN_EXPR <left_8, 4294967295>;
+      iftmp.0_11 = (unsigned int) _18;
+    
+    To:
+      _18 = MIN_EXPR <left_8, 4294967295>;
+      iftmp.0_11 = .SAT_TRUNC (left_8);
+    
+    But if there is another use of _18 like below,  the transform to the
+    .SAT_TRUNC may have no earnings.  For example:
+    
+    From:
+      _18 = MIN_EXPR <left_8, 4294967295>; // op_0 def
+      iftmp.0_11 = (unsigned int) _18;     // op_0
+      stream.avail_out = iftmp.0_11;
+      left_37 = left_8 - _18;              // op_0 use
+    
+    To:
+      _18 = MIN_EXPR <left_8, 4294967295>; // op_0 def
+      iftmp.0_11 = .SAT_TRUNC (left_8);
+      stream.avail_out = iftmp.0_11;
+      left_37 = left_8 - _18;              // op_0 use
+    
+    Pattern recog to .SAT_TRUNC cannot eliminate MIN_EXPR as above.  Then the
+    backend (for example x86/riscv) will have additional 2-3 more insns
+    after pattern recog besides the MIN_EXPR.  Thus,  keep the normal truncation
+    as is should be the better choose.
+    
+    The below testsuites are passed for this patch:
+    1. The rv64gcv fully regression tests.
+    2. The x86 bootstrap tests.
+    3. The x86 fully regression tests.PR target/115863gcc/ChangeLog:
+    
+            * match.pd: Add single_use check for .SAT_TRUNC form 2.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr115863-1.c: New test.
+    
+    Signed-off-by: Pan Li <pan2.li@intel.com>
+
+- User: Sergei Trofimovich | Time: 2024-07-25 08:07:05 UTC
+  Text: Declaring fixed. Thanks all!
+

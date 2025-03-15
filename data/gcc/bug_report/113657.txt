@@ -1,0 +1,111 @@
+Bug Summary: [14 Regression] ICE Segmentation fault with -mstrict-align and __arm_data512_t since r14-1187-gd6b756447cd58b
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Michal Jireš | Time: 2024-01-29 16:12:19 UTC
+  Text: Compiling reduced testcase gcc.target/aarch64/pr113550.c results in ICE sincer14-1187-gd6b756447cd58b.
+
+$ catpr113550.c
+#pragma GCC target "+ls64"
+#pragma GCC aarch64 "arm_acle.h"
+__arm_data512_t foo(__arm_data512_t* ptr) { return *ptr; }
+
+
+$ aarch64-linux-gnu-gccpr113550.c -mstrict-align
+during RTL pass: split5pr113550.c: In function ‘foo’:pr113550.c:3:58: internal compiler error: Segmentation fault
+    3 | __arm_data512_t foo(__arm_data512_t* ptr) { return *ptr; }
+      |                                                          ^
+0x178f9de crash_signal
+	/home/mjires/git/GCC/master/gcc/toplev.cc:317
+0x16f7566 reg_overlap_mentioned_p(rtx_def const*, rtx_def const*)
+	/home/mjires/git/GCC/master/gcc/rtlanal.cc:1857
+0x267687e gen_split_300(rtx_insn*, rtx_def**)
+	/home/mjires/git/GCC/master/gcc/config/aarch64/aarch64-simd.md:8232
+0x2a7ffb2 split_71
+	/home/mjires/git/GCC/master/gcc/config/aarch64/aarch64-simd.md:8212
+0x2a99edf split_131
+	/home/mjires/git/GCC/master/gcc/config/aarch64/aarch64.md:875
+0x2a9dcf4 split_insns(rtx_def*, rtx_insn*)
+	/home/mjires/git/GCC/master/gcc/config/aarch64/aarch64-sve.md:10993
+0x117c8db try_split(rtx_def*, rtx_insn*, int)
+	/home/mjires/git/GCC/master/gcc/emit-rtl.cc:3941
+0x16a3a44 split_insn
+	/home/mjires/git/GCC/master/gcc/recog.cc:3405
+0x16a3ea6 split_all_insns_noflow()
+	/home/mjires/git/GCC/master/gcc/recog.cc:3567
+0x16a5ee4 execute
+	/home/mjires/git/GCC/master/gcc/recog.cc:4641
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+
+$ aarch64-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=aarch64-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/home/mjires/built/master/libexec/gcc/aarch64-linux-gnu/14.0.1/lto-wrapper
+Target: aarch64-linux-gnu
+Configured with: /home/mjires/git/GCC/master/configure --prefix=/home/mjires/built/master --target=aarch64-linux-gnu --disable-bootstrap --enable-languages=c,c++,fortran --disable-multilib --disable-libsanitizer --enable-checking : (reconfigured) /home/mjires/git/GCC/master/configure --prefix=/home/mjires/built/master --target=aarch64-linux-gnu --disable-bootstrap --enable-languages=c,c++,fortran --disable-multilib --disable-libsanitizer --enable-checking
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240129 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-01-30 07:34:48 UTC
+  Text: Confirmed.
+
+8229                simplify_gen_subreg (TImode, operands[1], V8DImode, offset)
+
+(gdb) p debug_rtx(operands[1])
+(mem:V8DI (reg/f:DI 0 x0 [101]) [1 *ptr_2(D)+0 S64 A64])
+$4 = void
+(gdb) p offset
+$5 = 0
+
+That is due to:
+/* V8DI mode.  */
+VECTOR_MODE_WITH_PREFIX (V, INT, DI, 8, 5);
+ADJUST_ALIGNMENT (V8DI, 8);
+
+
+So maybe for strict alignment, we need to loop using DImode instead of TImode and hope ldp/stp pass optimizes it back into load/store pairs ...
+
+- User: Andrew Pinski | Time: 2024-01-30 08:40:15 UTC
+  Text: I have a patch.
+
+- User: Andrew Pinski | Time: 2024-01-30 18:44:13 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2024-January/644464.html
+
+- User: GCC Commits | Time: 2024-02-01 00:19:07 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:dbf847d2c8d1c910948ba34c9338939c67323273commitr14-8671-gdbf847d2c8d1c910948ba34c9338939c67323273Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Tue Jan 30 00:50:56 2024 -0800
+
+    aarch64: -mstrict-align vs __arm_data512_t [PR113657]
+    
+    Afterr14-1187-gd6b756447cd58b, simplify_gen_subreg can return
+    NULL for "unaligned" memory subreg. Since V8DI has an alignment of 8 bytes,
+    using TImode causes simplify_gen_subreg to return NULL.
+    This fixes the issue by using DImode instead for the loop. And then we will have
+    later on the STP/LDP pass combine it back into STP/LDP if needed.
+    Since strict align is less important (usually used for firmware and early boot only),
+    not doing LDP/STP here is ok.
+    
+    Built and tested for aarch64-linux-gnu with no regressions.PR target/113657gcc/ChangeLog:
+    
+            * config/aarch64/aarch64-simd.md (split for movv8di):
+            For strict aligned mode, use DImode instead of TImode.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/acle/ls64_strict_align.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-02-01 00:19:30 UTC
+  Text: Fixed.
+

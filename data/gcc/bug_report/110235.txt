@@ -1,0 +1,118 @@
+Bug Summary: [14 Regression] Wrong use of us_truncate in SSE and AVX RTL representation
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: testsuite-fail, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: N/A | Time: 2023-06-13 09:02:46 UTC
+  Text: Afterg:921b841350c4fc298d09f6c5674663e0f4208610added constant-folding for SS_TRUNCATE and US_TRUNCATE some tests in i386.exp started failing:
+FAIL: gcc.target/i386/avx-vpackuswb-1.c execution test
+FAIL: gcc.target/i386/avx2-vpackssdw-2.c execution test
+FAIL: gcc.target/i386/avx2-vpackusdw-2.c execution test
+FAIL: gcc.target/i386/avx2-vpackuswb-2.c execution test
+FAIL: gcc.target/i386/sse2-packuswb-1.c execution test
+
+From what I can gather from the documentation for intrinsics like _mm_packus_epi16 the operation they perform is not what we model as us_truncate in RTL. That is, they don't perform a truncation while treating their input as an unsigned value. Rather, they treat the input as a signed value and saturate it to the unsigned min and max of the narrow mode before truncation. In that regard they seem similar to the SQMOVUN instructions in aarch64.
+
+I think it'd be best to change the representation of those instructions to a truncating clamp operation, similar tog:b747f54a2a930da55330c2861cd1e344f67a88d9in aarch64.
+
+- User: Richard Biener | Time: 2023-06-13 14:00:07 UTC
+  Text: Confirmed (the FAILs)
+
+- User: Hongtao.liu | Time: 2023-06-14 06:25:17 UTC
+  Text: FAIL: gcc.target/i386/avx2-vpackssdw-2.c execution test
+
+This one is about sign saturation which should match rtl SS_TRUNCATE.
+
+- User: Hongtao.liu | Time: 2023-06-14 08:43:39 UTC
+  Text: (In reply to Hongtao.liu fromcomment #2)> FAIL: gcc.target/i386/avx2-vpackssdw-2.c execution test
+> 
+> This one is about sign saturation which should match rtl SS_TRUNCATE.I realize for 256-bit/512-bit vpackssdw, it's an 128-bit iterleave of src1 and src2, and then ss_truncate to the dest, not just vec_concat src1 and src2. So the simplification exposed the bug.
+
+- User: N/A | Time: 2023-06-15 08:48:54 UTC
+  Text: (In reply to Hongtao.liu fromcomment #3)> (In reply to Hongtao.liu fromcomment #2)
+> > FAIL: gcc.target/i386/avx2-vpackssdw-2.c execution test
+> > 
+> > This one is about sign saturation which should match rtl SS_TRUNCATE.
+> 
+> I realize for 256-bit/512-bit vpackssdw, it's an 128-bit iterleave of src1
+> and src2, and then ss_truncate to the dest, not just vec_concat src1 and
+> src2. So the simplification exposed the bug.Thanks for looking at it. I think it'd make sense for someone with x86/sse/avx experience to rewrite the RTL representation of the patterns involved to match the correct semantics for saturation and lane behaviour.
+Alternatively, a quick solution would be to convert uses of us_truncate/ss_truncate in the problematic patterns to an x86-specific UNSPEC, which would make things work like they did before the simplification was added. That would be just a stop-gap solution as it's better to use standard RTL operations where possible.
+
+- User: Andrew Pinski | Time: 2023-06-15 23:01:52 UTC
+  Text: ***Bug 110274has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2023-06-19 01:34:44 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:58e61a3ab1c13b6d5b07d86a30cf48a46e0345c8commitr14-1916-g58e61a3ab1c13b6d5b07d86a30cf48a46e0345c8Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Jun 14 10:34:32 2023 +0800
+
+    Reimplement packuswb/packusdw with UNSPEC_US_TRUNCATE instead of original us_truncate.
+    
+    packuswb/packusdw does unsigned saturation for signed source, but rtl
+    us_truncate means does unsigned saturation for unsigned source.
+    So for value -1, packuswb will produce 0, but us_truncate produces
+    255. The patch reimplement those related patterns and functions with
+    UNSPEC_US_TRUNCATE instead of us_truncate.
+    
+    gcc/ChangeLog:PR target/110235* config/i386/i386-expand.cc (ix86_split_mmx_pack): Use
+            UNSPEC_US_TRUNCATE instead of original us_truncate for
+            packusdw/packuswb.
+            * config/i386/mmx.md (mmx_pack<s_trunsuffix>swb): Substitute
+            with ..
+            (mmx_packsswb): .. this and ..
+            (mmx_packuswb): .. this.
+            (mmx_packusdw): Use UNSPEC_US_TRUNCATE instead of original
+            us_truncate.
+            (s_trunsuffix): Removed code iterator.
+            (any_s_truncate): Ditto.
+            * config/i386/sse.md (<sse2_avx2>_packuswb<mask_name>): Use
+            UNSPEC_US_TRUNCATE instead of original us_truncate.
+            (<sse4_1_avx2>_packusdw<mask_name>): Ditto.
+            * config/i386/i386.md (UNSPEC_US_TRUNCATE): New unspec_c_enum.
+
+- User: GCC Commits | Time: 2023-06-19 01:34:48 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:f8e02702726d4514b8ff9f5481c9c1f5d34e1787commitr14-1917-gf8e02702726d4514b8ff9f5481c9c1f5d34e1787Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Jun 15 16:46:14 2023 +0800
+
+    Refined 256/512-bit vpacksswb/vpackssdw patterns.
+    
+    The packing in vpacksswb/vpackssdw is not a simple concat, it's an
+    interweave from src1 and src2 for every 128 bit(or 64-bit for the
+    ss_truncate result).
+    
+    .i.e.
+    
+    dst[192-255] = ss_truncate (src2[128-255])
+    dst[128-191] = ss_truncate (src1[128-255])
+    dst[64-127] = ss_truncate (src2[0-127])
+    dst[0-63] = ss_truncate (src1[0-127]
+    
+    The patch refined those patterns with an extra vec_select for the
+    interweave.
+    
+    gcc/ChangeLog:PR target/110235* config/i386/sse.md (<sse2_avx2>_packsswb<mask_name>):
+            Substitute with ..
+            (sse2_packsswb<mask_name>): .. this, ..
+            (avx2_packsswb<mask_name>): .. this and ..
+            (avx512bw_packsswb<mask_name>): .. this.
+            (<sse2_avx2>_packssdw<mask_name>): Substitute with ..
+            (sse2_packssdw<mask_name>): .. this, ..
+            (avx2_packssdw<mask_name>): .. this and ..
+            (avx512bw_packssdw<mask_name>): .. this.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/avx512bw-vpackssdw-3.c: New test.
+            * gcc.target/i386/avx512bw-vpacksswb-3.c: New test.
+
+- User: Hongtao.liu | Time: 2023-06-19 01:40:14 UTC
+  Text: Fixed for GCC 14, the bug is latent on all release branches, but would not be exposed without rtl us/ss_truncate simplification.
+
+- User: Andrew Pinski | Time: 2023-07-15 06:04:20 UTC
+  Text: Fixed.
+

@@ -1,0 +1,259 @@
+Bug Summary: [11 Regression] Segmentation fault with -fsanitize=address -fsanitize=null -O2 when attribute no_sanitize_address is enabled since r9-5742
+Product: gcc
+Component: sanitizer
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Anonymous | Time: 2024-05-06 03:37:31 UTC
+  Text: Compiler Explorer:https://godbolt.org/z/33rbWdf49*******************************************************************************
+gcc version:
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=/home/gcc_set/gcc-trunk/bin/gcc
+COLLECT_LTO_WRAPPER=/home/gcc_set/gcc-trunk/libexec/gcc/aarch64-unknown-linux-gnu/15.0.0/lto-wrapper
+Target: aarch64-unknown-linux-gnu
+Configured with: ../gcc/configure --prefix=/home/gcc_set/gcc-trunk --with-gmp=/home/build_essential --with-mpfr=/home/build_essential --with-mpc=/home/build_essential --enable-languages=c,c++ --disable-multilib --with-sanitizer=address,undefined,thread,leakcd CC=gcc CXX=g++
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240430 (experimental) (GCC)
+
+git version: 22b20ac6c6aead2d3f36c413a77dd0b80adfec39
+*******************************************************************************
+Program:
+$ cat mutant.c
+int **a;
+__attribute__((always_inline)) int *c() {
+  int b[1];
+  b;
+}
+__attribute__((no_sanitize_address)) static char d() { *a = c(); }
+void e() { d(); }
+
+*******************************************************************************
+Command Lines:
+$ gcc -fsanitize=address -fsanitize=null -O2 -c mutant.c
+mutant.c:2:37: warning: 'always_inline' function might not be inlinable unless also declared 'inline' [-Wattributes]
+    2 | __attribute__((always_inline)) int *c() {
+      |                                     ^
+during GIMPLE pass: sanopt
+mutant.c: In function 'd.isra':
+mutant.c:6:50: internal compiler error: Segmentation fault
+    6 | __attribute__((no_sanitize_address)) static char d() { *a = c(); }
+      |                                                  ^
+0xf2d49b crash_signal
+	../../gcc/gcc/toplev.cc:319
+0xf3fcfc contains_struct_check(tree_node*, tree_node_structure_enum, char const*, int, char const*)
+	../../gcc/gcc/tree.h:3769
+0xf3fcfc build_shadow_mem_access
+	../../gcc/gcc/asan.cc:2552
+0xf4b90f asan_expand_mark_ifn(gimple_stmt_iterator*)
+	../../gcc/gcc/asan.cc:3854
+0xf5f6bf execute
+	../../gcc/gcc/sanopt.cc:1379
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions
+
+- User: Sam James | Time: 2024-05-06 07:21:23 UTC
+  Text: testing on godbolt gives..
+
+
+gcc 8.2:
+```
+<source>:2:37: warning: always_inline function might not be inlinable [-Wattributes]
+ __attribute__((always_inline)) int *c() {
+                                     ^
+<source>: In function 'd':
+<source>:2:37: error: inlining failed in call to always_inline 'c': function attribute mismatch
+<source>:6:61: note: called from here
+ __attribute__((no_sanitize_address)) static char d() { *a = c(); }
+                                                             ^~~
+Compiler returned: 1
+```
+
+gcc 8.3:
+```
+<source>:2:37: warning: always_inline function might not be inlinable [-Wattributes]
+ __attribute__((always_inline)) int *c() {
+                                     ^
+during GIMPLE pass: sanopt
+<source>: In function 'd':
+<source>:6:50: internal compiler error: Segmentation fault
+ __attribute__((no_sanitize_address)) static char d() { *a = c(); }
+                                                  ^
+Please submit a full bug report,
+with preprocessed source if appropriate.
+See <https://gcc.gnu.org/bugs/> for instructions.
+Compiler returned: 1
+```
+
+so a regression in that we ICE.
+
+- User: Jakub Jelinek | Time: 2024-05-06 08:04:13 UTC
+  Text: Started with myr9-5742-g6206a883fe7a741dbb9e09d88255a170a75950f5-O2 -fsanitize=address,null
+
+int **a;
+
+__attribute__((always_inline)) int *
+foo (void)
+{
+  int b[1];
+  (void) b;
+}
+
+__attribute__((no_sanitize_address)) static char
+bar (void)
+{
+  *a = foo ();
+}
+
+void
+baz (void)
+{
+  bar ();
+}
+
+- User: Jakub Jelinek | Time: 2024-05-06 08:58:25 UTC
+  Text: Createdattachment 58106[details]gcc15-pr114956.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-05-07 19:29:47 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d4e25cf4f7c1f51a8824cc62bbb85a81a41b829acommitr15-302-gd4e25cf4f7c1f51a8824cc62bbb85a81a41b829aAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 7 21:29:14 2024 +0200
+
+    tree-inline: Remove .ASAN_MARK calls when inlining functions into no_sanitize callers [PR114956]
+    
+    Inr9-5742we've started allowing to inline always_inline functions into
+    functions which have disabled e.g. address sanitization even when the
+    always_inline function is implicitly from command line options sanitized.
+    
+    This mostly works fine because most of the asan instrumentation is done only
+    late after ipa, but as the following testcase the .ASAN_MARK ifn calls
+    gimplifier adds can result in ICEs.
+    
+    Fixed by dropping those during inlining, similarly to how we drop
+    .TSAN_FUNC_EXIT calls.
+    
+    2024-05-07  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/114956* tree-inline.cc: Include asan.h.
+            (copy_bb): Remove also .ASAN_MARK calls if id->dst_fn has asan/hwasan
+            sanitization disabled.
+    
+            * gcc.dg/asan/pr114956.c: New test.
+
+- User: GCC Commits | Time: 2024-05-07 19:31:34 UTC
+  Text: The releases/gcc-14 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:aca573ea64ccfd54d4447e9a3200acd7a9157082commitr14-10180-gaca573ea64ccfd54d4447e9a3200acd7a9157082Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 7 21:29:14 2024 +0200
+
+    tree-inline: Remove .ASAN_MARK calls when inlining functions into no_sanitize callers [PR114956]
+    
+    Inr9-5742we've started allowing to inline always_inline functions into
+    functions which have disabled e.g. address sanitization even when the
+    always_inline function is implicitly from command line options sanitized.
+    
+    This mostly works fine because most of the asan instrumentation is done only
+    late after ipa, but as the following testcase the .ASAN_MARK ifn calls
+    gimplifier adds can result in ICEs.
+    
+    Fixed by dropping those during inlining, similarly to how we drop
+    .TSAN_FUNC_EXIT calls.
+    
+    2024-05-07  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/114956* tree-inline.cc: Include asan.h.
+            (copy_bb): Remove also .ASAN_MARK calls if id->dst_fn has asan/hwasan
+            sanitization disabled.
+    
+            * gcc.dg/asan/pr114956.c: New test.
+    
+    (cherry picked from commit d4e25cf4f7c1f51a8824cc62bbb85a81a41b829a)
+
+- User: Jakub Jelinek | Time: 2024-05-07 19:32:27 UTC
+  Text: Fixed for 14.2 and later for now.
+
+- User: GCC Commits | Time: 2024-05-09 04:26:50 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d1ec7bc9cb0639a212422710ba647dc1aaea6eaacommitr13-8733-gd1ec7bc9cb0639a212422710ba647dc1aaea6eaaAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 7 21:29:14 2024 +0200
+
+    tree-inline: Remove .ASAN_MARK calls when inlining functions into no_sanitize callers [PR114956]
+    
+    Inr9-5742we've started allowing to inline always_inline functions into
+    functions which have disabled e.g. address sanitization even when the
+    always_inline function is implicitly from command line options sanitized.
+    
+    This mostly works fine because most of the asan instrumentation is done only
+    late after ipa, but as the following testcase the .ASAN_MARK ifn calls
+    gimplifier adds can result in ICEs.
+    
+    Fixed by dropping those during inlining, similarly to how we drop
+    .TSAN_FUNC_EXIT calls.
+    
+    2024-05-07  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/114956* tree-inline.cc: Include asan.h.
+            (copy_bb): Remove also .ASAN_MARK calls if id->dst_fn has asan/hwasan
+            sanitization disabled.
+    
+            * gcc.dg/asan/pr114956.c: New test.
+    
+    (cherry picked from commit d4e25cf4f7c1f51a8824cc62bbb85a81a41b829a)
+
+- User: Jakub Jelinek | Time: 2024-05-09 08:18:19 UTC
+  Text: Fixed also for 13.3.
+
+- User: GCC Commits | Time: 2024-06-11 10:38:46 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:25bd98dfd99e92c57ff393d393f54d028d7f86f4commitr12-10529-g25bd98dfd99e92c57ff393d393f54d028d7f86f4Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 7 21:29:14 2024 +0200
+
+    tree-inline: Remove .ASAN_MARK calls when inlining functions into no_sanitize callers [PR114956]
+    
+    Inr9-5742we've started allowing to inline always_inline functions into
+    functions which have disabled e.g. address sanitization even when the
+    always_inline function is implicitly from command line options sanitized.
+    
+    This mostly works fine because most of the asan instrumentation is done only
+    late after ipa, but as the following testcase the .ASAN_MARK ifn calls
+    gimplifier adds can result in ICEs.
+    
+    Fixed by dropping those during inlining, similarly to how we drop
+    .TSAN_FUNC_EXIT calls.
+    
+    2024-05-07  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/114956* tree-inline.cc: Include asan.h.
+            (copy_bb): Remove also .ASAN_MARK calls if id->dst_fn has asan/hwasan
+            sanitization disabled.
+    
+            * gcc.dg/asan/pr114956.c: New test.
+    
+    (cherry picked from commit d4e25cf4f7c1f51a8824cc62bbb85a81a41b829a)
+
+- User: Jakub Jelinek | Time: 2024-06-11 10:53:35 UTC
+  Text: Should be fixed for 12.4+ too.
+
+- User: GCC Commits | Time: 2024-06-20 13:23:47 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:e4bd9558d431bee2f4a76875dd79c9a76d2c58ffcommitr11-11511-ge4bd9558d431bee2f4a76875dd79c9a76d2c58ffAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 7 21:29:14 2024 +0200
+
+    tree-inline: Remove .ASAN_MARK calls when inlining functions into no_sanitize callers [PR114956]
+    
+    Inr9-5742we've started allowing to inline always_inline functions into
+    functions which have disabled e.g. address sanitization even when the
+    always_inline function is implicitly from command line options sanitized.
+    
+    This mostly works fine because most of the asan instrumentation is done only
+    late after ipa, but as the following testcase the .ASAN_MARK ifn calls
+    gimplifier adds can result in ICEs.
+    
+    Fixed by dropping those during inlining, similarly to how we drop
+    .TSAN_FUNC_EXIT calls.
+    
+    2024-05-07  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/114956* tree-inline.c: Include asan.h.
+            (copy_bb): Remove also .ASAN_MARK calls if id->dst_fn has asan/hwasan
+            sanitization disabled.
+    
+            * gcc.dg/asan/pr114956.c: New test.
+    
+    (cherry picked from commit d4e25cf4f7c1f51a8824cc62bbb85a81a41b829a)
+
+- User: Jakub Jelinek | Time: 2024-06-20 13:44:01 UTC
+  Text: Fixed for 11.5 as well.
+

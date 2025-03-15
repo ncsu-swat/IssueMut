@@ -1,0 +1,79 @@
+Bug Summary: riscv: Infinite loop with mask extraction
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Robin Dapp | Time: 2023-12-13 12:29:12 UTC
+  Text: Pan Li found the following problematic case in his "full-coverage" testing and I'm just documenting it here for reference.
+
+/* { dg-do compile } */
+/* { dg-options "-march=rv64gcv_zvl512b -mabi=lp64d --param=riscv-autovec-lmul=m8 --param=riscv-autovec-preference=fixed-vlmax -O3 -fno-vect-cost-model -fno-tree-loop-distribute-patterns" } */
+
+int a[1024];
+int b[1024];
+
+_Bool
+fn1 ()
+{
+  _Bool tem;
+  for (int i = 0; i < 1024; ++i)
+    {
+      tem = !a[i];
+      b[i] = tem;
+    }
+  return tem;
+}
+
+We try to extract the last bit from a 128-bit value of a mask vector.  In order to do so we first subreg by a tieable vector mode (here RVVMF4QI) then, because we do not have a RVVMF4QI -> BI vector extraction, try type punning with a
+TImode subreg.
+As we do not natively support TImode, the result needs to be subreg'd again to DImode.  In the course of doing so we get lost in subreg moves and hit an infinite loop.  I have not tracked down the real root cause but the problem is fixed by providing a movti pattern and special casing subreg:TI extraction from vectors (just like we do in legitimize_move for other scalar subregs of vectors - and wich I don't particularly like either :) ).
+
+- User: Robin Dapp | Time: 2023-12-13 12:32:51 UTC
+  Text: What actually gets in the way of vec_extract here is changing to a "better" vector mode (which is RVVMF4QI here).  If we tried to extract from the mask directly everything would work directly.
+
+I have a patch locally that does this by refactoring extract_bit_field_1 slightly.  Going to post it soon but not sure if people agree with that idea.
+
+- User: JuzheZhong | Time: 2023-12-13 13:47:05 UTC
+  Text: Ok.It's mask bit field again. It's an annoying issue.
+
+I think explict movti pattern is controversial since it may have
+risks that affect scalar part.
+
+- User: GCC Commits | Time: 2023-12-14 16:54:07 UTC
+  Text: The master branch has been updated by Robin Dapp <rdapp@gcc.gnu.org>:https://gcc.gnu.org/g:e5e1999aa664333f766f3e6cc6996f769d50ae7acommitr14-6556-ge5e1999aa664333f766f3e6cc6996f769d50ae7aAuthor: Robin Dapp <rdapp@ventanamicro.com>
+Date:   Wed Dec 13 16:42:28 2023 +0100
+
+    expmed: Compare unit_precision for better mode.
+    
+    In extract_bit_field_1 we try to get a better vector mode before
+    extracting from it.  Better refers to the case when the requested target
+    mode does not equal the inner mode of the vector to extract from and we
+    have an equivalent tieable vector mode with a fitting inner mode.
+    
+    On riscv this triggered an ICE (PR112999) because we would take the
+    detour of extracting from a mask-mode vector via a vector integer mode.
+    One element of that mode could be subreg-punned with TImode which, in
+    turn, would need to be operated on in DImode chunks.
+    
+    This patch adds
+    
+        && known_eq (bitsize, GET_MODE_UNIT_PRECISION (new_mode))
+        && multiple_p (bitnum, GET_MODE_UNIT_PRECISION (new_mode))
+    
+    to the list of criteria for a better mode.
+    
+    gcc/ChangeLog:PR target/112999* expmed.cc (extract_bit_field_1):  Ensure better mode
+            has fitting unit_precision.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/pr112999.c: New test.
+
+- User: Robin Dapp | Time: 2023-12-15 08:47:46 UTC
+  Text: Should be fixed on trunk.
+

@@ -1,0 +1,110 @@
+Bug Summary: wrong code with shift and _BitInt() at -O0
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-01-13 07:31:50 UTC
+  Text: Createdattachment 57066[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc testcase.c
+$ ./a.out 
+Aborted
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-7215-20240112190107-g8b447fa89d5-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-7215-20240112190107-g8b447fa89d5-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240112 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-01-13 07:47:08 UTC
+  Text: Confirmed.
+
+Testcase which shows what something is wrong with the original value:
+```
+typedef _BitInt(255) B;
+
+[[gnu::noipa]]
+B
+foo(int s)
+{
+  B a = 0;
+  a = (-(B)3) >> s;
+  return a;
+}
+
+int
+main(void)
+{
+  B x = foo(51);
+  unsigned long *a = (unsigned long *)&x;
+  __builtin_printf("%lx\n", a[0]);
+  __builtin_printf("%lx\n", a[1]);
+  __builtin_printf("%lx\n", a[2]);
+  __builtin_printf("%lx\n", a[3]);
+  //if (x != -1)
+  //  __builtin_abort();
+  return 0;
+}
+```
+
+- User: Jakub Jelinek | Time: 2024-01-13 10:55:17 UTC
+  Text: Createdattachment 57071[details]gcc14-pr113370.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-01-15 08:59:25 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:8a1927856a10c5ff1b86504c345c8be449b53c30commitr14-7239-g8a1927856a10c5ff1b86504c345c8be449b53c30Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Jan 15 09:58:37 2024 +0100
+
+    lower-bitint: Fix up handling of INTEGER_CSTs in handle_operand in right shifts or comparisons [PR113370]
+    
+    The INTEGER_CST code uses the remainder bits in computations whether to use
+    whole constant or just part of it and extend it at runtime, and furthermore
+    uses it to avoid using all bits even when using the (almost) whole constant.
+    The problem is that the prec % (2 * limb_prec) computation it uses is
+    appropriate only for the normal lowering of mergeable operations (where
+    we process 2 limbs at a time in a loop starting with least significant
+    limbs and process the remaining 0-2 limbs after the loop (there with
+    constant indexes).  For that case it is ok not to emit the upper
+    prec % (2 * limb_prec) bits into the constant, because those bits will be
+    extracted using INTEGER_CST idx and so will be used directly in the
+    statements as INTEGER_CSTs.
+    For other cases, where we either process just a single limb in a loop,
+    process it downwards (e.g. non-equality comparisons) or with some runtime
+    addends (some shifts), there is either just at most one limb lowered with
+    INTEGER_CST idx after the loop (e.g. for right shift) or before the loop
+    (e.g. non-equality comparisons), or all limbs are processed with
+    non-INTEGER_CST indexes (e.g. for left shift, when m_var_msb is set).
+    Now, the m_var_msb case is already handled through
+                  if (m_var_msb)
+                    type = TREE_TYPE (op);
+                  else
+                    /* If we have a guarantee the most significant partial limb
+                       (if any) will be only accessed through handle_operand
+                       with INTEGER_CST idx, we don't need to include the partial
+                       limb in .rodata.  */
+                    type = build_bitint_type (prec - rem, 1);
+    but for the right shifts or comparisons the prec - rem when rem was
+    prec % (2 * limb_prec) was incorrect, so the following patch fixes it
+    to use remainder for 2 limbs only if m_upwards_2limb and remainder for
+    1 limb otherwise.
+    
+    2024-01-15  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113370* gimple-lower-bitint.cc (bitint_large_huge::handle_operand): Only
+            set rem to prec % (2 * limb_prec) if m_upwards_2limb, otherwise
+            set it to just prec % limb_prec.
+    
+            * gcc.dg/torture/bitint-48.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-01-15 08:59:54 UTC
+  Text: Fixed, thanks for the report.
+

@@ -1,0 +1,167 @@
+Bug Summary: [14 regression] ICE in find_uses_to_rename_use
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2024-01-13 09:58:34 UTC
+  Text: Createdattachment 57070[details]C++ source code
+
+In the last 24 hours or so, the attached code seems to have broken:
+
+$ ~/gcc/results.20240112.asan.ubsan/bin/gcc -c -w -O3 -march=znver2bug997.cc
+$ ~/gcc/results.20240113.asan.ubsan/bin/gcc -c -w -O3 -march=znver2bug997.cc
+during GIMPLE pass: vectbug997.cc: In member function ‘Botan::BER_Decoder& Botan::BER_Decoder::decode(Botan::BigInt&, Botan::ASN1_Tag, Botan::ASN1_Tag)’:bug997.cc:26093:14: internal compiler error: Segmentation fault
+26093 | BER_Decoder& BER_Decoder::decode(BigInt& out,
+      |              ^~~~~~~~~~~
+0x11e8ad9 crash_signal(int)
+	../../trunk.20210101/gcc/toplev.cc:317
+0x1388e28 find_uses_to_rename_use(basic_block_def*, tree_node*, bitmap_head**, bitmap_head*)
+
+- User: David Binderman | Time: 2024-01-13 14:50:42 UTC
+  Text: trunk.20210101 $ ~/gcc/results.20240112.asan.ubsan/bin/gcc -v 2>&1 | grep exp
+gcc version 14.0.0 20240112 (experimental) (72b3495dfdddc277) 
+trunk.20210101 $ ~/gcc/results.20240113.asan.ubsan/bin/gcc -v 2>&1 | grep exp
+gcc version 14.0.1 20240113 (experimental) (34a827039fabcf24) 
+trunk.20210101 $ git log 72b3495dfdddc277..34a827039fabcf24 | grep -c "^commit"
+52
+trunk.20210101 $
+
+- User: Andrew Pinski | Time: 2024-01-13 20:42:02 UTC
+  Text: reducing ...
+
+- User: Andrew Pinski | Time: 2024-01-13 22:50:15 UTC
+  Text: Createdattachment 57075[details]Reduced C testcase
+
+Note I think there is a missed VRP removing some bounds check but this is not the issue here.
+
+- User: Andrew Pinski | Time: 2024-01-13 22:50:24 UTC
+  Text: Confirmed.
+
+- User: Richard Biener | Time: 2024-01-15 08:33:36 UTC
+  Text: (gdb) p debug_gimple_stmt (phi)
+.MEM_31 = PHI <.MEM_109(5), (3)>
+
+- User: Jakub Jelinek | Time: 2024-01-15 08:44:48 UTC
+  Text: Started to ICE withr14-7194-g6cb155a6cf314232248a12bdd395ed4151ae5a28withpr113374.c: In function ‘void decode(vector)’:pr113374.c:7:6: error: PHI node with wrong VUSE on edge from BB 5
+    7 | void decode(struct vector vec) {
+      |      ^~~~~~
+.MEM_115 = PHI <.MEM_7(5), .MEM_7(3)>
+expected .MEM_108pr113374.c:7:6: error: multiple virtual PHI nodes in BB 11
+.MEM_28 = PHI <.MEM_7(7)>
+.MEM_116 = PHI <.MEM_9(D)(7)>pr113374.c:7:6: error: PHI node with wrong VUSE on edge from BB 11
+.MEM_30 = PHI <.MEM_116(11), .MEM_115(17)>
+expected .MEM_28
+during GIMPLE pass: vectpr113374.c:7:6: internal compiler error: verify_ssa failedr14-7195-g411de96dbf2bdafc7a90ebbfc63e68afd6388d29changes the ICE to
+during GIMPLE pass: vectpr113374.c: In function ‘void decode(vector)’:pr113374.c:7:6: internal compiler error: in as_a, at is-a.h:255
+    7 | void decode(struct vector vec) {
+      |      ^~~~~~
+0xa16d76 gphi* as_a<gphi*, gimple>(gimple*)
+	../../gcc/is-a.h:255
+0x14b5428 slpeel_tree_duplicate_loop_to_edge_cfg(loop*, edge_def*, loop*, edge_def*, edge_def*, edge_def**, bool, vec<basic_block_def*, va_heap, vl_ptr>*)
+	../../gcc/tree-vect-loop-manip.cc:1742
+0x14ba302 vect_do_peeling(_loop_vec_info*, tree_node*, tree_node*, tree_node**, tree_node**, tree_node**, int, bool, bool, tree_node**)
+	../../gcc/tree-vect-loop-manip.cc:3346
+0x14a47ee vect_transform_loop(_loop_vec_info*, gimple*)
+	../../gcc/tree-vect-loop.cc:11924
+and finallyr14-7196-g99c0a540d6689ede068f9ba98af6f38c3cd71362to
+during GIMPLE pass: vectpr113374.c: In function ‘void decode(vector)’:pr113374.c:7:6: internal compiler error: Segmentation fault
+    7 | void decode(struct vector vec) {
+      |      ^~~~~~
+0x1151dc6 crash_signal
+	../../gcc/toplev.cc:317
+0x13485a9 find_uses_to_rename_use
+	../../gcc/tree-ssa-loop-manip.cc:414
+0x1348884 find_uses_to_rename_bb
+	../../gcc/tree-ssa-loop-manip.cc:489
+0x1348a6d find_uses_to_rename
+	../../gcc/tree-ssa-loop-manip.cc:521
+which appears until latest trunk.
+
+- User: Jakub Jelinek | Time: 2024-01-15 09:08:40 UTC
+  Text: Thehttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=113364#c9patch doesn't fix this.
+
+- User: Jakub Jelinek | Time: 2024-01-15 16:51:21 UTC
+  Text: Slightly cleaned up testcase, -O3 -msse4 is what is needed to reproduce:
+
+typedef __SIZE_TYPE__ size_t;
+struct S { unsigned char *a, *b; };
+
+void
+foo (struct S x)
+{
+  for (size_t i = x.b - x.a; i > 0; --i)
+    {
+      size_t t = x.b - x.a;
+      size_t u = i - 1;
+      if (u >= t)
+	__builtin_abort ();
+      if (x.a[i - 1]--)
+	break;
+    }
+}
+
+- User: Richard Biener | Time: 2024-01-16 14:49:25 UTC
+  Text: The code populating alternative exit virtual PHIs simply doesn't handle more
+than one arg ...
+
+          /* Now link the alternative exits.  */
+          if (multiple_exits_p)  
+            {
+...
+                       SET_PHI_ARG_DEF (l_phi, 0, exit_val);
+
+we're losing the original ones doing
+
+      for (auto exit : loop_exits)
+        {       
+          basic_block dest = main_loop_exit_block;
+          if (exit != loop_exit)
+            {
+              if (!alt_loop_exit_block)
+                { 
+                  edge res = redirect_edge_and_branch ( 
+                                exit,
+                                new_preheader);
+                  flush_pending_stmts (res);
+                  alt_loop_exit_block = split_edge (res);
+                  continue;
+                }
+              dest = alt_loop_exit_block;
+            }
+          edge e = redirect_edge_and_branch (exit, dest);
+          flush_pending_stmts (e);
+        }
+
+since that creates a new BB without any virtual PHI.
+
+- User: GCC Commits | Time: 2024-01-18 07:37:17 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:0f38666680d6ad0e40c4a8b6d94b2c93931cdf42commitr14-8206-g0f38666680d6ad0e40c4a8b6d94b2c93931cdf42Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Jan 17 13:24:22 2024 +0100
+
+    tree-optimization/113374 - early break vect and virtual operands
+    
+    The following fixes wrong virtual operands being used for peeled
+    early breaks where we can have different live ones and for multiple
+    exits it makes sure to update the correct PHI arguments.
+    
+    I've introduced SET_PHI_ARG_DEF_ON_EDGE so we can avoid using
+    a wrong edge to compute the PHI arg index from.
+    
+    I've took the liberty to understand the code again and refactor
+    and comment it a bit differently.  The main functional change
+    is that we preserve the live virtual operand on all exits.PR tree-optimization/113374* tree-ssa-operands.h (SET_PHI_ARG_DEF_ON_EDGE): New.
+            * tree-vect-loop.cc (move_early_exit_stmts): Update
+            virtual LC PHIs.
+            * tree-vect-loop-manip.cc (slpeel_tree_duplicate_loop_to_edge_cfg):
+            Refactor.  Preserve virtual LC PHIs on all exits.
+    
+            * gcc.dg/vect/vect-early-break_106-pr113374.c: New testcase.
+
+- User: Richard Biener | Time: 2024-01-18 07:38:20 UTC
+  Text: Fixed.
+

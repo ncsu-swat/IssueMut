@@ -1,0 +1,156 @@
+Bug Summary: [14/15 regression] internal error in seh_cfa_offset with -O2 -fno-omit-frame-pointer
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 13.2.0
+Known to Fail: 
+
+Comments:
+- User: Christoph Reiter | Time: 2024-05-10 15:44:22 UTC
+  Text: Downstream issue:https://github.com/msys2/MINGW-packages/issues/20861The following code using GCC 14.1.0 on Windows targeting x86_64-w64-mingw32:
+
+```
+// gcc -c -fno-omit-frame-pointer -O2 repro.cpp
+template <typename a> void b(a, a);
+template <typename a> void c(a, a, float);
+float d;
+void e() {
+  float f;
+  c(f, f, d);
+  b(0.0f, f);
+}
+```
+
+results in
+
+```
+repro.cpp: In function 'void e()':
+repro.cpp:8:1: internal compiler error: in seh_cfa_offset, at config/i386/winnt.cc:1137
+    8 | }
+      | ^
+```
+
+* Replacing "-O2" with "-O1" fixes the issue
+* Removing "-fno-omit-frame-pointer" fixes the issue
+* Downgrading to GCC 13.2.0 fixes the issue
+
+If there is any other information I can provide, let me know.
+
+- User: Christoph Reiter | Time: 2024-05-11 12:15:56 UTC
+  Text: Another downstream report with the same error:https://github.com/msys2/MINGW-packages/issues/20864I've c-reduced that as well to:
+
+```
+// gcc -c -fno-omit-frame-pointer -O2 repro.cpp
+struct d {
+  d();
+};
+struct e {
+  e() : c(1.0) {}
+  float c;
+};
+struct j {
+  using ad = d;
+};
+class k : j {
+  d g;
+  e h;
+};
+template <typename, typename, typename, typename> using i = k;
+class {
+  i<int, int, int, int> f;
+} a;
+k b;
+```
+
+- User: Eric Botcazou | Time: 2024-05-12 15:42:35 UTC
+  Text: I can reproduce.
+
+- User: Eric Botcazou | Time: 2024-05-12 16:00:17 UTC
+  Text: It's the -ffold-mem-offsets pass messing up with the prologue and the frame-related instructions (so -fno-fold-mem-offsets is a workaround).
+
+- User: Eric Botcazou | Time: 2024-05-12 16:33:21 UTC
+  Text: Tentative fixlet:
+
+diff --git a/gcc/fold-mem-offsets.cc b/gcc/fold-mem-offsets.cc
+index 2e15b05529e..84b9623058b 100644
+--- a/gcc/fold-mem-offsets.cc
++++ b/gcc/fold-mem-offsets.cc
+@@ -491,7 +491,7 @@ fold_offsets (rtx_insn *insn, rtx reg, bool analyze, bitmap foldable_insns)
+ {
+   rtx_insn *def = get_single_def_in_bb (insn, reg);
+ 
+-  if (!def || GET_CODE (PATTERN (def)) != SET)
++  if (!def || RTX_FRAME_RELATED_P (def) || GET_CODE (PATTERN (def)) != SET)
+     return 0;
+ 
+   rtx dest = SET_DEST (PATTERN (def));
+
+- User: Christoph Reiter | Time: 2024-05-12 18:15:25 UTC
+  Text: Thanks! I can confirm that "-fno-fold-mem-offsets" works around the issue. I'll test the proposed patch tomorrow.
+
+In the meantime we've reduced another instance of this when building emacs, but this time with "simpler" C code and without -fno-omit-frame-pointer:
+
+```
+// gcc -c -O2 repro.c -> internal compiler error: in seh_cfa_offset
+// gcc -c -g3 -O2 -gdwarf-2 repro.c -> internal compiler error: in dwarf2out_frame_debug_expr
+void a() {
+    __builtin_unwind_init();
+}
+```
+
+Adding this here for completeness.
+
+- User: Christoph Reiter | Time: 2024-05-13 05:45:36 UTC
+  Text: I can confirm that the patch fromcomment 4fixes all the above cases, and also emacs builds again.
+
+Thanks again
+
+- User: Eric Botcazou | Time: 2024-05-20 06:25:51 UTC
+  Text: Recategorizing.
+
+- User: Jeffrey A. Law | Time: 2024-05-22 14:48:39 UTC
+  Text: Yea, I would think we want to avoid anything marked as frame related.  Otherwise we have to go back and fixup the CFI nodes and such.
+
+Eric, do you want to handle the final bootstrap+regression test?  Or do you want me to take it from here?
+
+- User: Eric Botcazou | Time: 2024-05-22 16:04:11 UTC
+  Text: > Eric, do you want to handle the final bootstrap+regression test?  Or do you
+> want me to take it from here?I can do it right now.
+
+- User: GCC Commits | Time: 2024-05-22 16:14:14 UTC
+  Text: The master branch has been updated by Eric Botcazou <ebotcazou@gcc.gnu.org>:https://gcc.gnu.org/g:f14ef5cfd4c1ba1d34afda9174935e40d3c0a3cecommitr15-776-gf14ef5cfd4c1ba1d34afda9174935e40d3c0a3ceAuthor: Eric Botcazou <ebotcazou@adacore.com>
+Date:   Wed May 22 18:10:39 2024 +0200
+
+    Fix internal error in seh_cfa_offset with -O2 -fno-omit-frame-pointer
+    
+    The problem directly comes from the -ffold-mem-offsets pass messing up with
+    the prologue and the frame-related instructions, which is a no-no with SEH,
+    so the fix simply disconnects the pass in these circumstances.
+    
+    gcc/PR rtl-optimization/115038* fold-mem-offsets.cc (fold_offsets): Return 0 if the defining
+            instruction of the register is frame related.
+    
+    gcc/testsuite/
+            * g++.dg/opt/fmo1.C: New test.
+
+- User: GCC Commits | Time: 2024-05-22 18:54:28 UTC
+  Text: The releases/gcc-14 branch has been updated by Eric Botcazou <ebotcazou@gcc.gnu.org>:https://gcc.gnu.org/g:2f0e0862406a17bb8bf4ad948ae22916bae092a0commitr14-10233-g2f0e0862406a17bb8bf4ad948ae22916bae092a0Author: Eric Botcazou <ebotcazou@adacore.com>
+Date:   Wed May 22 18:10:39 2024 +0200
+
+    Fix internal error in seh_cfa_offset with -O2 -fno-omit-frame-pointer
+    
+    The problem directly comes from the -ffold-mem-offsets pass messing up with
+    the prologue and the frame-related instructions, which is a no-no with SEH,
+    so the fix simply disconnects the pass in these circumstances.
+    
+    gcc/PR rtl-optimization/115038* fold-mem-offsets.cc (fold_offsets): Return 0 if the defining
+            instruction of the register is frame related.
+    
+    gcc/testsuite/
+            * g++.dg/opt/fmo1.C: New test.
+
+- User: Eric Botcazou | Time: 2024-05-22 18:55:27 UTC
+  Text: Thanks for reporting the problem.
+

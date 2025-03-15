@@ -1,0 +1,137 @@
+Bug Summary: [14 Regression] Dead Code Elimination Regression at -O2 since r14-261-g0ef3756adf0
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Theodoros Theodoridis | Time: 2023-06-28 10:21:15 UTC
+  Text: https://godbolt.org/z/KqcYxfevjGiven the following code:
+
+void foo(void);
+static int a = 1;
+static int *b = &a, *c = &a;
+static short d, e;
+static char f = 11;
+static char(g)(char h, int i) { return h << i; }
+int main() {
+    if (f) *c = g(0 >= a, 3);
+    e = *c;
+    d = e % f;
+    if (d) {
+        __builtin_unreachable();
+    } else if (*b)
+        foo();
+    ;
+}
+
+gcc-trunk -O2 does not eliminate the call to foo:
+
+main:
+	movl	a(%rip), %eax
+	xorl	%edx, %edx
+	testl	%eax, %eax
+	setle	%dl
+	leal	0(,%rdx,8), %edx
+	movl	%edx, a(%rip)
+	jle	.L8
+	xorl	%eax, %eax
+	ret
+.L8:
+	pushq	%rax
+	call	foo
+	xorl	%eax, %eax
+	popq	%rdx
+	ret
+
+gcc-13.1.0 -O2 eliminates the call to foo:
+
+main:
+	movl	a(%rip), %edx
+	xorl	%eax, %eax
+	testl	%edx, %edx
+	setle	%al
+	leal	0(,%rax,8), %eax
+	movl	%eax, a(%rip)
+	xorl	%eax, %eax
+	ret
+
+Bisects tor14-261-g0ef3756adf0
+
+- User: Andrew Pinski | Time: 2023-07-01 20:51:49 UTC
+  Text: In VRP:
+trunk:
+```
+Folding statement: _11 = _9 % 11;
+Matching expression match.pd:2480, gimple-match-4.cc:35
+Matching expression match.pd:2483, gimple-match-3.cc:66
+Matching expression match.pd:2490, gimple-match-2.cc:58
+Matching expression match.pd:1991, gimple-match-5.cc:23
+Matching expression match.pd:2480, gimple-match-4.cc:35
+Matching expression match.pd:2483, gimple-match-3.cc:66
+Matching expression match.pd:2490, gimple-match-2.cc:58
+Matching expression match.pd:1948, gimple-match-7.cc:20
+Matching expression match.pd:2480, gimple-match-4.cc:35
+Matching expression match.pd:2483, gimple-match-3.cc:66
+Matching expression match.pd:2490, gimple-match-2.cc:58
+Applying pattern match.pd:5319, gimple-match-8.cc:2688
+Applying pattern match.pd:6000, gimple-match-10.cc:587
+Applying pattern match.pd:2102, gimple-match-1.cc:6289
+Applying pattern match.pd:6000, gimple-match-10.cc:587
+Applying pattern match.pd:5284, gimple-match-4.cc:1099
+Applying pattern match.pd:1378, gimple-match-3.cc:7680
+Applying pattern match.pd:4720, gimple-match-1.cc:16033
+gimple_simplified to _14 = a.1_2 <= 0;
+_15 = (int) _14;
+_11 = _15 << 3;
+Global Exported: _11 = [irange] int [0, 0][8, 8] NONZERO 0x8
+Folded into: _11 = _15 << 3;
+```
+
+And the relationship between _5 and _11 is completely lost.
+
+
+while in GCC 13:
+```
+Folding statement: _11 = _9 % 11;
+Global Exported: _11 = [irange] int [0, 0][8, 8] NONZERO 0x8
+Folded into: _11 = _9;
+```
+
+And then we remove the __builtin_unreachable even though we infer that _5 would be 0 and therefore _11 would never be 8 .
+
+- User: Andrew Pinski | Time: 2023-11-24 04:01:27 UTC
+  Text: Looks to be fixed on the trunk.
+
+- User: Martin Jambor | Time: 2024-01-10 15:13:02 UTC
+  Text: This has been fixed withr14-4141-gbf6b107e2a3423(Andrew MacLeod: New early __builtin_unreachable processing).
+
+- User: Andrew Pinski | Time: 2024-01-11 00:56:58 UTC
+  Text: Will commit the testcase and close it as fixed. The fix seems like the correct one based on my comment:> And then we remove the __builtin_unreachable even though we infer that _5 would be 0 and therefore _11 would never be 8 .
+
+- User: GCC Commits | Time: 2024-01-13 04:39:27 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:34a827039fabcf24ce78da25984a1cc8be7ca2c3commitr14-7221-g34a827039fabcf24ce78da25984a1cc8be7ca2c3Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Fri Jan 12 20:24:34 2024 -0800
+
+    Add a few testcases for fix missed optimization regressions
+    
+    Adds a few new testcases for some missed optimization regressions.
+    The analysis on how each should be optimized is in the testcases
+    themselves (and in the bug report).
+    
+    Committed as obvious after running the testsuite to make sure they pass.PR tree-optimization/107823PR tree-optimization/110768PR tree-optimization/110941PR tree-optimization/110450PR tree-optimization/110841gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/ssa-thread-22.c: New test.
+            * gcc.dg/tree-ssa/vrp-loop-1.c: New test.
+            * gcc.dg/tree-ssa/vrp-loop-2.c: New test.
+            * gcc.dg/tree-ssa/vrp-unreachable-1.c: New test.
+            * gcc.dg/tree-ssa/vrp-unreachable-2.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-01-13 04:40:20 UTC
+  Text: Fixed.
+

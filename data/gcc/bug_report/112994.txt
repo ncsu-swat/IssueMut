@@ -1,0 +1,184 @@
+Bug Summary: [12/13/14 Regression] Missed optimization for redundancy computation elimination because pattern is broken
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Yi | Time: 2023-12-13 05:46:45 UTC
+  Text: Hello, we noticed that maybe there is a missed optimization for redundancy computation elimination.
+
+Different fromPR 111718, this missed optimization is a regression and not just because of one missing pattern, but because of changes that broke patterns that could have been eliminated:
+
+The pattern /* Simplify (t * 2) / t) -> 2.  */ is broken.https://godbolt.org/z/3er613Krxint n,m;
+void test(int a, int b){
+
+    n=a+a;
+    b=n;
+    m=(n+b)/(b);
+}
+
+GCC (trunk) -O3:
+test(int, int):
+        lea     eax, [0+rdi*4]
+        lea     ecx, [rdi+rdi]
+        cdq
+        mov     DWORD PTR n[rip], ecx
+        idiv    ecx
+        mov     DWORD PTR m[rip], eax
+        ret
+
+Expected code (GCC 11.4 -O3):
+test(int, int):
+        mov     DWORD PTR m[rip], 2
+        add     edi, edi
+        mov     DWORD PTR n[rip], edi
+        ret
+
+If our targeting is accurate, then this issue was caused by this commit:https://github.com/gcc-mirror/gcc/commit/d846f225c25Thank you very much for your time and effort! We look forward to hearing from you.
+
+- User: Andrew Pinski | Time: 2023-12-13 06:15:56 UTC
+  Text: It might be a regression but we are still missing a pattern for:
+int n,m;
+void test(int a, int b){
+    m=(a*4)/(a*2);
+}
+
+- User: Richard Biener | Time: 2023-12-13 08:24:45 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> It might be a regression but we are still missing a pattern for:
+> int n,m;
+> void test(int a, int b){
+>     m=(a*4)/(a*2);
+> }Yep, and we're seeing that first because when value-numbering
+
+_3 = n.0_2 + b_8;
+
+we're turning that into a_5(D) * 4 via
+
+  x+x -> x*2  (good)
+  (x*2)*2 -> x*4  ("bad", doesn't realize the other use of x*2 keeps it live)
+
+we're then missing said pattern.
+
+- User: Jakub Jelinek | Time: 2023-12-13 14:26:26 UTC
+  Text: Started withr12-476-gd846f225c25c5885250c303c8d118caa08c447ab
+
+- User: Jakub Jelinek | Time: 2023-12-13 15:13:14 UTC
+  Text: So, don't we want next to the /* Simplify (t * 2) / 2) -> t.  */ pattern (dunno why it uses there in thecomment 2when it is actually generic (a * b) / a -> b, doesn't rely on constants) also one (a * b) / c -> a * (b / c) for INTEGER_CST b and c where wi::multiple_of_p (wi::to_widest (b), wi::to_widest (c), SIGNED) and b / c folds into a constant?
+int f1 (int x) { return (x * 4) / 2;  }
+int f2 (int x) { return (x * 56) / 8;  }
+int f3 (int x) { return (x * 56) / -8;  }
+int f4 (int x) { int y = x * 4; return y / 2;  }
+int f5 (int x) { int y = x * 56; return y / 8;  }
+int f6 (int x) { int y = x * 56; return y / -8;  }
+In the above f1, f2 and f3 are folded in fold_binary_loc
+      strict_overflow_p = false;
+      if (TREE_CODE (arg1) == INTEGER_CST
+          && (tem = extract_muldiv (op0, arg1, code, NULL_TREE,
+                                    &strict_overflow_p)) != 0)
+        {
+          if (strict_overflow_p)
+            fold_overflow_warning (("assuming signed overflow does not occur "
+                                    "when simplifying division"),
+                                   WARN_STRICT_OVERFLOW_MISC);
+          return fold_convert_loc (loc, type, tem);
+        }
+but not at GIMPLE.  Or do we want to somehow reimplement even bigger part of extract_muldiv_1 in match.pd?  It can handle even (x * 16 + y * 32) / 8
+-> x * 2 + y * 4 etc.
+And then there is the case from this PR,
+int f7 (int x) { return (x * 4) / (x * 2); }
+int f8 (int x) { return (x * 56) / (x * 8); }
+int f9 (int x) { return (x * 56) / (x * -8); }
+int f10 (int x) { int y = x * 4; return y / (x * 2); }
+int f11 (int x) { int y = x * 56; return y / (x * 8); }
+int f12 (int x) { int y = x * 56; return y / (x * -8); }
+which isn't optimized in GENERIC nor in GIMPLE.
+
+- User: Jakub Jelinek | Time: 2023-12-13 16:02:51 UTC
+  Text: Createdattachment 56868[details]gcc14-pr112994-1.patch
+
+Untested patch which adds the first above mentioned pattern.
+
+- User: Jakub Jelinek | Time: 2023-12-13 18:15:45 UTC
+  Text: Createdattachment 56870[details]gcc14-pr112994-1.patch
+
+Small tweaks to the above patch.
+
+- User: Jakub Jelinek | Time: 2023-12-13 18:16:40 UTC
+  Text: Createdattachment 56871[details]gcc14-pr112994-2.patch
+
+Patch to add the other simplification.
+
+- User: GCC Commits | Time: 2023-12-14 10:58:06 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:90c9403f89d3c55512ae83dd20e2023c2e4430f4commitr14-6537-g90c9403f89d3c55512ae83dd20e2023c2e4430f4Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Dec 14 11:55:49 2023 +0100
+
+    match.pd: Simplify (t * u) / v -> t * (u / v) [PR112994]
+    
+    The following testcase is optimized just on GENERIC (using
+          strict_overflow_p = false;
+          if (TREE_CODE (arg1) == INTEGER_CST
+              && (tem = extract_muldiv (op0, arg1, code, NULL_TREE,
+                                        &strict_overflow_p)) != 0)
+            {
+              if (strict_overflow_p)
+                fold_overflow_warning (("assuming signed overflow does not occur "
+                                        "when simplifying division"),
+                                       WARN_STRICT_OVERFLOW_MISC);
+              return fold_convert_loc (loc, type, tem);
+            }
+    ) but not on GIMPLE.
+    
+    An earlier version of the patch regressed
+    +FAIL: gcc.dg/Wstrict-overflow-3.c correct warning (test for warnings, line 12)
+    test, we are indeed assuming that signed overflow does not occur
+    when simplifying division in there.
+    
+    This version of the patch (which provides the simplification only
+    for GIMPLE) fixes that.
+    And/or we could add the
+                fold_overflow_warning (("assuming signed overflow does not occur "
+                                        "when simplifying division"),
+                                       WARN_STRICT_OVERFLOW_MISC);
+    call into the simplification, but in that case IMHO it should go into
+    the (t * u) / u -> t simplification as well, there we assume the exact
+    same thing (of course, in both cases only in the spots where we don't
+    verify it through ranger that it never overflows).
+    
+    Guarding the whole simplification to GIMPLE only IMHO makes sense because
+    the above mentioned folding does it for GENERIC (and extract_muldiv even
+    handles far more cases, dunno how many from that we should be doing on
+    GIMPLE in match.pd and what could be done elsewhere; e.g. extract_muldiv
+    can handle (x * 16 + y * 32) / 8 -> x * 2 + y * 4 etc.).
+    
+    Dunno about the fold_overflow_warning, I always have doubts about why
+    such a warning is useful to users.
+    
+    2023-12-14  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/112994* match.pd ((t * 2) / 2 -> t): Adjust comment to use u instead of 2.
+            Punt without range checks if TYPE_OVERFLOW_SANITIZED.
+            ((t * u) / v -> t * (u / v)): New simplification.
+    
+            * gcc.dg/tree-ssa/pr112994-1.c: New test.
+
+- User: GCC Commits | Time: 2023-12-14 11:07:58 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:2c92551405bc8616f456e5cbc696ab0292c7ff00commitr14-6538-g2c92551405bc8616f456e5cbc696ab0292c7ff00Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Dec 14 12:06:59 2023 +0100
+
+    match.pd: Simplify (t * u) / (t * v) [PR112994]
+    
+    On top of the previously posted patch, this simplifies say (x * 16) / (x * 4)
+    into 4.  Unlike the previous pattern, this is something we didn't fold
+    previously on GENERIC, so I think it shouldn't be all wrapped with #if
+    GIMPLE.  The question whether there should be fold_overflow_warning for the
+    TYPE_OVERFLOW_UNDEFINED case remains.
+    
+    2023-12-14  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/112994* match.pd ((t * u) / (t * v) -> (u / v)): New simplification.
+    
+            * gcc.dg/tree-ssa/pr112994-2.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-12-15 12:40:19 UTC
+  Text: Fixed for 14+.  This is a new optimization, the old simplification is not broken, just another optimization means it doesn't trigger anymore.
+

@@ -1,0 +1,187 @@
+Issue Title: [PowerPC] fatal error: error in backend: failed to perform tail call elimination on a call site marked musttail
+Original Post: FreeBSD 13.2-RELEASE
+LLVM from devel/llvm-devel, version 17.0.d20230522,
+PowerPC, PowerPC64, PowerPC64LE
+
+Reproducer:
+```cpp
+void name(int *params, int *program, int r, int g, int b, int a) {
+  auto fn = (void (*)(int *, int *, int, int, int, int))1;
+  [[clang::musttail]] return fn(params, program, r, g, b, a);
+}
+```
+
+Compile with:
+```shell
+clang++-devel -cc1 -triple powerpc64le-portbld-freebsd13.2 -emit-obj SkOpts-735c83.cpp
+```
+
+Output:
+```console
+fatal error: error in backend: failed to perform tail call elimination on a call site marked musttail
+```
+
+This causes Firefox 114 to fail to build.
+
+Comment by llvmbot: @llvm/issue-subscribers-backend-powerpc
+Comment by orcguru: The error is due to following check:
+https://github.com/llvm/llvm-project/blob/375d798067806de0d5323bae5341f5bad4b8c107/llvm/lib/Target/PowerPC/PPCISelLowering.cpp#L4902
+
+According to the comments above the check logic, ppc backend cannot do tail call elimination for this case. PPC backend has a call `PPCTargetLowering::supportsTailCallFor()` to check if tail call elimination is eligible.
+
+Now looking at the reproducer, the "[[clang::musttail]]" attribute is verified by `Sema::checkMustTailAttr()`. At that time I don't know how to reach the PPC backend call to determine if that attribute is eligible, but the end result is the same: the source code won't compile on PPC backend, either due to a check from sema (if somebody add the backend check logic for PPC, but looks like not a good idea to me) or a check from PPC backend.
+Comment by pkubaj: When setting amd64-unknown-freebsd13.2 triple, the code is built properly, so it's likely about a PPC backend.
+Comment by Long5hot: There is one similiar case which i found..
+
+```c
+int square(int num) {
+    return num * num;
+}
+
+int checkNum(int num) {
+  [[clang::musttail]]
+  return square(num);
+}
+```
+
+But it fails only on ppc32 not on ppc64..
+
+
+Compile with:
+```
+clang++ ppc32crash.cpp --target=ppc32 -S
+```
+
+Comment by daltenty: Also fails on AIX 32-bit and 64-bit targets.
+Comment by nemanjai: This seems to be a poorly thought-out attribute. We ultimately can't tail-call across DSO boundaries. This is a hard limitation on PPC (both Linux and AIX) due to the TOC pointer. For the front end, we could implement a Sema check to error out when a call site is marked with this attribute and the callee does not qualify for the `dso_local` runtime specifier.
+Comment by nemanjai: The only PPC configuration that can always tail-call is Little Endian Linux with PC-Relative addressing turned on (default with `-mcpu=power10`).
+Comment by chenzheng1030: @pkubaj PPC is not able to tail call every function marked with `musttail` attribute. I think Nemanjai gave the reason in above comments. So what do you think resolving this issue by not setting this attribute on PowerPC target? Thanks.
+Comment by pkubaj: @chenzheng1030 disabling musttail on powerpc* is the current workaround, but this is not a proper solution. The compiler should not crash on musttail. If it can't tail call some code, it should print a warning, not crash. Crashing is not a proper behaviour.
+Comment by chenzheng1030: > @chenzheng1030 disabling musttail on powerpc* is the current workaround, but this is not a proper solution. The compiler should not crash on musttail. If it can't tail call some code, it should print a warning, not crash. Crashing is not a proper behaviour.
+
+OK, let me try adding diagnosis for this attribute and ignore the attribute if it is not able to tailcall.
+Comment by chenzheng1030: https://github.com/llvm/llvm-project/pull/93267 was created to diagnose this attribute. By default the compiler backend will not crash now and the musttail is changed to normal call when impossible for tail call.
+Comment by efriedma-quic: In case anyone else is confused why this isn't possible, the issue isn't actually the existence of TOC.  The problem comes when you have "a" and "b" with the same TOC, and "c" with a different TOC.  "a" calls "b", which musttail calls "c".  When "a" calls "b", the linker sees they have the same TOC, so "a" doesn't have any code to save/restore the TOC.  But a musttail call to "c" modifies the TOC, and nothing restores it.  So that isn't legal.
+
+The solution here is pretty simple: you add a marking to "b" that tells the linker not to do this optimization on calls to "b".  As far as I can tell, that marking actually does exist... but only for the ELFv2 ABI.
+Comment by nemanjai: Right. So a couple of notes:
+1. Converting a `musttail` call to a normal call is probably wrong. Its name includes the word `must` so we must honour it or diagnose it and reject the compilation.
+2. This attribute *can* be honoured as Eli points out. Any function that has a `musttail` call to an external function (for which we don't know if it shares the same TOC pointer) needs to have its `st_other` field set to `1` (i.e. "clobbers TOC, treat as caller-saved"). And yes, this is an ELFv2 ABI-specific fix. This will tell the linker to treat calls correctly for this function (see next point for the compiler).
+3. The compiler needs to learn to emit the `call+nop` calls when the callee has `musttail` calls (i.e. such a function must return `false` from `callsShareTOCBase()` for any caller).
+4. An equivalent mechanism to the `st_other` field needs to be found for ELFv1.
+Comment by chenzheng1030: OK, I'll update that patch. Yeah, I got same comment from the review, `mustail` attribute is not same with `always_inline`. When `musttail` is used, the call must be a tail call, otherwise we need to abort the compilation.
+Comment by efriedma-quic: Reopening to track the question of whether we can change the PowerPC backend to allow musttail in additional cases... unless someone wants to file a new bug for that.
+Comment by chenzheng1030: Will check the current st_other support status on ELFv2 and also the similar mechanism on ELFv1
+Comment by chenzheng1030: > Will check the current st_other support status on ELFv2
+
+For now, on ppc64le Linux, the default GNU linker and lld both can not handle the tail call case for external functions even I set the st_other to 1 for the callers.
+
+GNU linker error:
+```
+build/bin/clang 1.c -O2 -ltest -L./
+/tmp/1-20341a.o: in function `foo':
+1.c:(.text+0x0): call to `bar' lacks nop, can't restore toc; (plt call stub)
+1.c:(.text+0x0): unresolvable R_PPC64_REL24 against `bar'
+/opt/rh/gcc-toolset-12/root/usr/lib/gcc/ppc64le-redhat-linux/12/../../../../bin/ld: final link failed: bad value
+```
+
+lld error:
+```
+build/bin/clang 1.c -O2 -ltest -L./ -fuse-ld=lld
+ld.lld: error: /tmp/1-6c82b7.o:(function foo: .text+0x0): call to bar lacks nop, can't restore toc
+```
+
+```
+extern int bar(void);
+__attribute__((noinline)) int foo(void) {
+  [[clang::musttail]] return bar();
+}
+int b = 20;
+int main(int argc, char* argv[]) {
+  int a = foo() + argc + b;
+  return a;
+}
+```
+```
+build/bin/clang 1.c -O2 -c
+~/llvm_fork/llvm-project/build/bin/llvm-readobj --symbols 1.o
+  Symbol {
+    Name: foo (25)
+    Value: 0x0
+    Size: 20
+    Binding: Global (0x1)
+    Type: Function (0x2)
+    Other [ (0x20) <<<<< st_other is set to 1
+    ]
+    Section: .text (0x2)
+  }
+```
+
+```
+foo:                                    # @foo
+.Lfunc_begin0:
+	.cfi_startproc
+	.localentry	foo, 1
+# %bb.0:                                # %entry
+	b bar
+	#TC_RETURNd8 bar 0
+
+main:                                   # @main
+.Lfunc_begin1:
+	.cfi_startproc
+.Lfunc_gep1:
+	addis 2, 12, .TOC.-.Lfunc_gep1@ha
+	addi 2, 2, .TOC.-.Lfunc_gep1@l
+.Lfunc_lep1:
+	.localentry	main, .Lfunc_lep1-.Lfunc_gep1
+# %bb.0:                                # %entry
+	mflr 0
+	.cfi_def_cfa_offset 48
+	.cfi_offset lr, 16
+	.cfi_offset r30, -16
+	std 30, -16(1)                          # 8-byte Folded Spill
+	stdu 1, -48(1)
+	std 0, 64(1)
+	mr	30, 3
+	bl foo
+	nop
+```
+Comment by chenzheng1030: If what I experimented is right, we need to first implement this in the linker part?
+Comment by chenzheng1030: >  and also the similar mechanism on ELFv1
+
+from https://refspecs.linuxfoundation.org/ELF/ppc64/PPC-elf64abi.html#HOWTO, for ELFv1, if what I am understanding is correct, there is no similar mechanism for this ABI.
+Comment by efriedma-quic: Can you just stick a nop after the tail-call?
+Comment by chenzheng1030: > Can you just stick a nop after the tail-call?
+
+Yep, Adding a nop after the tailcall is able to workaround the LLVM linkers' complain(GNU linker still complains the same) and get the correct runtime result. But that is a hack in compiler, right? So to me, both the GNU linker and LLVM linker do not support tail call crossing modules, we may first need to implement that in the linkers?
+Comment by chenzheng1030: I created feature issue https://github.com/llvm/llvm-project/issues/98859 for ELFv2. Closing this one
+Comment by llvmbot: 
+@llvm/issue-subscribers-clang-codegen
+
+Author: Piotr Kubaj (pkubaj)
+
+<details>
+FreeBSD 13.2-RELEASE
+LLVM from devel/llvm-devel, version 17.0.d20230522,
+PowerPC, PowerPC64, PowerPC64LE
+
+Reproducer:
+```cpp
+void name(int *params, int *program, int r, int g, int b, int a) {
+  auto fn = (void (*)(int *, int *, int, int, int, int))1;
+  [[clang::musttail]] return fn(params, program, r, g, b, a);
+}
+```
+
+Compile with:
+```shell
+clang++-devel -cc1 -triple powerpc64le-portbld-freebsd13.2 -emit-obj SkOpts-735c83.cpp
+```
+
+Output:
+```console
+fatal error: error in backend: failed to perform tail call elimination on a call site marked musttail
+```
+
+This causes Firefox 114 to fail to build.
+</details>

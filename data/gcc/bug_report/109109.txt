@@ -1,0 +1,516 @@
+Bug Summary: [13 Regression] mariadb fails in tests on i586 (non-LTO mode) after r13-4435-g2c089640279614e3
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Martin Liška | Time: 2023-03-13 13:53:41 UTC
+  Text: Createdattachment 54648[details]Unreduced test-case
+
+After the revision I see the following failure in mariadb package:
+
+./mysql-test-run.pl --parallel=32 --force --retry=0 --ssl --suite-timeout=900 --testcase-timeout=30 --mysqld=--binlog-format=mixed --force-restart --shutdown-timeout=60 --max-test-fail=0 --skip-test=spider --skip-test-list=unstable-tests innodb_zip.bug36169...
+2023-03-13 13:49:08 4 [ERROR] InnoDB: Cannot add field `col48` in table `test`.`table0` because after adding it, the row size is 708 which is greater than maximum allowed size (708 bytes) for a record on index leaf page.
+2023-03-13 13:49:08 4 [ERROR] InnoDB: Trying to read 4096 bytes at 4294963200 outside the bounds of the file: ./ibdata1
+2023-03-13 13:49:08 4 [ERROR] InnoDB: File './ibdata1' is corrupted
+2023-03-13 13:49:08 4 [ERROR] InnoDB: Cannot add field `DB_ROW_ID` in table `test`.`table1` because after adding it, the row size is 537 which is greater than maximum allowed size (892 bytes) for a record on index leaf page.
+2023-03-13 13:49:08 4 [ERROR] InnoDB: Trying to read 4096 bytes at 1879228416 outside the bounds of the file: ./ibdata1
+2023-03-13 13:49:08 4 [ERROR] mariadbd: Index for table 'table2' is corrupt; try to repair it
+
+I reduced that to a single test-case and a function (see pragma GCC optimize "-O0"):
+g++ /tmp/trxundo.ii -o /var/tmp/build-root/standard-i586/home/abuild/rpmbuild/BUILD/mariadb-10.11.2/build/storage/innobase/CMakeFiles/innobase.dir/trx/trx0undo.cc.o -m32 -std=gnu++11 -fomit-frame-pointer -O2 -Wall -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -fstack-protector-strong -funwind-tables -fasynchronous-unwind-tables -fstack-clash-protection -Werror=return-type -flto=auto -ffat-lto-objects -fno-lto -U_FORTIFY_SOURCE -g -DOPENSSL_LOAD_CONF -DPIC -fPIC -DFORCE_INIT_OF_VARS -Wno-unused-but-set-variable -fno-strict-aliasing -Wno-unused-parameter -Wno-error -felide-constructors -pie -fPIC -fstack-protector --param=ssp-buffer-size=4 -fPIC -Wconversion -Wno-sign-conversion -fomit-frame-pointer -O2 -Wall -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -fstack-protector-strong -funwind-tables -fasynchronous-unwind-tables -fstack-clash-protection -Werror=return-type -flto=auto -ffat-lto-objects -fno-lto -U_FORTIFY_SOURCE -g -DOPENSSL_LOAD_CONF -DPIC -fPIC -DFORCE_INIT_OF_VARS -Wno-unused-but-set-variable -fno-strict-aliasing -Wno-unused-parameter -Wno-error -felide-constructors -fno-omit-frame-pointer -DDBUG_OFF -Wall -Wenum-compare -Wenum-conversion -Wextra -Wformat-security -Wmissing-braces -Wno-format-truncation -Wno-init-self -Wno-nonnull-compare -Wno-unused-parameter -Woverloaded-virtual -Wnon-virtual-dtor -Wvla -Wwrite-strings   -DHAVE_OPENSSL -DOPENSSL_API_COMPAT=0x10100000L  -fvisibility=hidden -std=gnu++11 -c
+
+- User: Martin Liška | Time: 2023-03-13 13:57:20 UTC
+  Text: The difference is somehow related to:
+
+  constexpr page_id_t(uint32_t space, uint32_t page_no) :
+    m_id(uint64_t{space} << 32 | page_no) {}
+
+- User: Jakub Jelinek | Time: 2023-03-13 16:43:52 UTC
+  Text: Without an actual self-contained reproducer hard to guess.
+The above mentioned change changes the content of
+_ZN9page_id_tC2Ejj
+_Z22trx_undo_get_first_recRK11fil_space_tjtjRPK11buf_block_tP5mtr_tP7dberr_t
+_ZN5trx_t9apply_logEv
+_Z17trx_undo_add_pageP10trx_undo_tP5mtr_tP7dberr_t
+_ZL18trx_undo_free_pageP10trx_rseg_tbjjP5mtr_tP7dberr_t
+functions from what I can see, so which one of these it is?
+
+Another possible way to narrow it down a little bit would be to undo the i386.md hunks from that commit one by one and see which one it is, all the 4 changes are optimizations and all of them are independent of each other (any of them dependent on the i386-expand.cc change which shouldn't change anything on its own).
+
+If you narrow it down to one function, then I guess we need to turn it into a self-contained reproducer, add dummy wrapper which calls that function from main with the right arguments and supply dummy callees for the function for functions which aren't inlined.
+
+- User: Jakub Jelinek | Time: 2023-03-13 16:52:58 UTC
+  Text: If you suspect that one, that is certainly the simplest, in C that would be
+__attribute__((noipa)) void
+foo (unsigned long long *a, unsigned int b, unsigned int c)
+{
+  *a = (((unsigned long long) b) << 32) | c;
+}
+
+int
+main ()
+{
+  unsigned long long a;
+  foo (&a, 0xcafebabeU, 0xdeadbeefU);
+  if (a != 0xcafebabedeadbeefULL)
+    __builtin_abort ();
+}
+and you can see the same difference with say -O2 -m32 -fno-omit-frame-pointer.
+But, that one works for both...
+
+- User: Martin Liška | Time: 2023-03-13 21:48:02 UTC
+  Text: > Another possible way to narrow it down a little bit would be to undo the
+> i386.md hunks from that commit one by one and see which one it is, all the 4
+> changes are optimizations and all of them are independent of each other (any
+> of them dependent on the i386-expand.cc change which shouldn't change
+> anything on its own).All right, I was able to revert 3/4 of the hunks in i386.md and the problematic one that caused the miscompilation is:
+
+(define_insn_and_split "*concat<mode><dwi>3_3"
+  [(set (match_operand:<DWI> 0 "nonimmediate_operand" "=ro,r,r,&r")
+	(any_or_plus:<DWI>
+	  (ashift:<DWI>
+	    (zero_extend:<DWI>
+	      (match_operand:DWIH 1 "nonimmediate_operand" "r,m,r,m"))
+	    (match_operand:<DWI> 2 "const_int_operand"))
+	  (zero_extend:<DWI>
+	    (match_operand:DWIH 3 "nonimmediate_operand" "r,r,m,m"))))]
+  "INTVAL (operands[2]) == <MODE_SIZE> * BITS_PER_UNIT"
+  "#"
+  "&& reload_completed"
+  [(clobber (const_int 0))]
+{
+
+- User: Jakub Jelinek | Time: 2023-03-13 21:50:28 UTC
+  Text: (In reply to Martin Liška fromcomment #4)> > Another possible way to narrow it down a little bit would be to undo the
+> > i386.md hunks from that commit one by one and see which one it is, all the 4
+> > changes are optimizations and all of them are independent of each other (any
+> > of them dependent on the i386-expand.cc change which shouldn't change
+> > anything on its own).
+> 
+> All right, I was able to revert 3/4 of the hunks in i386.md and the
+> problematic one that caused the miscompilation is:
+> 
+> (define_insn_and_split "*concat<mode><dwi>3_3"
+>   [(set (match_operand:<DWI> 0 "nonimmediate_operand" "=ro,r,r,&r")
+> 	(any_or_plus:<DWI>
+> 	  (ashift:<DWI>
+> 	    (zero_extend:<DWI>
+> 	      (match_operand:DWIH 1 "nonimmediate_operand" "r,m,r,m"))
+> 	    (match_operand:<DWI> 2 "const_int_operand"))
+> 	  (zero_extend:<DWI>
+> 	    (match_operand:DWIH 3 "nonimmediate_operand" "r,r,m,m"))))]
+>   "INTVAL (operands[2]) == <MODE_SIZE> * BITS_PER_UNIT"
+>   "#"
+>   "&& reload_completed"
+>   [(clobber (const_int 0))]
+> {Does using only that single hunk vs. no hunk at all narrow down further the list of changed functions?
+
+- User: Martin Liška | Time: 2023-03-13 21:57:43 UTC
+  Text: Createdattachment 54654[details]good.s (3/4 of hunks reverted)
+
+- User: Martin Liška | Time: 2023-03-13 21:58:43 UTC
+  Text: Createdattachment 54655[details]bad.s (3/4 of hunks reverted)
+
+Yes, it narrows down to a single function _Z23trx_undo_free_last_pageP10trx_undo_tP5mtr_t (and it's split part _ZL18trx_undo_free_pageP10trx_rseg_tbjjP5mtr_tP7dberr_t.cold).
+
+- User: Martin Liška | Time: 2023-03-13 22:01:34 UTC
+  Text: (In reply to Martin Liška fromcomment #7)> Createdattachment 54655[details]> bad.s (3/4 of hunks reverted)
+> 
+> Yes, it narrows down to a single function
+> _Z23trx_undo_free_last_pageP10trx_undo_tP5mtr_t (and it's split part
+> _ZL18trx_undo_free_pageP10trx_rseg_tbjjP5mtr_tP7dberr_t.cold).The diff in _ZL18trx_undo_free_pageP10trx_rseg_tbjjP5mtr_tP7dberr_t.cold can be ignored (I placed there ud2 instruction) and it's not met.
+
+- User: Jakub Jelinek | Time: 2023-03-13 22:48:27 UTC
+  Text: Weird, at least on the current trunk when reverting all 4 i386.md hunks vs. all but the 3_3 one I see differences in both
+_Z22trx_undo_get_first_recRK11fil_space_tjtjRPK11buf_block_tP5mtr_tP7dberr_t
+and
+_ZL18trx_undo_free_pageP10trx_rseg_tbjjP5mtr_tP7dberr_t
+So, are you sure it is the latter that matters?
+There indeed is this shift + ior in
+page_id_t(rseg->space->id,
+            page_no)
+How many times is this function called?
+What is rseg->space->id, hdr_page_no and page_no and what values receive the
+buf_page_get_gen callees?
+
+- User: Martin Liška | Time: 2023-03-14 07:29:56 UTC
+  Text: Btw. the backtrace leading to the problematic function:
+
+trxundo.ii:0(trx_undo_free_page(trx_rseg_t*, bool, unsigned int, unsigned int, mtr_t*, dberr_t*) [clone .constprop.0] [clone .isra.0])[0x5691bf33]
+??:0(trx_undo_free_last_page(trx_undo_t*, mtr_t*))[0x570e807a]
+trxundo.ii:0(trx_undo_truncate_end(trx_undo_t&, unsigned long long, bool))[0x570ea0d5]
+??:0(trx_undo_try_truncate(trx_t const&))[0x570ea25d]
+row/row0undo.cc:268(row_undo_step(que_thr_t*))[0x570beffe]
+que/que0que.cc:595(.L246)[0x57077534]
+trx/trx0roll.cc:127(trx_t::rollback_low(trx_savept_t*))[0x570ddc3a]
+trx/trx0roll.cc:197(trx_rollback_for_mysql(trx_t*))[0x570dc4e1]
+handler/ha_innodb.cc:13170(ha_innobase::create(char const*, TABLE*, HA_CREATE_INFO*, bool, trx_t*))[0x57006dd6]
+handler/ha_innodb.cc:13210(ha_innobase::create(char const*, TABLE*, HA_CREATE_INFO*))[0x57007043]
+sql/handler.cc:5498(handler::ha_create(char const*, TABLE*, HA_CREATE_INFO*))[0x56d186d5]
+sql/handler.cc:5966(ha_create_table(THD*, char const*, char const*, char const*, HA_CREATE_INFO*, st_mysql_const_unsigned_lex_string*, bool))[0x56d190e2]
+sql/sql_table.cc:4607(create_table_impl(THD*, st_ddl_log_state*, st_ddl_log_state*, st_mysql_const_lex_string const&, st_mysql_const_lex_string const&, st_mysql_const_lex_string const&, st_mysql_const_lex_string const&, st_mysql_const_lex_string const&, DDL_options_st, HA_CREATE_INFO*, Alter_info*, int, bool*, st_key**, unsigned int*, st_mysql_const_unsigned_lex_string*))[0x56b5feef]
+sql/sql_table.cc:4713(mysql_create_table_no_lock(THD*, st_ddl_log_state*, st_ddl_log_state*, st_mysql_const_lex_string const*, st_mysql_const_lex_string const*, Table_specification_st*, Alter_info*, bool*, int, TABLE_LIST*))[0x56b60476]
+sql/sql_table.cc:4824(Sql_cmd_create_table_like::execute(THD*))[0x56b653be]
+sql/sql_parse.cc:6003(mysql_execute_command(THD*, bool))[0x56aa7417]
+sql/sql_parse.cc:8003(mysql_parse(THD*, char*, unsigned int, Parser_state*))[0x56aac36b]
+sql/sql_parse.cc:1894(dispatch_command(enum_server_command, THD*, char*, unsigned int, bool))[0x56aaf004]
+sql/sql_parse.cc:1409(do_command(THD*, bool))[0x56ab042b]
+sql/sql_connect.cc:1416(do_handle_one_connection(CONNECT*, bool))[0x56bd248b]
+sql/sql_connect.cc:1318(handle_one_connection)[0x56bd28b5]
+perfschema/pfs.cc:2204(pfs_spawn_thread)[0x56f364d9]
+??:0(start_thread)[0xf728f4d0]
+??:0(__clone3)[0xf73170b8]
+
+- User: Martin Liška | Time: 2023-03-14 07:30:56 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #9)> Weird, at least on the current trunk when reverting all 4 i386.md hunks vs.
+> all but the 3_3 one I see differences in both
+> _Z22trx_undo_get_first_recRK11fil_space_tjtjRPK11buf_block_tP5mtr_tP7dberr_t
+> and
+> _ZL18trx_undo_free_pageP10trx_rseg_tbjjP5mtr_tP7dberr_t
+> So, are you sure it is the latter that matters?Pretty sure as I copied assembly content from good.s for _Z22trx_undo_get_first_recRK11fil_space_tjtjRPK11buf_block_tP5mtr_tP7dberr_t function. I'm going to step the function in gdb for good and bad version right now.
+
+- User: Martin Liška | Time: 2023-03-14 08:42:06 UTC
+  Text: So the problem happens here:
+
+static
+uint32_t
+trx_undo_free_page(
+
+ trx_rseg_t* rseg,
+ bool in_history,
+
+ uint32_t hdr_page_no,
+ uint32_t page_no,
+
+ mtr_t* mtr,
+
+
+ dberr_t* err)
+{
+ do { if (__builtin_expect(!(ulint) (hdr_page_no != page_no), (0))) { ut_dbg_assertion_failed("hdr_page_no != page_no", "/home/abuild/rpmbuild/BUILD/mariadb-10.11.2/storage/innobase/trx/trx0undo.cc", 744); } } while (0);
+
+ buf_block_t* undo_block = buf_page_get_gen(page_id_t(rseg->space->id,
+            page_no),
+         0, RW_X_LATCH, nullptr,
+         10, mtr, err);
+ if (__builtin_expect(!undo_block, (0))) {
+  return 0xFFFFFFFFU;
+ }
+ buf_block_t* header_block = buf_page_get_gen(page_id_t(rseg->space->id,
+              hdr_page_no), <---- HERE
+           0, RW_X_LATCH, nullptr,
+           10, mtr, err);
+ if (__builtin_expect(!header_block, (0))) {
+  return 0xFFFFFFFFU;
+ }
+...
+
+the function arguments are:
+#1  0x570e8874 in trx_undo_free_page (rseg=0x57a56c40 <trx_sys+16768>, in_history=false, hdr_page_no=807, page_no=817, mtr=0xef4ac434, err=0xef4ac3dc) at /tmp/trxundo.ii:181925
+
+and the construction of:
+page_id_t(rseg->space->id, hdr_page_no)
+ends in callee (buf_page_get_gen) with the argument:
+
+(gdb) p page_id
+$5 = {m_id = 0}
+
+while in good run it should be {m_id = 807} !
+
+- User: Jakub Jelinek | Time: 2023-03-14 09:02:20 UTC
+  Text: (In reply to Martin Liška fromcomment #12)> So the problem happens here:
+> 
+> static
+> uint32_t
+> trx_undo_free_page(
+> 
+>  trx_rseg_t* rseg,
+>  bool in_history,
+> 
+>  uint32_t hdr_page_no,
+>  uint32_t page_no,
+> 
+>  mtr_t* mtr,
+> 
+> 
+>  dberr_t* err)
+> {
+>  do { if (__builtin_expect(!(ulint) (hdr_page_no != page_no), (0))) {
+> ut_dbg_assertion_failed("hdr_page_no != page_no",
+> "/home/abuild/rpmbuild/BUILD/mariadb-10.11.2/storage/innobase/trx/trx0undo.
+> cc", 744); } } while (0);
+> 
+>  buf_block_t* undo_block = buf_page_get_gen(page_id_t(rseg->space->id,
+>             page_no),
+>          0, RW_X_LATCH, nullptr,
+>          10, mtr, err);
+>  if (__builtin_expect(!undo_block, (0))) {
+>   return 0xFFFFFFFFU;
+>  }
+>  buf_block_t* header_block = buf_page_get_gen(page_id_t(rseg->space->id,
+>               hdr_page_no), <---- HERE
+>            0, RW_X_LATCH, nullptr,
+>            10, mtr, err);
+>  if (__builtin_expect(!header_block, (0))) {
+>   return 0xFFFFFFFFU;
+>  }
+> ...
+> 
+> the function arguments are:
+> #1  0x570e8874 in trx_undo_free_page (rseg=0x57a56c40 <trx_sys+16768>,
+> in_history=false, hdr_page_no=807, page_no=817, mtr=0xef4ac434,
+> err=0xef4ac3dc) at /tmp/trxundo.ii:181925
+> 
+> and the construction of:
+> page_id_t(rseg->space->id, hdr_page_no)
+> ends in callee (buf_page_get_gen) with the argument:
+> 
+> (gdb) p page_id
+> $5 = {m_id = 0}
+> 
+> while in good run it should be {m_id = 807} !Ok, can you please print *rseg , rseg->space[0], *mtr and *err at the start of the function, so that I can try to construct a self-contained testcase?
+I assume both buf_page_get_gen return something non-NULL and it doesn't really matter otherwise what for the reproducer, since e.g. all the further calls can be noipa handled as completely dummy or even exit (0).
+
+- User: Martin Liška | Time: 2023-03-14 10:11:21 UTC
+  Text: Btw. the problematic instruction that assembly the page_id_t:
+
+# /tmp/trxundo.ii:181919:  if (__builtin_expect(!undo_block, (0))) {
+	addl	$48, %esp	#,
+# /tmp/trxundo.ii:181915:  buf_block_t* undo_block = buf_page_get_gen(page_id_t(rseg->space->id,
+	movl	%eax, -56(%ebp)	# _39, %sfp
+# /tmp/trxundo.ii:181919:  if (__builtin_expect(!undo_block, (0))) {
+	testl	%eax, %eax	# _39
+	je	.L636	#,
+# /tmp/trxundo.ii:181923:  saved = page_id_t(rseg->space->id, hdr_page_no);
+	movl	(%esi), %eax	# rseg_35(D)->space, rseg_35(D)->space
+# /tmp/trxundo.ii:181923:  saved = page_id_t(rseg->space->id, hdr_page_no);
+	movl	-44(%ebp), %ebx	# %sfp, tmp82
+# /tmp/trxundo.ii:58816:     m_id(uint64_t{space} << 32 | page_no) {}
+	movl	44(%eax), %edx	# _9->id, _69
+# /tmp/trxundo.ii:181923:  saved = page_id_t(rseg->space->id, hdr_page_no);
+	movl	saved@GOT(%ebx), %ecx	#, tmp164
+	movl	%edx, (%ecx)	# _69, saved.m_id
+	movl	%edx, 4(%ecx)	# _69, saved.m_id
+# /tmp/trxundo.ii:181924:  if (saved.raw() == 0)
+	movl	%edx, %ecx	# _69, tmp213
+	orl	%edx, %ecx	# tmp214, tmp215
+	je	.L662	#,
+
+for my adjusted code:
+
+ saved = page_id_t(rseg->space->id, hdr_page_no);
+ if (saved.raw() == 0)
+   __builtin_abort ();
+
+- User: Jakub Jelinek | Time: 2023-03-14 11:21:15 UTC
+  Text: I think I have finally a self-contained reproducer, -m32 -O2:
+struct S { char pad[44]; unsigned int id; };
+
+__attribute__((noipa, regparm (2))) unsigned long long
+foo (struct S *p, unsigned int q)
+{
+  return (((unsigned long long) p->id) << 32) | q;
+}
+
+int
+main ()
+{
+  struct S s = { {}, 0xcafebabeU };
+  if (foo (&s, 0xdeadbeefU) != 0xcafebabedeadbeefULL)
+    __builtin_abort ();
+}
+
+- User: Jakub Jelinek | Time: 2023-03-14 13:46:31 UTC
+  Text: More complete testcase:
+unsigned int arr[64];
+
+__attribute__((noipa, regparm (2))) unsigned long long
+f1 (unsigned int ax, unsigned int dx)
+{
+  return (((unsigned long long) arr[ax]) << 32) | ax;
+}
+
+__attribute__((noipa, regparm (2))) unsigned long long
+f2 (unsigned int ax, unsigned int dx)
+{
+  return (((unsigned long long) arr[dx]) << 32) | ax;
+}
+
+__attribute__((noipa, regparm (2))) unsigned long long
+f3 (unsigned int ax, unsigned int dx)
+{
+  return (((unsigned long long) ((unsigned int *) (((char *) arr) + ax))[dx]) << 32) | ax;
+}
+
+__attribute__((noipa, regparm (2))) unsigned long long
+f4 (unsigned int ax, unsigned int dx)
+{
+  return (((unsigned long long) arr[ax]) << 32) | dx;
+}
+
+__attribute__((noipa, regparm (2))) unsigned long long
+f5 (unsigned int ax, unsigned int dx)
+{
+  return (((unsigned long long) arr[dx]) << 32) | dx;
+}
+
+__attribute__((noipa, regparm (2))) unsigned long long
+f6 (unsigned int ax, unsigned int dx)
+{
+  return (((unsigned long long) ((unsigned int *) (((char *) arr) + ax))[dx]) << 32) | dx;
+}
+
+__attribute__((noipa, regparm (3))) unsigned long long
+f7 (unsigned int ax, unsigned int dx, unsigned int cx)
+{
+  return (((unsigned long long) arr[ax]) << 32) | cx;
+}
+
+__attribute__((noipa, regparm (3))) unsigned long long
+f8 (unsigned int ax, unsigned int dx, unsigned int cx)
+{
+  return (((unsigned long long) arr[dx]) << 32) | cx;
+}
+
+__attribute__((noipa, regparm (3))) unsigned long long
+f9 (unsigned int ax, unsigned int dx, unsigned int cx)
+{
+  return (((unsigned long long) ((unsigned int *) (((char *) arr) + ax))[dx]) << 32) | cx;
+}
+
+__attribute__((noipa, regparm (2))) unsigned long long
+f10 (unsigned int ax, unsigned int dx)
+{
+  return (((unsigned long long) ax) << 32) | arr[ax];
+}
+
+__attribute__((noipa, regparm (2))) unsigned long long
+f11 (unsigned int ax, unsigned int dx)
+{
+  return (((unsigned long long) ax) << 32) | arr[dx];
+}
+
+__attribute__((noipa, regparm (2))) unsigned long long
+f12 (unsigned int ax, unsigned int dx)
+{
+  return (((unsigned long long) ax) << 32) | ((unsigned int *) (((char *) arr) + ax))[dx];
+}
+
+__attribute__((noipa, regparm (2))) unsigned long long
+f13 (unsigned int ax, unsigned int dx)
+{
+  return (((unsigned long long) dx) << 32) | arr[ax];
+}
+
+__attribute__((noipa, regparm (2))) unsigned long long
+f14 (unsigned int ax, unsigned int dx)
+{
+  return (((unsigned long long) dx) << 32) | arr[dx];
+}
+
+__attribute__((noipa, regparm (2))) unsigned long long
+f15 (unsigned int ax, unsigned int dx)
+{
+  return (((unsigned long long) dx) << 32) | ((unsigned int *) (((char *) arr) + ax))[dx];
+}
+
+__attribute__((noipa, regparm (3))) unsigned long long
+f16 (unsigned int ax, unsigned int dx, unsigned int cx)
+{
+  return (((unsigned long long) cx) << 32) | arr[ax];
+}
+
+__attribute__((noipa, regparm (3))) unsigned long long
+f17 (unsigned int ax, unsigned int dx, unsigned int cx)
+{
+  return (((unsigned long long) cx) << 32) | arr[dx];
+}
+
+__attribute__((noipa, regparm (3))) unsigned long long
+f18 (unsigned int ax, unsigned int dx, unsigned int cx)
+{
+  return (((unsigned long long) cx) << 32) | ((unsigned int *) (((char *) arr) + ax))[dx];
+}
+
+int
+main ()
+{
+  for (int i = 0; i < 64; i++)
+    arr[i] = 64 + i;
+#define CHECK_EQ(x, y) do { if (x != y) __builtin_printf ("%s %llx != %llx\n", #x, x, y); } while (0)
+  CHECK_EQ (f1 (8, 9), 0x4800000008ULL);
+  CHECK_EQ (f2 (8, 9), 0x4900000008ULL);
+  CHECK_EQ (f3 (8, 9), 0x4b00000008ULL);
+  CHECK_EQ (f4 (8, 9), 0x4800000009ULL);
+  CHECK_EQ (f5 (8, 9), 0x4900000009ULL);
+  CHECK_EQ (f6 (8, 9), 0x4b00000009ULL);
+  CHECK_EQ (f7 (8, 9, 10), 0x480000000aULL);
+  CHECK_EQ (f8 (8, 9, 10), 0x490000000aULL);
+  CHECK_EQ (f9 (8, 9, 10), 0x4b0000000aULL);
+  CHECK_EQ (f10 (8, 9), 0x800000048ULL);
+  CHECK_EQ (f11 (8, 9), 0x800000049ULL);
+  CHECK_EQ (f12 (8, 9), 0x80000004bULL);
+  CHECK_EQ (f13 (8, 9), 0x900000048ULL);
+  CHECK_EQ (f14 (8, 9), 0x900000049ULL);
+  CHECK_EQ (f15 (8, 9), 0x90000004bULL);
+  CHECK_EQ (f16 (8, 9, 10), 0xa00000048ULL);
+  CHECK_EQ (f17 (8, 9, 10), 0xa00000049ULL);
+  CHECK_EQ (f18 (8, 9, 10), 0xa0000004bULL);
+}
+
+This fails:
+f4 (8, 9) 4800000048 != 4800000009
+f6 (8, 9) 4b0000004b != 4b00000009
+
+- User: Jakub Jelinek | Time: 2023-03-14 15:15:04 UTC
+  Text: Createdattachment 54661[details]gcc13-pr109109.patch
+
+Untested fix.
+
+- User: Jakub Jelinek | Time: 2023-03-14 18:23:24 UTC
+  Text: Hopefully fixed (the testcase is, but can't verify mariadb).
+
+- User: GCC Commits | Time: 2023-03-14 18:26:18 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:42630fadbe248717859d61c0244c821c32b4e52ccommitr13-6669-g42630fadbe248717859d61c0244c821c32b4e52cAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Mar 14 19:20:23 2023 +0100
+
+    i386: Fix up split_double_concat [PR109109]
+    
+    In myPR107627change I've missed one important case, which causes
+    miscompilation of f4 and f6 in the following tests.
+    
+    Combine matches there *concatsidi3_3 define_insn_and_split (as with all
+    other f* functions in those tests), and RA ends up with:
+    (insn 11 10 17 2 (set (reg:DI 0 ax [89])
+            (ior:DI (ashift:DI (zero_extend:DI (mem:SI (plus:SI (mult:SI (reg:SI 0 ax [94])
+                                    (const_int 4 [0x4]))
+                                (symbol_ref:SI ("arr") [flags 0x2]  <var_decl 0x7f4e7fe4ccf0 arr>)) [1 arr[ax_6(D)]+0 S4 A32]))
+                    (const_int 32 [0x20]))
+                (zero_extend:DI (reg:SI 1 dx [95])))) "pr109109-6.c":24:49 681 {*concatsidi3_3}
+         (nil))
+    split_double_concat turned that into:
+            movl    arr(,%eax,4), %edx
+            movl    %edx, %eax
+    which is incorrect, because the first instruction overrides the input
+    %edx value that should be put into output %eax; the two insns can't be
+    swapped because the MEM's address uses %eax.
+    
+    The following patch fixes that case to emit
+            movl    arr(,%eax,4), %eax
+            xchgl   %edx, %eax
+    instead.
+    
+    2023-03-14  Jakub Jelinek  <jakub@redhat.com>PR target/109109* config/i386/i386-expand.cc (split_double_concat): Fix splitting
+            when lo is equal to dhi and hi is a MEM which uses dlo register.
+    
+            * gcc.target/i386/pr109109-1.c: New test.
+            * gcc.target/i386/pr109109-2.c: New test.
+
+- User: Martin Liška | Time: 2023-03-14 18:27:55 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #18)> Hopefully fixed (the testcase is, but can't verify mariadb).Thank you for the fix, I'm going to verify the package build.
+

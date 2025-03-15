@@ -1,0 +1,278 @@
+Bug Summary: ICE in in extract_insn, at recog.cc:2791 on ppc64le with -mno-vsx
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-invalid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Martin Jambor | Time: 2023-05-22 17:05:20 UTC
+  Text: Using a cross compiler (revision ad0f80d945c) configured with
+
+/home/worker/buildworker/tiber-gcc-trunk-ppc64le/build/configure --enable-languages=c,c++,fortran,rust,m2 --disable-bootstrap --disable-libsanitizer --disable-multilib --enable-checking=release --prefix=/home/worker/cross --target=ppc64le-linux-gnu --with-as=/usr/bin/powerpc64le-suse-linux-as
+
+and running it on the following testcase (originally
+CodeGen/PowerPC/builtins-ppc-int128.c /tmp/test.c from clang
+testsuite)
+
+-----------------------------------------------------------------
+#include <altivec.h>
+
+vector signed __int128 res_vslll;
+unsigned long long aull[2] = { 1L, 2L };
+
+void testVectorInt128Pack(){
+  res_vslll = __builtin_pack_vector_int128(aull[0], aull[1]);
+  __builtin_unpack_vector_int128(res_vslll, 0);
+  __builtin_unpack_vector_int128(res_vslll, 1);
+}
+-----------------------------------------------------------------
+
+with option -mno-vsx resuts in an ICE:
+
+~/cross/bin/ppc64le-linux-gnu-gcc /tmp/test.c -mno-vsx
+/tmp/test.c: In function ‘testVectorInt128Pack’:
+/tmp/test.c:10:1: error: unrecognizable insn:
+   10 | }
+      | ^
+(insn 9 8 12 2 (set (reg:V1TI 124)
+        (unspec:V1TI [
+                (reg:DI 117 [ _1 ])
+                (reg:DI 118 [ _2 ])
+            ] UNSPEC_PACK_128BIT)) "/tmp/test.c":7:15 -1
+     (nil))
+during RTL pass: vregs
+/tmp/test.c:10:1: internal compiler error: in extract_insn, at recog.cc:2791
+0x62c70b _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+        /home/worker/buildworker/tiber-gcc-trunk-ppc64le/build/gcc/rtl-error.cc:108
+0x62c727 _fatal_insn_not_found(rtx_def const*, char const*, int, char const*)
+        /home/worker/buildworker/tiber-gcc-trunk-ppc64le/build/gcc/rtl-error.cc:116
+0x62bb8a extract_insn(rtx_insn*)
+        /home/worker/buildworker/tiber-gcc-trunk-ppc64le/build/gcc/recog.cc:2791
+0x8dacb0 instantiate_virtual_regs_in_insn
+        /home/worker/buildworker/tiber-gcc-trunk-ppc64le/build/gcc/function.cc:1611
+0x8dacb0 instantiate_virtual_regs
+        /home/worker/buildworker/tiber-gcc-trunk-ppc64le/build/gcc/function.cc:1984
+0x8dacb0 execute
+        /home/worker/buildworker/tiber-gcc-trunk-ppc64le/build/gcc/function.cc:2033
+
+
+I guess we should error out earlier and more user-friendly when
+expanding the built-ins?
+
+- User: Kewen Lin | Time: 2023-05-24 02:23:17 UTC
+  Text: Confirmed, thanks for reporting.
+
+Both bif __builtin_pack_vector_int128 and __builtin_unpack_vector_int128 are put in stanza power7 instead of vsx, so they miss to check vsx available or not.
+
+  const vsq __builtin_pack_vector_int128 (unsigned long long, \
+                                          unsigned long long);
+    PACK_V1TI packv1ti {}
+
+  void __builtin_ppc_speculation_barrier ();
+    SPECBARR speculation_barrier {}
+
+  const unsigned long __builtin_unpack_vector_int128 (vsq, const int<1>);
+    UNPACK_V1TI unpackv1ti {}
+
+But the underlying insn patterns do need VSX support, see:
+
+(define_insn "pack<mode>"
+  [(set (match_operand:FMOVE128_VSX 0 "register_operand" "=wa")
+	(unspec:FMOVE128_VSX
+	 [(match_operand:DI 1 "register_operand" "wa")
+	  (match_operand:DI 2 "register_operand" "wa")]
+	 UNSPEC_PACK_128BIT))]
+  "TARGET_VSX"   // here
+  "xxpermdi %x0,%x1,%x2,0"
+  [(set_attr "type" "vecperm")])
+
+(define_insn "unpack<mode>"
+  [(set (match_operand:DI 0 "register_operand" "=wa,wa")
+	(unspec:DI [(match_operand:FMOVE128_VSX 1 "register_operand" "0,wa")
+		    (match_operand:QI 2 "const_0_to_1_operand" "O,i")]
+	 UNSPEC_UNPACK_128BIT))]
+  "VECTOR_MEM_ALTIVEC_OR_VSX_P (<MODE>mode)"  // here
+{
+  if (REGNO (operands[0]) == REGNO (operands[1]) && INTVAL (operands[2]) == 0)
+    return ASM_COMMENT_START " xxpermdi to same register";
+
+  operands[3] = GEN_INT (INTVAL (operands[2]) == 0 ? 0 : 3);
+  return "xxpermdi %x0,%x1,%x1,%3";
+}
+  [(set_attr "type" "vecperm")])
+
+; Iterator for 128-bit VSX types for pack/unpack
+(define_mode_iterator FMOVE128_VSX [V1TI KF])
+
+both vector_mem for V1TI and KF are VSX.
+
+So the fix would be to move these two bifs to be under stanza vsx.
+
+- User: GCC Commits | Time: 2023-06-12 06:10:50 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:ff83d1b47aadcdaf80a4fda84b0dc00bb2cd3641commitr14-1704-gff83d1b47aadcdaf80a4fda84b0dc00bb2cd3641Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Mon Jun 12 01:08:22 2023 -0500
+
+    rs6000: Guard __builtin_{un,}pack_vector_int128 with vsx [PR109932]
+    
+    AsPR109932shows, builtins __builtin_{un,}pack_vector_int128
+    should be guarded under vsx rather than power7, as their
+    corresponding bif patterns have the conditions TARGET_VSX
+    and VECTOR_MEM_ALTIVEC_OR_VSX_P (V1TImode).  This patch is to
+    move __builtin_{un,}pack_vector_int128 to stanza vsx to ensure
+    their supports.PR target/109932gcc/ChangeLog:
+    
+            * config/rs6000/rs6000-builtins.def (__builtin_pack_vector_int128,
+            __builtin_unpack_vector_int128): Move from stanza power7 to vsx.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr109932-1.c: New test.
+            * gcc.target/powerpc/pr109932-2.c: New test.
+
+- User: GCC Commits | Time: 2023-06-13 08:08:09 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:16eb9d69079d769b2aa2c07ce54aca20f5547c14commitr14-1776-g16eb9d69079d769b2aa2c07ce54aca20f5547c14Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Tue Jun 13 03:04:54 2023 -0500
+
+    testsuite: Check int128 effective target forpr109932-{1,2}.c [PR110230]
+    
+    This patch is to make newly added test casespr109932-{1,2}.c
+    check int128 effective target to avoid unsupported type error
+    on 32-bit.  I did hit this failure during testing and fixed
+    it, but made a stupid mistake not updating the local formatted
+    patch which was actually out of date.PR testsuite/110230PR target/109932gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr109932-1.c: Adjust with int128 effective target.
+            * gcc.target/powerpc/pr109932-2.c: Ditto.
+
+- User: GCC Commits | Time: 2023-06-20 03:20:53 UTC
+  Text: The releases/gcc-12 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:31d88c795a0eb05df5a0684c34ec74116cce133fcommitr12-9713-g31d88c795a0eb05df5a0684c34ec74116cce133fAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Mon Jun 12 01:08:22 2023 -0500
+
+    rs6000: Guard __builtin_{un,}pack_vector_int128 with vsx [PR109932]
+    
+    AsPR109932shows, builtins __builtin_{un,}pack_vector_int128
+    should be guarded under vsx rather than power7, as their
+    corresponding bif patterns have the conditions TARGET_VSX
+    and VECTOR_MEM_ALTIVEC_OR_VSX_P (V1TImode).  This patch is to
+    move __builtin_{un,}pack_vector_int128 to stanza vsx to ensure
+    their supports.PR target/109932gcc/ChangeLog:
+    
+            * config/rs6000/rs6000-builtins.def (__builtin_pack_vector_int128,
+            __builtin_unpack_vector_int128): Move from stanza power7 to vsx.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr109932-1.c: New test.
+            * gcc.target/powerpc/pr109932-2.c: New test.
+    
+    (cherry picked from commit ff83d1b47aadcdaf80a4fda84b0dc00bb2cd3641)
+
+- User: GCC Commits | Time: 2023-06-20 03:20:58 UTC
+  Text: The releases/gcc-12 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:4591c2c8a6b15ca99ba049d84e0e694f12db4f60commitr12-9714-g4591c2c8a6b15ca99ba049d84e0e694f12db4f60Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Tue Jun 13 03:04:54 2023 -0500
+
+    testsuite: Check int128 effective target forpr109932-{1,2}.c [PR110230]
+    
+    This patch is to make newly added test casespr109932-{1,2}.c
+    check int128 effective target to avoid unsupported type error
+    on 32-bit.  I did hit this failure during testing and fixed
+    it, but made a stupid mistake not updating the local formatted
+    patch which was actually out of date.PR testsuite/110230PR target/109932gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr109932-1.c: Adjust with int128 effective target.
+            * gcc.target/powerpc/pr109932-2.c: Ditto.
+    
+    (cherry picked from commit 16eb9d69079d769b2aa2c07ce54aca20f5547c14)
+
+- User: GCC Commits | Time: 2023-06-20 03:21:34 UTC
+  Text: The releases/gcc-13 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:4e67d73ee5100c12993c79852e4ede13d2606cadcommitr13-7457-g4e67d73ee5100c12993c79852e4ede13d2606cadAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Mon Jun 12 01:08:22 2023 -0500
+
+    rs6000: Guard __builtin_{un,}pack_vector_int128 with vsx [PR109932]
+    
+    AsPR109932shows, builtins __builtin_{un,}pack_vector_int128
+    should be guarded under vsx rather than power7, as their
+    corresponding bif patterns have the conditions TARGET_VSX
+    and VECTOR_MEM_ALTIVEC_OR_VSX_P (V1TImode).  This patch is to
+    move __builtin_{un,}pack_vector_int128 to stanza vsx to ensure
+    their supports.PR target/109932gcc/ChangeLog:
+    
+            * config/rs6000/rs6000-builtins.def (__builtin_pack_vector_int128,
+            __builtin_unpack_vector_int128): Move from stanza power7 to vsx.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr109932-1.c: New test.
+            * gcc.target/powerpc/pr109932-2.c: New test.
+    
+    (cherry picked from commit ff83d1b47aadcdaf80a4fda84b0dc00bb2cd3641)
+
+- User: GCC Commits | Time: 2023-06-20 03:21:40 UTC
+  Text: The releases/gcc-13 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:4b4a21c93406aef276fbff00d3e9491285d7b4a9commitr13-7458-g4b4a21c93406aef276fbff00d3e9491285d7b4a9Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Tue Jun 13 03:04:54 2023 -0500
+
+    testsuite: Check int128 effective target forpr109932-{1,2}.c [PR110230]
+    
+    This patch is to make newly added test casespr109932-{1,2}.c
+    check int128 effective target to avoid unsupported type error
+    on 32-bit.  I did hit this failure during testing and fixed
+    it, but made a stupid mistake not updating the local formatted
+    patch which was actually out of date.PR testsuite/110230PR target/109932gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr109932-1.c: Adjust with int128 effective target.
+            * gcc.target/powerpc/pr109932-2.c: Ditto.
+    
+    (cherry picked from commit 16eb9d69079d769b2aa2c07ce54aca20f5547c14)
+
+- User: GCC Commits | Time: 2023-06-20 08:24:50 UTC
+  Text: The releases/gcc-11 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:db291447877aae67979ce3655fcc6fc877f57c6acommitr11-10866-gdb291447877aae67979ce3655fcc6fc877f57c6aAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Tue Jun 20 01:40:52 2023 -0500
+
+    rs6000: Guard __builtin_{un,}pack_vector_int128 with vsx [PR109932]
+    
+    AsPR109932shows, builtins __builtin_{un,}pack_vector_int128
+    should be guarded under vsx rather than power7, as their
+    corresponding bif patterns have the conditions TARGET_VSX
+    and VECTOR_MEM_ALTIVEC_OR_VSX_P (V1TImode).  This patch is to
+    ensure __builtin_{un,}pack_vector_int128 only available under
+    vsx.PR target/109932gcc/ChangeLog:
+    
+            * config/rs6000/rs6000-builtin.def (BU_VSX_MISC_2): New macro.
+            ({un,}pack_vector_int128): Use BU_VSX_MISC_2 instead of
+            BU_P7_MISC_2.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr109932-1.c: New test.
+            * gcc.target/powerpc/pr109932-2.c: New test.
+
+- User: GCC Commits | Time: 2023-06-20 09:30:27 UTC
+  Text: The releases/gcc-10 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:98763feef24b58573fa9e6c6eedaccc1e932bb46commitr10-11455-g98763feef24b58573fa9e6c6eedaccc1e932bb46Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Tue Jun 20 01:40:52 2023 -0500
+
+    rs6000: Guard __builtin_{un,}pack_vector_int128 with vsx [PR109932]
+    
+    AsPR109932shows, builtins __builtin_{un,}pack_vector_int128
+    should be guarded under vsx rather than power7, as their
+    corresponding bif patterns have the conditions TARGET_VSX
+    and VECTOR_MEM_ALTIVEC_OR_VSX_P (V1TImode).  This patch is to
+    ensure __builtin_{un,}pack_vector_int128 only available under
+    vsx.PR target/109932gcc/ChangeLog:
+    
+            * config/rs6000/rs6000-builtin.def (BU_VSX_MISC_2): New macro.
+            ({un,}pack_vector_int128): Use BU_VSX_MISC_2 instead of
+            BU_P7_MISC_2.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr109932-1.c: New test.
+            * gcc.target/powerpc/pr109932-2.c: New test.
+    
+    (cherry picked from commit db291447877aae67979ce3655fcc6fc877f57c6a)
+
+- User: Kewen Lin | Time: 2023-06-20 09:42:37 UTC
+  Text: Should be fixed everywhere.
+

@@ -1,0 +1,270 @@
+Bug Summary: [14 Regression] Missed phi-opt after recent change (phi-opt-24.c)
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jeffrey A. Law | Time: 2023-11-09 19:55:56 UTC
+  Text: This change:
+
+commit 3f176e1adc6bc9cc2c21222d776b51d9f43cb66b (HEAD)
+Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Thu Nov 9 13:59:39 2023 +0000
+
+    middle-end: optimize fneg (fabs (x)) to copysign (x, -1) [PR109154]
+    
+    This patch transforms fneg (fabs (x)) into copysign (x, -1) which is more
+    canonical and allows a target to expand this sequence efficiently.  Such
+    sequences are common in scientific code working with gradients.
+    
+    There is an existing canonicalization of copysign (x, -1) to fneg (fabs (x))
+    which I remove since this is a less efficient form.  The testsuite is also
+    updated in light of this.
+    
+    gcc/ChangeLog:PR tree-optimization/109154* match.pd: Add new neg+abs rule, remove inverse copysign rule.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/109154* gcc.dg/fold-copysign-1.c: Updated.
+            * gcc.dg/pr55152-2.c: Updated.
+            * gcc.dg/tree-ssa/abs-4.c: Updated.
+            * gcc.dg/tree-ssa/backprop-6.c: Updated.
+            * gcc.dg/tree-ssa/copy-sign-2.c: Updated.
+            * gcc.dg/tree-ssa/mult-abs-2.c: Updated.
+            * gcc.target/aarch64/fneg-abs_1.c: New test.
+            * gcc.target/aarch64/fneg-abs_2.c: New test.
+            * gcc.target/aarch64/fneg-abs_3.c: New test.
+            * gcc.target/aarch64/fneg-abs_4.c: New test.
+            * gcc.target/aarch64/sve/fneg-abs_1.c: New test.
+            * gcc.target/aarch64/sve/fneg-abs_2.c: New test.
+            * gcc.target/aarch64/sve/fneg-abs_3.c: New test.
+            * gcc.target/aarch64/sve/fneg-abs_4.c: New test.
+
+
+
+Is causing a testsuite regression on moxie-elf.  This is a scan dump failure, so you don't need a full toolchain, just a cross compiler.
+
+moxie-sim: gcc.dg/tree-ssa/phi-opt-24.c scan-tree-dump-not phiopt2 "if"
+
+- User: Andrew Pinski | Time: 2023-11-10 03:55:54 UTC
+  Text: phiopt match-simplify trying:
+        A_2(D) <= 0.0 ? A_2(D) : _3
+Applying pattern match.pd:1131, gimple-match-4.cc:4134
+Applying pattern match.pd:5798, gimple-match-8.cc:3689
+
+phiopt match-simplify back:
+_5 = ABS_EXPR <A_2(D)>;
+result:  (none)
+
+- User: Andrew Pinski | Time: 2023-11-10 04:06:29 UTC
+  Text: new_stmt = build_call_internal (ifn, res_op);
+
+static gcall *
+build_call_internal (internal_fn fn, gimple_match_op *res_op)
+{
+  if (direct_internal_fn_p (fn))
+    {
+      tree_pair types = direct_internal_fn_types (fn, res_op->type,
+                                                  res_op->ops);
+      if (!direct_internal_fn_supported_p (fn, types, OPTIMIZE_FOR_BOTH))
+        return NULL; // here.
+    }
+
+
+Causes copysign to return NULL here ....
+
+I suspect the pattern should be changed to:
+/* Transform fneg (fabs (X)) -> copysign (X, -1).  */
+(simplify
+ (negate (abs @0))
+ (if (direct_internal_fn_supported_p (IFN_COPYSIGN, type, OPTIMIZE_FOR_BOTH))
+  (IFN_COPYSIGN @0 { build_minus_one_cst (type); })))
+
+
+Notice the check against direct_internal_fn_supported_p here.
+
+This is similar to the (trunc)copysign((extend)..) pattern.
+
+/* Simplify (trunc)copysign ((extend)x, (extend)y) to copysignf (x, y),
+   x,y is float value, similar for _Float16/double.  */
+(for copysigns (COPYSIGN_ALL)
+ (simplify
+  (convert (copysigns (convert@2 @0) (convert @1)))
+
+- User: Tamar Christina | Time: 2023-11-10 07:25:08 UTC
+  Text: Hmm I rather think PHI ops should handle that null like other passes do. The folding is supposed to already test and only happen if it succeeds.
+
+This prevents match.pd from having to have a second check on every IFN usage.
+
+- User: Andrew Pinski | Time: 2023-11-10 07:52:50 UTC
+  Text: (In reply to Tamar Christina fromcomment #3)> Hmm I rather think PHI ops should handle that null like other passes do. The
+> folding is supposed to already test and only happen if it succeeds.It handles the null just fine.
+If you look at the output I posted,
+we start with "A_2(D) <= 0.0 ? A_2(D) : _3" where _3 is -A_2(D)
+
+The matches this pattern:
+ /* A <=/< 0 ? A : -A    same as -abs (A) */
+ (for cmp (le lt)
+  (simplify
+   (cnd (cmp @0 zerop) @1 (negate @1))
+    (if (!HONOR_SIGNED_ZEROS (TREE_TYPE(@0))
+	 && !TYPE_UNSIGNED (TREE_TYPE(@0))
+	 && bitwise_equal_p (@0, @1))
+     (if ((ANY_INTEGRAL_TYPE_P (TREE_TYPE (@0))
+	   && !TYPE_OVERFLOW_WRAPS (TREE_TYPE (@0)))
+	  || TYPE_UNSIGNED (type))
+      (with {
+	tree utype = unsigned_type_for (TREE_TYPE(@0));
+       }
+       (convert (negate (absu:utype @0))))
+       (negate (abs @0)))))
+
+But then match tries to simplify (negate (abs @0)) .
+phiopt was not involved in that simplification of the -abs(a) to ifn_copysign but only match and simplify.
+
+- User: Richard Biener | Time: 2023-11-10 08:31:06 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> new_stmt = build_call_internal (ifn, res_op);
+> 
+> static gcall *
+> build_call_internal (internal_fn fn, gimple_match_op *res_op)
+> {
+>   if (direct_internal_fn_p (fn))
+>     {
+>       tree_pair types = direct_internal_fn_types (fn, res_op->type,
+>                                                   res_op->ops);
+>       if (!direct_internal_fn_supported_p (fn, types, OPTIMIZE_FOR_BOTH))
+>         return NULL; // here.
+>     }
+> 
+> 
+> Causes copysign to return NULL here ....
+> 
+> I suspect the pattern should be changed to:
+> /* Transform fneg (fabs (X)) -> copysign (X, -1).  */
+> (simplify
+>  (negate (abs @0))
+>  (if (direct_internal_fn_supported_p (IFN_COPYSIGN, type, OPTIMIZE_FOR_BOTH))
+>   (IFN_COPYSIGN @0 { build_minus_one_cst (type); })))But that's already implicitly done, so I fail to see how it makes a difference?
+Or do you say it might make a difference for consumers which look at
+the gimple_match_op () result (which has the toplevel not committed to
+gimple *, and thus not "rejected" yet)?
+
+I suppose we could change things to reject it earlier but then the idea
+is of course that "unsupported" intermediate .COPYSIGN could be further
+simplified, avoiding the need to actually output it.> Notice the check against direct_internal_fn_supported_p here.
+> 
+> This is similar to the (trunc)copysign((extend)..) pattern.
+> 
+> /* Simplify (trunc)copysign ((extend)x, (extend)y) to copysignf (x, y),
+>    x,y is float value, similar for _Float16/double.  */
+> (for copysigns (COPYSIGN_ALL)
+>  (simplify
+>   (convert (copysigns (convert@2 @0) (convert @1)))
+
+- User: Hans-Peter Nilsson | Time: 2023-11-13 01:22:27 UTC
+  Text: This commit caused test-suite regressions not just for moxie-elf but for several other targets; also cris-elf and according to gcc-testresults posts:
+
+s390x-ibm-linux-gnuhttps://gcc.gnu.org/pipermail/gcc-testresults/2023-November/800481.htmlm68k-unknown-linux-gnuhttps://gcc.gnu.org/pipermail/gcc-testresults/2023-November/800547.htmlpru-unknown-elfhttps://gcc.gnu.org/pipermail/gcc-testresults/2023-November/800569.htmlAnd it's not just gcc.dg/tree-ssa/phi-opt-24.c scan-tree-dump-not phiopt2 "if", but:
+
+Running /x/gcc/gcc/testsuite/gcc.dg/dg.exp ...
+[...]
+FAIL: gcc.dg/pr55152-2.c scan-tree-dump-times optimized ".COPYSIGN" 1
+FAIL: gcc.dg/pr55152-2.c scan-tree-dump-times optimized "ABS_EXPR" 1
+
+Running /x/gcc/gcc/testsuite/gcc.dg/tree-ssa/tree-ssa.exp ...
+FAIL: gcc.dg/tree-ssa/abs-4.c scan-tree-dump-times optimized "= ABS_EXPR" 1
+FAIL: gcc.dg/tree-ssa/abs-4.c scan-tree-dump-times optimized "= -" 1
+FAIL: gcc.dg/tree-ssa/abs-4.c scan-tree-dump-times optimized "= .COPYSIGN" 2
+FAIL: gcc.dg/tree-ssa/backprop-6.c scan-tree-dump-times backprop "Deleting[^\\n]* = -" 4
+FAIL: gcc.dg/tree-ssa/backprop-6.c scan-tree-dump-times backprop "Deleting[^\\n]* = \\.COPYSIGN" 2
+FAIL: gcc.dg/tree-ssa/backprop-6.c scan-tree-dump-times backprop "Deleting[^\\n]* = ABS_EXPR <" 1
+FAIL: gcc.dg/tree-ssa/copy-headers-8.c scan-tree-dump-times ch2 "Conditional combines static and invariant" 1
+FAIL: gcc.dg/tree-ssa/copy-headers-8.c scan-tree-dump-times ch2 "Will duplicate bb" 2
+FAIL: gcc.dg/tree-ssa/copy-sign-2.c scan-tree-dump-times optimized "ABS" 1
+FAIL: gcc.dg/tree-ssa/copy-sign-2.c scan-tree-dump-times optimized ".COPYSIGN" 1
+FAIL: gcc.dg/tree-ssa/phi-opt-24.c scan-tree-dump-not phiopt2 "if"
+
+Summarily:
+gcc.sum gcc.dg/pr55152-2.c
+gcc.sum gcc.dg/tree-ssa/abs-4.c
+gcc.sum gcc.dg/tree-ssa/backprop-6.c
+gcc.sum gcc.dg/tree-ssa/copy-sign-2.c
+gcc.sum gcc.dg/tree-ssa/phi-opt-24.c
+
+- User: Tamar Christina | Time: 2023-11-13 07:04:31 UTC
+  Text: testing patch
+
+- User: Andrew Pinski | Time: 2023-12-10 19:34:08 UTC
+  Text: ***Bug 112945has been marked as a duplicate of this bug. ***
+
+- User: Hans-Peter Nilsson | Time: 2023-12-13 15:41:56 UTC
+  Text: (In reply to Tamar Christina fromcomment #7)> testing patchA month later: any update on that?
+I didn't see a patch posted, so perhaps there was more work to it.
+Please leave a note if you're no longer working on it and/or not expecting progress within, say, another month.
+
+- User: Tamar Christina | Time: 2023-12-13 15:44:35 UTC
+  Text: Hi,
+
+It's not forgotten. I've agreed on a fix with the maintainers that should solve a bunch of other (older) issues with copysign as well.
+
+Since it's a bug fix it's on my list after my stage3 changes.  But I expect to be able to send the patch next week.
+
+Sorry for the delay.
+
+- User: Hans-Peter Nilsson | Time: 2023-12-14 00:36:53 UTC
+  Text: (In reply to Tamar Christina fromcomment #10)> Hi,
+> 
+> It's not forgotten. I've agreed on a fix with the maintainers that should
+> solve a bunch of other (older) issues with copysign as well.
+> 
+> Since it's a bug fix it's on my list after my stage3 changes.  But I expect
+> to be able to send the patch next week.
+> 
+> Sorry for the delay.Fair enough, thanks for the update!
+
+- User: N/A | Time: 2023-12-19 02:40:58 UTC
+  Text: Add nios2 to the list of targets where this change triggered a bunch of test fails.
+
+- User: GCC Commits | Time: 2024-01-10 17:19:29 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:7cbe41d35e6a60776484e04e42e408de9fc82954commitr14-7115-g7cbe41d35e6a60776484e04e42e408de9fc82954Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Wed Jan 10 17:18:28 2024 +0000
+
+    middle-end: Don't apply copysign optimization if target does not implement optab [PR112468]
+    
+    Currently GCC does not treat IFN_COPYSIGN the same as the copysign tree expr.
+    The latter has a libcall fallback and the IFN can only do optabs.
+    
+    Because of this the change I made to optimize copysign only works if the
+    target has impemented the optab, but it should work for those that have the
+    libcall too.
+    
+    More annoyingly if a target has vector versions of ABS and NEG but not COPYSIGN
+    then the change made them lose vectorization.
+    
+    The proper fix for this is to treat the IFN the same as the tree EXPR and to
+    enhance expand_COPYSIGN to also support vector calls.
+    
+    I have such a patch for GCC 15 but it's quite big and too invasive for stage-4.
+    As such this is a minimal fix, just don't apply the transformation and leave
+    targets which don't have the optab unoptimized.
+    
+    Targets list for check_effective_target_ifn_copysign was gotten by grepping for
+    copysign and looking at the optab.
+    
+    gcc/ChangeLog:PR tree-optimization/112468* doc/sourcebuild.texi: Document ifn_copysign.
+            * match.pd: Only apply transformation if target supports the IFN.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/112468* gcc.dg/fold-copysign-1.c: Modify tests based on if target supports
+            IFN_COPYSIGN.
+            * gcc.dg/pr55152-2.c: Likewise.
+            * gcc.dg/tree-ssa/abs-4.c: Likewise.
+            * gcc.dg/tree-ssa/backprop-6.c: Likewise.
+            * gcc.dg/tree-ssa/copy-sign-2.c: Likewise.
+            * gcc.dg/tree-ssa/mult-abs-2.c: Likewise.
+            * lib/target-supports.exp (check_effective_target_ifn_copysign): New.
+
+- User: Tamar Christina | Time: 2024-01-10 17:21:29 UTC
+  Text: Fixed thanks for the report.
+

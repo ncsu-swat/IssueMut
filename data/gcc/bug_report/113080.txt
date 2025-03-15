@@ -1,0 +1,156 @@
+Bug Summary: Missed optimization of loop invariant elimination
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Yi | Time: 2023-12-19 07:45:57 UTC
+  Text: Hello, we noticed that maybe there is a missed optimization for loop invariant elimination.
+
+Loop invariant: a+b.https://godbolt.org/z/zYb7Ej47aint a,b,n;
+int w;
+void fun1(int t){
+    for(int i=0;i<100;i++){
+        a+=w;
+        b-=w;
+        t+=a+b;
+    }
+    n=t;
+}
+
+GCC -O3 -fwrapv (Loop part of the code):
+<bb 3> [local count: 1063004408]:
+  # t_20 = PHI <t_15(3), t_10(D)(2)>
+  # ivtmp_1 = PHI <ivtmp_7(3), 100(2)>
+  # ivtmp.32_34 = PHI <ivtmp.32_35(3), ivtmp.32_26(2)>
+  # ivtmp.33_25 = PHI <_31(3), ivtmp.33_22(2)>
+  # DEBUG i => NULL
+  # DEBUG t => NULL
+  b_lsm.18_24 = (int) ivtmp.33_25;
+  a_lsm.17_21 = (int) ivtmp.32_34;
+  # DEBUG i => NULL
+  # DEBUG t => NULL
+  # DEBUG BEGIN_STMT
+  # DEBUG BEGIN_STMT
+  # DEBUG BEGIN_STMT
+  _6 = a_lsm.17_21 + b_lsm.18_24;
+  t_15 = _6 + t_20;
+  # DEBUG t => t_15
+  # DEBUG BEGIN_STMT
+  # DEBUG i => NULL
+  # DEBUG t => t_15
+  # DEBUG BEGIN_STMT
+  ivtmp_7 = ivtmp_1 + 4294967295;
+  ivtmp.32_35 = _27 + ivtmp.32_34;
+  _14 = (unsigned int) w.1_2;
+  _31 = ivtmp.33_25 - _14;
+  if (ivtmp_7 != 0)
+    goto <bb 3>; [98.99%]
+  else
+    goto <bb 4>; [1.01%]
+
+fun1(int):
+        mov     r9d, DWORD PTR a[rip]
+        mov     esi, DWORD PTR w[rip]
+        mov     eax, 100
+        mov     r10d, DWORD PTR b[rip]
+        mov     ecx, r9d
+        mov     edx, r10d
+.L2:
+        lea     r8d, [rcx+rdx]
+        add     ecx, esi
+        sub     edx, esi
+        add     edi, r8d
+        sub     eax, 1
+        jne     .L2
+        imul    eax, esi, -99
+        add     r9d, esi
+        mov     DWORD PTR n[rip], edi
+        sub     r9d, eax
+        sub     eax, esi
+        add     eax, r10d
+        mov     DWORD PTR a[rip], r9d
+        mov     DWORD PTR b[rip], eax
+        ret
+
+
+Expected code (Clang):
+fun1(int):                               # @fun1(int)
+        mov     eax, dword ptr [rip + a]
+        mov     ecx, dword ptr [rip + b]
+        imul    edx, dword ptr [rip + w], 100
+        lea     esi, [rcx + rax]
+        add     eax, edx
+        imul    esi, esi, 100
+        sub     ecx, edx
+        add     esi, edi
+        mov     dword ptr [rip + a], eax
+        mov     dword ptr [rip + b], ecx
+        mov     dword ptr [rip + n], esi
+        ret
+
+The following code is optimized by gcc as expected in terms of loop invariants, which may help with this issue:
+int a,b,n;
+int w;
+void fun2(int t){
+    n=t;
+    for(int i=0;i<100;i++){
+        a+=w;
+        b-=w;
+        n+=a+b;
+    }
+}
+
+Thank you very much for your time and effort! We look forward to hearing from you.
+
+- User: Richard Biener | Time: 2023-12-19 09:50:22 UTC
+  Text: Confirmed.  We're considering the final value replacement of the 't' reduction
+expensive.  It's
+
+((b_lsm.10_8 + a_lsm.9_9) + t_10(D)) + (b_lsm.10_8 + a_lsm.9_9) * 99
+
+and since there's a shared tree (b_lsm.10_8 + a_lsm.9_9) which we'd
+duplicate (materializing as GIMPLE fails to immediately CSE).
+
+bool
+expression_expensive_p (tree expr, bool *cond_overflow_p)
+{
+  hash_map<tree, uint64_t> cache;
+  uint64_t expanded_size = 0;
+  *cond_overflow_p = false;
+  return (expression_expensive_p (expr, cond_overflow_p, cache, expanded_size)
+          || expanded_size > cache.elements ());
+}
+
+where expanded_size is 5 but cache.elements () is 4 (we grow because
+of unsharing).
+
+Allowing a little bit of unsharing fixes this.  Even better would be of
+course an unsharing mechanism that would "save" the shared parts to
+a gimple sequence (we need to unshare because gimplification is destructive
+and the SCEV result contains trees that can be part of the SCEV cache
+which we may not alter).
+
+- User: GCC Commits | Time: 2023-12-19 12:32:59 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:afd49e663258061a10f0f2c4a8f8aa2bf97bee42commitr14-6684-gafd49e663258061a10f0f2c4a8f8aa2bf97bee42Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Dec 19 10:51:06 2023 +0100
+
+    tree-optimization/113080 - missing final value replacement
+    
+    When performing final value replacement we guard against exponential
+    (temporary) code growth due to unsharing of trees (SCEV heavily
+    relies on tree sharing).  The following relaxes this a tiny bit
+    to cover some more optimizations and puts in comments as to what
+    the real fix would be.PR tree-optimization/113080* tree-scalar-evolution.cc (expression_expensive_p): Allow
+            a tiny bit of growth due to expansion of shared trees.
+            (final_value_replacement_loop): Add comment.
+    
+            * gcc.dg/tree-ssa/sccp-3.c: New testcase.
+
+- User: Richard Biener | Time: 2023-12-19 12:33:44 UTC
+  Text: Fixed.
+

@@ -1,0 +1,395 @@
+Bug Summary: [13 Regression] vector peeling ICEs with VLA in gcc_r in SPEC2017 since g:c13223b790bbc5e4a3f5605e057eac59b61b2c85
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Tamar Christina | Time: 2023-01-30 15:43:06 UTC
+  Text: PGO seems fine, LTO seems fine, but PGO + LTO + increase inlining makes it crash.
+
+Full options:
+
+-fprofile-generate -mcpu=native -Ofast -fomit-frame-pointer -flto=auto --param ipa-cp-eval-threshold=1 --param ipa-cp-unit-growth=80
+
+GCC 12 seems fine.
+
+I'm still trying to reduce (it's a combination of my worst nightmares :( ), but in the mean time here's the crash
+
+during GIMPLE pass: vect
+opts.c: In function 'common_handle_option':
+opts.c:1456:1: internal compiler error: in vect_peel_nonlinear_iv_init, at tree-vect-loop.cc:8664
+ 1456 | common_handle_option (size_t scode, const char *arg, int value,
+      | ^
+0xdcff4b vect_peel_nonlinear_iv_init(gimple**, tree_node*, tree_node*, tree_node*, vect_induction_op_type)
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-loop.cc:8664
+0xdee503 vect_update_ivs_after_vectorizer
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-loop-manip.cc:1594
+0xdee503 vect_do_peeling(_loop_vec_info*, tree_node*, tree_node*, tree_node**, tree_node**, tree_node**, int, bool, bool, tree_node**)
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-loop-manip.cc:2999
+0xde49d7 vect_transform_loop(_loop_vec_info*, gimple*)
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-loop.cc:10837
+0xe17447 vect_transform_loops
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vectorizer.cc:1007
+0xe17a8b try_vectorize_loop_1
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vectorizer.cc:1153
+0xe17a8b try_vectorize_loop
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vectorizer.cc:1183
+0xe17f6b execute
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vectorizer.cc:1299
+
+- User: Andrew Pinski | Time: 2023-01-30 16:05:14 UTC
+  Text: So here is how I would tackle this:
+Put all the needed .i/.ii files in a response file.
+
+
+$CC -c @files @options
+$CC -r -o file.o @fileso @options 
+
+Since this is only at profile generated stage it is not as hard ...
+Then start by reducing the needed .o files in `fileso` .
+When that is finished. Update `files` to match `fileso`.
+and then run delta (or another automated reducer) over the files in `files`.
+Maybe even change -flto=auto etc.
+
+- User: Richard Biener | Time: 2023-01-31 07:25:27 UTC
+  Text: To me it's obvious that the path in the backtrace gets a non-constant niter bump
+since we're dealing with epilog peeling.  Either we need to reject this when
+requiring a peeled epilogue or we should deal with a non-constant skip_niters.
+
+This was introduced withr13-2503-gc13223b790bbc5.
+
+Btw, I wonder why we need to use this function instead of re-using the
+IV from the vectorized loop (or extracting the "last" value from the
+vectorized variant).
+
+It should be possible to construct a testcase with a vectorizable non-linear IV
+that requires peeling of the epilog?
+
+- User: Richard Biener | Time: 2023-01-31 07:29:08 UTC
+  Text: So for the trivial
+
+void
+__attribute__((noipa))
+foo_mul (int* a, int b, int n)
+{
+  for (int i = 0; i != N; i++)
+    {
+      a[i] = b;
+      b *= 3;
+    }
+}
+
+
+I get
+
+t.c:5:21: note:   examining phi: b_17 = PHI <b_12(6), b_7(D)(5)>
+t.c:5:21: missed:   Peeling for epilogue is not supported for nonlinear induction except neg when iteration count is unknown.
+t.c:3:1: missed:   not vectorized: relevant phi not supported: b_17 = PHI <b_12(6), b_7(D)(5)>
+t.c:5:21: missed:  bad operation or unsupported loop bound.
+
+so for some reason this check doesn't trigger for the case in SPEC?  The
+check seems to be
+
+vect_can_peel_nonlinear_iv_p (loop_vec_info loop_vinfo,
+                              enum vect_induction_op_type induction_type)
+{
+  tree niters_skip;
+  /* Init_expr will be update by vect_update_ivs_after_vectorizer,
+     if niters is unkown:
+     For shift, when shift mount >= precision, there would be UD.
+     For mult, don't known how to generate
+     init_expr * pow (step, niters) for variable niters.
+     For neg, it should be ok, since niters of vectorized main loop
+     will always be multiple of 2.  */
+  if (!LOOP_VINFO_NITERS_KNOWN_P (loop_vinfo)
+      && induction_type != vect_step_op_neg)
+    {
+      if (dump_enabled_p ())
+        dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
+                         "Peeling for epilogue is not supported"
+                         " for nonlinear induction except neg"
+                         " when iteration count is unknown.\n");
+      return false;
+    }
+
+that might not be entirely sufficient to detect all epilogue peeling cases.
+
+- User: Hongtao.liu | Time: 2023-01-31 07:49:22 UTC
+  Text: So that would be case: the tripcount is known, the vect_factor is known, but still niters_vector_mult_vf is variable(or it's not fold into an constant).?
+
+- User: Hongtao.liu | Time: 2023-01-31 08:28:34 UTC
+  Text: (In reply to Hongtao.liu fromcomment #4)> So that would be case: the tripcount is known, the vect_factor is known, but
+> still niters_vector_mult_vf is variable(or it's not fold into an constant).?Maybe related to this tricky
+
+
+      if (!integer_onep (*step_vector))
+	{
+	  /* On exit from the loop we will have an easy way of calcalating
+	     NITERS_VECTOR / STEP * STEP.  Install a dummy definition
+	     until then.  */
+	  niters_vector_mult_vf = make_ssa_name (TREE_TYPE (*niters_vector));
+	  SSA_NAME_DEF_STMT (niters_vector_mult_vf) = gimple_build_nop ();
+	  *niters_vector_mult_vf_var = niters_vector_mult_vf;
+	}
+      else
+	vect_gen_vector_loop_niters_mult_vf (loop_vinfo, *niters_vector,
+					     &niters_vector_mult_vf);
+
+- User: Tamar Christina | Time: 2023-01-31 09:05:36 UTC
+  Text: probably relevant that I can only reproduce it on an SVE/VLA system. non-VLA works fine.
+
+I have cvise running trying for a repro.
+
+- User: Tamar Christina | Time: 2023-01-31 20:24:32 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> So here is how I would tackle this:
+> Put all the needed .i/.ii files in a response file.
+> 
+> 
+> $CC -c @files @options
+> $CC -r -o file.o @fileso @options 
+> 
+> Since this is only at profile generated stage it is not as hard ...
+> Then start by reducing the needed .o files in `fileso` .
+> When that is finished. Update `files` to match `fileso`.
+> and then run delta (or another automated reducer) over the files in `files`.
+> Maybe even change -flto=auto etc.Thanks! Managed to reduce it to something fairly simple.
+
+Repro:
+
+----
+
+decode_options() {
+  int flag = 1;
+  for (; flag <= 1 << 21; flag <<= 1)
+    ;
+}
+
+----
+
+compile with gcc -fprofile-generate -mcpu=neoverse-v1 -Ofast opts.i
+
+I also did a bisect and indeed it landed on
+
+commit c13223b790bbc5e4a3f5605e057eac59b61b2c85
+Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Aug 4 09:04:22 2022 +0800
+
+    Extend vectorizer to handle nonlinear induction for neg, mul/lshift/rshift with a constant.
+
+    For neg, the patch create a vec_init as [ a, -a, a, -a, ...  ] and no
+    vec_step is needed to update vectorized iv since vf is always multiple
+    of 2(negative * negative is positive).
+
+    For shift, the patch create a vec_init as [ a, a >> c, a >> 2*c, ..]
+    as vec_step as [ c * nunits, c * nunits, c * nunits, ... ], vectorized iv is
+    updated as vec_def = vec_init >>/<< vec_step.
+
+    For mul, the patch create a vec_init as [ a, a * c, a * pow(c, 2), ..]
+    as vec_step as [ pow(c,nunits), pow(c,nunits),...] iv is updated as vec_def =
+    vec_init * vec_step.
+
+    The patch handles nonlinear iv for
+    1. Integer type only, floating point is not handled.
+    2. No slp_node.
+    3. iv_loop should be same as vector loop, not nested loop.
+    4. No UD is created, for mul, use unsigned mult to avoid UD, for
+       shift, shift count should be less than type precision.
+
+- User: Tamar Christina | Time: 2023-01-31 21:08:46 UTC
+  Text: In case it helps, here's the reproducer on compiler explorer and the dump filehttps://godbolt.org/z/dWvqexjnv
+
+- User: Hongtao.liu | Time: 2023-02-01 05:32:35 UTC
+  Text: > ----
+> 
+> decode_options() {
+>   int flag = 1;
+>   for (; flag <= 1 << 21; flag <<= 1)
+>     ;
+> }
+> 
+> ----
+> 
+> compile with gcc -fprofile-generate -mcpu=neoverse-v1 -Ofast opts.iReproduced with cross-compiler, thanks.
+
+- User: Hongtao.liu | Time: 2023-02-01 07:29:31 UTC
+  Text: (In reply to Hongtao.liu fromcomment #9)> > ----
+> > 
+> > decode_options() {
+> >   int flag = 1;
+> >   for (; flag <= 1 << 21; flag <<= 1)
+> >     ;
+> > }Normally when vf is not constant, it will be prevented by
+vectorizable_nonlinear_inductions, but for this case, it failed going
+into
+    
+    if (STMT_VINFO_RELEVANT_P (stmt_info))
+      {
+        need_to_vectorize = true;
+        if (STMT_VINFO_DEF_TYPE (stmt_info) == vect_induction_def
+            && ! PURE_SLP_STMT (stmt_info))
+          ok = vectorizable_induction (loop_vinfo,
+                                       stmt_info, NULL, NULL,
+                                       &cost_vec);
+
+since the iv is never used outside of the loop, and will be dce later, so
+vectorizer doesn't bother checking if it's vectorizable. It's
+true but hit gcc_assert in vect_peel_nonlinear_iv_init when vf is not
+constant. One solution is ignoring the nonlinear iv peeling if it's
+!STMT_VINFO_RELEVANT_P (stmt_info) just like the upper code, the other
+solution is returning false earlier in the
+vect_can_peel_nonlinear_iv_p when vf is not known.
+
+- User: rguenther@suse.de | Time: 2023-02-01 07:32:46 UTC
+  Text: On Wed, 1 Feb 2023, crazylht at gmail dot com wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108601> 
+> ---Comment #10from Hongtao.liu <crazylht at gmail dot com> ---
+> (In reply to Hongtao.liu fromcomment #9)
+> > > ----
+> > > 
+> > > decode_options() {
+> > >   int flag = 1;
+> > >   for (; flag <= 1 << 21; flag <<= 1)
+> > >     ;
+> > > }
+> 
+> Normally when vf is not constant, it will be prevented by
+> vectorizable_nonlinear_inductions, but for this case, it failed going
+> into
+> 
+>     if (STMT_VINFO_RELEVANT_P (stmt_info))
+>       {
+>         need_to_vectorize = true;
+>         if (STMT_VINFO_DEF_TYPE (stmt_info) == vect_induction_def
+>             && ! PURE_SLP_STMT (stmt_info))
+>           ok = vectorizable_induction (loop_vinfo,
+>                                        stmt_info, NULL, NULL,
+>                                        &cost_vec);
+> 
+> since the iv is never used outside of the loop, and will be dce later, so
+> vectorizer doesn't bother checking if it's vectorizable. It's
+> true but hit gcc_assert in vect_peel_nonlinear_iv_init when vf is not
+> constant. One solution is ignoring the nonlinear iv peeling if it's
+> !STMT_VINFO_RELEVANT_P (stmt_info) just like the upper code, the other
+> solution is returning false earlier in the
+> vect_can_peel_nonlinear_iv_p when vf is not known.When the VF is not known we usually do not require an epilogue?  If
+we don't require one we should avoid creating one.
+
+- User: Hongtao.liu | Time: 2023-02-01 07:46:28 UTC
+  Text: > When the VF is not known we usually do not require an epilogue?  If
+> we don't require one we should avoid creating one.I may not be very clear in my description， here gdb shows.
+
+(gdb) p vf
+$1 = {<poly_int_pod<2, unsigned long>> = {coeffs = {4, 4}}, <No data fields>}
+(gdb) p vf.is_constant ()
+$2 = false
+(gdb)
+
+- User: Richard Biener | Time: 2023-02-01 08:41:37 UTC
+  Text: (In reply to Tamar Christina fromcomment #7)> (In reply to Andrew Pinski fromcomment #1)
+> > So here is how I would tackle this:
+> > Put all the needed .i/.ii files in a response file.
+> > 
+> > 
+> > $CC -c @files @options
+> > $CC -r -o file.o @fileso @options 
+> > 
+> > Since this is only at profile generated stage it is not as hard ...
+> > Then start by reducing the needed .o files in `fileso` .
+> > When that is finished. Update `files` to match `fileso`.
+> > and then run delta (or another automated reducer) over the files in `files`.
+> > Maybe even change -flto=auto etc.
+> 
+> Thanks! Managed to reduce it to something fairly simple.
+> 
+> Repro:
+> 
+> ----
+> 
+> decode_options() {
+>   int flag = 1;
+>   for (; flag <= 1 << 21; flag <<= 1)
+>     ;
+> }
+> 
+> ----
+> 
+> compile with gcc -fprofile-generate -mcpu=neoverse-v1 -Ofast opts.iOK so after _very_ many analyses we get
+
+t.c:3:15: note:  ***** Choosing vector mode VNx2DI
+t.c:3:15: note:  ***** Re-trying epilogue analysis with vector mode VNx2DI
+...
+
+but then vect_can_advance_ivs_p should return false for the VNx2DI mode
+vectorized loop and thus no epilogue peeling possible?
+
+We also do not choose any epilogue vector mode in the end, so the issue
+isn't really epilogue vectorization related.  I suppose the
+VNx2DI vector loop doesn't use fully masked vectorization but we should
+have forced that because we cannot create an epilogue.
+
+That boils down to vect_can_peel_nonlinear_iv_p but oddly enough that's
+called from vectorizable_nonlinear_induction itself, possibly because
+it calls vect_peel_nonlinear_iv_init.  But then this should never happen
+because peeling should be disabled if not possible (but in this context
+we don't know whether we actually need to peel).
+
+I think we should remove the vect_can_peel_nonlinear_iv_p call from
+vectorizable_nonlinear_induction and adjust vect_can_peel_nonlinear_iv_p
+to require a .is_constant () VF.
+
+- User: Hongtao.liu | Time: 2023-02-01 09:07:06 UTC
+  Text: > I think we should remove the vect_can_peel_nonlinear_iv_p call from
+> vectorizable_nonlinear_induction and adjust vect_can_peel_nonlinear_iv_p
+> to require a .is_constant () VF.Yes, testing a patch.
+
+- User: GCC Commits | Time: 2023-02-02 09:02:59 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:209f02b0a9e9adc0bf0247cb5eef04e0f175d64ecommitr13-5644-g209f02b0a9e9adc0bf0247cb5eef04e0f175d64eAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Feb 1 13:30:12 2023 +0800
+
+    Don't peel nonlinear iv(mult or shift) for epilog when vf is not constant.
+    
+    Normally when vf is not constant, it will be prevented by
+    vectorizable_nonlinear_inductions, but for this case, it failed going
+    into
+    
+        if (STMT_VINFO_RELEVANT_P (stmt_info))
+          {
+            need_to_vectorize = true;
+            if (STMT_VINFO_DEF_TYPE (stmt_info) == vect_induction_def
+               && ! PURE_SLP_STMT (stmt_info))
+              ok = vectorizable_induction (loop_vinfo,
+                                           stmt_info, NULL, NULL,
+                                           &cost_vec);
+    
+    since the iv is never used outside of the loop, and will be dce later, so
+    vectorizer doesn't bother checking if it's vectorizable. it's
+    true but hit gcc_assert in vect_can_peel_nonlinear_iv_p when vf is not
+    constant. One solution is ignoring the nonlinear iv peeling if it's
+    !STMT_VINFO_RELEVANT_P (stmt_info) just like the upper code, the other
+    solution is returning false earlier in the
+    vect_can_peel_nonlinear_iv_p when vf is not constant, the patch chooses
+    the second incase there's other cases using vect_can_advance_ivs_p which
+    calls vect_can_peel_nonlinear_iv_p.
+    Also remove vect_peel_nonlinear_iv_p from
+    vectorizable_nonlinear_inductions.
+    
+    gcc/ChangeLog:PR tree-optimization/108601* tree-vectorizer.h (vect_can_peel_nonlinear_iv_p): Removed.
+            * tree-vect-loop.cc
+            (vectorizable_nonlinear_induction): Remove
+            vect_can_peel_nonlinear_iv_p.
+            (vect_can_peel_nonlinear_iv_p): Don't peel
+            nonlinear iv(mult or shift) for epilog when vf is not
+            constant and moved the defination to ..
+            * tree-vect-loop-manip.cc (vect_can_peel_nonlinear_iv_p):
+            .. Here.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/pr108601.c: New test.
+
+- User: Richard Biener | Time: 2023-02-03 08:05:57 UTC
+  Text: Fixed.
+

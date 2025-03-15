@@ -1,0 +1,158 @@
+Bug Summary: [14 Regression] AArch64: memmove idiom regression
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Wilco | Time: 2024-01-26 14:49:54 UTC
+  Text: The following is often used as an idiom for memmove since GCC mid-end and most back-ends have no support for inlining memmove:
+
+void move64 (char *a, char *b)
+{
+    char temp[64];
+    memcpy (temp, a, 64);
+    memcpy (b, temp, 64);
+}
+
+On trunk this generates:
+
+        ldp     q30, q31, [x0]
+        sub     sp, sp, #64
+        ldp     q28, q29, [x0, 32]
+        stp     q30, q31, [sp]
+        ldp     q30, q31, [sp]
+        stp     q28, q29, [sp, 32]
+        ldp     q28, q29, [sp, 32]
+        stp     q30, q31, [x1]
+        stp     q28, q29, [x1, 32]
+        add     sp, sp, 64
+        ret
+
+This is a significant regression from GCC13 which has redundant stores but avoids load-after-store forwarding penalties:
+
+        ldp     q2, q3, [x0]
+        sub     sp, sp, #64
+        ldp     q0, q1, [x0, 32]
+        stp     q2, q3, [sp]
+        stp     q2, q3, [x1]
+        stp     q0, q1, [sp, 32]
+        stp     q0, q1, [x1, 32]
+        add     sp, sp, 64
+        ret
+
+LLVM avoids writing to the temporary and removes the stackframe altogether:
+
+        ldp     q1, q0, [x0, #32]
+        ldp     q2, q3, [x0]
+        stp     q1, q0, [x1, #32]
+        stp     q2, q3, [x1]
+        ret
+
+The reason for the regression appears to be the changed RTL representation of LDP/STP. The RTL optimizer does not understand LDP/STP, so emitting LDP/STP early in memcpy expansion means it cannot remove the redundant stack stores.
+
+A possible fix would be to avoid emitting LDP/STP in memcpy/memmove/memset expansions.
+
+- User: Alex Coplan | Time: 2024-01-26 15:05:13 UTC
+  Text: Confirmed.
+
+(In reply to Wilco fromcomment #0)> A possible fix would be to avoid emitting LDP/STP in memcpy/memmove/memset
+> expansions.Yeah, so I had postedhttps://gcc.gnu.org/pipermail/gcc-patches/2023-November/636855.htmlfor that but held off from committing it at the time as IMO there wasn't enough evidence to show that this helps in general (and the pass could in theory miss opportunities which would lead to regressions). 
+
+But perhaps this is a good argument for going ahead with that change (of course it will need rebasing).
+
+- User: Richard Biener | Time: 2024-01-29 07:55:42 UTC
+  Text: It might be good to recognize this pattern in strlenopt or a related pass.
+
+A purely local transform would turn it into
+
+    memcpy (temp, a, 64);
+    memmove (b, a, 64);
+
+relying on DSE to eliminate the copy to temp if possible.  Not sure if
+that possibly would be a bad transform if copying to temp is required.
+
+        stp     q30, q31, [sp]
+        ldp     q30, q31, [sp]
+
+why is CSE not able to catch this?
+
+- User: Wilco | Time: 2024-01-29 11:51:28 UTC
+  Text: (In reply to Richard Biener fromcomment #2)> It might be good to recognize this pattern in strlenopt or a related pass.
+> 
+> A purely local transform would turn it into
+> 
+>     memcpy (temp, a, 64);
+>     memmove (b, a, 64);
+> 
+> relying on DSE to eliminate the copy to temp if possible.  Not sure if
+> that possibly would be a bad transform if copying to temp is required.This would only be beneficial if you know memmove is inlined if memcpy is - on almost all targets memmove becomes a library call, so the transformation would be worse if memcpy can be inlined.>         stp     q30, q31, [sp]
+>         ldp     q30, q31, [sp]
+> 
+> why is CSE not able to catch this?The new RTL now has UNSPECs in them, so CSE doesn't know it is a plain load/store:
+
+STP: 
+
+(insn 12 11 13 2 (set (mem/c:V2x16QI (reg:DI 102) [0 +0 S32 A128])
+        (unspec:V2x16QI [
+                (reg:V4SI 104)
+                (reg:V4SI 105)
+            ] UNSPEC_STP)) "/app/example.c":5:5 -1
+     (nil))
+
+LDP:
+
+(insn 16 15 17 2 (parallel [
+            (set (reg:V4SI 108)
+                (unspec:V4SI [
+                        (mem/c:V2x16QI (reg:DI 107) [0 +0 S32 A128])
+                    ] UNSPEC_LDP_FST))
+            (set (reg:V4SI 109)
+                (unspec:V4SI [
+                        (mem/c:V2x16QI (reg:DI 107) [0 +0 S32 A128])
+                    ] UNSPEC_LDP_SND))
+        ]) "/app/example.c":6:5 -1
+     (nil))
+
+- User: Wilco | Time: 2024-01-31 16:58:01 UTC
+  Text: (In reply to Alex Coplan fromcomment #1)> Confirmed.
+> 
+> (In reply to Wilco fromcomment #0)
+> > A possible fix would be to avoid emitting LDP/STP in memcpy/memmove/memset
+> > expansions.
+> 
+> Yeah, so I had posted
+>https://gcc.gnu.org/pipermail/gcc-patches/2023-November/636855.htmlfor that
+> but held off from committing it at the time as IMO there wasn't enough
+> evidence to show that this helps in general (and the pass could in theory
+> miss opportunities which would lead to regressions). 
+> 
+> But perhaps this is a good argument for going ahead with that change (of
+> course it will need rebasing).Yes I have a patch based on current trunk + my outstanding memset cleanup patch. It's slightly faster but causes a small codesize regression. This appears mostly due to GCC being overly aggressive in changing loads/stores with a zero offset into indexing, a non-zero offset or a lo_sym. This not only blocks LDP opportunities but also increases register pressure and spilling.
+
+- User: GCC Commits | Time: 2024-03-07 21:25:59 UTC
+  Text: The master branch has been updated by Wilco Dijkstra <wilco@gcc.gnu.org>:https://gcc.gnu.org/g:19b23bf3c32df3cbb96b3d898a1d7142f7bea4a0commitr14-9373-g19b23bf3c32df3cbb96b3d898a1d7142f7bea4a0Author: Wilco Dijkstra <wilco.dijkstra@arm.com>
+Date:   Wed Feb 21 23:33:58 2024 +0000
+
+    AArch64: memcpy/memset expansions should not emit LDP/STP [PR113618]
+    
+    The new RTL introduced for LDP/STP results in regressions due to use of UNSPEC.
+    Given the new LDP fusion pass is good at finding LDP opportunities, change the
+    memcpy, memmove and memset expansions to emit single vector loads/stores.
+    This fixes the regression and enables more RTL optimization on the standard
+    memory accesses.  Handling of unaligned tail of memcpy/memmove is improved
+    with -mgeneral-regs-only.  SPEC2017 performance improves slightly.  Codesize
+    is a bit worse due to missed LDP opportunities as discussed in the PR.
+    
+    gcc/ChangeLog:PR target/113618* config/aarch64/aarch64.cc (aarch64_copy_one_block): Remove.
+            (aarch64_expand_cpymem): Emit single load/store only.
+            (aarch64_set_one_block): Emit single stores only.
+    
+    gcc/testsuite/ChangeLog:PR target/113618* gcc.target/aarch64/pr113618.c: New test.
+
+- User: Wilco | Time: 2024-03-13 14:36:07 UTC
+  Text: Fixed.
+

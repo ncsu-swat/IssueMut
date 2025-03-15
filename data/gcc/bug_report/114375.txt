@@ -1,0 +1,201 @@
+Bug Summary: [11 Regression] Wrong vectorization of permuted mask load
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 10.5.0, 12.3.1, 13.2.1, 14.0
+Known to Fail: 11.4.0, 11.5.0, 12.3.0, 13.2.0
+
+Comments:
+- User: Richard Biener | Time: 2024-03-18 10:23:04 UTC
+  Text: I've figured we never end up with a load permutation on .MASK_LOAD SLP nodes,
+instead we put one on the mask load only (if that ends up permuted).  It took
+me a while to produce a testcase we're happy to vectorize and not by accident
+produce correct values.  Here's one:
+
+int a[512];
+int b[512];
+int c[512];
+void __attribute__((noipa))
+foo(int * __restrict p)
+{
+  for (int i = 0; i < 64; ++i)
+    {
+      int tem = 2, tem2 = 2;
+      if (a[4*i + 1])
+        tem = p[4*i];
+      if (a[4*i])
+        tem2 = p[4*i + 2];
+      b[2*i] = tem2;
+      b[2*i+1] = tem;
+      if (a[4*i + 2])
+        tem = p[4*i + 1];
+      if (a[4*i + 3])
+        tem2 = p[4*i + 3];
+      c[2*i] = tem2;
+      c[2*i+1] = tem;
+    }
+}
+int main()
+{
+  for (int i = 0; i < 512; ++i)
+    a[i] = (i >> 1) & 1;
+  foo (a);
+  if (c[2] != 1 || c[3] != 0)
+    __builtin_abort ();
+}
+
+miscompiled on x86_64 with -O3 -mavx2.  Note b[] is correct in the end,
+but c[] is { 1, 0, 0, 1, 1, 0, 0, 1, ... } instead of { 1, 0, 1, 0, ... }.
+
+- User: Richard Biener | Time: 2024-03-18 10:29:19 UTC
+  Text: I think it's most sensible to reject permuted mask (and also gather) SLP loads
+for now, code generation definitely doesn't handle it right now.
+
+A first step of support might be computing the load-permutation and hope
+SLP permute optimization will make it identity and only reject it later.
+SLP permute optimization migh also be able to push the permute to the mask
+and re-materialize it after the masked load as well.
+
+I'll note we don't handle SLP masked loads with gaps either.
+
+I'll see to produce the fix on the SLP discovery side (rejecting it there).
+
+Richard - any other thoughts on this?
+
+It seems GCC 10 is fine, but it can already do SLP of masked loads so I'm
+not really sure.  Guess the testcase is not good enough there.
+
+- User: Richard Biener | Time: 2024-03-18 12:09:46 UTC
+  Text: I see that get_load_store_type and get_group_load_store_type return VMAT_*
+kinds that do not handle the masked case.  There's some rejection in the
+callers for that case but it's also incomplete (VMAT_ELEMENTWISE and
+VMAT_STRIDED_SLP but I also think VMAT_CONTIGUOUS_PERMUTE/REVERSE misses
+some handling, at least the optab check).
+
+diff --git a/gcc/tree-vect-stmts.cc b/gcc/tree-vect-stmts.cc
+index e8617439a48..5a4eb136c6d 100644
+--- a/gcc/tree-vect-stmts.cc
++++ b/gcc/tree-vect-stmts.cc
+@@ -10080,6 +10080,14 @@ vectorizable_load (vec_info *vinfo,
+                             "unsupported masked emulated gather.\n");
+          return false;
+        }
++      else if (memory_access_type == VMAT_ELEMENTWISE
++              || memory_access_type == VMAT_STRIDED_SLP)
++       {
++         if (dump_enabled_p ())
++           dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
++                            "unsupported masked strided access.\n");
++         return false;
++       }
+     }
+ 
+   bool costing_p = !vec_stmt;
+
+should plug the elementwise/SLP case.  Interestingly
+
+void __attribute__((noipa))
+foo (int s, int * __restrict p)
+{
+  for (int i = 0; i < 64; ++i)
+    {
+      int tem = 0;
+      if (a[i])
+        tem = p[s*i];
+      b[i] = tem;
+    }
+}
+
+uses VMAT_GATHER_SCATTER, I failed to get it produce VMAT_ELEMENTWISE.
+
+- User: GCC Commits | Time: 2024-03-19 08:02:36 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:94c3508c5a14d1948fe3bffa9e16c6f3d9c2836acommitr14-9533-g94c3508c5a14d1948fe3bffa9e16c6f3d9c2836aAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Mar 18 12:39:03 2024 +0100
+
+    tree-optimization/114375 - disallow SLP discovery of permuted mask loads
+    
+    We cannot currently handle permutations of mask loads in code generation
+    or permute optimization.  But we simply drop any permutation on the
+    floor, so the following instead rejects the SLP build rather than
+    producing wrong-code.  I've also made sure to reject them in
+    vectorizable_load for completeness.PR tree-optimization/114375* tree-vect-slp.cc (vect_build_slp_tree_2): Compute the
+            load permutation for masked loads but reject it when any
+            such is necessary.
+            * tree-vect-stmts.cc (vectorizable_load): Reject masked
+            VMAT_ELEMENTWISE and VMAT_STRIDED_SLP as those are not
+            supported.
+    
+            * gcc.dg/vect/vect-pr114375.c: New testcase.
+
+- User: Richard Biener | Time: 2024-03-19 08:04:59 UTC
+  Text: Fixed on trunk sofar.
+
+- User: GCC Commits | Time: 2024-05-08 13:38:59 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:4f2a35a76cca503749c696e7772d2e8eadc77ba5commitr13-8727-g4f2a35a76cca503749c696e7772d2e8eadc77ba5Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Mar 18 12:39:03 2024 +0100
+
+    tree-optimization/114375 - disallow SLP discovery of permuted mask loads
+    
+    We cannot currently handle permutations of mask loads in code generation
+    or permute optimization.  But we simply drop any permutation on the
+    floor, so the following instead rejects the SLP build rather than
+    producing wrong-code.  I've also made sure to reject them in
+    vectorizable_load for completeness.PR tree-optimization/114375* tree-vect-slp.cc (vect_build_slp_tree_2): Compute the
+            load permutation for masked loads but reject it when any
+            such is necessary.
+            * tree-vect-stmts.cc (vectorizable_load): Reject masked
+            VMAT_ELEMENTWISE and VMAT_STRIDED_SLP as those are not
+            supported.
+    
+            * gcc.dg/vect/vect-pr114375.c: New testcase.
+    
+    (cherry picked from commit 94c3508c5a14d1948fe3bffa9e16c6f3d9c2836a)
+
+- User: GCC Commits | Time: 2024-05-16 09:56:24 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:c1b21855e131bb818aedc953f403812b494917fccommitr12-10449-gc1b21855e131bb818aedc953f403812b494917fcAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Mar 18 12:39:03 2024 +0100
+
+    tree-optimization/114375 - disallow SLP discovery of permuted mask loads
+    
+    We cannot currently handle permutations of mask loads in code generation
+    or permute optimization.  But we simply drop any permutation on the
+    floor, so the following instead rejects the SLP build rather than
+    producing wrong-code.  I've also made sure to reject them in
+    vectorizable_load for completeness.PR tree-optimization/114375* tree-vect-slp.cc (vect_build_slp_tree_2): Compute the
+            load permutation for masked loads but reject it when any
+            such is necessary.
+            * tree-vect-stmts.cc (vectorizable_load): Reject masked
+            VMAT_ELEMENTWISE and VMAT_STRIDED_SLP as those are not
+            supported.
+    
+            * gcc.dg/vect/vect-pr114375.c: New testcase.
+    
+    (cherry picked from commit 4f2a35a76cca503749c696e7772d2e8eadc77ba5)
+
+- User: Richard Biener | Time: 2024-07-19 12:23:16 UTC
+  Text: Fixed in GCC 12.4.
+
+- User: GCC Commits | Time: 2024-10-09 07:55:56 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:dc90578f0b3b766303eef6f1acce45d603dee2c6commitr15-4195-gdc90578f0b3b766303eef6f1acce45d603dee2c6Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Oct 8 14:28:16 2024 +0200
+
+    tree-optimization/116575 - handle SLP of permuted masked loads
+    
+    The following handles SLP discovery of permuted masked loads which
+    was prohibited (because wrongly handled) forPR114375.  In particular
+    with single-lane SLP at the moment all masked group loads appear
+    permuted and we fail to use masked load lanes as well.  The following
+    addresses parts of the issues, starting with doing correct basic
+    discovery - namely discover an unpermuted mask load followed by
+    a permute node.  In particular groups with gaps do not support masking
+    yet (and didn't before w/o SLP IIRC).  There's still issues with
+    how we represent masked load/store-lanes I think, but I first have to
+    get my hands on a good testcase.PR tree-optimization/116575PR tree-optimization/114375* tree-vect-slp.cc (vect_build_slp_tree_2): Do not reject
+            permuted mask loads without gaps but instead discover a
+            node for the full unpermuted load and permute that with
+            a VEC_PERM node.
+    
+            * gcc.dg/vect/vect-pr114375.c: Expect vectorization now with avx2.
+

@@ -1,0 +1,136 @@
+Bug Summary: [14 regression] -fcompare-debug -gno-statement-frontiers failure with -O2 when building gdk-pixbuf
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: compare-debug-failure
+Known to Work: 13.3.0, 15.0
+Known to Fail: 14.1.0, 14.2.0
+
+Comments:
+- User: Sam James | Time: 2024-07-31 02:35:48 UTC
+  Text: Createdattachment 58779[details]io-jpeg.c.i.xz
+
+Let's try again with -fcompare-debug en-masse, this time with -gno-statement-frontiers. Tips welcome on these in general. Begging to not file these en-masse also tolerated.
+
+```
+$ gcc-14 -c io-jpeg.c.i -fcompare-debug -O2 -gno-statement-frontiers
+gcc-14: error: io-jpeg.c.i: ‘-fcompare-debug’ failure (length)
+
+$ gcc-15 -c io-jpeg.c.i -fcompare-debug -O2 -gno-statement-frontiers
+gcc-15: error: io-jpeg.c.i: ‘-fcompare-debug’ failure (length)
+
+$ gcc-15 -c io-jpeg.c.i -fcompare-debug -O3 -gno-statement-frontiers
+gcc-15: error: io-jpeg.c.i: ‘-fcompare-debug’ failure
+```
+
+(I don't know what the '(length)' significance is.)
+
+- User: Andrew Pinski | Time: 2024-07-31 02:44:48 UTC
+  Text: Reducing ...
+
+- User: Andrew Pinski | Time: 2024-07-31 03:10:38 UTC
+  Text: Note it is also reproducible on aarch64-linux-gnu which is why I moved this to tree-optimization.
+
+- User: Andrew Pinski | Time: 2024-07-31 03:38:13 UTC
+  Text: This might be a returns_twice issue (__sigsetjmp is implict returns twice even without a builtin).
+
+- User: Andrew Pinski | Time: 2024-07-31 03:42:56 UTC
+  Text: Createdattachment 58781[details]Reduced a lot
+
+This is what was automated reduced to. But will be reducing it further.
+
+- User: Andrew Pinski | Time: 2024-07-31 03:53:56 UTC
+  Text: Createdattachment 58782[details]Reduced and no builtins
+
+- User: Andrew Pinski | Time: 2024-07-31 04:11:09 UTC
+  Text: Confirmed.
+
+The first difference in the IR is in forwprop3:
+Removing dead stmt:x_density_8(ab) = x_density_17;
+
+is removed with -g while not removed without -g.
+
+In the case of it was used with:
+  x_density_8(ab) = x_density_17;
+  # DEBUG x_densityD.4428 => x_density_8(ab)
+
+
+I am 99% sure this was introduced byr14-3982-g9ea74d235c7e78.
+I have not checked if it is a bug in simple_dce_from_worklist or this loop is missing a check to see if the statement was a debug statement and not do it:
++                 /* Queue old uses for simple DCE.  */
++                 for (tree use : uses)
++                   if (TREE_CODE (use) == SSA_NAME
++                       && !SSA_NAME_IS_DEFAULT_DEF (use))
++                     bitmap_set_bit (simple_dce_worklist,
++                                     SSA_NAME_VERSION (use));
+
+- User: Andrew Pinski | Time: 2024-07-31 04:57:21 UTC
+  Text: Figured it out.
+```
+/* Substitute from our lattice.  We need to do so only once.  */
+....
+                  if (!is_gimple_debug (stmt))
+                    bitmap_set_bit (simple_dce_worklist, SSA_NAME_VERSION (use));
+                  if (may_propagate_copy (use, val))
+```
+
+That is the when subsituting from the lattice we can't set it the name here if the statement was a debug statement because then we would a difference between the debug and non-debug.
+
+- User: GCC Commits | Time: 2024-08-02 10:03:43 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:33baa20c5cdcf5ff8164606115f00aa30f559312commitr15-2691-g33baa20c5cdcf5ff8164606115f00aa30f559312Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Thu Aug 1 10:33:34 2024 -0700
+
+    forwprop: Don't add uses to dce list if debug statement [PR116156]
+    
+    The problem here is that when forwprop does a copy prop, into a statement,
+    we mark the uses of that statement as possibly need to be removed. But it just
+    happened that statement was a debug statement, there will be a difference when
+    compiling with debuging info turned on vs off; this is not expected.
+    So the fix is not to add the old use to dce list to process if it was a debug
+    statement.
+    
+    Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/116156gcc/ChangeLog:
+    
+            * tree-ssa-forwprop.cc (pass_forwprop::execute): Don't add
+            uses if the statement was a debug statement.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/torture/pr116156-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-08-02 10:06:20 UTC
+  Text: Fixed on the trunk, working on the backport.
+
+- User: GCC Commits | Time: 2024-08-02 16:35:13 UTC
+  Text: The releases/gcc-14 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:14fa2b2ae7f49dee5e7e7469243e281e48d925b9commitr14-10552-g14fa2b2ae7f49dee5e7e7469243e281e48d925b9Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Thu Aug 1 10:33:34 2024 -0700
+
+    forwprop: Don't add uses to dce list if debug statement [PR116156]
+    
+    The problem here is that when forwprop does a copy prop, into a statement,
+    we mark the uses of that statement as possibly need to be removed. But it just
+    happened that statement was a debug statement, there will be a difference when
+    compiling with debuging info turned on vs off; this is not expected.
+    So the fix is not to add the old use to dce list to process if it was a debug
+    statement.
+    
+    Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/116156gcc/ChangeLog:
+    
+            * tree-ssa-forwprop.cc (pass_forwprop::execute): Don't add
+            uses if the statement was a debug statement.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/torture/pr116156-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-08-02 16:35:40 UTC
+  Text: Fixed.
+
+- User: Sam James | Time: 2024-08-02 23:32:09 UTC
+  Text: Thank you as ever.
+

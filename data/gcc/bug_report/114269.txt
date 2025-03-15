@@ -1,0 +1,216 @@
+Bug Summary: [14 Regression] Multiple 3-6% exec time regressions of 434.zeusmp since r14-9193-ga0b1798042d033
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Filip Kastl | Time: 2024-03-07 15:30:54 UTC
+  Text: Our LNT instance has detected that runtime of benchmark 434.zeusmp from the SPEC 2006 suite regressed on x86_64 machines on most configurations by 3-27%.
+
+Some examples:
+
+AMD Zen2 -Ofast -march=native -flto (22% regression)https://lnt.opensuse.org/db_default/v4/SPEC/graph?plot.0=289.80.0Intel Skylake -Ofast -march=native PGO (11% regression)https://lnt.opensuse.org/db_default/v4/SPEC/graph?plot.0=791.80.0AMD Zen4 -O2 -flto PGO (7% regression)https://lnt.opensuse.org/db_default/v4/SPEC/graph?plot.0=960.80.0AMD Zen2 -Ofast -march=native (26% regression)https://lnt.opensuse.org/db_default/v4/SPEC/graph?plot.0=301.80.0I have bisected these configurations to the same commit
+- AMD Zen2 -Ofast
+- AMD Zen2 -Ofast -march=native -flto PGO
+- AMD Zen4 -O2 -flto PGO
+
+the commit isr14-9193-ga0b1798042d033(Richard Biener: tree-optimization/114074 - CHREC multiplication and undefined overflow).
+
+I haven't seen this speedup on our Aarch64 machine. I have seen it on our Intel machine though, so this is not an AMD-specific issue.
+
+There is another PR where a SPEC slowed down that was also bisected to the same commit:pr114238. Maybe these two PRs are actually the same bug.
+
+- User: Richard Biener | Time: 2024-03-08 08:18:53 UTC
+  Text: I will look if I can find a nice testcase for x86_64 here.
+
+- User: Xi Ruoyao | Time: 2024-03-08 10:08:10 UTC
+  Text: ***Bug 114281has been marked as a duplicate of this bug. ***
+
+- User: Richard Biener | Time: 2024-03-08 10:25:36 UTC
+  Text: good (base) vs. bad (peak) on Zen2 with -Ofast -march=native shows
+
+Samples: 654K of event 'cycles', Event count (approx.): 743149709374                                          
+Overhead       Samples  Command          Shared Object               Symbol                                   
+  16.71%        109793  zeusmp_peak.amd  zeusmp_peak.amd64-m64-mine  [.] hsmoc_
+  14.37%         94016  zeusmp_base.amd  zeusmp_base.amd64-m64-mine  [.] hsmoc_
+   8.82%         57979  zeusmp_peak.amd  zeusmp_peak.amd64-m64-mine  [.] lorentz_
+   8.48%         55451  zeusmp_base.amd  zeusmp_base.amd64-m64-mine  [.] lorentz_
+   4.84%         31575  zeusmp_peak.amd  zeusmp_peak.amd64-m64-mine  [.] momx3_
+   4.68%         30456  zeusmp_base.amd  zeusmp_base.amd64-m64-mine  [.] momx3_
+   4.08%         26675  zeusmp_peak.amd  zeusmp_peak.amd64-m64-mine  [.] tranx3_
+   3.56%         23145  zeusmp_base.amd  zeusmp_base.amd64-m64-mine  [.] tranx3_
+
+for hsmoc_ it looks like a difference in transformations done:
+
+-hsmoc.f:826:19: optimized: loop vectorized using 32 byte vectors
+
+(there are a lot more missed vectorizations).
+
+       subroutine hsmoc ( emf1, emf2, emf3 )
+
+       integer is, ie, js, je, ks, ke
+       common /gridcomi/
+     &   is, ie, js, je, ks, ke
+       integer in, jn, kn, ijkn
+       integer      i       , j       , k
+       parameter(in =           128+5
+     &        , jn =           128+5
+     &        , kn =           128+5)
+       parameter(ijkn =   128+5)
+       real*8         emf1    (  in,  jn,  kn), emf2    (  in,  jn,  kn)
+       real*8         vint    (ijkn), bint    (ijkn)
+
+       do 199 j=js,je+1
+         do 59 i=is,ie
+          do 858 k=ks,ke+1
+             vint(k)= k
+             bint(k)= k
+ 858      continue
+          do 58 k=ks,ke+1
+             emf1(i,j,k) = vint(k)
+             emf2(i,j,k) = bint(k)
+ 58       continue
+ 59      continue
+ 199   continue
+
+       return
+       end
+
+doesn't reproduce it though.  The actual difference for the whole testcase
+is of course failed data-ref analysis:
+
+ Creating dr for (*emf2_1966(D))[_402]
+-analyze_innermost: success.
+-       base_address: emf2_1966(D)
+-       offset from base address: (ssizetype) ((((sizetype) _1928 * 17689 + (sizetype) j_2705 * 133) + (sizetype) i_2672) * 8)
+-       constant offset from base address: -142584
+-       step: 141512
+-       base alignment: 8
++analyze_innermost: hsmoc.f:828:72: missed:  failed: evolution of offset is not affine.
++       base_address: 
++       offset from base address: 
++       constant offset from base address: 
++       step: 
++       base alignment: 0
+
+and then
+
+ hsmoc.f:826:19: note:   === vect_analyze_data_ref_accesses ===
+-hsmoc.f:826:19: missed:   not consecutive access (*emf1_1964(D))[_402] = _403;
+-hsmoc.f:826:19: note:   using strided accesses
+-hsmoc.f:826:19: missed:   not consecutive access (*emf2_1966(D))[_402] = _404;
+-hsmoc.f:826:19: note:   using strided accesses
+
+and we use gather and fail because of costs.
+
+I suspect that relying on global ranges (that could save us here) is quite
+fragile when there's a lot of other code around and thus opportunity for
+random transforms "trashing" them.
+
+Using the patch fromPR114151and enabling ranger during vectorization oddly
+enough doesn't help (even when wiping the SCEV cache).
+
+The odd thing is with the testcase above we get
+
+        Access function 0: (integer(kind=8)) {(((unsigned long) _30 * 17689 + (unsigned long) _10) + (unsigned long) _66) + 18446744073709533793, +, 17689}_4;
+
+where you can see some of the unsigned promotion being done, but we
+still succeed.
+
+As I'm lacking a smaller testcase right now it's difficult to understand why
+we fail in one case but not the other.
+
+- User: Richard Biener | Time: 2024-03-08 12:23:58 UTC
+  Text: The following is a C testcase for a case where ranges will not help:
+
+void foo (int *a, long js, long je, long is, long ie, long ks, long ke, long xi, long xj)
+{
+  for (long j = js; j < je; ++j)
+    for (long i = is; i < ie; ++i)
+      for (long k = ks; k < ke; ++k)
+        a[i + j*xi + k*xi*xj] = 5;
+}
+
+SCEV analysis result before/after shows issues.  When you re-order the loops
+so the fast increment goes innermost this doesn't make a difference for
+vectorization though.  In the order above we now require (emulated) gather
+which with SSE didn't work out and previously we used strided stores.
+
+The reason seems to be that when analyzing k*xi*xj the first multiply
+yields
+
+(long int) {(unsigned long) ks_21(D) * (unsigned long) xi_24(D), +, (unsigned long) xi_24(D)}_3
+
+but when then asking to fold the multiply by xj we fail as we run into
+
+tree
+chrec_fold_multiply (tree type,
+                     tree op0,
+                     tree op1)
+{         
+...
+    CASE_CONVERT:
+      if (tree_contains_chrecs (op0, NULL))
+        return chrec_dont_know;
+      /* FALLTHRU */ 
+
+but this case is somewhat odd as all other unhandled cases simply run into
+fold_build2.  This possibly means we'd never build other ops with
+CHREC operands.  This was added forPR42326.
+
+I think we can handle sign-conversions from unsigned just fine, chrec_fold_plus
+does such thing already (but it misses one case).
+
+Doing this restores things to some extent.
+
+I'm testing this as an intermediate step before considering reversion of the change.
+
+- User: GCC Commits | Time: 2024-03-08 13:41:06 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:018ddc86b928514d7dfee024dcdeb204d5dcdd61commitr14-9391-g018ddc86b928514d7dfee024dcdeb204d5dcdd61Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Mar 8 13:27:12 2024 +0100
+
+    tree-optimization/114269 - 434.zeusmp regression after SCEV analysis fix
+    
+    The following addresses a performance regression caused by the recent
+    SCEV analysis fix with regard to folding multiplications and undefined
+    behavior on overflow.  We do not handle (T) { a, +, b } * c but can
+    treat sign-conversions from unsigned by performing the multiplication
+    in the unsigned type.  That's what we already do for additions (but
+    that misses one case that turns out important).
+    
+    This fixes the 434.zeusmp regression for me.PR tree-optimization/114269PR tree-optimization/114074* tree-chrec.cc (chrec_fold_plus_1): Handle sign-conversions
+            in the third CASE_CONVERT case as well.
+            (chrec_fold_multiply): Handle sign-conversions from unsigned
+            by performing the operation in the unsigned type.
+
+- User: Richard Biener | Time: 2024-03-08 13:41:36 UTC
+  Text: For me this is fixed on Zen2 with -Ofast -march=native.
+
+- User: Filip Kastl | Time: 2024-03-12 12:48:35 UTC
+  Text: Nice, our LNT instance already shows that the patch sped up 434.zeusmp. However I'd like to reopen this bug since the benchmark didn't return to its original values. At least some configurations are still slower than beforer14-9193-ga0b1798042d033:
+
+Intel Skylake -Ofast -march=native (~5% regression)https://lnt.opensuse.org/db_default/v4/SPEC/graph?plot.0=798.80.0Intel Skylake -Ofast -march=native -flto PGO (~5% regression)https://lnt.opensuse.org/db_default/v4/SPEC/graph?plot.0=785.80.0AMD Zen3 -Ofast -march=native -flto (~6% regression)https://lnt.opensuse.org/db_default/v4/SPEC/graph?plot.0=476.80.0AMD Zen3 -Ofast -march=native -flto PGO (~4% regression)https://lnt.opensuse.org/db_default/v4/SPEC/graph?plot.0=474.80.0AMD Zen2 -Ofast -march=native -flto (~3% regression)https://lnt.opensuse.org/db_default/v4/SPEC/graph?plot.0=289.80.0
+
+- User: GCC Commits | Time: 2024-03-19 12:12:05 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:e0e9499aeffdaca88f0f29334384aa5f710a81a4commitr14-9540-ge0e9499aeffdaca88f0f29334384aa5f710a81a4Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Mar 19 12:24:08 2024 +0100
+
+    tree-optimization/114151 - revertPR114074fix
+    
+    The following reverts the chrec_fold_multiply fix and only keeps
+    handling of constant overflow which keeps the original testcase
+    fixed.  A better solution might involve ranger improvements or
+    tracking of assumptions during SCEV analysis similar to what niter
+    analysis does.PR tree-optimization/114151PR tree-optimization/114269PR tree-optimization/114322PR tree-optimization/114074* tree-chrec.cc (chrec_fold_multiply): Restrict the use of
+            unsigned arithmetic when actual overflow on constant operands
+            is observed.
+    
+            * gcc.dg/pr68317.c: Revert last change.
+
+- User: Richard Biener | Time: 2024-03-19 12:15:56 UTC
+  Text: So the change has been reverted, we should be back to normal.
+

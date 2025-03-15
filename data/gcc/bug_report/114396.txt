@@ -1,0 +1,319 @@
+Bug Summary: [13/14 Regression] Vector: Runtime mismatch at -O2 with -fwrapv since r13-7988-g82919cf4cb2321
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 13.2.0
+Known to Fail: 13.2.1
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-03-19 15:37:54 UTC
+  Text: Testcase:
+short a = 0xF;
+short b[16];
+int main() {
+  for (int e = 0; e < 9; e += 1)
+    b[e] = a *= 0x5;
+  __builtin_printf("decimal: %d\n", a);
+  __builtin_printf("hex: %X\n", a);
+}
+
+Commands:> /scratch/tc-testing/tc-mar-18/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv -O3 red.c -o red.out -fwrapv
+> /scratch/tc-testing/tc-mar-18/build-rv64gcv/bin/qemu-riscv64 red.outdecimal: 32693
+hex: 7FB5> /scratch/tc-testing/tc-mar-18/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc red.c -o red.out
+> /scratch/tc-testing/tc-mar-18/build-rv64gcv/bin/qemu-riscv64 red.outdecimal: 2283
+hex: 8EB
+
+Discovered/tested usingr14-9519-g3e3ad8eeb41(not bisected)
+
+Found using fuzzer.
+
+- User: Patrick O'Neill | Time: 2024-03-19 15:40:58 UTC
+  Text: Here's the result when running with -fwrapv on rv64gcv at O2:> /scratch/tc-testing/tc-mar-18/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv -O2 red.c -o red.out -fwrapv
+> /scratch/tc-testing/tc-mar-18/build-rv64gcv/bin/qemu-riscv64 red.outdecimal: 2283
+hex: 8EB
+
+- User: Robin Dapp | Time: 2024-03-19 16:58:50 UTC
+  Text: At first glance it doesn't really look like a target issue.
+
+Tried it on x86 and it fails as well with
+-O3 -march=nativepr114396.c -fno-vect-cost-model -fwrapv
+
+short a = 0xF;
+short b[16];
+
+int main() {
+        for (int e = 0; e < 9; e += 1)
+                b[e] = a *= 0x5;
+
+        if (a != 2283)
+                __builtin_abort ();
+}
+
+- User: Robin Dapp | Time: 2024-03-19 17:01:28 UTC
+  Text: -O3 -mavx2 -fno-vect-cost-model -fwrapv seems to be sufficient.
+
+- User: Jonathan Wakely | Time: 2024-03-19 17:07:30 UTC
+  Text: $ ~/gcc/14/bin/aarch64-unknown-linux-gnu-gcc -O3 -fwrapv  -fno-vect-cost-model -fwrapv red.c -o red.out
+$ ./red.out
+decimal: 32693
+hex: 7FB5
+$ ~/gcc/14/bin/aarch64-unknown-linux-gnu-gcc  red.c -o red.out
+$ ./red.out
+decimal: 2283
+hex: 8EB
+
+- User: Patrick O'Neill | Time: 2024-03-19 17:08:58 UTC
+  Text: Looks like an regression from 13.
+
+x86 godbolt:https://godbolt.org/z/fzd4cj6rz
+
+- User: Andrew Pinski | Time: 2024-03-19 17:59:03 UTC
+  Text: Confirmed.
+Fails on x86_64 with the simple: "-O3  -fno-vect-cost-model -fwrapv" .
+
+
+Note aarch64 vectorizes this loop in GCC 13 (with "-O3  -fno-vect-cost-model -fwrapv") and gets it right.
+
+The only difference is:
+
+trunk:
+  _34 = _36 * 32767;
+
+GCC 13:
+  _32 = _34 * 62945;
+
+- User: Robin Dapp | Time: 2024-03-19 20:48:40 UTC
+  Text: diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
+index 4375ebdcb49..f8f7ba0ccc1 100644
+--- a/gcc/tree-vect-loop.cc
++++ b/gcc/tree-vect-loop.cc
+@@ -9454,7 +9454,7 @@ vect_peel_nonlinear_iv_init (gimple_seq* stmts, tree init_expr,
+        wi::to_mpz (skipn, exp, UNSIGNED);
+        mpz_ui_pow_ui (mod, 2, TYPE_PRECISION (type));
+        mpz_powm (res, base, exp, mod);
+-       begin = wi::from_mpz (type, res, TYPE_SIGN (type));
++       begin = wi::from_mpz (type, res, TYPE_SIGN (utype));
+        tree mult_expr = wide_int_to_tree (utype, begin);
+        init_expr = gimple_build (stmts, MULT_EXPR, utype,
+                                  init_expr, mult_expr);
+
+This helps for the test case.
+
+- User: Robin Dapp | Time: 2024-03-20 06:12:01 UTC
+  Text: No fallout on x86 or aarch64.
+
+Of course using false instead of TYPE_SIGN (utype) is also possible and maybe clearer?
+
+- User: Richard Biener | Time: 2024-03-20 08:01:07 UTC
+  Text: (In reply to Robin Dapp fromcomment #8)> No fallout on x86 or aarch64.
+> 
+> Of course using false instead of TYPE_SIGN (utype) is also possible and
+> maybe clearer?Well, wi::from_mpz doesn't take a sign argument.  It's comment says
+
+/* Returns X converted to TYPE.  If WRAP is true, then out-of-range
+   values of VAL will be wrapped; otherwise, they will be set to the
+   appropriate minimum or maximum TYPE bound.  */
+wide_int
+wi::from_mpz (const_tree type, mpz_t x, bool wrap)
+
+I'm not sure if we really want saturating behavior here, so 'true' is
+more correct?  Note if we want an unsigned result we should pass utype here,
+that might be the bug?  So
+
+        begin = wi::from_mpz (utype, res, true);
+
+?
+
+The to_mpz args look like they could be mixing signs as well:
+
+    case vect_step_op_mul:
+      {
+        tree utype = unsigned_type_for (type);
+        init_expr = gimple_convert (stmts, utype, init_expr);
+        wide_int skipn = wi::to_wide (skip_niters);
+        wide_int begin = wi::to_wide (step_expr);
+        auto_mpz base, exp, mod, res;
+        wi::to_mpz (begin, base, TYPE_SIGN (type));
+
+TYPE_SIGN (step_expr)?
+
+        wi::to_mpz (skipn, exp, UNSIGNED);
+
+TYPE_SIGN (skip_niters) (which should be UNSIGNED I guess)?
+
+- User: Sam James | Time: 2024-03-20 11:10:30 UTC
+  Text: (In reply to Robin Dapp fromcomment #3)> -O3 -mavx2 -fno-vect-cost-model -fwrapv seems to be sufficient.This crashes for me with GCC 13 too.
+
+- User: Sam James | Time: 2024-03-20 11:12:52 UTC
+  Text: Bisecting.
+
+- User: Sam James | Time: 2024-03-20 11:41:18 UTC
+  Text: (In reply to Sam James fromcomment #11)> Bisecting.commitr13-7988-g82919cf4cb2321Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Oct 18 10:08:24 2023 +0800
+
+    Avoid compile time hog on vect_peel_nonlinear_iv_init for nonlinear induction vec_step_op_mul when iteration count is too big.
+
+    There's loop in vect_peel_nonlinear_iv_init to get init_expr *
+    pow (step_expr, skip_niters). When skipn_iters is too big, compile time
+    hogs. To avoid that, optimize init_expr * pow (step_expr, skip_niters) to
+    init_expr << (exact_log2 (step_expr) * skip_niters) when step_expr is
+    pow of 2, otherwise give up vectorization when skip_niters >=
+    TYPE_PRECISION (TREE_TYPE (init_expr)).
+
+- User: Sam James | Time: 2024-03-20 11:42:46 UTC
+  Text: That commit got backported so 13.2 is fine, but releases/gcc-13 isn't.
+
+- User: Richard Biener | Time: 2024-03-20 11:56:21 UTC
+  Text: Thus P1.
+
+- User: Hongtao Liu | Time: 2024-03-20 12:36:15 UTC
+  Text: (In reply to Richard Biener fromcomment #9)> (In reply to Robin Dapp fromcomment #8)
+> > No fallout on x86 or aarch64.
+> > 
+> > Of course using false instead of TYPE_SIGN (utype) is also possible and
+> > maybe clearer?
+> 
+> Well, wi::from_mpz doesn't take a sign argument.  It's comment says
+> 
+> /* Returns X converted to TYPE.  If WRAP is true, then out-of-range
+>    values of VAL will be wrapped; otherwise, they will be set to the
+>    appropriate minimum or maximum TYPE bound.  */
+> wide_int
+> wi::from_mpz (const_tree type, mpz_t x, bool wrap)
+> 
+> I'm not sure if we really want saturating behavior here, so 'true' is
+> more correct?  Note if we want an unsigned result we should pass utype here,
+> that might be the bug?  So
+> 
+>         begin = wi::from_mpz (utype, res, true);
+> 
+> ?Yes, it should be.> 
+> The to_mpz args look like they could be mixing signs as well:
+> 
+>     case vect_step_op_mul:
+>       {
+>         tree utype = unsigned_type_for (type);
+>         init_expr = gimple_convert (stmts, utype, init_expr);
+>         wide_int skipn = wi::to_wide (skip_niters);
+>         wide_int begin = wi::to_wide (step_expr);
+>         auto_mpz base, exp, mod, res;
+>         wi::to_mpz (begin, base, TYPE_SIGN (type));
+> 
+> TYPE_SIGN (step_expr)?step_expr should have same type as init_expr.> 
+>         wi::to_mpz (skipn, exp, UNSIGNED);
+> 
+> TYPE_SIGN (skip_niters) (which should be UNSIGNED I guess)?skipn must be a postive value, so I assume UNSIGNED/SIGNED doesn't make any difference here.
+
+- User: Hongtao Liu | Time: 2024-03-20 12:40:21 UTC
+  Text: Mine.
+
+- User: Hongtao Liu | Time: 2024-03-21 03:25:41 UTC
+  Text: > > 
+> > The to_mpz args look like they could be mixing signs as well:
+> >I tries below, looks like mixing signs works well.
+debug show step_expr is -5 and signed.
+ 
+short a = 0xF;
+short b[16];
+unsigned short ua = 0xF;
+unsigned short ub[16];
+
+int main() {
+  for (int e = 0; e < 9; e += 1)
+    b[e] = a *= 0x5;
+  __builtin_printf("decimal: %d\n", a);
+  __builtin_printf("hex: %X\n", a);
+
+  for (int e = 0; e < 9; e += 1)
+    b[e] = a *= -5;
+  __builtin_printf("decimal: %d\n", a);
+  __builtin_printf("hex: %X\n", a);
+
+  for (int e = 0; e < 9; e += 1)
+    ub[e] = ua *= 0x5;
+  __builtin_printf("decimal: %d\n", ua);
+  __builtin_printf("hex: %X\n", ua);
+
+  for (int e = 0; e < 9; e += 1)
+    ub[e] = ua *= -5;
+  __builtin_printf("decimal: %d\n", ua);
+  __builtin_printf("hex: %X\n", ua);
+
+}
+
+- User: GCC Commits | Time: 2024-03-21 10:01:37 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:ac2f8c2a367151fc0410f904339c475a953cffc8commitr14-9591-gac2f8c2a367151fc0410f904339c475a953cffc8Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Mar 21 13:15:23 2024 +0800
+
+    Fix runtime error for nonlinear iv vectorization(step_mult).
+    
+    wi::from_mpz doesn't take a sign argument, we want it to be wrapped
+    instead of saturation, so pass utype and true to it, and it fixes the
+    bug.
+    
+    gcc/ChangeLog:PR tree-optimization/114396* tree-vect-loop.cc (vect_peel_nonlinear_iv_init): Pass utype
+            and true to wi::from_mpz.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr114396.c: New test.
+
+- User: JuzheZhong | Time: 2024-03-21 10:05:27 UTC
+  Text: I think it's better to addpr114396.c into vect testsuite instead of x86 target test since it's the bug not only happens on x86.
+
+- User: Hongtao Liu | Time: 2024-03-21 10:08:41 UTC
+  Text: (In reply to JuzheZhong fromcomment #19)> I think it's better to addpr114396.c into vect testsuite instead of x86
+> target test since it's the bug not only happens on x86.Sure, there's no target specific intrinsics in the testcase, I'll move that to vect testsuite.
+
+- User: Andrew Pinski | Time: 2024-03-21 10:10:19 UTC
+  Text: (In reply to JuzheZhong fromcomment #19)> I think it's better to addpr114396.c into vect testsuite instead of x86
+> target test since it's the bug not only happens on x86.Actually I think a testcase would be better if it was placed in gcc.c-torture/execute/ with just `/* { dg-additional-options "-fno-vect-cost-model" } */` added.
+
+- User: GCC Commits | Time: 2024-03-21 11:17:55 UTC
+  Text: The releases/gcc-13 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:199b021a38f30b681e0dbecd2d0296beabd50b13commitr13-8475-g199b021a38f30b681e0dbecd2d0296beabd50b13Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Mar 21 13:15:23 2024 +0800
+
+    Fix runtime error for nonlinear iv vectorization(step_mult).
+    
+    wi::from_mpz doesn't take a sign argument, we want it to be wrapped
+    instead of saturation, so pass utype and true to it, and it fixes the
+    bug.
+    
+    gcc/ChangeLog:PR tree-optimization/114396* tree-vect-loop.cc (vect_peel_nonlinear_iv_init): Pass utype
+            and true to wi::from_mpz.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr114396.c: New test.
+    
+    (cherry picked from commit ac2f8c2a367151fc0410f904339c475a953cffc8)
+
+- User: GCC Commits | Time: 2024-03-22 02:16:51 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:9a6c7aa1b011b77fcd9b19f7b8d7ff0fc823cdb2commitr14-9603-g9a6c7aa1b011b77fcd9b19f7b8d7ff0fc823cdb2Author: liuhongt <hongtao.liu@intel.com>
+Date:   Fri Mar 22 10:09:43 2024 +0800
+
+    Movepr114396.c from gcc.target/i386 to gcc.c-torture/execute.
+    
+    Also fixed a typo in the testcase.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/114396* gcc.target/i386/pr114396.c: Move to...
+            * gcc.c-torture/execute/pr114396.c: ...here.
+
+- User: GCC Commits | Time: 2024-03-22 02:18:43 UTC
+  Text: The releases/gcc-13 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:e6a3d1f5bcfd954b614155d96c97bde8ac230e2ecommitr13-8488-ge6a3d1f5bcfd954b614155d96c97bde8ac230e2eAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Fri Mar 22 10:09:43 2024 +0800
+
+    Movepr114396.c from gcc.target/i386 to gcc.c-torture/execute.
+    
+    Also fixed a typo in the testcase.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/114396* gcc.target/i386/pr114396.c: Move to...
+            * gcc.c-torture/execute/pr114396.c: ...here.
+    
+    (cherry picked from commit 9a6c7aa1b011b77fcd9b19f7b8d7ff0fc823cdb2)
+
+- User: Hongtao Liu | Time: 2024-03-22 02:19:51 UTC
+  Text: Fixed in GCC14 and GCC13.3.
+

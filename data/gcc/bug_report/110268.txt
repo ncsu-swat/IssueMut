@@ -1,0 +1,123 @@
+Bug Summary: [14 Regression] arm MVE intrinsics support broken with LTO
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: rejects-valid
+Known to Work: 
+Known to Fail: 14.0
+
+Comments:
+- User: Christophe Lyon | Time: 2023-06-15 15:59:28 UTC
+  Text: Since I rewrote (a lot of) MVE intrinsics, use of LTO is broken:
+
+$ cat ~/t.c
+#include <arm_mve.h>
+int main(void)
+{
+  return vaddvq(vdupq_n_s8 (1));
+}
+
+# no LTO, OK:
+$ arm-none-eabi-gcc ~/t.c -march=armv8.1-m.main+mve -mfloat-abi=hard -specs=rdimon.specs
+
+# with LTO, broken:
+$ arm-none-eabi-gcc ~/t.c -march=armv8.1-m.main+mve -mfloat-abi=hard -specs=rdimon.specs -flto
+lto1: fatal error: target specific builtin not available
+compilation terminated.
+lto-wrapper: fatal error: arm-none-eabi-gcc returned 1 exit status
+compilation terminated.
+/arm-none-eabi/bin/../lib/gcc/arm-none-eabi/14.0.0/../../../../arm-none-eabi/bin/ld: error: lto-wrapper failed
+collect2: error: ld returned 1 exit status
+
+- User: Alex Coplan | Time: 2023-06-15 16:01:11 UTC
+  Text: Confirmed.
+
+- User: Christophe Lyon | Time: 2023-06-15 16:40:05 UTC
+  Text: This regression appeared after the patch that re-implements vdupq, but the issue is likely more generic.
+velo r
+
+I tried to update arm_init_mve_builtins() with:
+
++ if (in_lto_p)
++   {
++     arm_mve::handle_arm_mve_types_h ();
++     arm_mve::handle_arm_mve_h (false);
++   }
+
+but that's not sufficient, we still get the same error although the MVE intrinsics are registered.
+
+I noticed that the error happens in unpack_ts_function_decl_value_fields() with fcode==885, not sure where it comes from?
+
+Besides, we'll also have to check how to compute the right value for handle_arm_mve_h's parameter.
+
+- User: Richard Biener | Time: 2023-06-16 06:20:01 UTC
+  Text: At stream-out time we stream the MD specific DECL_FUNCTION_CODE and at stream-in time we expect the backend has a FUNCTION_DECL corresponding to that code for us.  The error means that targetm.builtin_decl doesn't know about the builtin
+(or did not implement "materializing" it).
+
+- User: Richard Biener | Time: 2023-06-16 06:21:14 UTC
+  Text: tree
+arm_builtin_decl (unsigned code, bool initialize_p ATTRIBUTE_UNUSED)
+{ 
+  unsigned subcode = code >> ARM_BUILTIN_SHIFT;
+  switch (code & ARM_BUILTIN_CLASS)
+    {
+    case ARM_BUILTIN_GENERAL:
+      return arm_general_builtin_decl (subcode);
+    case ARM_BUILTIN_MVE:
+      return error_mark_node;
+
+^^^
+
+I guess that's the problem.  MVE builtins are not handled at all?
+
+- User: Christophe Lyon | Time: 2023-06-19 12:38:14 UTC
+  Text: Indeed, a small update to arm_builtin_decl() does the trick.
+
+Investigating how to decide whether to call
+arm_mve::handle_arm_mve_h (false);
+or
+arm_mve::handle_arm_mve_h (true);
+
+which is normally controlled at preprocessing time depending on __ARM_MVE_PRESERVE_USER_NAMESPACE
+
+- User: GCC Commits | Time: 2023-07-10 14:15:40 UTC
+  Text: The master branch has been updated by Christophe Lyon <clyon@gcc.gnu.org>:https://gcc.gnu.org/g:eca10aaa3954af3dab56eccc208c90273c2b1732commitr14-2418-geca10aaa3954af3dab56eccc208c90273c2b1732Author: Christophe Lyon <christophe.lyon@linaro.org>
+Date:   Mon Jun 26 14:39:47 2023 +0000
+
+    arm: Fix MVE intrinsics support with LTO (PR target/110268)
+    
+    After the recent MVE intrinsics re-implementation, LTO stopped working
+    because the intrinsics would no longer be defined.
+    
+    The main part of the patch is simple and similar to what we do for
+    AArch64:
+    - call handle_arm_mve_h() from arm_init_mve_builtins to declare the
+      intrinsics when the compiler is in LTO mode
+    - actually implement arm_builtin_decl for MVE.
+    
+    It was just a bit tricky to handle __ARM_MVE_PRESERVE_USER_NAMESPACE:
+    its value in the user code cannot be guessed at LTO time, so we always
+    have to assume that it was not defined.  The led to a few fixes in the
+    way we register MVE builtins as placeholders or not.  Without this
+    patch, we would just omit some versions of the inttrinsics when
+    __ARM_MVE_PRESERVE_USER_NAMESPACE is true. In fact, like for the C/C++
+    placeholders, we need to always keep entries for all of them to ensure
+    that we have a consistent numbering scheme.
+    
+    2023-06-26  Christophe Lyon   <christophe.lyon@linaro.org>PR target/110268gcc/
+            * config/arm/arm-builtins.cc (arm_init_mve_builtins): Handle LTO.
+            (arm_builtin_decl): Hahndle MVE builtins.
+            * config/arm/arm-mve-builtins.cc (builtin_decl): New function.
+            (add_unique_function): Fix handling of
+            __ARM_MVE_PRESERVE_USER_NAMESPACE.
+            (add_overloaded_function): Likewise.
+            * config/arm/arm-protos.h (builtin_decl): New declaration.
+    
+            gcc/testsuite/
+            * gcc.target/arm/pr110268-1.c: New test.
+            * gcc.target/arm/pr110268-2.c: New test.
+
+- User: Christophe Lyon | Time: 2023-07-10 14:16:35 UTC
+  Text: Fixed.
+

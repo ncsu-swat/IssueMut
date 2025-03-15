@@ -1,0 +1,158 @@
+Bug Summary: RISC-V: Redundant vsetvl insn in function
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Li Pan | Time: 2024-02-01 01:59:35 UTC
+  Text: Give the sample code as below, build with -march=rv64gcv -O3 -g0
+
+int foo (int * __restrict a, int n)
+{
+    int result = 0;
+    for (int i = 0; i < n; i++)
+      result += a[i];
+    return result;
+}
+
+The asm code looks like below, we have one duplicated vsetvl insn here.
+
+foo:
+.LFB0:
+        .cfi_startproc
+        ble     a1,zero,.L4
+        vsetvli a5,zero,e32,m1,ta,ma
+        vmv.v.i v1,0
+.L3:
+        vsetvli a5,a1,e32,m1,tu,ma
+        slli    a4,a5,2
+        sub     a1,a1,a5
+        vle32.v v2,0(a0)
+        add     a0,a0,a4
+        vadd.vv v1,v2,v1
+        bne     a1,zero,.L3
+        li      a5,0
+        vsetivli        zero,1,e32,m1,ta,ma
+        vmv.s.x v2,a5
+        vsetvli a5,zero,e32,m1,ta,ma  <== redundant vsetvl
+        vredsum.vs      v1,v1,v2
+        vmv.x.s a0,v1
+        ret
+.L4:
+        li      a0,0
+        ret
+
+- User: GCC Commits | Time: 2024-02-02 17:37:03 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:922e4599e6261644d336b009b6901cd221ec95fdcommitr14-8757-g922e4599e6261644d336b009b6901cd221ec95fdAuthor: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Fri Feb 2 09:56:59 2024 +0800
+
+    RISC-V: Expand VLMAX scalar move in reduction
+    
+    This patch fixes the following:
+    
+            vsetvli a5,a1,e32,m1,tu,ma
+            slli    a4,a5,2
+            sub     a1,a1,a5
+            vle32.v v2,0(a0)
+            add     a0,a0,a4
+            vadd.vv v1,v2,v1
+            bne     a1,zero,.L3
+            vsetivli        zero,1,e32,m1,ta,ma
+            vmv.s.x v2,zero
+            vsetvli a5,zero,e32,m1,ta,ma              ---> Redundant vsetvl.
+            vredsum.vs      v1,v1,v2
+            vmv.x.s a0,v1
+            ret
+    
+    VSETVL PASS is able to fuse avl = 1 of scalar move and VLMAX avl of reduction.
+    
+    However, this following RTL blocks the fusion in dependence analysis in VSETVL PASS:
+    
+    (insn 49 24 50 5 (set (reg:RVVM1SI 98 v2 [148])
+            (if_then_else:RVVM1SI (unspec:RVVMF32BI [
+                        (const_vector:RVVMF32BI [
+                                (const_int 1 [0x1])
+                                repeat [
+                                    (const_int 0 [0])
+                                ]
+                            ])
+                        (const_int 1 [0x1])
+                        (const_int 2 [0x2]) repeated x2
+                        (const_int 0 [0])
+                        (reg:SI 66 vl)
+                        (reg:SI 67 vtype)
+                    ] UNSPEC_VPREDICATE)
+                (const_vector:RVVM1SI repeat [
+                        (const_int 0 [0])
+                    ])
+                (unspec:RVVM1SI [
+                        (reg:DI 0 zero)
+                    ] UNSPEC_VUNDEF))) 3813 {*pred_broadcastrvvm1si_zero}
+         (nil))
+    (insn 50 49 51 5 (set (reg:DI 15 a5 [151])                          ---->  It set a5, blocks the following VLMAX into the scalar move above.
+            (unspec:DI [
+                    (const_int 32 [0x20])
+                ] UNSPEC_VLMAX)) 2566 {vlmax_avldi}
+         (expr_list:REG_EQUIV (unspec:DI [
+                    (const_int 32 [0x20])
+                ] UNSPEC_VLMAX)
+            (nil)))
+    (insn 51 50 52 5 (set (reg:RVVM1SI 97 v1 [150])
+            (unspec:RVVM1SI [
+                    (unspec:RVVMF32BI [
+                            (const_vector:RVVMF32BI repeat [
+                                    (const_int 1 [0x1])
+                                ])
+                            (reg:DI 15 a5 [151])
+                            (const_int 2 [0x2])
+                            (const_int 1 [0x1])
+                            (reg:SI 66 vl)
+                            (reg:SI 67 vtype)
+                        ] UNSPEC_VPREDICATE)
+                    (unspec:RVVM1SI [
+                            (reg:RVVM1SI 97 v1 [orig:134 vect_result_14.6 ] [134])
+                            (reg:RVVM1SI 98 v2 [148])
+                        ] UNSPEC_REDUC_SUM)
+                    (unspec:RVVM1SI [
+                            (reg:DI 0 zero)
+                        ] UNSPEC_VUNDEF)
+                ] UNSPEC_REDUC)) 17541 {pred_redsumrvvm1si}
+         (expr_list:REG_DEAD (reg:RVVM1SI 98 v2 [148])
+            (expr_list:REG_DEAD (reg:SI 66 vl)
+                (expr_list:REG_DEAD (reg:DI 15 a5 [151])
+                    (expr_list:REG_DEAD (reg:DI 0 zero)
+                        (nil))))))
+    
+    Such situation can only happen on auto-vectorization, never happen on intrinsic codes.
+    Since the reduction is passed VLMAX AVL, it should be more natural to pass VLMAX to the scalar move which initial the value of the reduction.
+    
+    After this patch:
+    
+            vsetvli a5,a1,e32,m1,tu,ma
+            slli    a4,a5,2
+            sub     a1,a1,a5
+            vle32.v v2,0(a0)
+            add     a0,a0,a4
+            vadd.vv v1,v2,v1
+            bne     a1,zero,.L3
+            vsetvli a5,zero,e32,m1,ta,ma
+            vmv.s.x v2,zero
+            vredsum.vs      v1,v1,v2
+            vmv.x.s a0,v1
+            ret
+    
+    Tested on both RV32/RV64 no regression.PR target/113697gcc/ChangeLog:
+    
+            * config/riscv/riscv-v.cc (expand_reduction): Pass VLMAX avl to scalar move.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/pr113697.c: New test.
+
+- User: Li Pan | Time: 2024-02-04 00:46:37 UTC
+  Text: Fixed.
+

@@ -1,0 +1,183 @@
+Bug Summary: [13 Regression] Wrong optimization of fabs at -O1
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 12.3.0
+Known to Fail: 13.1.0
+
+Comments:
+- User: Aurelien Jarno | Time: 2023-07-20 20:18:52 UTC
+  Text: The following code, extracted and simplified from the PowerPC implementation of nearbyintf() in the GNU libc is wrongly optimized at -O1 and -O2 on ppc64el with GCC 13. The fabs is removed, while it is not the case with GCC 12
+
+#include <fenv.h>
+#include <math.h>
+#include <stdio.h>
+
+static float my_nearbyintf (float x)
+{ 
+  float r = x;
+
+  if (x > 0.0)
+    { 
+      r += 0x1p+23;
+      r -= 0x1p+23;
+      r = fabs (r);
+    }
+
+  return r;
+}
+
+int main()
+{
+        volatile float in = 0.5f;
+
+        fesetround (FE_DOWNWARD);
+        printf("mynearbyintf(in) = %lf\n", my_nearbyintf(in));
+}
+
+This causes the result to have the wrong sign.
+
+- User: Andrew Pinski | Time: 2023-07-20 20:25:32 UTC
+  Text: Hmm, this might be the case where you need -frounding-math since we don't expectly implement the pragma.
+
+- User: Aurelien Jarno | Time: 2023-07-20 20:28:07 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> Hmm, this might be the case where you need -frounding-math since we don't
+> expectly implement the pragma.Indeed the original glibc code is compiled with -frounding-math. However adding it or not doesn't change the resulting code.
+
+- User: Andrew Pinski | Time: 2023-07-20 20:31:07 UTC
+  Text: This is not just a bug on powerpc either.
+
+
+Folding statement: r_6 = ABS_EXPR <r_5>;
+Applying pattern match.pd:1653, gimple-match.cc:35557
+gimple_simplified to r_6 = r_5;
+
+- User: Richard Biener | Time: 2023-07-21 06:56:41 UTC
+  Text: if (in.0_1 > 0.0)
+    goto <bb 3>; [59.00%]
+  else
+    goto <bb 4>; [41.00%]
+
+  <bb 3> [local count: 633507681]:
+  # RANGE [frange] float [8.388608e+6 (0x0.8p+24), +Inf]
+  r_8 = in.0_1 + 8.388608e+6;
+  # RANGE [frange] float [0.0 (0x0.0p+0), +Inf]
+  r_9 = r_8 - 8.388608e+6;
+  # RANGE [frange] float [0.0 (0x0.0p+0), +Inf]
+  r_10 = ABS_EXPR <r_9>;
+
+looks like we mishandle signed zeros somehow.
+
+- User: Jakub Jelinek | Time: 2023-07-21 08:11:24 UTC
+  Text: A big hammer solution might be to treat flag_rounding_math in frange::set the same as
+!HONOR_SIGNED_ZEROS, i.e. always extend [0, x] ranges to [-0, x] and [y, -0] to [y, 0]
+because we don't know what the rounding will do:
+-  else if (!HONOR_SIGNED_ZEROS (m_type))
++  else if (!HONOR_SIGNED_ZEROS (m_type) || flag_rounding_math)
+     {
+       if (real_iszero (&m_max, 1))
+         m_max.sign = 0;
+       if (real_iszero (&m_min, 0))
+         m_min.sign = 1;
+     }
+Though, such a change would affect even say operator_abs handling where we even for flag_rounding_math are guaranteed the sign will be positive (unless -fno-signed-zeros, in that case it is right we don't assume anything).
+Or do it in range_operator::fold_range?  Or some other spot?
+Generally, operations like neg, abs, comparisons should be fine, but +-*/ at least in the fold_range direction probably need to do that.
+
+- User: Jakub Jelinek | Time: 2023-07-21 08:38:37 UTC
+  Text: Createdattachment 55594[details]gcc14-pr110755.patch
+
+Untested patch.
+
+- User: Aurelien Jarno | Time: 2023-07-22 20:20:26 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #6)> Createdattachment 55594[details]> gcc14-pr110755.patch
+> 
+> Untested patch.Thanks for the patch, I confirm it works as expected, now the result is a positive 0 when using -frounding-math.
+
+- User: Jakub Jelinek | Time: 2023-07-24 07:12:12 UTC
+  Text: Actually looking at IEEE754, the fix should be limited to +- operations, not +-*/.
+Because only for +- IEEE754 has:
+"When the sum of two operands with opposite signs (or the difference of two operands with like signs) is exactly zero, the sign of that sum (or difference) shall be +0 in all rounding direction modes except roundTowardNegative; in that mode, the sign of an exact zero sum (or difference) shall be –0. However, x+x = x–(–x) retains the same sign as x even when x is zero."
+
+- User: Jakub Jelinek | Time: 2023-07-24 07:47:22 UTC
+  Text: Createdattachment 55616[details]gcc14-pr110755.patch
+
+Updated patch.
+
+- User: Aurelien Jarno | Time: 2023-07-24 18:31:30 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #9)> Createdattachment 55616[details]> gcc14-pr110755.patch
+> 
+> Updated patch.Thanks. I have just tested it, and I confirm it fixes the reported issue.
+
+- User: GCC Commits | Time: 2023-07-26 08:52:58 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:21da32d995c8b574c929ec420cd3b0fcfe6fa4fecommitr14-2782-g21da32d995c8b574c929ec420cd3b0fcfe6fa4feAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Jul 26 10:50:50 2023 +0200
+
+    range-op-float: Fix up -frounding-math frange_arithmetic +- handling [PR110755]
+    
+    IEEE754 says that x + (-x) and x - x result in +0 in all rounding modes
+    but rounding towards negative infinity, in which case the result is -0
+    for all finite x.  x + x and x - (-x) if it is zero retain sign of x.
+    Now, range_arithmetic implements the normal rounds to even rounding,
+    and as the addition or subtraction in those cases is exact, we don't do any
+    further rounding etc. and e.g. on the testcase below distilled from glibc
+    compute a range [+0, +INF], which is fine for -fno-rounding-math or
+    if we'd have a guarantee that those statements aren't executed with rounding
+    towards negative infinity.
+    
+    I believe it is only +- which has this problematic behavior and I think
+    it is best to deal with it in frange_arithmetic; if we know -frounding-math
+    is on, it is x + (-x) or x - x and we are asked to round to negative
+    infinity (i.e. want low bound rather than high bound), change +0 result to
+    -0.
+    
+    2023-07-26  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/110755* range-op-float.cc (frange_arithmetic): Change +0 result to -0
+            for PLUS_EXPR or MINUS_EXPR if -frounding-math, inf is negative and
+            it is exact op1 + (-op1) or op1 - op1.
+    
+            * gcc.dg/pr110755.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-07-26 10:00:02 UTC
+  Text: Should be fixed on the trunk so far.
+
+- User: Richard Biener | Time: 2023-07-27 09:27:17 UTC
+  Text: GCC 13.2 is being released, retargeting bugs to GCC 13.3.
+
+- User: GCC Commits | Time: 2023-07-27 17:53:36 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:e684084a5fa9edaedb1a14e118b966a60e3449b9commitr13-7615-ge684084a5fa9edaedb1a14e118b966a60e3449b9Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Jul 26 10:50:50 2023 +0200
+
+    range-op-float: Fix up -frounding-math frange_arithmetic +- handling [PR110755]
+    
+    IEEE754 says that x + (-x) and x - x result in +0 in all rounding modes
+    but rounding towards negative infinity, in which case the result is -0
+    for all finite x.  x + x and x - (-x) if it is zero retain sign of x.
+    Now, range_arithmetic implements the normal rounds to even rounding,
+    and as the addition or subtraction in those cases is exact, we don't do any
+    further rounding etc. and e.g. on the testcase below distilled from glibc
+    compute a range [+0, +INF], which is fine for -fno-rounding-math or
+    if we'd have a guarantee that those statements aren't executed with rounding
+    towards negative infinity.
+    
+    I believe it is only +- which has this problematic behavior and I think
+    it is best to deal with it in frange_arithmetic; if we know -frounding-math
+    is on, it is x + (-x) or x - x and we are asked to round to negative
+    infinity (i.e. want low bound rather than high bound), change +0 result to
+    -0.
+    
+    2023-07-26  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/110755* range-op-float.cc (frange_arithmetic): Change +0 result to -0
+            for PLUS_EXPR or MINUS_EXPR if -frounding-math, inf is negative and
+            it is exact op1 + (-op1) or op1 - op1.
+    
+            * gcc.dg/pr110755.c: New test.
+    
+    (cherry picked from commit 21da32d995c8b574c929ec420cd3b0fcfe6fa4fe)
+
+- User: Jakub Jelinek | Time: 2023-08-30 22:21:11 UTC
+  Text: Fixed for 13.3+ and 14+.
+
+- User: Hans-Peter Nilsson | Time: 2023-11-06 02:38:59 UTC
+  Text: As alluded already incomment #3, this bug is generic: I built gcc-13.2 and verified that it also exists (or perhaps more correctly put, existed) for aarch64, for that version.
+

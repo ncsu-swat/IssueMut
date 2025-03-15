@@ -1,0 +1,131 @@
+Bug Summary: [11/12/13/14 Regression] Missed optimization: (!a) * a => 0 when a=(a/2)*2
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 9.5.0
+Known to Fail: 10.2.0
+
+Comments:
+- User: Yi | Time: 2024-02-20 10:16:58 UTC
+  Text: Hello, we noticed that the code below can be optimized as stated in the title ((!a) * a => 0), but gcc -O3 missed it.
+
+Different fromPR 113716, this example can be optimized under the option of gcc -O3 -fwrapv. At the same time, their patterns are different.https://godbolt.org/z/GrPY1d6o3int w;
+void func(int a) {
+    a = (a/2)*2;
+    w = (!a) * a;
+}
+
+GCC -O3 :
+func(int):
+        mov     eax, edi
+        xor     edx, edx
+        shr     eax, 31
+        add     eax, edi
+        add     edi, 1
+        sar     eax
+        cmp     edi, 2
+        cmova   eax, edx
+        add     eax, eax
+        mov     DWORD PTR w[rip], eax
+        ret
+
+Expected code (GCC -O3 -fwrapv):
+func(int):
+        mov     DWORD PTR w[rip], 0
+        ret
+
+Thank you very much for your time and effort! We look forward to hearing from you.
+
+- User: Andrew Pinski | Time: 2024-02-21 00:03:12 UTC
+  Text: Confirmed.
+
+What is happening is:
+`(a/2)*2 == 0` gets optimized to `((unsigned)a) + 1 <= 2` and then we don't handle:
+`((unsigned)a) + 1 <= 2 ? (a/2) : 0` which is just 0. as a has the range of [-1,1] for the truth side and divide that by 2 is always 0.
+
+- User: Jakub Jelinek | Time: 2024-03-05 13:02:03 UTC
+  Text: Is the regression marker added for ther11-2550-gca2b8c082c4f16919071c9f8de8db0b33b54c405change:
+ 	movl	%edi, %eax
+-	xorl	%edx, %edx
++	movl	$0, %edx
+ 	shrl	$31, %eax
+ 	addl	%edi, %eax
++	addl	$1, %edi
+ 	andl	$-2, %eax
+-	sete	%dl
+-	imull	%edx, %eax
++	cmpl	$2, %edi
++	cmova	%edx, %eax
+ 	movl	%eax, w(%rip)
+ 	ret
+or for ther12-5392-g527e54a431473cc497204226a21f2831d2375e66change:
+-	movl	%edi, %eax
+-	movl	$0, %edx
+-	shrl	$31, %eax
+-	addl	%edi, %eax
+-	addl	$1, %edi
+-	andl	$-2, %eax
+-	cmpl	$2, %edi
+-	cmova	%edx, %eax
++	leal	1(%rdi), %eax
++	movl	%edi, %edx
++	cmpl	$2, %eax
++	setbe	%al
++	shrl	$31, %edx
++	addl	%edi, %edx
++	movzbl	%al, %eax
++	sarl	%edx
++	imull	%edx, %eax
++	addl	%eax, %eax
+or both?  I don't think we ever optimized this without -fwrapv to just 0.
+
+- User: Jakub Jelinek | Time: 2024-03-05 14:14:50 UTC
+  Text: That said, I fail to see why the a/2*2 in there matters.
+a*!a is simply always 0 for integral types, both signed and unsigned, including signed 1-bit precision.  If a is 0, the result is 0*1 (or for the last one 0*-1), if a is non-zero, then the result is a*0.
+
+- User: Jakub Jelinek | Time: 2024-03-05 14:24:04 UTC
+  Text: Createdattachment 57615[details]gcc14-pr114009.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-03-07 07:47:04 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:95b6ee96348041eaee9133f082b57f3e57ef0b11commitr14-9350-g95b6ee96348041eaee9133f082b57f3e57ef0b11Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Mar 7 08:43:16 2024 +0100
+
+    match.pd: Optimize a * !a to 0 [PR114009]
+    
+    The following patch attempts to fix an optimization regression through
+    adding a simple simplification.  We already have the
+    /* (m1 CMP m2) * d -> (m1 CMP m2) ? d : 0  */
+    (if (!canonicalize_math_p ())
+     (for cmp (tcc_comparison)
+      (simplify
+       (mult:c (convert (cmp@0 @1 @2)) @3)
+       (if (INTEGRAL_TYPE_P (type)
+            && INTEGRAL_TYPE_P (TREE_TYPE (@0)))
+         (cond @0 @3 { build_zero_cst (type); })))
+    optimization which otherwise triggers during the a * !a multiplication,
+    but that is done only late and we aren't able through range assumptions
+    optimize it yet anyway.
+    
+    The patch adds a specific simplification for it.
+    If a is zero, then a * !a will be 0 * 1 (or for signed 1-bit 0 * -1)
+    and so 0.
+    If a is non-zero, then a * !a will be a * 0 and so again 0.
+    THe pattern is valid for scalar integers, complex integers and vector types,
+    but I think will actually trigger only for the scalar integers.  For
+    vector types I've added other two with VEC_COND_EXPR in it, for complex
+    there are different GENERIC trees to match and it is something that likely
+    would be never matched in GIMPLE, so I didn't handle that.
+    
+    2024-03-07  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114009* genmatch.cc (decision_tree::gen): Emit ARG_UNUSED for captures
+            argument even for GENERIC, not just for GIMPLE.
+            * match.pd (a * !a -> 0): New simplifications.
+    
+            * gcc.dg/tree-ssa/pr114009.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-03-15 09:45:54 UTC
+  Text: Fixed for GCC 14+.  No plans to backport.
+

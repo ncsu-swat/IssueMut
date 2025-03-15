@@ -1,0 +1,167 @@
+Bug Summary: [14 Regression] wrong code with __builtin_parityl() at -O and above on x86_64
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 13.2.1
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-11-22 17:04:24 UTC
+  Text: Createdattachment 56666[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -O testcase.c
+$ ./a.out 
+Aborted
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-5761-20231122145100-ge9b39df9333-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-5761-20231122145100-ge9b39df9333-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20231122 (experimental) (GCC) 
+
+At the asm output, the problem is obvious:
+
+main:
+# testcase.c:8:   u *= g;
+	movzx	eax, WORD PTR g[rip]	# tmp110, g
+	sal	eax, 2	# u,
+# testcase.c:9:   return u + __builtin_parityl (u);
+	xor	al, ah	# u <== THIS OVERWRITES "u" in eax
+	setnp	dl	#, tmp105
+	movzx	edx, dl	# tmp105, tmp105
+# testcase.c:9:   return u + __builtin_parityl (u);
+	add	eax, edx	# tmp107, tmp105 <== THIS READ "u", but it has been lost
+# testcase.c:16:   if (x != 4 * 254 + 1)
+	cmp	ax, 1017	# tmp107,
+	jne	.L6	#,
+# testcase.c:19: }
+	mov	eax, 0	#,
+	ret
+
+- User: Andrew Pinski | Time: 2023-11-23 02:20:14 UTC
+  Text: Obvious this is wrong:
+;; _5 = .PARITY (u_4);
+
+(insn 7 6 8 (parallel [
+            (set (reg:CC 17 flags)
+                (unspec:CC [
+                        (reg/v:HI 99 [ uD.2808 ])
+                    ] UNSPEC_PARITY))
+            (clobber (reg/v:HI 99 [ uD.2808 ]))
+        ]) "/app/example.cpp":9:32 -1
+     (nil))
+...
+;; if (_7 != 1017)
+
+(insn 11 10 12 (parallel [
+            (set (reg:HI 107)
+                (plus:HI (reg/v:HI 99 [ uD.2808 ])
+                    (subreg:HI (reg:SI 100 [ _5 ]) 0)))
+            (clobber (reg:CC 17 flags))
+        ]) "/app/example.cpp":9:34 discrim 1 -1
+     (nil))
+
+- User: Andrew Pinski | Time: 2023-11-23 02:24:19 UTC
+  Text: Actually it has been wrong sincer11-1027-gf08995eefbf579. Just exposed by Jakub's parity improvement:r14-5557-g6dd4c703be17fa.
+
+- User: Andrew Pinski | Time: 2023-11-23 02:27:54 UTC
+  Text: parityhi2 should have:
+rtx extra = gen_reg_rtx (HImode);
+emit_move_insn (extra, operands[1]);
+emit_insn (gen_parityhi2_cmp (extra));
+
+Or something similar because parityqi2_cmp clobbers its argument.
+
+- User: Uroš Bizjak | Time: 2023-11-23 09:46:15 UTC
+  Text: (In reply to Andrew Pinski fromcomment #3)> parityhi2 should have:
+> rtx extra = gen_reg_rtx (HImode);
+> emit_move_insn (extra, operands[1]);
+> emit_insn (gen_parityhi2_cmp (extra));
+> 
+> Or something similar because parityqi2_cmp clobbers its argument.Exactly.
+
+I have a patch in testing.
+
+- User: GCC Commits | Time: 2023-11-23 15:18:27 UTC
+  Text: The master branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:b2d17bdd45b582b93e89c00b04763a45f97d7a34commitr14-5785-gb2d17bdd45b582b93e89c00b04763a45f97d7a34Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Thu Nov 23 16:17:57 2023 +0100
+
+    i386: Wrong code with __builtin_parityl [PR112672]
+    
+    gen_parityhi2_cmp instruction clobbers its input operand, so use
+    a temporary register in the call to gen_parityhi2_cmp.PR target/112672gcc/ChangeLog:
+    
+            * config/i386/i386.md (parityhi2):
+            Use temporary register in the call to gen_parityhi2_cmp.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr112672.c: New test.
+
+- User: GCC Commits | Time: 2023-11-23 20:22:25 UTC
+  Text: The releases/gcc-13 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:d035b57d51167af805ccc91ee0492c8b27e22184commitr13-8092-gd035b57d51167af805ccc91ee0492c8b27e22184Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Thu Nov 23 16:17:57 2023 +0100
+
+    i386: Wrong code with __builtin_parityl [PR112672]
+    
+    gen_parityhi2_cmp instruction clobbers its input operand, so use
+    a temporary register in the call to gen_parityhi2_cmp.PR target/112672gcc/ChangeLog:
+    
+            * config/i386/i386.md (parityhi2):
+            Use temporary register in the call to gen_parityhi2_cmp.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr112672.c: New test.
+    
+    (cherry picked from commit b2d17bdd45b582b93e89c00b04763a45f97d7a34)
+
+- User: GCC Commits | Time: 2023-11-24 14:59:11 UTC
+  Text: The releases/gcc-12 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:f0445f4401c941d0aa3cc413ca4548f313cc1257commitr12-10001-gf0445f4401c941d0aa3cc413ca4548f313cc1257Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Thu Nov 23 16:17:57 2023 +0100
+
+    i386: Wrong code with __builtin_parityl [PR112672]
+    
+    gen_parityhi2_cmp instruction clobbers its input operand, so use
+    a temporary register in the call to gen_parityhi2_cmp.PR target/112672gcc/ChangeLog:
+    
+            * config/i386/i386.md (parityhi2):
+            Use temporary register in the call to gen_parityhi2_cmp.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr112672.c: New test.
+    
+    (cherry picked from commit b2d17bdd45b582b93e89c00b04763a45f97d7a34)
+
+- User: GCC Commits | Time: 2023-11-24 14:59:50 UTC
+  Text: The releases/gcc-11 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:422e30e4d5ca2f26f77e7c90e09658408c07a23ccommitr11-11111-g422e30e4d5ca2f26f77e7c90e09658408c07a23cAuthor: Uros Bizjak <ubizjak@gmail.com>
+Date:   Thu Nov 23 16:17:57 2023 +0100
+
+    i386: Wrong code with __builtin_parityl [PR112672]
+    
+    gen_parityhi2_cmp instruction clobbers its input operand, so use
+    a temporary register in the call to gen_parityhi2_cmp.PR target/112672gcc/ChangeLog:
+    
+            * config/i386/i386.md (parityhi2):
+            Use temporary register in the call to gen_parityhi2_cmp.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr112672.c: New test.
+    
+    (cherry picked from commit b2d17bdd45b582b93e89c00b04763a45f97d7a34)
+
+- User: Uroš Bizjak | Time: 2023-11-24 15:03:04 UTC
+  Text: Fixed everywhere.
+
+- User: Jakub Jelinek | Time: 2023-11-24 16:08:39 UTC
+  Text: .
+

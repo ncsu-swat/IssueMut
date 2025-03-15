@@ -1,0 +1,185 @@
+Bug Summary: ICE: in execute_todo, at passes.cc:2138
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-checking, ice-on-valid-code, inline-asm, wrong-code
+Known to Work: 14.2.1, 15.0
+Known to Fail: 14.2.0, 7.5.0
+
+Comments:
+- User: Anonymous | Time: 2024-06-11 03:40:19 UTC
+  Text: *******************************************************************************
+The compiler produces an internal error when compiling the provided code with the specified options. 
+The issue occurs during the GIMPLE pass (walloca), causing an internal compiler error in the execute_todo function at passes.cc:2138.
+*******************************************************************************
+OS and Platform:
+# uname -a
+Linux ubuntu 4.15.0-213-generic #224-Ubuntu SMP Mon Jun 19 13:30:12 UTC 2023 x86_64 x86_64 x86_64 GNU/Linux
+*******************************************************************************
+# gcc -v
+Using built-in specs.
+COLLECT_GCC=gcc
+COLLECT_LTO_WRAPPER=/root/gdbtest/gcc/gcc-15/libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /root/gdbtest/gcc/obj/../gcc/configure --prefix=/root/gdbtest/gcc/gcc-15 --enable-languages=c,c++,fortran,go --disable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240509 (experimental) (GCC) 
+*******************************************************************************
+Program:
+# cat fam-asm.c
+
+ #include <stdio.h>
+ #include <complex.h> 
+
+ _Complex float fcs(_Complex float x) {
+  float ixy;
+  float diff, sum;
+  _Complex float r;
+  __asm__("fmul %s[ixy], %s[xr], %s[yr]\n"
+          "\tfsub %s[diff], %s[xr], %s[yr]\n"
+          "\tfadd %s[sum],  %s[xr], %s[yr]\n"
+          "\tfmul %s[rr],  %s[diff], %s[sum]\n"
+          "\tfadd %s[ri],  %s[ixy], %s[ixy]\n"
+          : [ixy] "=&w" (ixy), [diff] "=&w" (diff), [sum] "=w" (sum), [rr] "=w" (__real__ r), [ri] "=w" (__imag__ r)
+          : [xr] "w" (__real__ x), [yr] "w"( __imag__ x)
+          : );
+  return r;
+ }
+ 
+ int main(int argc, char *argv[])
+ {
+  _Complex float i = 0.0f + I * 1.0f;
+  _Complex float i2 = fcs(i);
+  printf("%f+i%f\n", __real__ i2, __imag__ i2);
+ }
+
+
+*******************************************************************************
+Command Lines:
+# gcc fam-asm.c -Wall -Wextra  -o fam-asm.out
+fam-asm.c: In function ‘main’:
+fam-asm.c:19:15: warning: unused parameter ‘argc’ [-Wunused-parameter]
+   19 |  int main(int argc, char *argv[])
+      |           ~~~~^~~~
+fam-asm.c:19:27: warning: unused parameter ‘argv’ [-Wunused-parameter]
+   19 |  int main(int argc, char *argv[])
+      |                     ~~~~~~^~~~~~
+during GIMPLE pass: walloca
+fam-asm.c: In function ‘fcs’:
+fam-asm.c:24:2: internal compiler error: in execute_todo, at passes.cc:2138
+   24 |  }
+      |  ^
+0x839f1b execute_todo
+        /root/gdbtest/gcc/obj/../gcc/gcc/passes.cc:2138
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+*******************************************************************************
+
+Also ICE on trunk, compiler explorer:https://godbolt.org/z/soaoeW5z7*******************************************************************************
+
+- User: Andrew Pinski | Time: 2024-06-11 04:05:02 UTC
+  Text: Reduced testcase that ICEs on all targets:
+```
+ _Complex float fcs() {
+  _Complex float r;
+  __asm__(""  : "=X" (__imag__ r)  );
+  return r;
+ } 
+```
+
+Looks like this has been ICEing for a while with checking enabled.
+
+- User: Richard Biener | Time: 2024-06-11 09:51:09 UTC
+  Text: Mine (into-SSA is broken it seems)
+
+- User: Richard Biener | Time: 2024-06-11 11:07:31 UTC
+  Text: I think this is a gimplification failure.  'r' is neither TREE_ADDRESSABLE
+nor DECL_NOT_GIMPLE_REG and the =X constraint results in both allow_reg
+and allow_mem but we gimplify it as is_gimple_lvalue which should,
+as the base is a gimple register, emit a component extract to pre_p and
+a complex build to post_p.
+
+gimplify_compound_lval correctly sees this and forces a register argument
+to the __imag operation but I'm not sure that's enough for lvalues.
+IIRC a simple
+
+ __imag x = 1;
+
+also doesn't have DECL_NOT_GIMPLE_REG on 'x', and gimplify_compound_lval
+behaves the same.  Still we eventually gimplify to
+
+  _1 = REALPART_EXPR <x>;
+  x = COMPLEX_EXPR <_1, 1.0e+0>;
+  D.2772 = x;
+
+which is done via gimplify_modify_expr_complex_part.  That suggests
+it's gimplify_asm_expr that would need to do this very same thing as we
+seem to rely on this for correctness.
+
+With "=r" we correctly gimplify to
+
+  __asm__("" : "=r" D.2772);
+  _1 = REALPART_EXPR <r>;
+  r = COMPLEX_EXPR <_1, D.2772>;
+  D.2773 = r;
+
+- User: GCC Commits | Time: 2024-07-04 06:58:12 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:a4bbdec2be1c9f8fb49276b8a54ee86024ceac17commitr15-1837-ga4bbdec2be1c9f8fb49276b8a54ee86024ceac17Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Jun 11 13:11:08 2024 +0200
+
+    middle-end/115426 - wrong gimplification of "rm" asm output operand
+    
+    When the operand is gimplified to an extract of a register or a
+    register we have to disallow memory as we otherwise fail to
+    gimplify it properly.  Instead of
+    
+      __asm__("" : "=rm" __imag <r>);
+    
+    we want
+    
+      __asm__("" : "=rm" D.2772);
+      _1 = REALPART_EXPR <r>;
+      r = COMPLEX_EXPR <_1, D.2772>;
+    
+    otherwise SSA rewrite will fail and generate wrong code with 'r'
+    left bare in the asm output.PR middle-end/115426* gimplify.cc (gimplify_asm_expr): Handle "rm" output
+            constraint gimplified to a register (operation).
+    
+            * gcc.dg/pr115426.c: New testcase.
+
+- User: Richard Biener | Time: 2024-07-04 06:59:58 UTC
+  Text: Fixed on trunk sofar (I think the final testcases are valid).
+
+- User: GCC Commits | Time: 2024-09-18 09:31:23 UTC
+  Text: The releases/gcc-14 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:5b264a4b95b8f27c3c73892892d5c2030d3c8ea7commitr14-10685-g5b264a4b95b8f27c3c73892892d5c2030d3c8ea7Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Jun 11 13:11:08 2024 +0200
+
+    middle-end/115426 - wrong gimplification of "rm" asm output operand
+    
+    When the operand is gimplified to an extract of a register or a
+    register we have to disallow memory as we otherwise fail to
+    gimplify it properly.  Instead of
+    
+      __asm__("" : "=rm" __imag <r>);
+    
+    we want
+    
+      __asm__("" : "=rm" D.2772);
+      _1 = REALPART_EXPR <r>;
+      r = COMPLEX_EXPR <_1, D.2772>;
+    
+    otherwise SSA rewrite will fail and generate wrong code with 'r'
+    left bare in the asm output.PR middle-end/115426* gimplify.cc (gimplify_asm_expr): Handle "rm" output
+            constraint gimplified to a register (operation).
+    
+            * gcc.dg/pr115426.c: New testcase.
+    
+    (cherry picked from commit a4bbdec2be1c9f8fb49276b8a54ee86024ceac17)
+
+- User: Richard Biener | Time: 2024-09-18 09:38:16 UTC
+  Text: Fixed for GCC 14, not backporting further (the testcase looks artificially generated, not from real-world code).
+

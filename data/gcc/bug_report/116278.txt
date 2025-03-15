@@ -1,0 +1,187 @@
+Bug Summary: [15] RISC-V: Miscompile at -O2 -fwrapv -fno-strict-aliasing
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 15.0
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-08-08 00:46:31 UTC
+  Text: Testcase:
+signed char b[1];
+int c;
+signed char *d = b;
+int main() {
+  b[0] = -40;
+  c = ({ (unsigned short)d[0] < 0xFFF6 ? (unsigned short)d[0] : 0xFFF6; }) + 9;
+  __builtin_printf("%d\n", c);
+}
+
+Commands:> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -O2 -fwrapv -fno-strict-aliasing red.c -o red.out
+> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/qemu-riscv64 red.out65535> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -O1 -fwrapv -fno-strict-aliasing red.c -o red.out
+> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/qemu-riscv64 red.out65505
+
+Found via fuzzer
+
+- User: Andrew Pinski | Time: 2024-08-08 01:01:21 UTC
+  Text: This might be a SAT_ADD issue.
+
+- User: Kito Cheng | Time: 2024-08-08 01:17:50 UTC
+  Text: Hi Pan, could you take a look to see if it related to SAT_ADD?
+
+- User: Li Pan | Time: 2024-08-08 01:21:03 UTC
+  Text: (In reply to Kito Cheng fromcomment #2)> Hi Pan, could you take a look to see if it related to SAT_ADD?Ack, thanks.
+
+- User: Andrew Pinski | Time: 2024-08-08 01:21:57 UTC
+  Text: lb      a1,0(a5) // load -40
+        lui     a0,%hi(.LC0)
+        lui     a4,%hi(c)
+        addi    a5,a1,9 //a5 = -31
+        slli    a5,a5,48 
+        srli    a5,a5,48 // a5 = -31
+        sltu    a1,a5,a1 // -31 <u -40 ? false
+        neg     a1,a1 // 0
+        or      a1,a1,a5 // -31
+        slli    a1,a1,48
+        srli    a1,a1,48
+
+I don't see anything wrong here ... Unless I missed something (is lb a signed load byte?)
+
+- User: Li Pan | Time: 2024-08-08 01:42:46 UTC
+  Text: Reproduced from both qemu and hardware, let me take a look.
+
+- User: Li Pan | Time: 2024-08-08 02:13:57 UTC
+  Text: (In reply to Andrew Pinski fromcomment #4)>         lb      a1,0(a5) // load -40
+>         lui     a0,%hi(.LC0)
+>         lui     a4,%hi(c)
+>         addi    a5,a1,9 //a5 = -31
+>         slli    a5,a5,48 
+>         srli    a5,a5,48 // a5 = -31
+>         sltu    a1,a5,a1 // -31 <u -40 ? false
+>         neg     a1,a1 // 0
+>         or      a1,a1,a5 // -31
+>         slli    a1,a1,48
+>         srli    a1,a1,48
+> 
+> I don't see anything wrong here ... Unless I missed something (is lb a
+> signed load byte?)I think the problem comes from the lb side
+
+     0x1014c <main+16>               lb      a1,0(a5)  // a1 is -40, aka 0xffffffffffffffd8                                                                                                                                                       ││   0x10150 <main+20>               lui     a0,0x1a                                                                                                                                                             ││   0x10152 <main+22>               addi    a5,a1,9                                                                                                                                                             ││   0x10156 <main+26>               slli    a5,a5,0x30                                                                                                                                                          ││   0x10158 <main+28>               srli    a5,a5,0x30 // a5 is 65505                                                                                                                                                          ││  >0x1015a <main+30>               sltu    a1,a5,a1   // compare 65505 and 0xffffffffffffffd8 => TRUE, and then get max 65535.
+
+It should be one backend code-gen issue, will take care of this.
+
+- User: Li Pan | Time: 2024-08-08 02:30:34 UTC
+  Text: The backend take 
+rtx xmode_x = gen_lowpart (Xmode, x);
+
+For the incoming op of .SAT_ADD, thus I think we should take lbu instead of lb according to the ISA.
+
+- User: Li Pan | Time: 2024-08-08 03:19:01 UTC
+  Text: (In reply to Li Pan fromcomment #7)> The backend take 
+> rtx xmode_x = gen_lowpart (Xmode, x);
+> 
+> For the incoming op of .SAT_ADD, thus I think we should take lbu instead of
+> lb according to the ISA.During usadd expanding the mode is HI instead of QI, thus we need zero_extend for non-Xmodes, will prepare the fix soon.
+
+- User: GCC Commits | Time: 2024-08-18 01:28:33 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:e8f31f4f58f0fcf1716fc1d9ee003fbcdda600c3commitr15-2979-ge8f31f4f58f0fcf1716fc1d9ee003fbcdda600c3Author: Pan Li <pan2.li@intel.com>
+Date:   Fri Aug 9 10:26:32 2024 +0800
+
+    RISC-V: Make sure high bits of usadd operands is clean for non-Xmode [PR116278]
+    
+    For QI/HImode of .SAT_ADD,  the operands may be sign-extended and the
+    high bits of Xmode may be all 1 which is not expected.  For example as
+    below code.
+    
+    signed char b[1];
+    unsigned short c;
+    signed char *d = b;
+    int main() {
+      b[0] = -40;
+      c = ({ (unsigned short)d[0] < 0xFFF6 ? (unsigned short)d[0] : 0xFFF6; }) + 9;
+      __builtin_printf("%d\n", c);
+    }
+    
+    After expanding we have:
+    
+    ;; _6 = .SAT_ADD (_3, 9);
+    (insn 8 7 9 (set (reg:DI 143)
+            (high:DI (symbol_ref:DI ("d") [flags 0x86]  <var_decl d>)))
+         (nil))
+    (insn 9 8 10 (set (reg/f:DI 142)
+            (mem/f/c:DI (lo_sum:DI (reg:DI 143)
+                    (symbol_ref:DI ("d") [flags 0x86]  <var_decl d>)) [1 d+0 S8 A64]))
+         (nil))
+    (insn 10 9 11 (set (reg:HI 144 [ _3 ])
+            (sign_extend:HI (mem:QI (reg/f:DI 142) [0 *d.0_1+0 S1 A8]))) "test.c":7:10 -1
+         (nil))
+    
+    The convert from signed char to unsigned short will have sign_extend rtl
+    as above.  And finally become the lb insn as below:
+    
+    lb      a1,0(a5)   // a1 is -40, aka 0xffffffffffffffd8
+    lui     a0,0x1a
+    addi    a5,a1,9
+    slli    a5,a5,0x30
+    srli    a5,a5,0x30 // a5 is 65505
+    sltu    a1,a5,a1   // compare 65505 and 0xffffffffffffffd8 => TRUE
+    
+    The sltu try to compare 65505 and 0xffffffffffffffd8 here,  but we
+    actually want to compare 65505 and 65496 (0xffd8).  Thus we need to
+    clean up the high bits to ensure this.
+    
+    The below test suites are passed for this patch:
+    * The rv64gcv fully regression test.PR target/116278gcc/ChangeLog:
+    
+            * config/riscv/riscv.cc (riscv_gen_zero_extend_rtx): Add new
+            func impl to zero extend rtx.
+            (riscv_expand_usadd): Leverage above func to cleanup operands 0
+            and remove the special handing for SImode in RV64.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/sat_u_add-11.c: Adjust asm check body.
+            * gcc.target/riscv/sat_u_add-15.c: Ditto.
+            * gcc.target/riscv/sat_u_add-19.c: Ditto.
+            * gcc.target/riscv/sat_u_add-23.c: Ditto.
+            * gcc.target/riscv/sat_u_add-3.c: Ditto.
+            * gcc.target/riscv/sat_u_add-7.c: Ditto.
+            * gcc.target/riscv/sat_u_add_imm-11.c: Ditto.
+            * gcc.target/riscv/sat_u_add_imm-15.c: Ditto.
+            * gcc.target/riscv/sat_u_add_imm-3.c: Ditto.
+            * gcc.target/riscv/sat_u_add_imm-7.c: Ditto.
+            * gcc.target/riscv/pr116278-run-1.c: New test.
+            * gcc.target/riscv/pr116278-run-2.c: New test.
+    
+    Signed-off-by: Pan Li <pan2.li@intel.com>
+
+- User: Sam James | Time: 2024-08-18 03:49:44 UTC
+  Text: I would suggest makingpr116278-run-{1,2}.c generic torture tests (outside of riscv) but having either a scan assembler directive just on riscv, or a separate copy of the test in riscv/ for the assembly check.
+
+- User: Li Pan | Time: 2024-08-18 04:12:53 UTC
+  Text: Thanks for suggestion, will move run test to gcc/testsuite/gcc.c-torture/execute and only leave asm check under riscv.
+
+- User: Sam James | Time: 2024-08-18 05:32:02 UTC
+  Text: Thank you!
+
+- User: GCC Commits | Time: 2024-08-28 08:09:02 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:3178786c88761e47b3cbe700a97a0de2b6e133cbcommitr15-3244-g3178786c88761e47b3cbe700a97a0de2b6e133cbAuthor: Pan Li <pan2.li@intel.com>
+Date:   Mon Aug 19 10:02:46 2024 +0800
+
+    Test: Movepr116278run test to dg/torture [NFC]
+    
+    Move the run test ofpr116278to dg/torture and leave the risc-v the
+    asm check under risc-v part.PR target/116278gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/pr116278-run-1.c: Take compile instead of run.
+            * gcc.target/riscv/pr116278-run-2.c: Ditto.
+            * gcc.dg/torture/pr116278-run-1.c: New test.
+            * gcc.dg/torture/pr116278-run-2.c: New test.
+    
+    Signed-off-by: Pan Li <pan2.li@intel.com>
+
+- User: Jeffrey A. Law | Time: 2024-09-02 04:43:01 UTC
+  Text: Should be fixed on the trunk now.
+

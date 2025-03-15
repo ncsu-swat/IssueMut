@@ -1,0 +1,303 @@
+Bug Summary: [11/12/13/14 Regression] Missing vzeroupper insert
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Hongtao Liu | Time: 2023-12-07 00:59:22 UTC
+  Text: #include<math.h>
+void
+__attribute__((noinline))
+bar (double* a)
+{
+    a[0] = 1.0;
+    a[1] = 2.0;
+}
+
+void
+__attribute__((noinline))
+foo (double* __restrict a, double* b)
+{
+    a[0] += b[0];
+    a[1] += b[1];
+    a[2] += b[2];
+    a[3] += b[3];
+    bar (b);
+}
+
+double
+foo1 (double* __restrict a, double* b)
+{
+    foo (a, b);
+    return exp (b[1]);
+}
+
+
+gcc -O3 -mavx2 Got
+
+bar(double*):
+        vmovapd xmm0, XMMWORD PTR .LC0[rip]
+        vmovupd XMMWORD PTR [rdi], xmm0
+        ret
+foo(double*, double*):
+        mov     rax, rdi
+        vmovupd ymm0, YMMWORD PTR [rsi]
+        mov     rdi, rsi
+        vaddpd  ymm0, ymm0, YMMWORD PTR [rax]
+        vmovupd YMMWORD PTR [rax], ymm0
+        jmp     bar(double*)
+foo1(double*, double*):
+        sub     rsp, 8
+        call    foo(double*, double*)
+        vmovsd  xmm0, QWORD PTR [rsi+8]
+        add     rsp, 8
+        jmp     exp
+.LC0:
+        .long   0
+        .long   1072693248
+        .long   0
+        .long   1073741824
+
+In foo, 256-bit ymm are used, and the upper bits are dirty, but there's no vzeroupper inserted by exp which cause big avx->sse transition penalty.
+
+- User: Hongtao Liu | Time: 2023-12-07 01:10:55 UTC
+  Text: Aaused byr10-3477-g2a2e3a0dfcbe08, Can be fixed by revert the patch.
+
+--- a/gcc/config/i386/i386.cc
++++ b/gcc/config/i386/i386.cc
+@@ -15032,14 +15032,7 @@ ix86_avx_u128_mode_needed (rtx_insn *insn)
+       if (avx_upper_reg_found)
+        return AVX_U128_DIRTY;
+
+-      /* If the function is known to preserve some SSE registers,
+-        RA and previous passes can legitimately rely on that for
+-        modes wider than 256 bits.  It's only safe to issue a
+-        vzeroupper if all SSE registers are clobbered.  */
+-      const function_abi &abi = insn_callee_abi (insn);
+-      if (vzeroupper_pattern (PATTERN (insn), VOIDmode)
+-         || !hard_reg_set_subset_p (reg_class_contents[SSE_REGS],
+-                                    abi.mode_clobbers (V4DImode)))
++      if (vzeroupper_pattern (PATTERN (insn), VOIDmode))
+        return AVX_U128_ANY;
+
+       return AVX_U128_CLEAN;
+
+
+It looks like abi.mode_clobbers is not equal to there's ymm/zmm live through the callee, it just means callee doens't need to clobber those registers according to RA. So when there's no 256/512-bit registers live through the callee there're would be some mistake for the mode. since ix86_avx_u128_mode_after will return AVX_U128_CLEAN is there's no 256/512-bit registers are returned, but actaully it 's still dirty for upper bits since there's no vzeroupper inserted.
+
+- User: Hongtao Liu | Time: 2023-12-07 05:04:27 UTC
+  Text: (In reply to Hongtao Liu fromcomment #1)> Aaused byr10-3477-g2a2e3a0dfcbe08, Can be fixed by revert the patch.
+> 
+> --- a/gcc/config/i386/i386.cc
+> +++ b/gcc/config/i386/i386.cc
+> @@ -15032,14 +15032,7 @@ ix86_avx_u128_mode_needed (rtx_insn *insn)
+>        if (avx_upper_reg_found)
+>         return AVX_U128_DIRTY;
+> 
+> -      /* If the function is known to preserve some SSE registers,
+> -        RA and previous passes can legitimately rely on that for
+> -        modes wider than 256 bits.  It's only safe to issue a
+> -        vzeroupper if all SSE registers are clobbered.  */
+> -      const function_abi &abi = insn_callee_abi (insn);
+> -      if (vzeroupper_pattern (PATTERN (insn), VOIDmode)
+> -         || !hard_reg_set_subset_p (reg_class_contents[SSE_REGS],
+> -                                    abi.mode_clobbers (V4DImode)))
+> +      if (vzeroupper_pattern (PATTERN (insn), VOIDmode))
+>         return AVX_U128_ANY;
+> 
+>        return AVX_U128_CLEAN;Remove this regressed many testcases
+
+So it looks like we need to handle ix86_avx_u128_mode_after 
+
+--- a/gcc/config/i386/i386.cc
++++ b/gcc/config/i386/i386.cc
+@@ -15177,7 +15177,14 @@ ix86_avx_u128_mode_after (int mode, rtx_insn *insn)
+       bool avx_upper_reg_found = false;
+       note_stores (insn, ix86_check_avx_upper_stores, &avx_upper_reg_found);
+
+-      return avx_upper_reg_found ? AVX_U128_DIRTY : AVX_U128_CLEAN;
++      if (avx_upper_reg_found)
++       return AVX_U128_DIRTY;
++
++      const function_abi &abi = insn_callee_abi (insn);
++      if (!hard_reg_set_subset_p (reg_class_contents[SSE_REGS],
++                                 abi.mode_clobbers (V4DImode)))
++       return AVX_U128_ANY;
++      return  AVX_U128_CLEAN;
+     }
+
+- User: Hongtao Liu | Time: 2023-12-07 06:13:50 UTC
+  Text: (In reply to Hongtao Liu fromcomment #2)> (In reply to Hongtao Liu fromcomment #1)
+> > Aaused byr10-3477-g2a2e3a0dfcbe08, Can be fixed by revert the patch.
+> > 
+> > --- a/gcc/config/i386/i386.cc
+> > +++ b/gcc/config/i386/i386.cc
+> > @@ -15032,14 +15032,7 @@ ix86_avx_u128_mode_needed (rtx_insn *insn)
+> >        if (avx_upper_reg_found)
+> >         return AVX_U128_DIRTY;
+> > 
+> > -      /* If the function is known to preserve some SSE registers,
+> > -        RA and previous passes can legitimately rely on that for
+> > -        modes wider than 256 bits.  It's only safe to issue a
+> > -        vzeroupper if all SSE registers are clobbered.  */
+> > -      const function_abi &abi = insn_callee_abi (insn);
+> > -      if (vzeroupper_pattern (PATTERN (insn), VOIDmode)
+> > -         || !hard_reg_set_subset_p (reg_class_contents[SSE_REGS],
+> > -                                    abi.mode_clobbers (V4DImode)))
+> > +      if (vzeroupper_pattern (PATTERN (insn), VOIDmode))
+> >         return AVX_U128_ANY;
+> > 
+> >        return AVX_U128_CLEAN;
+> Remove this regressed many testcases
+> 
+> So it looks like we need to handle ix86_avx_u128_mode_after 
+> 
+> --- a/gcc/config/i386/i386.cc
+> +++ b/gcc/config/i386/i386.cc
+> @@ -15177,7 +15177,14 @@ ix86_avx_u128_mode_after (int mode, rtx_insn *insn)
+>        bool avx_upper_reg_found = false;
+>        note_stores (insn, ix86_check_avx_upper_stores, &avx_upper_reg_found);
+> 
+> -      return avx_upper_reg_found ? AVX_U128_DIRTY : AVX_U128_CLEAN;
+> +      if (avx_upper_reg_found)
+> +       return AVX_U128_DIRTY;
+> +
+> +      const function_abi &abi = insn_callee_abi (insn);
+> +      if (!hard_reg_set_subset_p (reg_class_contents[SSE_REGS],
+> +                                 abi.mode_clobbers (V4DImode)))
+> +       return AVX_U128_ANY;
+> +      return  AVX_U128_CLEAN;
+>      }Also for sibcall, we should return AVX_U128_CLEAN for ix86_avx_u128_mode_needed.
+
+- User: Richard Sandiford | Time: 2023-12-07 17:00:27 UTC
+  Text: (In reply to Hongtao Liu fromcomment #2)> So it looks like we need to handle ix86_avx_u128_mode_after 
+> 
+> --- a/gcc/config/i386/i386.cc
+> +++ b/gcc/config/i386/i386.cc
+> @@ -15177,7 +15177,14 @@ ix86_avx_u128_mode_after (int mode, rtx_insn *insn)
+>        bool avx_upper_reg_found = false;
+>        note_stores (insn, ix86_check_avx_upper_stores, &avx_upper_reg_found);
+> 
+> -      return avx_upper_reg_found ? AVX_U128_DIRTY : AVX_U128_CLEAN;
+> +      if (avx_upper_reg_found)
+> +       return AVX_U128_DIRTY;
+> +
+> +      const function_abi &abi = insn_callee_abi (insn);
+> +      if (!hard_reg_set_subset_p (reg_class_contents[SSE_REGS],
+> +                                 abi.mode_clobbers (V4DImode)))
+> +       return AVX_U128_ANY;
+> +      return  AVX_U128_CLEAN;
+>      }It's a long time since I looked at this code, but this looks correct
+to me FWIW.
+
+- User: GCC Commits | Time: 2023-12-12 05:24:39 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:fc62716fe8d1d60a9f1c6906e5a4845b3331b828commitr14-6447-gfc62716fe8d1d60a9f1c6906e5a4845b3331b828Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Dec 7 09:17:27 2023 +0800
+
+    Don't assume it's AVX_U128_CLEAN after call_insn whose abi.mode_clobber(V4DImode) deosn't contains all SSE_REGS.
+    
+    If the function desn't clobber any sse registers or only clobber
+    128-bit part, then vzeroupper isn't issued before the function exit.
+    the status not CLEAN but ANY after the function.
+    
+    Also for sibling_call, it's safe to issue an vzeroupper. Also there
+    could be missing vzeroupper since there's no mode_exit for
+    sibling_call_p.
+    
+    gcc/ChangeLog:PR target/112891* config/i386/i386.cc (ix86_avx_u128_mode_after): Return
+            AVX_U128_ANY if callee_abi doesn't clobber all_sse_regs to
+            align with ix86_avx_u128_mode_needed.
+            (ix86_avx_u128_mode_needed): Return AVX_U128_ClEAN for
+            sibling_call.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr112891.c: New test.
+            * gcc.target/i386/pr112891-2.c: New test.
+
+- User: GCC Commits | Time: 2023-12-12 10:48:19 UTC
+  Text: The releases/gcc-13 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:d3e140ac549a2117e82dac51f2e739b20f9c7941commitr13-8149-gd3e140ac549a2117e82dac51f2e739b20f9c7941Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Dec 7 09:17:27 2023 +0800
+
+    Don't assume it's AVX_U128_CLEAN after call_insn whose abi.mode_clobber(V4DImode) deosn't contains all SSE_REGS.
+    
+    If the function desn't clobber any sse registers or only clobber
+    128-bit part, then vzeroupper isn't issued before the function exit.
+    the status not CLEAN but ANY after the function.
+    
+    Also for sibling_call, it's safe to issue an vzeroupper. Also there
+    could be missing vzeroupper since there's no mode_exit for
+    sibling_call_p.
+    
+    gcc/ChangeLog:PR target/112891* config/i386/i386.cc (ix86_avx_u128_mode_after): Return
+            AVX_U128_ANY if callee_abi doesn't clobber all_sse_regs to
+            align with ix86_avx_u128_mode_needed.
+            (ix86_avx_u128_mode_needed): Return AVX_U128_ClEAN for
+            sibling_call.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr112891.c: New test.
+            * gcc.target/i386/pr112891-2.c: New test.
+
+- User: GCC Commits | Time: 2023-12-12 10:48:53 UTC
+  Text: The releases/gcc-12 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:2dc102c030093ab2abb69f6d991c6a43bf6f0201commitr12-10037-g2dc102c030093ab2abb69f6d991c6a43bf6f0201Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Dec 7 09:17:27 2023 +0800
+
+    Don't assume it's AVX_U128_CLEAN after call_insn whose abi.mode_clobber(V4DImode) deosn't contains all SSE_REGS.
+    
+    If the function desn't clobber any sse registers or only clobber
+    128-bit part, then vzeroupper isn't issued before the function exit.
+    the status not CLEAN but ANY after the function.
+    
+    Also for sibling_call, it's safe to issue an vzeroupper. Also there
+    could be missing vzeroupper since there's no mode_exit for
+    sibling_call_p.
+    
+    gcc/ChangeLog:PR target/112891* config/i386/i386.cc (ix86_avx_u128_mode_after): Return
+            AVX_U128_ANY if callee_abi doesn't clobber all_sse_regs to
+            align with ix86_avx_u128_mode_needed.
+            (ix86_avx_u128_mode_needed): Return AVX_U128_ClEAN for
+            sibling_call.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr112891.c: New test.
+            * gcc.target/i386/pr112891-2.c: New test.
+    
+    (cherry picked from commit fc189a08f5b7ad5889bd4c6b320c1dd99dd5d642)
+
+- User: GCC Commits | Time: 2023-12-12 10:49:43 UTC
+  Text: The releases/gcc-11 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:172b7ad97c46594d44aeb73dce03daff5f575cfbcommitr11-11135-g172b7ad97c46594d44aeb73dce03daff5f575cfbAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Dec 7 09:17:27 2023 +0800
+
+    Don't assume it's AVX_U128_CLEAN after call_insn whose abi.mode_clobber(V4DImode) deosn't contains all SSE_REGS.
+    
+    If the function desn't clobber any sse registers or only clobber
+    128-bit part, then vzeroupper isn't issued before the function exit.
+    the status not CLEAN but ANY after the function.
+    
+    Also for sibling_call, it's safe to issue an vzeroupper. Also there
+    could be missing vzeroupper since there's no mode_exit for
+    sibling_call_p.
+    
+    gcc/ChangeLog:PR target/112891* config/i386/i386.c (ix86_avx_u128_mode_after): Return
+            AVX_U128_ANY if callee_abi doesn't clobber all_sse_regs to
+            align with ix86_avx_u128_mode_needed.
+            (ix86_avx_u128_mode_needed): Return AVX_U128_ClEAN for
+            sibling_call.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr112891.c: New test.
+            * gcc.target/i386/pr112891-2.c: New test.
+    
+    (cherry picked from commit fc189a08f5b7ad5889bd4c6b320c1dd99dd5d642)
+
+- User: Hongtao Liu | Time: 2023-12-12 10:50:28 UTC
+  Text: Fixed everywhere.
+

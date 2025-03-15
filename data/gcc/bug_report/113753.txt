@@ -1,0 +1,165 @@
+Bug Summary: wrong code with _BitInt(129) multiplication and division at -O2
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-02-04 07:32:36 UTC
+  Text: Createdattachment 57316[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -O2 testcase.c
+$ ./a.out 
+Aborted
+
+The result of "u * m" does not fit into unsigned _BitInt(129), but at -O2, 'm' is returned.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-8779-20240203093135-gd436e8e70da-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-8779-20240203093135-gd436e8e70da-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240203 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2024-02-05 14:53:42 UTC
+  Text: I see 2 issues.
+One is a wide-int.cc bug, where VRP calls operator_mult::overflow_free_p on
+unsigned _BitInt(129) [0, 340282366920938463463374607431768211454]
+and
+unsigned _BitInt(129) [0, 4294967295]
+and incorrectly says that it is overflow free, that is not the case,
+((unsigned _BitInt(129)) 0xfffffffffffffffffffffffffffffffeuwb) * 0x00000000ffffffffuwb
+is
+0xfffffffefffffffffffffffffffffffe00000002uwb and that surely doesn't fit into 129 bits, the above shifted right by 129 gives 0x7fffffff.
+Now, mul_internal seems to compute the right value:
+x/12wx r
+0x7fffffffa800:	0x00000002	0xfffffffe	0xffffffff	0xffffffff
+0x7fffffffa810:	0xfffffffe	0x00000000	0x00000000	0x00000000
+0x7fffffffa820:	0x00000000	0x00000000	0x00000000	0x00000000
+where half_blocks_needed is 6.
+The problem is that the needs_overflow code just looks at the half limbs from
+half_blocks_needed to half_blocks_needed * 2, which is fine for precisions which are multiple of 64 (HOST_BITS_PER_WIDE_INT), or for precisions <= 32 (HOST_BITS_PER_HALF_WIDE_INT) for which we use different code, the
+  /* If we need to check for overflow, we can only do half wide
+     multiplies quickly because we need to look at the top bits to
+     check for the overflow.  */
+stuff.
+
+And another issue (not relevant to x86_64 or aarch64, but probably to arm) is that
+__mulbitint3 doesn't doesn't actually try to extend the most significant limb if there is an overflow, so on the testcase with -O0 we end up with the most significant of the 3 limbs being 3 even when it is unsigned 129 precision.  That needs to be 1 if the ABI doesn't say the upper bits beyond precision are unspecified.
+Now, we could do that extension either only on the affected arches in __mulbitint3 caller, or in libgcc unconditionally, or in libgcc only for affected targets.
+
+- User: Jakub Jelinek | Time: 2024-02-05 17:52:26 UTC
+  Text: Createdattachment 57327[details]gcc14-pr113753.patch
+
+Untested fix.
+
+- User: Jakub Jelinek | Time: 2024-02-06 09:56:59 UTC
+  Text: Createdattachment 57337[details]gcc14-pr113753.patch
+
+Updated patch.
+
+- User: GCC Commits | Time: 2024-02-07 08:45:51 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d755a82079d61783eb0a573b0c74024d29359e4ccommitr14-8835-gd755a82079d61783eb0a573b0c74024d29359e4cAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Feb 7 09:44:33 2024 +0100
+
+    wide-int: Fix mul_internal overflow handling [PR113753]
+    
+    As the following testcases show, the overflow (needs_overflow) and high
+    handling in wi::mul_internal seem to only work correctly for either
+    small precisions (less than or equal to 32, that is handled by earlier
+    simpler code, not the full Knuth's multiplication algorithm) or for
+    precisions which are multiple of HOST_BITS_PER_WIDE_INT, so it happened
+    to work fine in most pre-_BitInt era types (and for large bitfields we
+    probably didn't have good coverage or were lucky and nothing was asking
+    if there was overflow or not; I think high multiplication is typically
+    used only when we have optab in corresponding mode).
+    E.g. on the gcc.dg/bitint-87.c testcase, there were overflow warnings
+    emitted only the the / 2wb * 3wb _BitInt(128) cases, but not in the
+    other precisions.
+    
+    I found 3 issues when prec > HOST_BITS_PER_HALF_WIDE_INT and
+    (prec % HOST_BITS_PER_WIDE_INT) != 0:
+    1) the checking for overflow was simply checking the values of the
+       r array members from half_blocks_needed to 2 * half_blocks_needed - 1,
+       for UNSIGNED overflow checking if any of them is non-zero, for
+       SIGNED comparing them if any is different from top where top is computed
+       from the sign bit of the result (see below); similarly, the highpart
+       multiplication simply picks the half limbs at r + half_blocks_needed
+       offset; and furthermore, for SIGNED there is an adjustment if either
+       operand was negative which also just walks r half-limbs from
+       half_blocks_needed onwards;
+       this works great for precisions like 64 or 128, but for precisions like
+       129, 159, 160 or 161 doesn't, it would need to walk the bits in the
+       half-limbs starting right above the most significant bit of the base
+       precision; that can be up to a whole half-limb and all but one bit from
+       the one below it earlier
+    2) as the comment says, the multiplication is originally done as unsigned
+       multiplication, with adjustment of the high bits which subtracts the
+       other operand once:
+          if (wi::neg_p (op1))
+            {
+              b = 0;
+              for (i = 0; i < half_blocks_needed; i++)
+                {
+                  t = (unsigned HOST_WIDE_INT)r[i + half_blocks_needed]
+                    - (unsigned HOST_WIDE_INT)v[i] - b;
+                  r[i + half_blocks_needed] = t & HALF_INT_MASK;
+                  b = t >> (HOST_BITS_PER_WIDE_INT - 1);
+                }
+            }
+       and similarly for the other one.  Now, this also only works nicely if
+       a negative operand has just a single sign bit set in the given precision;
+       but we were unpacking the operands with wi_unpack (..., SIGNED);, so
+       say for the negative operand in 129-bit precision, that means the least
+       significant bit of u[half_blocks_needed - 2] (or v instead of u depending
+       on which argument it is) is the set sign bit, but then there are 31
+       further copies of the sign bit in u[half_blocks_needed - 2] and
+       further 32 copies in u[half_blocks_needed - 1]; the above adjustment
+       for signed operands doesn't really do the right job in such cases, it
+       would need to subtract many more times the other operand
+    3) the computation of top for SIGNED
+              top = r[(half_blocks_needed) - 1];
+              top = SIGN_MASK (top << (HOST_BITS_PER_WIDE_INT / 2));
+              top &= mask;
+       also uses the most significant bit which fits into prec of the result
+       only if prec is multiple of HOST_BITS_PER_WIDE_INT, otherwise we need
+       to look at a different bit and sometimes it can be also a bit in
+       r[half_blocks_needed - 2]
+    
+    For 1), while for UNSIGNED overflow it could be fairly easy to check
+    the bits above prec in r half-limbs for being non-zero, doing all the
+    shifts also in the SIGNED adjustment code in 2 further locations and finally
+    for the high handling (unless we want to assert one doesn't do the highpart
+    multiply for such precisions) would be quite ugly and hard to maintain, so
+    I instead chose (implemented in the second hunk) to shift the
+    beyond-precision bits up such that the expectations of the rest of the
+    code are met, that is the LSB of r[half_blocks_needed] after adjustment
+    is the bit immediately above the precision, etc.  We don't need to care
+    about the bits it shifts out, because the multiplication will yield at most
+    2 * prec bits.
+    
+    For 2), the patch changes the wi_unpack argument from SIGNED to UNSIGNED,
+    so that we get all zero bits above the precision.
+    
+    And finally for 3) it does shifts and perhaps picks lower r half-limb so
+    that it uses the actual MSB of the result within prec.
+    
+    2024-02-07  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113753* wide-int.cc (wi::mul_internal): Unpack op1val and op2val with
+            UNSIGNED rather than SIGNED.  If high or needs_overflow and prec is
+            not a multiple of HOST_BITS_PER_WIDE_INT, shift left bits above prec
+            so that they start with r[half_blocks_needed] lowest bit.  Fix up
+            computation of top mask for SIGNED.
+    
+            * gcc.dg/torture/bitint-56.c: New test.
+            * gcc.dg/bitint-87.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-07 08:57:29 UTC
+  Text: Should be fixed now.
+

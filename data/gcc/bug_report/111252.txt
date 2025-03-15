@@ -1,0 +1,122 @@
+Bug Summary: LoongArch: Suboptimal code for (a & ~mask) | (b & mask) where mask is a constant with value ((1 << n) - 1) << m
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Xi Ruoyao | Time: 2023-08-31 04:31:18 UTC
+  Text: int test(int a, int b)
+{
+  return (a & ~0x10) | (b & 0x10);
+}
+
+compiles to:
+
+	addi.w	$r12,$r0,-17			# 0xffffffffffffffef
+	and	$r12,$r12,$r4
+	andi	$r5,$r5,16
+	or	$r12,$r12,$r5
+	slli.w	$r4,$r12,0
+	jr	$r1
+
+It should be improved:
+
+bstrpick.w $r4, $r4, 4, 4
+bstrins.w  $r5, $r4, 4, 4
+or         $r5, $r4, $r0
+
+- User: Xi Ruoyao | Time: 2023-08-31 04:33:39 UTC
+  Text: In particular this issue causes the compiler to compile __builtin_copysignf128 into very stupid code.
+
+- User: Andrew Pinski | Time: 2023-08-31 04:42:21 UTC
+  Text: Interesting:
+int test(int a, int b)
+{
+  return (a & ~0x80000000) | (b & 0x80000000);
+}
+
+Produces better code:
+        lu12i.w $r12,-2147483648>>12                  # 0xffffffff80000000
+        and     $r12,$r12,$r5
+        bstrpick.w      $r4,$r4,30,0
+        or      $r4,$r4,$r12
+        slli.w  $r4,$r4,0
+        jr      $r1
+
+
+But note the expansion of __builtin_copysignf128 should be using extract_bit_field and friends to extract the bit and do the insertation. I have not looked into that yet though.
+
+- User: Andrew Pinski | Time: 2023-08-31 04:46:43 UTC
+  Text: The easiest fix for __builtin_copysignf128 is change expand_copysign_bit in optabs.cc to use extract_bit_field to do the extraction and store_bit_field for the insert instead of what it currently does of using ands and ors ...
+
+- User: Xi Ruoyao | Time: 2023-08-31 04:53:29 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> Interesting:
+> int test(int a, int b)
+> {
+>   return (a & ~0x80000000) | (b & 0x80000000);
+> }
+> 
+> Produces better code:
+>         lu12i.w $r12,-2147483648>>12                  # 0xffffffff80000000
+>         and     $r12,$r12,$r5
+>         bstrpick.w      $r4,$r4,30,0
+>         or      $r4,$r4,$r12
+>         slli.w  $r4,$r4,0
+>         jr      $r1Hmm, this seems a separate issue.  The compiler knows to optimize (a & mask) if mask is ((1 << a) - 1) << b iff a + b = 32 or b = 0, but not for any other masks even if it's "expensive" to materialize the mask:
+
+long test(long a, long b)
+{
+  return a & 0xfffff0000l;
+}
+
+compiles to:
+
+	lu12i.w	$r12,-65536>>12			# 0xffffffffffff0000
+	lu32i.d	$r12,0xf00000000>>32
+	and	$r4,$r4,$r12
+	jr	$r1
+
+But the following is better:
+
+bstrpick.d $r12, $r12, 35, 16
+slli.d     $r12, $r12, 16
+
+- User: Xi Ruoyao | Time: 2023-08-31 04:54:41 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #4)> Hmm, this seems a separate issue.  The compiler knows to optimize (a & mask)
+> if mask is ((1 << a) - 1) << b iff a + b = 32 or b = 0, but not for anyI mean "32 or 64".> other masks even if it's "expensive" to materialize the mask:
+
+- User: GCC Commits | Time: 2023-09-07 07:59:13 UTC
+  Text: The master branch has been updated by Xi Ruoyao <xry111@gcc.gnu.org>:https://gcc.gnu.org/g:5b857e87201335148f23ec7134cf7fbf97c04c72commitr14-3773-g5b857e87201335148f23ec7134cf7fbf97c04c72Author: Xi Ruoyao <xry111@xry111.site>
+Date:   Tue Sep 5 19:42:30 2023 +0800
+
+    LoongArch: Use bstrins instruction for (a & ~mask) and (a & mask) | (b & ~mask) [PR111252]
+    
+    If mask is a constant with value ((1 << N) - 1) << M we can perform this
+    optimization.
+    
+    gcc/ChangeLog:PR target/111252* config/loongarch/loongarch-protos.h
+            (loongarch_pre_reload_split): Declare new function.
+            (loongarch_use_bstrins_for_ior_with_mask): Likewise.
+            * config/loongarch/loongarch.cc
+            (loongarch_pre_reload_split): Implement.
+            (loongarch_use_bstrins_for_ior_with_mask): Likewise.
+            * config/loongarch/predicates.md (ins_zero_bitmask_operand):
+            New predicate.
+            * config/loongarch/loongarch.md (bstrins_<mode>_for_mask):
+            New define_insn_and_split.
+            (bstrins_<mode>_for_ior_mask): Likewise.
+            (define_peephole2): Further optimize code sequence produced by
+            bstrins_<mode>_for_ior_mask if possible.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/loongarch/bstrins-compile.C: New test.
+            * g++.target/loongarch/bstrins-run.C: New test.
+
+- User: Xi Ruoyao | Time: 2023-09-07 08:01:46 UTC
+  Text: Done.
+

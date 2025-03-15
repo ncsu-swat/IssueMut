@@ -1,0 +1,143 @@
+Bug Summary: [14 Regression] ICE in process_uses_of_deleted_def, at rtl-ssa/changes.cc:252
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code, patch
+Known to Work: 
+Known to Fail: 14.0
+
+Comments:
+- User: Jakub Jelinek | Time: 2024-01-26 10:55:16 UTC
+  Text: struct A { struct A *a; } foo ();
+struct B { long b; };
+struct C { struct B c; struct A d; } *e;
+
+void
+bar (void)
+{
+  int f;
+  struct C *g;
+  struct A *h;
+  for (g = 0, g = e ? (void *) e - (char) (__SIZE_TYPE__) &g->d : 0, h = g ? (&g->d)->a : 0; g;
+       g = 0, g = h ? (void *) h - (char) (__SIZE_TYPE__) &g->d : 0, h = h ? h->a : 0)
+    {
+      f = (int) (__SIZE_TYPE__) g;
+      foo (((struct B *) g)->b);
+    }
+}
+
+ICEs with -g -O2 on aarch64-linux:
+during RTL pass: ldp_fusion
+rh2260449.i: In function ‘bar’:
+rh2260449.i:17:1: internal compiler error: in process_uses_of_deleted_def, at rtl-ssa/changes.cc:252
+   17 | }
+      | ^
+0x2c6f609 rtl_ssa::function_info::process_uses_of_deleted_def(rtl_ssa::set_info*)
+	../../gcc/rtl-ssa/changes.cc:252
+0x2c718e1 rtl_ssa::function_info::change_insns(array_slice<rtl_ssa::insn_change*>)
+	../../gcc/rtl-ssa/changes.cc:839
+0x1dc3cbb ldp_bb_info::fuse_pair(bool, unsigned int, int, rtl_ssa::insn_info*, rtl_ssa::insn_info*, base_cand&, rtl_ssa::insn_range_info const&)
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:2063
+0x1dc539e ldp_bb_info::try_fuse_pair(bool, unsigned int, rtl_ssa::insn_info*, rtl_ssa::insn_info*)
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:2782
+0x1dc5627 ldp_bb_info::merge_pairs(std::__cxx11::list<rtl_ssa::insn_info*, std::allocator<rtl_ssa::insn_info*> >&, std::__cxx11::list<rtl_ssa::insn_info*, std::allocator<rtl_ssa::insn_info*> >&, bool, unsigned int)
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:2871
+0x1dc5816 ldp_bb_info::transform_for_base(int, access_group&)
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:2904
+0x1dc801c void ldp_bb_info::traverse_base_map<ordered_hash_map<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> >, access_group, simple_hashmap_traits<default_hash_traits<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> > >, access_group> > >(ordered_hash_map<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> >, access_group, simple_hashmap_traits<default_hash_traits<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> > >, access_group> >&)
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:2963
+0x1dc5a75 ldp_bb_info::transform()
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:2971
+0x1dc01fb ldp_fusion_bb(rtl_ssa::bb_info*)
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:3209
+0x1dc0285 ldp_fusion()
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:3218
+0x1dc0398 execute
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:3268
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: Alex Coplan | Time: 2024-01-26 10:59:20 UTC
+  Text: Confirmed, mine.
+
+- User: Alex Coplan | Time: 2024-01-26 11:47:00 UTC
+  Text: I think the problem is this loop (and others that iterate over debug
+uses in this way):
+
+      // Now that we've characterized the defs involved, go through the
+      // debug uses and determine how to update them (if needed).
+      for (auto use : set->debug_insn_uses ())
+        {
+          if (*pair_dst < *use->insn () && defs[1])
+            // We're re-ordering defs[1] above a previous use of the
+            // same resource.
+            update_debug_use (use, defs[1], writeback_pats[1]);
+          else if (*pair_dst >= *use->insn ())
+            // We're re-ordering defs[0] below its use.
+            update_debug_use (use, defs[0], writeback_pats[0]);
+        }
+
+because `update_debug_use` can remove uses from the list of debug uses,
+we can't use a for-range loop as the iterator will become invalidated
+before getting advanced.
+
+Should be fairly straightforward to fix, sorry for the oversight.
+
+- User: Alex Coplan | Time: 2024-01-26 18:06:44 UTC
+  Text: Testing a patch.
+
+- User: Alex Coplan | Time: 2024-01-29 09:01:08 UTC
+  Text: Patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2024-January/644167.html
+
+- User: GCC Commits | Time: 2024-01-29 13:30:10 UTC
+  Text: The master branch has been updated by Alex Coplan <acoplan@gcc.gnu.org>:https://gcc.gnu.org/g:d41a1873f334cf29b9a595bb03c27bff2be17319commitr14-8496-gd41a1873f334cf29b9a595bb03c27bff2be17319Author: Alex Coplan <alex.coplan@arm.com>
+Date:   Mon Jan 29 13:28:04 2024 +0000
+
+    aarch64: Ensure iterator validity when updating debug uses [PR113616]
+    
+    The fix forPR113089introduced range-based for loops over the
+    debug_insn_uses of an RTL-SSA set_info, but in the case that we reset a
+    debug insn, the use would get removed from the use list, and thus we
+    would end up using an invalidated iterator in the next iteration of the
+    loop.  In practice this means we end up terminating the loop
+    prematurely, and hence ICE as inPR113089since there are debug uses
+    that we failed to fix up.
+    
+    This patch fixes that by introducing a general mechanism to avoid this
+    sort of problem.  We introduce a safe_iterator to iterator-utils.h which
+    wraps an iterator, and also holds the end iterator value.  It then
+    pre-computes the next iterator value at all iterations, so it doesn't
+    matter if the original iterator got invalidated during the loop body, we
+    can still move safely to the next iteration.
+    
+    We introduce an iterate_safely helper which effectively adapts a
+    container such as iterator_range into a container of safe_iterators over
+    the original iterator type.
+    
+    We then use iterate_safely around all loops over debug_insn_uses () in
+    the aarch64 ldp/stp pass to fixPR113616.  While doing this, I
+    remembered that cleanup_tombstones () had the same problem.  I
+    previously worked around this locally by manually maintaining the next
+    nondebug insn, so this patch also refactors that loop to use the new
+    iterate_safely helper.
+    
+    While doing that I noticed that a couple of cases in cleanup_tombstones
+    could be converted from using dyn_cast<set_info *> to as_a<set_info *>,
+    which should be safe because there are no clobbers of mem in RTL-SSA, so
+    all defs of memory should be set_infos.
+    
+    gcc/ChangeLog:PR target/113616* config/aarch64/aarch64-ldp-fusion.cc (fixup_debug_uses_trailing_add):
+            Use iterate_safely when iterating over debug uses.
+            (fixup_debug_uses): Likewise.
+            (ldp_bb_info::cleanup_tombstones): Use iterate_safely to iterate
+            over nondebug insns instead of manually maintaining the next insn.
+            * iterator-utils.h (class safe_iterator): New.
+            (iterate_safely): New.
+    
+    gcc/testsuite/ChangeLog:PR target/113616* gcc.c-torture/compile/pr113616.c: New test.
+
+- User: Alex Coplan | Time: 2024-01-29 13:31:19 UTC
+  Text: Should be fixed, thanks for the report.
+

@@ -1,0 +1,171 @@
+Bug Summary: [13 Regression] ICE with function ptr and setjmp/returns twice at -O1
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Spickett | Time: 2023-02-07 10:04:44 UTC
+  Text: Createdattachment 54416[details]Output from -freport-bug
+
+This code:
+```
+extern int __attribute__((returns_twice)) setjmp(void*);
+
+void bbb(void) {
+  int (*fnptr)(void*) = setjmp;
+  fnptr(0);
+}
+```
+Causes an ICE when compiled with gcc trunk.
+```
+during GIMPLE pass: cddce
+<source>: In function 'bbb':
+<source>:6:1: internal compiler error: in eliminate_unnecessary_stmts, at tree-ssa-dce.cc:1512
+    6 | }
+      | ^
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+See <https://gcc.gnu.org/bugs/> for instructions.
+Compiler returned: 1
+```https://godbolt.org/z/6dEMEbEG8Compiling at -O0, or calling setjmp directly avoids the crash. There is no crash with gcc 12.2.
+
+Also calling setjmp directly after using the function pointer avoids the crash. One thing that is happening here is that gcc is converting the indirect call into a direct one. Perhaps when that is the only call in the function, that's the problematic situation.
+
+For context, this is not from real code. It's a clang test case for bti protection of returns twice calls. Either way, the compiler shouldn't crash and if there's something wrong with the source it should say so.
+
+- User: David Spickett | Time: 2023-02-07 10:06:19 UTC
+  Text: Output from freport-bug attached.
+
+- User: Andrew Pinski | Time: 2023-02-07 10:16:07 UTC
+  Text: This is unrelated to BTI. It ICEs for x86_64 too.q
+
+- User: Andrew Pinski | Time: 2023-02-07 10:17:34 UTC
+  Text: Confirmed.
+
+- User: Andrew Pinski | Time: 2023-02-07 10:21:07 UTC
+  Text: Most likely caused by the patch which inserted the assertr13-2518-ga262f969d6fd93
+
+- User: Richard Biener | Time: 2023-02-07 14:07:50 UTC
+  Text: I will have a look.
+
+- User: Richard Biener | Time: 2023-02-13 09:34:49 UTC
+  Text: The reason is that gimple_call_flags returns a different answer from the
+indirect function call vs. the direct function call after propagating of
+the &setjmp constant.  First of all 'returns_twice' is an attribute that
+cannot be set on a function type:
+
+int __attribute__((returns_twice)) (*foo) (void);> gcc-12 -S t.c -Wallt.c:1:1: warning: 'returns_twice' attribute ignored [-Wattributes]
+    1 | int __attribute__((returns_twice)) (*foo) (void);
+      | ^~~
+
+so one cannot have an indirect call annotated.  But even then we for
+example treat indirect missing 'noreturn' conservatively, not requiring
+it to end a BB and only enforce that in the fixup-CFG pass.
+
+Now, for return_twice we could similarly check gimple_call_ctrl_altering.
+
+That still leaves us with missing abnormal edges - David, was this reduced
+from an actual program?
+
+When fixing up DCE to not set cfun->calls_setjmp it will eventually be
+set late in emit_call_1 via
+
+  if (ecf_flags & ECF_RETURNS_TWICE)
+    {
+      add_reg_note (call_insn, REG_SETJMP, const0_rtx);
+      cfun->calls_setjmp = 1;
+    }
+
+a "fix" here would be to _check_ for cfun->calls_setjmp instead of setting it
+(or assert it is set).  The control-altering flag has no representation
+on GENERIC, and we're still expanding calls via intermediate GENERIC ...
+
+- User: David Spickett | Time: 2023-02-13 09:51:54 UTC
+  Text: > That still leaves us with missing abnormal edges - David, was this reduced from an actual program?No, it's a simplified version of the C used to generate an LLVM IR test case:
+extern int setjmp(ptr);
+extern void notsetjmp(void);
+
+void bbb(void) {
+  setjmp(0);
+  int (*fnptr)(ptr) = setjmp;
+  fnptr(0);
+  notsetjmp();
+}
+
+The test is checking that llvm follows each call to a returns twice function with a branch target identifier instruction. In case the function returns using a jump instead of the normal ret. That's probably beside the point for this bug though.
+
+The "real code" that motivated the feature was not doing indirect calls. I just tested that because there's no reason it shouldn't also work.
+
+I don't know of a use case for code like this. Like you said, if the compiler doesn't know what the indirect call target is, it won't know it's return twice. If it does know what you're calling, you could probably just call it directly.
+
+So I was just shuffling statements around to test clang and compare against gcc and found the ICE that way.
+
+- User: Richard Biener | Time: 2023-02-13 10:01:45 UTC
+  Text: Thanks.  I'm thinking what to most sensibly do given that we do not support annotating an indirect call as returns_twice (that's something easy to add though, but won't help legacy code)
+
+- User: GCC Commits | Time: 2023-02-13 14:57:32 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:6436add49ed9ecf74f1f01b4fe18961df4f3e83dcommitr13-5965-g6436add49ed9ecf74f1f01b4fe18961df4f3e83dAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Feb 13 10:41:51 2023 +0100
+
+    tree-optimization/108691 - indirect calls to setjmp
+    
+    DCE now chokes on indirect setjmp calls becoming direct because
+    that exposes them too late to be subject to abnormal edge creation.
+    The following patch honors gimple_call_ctrl_altering for those and
+    _not_ treat formerly indirect calls to setjmp as calls to setjmp
+    in notice_special_calls.
+    
+    Unfortunately there's no way to have an indirect call to setjmp
+    properly annotated (the returns_twice attribute is ignored on types).
+    
+    RTL expansion late discovers returns-twice for the purpose of
+    adding REG_SETJMP notes and also sets ->calls_setjmp
+    (instead of asserting it is set).  There's no good way to
+    transfer proper knowledge around here so I'm using ->calls_setjmp
+    as a flag to indicate whether gimple_call_ctrl_altering_p was set.PR tree-optimization/108691* tree-cfg.cc (notice_special_calls): When the CFG is built
+            honor gimple_call_ctrl_altering_p.
+            * cfgexpand.cc (expand_call_stmt): Clear cfun->calls_setjmp
+            temporarily if the call is not control-altering.
+            * calls.cc (emit_call_1): Do not add REG_SETJMP if
+            cfun->calls_setjmp is not set.  Do not alter cfun->calls_setjmp.
+    
+            * gcc.dg/pr108691.c: New testcase.
+
+- User: Richard Biener | Time: 2023-02-13 14:58:08 UTC
+  Text: Fixed.
+
+- User: David Spickett | Time: 2023-02-15 08:19:12 UTC
+  Text: Thanks for the quick fix!> That still leaves us with missing abnormal edges - David, was this reduced from an actual program?Further to this, someone pointed out to me that an indirect call to setjmp is undefined behaviour:https://pubs.opengroup.org/onlinepubs/9699919799/functions/setjmp.htmlSo even if this was real code, it's undefined behaviour.
+
+(it just so happens that llvm's IR is able to represent that situation)
+
+- User: Richard Biener | Time: 2023-02-21 09:27:34 UTC
+  Text: The fix was reverted.
+
+- User: Sam James | Time: 2023-02-21 09:50:49 UTC
+  Text: (Revert was forpr108868).
+
+- User: Jakub Jelinek | Time: 2023-02-21 09:59:12 UTC
+  Text: andPR108855.
+
+- User: GCC Commits | Time: 2023-02-21 13:08:00 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:1dd033b8bcb0c50ad80084a3a13a391808b2deb6commitr13-6259-g1dd033b8bcb0c50ad80084a3a13a391808b2deb6Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Feb 21 13:02:31 2023 +0100
+
+    tree-optimization/108691 - remove trigger-happy assert
+    
+    The following gets rid of the idea that we should prevent setjmp
+    like calls from popping up in uncontrolled way in the IL for now.
+    The solution is probably to handle it similar as noreturn has
+    the ctrl-altering flag on stmts, but use another flag, for example
+    ctrl-receiving which would also make sure the stmt is first.PR tree-optimization/108691* tree-ssa-dce.cc (eliminate_unnecessary_stmts): Remove
+            assert about calls_setjmp not becoming true when it was false.
+    
+            * gcc.dg/pr108691.c: New testcase.
+
+- User: Richard Biener | Time: 2023-02-21 13:08:14 UTC
+  Text: Fixed.
+

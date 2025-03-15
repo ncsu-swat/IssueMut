@@ -1,0 +1,214 @@
+Bug Summary: [13 Regression] wrong code at -O1 and above on x86_64-linux-gnu since r13-990
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2024-04-01 19:34:46 UTC
+  Text: It is a regression from 12.3, and affects 13.* and the trunk. 
+
+Compiler Explorer:https://godbolt.org/z/bznEs9bao[656] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.1 20240401 (experimental) (GCC) 
+[657] % 
+[657] % gcctk -O0 small.c; ./a.out
+[658] % 
+[658] % gcctk -O1 small.c
+[659] % ./a.out
+Segmentation fault
+[660] % 
+[660] % cat small.c
+#pragma pack(1)
+struct a {
+  short b;
+  int c;
+};
+struct d {
+  struct a b;
+  int e;
+};
+short f, g, h;
+int i, j, o;
+const struct d k = {{1,0},0};
+short *l = &h, *m = &g, *n = &f;
+void p() { *n = (o > 0) > o; }
+void q(struct a n) {
+  j = 0;
+  for (; j < 5; j++)
+    i = *m = *l != 0;
+  p();
+}
+int main() {
+  q(k.b);
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2024-04-01 19:38:09 UTC
+  Text: Not this might not be a bug as pragma pack(1) changes the alignment of the fields.
+
+- User: Andrew Pinski | Time: 2024-04-01 20:36:09 UTC
+  Text: Better reduced testcase, removing the pragma and putting the packed on the struct that is causing the issue:
+```
+struct a {
+  short b;
+  int c;
+}__attribute__((packed));
+struct d {
+  struct a b;
+  int e;
+};
+static const struct d k = {{1,0},0};
+[[gnu::noinline]]
+void p() { asm("":::"memory"); }
+[[gnu::noinline]]
+void q(struct a n) {
+  p();
+}
+int main() {
+  q(k.b);
+  return 0;
+}
+```
+
+The bug is in the middle-end expanding the call `q(k.b);` such that k.b is on the stack but it messes up and uses the wrong size or something.
+
+- User: Jakub Jelinek | Time: 2024-04-02 13:29:02 UTC
+  Text: Further cleaned up testcase:
+
+struct __attribute__((packed)) S { short b; int c; };
+struct T { struct S b; int e; };
+static const struct T k = { { 1, 0 }, 0 };
+
+__attribute__((noinline)) void
+foo (void)
+{
+  asm ("" : : : "memory");
+}
+
+__attribute__((noinline)) void
+bar (struct S n)
+{
+  foo ();
+}
+
+int
+main ()
+{
+  bar (k.b);
+  return 0;
+}
+
+Started withr13-990-ged6fd2aed58f2cca99f15331bf68999c0e6df370
+
+- User: Jakub Jelinek | Time: 2024-04-02 13:46:58 UTC
+  Text: Ther13-989tor13-990difference is
+-	movl	k(%rip), %eax
+-	movl	%eax, (%rsp)
+-	movzwl	k+4(%rip), %eax
+-	movw	%ax, 4(%rsp)
++	movw	$1, (%rsp)
++	movl	$0, 2(%rsp)
++	movl	$0, 8(%rsp)
+which clearly shows that previously it was copying just 6 bytes from k to %rsp+0,
+while now it directly sets those 6 bytes at %rsp+0 + another 4 bytes at %rsp+8.
+The last insn is incorrect, shouldn't be there.
+
+- User: Jakub Jelinek | Time: 2024-04-02 14:18:04 UTC
+  Text: Createdattachment 57850[details]gcc14-pr114552.patch
+
+Untested fix.
+Note, perhaps for GCC 15 we could support even non-matching sizes, as long as we'd create a CONSTRUCTOR for just the needed bytes.  But, in that case we wouldn't have to require that it is loaded from the beginning of a .rodata MEM.
+
+- User: Roger Sayle | Time: 2024-04-02 14:49:01 UTC
+  Text: Many thanks Jakub, and my apologies for the breakage/inconvenience.  It looks like sizeof(k) is 10 bytes, and sizeof(k.b) is 6 bytes, and somehow this code is getting the constructor for "k" and not for just "k.b".  This is, of course, fine for memcpy as it can move the just the pieces it wants.  I completely agree that the safe fix is to check that the sizes match; I don't think I ever considered that they might not be identical when I wrote this code, or assumed that partial would be non-zero for this case].
+
+- User: GCC Commits | Time: 2024-04-03 08:01:30 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:03039744f368a24a452e4ea8d946e9c2cedaf1aacommitr14-9768-g03039744f368a24a452e4ea8d946e9c2cedaf1aaAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Apr 3 09:59:45 2024 +0200
+
+    expr: Fix up emit_push_insn [PR114552]r13-990added optimizations in multiple spots to optimize during
+    expansion storing of constant initializers into targets.
+    In the load_register_parameters and expand_expr_real_1 cases,
+    it checks it has a tree as the source and so knows we are reading
+    that whole decl's value, so the code is fine as is, but in the
+    emit_push_insn case it checks for a MEM from which something
+    is pushed and checks for SYMBOL_REF as the MEM's address, but
+    still assumes the whole object is copied, which as the following
+    testcase shows might not always be the case.  In the testcase,
+    k is 6 bytes, then 2 bytes of padding, then another 4 bytes,
+    while the emit_push_insn wants to store just the 6 bytes.
+    
+    The following patch simply verifies it is the whole initializer
+    that is being stored, I think that is best thing to do so late
+    in GCC 14 cycle as well for backporting.
+    
+    For GCC 15, perhaps the code could stop requiring it must be at offset zero,
+    nor that the size is equal, but could use
+    get_symbol_constant_value/fold_ctor_reference gimple-fold APIs to actually
+    extract just part of the initializer if we e.g. push just some subset
+    (of course, still verify that it is a subset).  For sizes which are power
+    of two bytes and we have some integer modes, we could use as type for
+    fold_ctor_reference corresponding integral types, otherwise dunno, punt
+    or use some structure (e.g. try to find one in the initializer?), whatever.
+    But even in the other spots it could perhaps handle loading of
+    COMPONENT_REFs or MEM_REFs from the .rodata vars.
+    
+    2024-04-03  Jakub Jelinek  <jakub@redhat.com>PR middle-end/114552* expr.cc (emit_push_insn): Only use store_constructor for
+            immediate_const_ctor_p if int_expr_size matches size.
+    
+            * gcc.c-torture/execute/pr114552.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-04-03 14:32:46 UTC
+  Text: Fixed on the trunk so far.
+
+- User: GCC Commits | Time: 2024-04-21 04:08:37 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:ba6fd407891fd83648ad803c85b607dc09e23be4commitr13-8624-gba6fd407891fd83648ad803c85b607dc09e23be4Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Apr 3 09:59:45 2024 +0200
+
+    expr: Fix up emit_push_insn [PR114552]r13-990added optimizations in multiple spots to optimize during
+    expansion storing of constant initializers into targets.
+    In the load_register_parameters and expand_expr_real_1 cases,
+    it checks it has a tree as the source and so knows we are reading
+    that whole decl's value, so the code is fine as is, but in the
+    emit_push_insn case it checks for a MEM from which something
+    is pushed and checks for SYMBOL_REF as the MEM's address, but
+    still assumes the whole object is copied, which as the following
+    testcase shows might not always be the case.  In the testcase,
+    k is 6 bytes, then 2 bytes of padding, then another 4 bytes,
+    while the emit_push_insn wants to store just the 6 bytes.
+    
+    The following patch simply verifies it is the whole initializer
+    that is being stored, I think that is best thing to do so late
+    in GCC 14 cycle as well for backporting.
+    
+    For GCC 15, perhaps the code could stop requiring it must be at offset zero,
+    nor that the size is equal, but could use
+    get_symbol_constant_value/fold_ctor_reference gimple-fold APIs to actually
+    extract just part of the initializer if we e.g. push just some subset
+    (of course, still verify that it is a subset).  For sizes which are power
+    of two bytes and we have some integer modes, we could use as type for
+    fold_ctor_reference corresponding integral types, otherwise dunno, punt
+    or use some structure (e.g. try to find one in the initializer?), whatever.
+    But even in the other spots it could perhaps handle loading of
+    COMPONENT_REFs or MEM_REFs from the .rodata vars.
+    
+    2024-04-03  Jakub Jelinek  <jakub@redhat.com>PR middle-end/114552* expr.cc (emit_push_insn): Only use store_constructor for
+            immediate_const_ctor_p if int_expr_size matches size.
+    
+            * gcc.c-torture/execute/pr114552.c: New test.
+    
+    (cherry picked from commit 03039744f368a24a452e4ea8d946e9c2cedaf1aa)
+
+- User: Jakub Jelinek | Time: 2024-04-23 06:45:59 UTC
+  Text: Fixed for 13.3 too.
+

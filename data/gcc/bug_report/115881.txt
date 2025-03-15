@@ -1,0 +1,218 @@
+Bug Summary: [15 Regression] ICE: RTL check: expected code 'reg', have 'subreg' in rhs_regno, at rtl.h:1934 with -O2 -mx32 -maddress-mode=long
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 14.1.1
+Known to Fail: 15.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-07-11 19:48:15 UTC
+  Text: Createdattachment 58638[details]reduced testcase
+
+This might need RTL checking enabled.
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O2 -mx32 -maddress-mode=long testcase.c
+testcase.c: In function 'foo':
+testcase.c:7:3: warning: '__builtin_memset' writing 940 bytes into a region of size 4 overflows the destination [-Wstringop-overflow=]
+    7 |   __builtin_memset(&i, c, 940);
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+testcase.c:6:7: note: destination object 'i' of size 4
+    6 |   int i;
+      |       ^
+during RTL pass: peephole2
+testcase.c:9:1: internal compiler error: RTL check: expected code 'reg', have 'subreg' in rhs_regno, at rtl.h:1934
+    9 | }
+      | ^
+0x2a7433b internal_error(char const*, ...)
+        /repo/gcc-trunk/gcc/diagnostic-global-context.cc:491
+0x8167b0 rtl_check_failed_code1(rtx_def const*, rtx_code, char const*, int, char const*)
+        /repo/gcc-trunk/gcc/rtl.cc:770
+0xc7f0e6 rhs_regno(rtx_def const*)
+        /repo/gcc-trunk/gcc/rtl.h:1934
+0xd8470c rhs_regno(rtx_def const*)
+        /repo/gcc-trunk/gcc/config/i386/i386.md:1153
+0xd8470c peephole2_36
+        /repo/gcc-trunk/gcc/config/i386/i386.md:27491
+0x1487f14 peephole2_optimize
+        /repo/gcc-trunk/gcc/recog.cc:4229
+0x1487f14 rest_of_handle_peephole2
+        /repo/gcc-trunk/gcc/recog.cc:4380
+0x1487f14 execute
+        /repo/gcc-trunk/gcc/recog.cc:4417
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r15-1975-20240711091856-g4e0aa05f67c-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r15-1975-20240711091856-g4e0aa05f67c-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 15.0.0 20240711 (experimental) (GCC)
+
+- User: Uroš Bizjak | Time: 2024-07-11 20:25:18 UTC
+  Text: Confirmed, _late_combine2 is doing:
+
+trying to combine definition of r1 in:
+    6: {dx:DI=sp:DI+0xc;clobber flags:CC;}
+      REG_EQUIV frame:DI-0x4
+into:
+   46: cx:DI=dx:DI
+successfully matched this instruction to *leadi:
+(set (reg:DI 2 cx [118])
+    (plus:DI (reg/f:DI 7 sp)
+        (const_int 12 [0xc])))
+   31: {di:DI=zero_extend(dx:SI+0x1);clobber flags:CC;}
+successfully matched this instruction to addsi_1_zext:
+(parallel [
+        (set (reg:DI 5 di)
+            (zero_extend:DI (plus:SI (subreg:SI (reg/f:DI 7 sp) 0)
+                    (const_int 13 [0xd]))))
+        (clobber (reg:CC 17 flags))
+    ])
+
+which then triggers:
+
+(define_peephole2
+  [(set (match_operand:DI 0 "register_operand")
+  	(zero_extend:DI
+	  (plus:SI (match_operand:SI 1 "nonmemory_operand")
+		   (match_operand:SI 2 "register_operand"))))]
+  "TARGET_64BIT && !TARGET_OPT_AGU
+   && REGNO (operands[0]) == REGNO (operands[2])
+   && peep2_regno_dead_p (0, FLAGS_REG)"
+  [(parallel [(set (match_dup 0)
+		   (zero_extend:DI (plus:SI (match_dup 2) (match_dup 1))))
+	      (clobber (reg:CC FLAGS_REG))])])
+
+However, there should be no SUBREG RTXes after reload.
+
+- User: Uroš Bizjak | Time: 2024-07-11 20:34:04 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #1)> However, there should be no SUBREG RTXes after reload.x86 assumes the above, if this is no longer the case, then all post-reload splitters and peephole2 patterns that use REGNO (operands[X]) should be converted to use reg_or_subregno (operands[X]) instead.
+
+CC added.
+
+- User: Richard Sandiford | Time: 2024-07-11 21:17:32 UTC
+  Text: Hmm, yeah.  This is due to an inconsistency between simplify_subreg_regno
+(which rightly refuses to generate (reg:SI sp)) and validate_subreg,
+which instead uses subreg_offset_representable_p + some preparatory tests.
+Those preparatory tests are similar, but not quite identical to, the first
+tests in simplify_subre_regno.  And they don't include the stack and frame
+pointer tests.
+
+In principle, it feels like the validate_subreg test should just be:
+
+  /* For hard registers, check that the subreg can be folded to a REG.  */
+  if (reg && REG_P (reg) && HARD_REGISTER_P (reg))
+    return simplify_subreg_regno (REGNO (reg), imode, offset, omode) >= 0;
+
+but I've no idea how much that will break.  Will try it and see.
+
+- User: Richard Sandiford | Time: 2024-07-12 08:14:05 UTC
+  Text: As expected, the results weren't pretty.  Things like:
+
+(define_split
+  [(set (match_operand:SWI48 0 "register_operand")
+        (and:SWI48 (match_dup 0)
+                   (const_int -65536)))
+   (clobber (reg:CC FLAGS_REG))]
+  "(TARGET_FAST_PREFIX && !TARGET_PARTIAL_REG_STALL)
+    || optimize_function_for_size_p (cfun)"
+  [(set (strict_low_part (match_dup 1)) (const_int 0))]
+  "operands[1] = gen_lowpart (HImode, operands[0]);")
+
+expect to be able to generate (strict_low_part (subreg:HI (reg:DI SP) 0))
+after reload, so we can't ban it outright.  The fallback was going to be
+to make register_operand reject subregs after reload, but patterns like:
+
+(define_insn_and_split "*neg<mode>_1_slp"
+  [(set (strict_low_part (match_operand:SWI12 0 "register_operand" "+<r>,&<r>")\
+)
+        (neg:SWI12 (match_operand:SWI12 1 "register_operand" "0,!<r>")))
+   (clobber (reg:CC FLAGS_REG))]
+
+use register_operand for cases like the above.  Not really sure what
+to do here.
+
+- User: Uroš Bizjak | Time: 2024-07-12 08:53:18 UTC
+  Text: (In reply to Richard Sandiford fromcomment #4)> As expected, the results weren't pretty.  Things like:
+> 
+> (define_split
+>   [(set (match_operand:SWI48 0 "register_operand")
+>         (and:SWI48 (match_dup 0)
+>                    (const_int -65536)))
+>    (clobber (reg:CC FLAGS_REG))]
+>   "(TARGET_FAST_PREFIX && !TARGET_PARTIAL_REG_STALL)
+>     || optimize_function_for_size_p (cfun)"
+>   [(set (strict_low_part (match_dup 1)) (const_int 0))]
+>   "operands[1] = gen_lowpart (HImode, operands[0]);")
+> 
+> expect to be able to generate (strict_low_part (subreg:HI (reg:DI SP) 0))
+> after reload, so we can't ban it outright.  The fallback was going to be
+> to make register_operand reject subregs after reload, but patterns like:
+> 
+> (define_insn_and_split "*neg<mode>_1_slp"
+>   [(set (strict_low_part (match_operand:SWI12 0 "register_operand"
+> "+<r>,&<r>")\
+> )
+>         (neg:SWI12 (match_operand:SWI12 1 "register_operand" "0,!<r>")))
+>    (clobber (reg:CC FLAGS_REG))]
+> 
+> use register_operand for cases like the above.  Not really sure what
+> to do here.Maybe define "register_operand_slp" predicate that would allow SUBREGs after reload? When accessing the operand of "register_operand_slp" after reload, one would have to use reg_or_subregno instead of REGNO.
+
+- User: Sergei Trofimovich | Time: 2024-07-25 20:40:59 UTC
+  Text: ***Bug 115991has been marked as a duplicate of this bug. ***
+
+- User: Sergei Trofimovich | Time: 2024-07-25 20:45:38 UTC
+  Text: Started fromr15-1945-g9d20529d94b232.https://gcc.gnu.org/PR115991#c10also has an `x86_64 -m64 -O2` example extracted from ICE during `linux-6.10` kernel build.
+
+- User: GCC Commits | Time: 2024-07-31 08:23:52 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:d63b6d8b494483b0049370ff0dfeee0e1d10e54bcommitr15-2429-gd63b6d8b494483b0049370ff0dfeee0e1d10e54bAuthor: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Wed Jul 31 09:23:35 2024 +0100
+
+    recog: Disallow subregs in mode-punned value [PR115881]
+    
+    Ing:9d20529d94b23275885f380d155fe8671ab5353a, I'd extended
+    insn_propagation to handle simple cases of hard-reg mode punning.
+    The punned "to" value was created using simplify_subreg rather
+    than simplify_gen_subreg, on the basis that hard-coded subregs
+    aren't generally useful after RA (where hard-reg propagation is
+    expected to happen).
+    
+    This PR is about a case where the subreg gets pushed into the
+    operands of a plus, but the subreg on one of the operands
+    cannot be simplified.  Specifically, we have to generate
+    (subreg:SI (reg:DI sp) 0) rather than (reg:SI sp), since all
+    references to the stack pointer must be via stack_pointer_rtx.
+    
+    However, code in x86 (reasonably) expects no subregs of registers
+    to appear after RA, except for special cases like strict_low_part.
+    This leads to an awkward situation where we can't ban subregs of sp
+    (because of the strict_low_part use), can't allow direct references
+    to sp in other modes (because of the stack_pointer_rtx requirement),
+    and can't allow rvalue uses of the subreg (because of the "no subregs
+    after RA" assumption).  It all seems a bit of a mess...
+    
+    I sat on this for a while in the hope that a clean solution might
+    become apparent, but in the end, I think we'll just have to check
+    manually for nested subregs and punt on them.
+    
+    gcc/PR rtl-optimization/115881* recog.cc: Include rtl-iter.h.
+            (insn_propagation::apply_to_rvalue_1): Check that the result
+            of simplify_subreg does not include nested subregs.
+    
+    gcc/testsuite/PR rtl-optimization/115881* gcc.c-torture/compile/pr115881.c: New test.
+
+- User: Richard Sandiford | Time: 2024-07-31 08:24:35 UTC
+  Text: Fixed.
+
+- User: Sergei Trofimovich | Time: 2024-07-31 17:17:50 UTC
+  Text: I confirm the change fixed linux-6.10 build for me. Thank you!
+

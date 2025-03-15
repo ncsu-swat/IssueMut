@@ -1,0 +1,282 @@
+Bug Summary: [12 Regression] Wrong code at -Os on x86_64-linux-gnu since r12-1077-g57bf3751511
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 12.3.1, 13.2.1, 14.0
+Known to Fail: 12.3.0, 13.2.0
+
+Comments:
+- User: Shaohua Li | Time: 2023-09-17 13:21:12 UTC
+  Text: gcc at -Os produced the wrong code
+
+Bisected tor12-1077-g57bf3751511Compiler explorer:https://godbolt.org/z/1Ej5jxYPa$ cat a.c
+int printf(const char *, ...);
+short a, b;
+unsigned char c = 255;
+int main() {
+  int d;
+  unsigned char e;
+  d = 0;
+  for (; a >= 0; a--) {
+    int *f = &d;
+    *f = c;
+  }
+  e = 0;
+  for (; (unsigned char)(d - 255) + e <= 1; e++)
+    printf("%d\n", b);
+}
+$
+$ gcc -O0 a.c && ./a.out
+0
+0
+$ gcc -Os a.c && ./a.out
+$
+
+- User: Andrew Pinski | Time: 2023-09-17 16:12:21 UTC
+  Text: Confirmed. Though I thinkr12-1077-g57bf3751511just exposed the issue. -fno-ivopts causes the bug to go away. So does -fwrapv . So I suspect IV-OPTS is introducing some signed integer overflow for this ...
+
+- User: Richard Biener | Time: 2023-09-18 09:14:43 UTC
+  Text: Maybe related toPR110243.
+
+- User: Richard Biener | Time: 2023-10-20 12:04:36 UTC
+  Text: For the testsuite, not fixed by the fix forPR110243:
+
+/* { dg-do run } */
+
+extern void abort (void);
+short a, b;
+unsigned char c = 255;
+unsigned cnt;
+void __attribute__((noipa))
+check (int x)
+{
+  if (x != 0)
+    abort ();
+  cnt++;
+}
+int main() 
+{ 
+  int d;
+  unsigned char e;
+  d = 0; 
+  for (; a >= 0; a--) {
+    int *f = &d;
+    *f = c;
+  } 
+  e = 0; 
+  for (; (unsigned char)(d - 255) + e <= 1; e++)
+    check (b);
+  if (cnt != 2)
+    abort ();
+  return 0;
+}
+
+- User: Richard Biener | Time: 2023-10-20 12:36:21 UTC
+  Text: -Os -fallow-store-data-races -fdisable-tree-sccp -fno-tree-loop-im
+
+makes the case simpler to look at, IVOPTs only mangles the last loop there:
+
+Analyzing # of iterations of loop 2
+  exit condition [d_26 + 1, + , 1](no_overflow) <= 1
+  bounds on difference of bases: -255 ... 0
+  result:
+    zero if d_26 > 1
+    # of iterations 1 - (unsigned int) d_26, bounded by 1
+  number of iterations 1 - (unsigned int) d_26; zero if d_26 > 1
+..
+Selected IV set for loop 2 at t.c:22, 2 avg niters, 1 IVs:
+Candidate 10:
+  Var befor: ivtmp.26_28
+  Var after: ivtmp.26_29
+  Incr POS: at end
+  IV struct:
+    Type:       unsigned int
+    Base:       (unsigned int) (d_26 + 1)
+    Step:       1
+    Biv:        N
+    Overflowness wrto loop niter:       No-overflow
+
+changing
+
++  _31 = d_26 + 1;
++  ivtmp.26_30 = (unsigned int) _31;
+   goto <bb 6>; [100.00%]
+ 
+   <bb 5> [local count: 118111600]:
+   b.6_7 = b;
+   _8 = (int) b.6_7;
+   check (_8);
+-  e_21 = e_15 + 1;
++  ivtmp.26_29 = ivtmp.26_28 + 1;
+ 
+   <bb 6> [local count: 236223200]:
+-  # e_15 = PHI <0(10), e_21(5)>
++  # ivtmp.26_28 = PHI <ivtmp.26_30(10), ivtmp.26_29(5)>
+   _9 = (unsigned char) d_26;
+   _10 = _9 + 1;
+   _11 = (int) _10;
+-  _12 = (int) e_15;
+-  _13 = _11 + _12;
+-  if (_13 <= 1)
++  _32 = (int) ivtmp.26_28;
++  if (_32 <= 1)
+     goto <bb 5>; [50.00%]
+   else
+     goto <bb 7>; [50.00%]
+
+- User: Richard Biener | Time: 2023-10-20 13:08:32 UTC
+  Text: And I think its a SCEV/tree-affine issue.  We have
+
+  <bb 6> [local count: 236223200]:
+  # e_15 = PHI <0(10), e_21(5)>
+  _9 = (unsigned char) d_26;
+  _10 = _9 + 1;
+  _11 = (int) _10;
+  _12 = (int) e_15;
+  _13 = _11 + _12;
+  if (_13 <= 1)
+    goto <bb 5>; [50.00%]
+  else
+    goto <bb 7>; [50.00%]
+
+  <bb 5> [local count: 118111600]:
+  b.6_7 = b;
+  _8 = (int) b.6_7;
+  check (_8);
+  e_21 = e_15 + 1;
+  goto <bb 6>;
+
+(get_scalar_evolution
+  (scalar = e_15)
+  (scalar_evolution = {0, +, 1}_2))
+
+that's OK if the niter bound is correct
+
+(get_scalar_evolution
+  (scalar = _12)
+  (scalar_evolution = {0, +, 1}_2))
+
+likewise
+
+(get_scalar_evolution
+  (scalar = _13)
+  (scalar_evolution = {(int) ((unsigned char) d_26 + 1), +, 1}_2))
+
+also OK.  But from that we get
+
+IV struct:
+  SSA_NAME:     _13
+  Type: int
+  Base: d_26 + 1
+  Step: 1
+  Biv:  N
+  Overflowness wrto loop niter: No-overflow
+
+That's because simple_iv_with_niters does, getting the correct iv->base
+(int) ((unsigned char) d_26 + 1)
+
+  /* Try to simplify iv base:
+
+       (signed T) ((unsigned T)base + step) ;; TREE_TYPE (base) == signed T
+         == (signed T)(unsigned T)base + step
+         == base + step
+
+     If we can prove operation (base + step) doesn't overflow or underflow.
+     Specifically, we try to prove below conditions are satisfied: 
+    
+             base <= UPPER_BOUND (type) - step  ;;step > 0
+             base >= LOWER_BOUND (type) - step  ;;step < 0
+    
+     This is done by proving the reverse conditions are false using loop's
+     initial conditions.
+    
+     The is necessary to make loop niter, or iv overflow analysis easier
+     for below example:
+    
+       int foo (int *a, signed char s, signed char l)
+         {
+           signed char i;
+           for (i = s; i < l; i++)
+             a[i] = 0;
+           return 0;
+          }
+    
+     Note variable I is firstly converted to type unsigned char, incremented,
+     then converted back to type signed char.  */
+
+where we end up querying
+
+  d_26 > 2147483646
+
+but the comment also doesn't match us skipping a narrowing conversion here
+(besides failing to use the limit based on the narrowed type).
+
+- User: GCC Commits | Time: 2023-10-20 13:53:55 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:9692309ed6b625f0fb358c0e230404b5603f69a6commitr14-4790-g9692309ed6b625f0fb358c0e230404b5603f69a6Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Oct 20 15:08:49 2023 +0200
+
+    tree-optimization/111445 - simple_iv simplification fault
+    
+    The following fixes a missed check in the simple_iv attempt
+    to simplify (signed T)((unsigned T) base + step) where it
+    allows a truncating inner conversion leading to wrong code.PR tree-optimization/111445* tree-scalar-evolution.cc (simple_iv_with_niters):
+            Add missing check for a sign-conversion.
+    
+            * gcc.dg/torture/pr111445.c: New testcase.
+
+- User: Richard Biener | Time: 2023-10-20 13:54:48 UTC
+  Text: Fixed on trunk sofar.
+
+- User: GCC Commits | Time: 2023-11-10 14:24:08 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:bd7800a3a73fa07b4688c75edcaaaf923802f020commitr13-8038-gbd7800a3a73fa07b4688c75edcaaaf923802f020Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Oct 20 15:08:49 2023 +0200
+
+    tree-optimization/111445 - simple_iv simplification fault
+    
+    The following fixes a missed check in the simple_iv attempt
+    to simplify (signed T)((unsigned T) base + step) where it
+    allows a truncating inner conversion leading to wrong code.PR tree-optimization/111445* tree-scalar-evolution.cc (simple_iv_with_niters):
+            Add missing check for a sign-conversion.
+    
+            * gcc.dg/torture/pr111445.c: New testcase.
+    
+    (cherry picked from commit 9692309ed6b625f0fb358c0e230404b5603f69a6)
+
+- User: Richard Biener | Time: 2023-11-14 14:20:00 UTC
+  Text: ***Bug 111572has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2023-11-27 13:09:43 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:948c4616e504b656278cd47f8b96ad3fb47db626commitr12-10011-g948c4616e504b656278cd47f8b96ad3fb47db626Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Oct 20 15:08:49 2023 +0200
+
+    tree-optimization/111445 - simple_iv simplification fault
+    
+    The following fixes a missed check in the simple_iv attempt
+    to simplify (signed T)((unsigned T) base + step) where it
+    allows a truncating inner conversion leading to wrong code.PR tree-optimization/111445* tree-scalar-evolution.cc (simple_iv_with_niters):
+            Add missing check for a sign-conversion.
+    
+            * gcc.dg/torture/pr111445.c: New testcase.
+    
+    (cherry picked from commit 9692309ed6b625f0fb358c0e230404b5603f69a6)
+
+- User: Richard Biener | Time: 2023-11-27 13:10:35 UTC
+  Text: Fixed.
+
+- User: GCC Commits | Time: 2024-06-21 09:22:32 UTC
+  Text: The releases/gcc-11 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:ce653fa683643d4e5a7146181954358f1060dfedcommitr11-11526-gce653fa683643d4e5a7146181954358f1060dfedAuthor: Richard Biener <rguenther@suse.de>
+Date:   Fri Oct 20 15:08:49 2023 +0200
+
+    tree-optimization/111445 - simple_iv simplification fault
+    
+    The following fixes a missed check in the simple_iv attempt
+    to simplify (signed T)((unsigned T) base + step) where it
+    allows a truncating inner conversion leading to wrong code.PR tree-optimization/111445* tree-scalar-evolution.c (simple_iv_with_niters):
+            Add missing check for a sign-conversion.
+    
+            * gcc.dg/torture/pr111445.c: New testcase.
+    
+    (cherry picked from commit 9692309ed6b625f0fb358c0e230404b5603f69a6)
+

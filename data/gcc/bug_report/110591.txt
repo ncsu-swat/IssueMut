@@ -1,0 +1,86 @@
+Bug Summary: [i386] (Maybe) Missed optimisation: _cmpccxadd sets flags
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Thiago Macieira | Time: 2023-07-07 17:13:32 UTC
+  Text: In:
+#include <immintrin.h>
+
+bool increment_if(int *ptr, int v)
+{
+    return _cmpccxadd_epi32(ptr, v, 1, _CMPCCX_Z) == v;
+}
+
+GCC generates (and current Clang does the same):
+
+increment_if(int*, int):
+        movl    $1, %edx
+        movl    %esi, %eax
+        cmpzxadd        %edx, %eax, (%rdi)
+        cmpl    %eax, %esi
+        sete    %al
+        ret
+
+The CMPccXADD instructions set EFLAGS to the result of the comparison of their memory operand to the middle one, which will get the current value of that memory location whether the comparison succeeded or not. That means the CMP instruction on the next line is superfluous, since it'll set the flags to exactly what they are already set to. That means this particular example could be written:
+
+        movl    $1, %edx
+        cmpzxadd        %edx, %esi, (%rdi)
+        sete    %al
+        ret
+
+Saving 2 retire slots and 1 uop. This can be done every time the result of the intrinsic is compared to the same value that was passed as the intrinsic's second parameter.
+
+However, in a real workload, this function is likely to be inlined, where the extra MOV may not be present at all and the CMP is likely to be followed by a Jcc instead of a SETcc. For the latter case, the CMP+Jcc would be macro-fused, so there would be no 1-uop gain. Moreover, this atomic operation is likely going to be multiple cycles long and the conditional code after it probably can't be speculated very well either.
+
+I'll leave it up to you to decide whether it's worth pursuing this.
+
+- User: Hongtao.liu | Time: 2023-07-10 02:21:57 UTC
+  Text: I guess we can add a peephole for this, middle-end optimizer doesn't know cmpccxadd set EFLAGS same as cmp.
+
+- User: Hongtao.liu | Time: 2023-07-10 04:27:09 UTC
+  Text: (In reply to Hongtao.liu fromcomment #1)> I guess we can add a peephole for this, middle-end optimizer doesn't know
+> cmpccxadd set EFLAGS same as cmp.We already have a peephole for cmpxchg, for cmpxchg it's only valid for CCZmode, but for cmpccxadd, it should be ok for all CCmode since it sets EFLAGS exactly the same as CMP. The _CMPCCX_Z in the intrinsic is used as condition of updating memory.
+
+- User: Hongtao.liu | Time: 2023-07-10 06:22:47 UTC
+  Text: Createdattachment 55510[details]untested patch.
+
+Under testing.
+
+- User: GCC Commits | Time: 2023-07-18 03:31:48 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:06cc38c1c350b34cbd6dde23aefca32442c07a73commitr14-2595-g06cc38c1c350b34cbd6dde23aefca32442c07a73Author: liuhongt <hongtao.liu@intel.com>
+Date:   Mon Jul 10 14:12:07 2023 +0800
+
+    Add peephole to eliminate redundant comparison after cmpccxadd.
+    
+    Similar like we did for cmpxchg, but extended to all
+    ix86_comparison_int_operator since cmpccxadd set EFLAGS exactly same
+    as CMP.
+    
+    When operand order in compare insn is same as that in cmpccxadd,
+    compare insn can be eliminated directly.
+    
+    When operand order is swapped in compare insn, only optimize cmpccxadd
+    + cmpl + jcc/setcc to cmpccxadd + jcc/setcc when FLAGS_REG is dead
+    after jcc/setcc.
+    
+    gcc/ChangeLog:PR target/110591* config/i386/sync.md (cmpccxadd_<mode>): Adjust the pattern
+            to explicitly set FLAGS_REG like *cmp<mode>_1, also add extra
+            3 define_peephole2 after the pattern.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110591.c: New test.
+            * gcc.target/i386/pr110591-2.c: New test.
+
+- User: Hongtao.liu | Time: 2023-07-18 03:32:14 UTC
+  Text: Fixed in GCC14.
+
+- User: Hongtao Liu | Time: 2023-11-30 10:53:57 UTC
+  Text: .
+

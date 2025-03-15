@@ -1,0 +1,244 @@
+Bug Summary: [12/13/14/15 Regression] highway-1.0.7 wrong _mm_cvttps_epi32() constant fold
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2024-05-15 21:38:37 UTC
+  Text: Initially I observed the testsuite failure on highway-1.0.7 library as onr15-523-g1a05332bbac98a.
+
+I reduced it down to the following:
+
+```c
+// $ cat bug.c
+#include <emmintrin.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+__attribute__((noipa))
+static void dump_m128i(const char * prefix, const __m128i * v) {
+  uint32_t p[4];
+  memcpy(p, v, 16);
+  fprintf(stderr, "%s:", prefix);
+  for (size_t i = 0; i < 4; ++i) {
+    fprintf(stderr, " %#08x", p[i]);
+  }
+  fprintf(stderr, "\n");
+}
+
+__attribute__((noipa))
+static void assert_m128i(const __m128i * v) {
+  uint32_t p[4];
+  memcpy(p, v, 16);
+  uint32_t q[4] = {
+      0x80000000,
+      0x80000000,
+      0x80000000,
+      0x80000000,
+  };
+  if (memcmp(p, q, 16) != 0) __builtin_abort();
+}
+
+__attribute__((noipa))
+static void TestAllF2IPromoteTo() {
+  const __m128i iv = _mm_set_epi32(0x4f000000, 0x4f000000, 0x4f000000, 0x4f000000);
+  const __m128  fv = _mm_castsi128_ps(iv);
+  const __m128i riv = _mm_cvttps_epi32(fv);
+
+  dump_m128i("riv", &riv);
+  assert_m128i(&riv);
+}
+
+int main() {
+    TestAllF2IPromoteTo();
+}
+```
+
+Triggering:
+
+$ gcc-15 bug.c -o a -O0 && ./a
+riv: 0x80000000 0x80000000 0x80000000 0x80000000
+# ok?
+
+$ gcc-15 bug.c -o a -O1 && ./a
+riv: 0x7fffffff 0x7fffffff 0x7fffffff 0x7fffffff
+Aborted (core dumped)
+# bad?
+
+I think highway expect the former. At least gcc-8/9/10/11 pass the test. gcc-12/13/14/15 all fail it.
+
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=/<<NIX>>/gcc-15.0.0/bin/gcc
+COLLECT_LTO_WRAPPER=/<<NIX>>/gcc-15.0.0/libexec/gcc/x86_64-unknown-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-unknown-linux-gnu
+Configured with: ../source/configure --prefix=/<<NIX>>/gcc-15.0.0 --with-gmp-include=/<<NIX>>/gmp-6.3.0-dev/include --with-gmp-lib=/<<NIX>>/gmp-6.3.0/lib --with-mpfr-include=/<<NIX>>/mpfr-4.2.1-dev/include --with-mpfr-lib=/<<NIX>>/mpfr-4.2.1/lib --with-mpc=/<<NIX>>/libmpc-1.3.1 --with-native-system-header-dir=/<<NIX>>/glibc-2.39-52-dev/include --with-build-sysroot=/ --with-gxx-include-dir=/<<NIX>>/gcc-15.0.0/include/c++/15.0.0/ --program-prefix= --enable-lto --disable-libstdcxx-pch --without-included-gettext --with-system-zlib --enable-checking=release --enable-static --enable-languages=c,c++ --disable-multilib --enable-plugin --disable-libcc1 --with-isl=/<<NIX>>/isl-0.20 --disable-bootstrap --build=x86_64-unknown-linux-gnu --host=x86_64-unknown-linux-gnu --target=x86_64-unknown-linux-gnu
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 99999999 (experimental) (GCC)
+
+- User: Sergei Trofimovich | Time: 2024-05-15 21:45:05 UTC
+  Text: If I understand the test correctly it uses 2^63 floating point value and converts it to uint32_t (or int32_t?).
+
+gcc's constant-fold saturates it to 2^63-1 while CPU keeps it at 2^63 (as if it was uint32_t).
+
+Original highway test names are:
+
+The following tests FAILED:
+        464 - HwyConvertTestGroup/HwyConvertTest.TestAllF2IPromoteTo/AVX2  # GetParam() = 512 (Subprocess aborted)
+        465 - HwyConvertTestGroup/HwyConvertTest.TestAllF2IPromoteTo/SSE4  # GetParam() = 2048 (Subprocess aborted)
+        466 - HwyConvertTestGroup/HwyConvertTest.TestAllF2IPromoteTo/SSSE3  # GetParam() = 4096 (Subprocess aborted)
+        467 - HwyConvertTestGroup/HwyConvertTest.TestAllF2IPromoteTo/SSE2  # GetParam() = 16384 (Subprocess aborted)
+        972 - HwyShuffle4TestGroup/HwyShuffle4Test.TestAllPer4LaneBlockShuffle/SSE2  # GetParam() = 16384 (Subprocess aborted)
+
+- User: Andrew Pinski | Time: 2024-05-15 21:49:12 UTC
+  Text: So from a point of view of float to int conversion, both are valid for out of range values.
+
+Now it might that we are lowering it to a float to int conversion and then constant folding that way. If so the issue is this might
+
+- User: Sergei Trofimovich | Time: 2024-05-15 22:00:34 UTC
+  Text: I might also have overzealously extracted simplified example from highway-1.0.7: `gcc-14` (or older) do not fail on unmodified highway-1.0.7 testsuite.
+
+- User: Hongtao Liu | Time: 2024-05-16 00:36:15 UTC
+  Text: It looks same ashttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=100927#c4
+
+- User: Sergei Trofimovich | Time: 2024-05-16 09:08:32 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> So from a point of view of float to int conversion, both are valid for out
+> of range values.Looking at CVTTPS2DQ instruction fromhttps://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html"Intel® 64 and IA-32 Architectures Software Developer’s Manual Combined Volumes: 1, 2A, 2B, 2C, 2D, 3A, 3B, 3C, 3D, and 4":
+
+"""
+Description
+...
+When a conversion is inexact, a truncated (round toward zero) value is returned. If a converted result is larger than
+the maximum signed doubleword integer, the floating-point invalid exception is raised, and if this exception is
+masked, the indefinite integer value (80000000H) is returned.
+"""
+
+It feels like 2^63 is an exact value and no truncation should happen. Thus 0x80000000 seems to be the correct value. Why 0x7fffffff would be a reasonable outcome as well? Is it because `_mm_cvttps_epi32()` semantics are not a 1-to-1 to CVTTPS2DQ instruction?
+
+Trying to understand the detail as I'm not yet sure if I should file a `highway` bug to be compatible with gcc's expectations. The exact test is athttps://github.com/google/highway/blob/b7cff55896e36e6080909d35ef6fb3d0986b4cfa/hwy/tests/convert_test.cc#L1202
+
+- User: Andrew Pinski | Time: 2024-05-16 09:14:38 UTC
+  Text: It depends on if you consider a float to int conversion or not. For (long long)float . The value if the float was out of range is unspecified so returning one value or another is both valid.
+So the question is it corresponding to float to integer conversion in c or exactly what the instruction does. The later has implications across the board.
+
+- User: Sergei Trofimovich | Time: 2024-05-16 21:57:44 UTC
+  Text: Filedhttps://github.com/google/highway/issues/2183on `highway` upstream side.
+
+- User: Jan Wassenberg | Time: 2024-05-17 08:27:29 UTC
+  Text: Thanks Andrew and Sergei :) I agree we should not require a certain outcome for converting source values which are outside the domain of the target type. We'll update the test.
+
+- User: Jan Wassenberg | Time: 2024-05-17 09:22:36 UTC
+  Text: On second thought, we are actually trying to convert out-of-bounds values to the closest representable. We use the documented behavior of the instruction, as mentioned in #5, and then correct the result afterwards.
+
+Per the comment in the code below, it seems GCC since v11 or even 10 has been assuming this is UB, and optimizing out our fix.
+
+I do believe this is compiler misbehavior, rooted in treating the operation as if it were scalar code. But vector instructions are more modern and have tighter specs; for example, integers are 2's complement and wraparound for addition is well-defined in the actual instructions.
+
+Given that at least GCC's constant folding has unexpected results, we will have to find a workaround. I had previously worried that a floating-point min(input, (2^63)-1) is not exact. But comparing the float >= 2^63 and if so returning (2^63)-1 would work, right? The CPU will anyway truncate the float to int.
+
+Our current fixup code:
+
+// For ConvertTo float->int of same size, clamping before conversion would
+// change the result because the max integer value is not exactly representable.
+// Instead detect the overflow result after conversion and fix it.
+// Generic for all vector lengths.
+template <class DI>
+HWY_INLINE VFromD<DI> FixConversionOverflow(DI di,
+                                            VFromD<RebindToFloat<DI>> original,
+                                            VFromD<DI> converted) {
+  // Combinations of original and output sign:
+  //   --: normal <0 or -huge_val to 80..00: OK
+  //   -+: -0 to 0                         : OK
+  //   +-: +huge_val to 80..00             : xor with FF..FF to get 7F..FF
+  //   ++: normal >0                       : OK
+  const VFromD<DI> sign_wrong = AndNot(BitCast(di, original), converted);
+#if HWY_COMPILER_GCC_ACTUAL
+  // Critical GCC 11 compiler bug (possibly also GCC 10): omits the Xor; also
+  // Add() if using that instead. Work around with one more instruction.
+  const RebindToUnsigned<DI> du;
+  const VFromD<DI> mask = BroadcastSignBit(sign_wrong);
+  const VFromD<DI> max = BitCast(di, ShiftRight<1>(BitCast(du, mask)));
+  return IfVecThenElse(mask, max, converted);
+#else
+  return Xor(converted, BroadcastSignBit(sign_wrong));
+#endif
+}
+
+- User: Jan Wassenberg | Time: 2024-05-17 18:10:58 UTC
+  Text: We have a workaround. I changed the ConvertTo (round to nearest int) code to 
+
+const auto overflow = RebindMask(di, Ge(v, Set(df, 2147483648.0f)));
+return IfThenElse(overflow, Set(di, LimitsMax<int32_t>()), ConvertInRangeTo(di, v)));
+
+However, this requires an additional workaround, inserting in the middle
+
+#if HWY_COMPILER_GCC_ACTUAL
+v = IfThenZeroElse(RebindMask(df, overflow), v);
+#endif
+
+It seems that passing an out of bounds value to _mm_cvtps_epi32 (bug is about cvttps, but cvtps also had the problem), even if its return value will be unused due to the IfThenElse (blending), still causes breakage. This is unfortunate.
+
+Wrapping the workaround in __builtin_constant_p(v) causes it to fail, so it seems the error is not in constant folding.
+
+- User: Sergei Trofimovich | Time: 2024-05-20 13:56:37 UTC
+  Text: After `highway` applied a masking fix to `highway/master` `gcc-15` still fails to pass the `HwyConvertTestGroup/HwyConvertTest.TestAllF2IPromoteTo/SSE2`.
+
+I tried to reduce the test with more care and I think it's a new `gcc-15` regression related to constant folding in vector shifts. Filedhttps://gcc.gnu.org/PR115161And somewhat related:> 972 - HwyShuffle4TestGroup/HwyShuffle4Test.TestAllPer4LaneBlockShuffle/SSE2  # GetParam() = 16384 (Subprocess aborted)from the #comment1is a separate `gcc-15` regression related to vector rotations:https://gcc.gnu.org/PR115146. It's (pending) fix does not help the `TestAllF2IPromoteTo/SSE2` above.
+
+Thus it looks like all the bugs are independent and require separate fixes.
+
+- User: Jan Wassenberg | Time: 2024-05-20 15:48:53 UTC
+  Text: Thanks for continuing to look into this and filing the issues.
+It seems like the Highway tests are examples of nontrivial vector code that are detecting some regressions. Would it be useful to add them to the GCC test suite to detect these issues immediately, rather than after a release cycle?
+
+- User: GCC Commits | Time: 2024-06-05 04:09:11 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:b05288d1f1e4b632eddf8830b4369d4659f6c2ffcommitr15-1022-gb05288d1f1e4b632eddf8830b4369d4659f6c2ffAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Tue May 21 16:57:17 2024 +0800
+
+    Don't simplify NAN/INF or out-of-range constant for FIX/UNSIGNED_FIX.
+    
+    According to IEEE standard, for conversions from floating point to
+    integer. When a NaN or infinite operand cannot be represented in the
+    destination format and this cannot otherwise be indicated, the invalid
+    operation exception shall be signaled. When a numeric operand would
+    convert to an integer outside the range of the destination format, the
+    invalid operation exception shall be signaled if this situation cannot
+    otherwise be indicated.
+    
+    The patch prevent simplication of the conversion from floating point
+    to integer for NAN/INF/out-of-range constant when flag_trapping_math.
+    
+    gcc/ChangeLog:PR rtl-optimization/100927PR rtl-optimization/115161PR rtl-optimization/115115* simplify-rtx.cc (simplify_const_unary_operation): Prevent
+            simplication of FIX/UNSIGNED_FIX for NAN/INF/out-of-range
+            constant when flag_trapping_math.
+            * fold-const.cc (fold_convert_const_int_from_real): Don't fold
+            for overflow value when_trapping_math.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr100927.c: New test.
+            * c-c++-common/Wconversion-1.c: Add -fno-trapping-math.
+            * c-c++-common/dfp/convert-int-saturate.c: Ditto.
+            * g++.dg/ubsan/pr63956.C: Ditto.
+            * g++.dg/warn/Wconversion-real-integer.C: Ditto.
+            * gcc.c-torture/execute/20031003-1.c: Ditto.
+            * gcc.dg/Wconversion-complex-c99.c: Ditto.
+            * gcc.dg/Wconversion-real-integer.c: Ditto.
+            * gcc.dg/c90-const-expr-11.c: Ditto.
+            * gcc.dg/overflow-warn-8.c: Ditto.
+
+- User: Sergei Trofimovich | Time: 2024-06-05 09:12:32 UTC
+  Text: The change fixed highway-1.0.7 test suite for me. Thank you!
+
+- User: Richard Biener | Time: 2024-06-20 09:15:28 UTC
+  Text: GCC 12.4 is being released, retargeting bugs to GCC 12.5.
+
+- User: Hongtao Liu | Time: 2024-07-09 07:03:48 UTC
+  Text: Fixed in GCC15.
+

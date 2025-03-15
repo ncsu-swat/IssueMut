@@ -1,0 +1,350 @@
+Bug Summary: error: inlining failed in call to 'always_inline' 'hwy::PreventElision<int&>(int&)void': target specific option mismatch
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Mathieu Malaterre | Time: 2023-09-11 08:08:39 UTC
+  Text: I cannot compile highway on ppc64el (ubuntu setup). It fails with:
+
+In file included from /<<PKGBUILDDIR>>/hwy/examples/skeleton.h:24,
+                 from /<<PKGBUILDDIR>>/hwy/examples/skeleton_test.cc:18:
+/<<PKGBUILDDIR>>/hwy/base.h: In member function ‘skeleton::N_PPC10::TestFloorLog2::operator()<float, hwy::N_PPC10::Simd<float, 4ul, 0> >(float, hwy::N_PPC10::Simd<float, 4ul, 0>)void’:
+/<<PKGBUILDDIR>>/hwy/base.h:1511:14: error: inlining failed in call to ‘always_inline’ ‘hwy::PreventElision<int&>(int&)void’: target specific option mismatch
+ 1511 | HWY_API void PreventElision(T&& output) {
+      |              ^~~~~~~~~~~~~~
+In file included from /<<PKGBUILDDIR>>/hwy/foreach_target.h:266,
+                 from /<<PKGBUILDDIR>>/hwy/examples/skeleton_test.cc:24:
+/<<PKGBUILDDIR>>/hwy/examples/skeleton_test.cc:73:24: note: called from here
+   73 |     hwy::PreventElision(sum);
+      |     ~~~~~~~~~~~~~~~~~~~^~~~~
+/<<PKGBUILDDIR>>/hwy/base.h:1511:14: error: inlining failed in call to ‘always_inline’ ‘hwy::PreventElision<int&>(int&)void’: target specific option mismatch
+ 1511 | HWY_API void PreventElision(T&& output) {
+      |              ^~~~~~~~~~~~~~
+/<<PKGBUILDDIR>>/hwy/examples/skeleton_test.cc:73:24: note: called from here
+   73 |     hwy::PreventElision(sum);
+      |     ~~~~~~~~~~~~~~~~~~~^~~~~
+
+- User: Mathieu Malaterre | Time: 2023-09-11 08:08:59 UTC
+  Text: Full log:
+
+*https://launchpadlibrarian.net/684588621/buildlog_ubuntu-mantic-ppc64el.highway_1.0.7-1_BUILDING.txt.gz
+
+- User: Mathieu Malaterre | Time: 2023-09-11 08:10:38 UTC
+  Text: Typical setup:
+
+*https://gcc.godbolt.org/z/5W45a6j8x
+
+- User: Mathieu Malaterre | Time: 2023-09-11 08:11:00 UTC
+  Text: compilation flags required are: `-O1 -mcpu=power9 -flto=auto`
+
+- User: Mathieu Malaterre | Time: 2023-09-11 08:15:37 UTC
+  Text: reduction started:
+
+ % cvise check.sh skeleton_test.cc
+00:00:02 INFO ===< 4165591 >===
+00:00:02 INFO running 4 interestingness tests in parallel
+00:00:02 INFO INITIAL PASSES
+
+- User: Jan Wassenberg | Time: 2023-09-11 11:08:28 UTC
+  Text: Thanks for reporting this. One might think this is caused by -mcpu=power9 clashing with our #pragma target altivec,vsx,power8-vector.
+
+However, what makes this seem like an actual bug is that -flto=auto is additionally required to trigger the bug.
+
+- User: Jan Wassenberg | Time: 2023-09-11 12:04:27 UTC
+  Text: Thinking about this more, the LTO means more opportunity for inlining and thus for the compiler to hit the legit "don't want to inline POWER9 into POWER8" error.
+
+Interestingly this does not happen on x86 - even if we have -march=haswell, #pragma target -mssse3 is not a problem. Perhaps POWER9 vs POWER8 has a larger/wider impact on codegen than Haswell vs SSE.
+
+I suppose we will have to work around this on the library level: if we detect any POWER9 flag, then do not attempt to also generate POWER8 codepaths.
+
+- User: Mathieu Malaterre | Time: 2023-09-11 12:46:03 UTC
+  Text: In case this helps resolve this, here is the cvise-reduced code:
+
+% cat skeleton_test.cc
+#include <stddef.h>
+#define HWY_PRAGMA(tokens) _Pragma(#tokens)
+namespace hwy {
+#define HWY_PUSH_ATTRIBUTES(targets_str) HWY_PRAGMA(GCC target targets_str)
+inline __attribute__((always_inline)) void PreventElision(int output) {
+  asm("" : "+r"(output) : : "memory");
+}
+} // namespace hwy
+#if HWY_TARGET == HWY_PPC10
+#define HWY_BEFORE_NAMESPACE() HWY_PUSH_ATTRIBUTES(",cpu=power10")
+#endif
+HWY_BEFORE_NAMESPACE() namespace detail {
+  template <typename, size_t, int> struct CappedTagChecker {};
+}
+template <typename T, size_t kLimit, int kPow2 = 0>
+using CappedTag = detail::CappedTagChecker<T, kLimit, kPow2>;
+template <class D> size_t Lanes(D);
+template <typename, size_t, size_t kMinArg, class Test> struct ForeachCappedR {
+  static void Do(size_t min_lanes, size_t max_lanes) {
+    CappedTag<int, kMinArg> d;
+    Test()(int(), d);
+    Do(min_lanes, max_lanes);
+  }
+};
+template <class Test> struct ForPartialVectors {
+  template <typename T> void operator()(T t) {
+    (void)t;
+    ForeachCappedR<T, 1, 1, Test>::Do(1, 1);
+  }
+};
+struct TestFloorLog2 {
+  template <class T, class DF> void operator()(T, DF df) {
+    size_t count = Lanes(df);
+    int sum;
+    for (size_t i; count; ++i)
+      hwy::PreventElision(sum);
+  }
+};
+void TestAllFloorLog2() { ForPartialVectors<TestFloorLog2>()(float()); }
+
+
+Compilation line is:
+
+% /usr/bin/c++  -O1 -mcpu=power9 -flto=auto -c skeleton_test.cc
+
+- User: Mathieu Malaterre | Time: 2023-09-11 12:58:33 UTC
+  Text: Further reduced:
+
+#include <stddef.h>
+#define HWY_PRAGMA(tokens) _Pragma(#tokens)
+#define HWY_PUSH_ATTRIBUTES(targets_str) HWY_PRAGMA(GCC target targets_str)
+__attribute__((always_inline)) void PreventElision() { asm(""); }
+#define HWY_BEFORE_NAMESPACE() HWY_PUSH_ATTRIBUTES(",cpu=power10")
+HWY_BEFORE_NAMESPACE() namespace detail {
+  template <typename, size_t, int> struct CappedTagChecker {};
+}
+template <typename T, size_t kLimit, int kPow2 = 0>
+using CappedTag = detail::CappedTagChecker<T, kLimit, kPow2>;
+template <typename, size_t, size_t kMinArg, class Test> struct ForeachCappedR {
+  static void Do(size_t, size_t) {
+    CappedTag<int, kMinArg> d;
+    Test()(int(), d);
+  }
+};
+template <class Test> struct ForPartialVectors {
+  template <typename T> void operator()(T) {
+    ForeachCappedR<T, 1, 1, Test>::Do(1, 1);
+  }
+};
+struct TestFloorLog2 {
+  template <class T, class DF> void operator()(T, DF) { PreventElision(); }
+};
+void TestAllFloorLog2() { ForPartialVectors<TestFloorLog2>()(float()); }
+
+- User: Kewen Lin | Time: 2023-09-12 03:00:53 UTC
+  Text: It looks to me that the error message is expected, because the source code forces the function as always_inline, users would like it to be inlined always, it's compiled with -mcpu=power10 as pragma function target specifies, but the caller is compiled with -mcpu=power9 as command line specifies, the caller doesn't have the full ISA capability over the callee, it's unable to make inlining happen.
+
+- User: Kewen Lin | Time: 2023-09-12 03:14:10 UTC
+  Text: (In reply to Jan Wassenberg fromcomment #5)> Thanks for reporting this. One might think this is caused by -mcpu=power9
+> clashing with our #pragma target altivec,vsx,power8-vector.
+> 
+> However, what makes this seem like an actual bug is that -flto=auto is
+> additionally required to trigger the bug.This reminds me there is one bug in the current function rs6000_can_inline_p, seehttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=102059#c17-flto=auto makes the callee have a constructed DECL_FUNCTION_SPECIFIC_TARGET, so callee_tree is not NULL, it would further check ISA flags. Without it, the current implementation doesn't adopt the default option node and just ignore it unexpectedly. FiledPR111380.
+
+- User: Mathieu Malaterre | Time: 2023-09-12 06:03:53 UTC
+  Text: (In reply to Kewen Lin fromcomment #9)> It looks to me that the error message is expected, because the source code
+> forces the function as always_inline, users would like it to be inlined
+> always, it's compiled with -mcpu=power10 as pragma function target
+> specifies, but the caller is compiled with -mcpu=power9 as command line
+> specifies, the caller doesn't have the full ISA capability over the callee,
+> it's unable to make inlining happen.Ah right. I missed the fact that `-O1 -mcpu=power8 -flto=auto` also does trigger the exact same error message. Sorry for the noise.
+
+- User: Kewen Lin | Time: 2023-09-12 07:02:53 UTC
+  Text: (In reply to Kewen Lin fromcomment #9)> It looks to me that the error message is expected, because the source code
+> forces the function as always_inline, users would like it to be inlined
+> always, it's compiled with -mcpu=power10 as pragma function target
+> specifies, but the caller is compiled with -mcpu=power9 as command line
+> specifies, the caller doesn't have the full ISA capability over the callee,
+> it's unable to make inlining happen.Sorry, I just realized that I misread the function which the pragma is applied for (inverted the caller and the callee). It seems fine to make a caller with -mcpu=power10 to inline a callee with -mcpu=power9, but unfortunately Power10 drops HTM capability, it causes the mismatch. The issue should be gone with an extra -mno-htm.
+
+This issue is similar toPR102059, whose fix already takes care of some cases without actual htm feature uses. But it leaves inline asm alone, unfortunately the reduced test case here is using inline asm. One idea is to enhance the fix ofPR102059to further parse inline asm mnemonics.
+
+- User: Kewen Lin | Time: 2023-09-12 07:09:58 UTC
+  Text: I'd assume that most of applications don't adopt HTM features from Power8 and Power9 at all, adding an extra option -mno-htm can be considered for them for this special case of HTM removal in a later CPU (Power10).
+
+- User: Kewen Lin | Time: 2023-09-12 07:52:42 UTC
+  Text: Both the reduced test case and the upstream code (https://github.com/google/highway/blob/master/hwy/base.h) have empty inline asm string, one quick simple fix can treat empty asm string specially:
+
+diff --git a/gcc/config/rs6000/rs6000.cc b/gcc/config/rs6000/rs6000.cc
+index efe9adce1f8..6ef75164d08 100644
+--- a/gcc/config/rs6000/rs6000.cc
++++ b/gcc/config/rs6000/rs6000.cc
+@@ -25475,9 +25475,11 @@ rs6000_update_ipa_fn_target_info (unsigned int &info, const gimple *stmt)
+   /* Assume inline asm can use any instruction features.  */
+   if (gimple_code (stmt) == GIMPLE_ASM)
+     {
+-      /* Should set any bits we concerned, for now OPTION_MASK_HTM is
+-         the only bit we care about.  */
+-      info |= RS6000_FN_TARGET_INFO_HTM;
++      const char *asm_str = gimple_asm_string (as_a<const gasm *> (stmt));
++      if (strlen (asm_str) > 0)
++        /* Should set any bits we concerned, for now OPTION_MASK_HTM is
++           the only bit we care about.  */
++        info |= RS6000_FN_TARGET_INFO_HTM;
+       return false;
+     }
+   else if (gimple_code (stmt) == GIMPLE_CALL)
+
+- User: Mathieu Malaterre | Time: 2023-09-14 14:19:37 UTC
+  Text: For some reason the no-htm flag does not seems to work in my case:
+
+% /usr/bin/c++  -O1 -mcpu=power8 -flto=auto -c skeleton_test.cc
+skeleton_test.cc: In member function 'TestFloorLog2::operator()<int, detail::CappedTagChecker<int, 1u, 0> >(int, detail::CappedTagChecker<int, 1u, 0>)void':
+skeleton_test.cc:5:44: error: inlining failed in call to 'always_inline' 'hwy::PreventElision(int)': target specific option mismatch
+    5 | inline __attribute__((always_inline)) void PreventElision(int output) {
+      |                                            ^~~~~~~~~~~~~~
+skeleton_test.cc:36:26: note: called from here
+   36 |       hwy::PreventElision(sum);
+      |       ~~~~~~~~~~~~~~~~~~~^~~~~
+
+with:
+
+% cat skeleton_test.cc
+#include <stddef.h>
+#define HWY_PRAGMA(tokens) _Pragma(#tokens)
+namespace hwy {
+#define HWY_PUSH_ATTRIBUTES(targets_str) HWY_PRAGMA(GCC target targets_str)
+inline __attribute__((always_inline)) void PreventElision(int output) {
+  asm("" : "+r"(output) : : "memory");
+}
+} // namespace hwy
+#if HWY_TARGET == HWY_PPC10
+#define HWY_BEFORE_NAMESPACE() HWY_PUSH_ATTRIBUTES(",cpu=power10,no-htm")
+#endif
+HWY_BEFORE_NAMESPACE() namespace detail {
+  template <typename, size_t, int> struct CappedTagChecker {};
+}
+template <typename T, size_t kLimit, int kPow2 = 0>
+using CappedTag = detail::CappedTagChecker<T, kLimit, kPow2>;
+template <class D> size_t Lanes(D);
+template <typename, size_t, size_t kMinArg, class Test> struct ForeachCappedR {
+  static void Do(size_t min_lanes, size_t max_lanes) {
+    CappedTag<int, kMinArg> d;
+    Test()(int(), d);
+    Do(min_lanes, max_lanes);
+  }
+};
+template <class Test> struct ForPartialVectors {
+  template <typename T> void operator()(T t) {
+    (void)t;
+    ForeachCappedR<T, 1, 1, Test>::Do(1, 1);
+  }
+};
+struct TestFloorLog2 {
+  template <class T, class DF> void operator()(T, DF df) {
+    size_t count = Lanes(df);
+    int sum;
+    for (size_t i; count; ++i)
+      hwy::PreventElision(sum);
+  }
+};
+void TestAllFloorLog2() { ForPartialVectors<TestFloorLog2>()(float()); }
+
+- User: Mathieu Malaterre | Time: 2023-09-14 14:40:13 UTC
+  Text: Interesting, the following works for me:
+
+% /usr/bin/c++  -O1 -mcpu=power8 -mno-htm -flto=auto -c skeleton_test.cc
+
+- User: Kewen Lin | Time: 2023-09-15 02:02:19 UTC
+  Text: (In reply to Mathieu Malaterre fromcomment #16)> Interesting, the following works for me:
+> 
+> % /usr/bin/c++  -O1 -mcpu=power8 -mno-htm -flto=auto -c skeleton_test.ccYeah, the suggestion on an extra option -mno-htm is for command line options, since they are used for compiling the callee PreventElision.
+
+It makes that:
+  - the callee(PreventElision): -mcpu=power8 -mno-htm
+  - caller: -mcpu=power10
+
+caller doesn't have the htm capability (as it's compiled with p10 which drops htm), but the callee claims it doesn't need htm with -mno-htm, so it's safe to do the inlining.
+
+If you want to adjust the pragma
+
+#define HWY_BEFORE_NAMESPACE() HWY_PUSH_ATTRIBUTES(",cpu=power10")
+
+, it should be:
+
+#define HWY_BEFORE_NAMESPACE() HWY_PUSH_ATTRIBUTES(",cpu=power10,htm")
+
+it pretends that the caller has the htm support, then it's also fine.
+
+- User: Jan Wassenberg | Time: 2023-09-15 06:41:15 UTC
+  Text: Ah, got it. We'll change the pragma to ",htm" as you suggest. Thank you :)
+
+- User: GCC Commits | Time: 2023-09-25 05:31:41 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:a65b38e361320e0aa45adbc969c704385ab1f45bcommitr14-4247-ga65b38e361320e0aa45adbc969c704385ab1f45bAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Mon Sep 25 00:28:19 2023 -0500
+
+    rs6000: Skip empty inline asm in rs6000_update_ipa_fn_target_info [PR111366]PR111366exposes one thing that can be improved in function
+    rs6000_update_ipa_fn_target_info is to skip the given empty
+    inline asm string, since it's impossible to adopt any
+    hardware features (so far HTM).
+    
+    Since this rs6000_update_ipa_fn_target_info related approach
+    exists in GCC12 and later, the affected project highway has
+    updated its target pragma with ",htm", see the link:https://github.com/google/highway/commit/15e63d61eb535f478bcI'd not bother to consider an inline asm parser for now but
+    will file a separated PR for further enhancement.PR target/111366gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.cc (rs6000_update_ipa_fn_target_info): Skip
+            empty inline asm.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/powerpc/pr111366.C: New test.
+
+- User: GCC Commits | Time: 2023-10-16 02:07:27 UTC
+  Text: The releases/gcc-13 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:4d22de945430e6f8c33ef98c90a4fad8de0ef41ecommitr13-7953-g4d22de945430e6f8c33ef98c90a4fad8de0ef41eAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Sun Oct 15 21:05:40 2023 -0500
+
+    rs6000: Skip empty inline asm in rs6000_update_ipa_fn_target_info [PR111366]PR111366exposes one thing that can be improved in function
+    rs6000_update_ipa_fn_target_info is to skip the given empty
+    inline asm string, since it's impossible to adopt any
+    hardware features (so far HTM).
+    
+    Since this rs6000_update_ipa_fn_target_info related approach
+    exists in GCC12 and later, the affected project highway has
+    updated its target pragma with ",htm", see the link:https://github.com/google/highway/commit/15e63d61eb535f478bcI'd not bother to consider an inline asm parser for now but
+    will file a separated PR for further enhancement.PR target/111366gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.cc (rs6000_update_ipa_fn_target_info): Skip
+            empty inline asm.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/powerpc/pr111366.C: New test.
+    
+    (cherry picked from commit a65b38e361320e0aa45adbc969c704385ab1f45b)
+
+- User: GCC Commits | Time: 2023-10-16 02:09:09 UTC
+  Text: The releases/gcc-12 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:2b50ddce27be4738b494f5c4dd7083099b3de68ccommitr12-9925-g2b50ddce27be4738b494f5c4dd7083099b3de68cAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Sun Oct 15 21:08:26 2023 -0500
+
+    rs6000: Skip empty inline asm in rs6000_update_ipa_fn_target_info [PR111366]PR111366exposes one thing that can be improved in function
+    rs6000_update_ipa_fn_target_info is to skip the given empty
+    inline asm string, since it's impossible to adopt any
+    hardware features (so far HTM).
+    
+    Since this rs6000_update_ipa_fn_target_info related approach
+    exists in GCC12 and later, the affected project highway has
+    updated its target pragma with ",htm", see the link:https://github.com/google/highway/commit/15e63d61eb535f478bcI'd not bother to consider an inline asm parser for now but
+    will file a separated PR for further enhancement.PR target/111366gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.cc (rs6000_update_ipa_fn_target_info): Skip
+            empty inline asm.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/powerpc/pr111366.C: New test.
+    
+    (cherry picked from commit a65b38e361320e0aa45adbc969c704385ab1f45b)
+
+- User: Kewen Lin | Time: 2023-10-16 03:33:45 UTC
+  Text: Should be fixed on trunk and gcc-{12,13}.
+

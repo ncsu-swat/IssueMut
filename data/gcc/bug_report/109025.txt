@@ -1,0 +1,139 @@
+Bug Summary: [13 Regression] ice in nested_in_vect_loop_p
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2023-03-04 20:39:19 UTC
+  Text: Createdattachment 54586[details]C source code
+
+The attached C code, when compiled by recent gcc and compiler flag -O3,
+does this:
+
+runData/keep/in.35565.c: In function ‘func_1.isra’:
+runData/keep/in.35565.c:187:16: internal compiler error: Segmentation fault
+0xdb5149 crash_signal(int)
+	../../trunk.d1/gcc/toplev.cc:314
+0x10424d1 nested_in_vect_loop_p(loop*, _stmt_vec_info*)
+	../../trunk.d1/gcc/tree-vectorizer.h:1648
+0x10424d1 vectorizable_reduction(_loop_vec_info*, _stmt_vec_info*, _slp_tree*, _
+slp_instance*, vec<stmt_info_for_cost, va_heap, vl_ptr>*)
+	../../trunk.d1/gcc/tree-vect-loop.cc:6943
+
+The bug first seems to occur sometime between git hashg:4acc4c2be84d6607,
+dated 20221101 andg:d0a3d55ae4a2656f, dated 20221201.
+
+I have a reduction running.
+
+- User: David Binderman | Time: 2023-03-04 20:42:34 UTC
+  Text: Reduced C code seems to be:
+
+g_86, g_472, g_1844, func_4_p_8;
+func_4() {
+  int *l_3175 = &g_86;
+  for (; g_1844; g_1844 -= 1) {
+    g_472 = 1;
+    for (; g_472; g_472 += 1)
+      if (func_4_p_8)
+        *l_3175 ^= 10;
+    *l_3175 ^= 10;
+  }
+}
+
+- User: Andrew Pinski | Time: 2023-03-05 00:36:43 UTC
+  Text: Confirmed, reduced a little further and valid well defined code:
+```
+int func_4(int t, int b) {
+  for (int tt1 = 0; tt1 < 1024 ; tt1 ++)
+  {
+    for (int tt = 0; tt < 1024; tt ++)
+      if (b)
+        t ^= 10;
+    t ^= 10;
+  }
+  return t;
+}
+```
+
+- User: Andrew Pinski | Time: 2023-03-05 00:40:46 UTC
+  Text: Note using &, | or ^ causes the ICE. Using + or - or * does not.
+
+Here is more simplified testcase:
+```
+int func_4(int t, int b) {
+  for (int tt1 = 0; tt1 < 128 ; tt1 ++)
+  {
+    for (int tt = 0; tt < 128; tt ++)
+      if (b)
+        t |= 3;
+    t |= 3;
+  }
+  return t;
+}
+```
+The above should just optimized to `return t | 3;` really.
+The ^/& case should be optimized too but it depends on if the number of loops is even or odd and if b was non-zero or not.
+
+- User: David Binderman | Time: 2023-03-05 08:33:37 UTC
+  Text: (In reply to Andrew Pinski fromcomment #3)> Note using &, | or ^ causes the ICE. Using + or - or * does not.Interesting.> Here is more simplified testcase:Thanks for that. I will have a go at a bisection. 825 git commits in the range.
+
+- User: David Binderman | Time: 2023-03-05 09:17:34 UTC
+  Text: (In reply to David Binderman fromcomment #4)> I will have a go at a bisection. 825 git commits in the range.Current range seems to beg:59ad8b684dd67e17..g:1191a412bb17a734,
+with 206 commits in the range.
+
+- User: David Binderman | Time: 2023-03-05 09:32:34 UTC
+  Text: (In reply to David Binderman fromcomment #5)> (In reply to David Binderman fromcomment #4)
+> > I will have a go at a bisection. 825 git commits in the range.
+> 
+> Current range seems to beg:59ad8b684dd67e17..g:1191a412bb17a734,
+> with 206 commits in the range.Range now seems to beg:d699d32f47833cfa..g:3b54cc9d04c2efb2,
+with 52 commits in the range.
+
+- User: David Binderman | Time: 2023-03-05 09:52:29 UTC
+  Text: (In reply to David Binderman fromcomment #6)> Range now seems to beg:d699d32f47833cfa..g:3b54cc9d04c2efb2,
+> with 52 commits in the range.Now downtog:0cbb756fe9c8e13a..g:7e3ce73849fef8b5, with 13 commits in
+the range.
+
+- User: David Binderman | Time: 2023-03-05 10:17:37 UTC
+  Text: $ git bisect good 49de156a6adb50e0
+9e11ceef165bc074c2fc85b8ddece606b24e710b is the first bad commit
+commit 9e11ceef165bc074c2fc85b8ddece606b24e710b
+Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Sep 27 10:16:52 2022 +0200
+
+    unswitching of outer loops
+
+Over to Richard for their best advice.
+
+- User: Richard Biener | Time: 2023-03-06 08:37:44 UTC
+  Text: I will have a look.
+
+- User: Richard Biener | Time: 2023-03-06 09:41:50 UTC
+  Text: This is a latent issue where we are mis-detecting a double reduction.  Since we've loosened constraint on nested cycle detection we failed to beef up
+constraints we put on double reductions.
+
+Testing a minimal patch.  Coverage of weird double reductions isn't too great though so thanks for this testcase.
+
+- User: GCC Commits | Time: 2023-03-06 10:26:34 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:c1873079b05e399355eb79e4828ed9ba2d0c6968commitr13-6503-gc1873079b05e399355eb79e4828ed9ba2d0c6968Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Mar 6 10:43:13 2023 +0100
+
+    tree-optimization/109025 - fixup double reduction detection
+    
+    The following closes a gap in double reduction detection where we
+    in the outer loop analysis fail to verify the inner LC PHI use is
+    the latch definition of the inner loop PHI.  That latch definition
+    is used to detect that an inner loop is part of a double reduction
+    when later doing the inner loop analysis.PR tree-optimization/109025* tree-vect-loop.cc (vect_is_simple_reduction): Verify
+            the inner LC PHI use is the inner loop PHI latch definition
+            before classifying an outer PHI as double reduction.
+    
+            * gcc.dg/vect/pr109025.c: New testcase.
+
+- User: Richard Biener | Time: 2023-03-06 10:37:35 UTC
+  Text: Fixed (but latent I think).
+

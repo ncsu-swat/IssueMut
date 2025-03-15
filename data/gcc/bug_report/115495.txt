@@ -1,0 +1,171 @@
+Bug Summary: [15 Regression] ICE in smallest_mode_for_size, at stor-layout.cc:356 during combine on RISC-V rv64gcv_zvl256b at -O3 since r15-1042-g68b0742a49d
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-06-14 19:07:31 UTC
+  Text: Testcase:
+extern short a[];
+short b;
+int main() {
+  for (char c = 0; c < 18; c += 1)
+    a[c + 0] = b;
+}
+
+Backtrace:> /scratch/tc-testing/tc-jun-14/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv_zvl256b -O3 red.c -o red.outduring RTL pass: combine
+./red.c: In function 'main':
+./red.c:6:1: internal compiler error: in smallest_mode_for_size, at stor-layout.cc:356
+    6 | }
+      | ^
+0x134a8f7 smallest_mode_for_size(poly_int<2u, unsigned long>, mode_class)
+        ../../../gcc/gcc/stor-layout.cc:356
+0x11fa32a smallest_int_mode_for_size(poly_int<2u, unsigned long>)
+        ../../../gcc/gcc/machmode.h:916
+0x11fa32a get_best_extraction_insn
+        ../../../gcc/gcc/optabs-query.cc:208
+0x25f7d54 make_extraction
+        ../../../gcc/gcc/combine.cc:7779
+0x25f903f make_compound_operation_int
+        ../../../gcc/gcc/combine.cc:8186
+0x25fa07f make_compound_operation(rtx_def*, rtx_code)
+        ../../../gcc/gcc/combine.cc:8471
+0x25fddce simplify_set
+        ../../../gcc/gcc/combine.cc:6975
+0x25fddce combine_simplify_rtx
+        ../../../gcc/gcc/combine.cc:6374
+0x260006f subst
+        ../../../gcc/gcc/combine.cc:5630
+0x2604101 try_combine
+        ../../../gcc/gcc/combine.cc:3312
+0x2609351 combine_instructions
+        ../../../gcc/gcc/combine.cc:1264
+0x2609351 rest_of_handle_combine
+        ../../../gcc/gcc/combine.cc:15127
+0x2609351 execute
+        ../../../gcc/gcc/combine.cc:15171
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+Godbolt:https://godbolt.org/z/zTf5nWz48Found via fuzzer.
+
+The fuzzer first detected this on 2024-06-07 and many times since so it was likely caused by a patch committed a day or two before 2024-06-07.
+
+- User: Andrew Pinski | Time: 2024-06-14 23:47:10 UTC
+  Text: Trying 25 -> 26:
+   25: r150:DI=r139:V16HI#0 0>>0x10
+   26: r151:DI=zero_extend(r150:DI#0)
+
+That is these 2 instructions:
+```
+(insn 25 24 26 2 (set (reg:DI 150)
+        (lshiftrt:DI (subreg:DI (reg:V16HI 139 [ vect_cst__21 ]) 0)
+            (const_int 16 [0x10]))) "/app/example.c":5:14 299 {lshrdi3}
+     (nil))
+(insn 26 25 34 2 (set (reg:DI 151)
+        (zero_extend:DI (subreg:HI (reg:DI 150) 0))) "/app/example.c":5:14 121 {*zero_extendhidi2}
+     (expr_list:REG_DEAD (reg:DI 150)
+        (nil)))
+```
+The above rtl looks good as far as I know. It looks like get_best_extraction_insn is using V16HI there though which is where it goes wrong.
+
+Confirmed.
+
+This comes from the expanision of:
+;; MEM <vector(16) short int> [(short int *)&a] = vect_cst__21;
+
+Which looks different for GCC 14.1.0 and much simplier.
+
+- User: Andrew Pinski | Time: 2024-06-14 23:48:03 UTC
+  Text: Note in most cases `(subreg:DI (reg:V16HI 139 [ vect_cst__21 ]) 0) (const_int 16 [0x10])` would normally be a `vec_select` so I am shock that it is using a subreg here ...
+
+- User: Robin Dapp | Time: 2024-06-19 16:13:57 UTC
+  Text: At first it looked very weird that we need 50 (or so) instructions to expand
+
+;; MEM <vector(16) short int> [(short int *)&a] = vect_cst__21;
+
+but then I realized that all the hoops we jump through are due to possible misalignment.  Otherwise we could of course just emit a vector store.
+
+So we don't ICE with -mno-vector-strict-align.
+
+Going to look into the actual issue in the next days.
+
+- User: Patrick O'Neill | Time: 2024-06-20 03:33:36 UTC
+  Text: This failure also appears when compiling glibc 2.39 with rv64gcv_zvl512b and rv64gcv_zvl1024b.
+
+- User: Patrick O'Neill | Time: 2024-06-20 18:14:02 UTC
+  Text: Bisected to first bad commit:r15-1042-g68b0742a49d
+
+- User: Robin Dapp | Time: 2024-08-20 12:16:25 UTC
+  Text: Finally looking into this one.  The fix is pretty simple and it's similar to other occurrences of smallest_int_mode_for_size.
+smallest_int_mode_for_size expects to find at least one mode equal to or larger than the provided size but in some cases this fails - in particular when we have full-vector-size structures like here.
+
+Testing a patch.
+
+- User: Robin Dapp | Time: 2024-08-20 13:57:29 UTC
+  Text: Ah, hmm, this doesn't seem to occur on trunk anymore for me.  It's still likely latent.  Patrick, does it still happen for you?
+
+- User: Patrick O'Neill | Time: 2024-08-20 17:00:28 UTC
+  Text: I'm not able to replicate it either (and the fuzzer hasn't found a duplicate that is still valid)
+
+- User: GCC Commits | Time: 2024-08-23 10:38:46 UTC
+  Text: The master branch has been updated by Robin Dapp <rdapp@gcc.gnu.org>:https://gcc.gnu.org/g:96fe95bac67c7303dc811c04f5e99cc959a7182acommitr15-3120-g96fe95bac67c7303dc811c04f5e99cc959a7182aAuthor: Robin Dapp <rdapp@ventanamicro.com>
+Date:   Tue Aug 20 14:02:09 2024 +0200
+
+    optabs-query: Use opt_machine_mode for smallest_int_mode_for_size [PR115495].
+    
+    In get_best_extraction_insn we use smallest_int_mode_for_size with
+    struct_bits as size argument.PR115495has struct_bits = 256 and we
+    don't have a mode for that.  This patch makes smallest_mode_for_size
+    and smallest_int_mode_for_size return opt modes so we can just skip
+    over the loop when there is no mode.PR middle-end/115495gcc/ChangeLog:
+    
+            * cfgexpand.cc (expand_debug_expr): Require mode.
+            * combine.cc (make_extraction): Ditto.
+            * config/aarch64/aarch64.cc (aarch64_expand_cpymem): Ditto.
+            (aarch64_expand_setmem): Ditto.
+            * config/arc/arc.cc (arc_expand_cpymem): Ditto.
+            * config/arm/arm.cc (arm_expand_divmod_libfunc): Ditto.
+            * config/i386/i386.cc (ix86_get_mask_mode): Ditto.
+            * config/rs6000/predicates.md: Ditto.
+            * config/rs6000/rs6000.cc (vspltis_constant): Ditto.
+            * config/s390/s390.cc (s390_expand_insv): Ditto.
+            * config/sparc/sparc.cc (assign_int_registers): Ditto.
+            * coverage.cc (get_gcov_type): Ditto.
+            (get_gcov_unsigned_t): Ditto.
+            * dse.cc (find_shift_sequence): Ditto.
+            * expmed.cc (store_integral_bit_field): Ditto.
+            * expr.cc (convert_mode_scalar): Ditto.
+            (op_by_pieces_d::smallest_fixed_size_mode_for_size): Ditto.
+            (emit_block_move_via_oriented_loop): Ditto.
+            (copy_blkmode_to_reg): Ditto.
+            (store_field): Ditto.
+            * internal-fn.cc (expand_arith_overflow): Ditto.
+            * machmode.h (HAVE_MACHINE_MODES): Ditto.
+            (smallest_mode_for_size): Use opt_machine_mode.
+            (smallest_int_mode_for_size): Use opt_scalar_int_mode.
+            * optabs-query.cc (get_best_extraction_insn): Require mode.
+            * optabs.cc (expand_twoval_binop_libfunc): Ditto.
+            * stor-layout.cc (smallest_mode_for_size): Return
+            opt_machine_mode.
+            (layout_type): Require mode.
+            (initialize_sizetypes): Ditto.
+            * tree-ssa-loop-manip.cc (canonicalize_loop_ivs): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/pr115495.c: New test.
+    
+    gcc/ada/ChangeLog:
+    
+            * gcc-interface/utils2.cc (fast_modulo_reduction): Require mode.
+            (nonbinary_modular_operation): Ditto.
+
+- User: Robin Dapp | Time: 2024-08-23 10:39:14 UTC
+  Text: Fixed.
+

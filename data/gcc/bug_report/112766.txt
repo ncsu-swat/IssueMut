@@ -1,0 +1,104 @@
+Bug Summary: [14 regression] spurious -Wmaybe-uninitialized with array new since r14-4089
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: diagnostic, missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: scott snyder | Time: 2023-11-29 16:54:48 UTC
+  Text: hi -
+
+With a recent checkout of gcc14 (20231129), on a x86_64-pc-linux-gnu host,
+the following source gives a bogus -Wmaybe-uninitialized warning
+with -Wall:
+
+--------------------------------------------------------------
+void* operator new[](unsigned long, void* __p) ;
+
+class Result
+{
+public:
+  Result();
+  ~Result();
+};
+ 
+void *foo(long nElements, void *p) {
+  return p ? new((int*)p) Result[nElements] : new Result[nElements];
+}
+--------------------------------------------------------------
+
+
+$ g++ -c -O1 -Wall x.cc
+x.cc: In function ‘void* foo(long int, void*)’:
+x.cc:11:67: warning: ‘nElements.6’ may be used uninitialized [-Wmaybe-uninitialized]
+   11 |   return p ? new((int*)p) Result[nElements] : new Result[nElements];
+      |                                                                   ^
+x.cc:11:58: note: ‘nElements.6’ was declared here
+   11 |   return p ? new((int*)p) Result[nElements] : new Result[nElements];
+      |                                                          ^~~~~~~~~
+
+We get the same warning with -O2 and -O3, but not -O0.
+
+This warning does not occur with gcc 13.2.1 20230728.
+
+- User: Marek Polacek | Time: 2023-11-29 17:04:00 UTC
+  Text: Started withr14-4089:
+
+commit d45ddc2c04e471d0dcee016b6edacc00b8341b16
+Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Sep 14 13:06:51 2023 +0200
+
+    tree-optimization/111294 - backwards threader PHI costing
+
+- User: Richard Biener | Time: 2023-11-30 09:01:53 UTC
+  Text: OK, so one uninit use occurs on the exceptional path from Result::Result()
+during the initialization loop of the allocated array, this then has
+
+<bb 25> [count: 0]:
+# _71 = PHI <_58(21), _42(D)(6), _42(D)(45), _42(D)(14), _42(D)(24)>
+# _72 = PHI <_85(21), _43(D)(6), _43(D)(45), _43(D)(14), _43(D)(24)>
+# _73 = PHI <_44(D)(21), _44(D)(6), _41(45), _44(D)(14), _44(D)(24)>
+# nElements.2_74 = PHI <_17(21), _17(6), nElements.2_47(D)(45), nElements.2_47(D)(14), _17(24)>
+# cleanup.4_75 = PHI <1(21), 0(6), 0(45), 0(14), 0(24)>
+# nElements.6_76 = PHI <nElements.6_56(D)(21), nElements.6_56(D)(6), _17(45), _17(14), nElements.6_56(D)(24)>
+# cleanup.7_77 = PHI <0(21), 0(6), 1(45), 0(14), 0(24)>
+<L47>:
+resx 3  // goes to L25
+
+<L25>:
+if (cleanup.7_77 != 0)
+  goto <bb 27>; [0.00%]
+else
+  goto <bb 46>; [0.00%]
+
+but somehow we are not seeing that cleanup.7_77 is 0 on all the paths
+n_Elements.6_76 are uninitialized.  (We're also not threading this
+for unknown reasons, likely the threader not going up EH edges)
+
+- User: Richard Biener | Time: 2023-11-30 09:50:59 UTC
+  Text: There's some logic in uninit_analysis::overlap, it looks incomplete.
+
+- User: GCC Commits | Time: 2023-11-30 12:35:19 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:8a6062a47b33da6d961c6354fd5788bc46aef0a9commitr14-6009-g8a6062a47b33da6d961c6354fd5788bc46aef0a9Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Nov 30 10:58:13 2023 +0100
+
+    tree-optimization/112766 - improve pruning of uninit diagnostics
+    
+    Uninit diagnostics has code to prune based on incoming PHI args
+    that prove the uninit code is never executed.  But that only
+    looks at the first found flag candidate while in the PRs case
+    only the second candidate would be the one to prune on.  The
+    following patch makes us consider all of the flag candidates
+    which is cycles well spent IMHO.PR tree-optimization/112766* gimple-predicate-analysis.cc (find_var_cmp_const):
+            Support continuing the iteration and report every candidate.
+            (uninit_analysis::overlap): Iterate over all flag var
+            candidates.
+    
+            * g++.dg/torture/uninit-pr112766.C: New testcase.
+
+- User: Richard Biener | Time: 2023-11-30 12:35:48 UTC
+  Text: Fixed.  Note it's a generally latent issue.
+

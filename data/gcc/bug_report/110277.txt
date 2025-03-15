@@ -1,0 +1,113 @@
+Bug Summary: RISC-V: ICE when build RVV intrinsic float reduction with "-march=rv32gc_zve64d -mabi=ilp32d", both GCC 14 and 13.
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Li Pan | Time: 2023-06-16 08:25:08 UTC
+  Text: Createdattachment 55338[details]Reproduce code
+
+Given we have the below code.
+
+#include "riscv_vector.h"y
+
+vfloat32m1_t test_vfredmax_vs_f32mf2_f32m1(vfloat32mf2_t vector, vfloat32m1_t scalar, size_t vl) {
+  return __riscv_vfredmax_vs_f32mf2_f32m1(vector, scalar, vl);
+}
+
+There will be the ICE when build similar as "riscv64-unknown-elf-gcc -march=rv64gc_zve64d -mabi=lp64 -O3 -Wno-psabi -c -S test-float.c -o -".
+
+test-float.c: In function ‘test_vfredmax_vs_f32mf2_f32m1’:
+test-float.c:17:10: error: invalid argument to built-in function
+   17 |   return __riscv_vfredmax_vs_f32mf2_f32m1(vector, scalar, vl);
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+during RTL pass: expand
+test-float.c:17:10: internal compiler error: Segmentation fault
+0x16e8945 crash_signal
+        /home/pli/repos/gcc/555/riscv-gnu-toolchain/gcc/__RISC-V_BUILD__/../gcc/toplev.cc:314
+0x7fcc1724251f ???
+        ./signal/../sysdeps/unix/sysv/linux/x86_64/libc_sigaction.c:0
+0x111c93c store_expr(tree_node*, rtx_def*, int, bool, bool)
+        /home/pli/repos/gcc/555/riscv-gnu-toolchain/gcc/__RISC-V_BUILD__/../gcc/expr.cc:6345
+0x111ae77 expand_assignment(tree_node*, tree_node*, bool)
+        /home/pli/repos/gcc/555/riscv-gnu-toolchain/gcc/__RISC-V_BUILD__/../gcc/expr.cc:6048
+0xf65d2c expand_call_stmt
+        /home/pli/repos/gcc/555/riscv-gnu-toolchain/gcc/__RISC-V_BUILD__/../gcc/cfgexpand.cc:2829
+0xf69ac6 expand_gimple_stmt_1
+        /home/pli/repos/gcc/555/riscv-gnu-toolchain/gcc/__RISC-V_BUILD__/../gcc/cfgexpand.cc:3880
+0xf6a1b3 expand_gimple_stmt
+        /home/pli/repos/gcc/555/riscv-gnu-toolchain/gcc/__RISC-V_BUILD__/../gcc/cfgexpand.cc:4044
+0xf72d20 expand_gimple_basic_block
+        /home/pli/repos/gcc/555/riscv-gnu-toolchain/gcc/__RISC-V_BUILD__/../gcc/cfgexpand.cc:6096
+0xf75279 execute
+        /home/pli/repos/gcc/555/riscv-gnu-toolchain/gcc/__RISC-V_BUILD__/../gcc/cfgexpand.cc:6831
+
+- User: Li Pan | Time: 2023-06-16 08:30:23 UTC
+  Text: Meanwhile, the float reduction for FP16 is not well supported for both the ZVE64 and ZVE32. We will try to fix them together with this bug.
+
+- User: GCC Commits | Time: 2023-06-19 14:25:59 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:2ba7347aba59faa119345c7b374fbbf1f35bae85commitr14-1945-g2ba7347aba59faa119345c7b374fbbf1f35bae85Author: Pan Li <pan2.li@intel.com>
+Date:   Sat Jun 17 22:11:02 2023 +0800
+
+    RISC-V: Bugfix for RVV float reduction in ZVE32/64
+    
+    The rvv integer reduction has 3 different patterns for zve128+, zve64
+    and zve32. They take the same iterator with different attributions.
+    However, we need the generated function code_for_reduc (code, mode1, mode2).
+    The implementation of code_for_reduc may look like below.
+    
+    code_for_reduc (code, mode1, mode2)
+    {
+      if (code == max && mode1 == VNx1HF && mode2 == VNx1HF)
+        return CODE_FOR_pred_reduc_maxvnx1hfvnx16hf; // ZVE128+
+    
+      if (code == max && mode1 == VNx1HF && mode2 == VNx1HF)
+        return CODE_FOR_pred_reduc_maxvnx1hfvnx8hf;  // ZVE64
+    
+      if (code == max && mode1 == VNx1HF && mode2 == VNx1HF)
+        return CODE_FOR_pred_reduc_maxvnx1hfvnx4hf;  // ZVE32
+    }
+    
+    Thus there will be a problem here. For example zve32, we will have
+    code_for_reduc (max, VNx1HF, VNx1HF) which will return the code of
+    the ZVE128+ instead of the ZVE32 logically.
+    
+    This patch will merge the 3 patterns into pattern, and pass both the
+    input_vector and the ret_vector of code_for_reduc. For example, ZVE32
+    will be code_for_reduc (max, VNx1HF, VNx2HF), then the correct code of ZVE32
+    will be returned as expectation.
+    
+    Please note both GCC 13 and 14 are impacted by this issue.
+    
+    Signed-off-by: Pan Li <pan2.li@intel.com>
+    Co-Authored by: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+    
+    gcc/ChangeLog:PR target/110277* config/riscv/riscv-vector-builtins-bases.cc: Adjust expand for
+            ret_mode.
+            * config/riscv/vector-iterators.md: Add VHF, VSF, VDF,
+            VHF_LMUL1, VSF_LMUL1, VDF_LMUL1, and remove unused attr.
+            * config/riscv/vector.md (@pred_reduc_<reduc><mode><vlmul1>): Removed.
+            (@pred_reduc_<reduc><mode><vlmul1_zve64>): Ditto.
+            (@pred_reduc_<reduc><mode><vlmul1_zve32>): Ditto.
+            (@pred_reduc_plus<order><mode><vlmul1>): Ditto.
+            (@pred_reduc_plus<order><mode><vlmul1_zve32>): Ditto.
+            (@pred_reduc_plus<order><mode><vlmul1_zve64>): Ditto.
+            (@pred_reduc_<reduc><VHF:mode><VHF_LMUL1:mode>): New pattern.
+            (@pred_reduc_<reduc><VSF:mode><VSF_LMUL1:mode>): Ditto.
+            (@pred_reduc_<reduc><VDF:mode><VDF_LMUL1:mode>): Ditto.
+            (@pred_reduc_plus<order><VHF:mode><VHF_LMUL1:mode>): Ditto.
+            (@pred_reduc_plus<order><VSF:mode><VSF_LMUL1:mode>): Ditto.
+            (@pred_reduc_plus<order><VDF:mode><VDF_LMUL1:mode>): Ditto.
+    
+    gcc/testsuite/ChangeLog:PR target/110277* gcc.target/riscv/rvv/base/pr110277-1.c: New test.
+            * gcc.target/riscv/rvv/base/pr110277-1.h: New test.
+            * gcc.target/riscv/rvv/base/pr110277-2.c: New test.
+            * gcc.target/riscv/rvv/base/pr110277-2.h: New test.
+
+- User: Kito Cheng | Time: 2023-09-07 10:33:35 UTC
+  Text: Fixed on trunk
+

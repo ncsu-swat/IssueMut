@@ -1,0 +1,164 @@
+Bug Summary: [14 Regression] SPEC 2006 416.gamess miscompares on Aarch64 when built with -Ofast -mcpu=native since g:2f46e3578d45ff060a0a329cb39d4f52878f9d5a
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: needs-reduction, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Martin Jambor | Time: 2024-01-09 17:42:28 UTC
+  Text: Our Aarch64 benchmarker (armv8.2-a+crypto+fp16+rcpc+dotprod+ssbs)
+signals that SPEC 2006 416.gamess miscompares when built with -Ofast
+-march=native -flto and master revisionr14-7022-g34d339bbd0c1f5.
+
+*** Miscompare of cytosine.2.out; 
+1120:      1 C                0.027630132       0.018067739       0.002234116
+           1 C             -223.432234062       7.107716215      -9.326017293
+                                        ^
+1121:      2 C                0.012259576      -0.006051645      -0.000067202
+           2 C             -205.307990130    -173.019401916      -6.442472179
+                                        ^
+1122:      3 C               -0.012829758       0.003221329      -0.000743429
+           3 C               -0.900001858    -263.923127366       3.131404191
+                                        ^
+1123:      4 N               -0.041204707       0.020932737      -0.000372560
+           4 N              291.766837166    -257.876625173      10.788390925
+                                        ^
+1124:      5 C                0.057007688       0.032540385      -0.000909621
+           5 C             -204.215830139      57.403322317      -0.929403441
+                                        ^
+1125:      6 N               -0.015041867      -0.049945043       0.002129121
+           6 N              117.540483305     300.802327718     -10.562573219
+                                        ^
+1126:      7 O               -0.076442899      -0.041673056      -0.000117411
+           7 O              481.672983389     238.169793443       3.121961894
+                                        ^
+1127:      8 N                0.034391335      -0.016048119      -0.001905357
+           8 N             -247.780884876      91.547672097      -1.133077767
+                                        ^
+1128:      9 H                0.014938973       0.008953835       0.000373759
+           9 H               -3.948185240       0.659195159      -0.007774350
+                                        ^
+1129:     10 H               -0.002268325       0.023480419       0.000010207
+          10 H               -0.160267091      -4.621874235      -0.178161165
+
+
+Unfortunately at the moment don't have another access to another
+adequate Aarch64 machine to debug further and so at this time I cannot
+provide more information (and so the component "target" is likely
+bogus, sorry).
+
+- User: Tamar Christina | Time: 2024-02-19 13:13:01 UTC
+  Text: Ah, I missed this. Yeah we've seen it but didn't have time to track down untill now.
+
+however our CI shows it showed up betweeng:ae034b9106fbdd855ec22ce221bb61a1a9a532c3andg:3333a064e4925afa1ad5f2f8c1350c4f57d631ceandg:34d339bbd0c1f5b4ad9587e7ae8387c912cb028bis a target only change so unlikely to be related.
+
+bisecting.
+
+- User: Tamar Christina | Time: 2024-02-21 10:25:56 UTC
+  Text: bisected to
+
+commitg:2f46e3578d45ff060a0a329cb39d4f52878f9d5aAuthor: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Thu Dec 14 13:46:16 2023 +0000
+
+    aarch64: Improve handling of accumulators in early-ra
+
+    Being very simplistic, early-ra just models an allocno's live range
+    as a single interval.  This doesn't work well for single-register
+    accumulators that are updated multiple times in a loop, since in
+
+and it still seems to be miscomparing today.
+
+- User: Tamar Christina | Time: 2024-02-21 10:32:35 UTC
+  Text: I'm however able to reproduce it at -Ofast alone, no need for `-flto`
+
+- User: Tamar Christina | Time: 2024-02-21 11:07:08 UTC
+  Text: most of the changes seem to be scheduling and register renaming, so I guess one should compile with scheduling off to reduce the noise a bit.
+
+detinp_ does have a weird transformation where a cluster of csel go missing and replaced with mov, but the function is too big for me to quickly tell if this is the issue.
+
+- User: Richard Sandiford | Time: 2024-02-21 11:09:57 UTC
+  Text: Mine.  Could be the same asPR112922.
+
+- User: Richard Sandiford | Time: 2024-02-21 18:37:13 UTC
+  Text: For me the miscompilation is in jkdmem_, where we end up allocating the same registers to both arms of an fcsel.  It sounds like it occurs elsewhere too.
+
+I have a candidate fix, but need to think a bit more about it.
+
+- User: GCC Commits | Time: 2024-02-23 14:13:25 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:8a16e06da97f51574cfad17e2cece2e58571305dcommitr14-9155-g8a16e06da97f51574cfad17e2cece2e58571305dAuthor: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Fri Feb 23 14:12:54 2024 +0000
+
+    aarch64: Add missing early-ra bookkeeping [PR113295]
+    
+    416.gamess showed up two wrong-code bugs in early-ra.  This patch
+    fixes the first of them.  It was difficult to reduce the source code
+    to something that would meaningfully show the situation, so the
+    testcase uses a direct RTL sequence instead.
+    
+    In the sequence:
+    
+    (a) register <2> is set more than once
+    (b) register <2> is copied to a temporary (<4>)
+    (c) register <2> is the destination of an FCSEL between <4> and
+        another value (<5>)
+    (d) <4> and <2> are equivalent for <4>'s live range
+    (e) <5>'s and <2>'s live ranges do not intersect, and there is
+        a pseudo-copy between <5> and <2>
+    
+    On its own, (d) implies that <4> can be treated as equivalent to <2>.
+    And on its own, (e) implies that <5> can share <2>'s register.  But
+    <4>'s and <5>'s live ranges conflict, meaning that they cannot both
+    share the register together.  A bit of missing bookkeeping meant that
+    the mechanism for detecting this didn't fire.  We therefore ended up
+    with an FCSEL in which both inputs were the same register.
+    
+    gcc/PR target/113295* config/aarch64/aarch64-early-ra.cc
+            (early_ra::find_related_start): Account for definitions by shared
+            registers when testing for a single register definition.
+            (early_ra::accumulate_defs): New function.
+            (early_ra::record_copy): If A shares B's register, fold A's
+            definition information into B's.  Fold A's use information into B's.
+    
+    gcc/testsuite/PR target/113295* gcc.dg/rtl/aarch64/pr113295-1.c: New test.
+
+- User: GCC Commits | Time: 2024-02-23 14:13:30 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:9f105cfdc1bca6c9224384b3044c4ca5894e1e4ccommitr14-9156-g9f105cfdc1bca6c9224384b3044c4ca5894e1e4cAuthor: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Fri Feb 23 14:12:55 2024 +0000
+
+    aarch64: Tighten early-ra chain test for wide registers [PR113295]
+    
+    Most code in early-ra used is_chain_candidate to check whether we
+    should chain two allocnos.  This included both tests that matter
+    for correctness and tests for certain heuristics.
+    
+    Once that test passes for one pair of allocnos, we test whether
+    it's safe to chain the containing groups (which might contain
+    multiple allocnos for x2, x3 and x4 modes).  This test used an
+    inline test for correctness only, deliberately skipping the
+    heuristics.  However, this instance of the test was missing
+    some handling of equivalent allocnos.
+    
+    This patch fixes things by making is_chain_candidate take a
+    strictness parameter: correctness only, or correctness + heuristics.
+    It then makes the group-chaining test use the correctness version
+    rather than trying to replicate it inline.
+    
+    gcc/PR target/113295* config/aarch64/aarch64-early-ra.cc
+            (early_ra::test_strictness): New enum.
+            (early_ra::is_chain_candidate): Add a strictness parameter to
+            control whether only correctness matters, or whether both correctness
+            and heuristics should be used.  Handle multiple levels of equivalence.
+            (early_ra::find_related_start): Update call accordingly.
+            (early_ra::strided_polarity_pref): Likewise.
+            (early_ra::form_chains): Likewise.
+            (early_ra::try_to_chain_allocnos): Use is_chain_candidate in
+            correctness mode rather than trying to inline the test.
+    
+    gcc/testsuite/PR target/113295* gcc.target/aarch64/pr113295-2.c: New test.
+
+- User: Richard Sandiford | Time: 2024-02-23 14:17:00 UTC
+  Text: Fixed.
+

@@ -1,0 +1,112 @@
+Bug Summary: [15 regression] SIGFPE (branch optimised out) in eigen-3.4.0 testsuite
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sam James | Time: 2024-09-18 21:53:52 UTC
+  Text: Forwarding a report from Paul Zander in Gentoo:
+"""
+While running the eigen-3.4.0 test suite in gentoo, a few tests fail with "signal SIGFPE, Arithmetic exception" under gcc-15.> Program received signal SIGFPE, Arithmetic exception.
+> 0x0000555555559dda in Eigen::internal::gemm_pack_lhs<double, long, Eigen::internal::const_blas_data_mapper<double, long, 0>, 4, 2, double __vector(4), 0, false, false>::operator()(double*, Eigen::internal::const_blas_data_mapper<double, long, 0> const&, long, long, long, long) (blockA=blockA@entry=0x7fffffffcb40, lhs=..., depth=depth@entry=3, 
+>     rows=rows@entry=3, stride=stride@entry=0, offset=offset@entry=0, this=<optimized out>) at /var/tmp/paludis/dev-cpp-eigen-3.4.0-r3/work/eigen-3.4.0/Eigen/src/Core/products/GeneralBlockPanelKernel.h:2121
+> 2121      const Index peeled_mc0 = Pack2>=PacketSize ? peeled_mc_quarter
+> (gdb) x/i $pc
+> => 0x555555559dda <_ZN5Eigen8internal13gemm_pack_lhsIdlNS0_22const_blas_data_mapperIdlLi0EEELi4ELi2EDv4_dLi0ELb0ELb0EEclEPdRKS3_llll+154>:      idiv   %r13The failure occurs in> const Index peeled_mc0 = Pack2>=PacketSize ? peeled_mc_quarter
+>                        : Pack2>1 && last_lhs_progress ? (rows/last_lhs_progress)*last_lhs_progress : 0;https://gitlab.com/libeigen/eigen/-/blob/3.4/Eigen/src/Core/products/GeneralBlockPanelKernel.h?ref_type=heads#L2121-2122A simple reproducer ishttps://godbolt.org/z/a5hzzK377> #include <iostream>
+> template<typename Index>
+> Index round(Index a,Index b){
+>   return b!=0 ? a/b*b :0;
+> }
+> 
+> int main() {
+>   std::cout << round<long>(3L, 1L) << '\n';
+>   std::cout << round<long>(3L, 0L) << '\n';
+>   return 0;
+> }Looking at assembler code gcc-15 reduces the ternary operation to "a/b*b", which then fails for b == 0.
+"""
+
+- User: Sam James | Time: 2024-09-18 21:54:19 UTC
+  Text: Createdattachment 59142[details]test.cxx
+
+- User: Marek Polacek | Time: 2024-09-18 22:01:29 UTC
+  Text: Started withr15-307:
+
+commit e472527c7b45d23e8dfd0fb767a6e663b4bc136e
+Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Tue Apr 30 14:45:26 2024 -0700
+
+    MATCH: Add some more value_replacement simplifications (a != 0 ? expr : 0) to match
+
+- User: Andrew Pinski | Time: 2024-09-18 22:08:24 UTC
+  Text: It is this pattern:
+a != 0 ? a * b : 0 -> a * b
+
+as we don't check if b could trap.
+match and generic and cond_expr don't always get along it seems.
+
+- User: Andrew Pinski | Time: 2024-09-18 22:13:07 UTC
+  Text: if (TREE_SIDE_EFFECTS (_p0)) goto next_after_fail964;
+      if (TREE_SIDE_EFFECTS (_p1)) goto next_after_fail964;
+      if (TREE_SIDE_EFFECTS (_p2)) goto next_after_fail964;
+
+
+We check for SIDE_EFFECTS so that works correctly but trap is counted as  a side effect here. Double blah.
+
+- User: Andrew Pinski | Time: 2024-09-18 22:21:41 UTC
+  Text: The easiest fix is to add:
+&& !generic_expr_could_trap_p (@3)
+
+There but I am not sure if that will always work even though generic_expr_could_trap_p is recusive.
+
+- User: Andrew Pinski | Time: 2024-09-18 22:31:49 UTC
+  Text: Createdattachment 59143[details]Better reduced testcase
+
+Here is a better reduced testcase.
+
+The problem only shows up with these 2 patterns because in:
+ a != 0 ? a * b : 0
+ a != 0 ? a & b : 0
+
+b is only conditionaly used.
+
+- User: Andrew Pinski | Time: 2024-09-18 22:36:30 UTC
+  Text: I am wondering if genmatch should generate the call to generic_expr_could_trap_p rather than adding it to the pattern because there could be more issues like this learking around.
+
+- User: Richard Biener | Time: 2024-09-19 08:46:28 UTC
+  Text: Note genmatch uses TREE_SIDE_EFFECTS only for dropping/duplicating issues,
+making traps unconditional is sth that patterns need to check.
+
+- User: GCC Commits | Time: 2024-09-25 15:17:48 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:6c5543d3d9c4bbcd19f0ae2b7ed7e523c978a9a8commitr15-3870-g6c5543d3d9c4bbcd19f0ae2b7ed7e523c978a9a8Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Thu Sep 19 13:50:14 2024 -0700
+
+    match: Fix `a != 0 ? a * b : 0` patterns for things that trap [PR116772]
+    
+    For generic, `a != 0 ? a * b : 0` would match where `b` would be an expression
+    which trap (in the case of the testcase, it was an integer division but it could be any).
+    
+    This adds a new helper function, expr_no_side_effects_p which tests if there is no side effects
+    and the expression is not trapping which might be used in other locations.
+    
+    Changes since v1:
+    * v2: Add move check to helper function instead of inlining it.PR middle-end/116772gcc/ChangeLog:
+    
+            * generic-match-head.cc (expr_no_side_effects_p): New function
+            * gimple-match-head.cc (expr_no_side_effects_p): New function
+            * match.pd (`a != 0 ? a / b : 0`): Check expr_no_side_effects_p.
+            (`a != 0 ? a * b : 0`, `a != 0 ? a & b : 0`): Likewise.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/torture/pr116772-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-09-25 15:18:08 UTC
+  Text: Fixed.
+

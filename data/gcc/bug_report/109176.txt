@@ -1,0 +1,538 @@
+Bug Summary: [11 Regression] internal compiler error: in to_constant, at poly-int.h:504
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Mathieu Malaterre | Time: 2023-03-17 16:19:17 UTC
+  Text: I cannot compile highway on arm64 with gcc-13 anymore.
+
+Compilation fais with:
+
+/home/malat/h/highway/hwy/tests/mask_test.cc:230:21: internal compiler error: in to_constant, at poly-int.h:504
+  230 |   HWY_NOINLINE void operator()(T /*unused*/, D d) {
+      |                     ^~~~~~~~
+0x6a06eb poly_int_pod<2u, unsigned long>::to_constant() const [clone .part.0] [clone .lto_priv.0]
+        ../../src/gcc/poly-int.h:504
+0xf5057b poly_int_pod<2u, unsigned long>::to_constant() const
+        ../../src/gcc/poly-int.h:502
+0x9451c3 nunits_for_known_piecewise_op
+        ../../src/gcc/tree-vect-generic.cc:92
+0x1e1b803 expand_vector_condition
+        ../../src/gcc/tree-vect-generic.cc:1120
+0x1a4b67b expand_vector_operations_1
+        ../../src/gcc/tree-vect-generic.cc:2122
+0x1a4b67b expand_vector_operations
+        ../../src/gcc/tree-vect-generic.cc:2382
+0x1a4b67b execute
+        ../../src/gcc/tree-vect-generic.cc:2479
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+
+ref:
+*https://buildd.debian.org/status/fetch.php?pkg=highway&arch=arm64&ver=1.0.4%7Egit20230317.8681eb8-1&stamp=1679067803&raw=0
+
+- User: Mathieu Malaterre | Time: 2023-03-17 16:43:44 UTC
+  Text: Createdattachment 54697[details]Preprocessed source gcc-13
+
+% /usr/lib/gcc-snapshot/bin/g++ -freport-bug -DHWY_STATIC_DEFINE -I/home/malat/h/highway -O2 -g -DNDEBUG -fPIE -fvisibility=hidden -fvisibility-inlines-hidden -Wno-builtin-macro-redefined -D__DATE__=\"redacted\" -D__TIMESTAMP__=\"redacted\" -D__TIME__=\"redacted\" -fmerge-all-constants -Wall -Wextra -Wconversion -Wsign-conversion -Wvla -Wnon-virtual-dtor -fmath-errno -fno-exceptions -DHWY_IS_TEST=1 -DGTEST_HAS_PTHREAD=1 -MD -MT CMakeFiles/mask_test.dir/hwy/tests/mask_test.cc.o -MF CMakeFiles/mask_test.dir/hwy/tests/mask_test.cc.o.d -o CMakeFiles/mask_test.dir/hwy/tests/mask_test.cc.o -c /home/malat/h/highway/hwy/tests/mask_test.cc
+
+- User: N/A | Time: 2023-03-17 17:54:38 UTC
+  Text: Confirmed. Running reduction
+
+- User: N/A | Time: 2023-03-20 09:37:57 UTC
+  Text: Createdattachment 54708[details]Reduced testcase
+
+Reduced testcase ICEs at -O2
+
+- User: Jakub Jelinek | Time: 2023-03-20 13:59:21 UTC
+  Text: At least on the reduced testcase, this started to ICE withr11-1445-g502d63b6d6141597bbone way and withr11-1470-gd11c9841d54ed74978f8d0e0f352631f90504dd5changed to the ICE in to_constant.  So not really sure this should be P1.
+
+- User: Jakub Jelinek | Time: 2023-03-20 15:35:56 UTC
+  Text: Before veclower2 we had/have
+  _7 = ba_5(D) < a_6(D);
+  _8 = svnand_b_z (_7, _7, _7);
+  _9 = VEC_COND_EXPR <_7, _8, _7>;
+where _7/_8/_9 are all __SVBool_t.
+Before ther11-1445changes, the VEC_COND_EXPR would be left untouched, because
+expand_vec_cond_expr_p (__SVBool_t, __SVBool_t, SSA_NAME) is true on aarch64.
+Now it doesn't, because _7 def_stmt is a comparison, and so
+expand_vec_cond_expr_p (__SVBool_t, VNx16QI, LT_EXPR).
+--- gcc/tree-vect-generic.cc.jj	2023-03-12 22:36:06.356178068 +0100
++++ gcc/tree-vect-generic.cc	2023-03-20 16:31:03.321831866 +0100
+@@ -1063,6 +1063,12 @@ expand_vector_condition (gimple_stmt_ite
+       return true;
+     }
+ 
++  if (!TYPE_VECTOR_SUBPARTS (type).is_constant ()
++      && VECTOR_BOOLEAN_TYPE_P (type)
++      && VECTOR_BOOLEAN_TYPE_P (TREE_TYPE (a))
++      && expand_vec_cond_expr_p (type, TREE_TYPE (a), TREE_CODE (a)))
++    return true;
++
+   /* Handle vector boolean types with bitmasks.  If there is a comparison
+      and we can expand the comparison into the vector boolean bitmask,
+      or otherwise if it is compatible with type, we can transform
+basically restores the behaviour here for the SVE boolean types and makes it compile.
+Because otherwise, unless this would be solvable by the AVX512 "Handle vector boolean types with bitmasks." code the non-constant vector elts cases will always ICE in the following code,   int nunits = nunits_for_known_piecewise_op (type);
+requires constant TYPE_VECTOR_SUBPARTS and the code really isn't prepared to handle anything non-constant.
+
+- User: Jakub Jelinek | Time: 2023-03-21 09:25:01 UTC
+  Text: Reduced testcase:
+#pragma GCC aarch64 "arm_sve.h"
+
+svbool_t
+foo (svint8_t a, svint8_t b, svbool_t c)
+{
+  svbool_t d = svcmplt_s8 (svptrue_pat_b8 (SV_ALL), a, b);
+  return svsel_b (d, c, d);
+}
+
+- User: Richard Biener | Time: 2023-03-21 09:53:18 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #5)> Before veclower2 we had/have
+>   _7 = ba_5(D) < a_6(D);
+>   _8 = svnand_b_z (_7, _7, _7);
+>   _9 = VEC_COND_EXPR <_7, _8, _7>;
+> where _7/_8/_9 are all __SVBool_t.
+> Before ther11-1445changes, the VEC_COND_EXPR would be left untouched,
+> because
+> expand_vec_cond_expr_p (__SVBool_t, __SVBool_t, SSA_NAME) is true on aarch64.
+> Now it doesn't, because _7 def_stmt is a comparison, and so
+> expand_vec_cond_expr_p (__SVBool_t, VNx16QI, LT_EXPR).
+> --- gcc/tree-vect-generic.cc.jj	2023-03-12 22:36:06.356178068 +0100
+> +++ gcc/tree-vect-generic.cc	2023-03-20 16:31:03.321831866 +0100
+> @@ -1063,6 +1063,12 @@ expand_vector_condition (gimple_stmt_ite
+>        return true;
+>      }
+>  
+> +  if (!TYPE_VECTOR_SUBPARTS (type).is_constant ()
+> +      && VECTOR_BOOLEAN_TYPE_P (type)
+> +      && VECTOR_BOOLEAN_TYPE_P (TREE_TYPE (a))
+> +      && expand_vec_cond_expr_p (type, TREE_TYPE (a), TREE_CODE (a)))
+> +    return true;
+> +
+>    /* Handle vector boolean types with bitmasks.  If there is a comparison
+>       and we can expand the comparison into the vector boolean bitmask,
+>       or otherwise if it is compatible with type, we can transform
+> basically restores the behaviour here for the SVE boolean types and makes it
+> compile.
+> Because otherwise, unless this would be solvable by the AVX512 "Handle
+> vector boolean types with bitmasks." code the non-constant vector elts cases
+> will always ICE in the following code,   int nunits =
+> nunits_for_known_piecewise_op (type);
+> requires constant TYPE_VECTOR_SUBPARTS and the code really isn't prepared to
+> handle anything non-constant.OK, so expand_vec_cond_expr_p does
+
+bool
+expand_vec_cond_expr_p (tree value_type, tree cmp_op_type, enum tree_code code)
+{
+  machine_mode value_mode = TYPE_MODE (value_type);
+  machine_mode cmp_op_mode = TYPE_MODE (cmp_op_type);
+  if (VECTOR_BOOLEAN_TYPE_P (cmp_op_type)
+      && get_vcond_mask_icode (TYPE_MODE (value_type),
+                               TYPE_MODE (cmp_op_type)) != CODE_FOR_nothing)
+    return true;
+
+first.  I think vector lowering should always check the original 'a'
+if it is a mask, like with the following, there's no good reason to
+special-case this just for VL vectors
+
+diff --git a/gcc/tree-vect-generic.cc b/gcc/tree-vect-generic.cc
+index 519a824ec72..c957c9aa7a9 100644
+--- a/gcc/tree-vect-generic.cc
++++ b/gcc/tree-vect-generic.cc
+@@ -1040,6 +1040,10 @@ expand_vector_condition (gimple_stmt_iterator *gsi, bitmap dce_ssa_names)
+   tree_code code = TREE_CODE (a);
+   gassign *assign = NULL;
+ 
++  if (VECTOR_BOOLEAN_TYPE_P (TREE_TYPE (a))
++      && expand_vec_cond_expr_p (type, TREE_TYPE (a), ERROR_MARK))
++    return true;
++
+   if (code == SSA_NAME)
+     {
+       assign = dyn_cast<gassign *> (SSA_NAME_DEF_STMT (a));
+@@ -1053,14 +1057,14 @@ expand_vector_condition (gimple_stmt_iterator *gsi, bitmap dce_ssa_names)
+          comp_inner_type = TREE_TYPE (TREE_TYPE (a1));
+          comp_width = vector_element_bits_tree (TREE_TYPE (a1));
+        }
+-    }
+ 
+-  if (expand_vec_cond_expr_p (type, TREE_TYPE (a1), code)
+-      || (integer_all_onesp (b) && integer_zerop (c)
+-         && expand_vec_cmp_expr_p (type, TREE_TYPE (a1), code)))
+-    {
+-      gcc_assert (TREE_CODE (a) == SSA_NAME || TREE_CODE (a) == VECTOR_CST);
+-      return true;
++      if (expand_vec_cond_expr_p (type, TREE_TYPE (a1), code)
++         || (integer_all_onesp (b) && integer_zerop (c)
++             && expand_vec_cmp_expr_p (type, TREE_TYPE (a1), code)))
++       {
++         gcc_assert (TREE_CODE (a) == SSA_NAME || TREE_CODE (a) == VECTOR_CST);
++         return true;
++       }
+     }
+ 
+   /* Handle vector boolean types with bitmasks.  If there is a comparison
+
+- User: Jakub Jelinek | Time: 2023-03-21 10:28:39 UTC
+  Text: (In reply to Richard Biener fromcomment #7)> --- a/gcc/tree-vect-generic.cc
+> +++ b/gcc/tree-vect-generic.cc
+> @@ -1040,6 +1040,10 @@ expand_vector_condition (gimple_stmt_iterator *gsi,
+> bitmap dce_ssa_names)
+>    tree_code code = TREE_CODE (a);
+>    gassign *assign = NULL;
+>  
+> +  if (VECTOR_BOOLEAN_TYPE_P (TREE_TYPE (a))
+> +      && expand_vec_cond_expr_p (type, TREE_TYPE (a), ERROR_MARK))
+> +    return true;
+> +
+>    if (code == SSA_NAME)
+>      {
+>        assign = dyn_cast<gassign *> (SSA_NAME_DEF_STMT (a));Ok, the above LGTM.> @@ -1053,14 +1057,14 @@ expand_vector_condition (gimple_stmt_iterator *gsi,
+> bitmap dce_ssa_names)
+>           comp_inner_type = TREE_TYPE (TREE_TYPE (a1));
+>           comp_width = vector_element_bits_tree (TREE_TYPE (a1));
+>         }
+> -    }
+>  
+> -  if (expand_vec_cond_expr_p (type, TREE_TYPE (a1), code)
+> -      || (integer_all_onesp (b) && integer_zerop (c)
+> -         && expand_vec_cmp_expr_p (type, TREE_TYPE (a1), code)))
+> -    {
+> -      gcc_assert (TREE_CODE (a) == SSA_NAME || TREE_CODE (a) == VECTOR_CST);
+> -      return true;
+> +      if (expand_vec_cond_expr_p (type, TREE_TYPE (a1), code)
+> +         || (integer_all_onesp (b) && integer_zerop (c)
+> +             && expand_vec_cmp_expr_p (type, TREE_TYPE (a1), code)))
+> +       {
+> +         gcc_assert (TREE_CODE (a) == SSA_NAME || TREE_CODE (a) ==
+> VECTOR_CST);
+> +         return true;
+> +       }
+>      }
+>  
+>    /* Handle vector boolean types with bitmasks.  If there is a comparisonIs the second hunk because the verifier now requires that first argument of VEC_COND_EXPR is always is_gimple_val and so it will be never tcc_comparison?
+I don't understand the assert after the change though, this is in code guarded with
+code == SSA_NAME, so TREE_CODE (a) == SSA_NAME is always true.
+If TREE_CODE (a) == VECTOR_CST, then it could return true without lowering only in the
+first hunk.
+
+Are you going to test the patch (with the assert removed?)?
+
+Not really sure about the testcase, perhaps the #c6 one in gcc.target/aarch64/sve/pr109176.c with
+/*PR tree-optimization/109176*/
+/* { dg-do compile } */
+/* { dg-options "-O2 -march=armv8.2-a+sve" } */
+
+at the start added?  Or #pragma GCC aarch64 "arm_sve.h" line replaced with
+#include <arm_sve.h> as well?
+
+- User: Jakub Jelinek | Time: 2023-03-21 10:41:33 UTC
+  Text: Oh, and one more thing, why the second hunk isn't inside of the if (assign && ) body, but after it?
+If we haven't updated code, then it will never succeed with code = SSA_NAME unless the first hunk already returned true.
+
+- User: N/A | Time: 2023-03-21 10:57:47 UTC
+  Text: For the testcase, having it in gcc.target/aarch64/sve as
+/* { dg-options "-O2" } */
+
+#include <arm_sve.h>
+
+svbool_t
+foo (svint8_t a, svint8_t b, svbool_t c)
+{
+  svbool_t d = svcmplt_s8 (svptrue_pat_b8 (SV_ALL), a, b);
+  return svsel_b (d, c, d);
+}
+
+would be fine.
+
+- User: Jakub Jelinek | Time: 2023-03-21 12:03:28 UTC
+  Text: Createdattachment 54718[details]gcc13-pr109176.patch
+
+Full untested patch.
+
+- User: Richard Biener | Time: 2023-03-21 12:12:38 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #11)> Createdattachment 54718[details]> gcc13-pr109176.patch
+> 
+> Full untested patch.LGTM
+
+- User: Jakub Jelinek | Time: 2023-03-22 08:47:48 UTC
+  Text: Unfortunately the patch breaks quite a lot of tests on x86_64:
++FAIL: c-c++-common/goacc/firstprivate-mappings-1.c (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: gcc.target/i386/sse2-pr88547-1.c (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:281)
++FAIL: gcc.target/i386/sse2-pr88547-2.c (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:281)
++FAIL: gcc.target/i386/sse4_1-pr88547-1.c (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:281)
++FAIL: gcc.target/i386/sse4_1-pr88547-2.c (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:281)
++FAIL: gdc.dg/torture/simd_blendvector.d   -O0  (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:281)
++FAIL: gdc.dg/torture/simd_blendvector.d   -O0 -g  (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:281)
++FAIL: g++.dg/tree-ssa/pr88152-1.C   (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:281)
++FAIL: c-c++-common/goacc/firstprivate-mappings-1.c  -std=c++11 (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: c-c++-common/goacc/firstprivate-mappings-1.c  -std=c++14 (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: c-c++-common/goacc/firstprivate-mappings-1.c  -std=c++17 (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: c-c++-common/goacc/firstprivate-mappings-1.c  -std=c++20 (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: c-c++-common/goacc/firstprivate-mappings-1.c  -std=c++2b (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: c-c++-common/goacc/firstprivate-mappings-1.c  -std=c++98 (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: g++.dg/goacc/firstprivate-mappings-1.C  -std=c++11 (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: g++.dg/goacc/firstprivate-mappings-1.C  -std=c++14 (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: g++.dg/goacc/firstprivate-mappings-1.C  -std=c++17 (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: g++.dg/goacc/firstprivate-mappings-1.C  -std=c++20 (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: g++.dg/goacc/firstprivate-mappings-1.C  -std=c++2b (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: g++.dg/goacc/firstprivate-mappings-1.C  -std=c++98 (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: libgomp.oacc-c/../libgomp.oacc-c-c++-common/firstprivate-mappings-1.c -DACC_DEVICE_TYPE_host=1 -DACC_MEM_SHARED=1 -foffload=disable  -O2  (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: libgomp.oacc-c++/../libgomp.oacc-c-c++-common/firstprivate-mappings-1.c -DACC_DEVICE_TYPE_host=1 -DACC_MEM_SHARED=1 -foffload=disable  -O2  (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
++FAIL: libgomp.oacc-c++/firstprivate-mappings-1.C -DACC_DEVICE_TYPE_host=1 -DACC_MEM_SHARED=1 -foffload=disable  -O2  (internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:249)
+
+- User: Jakub Jelinek | Time: 2023-03-22 12:03:21 UTC
+  Text: So, e.g. in the gcc.target/i386/sse4_1-pr88547-1.c testcase, we have before veclower21:
+v2di f13 (v2di x, v2di y)
+{
+  vector(2) <signed-boolean:64> _1;
+  v2di _4;
+
+  <bb 2> [local count: 1073741824]:
+  _1 = x_2(D) <= y_3(D);
+  _4 = VEC_COND_EXPR <_1, { -1, -1 }, { 0, 0 }>;
+  return _4;
+}
+And the problem is quite obvious.  We do have vcond_mask_v2div2di optab,
+so with the changed code expand_vector_condition just returns true.
+But, expand_vector_comparison has:
+  /* As seen inPR95830, we should not expand comparisons that are only
+     feeding a VEC_COND_EXPR statement.  */
+  auto_vec<gimple *> uses;
+  FOR_EACH_IMM_USE_FAST (use_p, iterator, lhs)
+    {
+      gimple *use = USE_STMT (use_p);
+      if (is_gimple_debug (use))
+        continue;
+      if (is_gimple_assign (use)
+          && gimple_assign_rhs_code (use) == VEC_COND_EXPR
+          && gimple_assign_rhs1 (use) == lhs
+          && gimple_assign_rhs2 (use) != lhs
+          && gimple_assign_rhs3 (use) != lhs)
+        uses.safe_push (use);
+      else
+        vec_cond_expr_only = false;
+    }
+
+  if (vec_cond_expr_only)
+    for (gimple *use : uses)
+      {
+        gimple_stmt_iterator it = gsi_for_stmt (use);
+        if (!expand_vector_condition (&it, dce_ssa_names))
+          {
+            vec_cond_expr_only = false;
+            break;
+          }
+      }
+
+  if (!uses.is_empty () && vec_cond_expr_only)
+    return NULL_TREE;
+So, it effectively relies on expand_vector_condition doing its previous job
+when the def stmt of a is a comparison, as nothing else checks it in that case,
+and here x86 doesn't have V2DImode comparison instruction for this case.
+
+Thus, I think we should instead of the tree-vect-generic.cc changes do:
+--- gcc/tree-vect-generic.cc.jj	2023-03-21 13:28:21.354671095 +0100
++++ gcc/tree-vect-generic.cc	2023-03-22 12:53:27.853986127 +0100
+@@ -1063,6 +1063,15 @@ expand_vector_condition (gimple_stmt_ite
+       return true;
+     }
+ 
++  /* If a has vector boolean type and is a comparison, above
++     expand_vec_cond_expr_p might fail, even if both the comparison and
++     VEC_COND_EXPR could be supported individually.  SeePR109176.  */
++  if (a_is_comparison
++      && VECTOR_BOOLEAN_TYPE_P (TREE_TYPE (a))
++      && expand_vec_cond_expr_p (type, TREE_TYPE (a), SSA_NAME)
++      && expand_vec_cmp_expr_p (TREE_TYPE (a1), TREE_TYPE (a), code))
++    return true;
++
+   /* Handle vector boolean types with bitmasks.  If there is a comparison
+      and we can expand the comparison into the vector boolean bitmask,
+      or otherwise if it is compatible with type, we can transform
+
+i.e. always look at the comparison and always try to handle it together, and if that
+fails, try to handle this special case by handling both stmts individually, and only
+if not do the piecewise etc. lowering.
+At least, with the above patch, all FAILs I got in the x86_64-linux bootstrap got fixed
+(tested just those for now and nothing else).
+
+- User: Jakub Jelinek | Time: 2023-03-22 12:08:25 UTC
+  Text: Createdattachment 54732[details]gcc13-pr109176.patch
+
+Now as full untested patch.
+
+- User: GCC Commits | Time: 2023-03-23 09:04:03 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:484c41c747d95f9cee15a33b75b32ae2e7eb45f3commitr13-6827-g484c41c747d95f9cee15a33b75b32ae2e7eb45f3Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Mar 23 10:02:25 2023 +0100
+
+    tree-vect-generic: Fix up expand_vector_condition [PR109176]
+    
+    The following testcase ICEs on aarch64-linux, because
+    expand_vector_condition attempts to piecewise lower SVE
+      d_3 = a_1(D) < b_2(D);
+      _5 = VEC_COND_EXPR <d_3, c_4(D), d_3>;
+    which isn't possible - nunits_for_known_piecewise_op ICEs but
+    the rest of the code assumes constant number of elements too.
+    
+    expand_vector_condition attempts to find if a (rhs1) is a SSA_NAME
+    for comparison and calls expand_vec_cond_expr_p (type, TREE_TYPE (a1), code)
+    where a1 is one of the operands of the comparison and code is the comparison
+    code.  That one indeed isn't supported here, but what aarch64 SVE supports
+    are the individual statements, comparison (expand_vec_cmp_expr_p) and
+    expand_vec_cond_expr_p (type, TREE_TYPE (a), SSA_NAME), the latter because
+    that function starts with
+      if (VECTOR_BOOLEAN_TYPE_P (cmp_op_type)
+          && get_vcond_mask_icode (TYPE_MODE (value_type),
+                                   TYPE_MODE (cmp_op_type)) != CODE_FOR_nothing)
+        return true;
+    
+    In an earlier version of the patch (in the PR), we did this
+      if (VECTOR_BOOLEAN_TYPE_P (TREE_TYPE (a))
+          && expand_vec_cond_expr_p (type, TREE_TYPE (a), ERROR_MARK))
+        return true;
+    before the code == SSA_NAME handling plus some further tweaks later.
+    While that fixed the ICE, it broke quite a few tests on x86 and some on
+    aarch64 too.  The problem is that expand_vector_comparison doesn't lower
+    comparisons which aren't supported and only feed VEC_COND_EXPR first operand
+    and expand_vector_condition succeeds for those, so with the above mentioned
+    change we'd verify the VEC_COND_EXPR is implementable using optab alone,
+    but nothing would verify the tcc_comparison which relied on
+    expand_vector_condition to verify.
+    
+    So, the following patch instead queries whether optabs can handle the
+    comparison and VEC_COND_EXPR together (if a (rhs1) is a comparison;
+    otherwise as before it checks only the VEC_COND_EXPR) and if that fails,
+    also checks whether the two operations could be supported individually
+    and only if even that fails does the piecewise lowering.
+    
+    2023-03-23  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109176* tree-vect-generic.cc (expand_vector_condition): If a has
+            vector boolean type and is a comparison, also check if both
+            the comparison and VEC_COND_EXPR could be successfully expanded
+            individually.
+    
+            * gcc.target/aarch64/sve/pr109176.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-03-23 09:08:03 UTC
+  Text: Fixed on the trunk.  To be backported to 12.3 and 11.4.
+
+- User: GCC Commits | Time: 2023-04-18 07:15:48 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:0a4cf0e92cbd5f18de3195fa2deb058f2f88e77ecommitr12-9421-g0a4cf0e92cbd5f18de3195fa2deb058f2f88e77eAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Mar 23 10:02:25 2023 +0100
+
+    tree-vect-generic: Fix up expand_vector_condition [PR109176]
+    
+    The following testcase ICEs on aarch64-linux, because
+    expand_vector_condition attempts to piecewise lower SVE
+      d_3 = a_1(D) < b_2(D);
+      _5 = VEC_COND_EXPR <d_3, c_4(D), d_3>;
+    which isn't possible - nunits_for_known_piecewise_op ICEs but
+    the rest of the code assumes constant number of elements too.
+    
+    expand_vector_condition attempts to find if a (rhs1) is a SSA_NAME
+    for comparison and calls expand_vec_cond_expr_p (type, TREE_TYPE (a1), code)
+    where a1 is one of the operands of the comparison and code is the comparison
+    code.  That one indeed isn't supported here, but what aarch64 SVE supports
+    are the individual statements, comparison (expand_vec_cmp_expr_p) and
+    expand_vec_cond_expr_p (type, TREE_TYPE (a), SSA_NAME), the latter because
+    that function starts with
+      if (VECTOR_BOOLEAN_TYPE_P (cmp_op_type)
+          && get_vcond_mask_icode (TYPE_MODE (value_type),
+                                   TYPE_MODE (cmp_op_type)) != CODE_FOR_nothing)
+        return true;
+    
+    In an earlier version of the patch (in the PR), we did this
+      if (VECTOR_BOOLEAN_TYPE_P (TREE_TYPE (a))
+          && expand_vec_cond_expr_p (type, TREE_TYPE (a), ERROR_MARK))
+        return true;
+    before the code == SSA_NAME handling plus some further tweaks later.
+    While that fixed the ICE, it broke quite a few tests on x86 and some on
+    aarch64 too.  The problem is that expand_vector_comparison doesn't lower
+    comparisons which aren't supported and only feed VEC_COND_EXPR first operand
+    and expand_vector_condition succeeds for those, so with the above mentioned
+    change we'd verify the VEC_COND_EXPR is implementable using optab alone,
+    but nothing would verify the tcc_comparison which relied on
+    expand_vector_condition to verify.
+    
+    So, the following patch instead queries whether optabs can handle the
+    comparison and VEC_COND_EXPR together (if a (rhs1) is a comparison;
+    otherwise as before it checks only the VEC_COND_EXPR) and if that fails,
+    also checks whether the two operations could be supported individually
+    and only if even that fails does the piecewise lowering.
+    
+    2023-03-23  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109176* tree-vect-generic.cc (expand_vector_condition): If a has
+            vector boolean type and is a comparison, also check if both
+            the comparison and VEC_COND_EXPR could be successfully expanded
+            individually.
+    
+            * gcc.target/aarch64/sve/pr109176.c: New test.
+    
+    (cherry picked from commit 484c41c747d95f9cee15a33b75b32ae2e7eb45f3)
+
+- User: Jakub Jelinek | Time: 2023-04-18 07:21:55 UTC
+  Text: Fixed also for 12.3.
+
+- User: Richard Biener | Time: 2023-04-26 06:58:10 UTC
+  Text: GCC 13.1 is being released, retargeting bugs to GCC 13.2.
+
+- User: GCC Commits | Time: 2023-05-02 20:16:14 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:3384fb5024e05cfd429e2fb619ae8d51eba69661commitr11-10729-g3384fb5024e05cfd429e2fb619ae8d51eba69661Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Mar 23 10:02:25 2023 +0100
+
+    tree-vect-generic: Fix up expand_vector_condition [PR109176]
+    
+    The following testcase ICEs on aarch64-linux, because
+    expand_vector_condition attempts to piecewise lower SVE
+      d_3 = a_1(D) < b_2(D);
+      _5 = VEC_COND_EXPR <d_3, c_4(D), d_3>;
+    which isn't possible - nunits_for_known_piecewise_op ICEs but
+    the rest of the code assumes constant number of elements too.
+    
+    expand_vector_condition attempts to find if a (rhs1) is a SSA_NAME
+    for comparison and calls expand_vec_cond_expr_p (type, TREE_TYPE (a1), code)
+    where a1 is one of the operands of the comparison and code is the comparison
+    code.  That one indeed isn't supported here, but what aarch64 SVE supports
+    are the individual statements, comparison (expand_vec_cmp_expr_p) and
+    expand_vec_cond_expr_p (type, TREE_TYPE (a), SSA_NAME), the latter because
+    that function starts with
+      if (VECTOR_BOOLEAN_TYPE_P (cmp_op_type)
+          && get_vcond_mask_icode (TYPE_MODE (value_type),
+                                   TYPE_MODE (cmp_op_type)) != CODE_FOR_nothing)
+        return true;
+    
+    In an earlier version of the patch (in the PR), we did this
+      if (VECTOR_BOOLEAN_TYPE_P (TREE_TYPE (a))
+          && expand_vec_cond_expr_p (type, TREE_TYPE (a), ERROR_MARK))
+        return true;
+    before the code == SSA_NAME handling plus some further tweaks later.
+    While that fixed the ICE, it broke quite a few tests on x86 and some on
+    aarch64 too.  The problem is that expand_vector_comparison doesn't lower
+    comparisons which aren't supported and only feed VEC_COND_EXPR first operand
+    and expand_vector_condition succeeds for those, so with the above mentioned
+    change we'd verify the VEC_COND_EXPR is implementable using optab alone,
+    but nothing would verify the tcc_comparison which relied on
+    expand_vector_condition to verify.
+    
+    So, the following patch instead queries whether optabs can handle the
+    comparison and VEC_COND_EXPR together (if a (rhs1) is a comparison;
+    otherwise as before it checks only the VEC_COND_EXPR) and if that fails,
+    also checks whether the two operations could be supported individually
+    and only if even that fails does the piecewise lowering.
+    
+    2023-03-23  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109176* tree-vect-generic.c (expand_vector_condition): If a has
+            vector boolean type and is a comparison, also check if both
+            the comparison and VEC_COND_EXPR could be successfully expanded
+            individually.
+    
+            * gcc.target/aarch64/sve/pr109176.c: New test.
+    
+    (cherry picked from commit 484c41c747d95f9cee15a33b75b32ae2e7eb45f3)
+
+- User: Jakub Jelinek | Time: 2023-05-03 10:45:26 UTC
+  Text: Fixed for 11.4 as well.
+

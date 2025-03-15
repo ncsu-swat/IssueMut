@@ -1,0 +1,301 @@
+Bug Summary: [14/15 regression] 8 bit integer vector performance regression, x86, between gcc-14 and gcc-13 using avx2 target clones on skylake platform
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Colin Ian King | Time: 2024-05-13 13:05:56 UTC
+  Text: Createdattachment 58188[details]reproducer source code
+
+I'm seeing a ~12-14% performance regression in gcc-14 compared to gcc-13, using gcc on Ubuntu 24.04:
+
+Versions:
+gcc version 13.2.0 (Ubuntu 13.2.0-23ubuntu4) 
+gcc version 14.0.1 20240412 (experimental) [masterr14-9935-g67e1433a94f] (Ubuntu 14-20240412-0ubuntu1) 
+
+cking@skylake:~$ gcc-13 reproducer-vecmath.c -O2
+cking@skylake:~$ ./a.out 
+13540.16 vec8 ops per sec, duration = 14.77 secs
+
+cking@skylake:~$ gcc-14 reproducer-vecmath.c -O2
+cking@skylake:~$ ./a.out 
+11720.25 vec8 ops per sec, duration = 17.06 secs
+
+The original issue appeared when regression testing stress-ng vecmath stressor [1]. I've managed to extract the attached reproducer from the original code (see attached).
+
+Salient point to focus on:
+
+1. The issue is also dependant on the TARGET_CLONES macro being defined as __attribute__((target_clones("mmx,avx,avx2,default")))  - the avx2 target clones seems to be an issue in reproducing this problem, remove it for gcc-14 and the performance regression is reduced.
+
+Attached are the reproducer C source and disassembled object code. 
+
+References: [1]https://github.com/ColinIanKing/stress-ng/blob/master/stress-vecmath.c
+
+- User: Colin Ian King | Time: 2024-05-13 13:07:21 UTC
+  Text: Createdattachment 58189[details]gcc-13 disassembly
+
+- User: Colin Ian King | Time: 2024-05-13 13:07:46 UTC
+  Text: Createdattachment 58190[details]gcc-14 disassembly
+
+- User: Haochen Jiang | Time: 2024-05-15 08:51:13 UTC
+  Text: From my investigation, GCC14 generates some perm instructions, which caused data dependency.
+
+Going to bisect which commit caused this issue.
+
+- User: Krzysztof Kanas | Time: 2024-05-17 06:59:59 UTC
+  Text: I bisected the issue and it seems that commit 0368fc54bc11f15bfa0ed9913fd0017815dfaa5d introduces regression.
+
+- User: Hongtao Liu | Time: 2024-05-17 07:06:38 UTC
+  Text: (In reply to Krzysztof Kanas fromcomment #4)> I bisected the issue and it seems that commit
+> 0368fc54bc11f15bfa0ed9913fd0017815dfaa5d introduces regression.I guess the real guilty commit is 
+
+commit 52ff3f7b863da1011b73c0ab3b11f6c78b6451c7
+Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Thu May 25 19:40:26 2023 +0200
+ 
+    i386: Use 2x-wider modes when emulating QImode vector instructions
+ 
+    Rewrite ix86_expand_vecop_qihi2 to expand fo 2x-wider (e.g. V16QI -> V16HImode)
+    instructions when available.  Currently, the compiler generates following
+    assembly for V16QImode multiplication (-mavx2):
+
+- User: Haochen Jiang | Time: 2024-05-17 07:08:50 UTC
+  Text: (In reply to Hongtao Liu fromcomment #5)> (In reply to Krzysztof Kanas fromcomment #4)
+> > I bisected the issue and it seems that commit
+> > 0368fc54bc11f15bfa0ed9913fd0017815dfaa5d introduces regression.
+> 
+> I guess the real guilty commit is 
+> 
+> commit 52ff3f7b863da1011b73c0ab3b11f6c78b6451c7
+> Author: Uros Bizjak <ubizjak@gmail.com>
+> Date:   Thu May 25 19:40:26 2023 +0200
+>  
+>     i386: Use 2x-wider modes when emulating QImode vector instructions
+>  
+>     Rewrite ix86_expand_vecop_qihi2 to expand fo 2x-wider (e.g. V16QI ->
+> V16HImode)
+>     instructions when available.  Currently, the compiler generates following
+>     assembly for V16QImode multiplication (-mavx2):Yes, since 0368fc54bc11f15bfa0ed9913fd0017815dfaa5d only fixed a typo in that patch.
+
+Original thread:https://gcc.gnu.org/pipermail/gcc-patches/2023-May/619745.html
+
+- User: Uroš Bizjak | Time: 2024-05-17 08:26:41 UTC
+  Text: (In reply to Hongtao Liu fromcomment #5)> (In reply to Krzysztof Kanas fromcomment #4)
+> > I bisected the issue and it seems that commit
+> > 0368fc54bc11f15bfa0ed9913fd0017815dfaa5d introduces regression.
+> 
+> I guess the real guilty commit is 
+> 
+> commit 52ff3f7b863da1011b73c0ab3b11f6c78b6451c7
+> Author: Uros Bizjak <ubizjak@gmail.com>
+> Date:   Thu May 25 19:40:26 2023 +0200
+>  
+>     i386: Use 2x-wider modes when emulating QImode vector instructions
+>  
+>     Rewrite ix86_expand_vecop_qihi2 to expand fo 2x-wider (e.g. V16QI ->
+> V16HImode)
+>     instructions when available.  Currently, the compiler generates following
+>     assembly for V16QImode multiplication (-mavx2):The patch is at:https://gcc.gnu.org/pipermail/gcc-patches/2023-May/619715.htmlAs mentioned inComment #3, it looks that VPERMQ is a problematic insn. This should be reflected in some cost function. Alternatively, we can simply change the first line in:
+
++  if ((qimode == V16QImode && !TARGET_AVX2)
++      || (qimode == V32QImode && !TARGET_AVX512BW)
++      /* There are no V64HImode instructions.  */
++      || qimode == V64QImode)
++     return false;
+
+to check "qimode == V16QImode && !TARGET_AVX512VL" to avoid VPERMQ:
+
+diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
+index 4e16aedc5c1..450035ea9e6 100644
+--- a/gcc/config/i386/i386-expand.cc
++++ b/gcc/config/i386/i386-expand.cc
+@@ -24493,7 +24493,7 @@ ix86_expand_vecop_qihi2 (enum rtx_code code, rtx dest, rtx op1, rtx op2)
+   bool op2vec = GET_MODE_CLASS (GET_MODE (op2)) == MODE_VECTOR_INT;
+   bool uns_p = code != ASHIFTRT;
+ 
+-  if ((qimode == V16QImode && !TARGET_AVX2)
++  if ((qimode == V16QImode && !TARGET_AVX512VL)
+       || (qimode == V32QImode && (!TARGET_AVX512BW || !TARGET_EVEX512))
+       /* There are no V64HImode instructions.  */
+       || qimode == V64QImode)
+
+- User: Uroš Bizjak | Time: 2024-05-17 08:41:56 UTC
+  Text: A better patch:
+
+--cut here--
+diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
+index 4e16aedc5c1..88bfc43201b 100644
+--- a/gcc/config/i386/i386-expand.cc
++++ b/gcc/config/i386/i386-expand.cc
+@@ -24493,6 +24493,10 @@ ix86_expand_vecop_qihi2 (enum rtx_code code, rtx dest, rtx op1, rtx op2)
+   bool op2vec = GET_MODE_CLASS (GET_MODE (op2)) == MODE_VECTOR_INT;
+   bool uns_p = code != ASHIFTRT;
+ 
++  /* ??? VPERMQ is slow and VPMOWVB is only available under AVX512BW.  */
++  if (!TARGET_AVX512BW)
++    return false;
++
+   if ((qimode == V16QImode && !TARGET_AVX2)
+       || (qimode == V32QImode && (!TARGET_AVX512BW || !TARGET_EVEX512))
+       /* There are no V64HImode instructions.  */
+--cut here--
+
+- User: Uroš Bizjak | Time: 2024-05-17 08:48:22 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #8)> A better patch:The real issue is that the following permutation (truncation):
+
++      for (i = 0; i < d.nelt; ++i)
++	d.perm[i] = i * 2;
++
++      ok = ix86_expand_vec_perm_const_1 (&d);
+
+results in a slow code involving VPERMQ. Ideally, ix86_expand_vec_perm_const_1 should emit faster code for truncation, because this will benefit other code as well.
+
+- User: Haochen Jiang | Time: 2024-05-17 09:13:37 UTC
+  Text: A patch likeComment 8could definitely solve the problem. But I need to test more benchmarks to see if there is surprise.
+
+But, yes, as Uros said inComment 9, maybe there is a chance we could do it better.
+
+- User: Hongtao Liu | Time: 2024-05-20 01:23:23 UTC
+  Text: (In reply to Haochen Jiang fromcomment #10)> A patch likeComment 8could definitely solve the problem. But I need to
+> test more benchmarks to see if there is surprise.
+> 
+> But, yes, as Uros said inComment 9, maybe there is a chance we could do it
+> better.Could you add "arch=skylake-avx512" to target_clones and try disable whole ix86_expand_vecop_qihi2 to see if there's any performance improvement?
+For x86, cross-lane permutation(truncation) is not very efficient(3-4 cycles for both vpermq and vpmovwb).
+
+- User: Haochen Jiang | Time: 2024-05-20 05:50:16 UTC
+  Text: (In reply to Hongtao Liu fromcomment #11)> (In reply to Haochen Jiang fromcomment #10)
+> > A patch likeComment 8could definitely solve the problem. But I need to
+> > test more benchmarks to see if there is surprise.
+> > 
+> > But, yes, as Uros said inComment 9, maybe there is a chance we could do it
+> > better.
+> 
+> Could you add "arch=skylake-avx512" to target_clones and try disable whole
+> ix86_expand_vecop_qihi2 to see if there's any performance improvement?
+> For x86, cross-lane permutation(truncation) is not very efficient(3-4 cycles
+> for both vpermq and vpmovwb).When I disable/enable ix86_expand_vecop_qihi2 with arch=skylake-avx512 on trunk, there is no performance regression comparing to GCC13 + avx2.
+
+It seems that the regression only happens when GCC14 + avx2.
+
+- User: Uroš Bizjak | Time: 2024-05-20 06:27:47 UTC
+  Text: (In reply to Haochen Jiang fromcomment #12)> (In reply to Hongtao Liu fromcomment #11)
+> > (In reply to Haochen Jiang fromcomment #10)
+> > > A patch likeComment 8could definitely solve the problem. But I need to
+> > > test more benchmarks to see if there is surprise.
+> > > 
+> > > But, yes, as Uros said inComment 9, maybe there is a chance we could do it
+> > > better.
+> > 
+> > Could you add "arch=skylake-avx512" to target_clones and try disable whole
+> > ix86_expand_vecop_qihi2 to see if there's any performance improvement?
+> > For x86, cross-lane permutation(truncation) is not very efficient(3-4 cycles
+> > for both vpermq and vpmovwb).
+> 
+> When I disable/enable ix86_expand_vecop_qihi2 with arch=skylake-avx512 on
+> trunk, there is no performance regression comparing to GCC13 + avx2.
+> 
+> It seems that the regression only happens when GCC14 + avx2.This is what the patch inComment #8prevents. skylake-avx512 enables TARGET_AVX512BW, so VPMOVB is emitted instead of problematic VPERMQ.
+
+- User: Hongtao Liu | Time: 2024-05-20 06:35:01 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #13)> (In reply to Haochen Jiang fromcomment #12)
+> > (In reply to Hongtao Liu fromcomment #11)
+> > > (In reply to Haochen Jiang fromcomment #10)
+> > > > A patch likeComment 8could definitely solve the problem. But I need to
+> > > > test more benchmarks to see if there is surprise.
+> > > > 
+> > > > But, yes, as Uros said inComment 9, maybe there is a chance we could do it
+> > > > better.
+> > > 
+> > > Could you add "arch=skylake-avx512" to target_clones and try disable whole
+> > > ix86_expand_vecop_qihi2 to see if there's any performance improvement?
+> > > For x86, cross-lane permutation(truncation) is not very efficient(3-4 cycles
+> > > for both vpermq and vpmovwb).
+> > 
+> > When I disable/enable ix86_expand_vecop_qihi2 with arch=skylake-avx512 on
+> > trunk, there is no performance regression comparing to GCC13 + avx2.
+> > 
+> > It seems that the regression only happens when GCC14 + avx2.
+> 
+> This is what the patch inComment #8prevents. skylake-avx512 enables
+> TARGET_AVX512BW, so VPMOVB is emitted instead of problematic VPERMQ.Yes, the patch looks good to me.
+
+- User: Haochen Jiang | Time: 2024-05-20 06:38:14 UTC
+  Text: I am doing like this way. Suppose should be same asComment 8.
+
+diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
+index a6132911e6a..1e8334877d6 100644
+--- a/gcc/config/i386/i386-expand.cc
++++ b/gcc/config/i386/i386-expand.cc
+@@ -24323,8 +24323,8 @@ ix86_expand_vecop_qihi2 (enum rtx_code code, rtx dest, rtx op1, rtx op2)
+   bool op2vec = GET_MODE_CLASS (GET_MODE (op2)) == MODE_VECTOR_INT;
+   bool uns_p = code != ASHIFTRT;
+
+-  if ((qimode == V16QImode && !TARGET_AVX2)
+-      || (qimode == V32QImode && (!TARGET_AVX512BW || !TARGET_EVEX512))
++  if (!TARGET_AVX512BW
++      || (qimode == V32QImode && !TARGET_EVEX512)
+       /* There are no V64HImode instructions.  */
+       || qimode == V64QImode)
+
+Should we also run a SPEC on with -O2 -mtune=generic -march=x86-64-v3 to see if there is any surprise?
+
+- User: Hongtao Liu | Time: 2024-05-20 06:40:43 UTC
+  Text: > Should we also run a SPEC on with -O2 -mtune=generic -march=x86-64-v3 to see
+> if there is any surprise?Sure, I guess no.
+
+- User: Uroš Bizjak | Time: 2024-05-20 06:47:59 UTC
+  Text: (In reply to Haochen Jiang fromcomment #15)> I am doing like this way. Suppose should be same asComment 8.Yes, but IMO the patch inComment #8better describes where the problem is.
+
+Please note that without VPMOVWB we fall-back to the original ix86_expand_vecop_qihi, where the expansion is implemented in a different way.
+
+(BTW: If there is a better way to emulate VPMOVWB, it should be implemented in vec-perm routines, it will universally benefit this permutation. In this case, early exit, as introduced in the mentioned patch, could be removed.)
+
+- User: Haochen Jiang | Time: 2024-05-21 05:56:55 UTC
+  Text: SPEC
+
+- User: Haochen Jiang | Time: 2024-05-21 05:58:08 UTC
+  Text: (In reply to Haochen Jiang fromcomment #18)> SPECSPEC seems all same binary to me. So there is no surprise.
+
+I suppose let's go with patch from Uros to just emphasize the problem.
+
+- User: GCC Commits | Time: 2024-05-22 02:25:45 UTC
+  Text: The master branch has been updated by Haochen Jiang <jianghc@gcc.gnu.org>:https://gcc.gnu.org/g:73a167cfa225d5ee7092d41596b9fea1719898ffcommitr15-764-g73a167cfa225d5ee7092d41596b9fea1719898ffAuthor: Haochen Jiang <haochen.jiang@intel.com>
+Date:   Tue May 21 14:10:43 2024 +0800
+
+    i386: Disable ix86_expand_vecop_qihi2 when !TARGET_AVX512BW
+    
+    Since vpermq is really slow, we should avoid using it for permutation
+    when vpmovwb is not available (needs AVX512BW) for ix86_expand_vecop_qihi2
+    and fall back to ix86_expand_vecop_qihi.
+    
+    gcc/ChangeLog:PR target/115069* config/i386/i386-expand.cc (ix86_expand_vecop_qihi2):
+            Do not enable the optimization when AVX512BW is not enabled.
+    
+    gcc/testsuite/ChangeLog:PR target/115069* gcc.target/i386/pr115069.c: New.
+
+- User: GCC Commits | Time: 2024-05-22 02:27:16 UTC
+  Text: The releases/gcc-14 branch has been updated by Haochen Jiang <jianghc@gcc.gnu.org>:https://gcc.gnu.org/g:1ad5c9d524d8fa99773045e75da04ae958012085commitr14-10229-g1ad5c9d524d8fa99773045e75da04ae958012085Author: Haochen Jiang <haochen.jiang@intel.com>
+Date:   Tue May 21 14:10:43 2024 +0800
+
+    i386: Disable ix86_expand_vecop_qihi2 when !TARGET_AVX512BW
+    
+    Since vpermq is really slow, we should avoid using it for permutation
+    when vpmovwb is not available (needs AVX512BW) for ix86_expand_vecop_qihi2
+    and fall back to ix86_expand_vecop_qihi.
+    
+    gcc/ChangeLog:PR target/115069* config/i386/i386-expand.cc (ix86_expand_vecop_qihi2):
+            Do not enable the optimization when AVX512BW is not enabled.
+    
+    gcc/testsuite/ChangeLog:PR target/115069* gcc.target/i386/pr115069.c: New.
+
+- User: Haochen Jiang | Time: 2024-05-22 02:27:39 UTC
+  Text: Fixed in GCC14 and GCC15
+
+- User: Hongtao Liu | Time: 2024-05-22 05:13:21 UTC
+  Text: Fixed in GCC15 and GCC14.2
+

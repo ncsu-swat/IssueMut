@@ -1,0 +1,147 @@
+Bug Summary: ICE: in lower_complexexpr_stmt, at gimple-lower-bitint.cc:4719 with -O -fno-tree-fre -fno-tree-ccp -fno-tree-forwprop and _BitInt() __builtin_mul_overflow()
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 14.1.0, 15.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-06-18 18:43:25 UTC
+  Text: Createdattachment 58465[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O -fno-tree-fre -fno-tree-ccp -fno-tree-forwprop testcase.c 
+during GIMPLE pass: bitintlower
+testcase.c: In function 'foo':
+testcase.c:5:1: internal compiler error: in lower_complexexpr_stmt, at gimple-lower-bitint.cc:4719
+    5 | foo()
+      | ^~~
+0xdad936 lower_complexexpr_stmt
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:4719
+0xdad936 lower_stmt
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:5708
+0x27cf3f1 gimple_lower_bitint
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:6926
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r15-1418-20240618085924-gadadb5c7ba0-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r15-1418-20240618085924-gadadb5c7ba0-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 15.0.0 20240618 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-06-18 20:35:52 UTC
+  Text: Confirmed. ICEs for me with released GCC 14.1.0 on both x86_64 and aarch64.
+
+- User: Andrew Pinski | Time: 2024-06-18 20:36:38 UTC
+  Text: .
+
+- User: Andrew Pinski | Time: 2024-06-18 22:14:43 UTC
+  Text: Note the gimple stmt/complex_expr in this case:
+  _6 = COMPLEX_EXPR <a.0_1, 0>;
+
+
+where _6 is fully unused.
+
+Complex lowering changes:
+  _6 = COMPLEX_EXPR <a.0_1, 0>;
+  _2 = REALPART_EXPR <_6>;
+
+into:
+  _6 = COMPLEX_EXPR <a.0_1, 0>;
+  _2 = a.0_1;
+
+Which is totally correct though it does not do any DCE.
+I am not sure if complex lowering should do some simple DCE or if it matters if it does not do it.
+
+- User: Jakub Jelinek | Time: 2024-06-19 13:58:57 UTC
+  Text: Createdattachment 58466[details]gcc15-pr115544.patch
+
+So far lightly tested fix.
+
+- User: GCC Commits | Time: 2024-06-19 19:12:07 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:25860fd2a674373a6476af5ff0bd92354fc53d06commitr15-1455-g25860fd2a674373a6476af5ff0bd92354fc53d06Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Jun 19 21:10:39 2024 +0200
+
+    bitint: Fix up lowering of COMPLEX_EXPR [PR115544]
+    
+    We don't really support _Complex _BitInt(N), the only place we use
+    bitint complex types is for the .{ADD,SUB,MUL}_OVERFLOW internal function
+    results and COMPLEX_EXPR in the usual case should be either not present
+    yet because the ifns weren't folded and will be lowered, or optimized
+    into something simpler, because normally the complex bitint should be
+    used just for extracting the 2 subparts from it.
+    Still, with disabled optimizations it can occassionally happen that it
+    appears in the IL and that is why there is support for lowering those,
+    but it doesn't handle optimizing those too much, so if it uses SSA_NAME,
+    it relies on them having a backing VAR_DECL during the lowering.
+    This is normally achieves through the
+                          && ((is_gimple_assign (use_stmt)
+                               && (gimple_assign_rhs_code (use_stmt)
+                                   != COMPLEX_EXPR))
+                              || gimple_code (use_stmt) == GIMPLE_COND)
+    hunk in gimple_lower_bitint, but as the following testcase shows, there
+    is one thing I've missed, the load optimization isn't guarded by the
+    above stuff.  So, either we'd need to add support for loads to
+    lower_complexexpr_stmt, or because they should be really rare, this
+    patch just disables the load optimization if at least one load use is
+    a COMPLEX_EXPR (like we do already for PHIs, calls, asm).
+    
+    2024-06-19  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/115544* gimple-lower-bitint.cc (gimple_lower_bitint): Disable optimizing
+            loads used by COMPLEX_EXPR operands.
+    
+            * gcc.dg/bitint-107.c: New test.
+
+- User: GCC Commits | Time: 2024-06-20 08:27:35 UTC
+  Text: The releases/gcc-14 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:f79e909a11672f2c5b04239d8d9376b900c5b295commitr14-10327-gf79e909a11672f2c5b04239d8d9376b900c5b295Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Jun 19 21:10:39 2024 +0200
+
+    bitint: Fix up lowering of COMPLEX_EXPR [PR115544]
+    
+    We don't really support _Complex _BitInt(N), the only place we use
+    bitint complex types is for the .{ADD,SUB,MUL}_OVERFLOW internal function
+    results and COMPLEX_EXPR in the usual case should be either not present
+    yet because the ifns weren't folded and will be lowered, or optimized
+    into something simpler, because normally the complex bitint should be
+    used just for extracting the 2 subparts from it.
+    Still, with disabled optimizations it can occassionally happen that it
+    appears in the IL and that is why there is support for lowering those,
+    but it doesn't handle optimizing those too much, so if it uses SSA_NAME,
+    it relies on them having a backing VAR_DECL during the lowering.
+    This is normally achieves through the
+                          && ((is_gimple_assign (use_stmt)
+                               && (gimple_assign_rhs_code (use_stmt)
+                                   != COMPLEX_EXPR))
+                              || gimple_code (use_stmt) == GIMPLE_COND)
+    hunk in gimple_lower_bitint, but as the following testcase shows, there
+    is one thing I've missed, the load optimization isn't guarded by the
+    above stuff.  So, either we'd need to add support for loads to
+    lower_complexexpr_stmt, or because they should be really rare, this
+    patch just disables the load optimization if at least one load use is
+    a COMPLEX_EXPR (like we do already for PHIs, calls, asm).
+    
+    2024-06-19  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/115544* gimple-lower-bitint.cc (gimple_lower_bitint): Disable optimizing
+            loads used by COMPLEX_EXPR operands.
+    
+            * gcc.dg/bitint-107.c: New test.
+    
+    (cherry picked from commit 25860fd2a674373a6476af5ff0bd92354fc53d06)
+
+- User: Jakub Jelinek | Time: 2024-06-20 08:30:32 UTC
+  Text: Fixed for 14.2+ and 15.1+.
+
+- User: Andrew Pinski | Time: 2024-08-23 20:43:26 UTC
+  Text: (In reply to Andrew Pinski fromcomment #3)> I am not sure if complex lowering should do some simple DCE or if it matters
+> if it does not do it.Note complex lowering now does the simple DCE afterr15-3128-gde1923f9f4d534:
+Removing dead stmt:_6 = COMPLEX_EXPR <a.0_1, 0>;
+
+And the unused statement is removed.
+

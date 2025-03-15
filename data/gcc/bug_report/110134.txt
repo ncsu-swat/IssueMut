@@ -1,0 +1,135 @@
+Bug Summary: [10/11/12/13/14 Regression] (-unsigned1) != CST is not optimized to unsigned1 != CST at the gimple level
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization, patch, TREE
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2023-06-06 01:50:17 UTC
+  Text: Take:
+```
+bool f1(int  a)
+{
+  unsigned t = a < 10;
+  t = -t;
+  return t != 0;
+}
+
+bool f2(int  a)
+{
+  signed t = a < 10;
+  t = -t;
+  return t != 0;
+}
+```
+
+These should both optimize to just `a >= 9` in forwprop1 .
+Both of these were working in GCC 5.
+Starting GCC 6, neither was done and then in GCC 8, f2 was handled.
+
+I noticed this while looking atPR 110131(doing this does not fix that though).
+
+- User: Andrew Pinski | Time: 2023-06-06 01:59:32 UTC
+  Text: I have a simple patch.
+TYPE_OVERFLOW_UNDEFINED (TREE_TYPE (@0))
+Can just be:
+(cmp == EQ_EXPR || cmp == NE_EXPR || TYPE_OVERFLOW_UNDEFINED (TREE_TYPE (@0)))
+
+For /* -A CMP -B -> B CMP A.  */
+
+Because -a == -b is still a == b, no matter what.
+
+- User: Andrew Pinski | Time: 2023-06-06 02:08:12 UTC
+  Text: That is:
+```
+/* -A CMP -B -> B CMP A.  */
+(for cmp (tcc_comparison)
+     scmp (swapped_tcc_comparison)
+ (simplify
+  (cmp (negate @0) (negate @1))
+  (if (FLOAT_TYPE_P (TREE_TYPE (@0))
+       || (ANY_INTEGRAL_TYPE_P (TREE_TYPE (@0))
+	   && (cmp == EQ_EXPR
+	       || cmp == NE_EXPR
+	       || TYPE_OVERFLOW_UNDEFINED (TREE_TYPE (@0)))))
+   (scmp @0 @1)))
+ (simplify
+  (cmp (negate @0) CONSTANT_CLASS_P@1)
+  (if (FLOAT_TYPE_P (TREE_TYPE (@0))
+       || (ANY_INTEGRAL_TYPE_P (TREE_TYPE (@0))
+	   && (cmp == EQ_EXPR
+	       || cmp == NE_EXPR
+	       || TYPE_OVERFLOW_UNDEFINED (TREE_TYPE (@0)))))
+   (with { tree tem = const_unop (NEGATE_EXPR, TREE_TYPE (@0), @1); }
+    (if (tem && !TREE_OVERFLOW (tem))
+     (scmp @0 { tem; }))))))
+```
+
+- User: Andrew Pinski | Time: 2023-06-06 02:50:34 UTC
+  Text: r6-1814-g66e1cacf608045caused GCC 6 to stop doing both.
+Because they were considered redundant with the patterns added by:r6-1113-g534bd33b61d08eWhich was mostly true.
+
+I think forwprop was working again withr8-2194-g4f450a2b102212for f2 (I am not 100% sure).
+
+So to summarizer6-1814-g66e1cacf608045removed the unsigned/wrapping case for NE/EQ since it was originally thought as redundant. My patch adds support back for those 2.
+
+case EQ_EXPR:
+case NE_EXPR:
+...
+
+-      /* Similarly for a NEGATE_EXPR.  */
+-      if (TREE_CODE (arg0) == NEGATE_EXPR
+-         && TREE_CODE (arg1) == INTEGER_CST
+-         && 0 != (tem = negate_expr (fold_convert_loc (loc, TREE_TYPE (arg0),
+-                                                       arg1)))
+-         && TREE_CODE (tem) == INTEGER_CST
+-         && !TREE_OVERFLOW (tem))
+-       return fold_build2_loc (loc, code, type, TREE_OPERAND (arg0, 0), tem);
+
+...
+
+-      /* Fold -X op -Y as X op Y, where op is eq/ne.  */
+-      if (TREE_CODE (arg0) == NEGATE_EXPR
+-          && TREE_CODE (arg1) == NEGATE_EXPR)
+-       return fold_build2_loc (loc, code, type,
+-                               TREE_OPERAND (arg0, 0),
+-                               fold_convert_loc (loc, TREE_TYPE (arg0),
+-                                                 TREE_OPERAND (arg1, 0)));
+
+
+Since these 2 did cases didn't test TYPE_OVERFLOW_UNDEFINED, we should handle EQ/NE also in match.pd the same way.
+
+- User: Andrew Pinski | Time: 2023-06-06 21:11:18 UTC
+  Text: Patch submitted with a few testcases to make sure it will not regress again:https://gcc.gnu.org/pipermail/gcc-patches/2023-June/620818.html
+
+- User: GCC Commits | Time: 2023-06-07 02:59:01 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:cc155ff9c38848a8e6a7125dd0b66ac0aef47880commitr14-1599-gcc155ff9c38848a8e6a7125dd0b66ac0aef47880Author: Andrew Pinski <apinski@marvell.com>
+Date:   Mon Jun 5 19:12:43 2023 -0700
+
+    For the `-A CMP -B -> B CMP A` pattern allow EQ/NE for all integer types
+    
+    I noticed while looking at some code generation issue, that forwprop
+    was not handling `-a == 0` for unsigned types and I was confused why
+    it was not.r6-1814-g66e1cacf608045removed these from fold because they
+    were supposed to be already handled by the match.pd patterns
+    but it was missed that the match.pd patterns checked
+    TYPE_OVERFLOW_UNDEFINED while fold didn't do that for NE/EQ.
+    This patch removes the restriction on NE/EQ on TYPE_OVERFLOW_UNDEFINED.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu.
+    
+    gcc/ChangeLog:PR tree-optimization/110134* match.pd (-A CMP -B -> B CMP A): Allow EQ/NE for all integer
+            types.
+            (-A CMP CST -> B CMP (-CST)): Likewise.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/110134* gcc.dg/tree-ssa/negneq-1.c: New test.
+            * gcc.dg/tree-ssa/negneq-2.c: New test.
+            * gcc.dg/tree-ssa/negneq-3.c: New test.
+            * gcc.dg/tree-ssa/negneq-4.c: New test.
+
+- User: Andrew Pinski | Time: 2023-06-07 03:02:04 UTC
+  Text: Fixed on the trunk for GCC 14, the performance regression due to this bug I doubt is noticable since it had not been noticed since GCC 6 even (wellPR 14753noticed it but it was similar to this one, it was not noticed in real code yet).
+

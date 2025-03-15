@@ -1,0 +1,123 @@
+Bug Summary: rs6000: ICE when long double is ieee128 format by default but without vsx
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 12.3.1, 13.2.1
+
+Comments:
+- User: Kewen Lin | Time: 2024-03-20 08:47:40 UTC
+  Text: When I was doing a patch to make us only have two 128bit fp on rs6000, I found that we can have long double with ieee128 format by default and even not having vsx support, but a simple test case with comparison triggers ICE as below:
+
+long double a;
+long double b;
+
+int foo() {
+  if (a > b)
+    return 0;
+  else
+    return 1;
+}
+
+/opt/gcc-nightly/trunk/bin/gcc test.c -mno-vsx
+
+test.c: In function ‘foo’:
+test.c:9:1: error: unrecognizable insn:
+    9 | }
+      | ^
+(insn 9 8 10 2 (set (reg:CCFP 123)
+        (compare:CCFP (reg:TF 117 [ a.0_1 ])
+            (reg:TF 118 [ b.1_2 ]))) "test.c":5:6 -1
+     (nil))
+during RTL pass: vregs
+test.c:9:1: internal compiler error: in extract_insn, at recog.cc:2812
+0x102b7353 _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+        /home/gccbuild/gcc_trunk_git/gcc/gcc/rtl-error.cc:108
+0x102b73a7 _fatal_insn_not_found(rtx_def const*, char const*, int, char const*)
+        /home/gccbuild/gcc_trunk_git/gcc/gcc/rtl-error.cc:116
+0x10c6636b extract_insn(rtx_insn*)
+        /home/gccbuild/gcc_trunk_git/gcc/gcc/recog.cc:2812
+0x107ef797 instantiate_virtual_regs_in_insn
+        /home/gccbuild/gcc_trunk_git/gcc/gcc/function.cc:1611
+0x107ef797 instantiate_virtual_regs
+        /home/gccbuild/gcc_trunk_git/gcc/gcc/function.cc:1994
+0x107ef797 execute
+        /home/gccbuild/gcc_trunk_git/gcc/gcc/function.cc:2041
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+Note that it should be configured with --with-long-double-format=ieee, since if -mabi=ieeelongdouble is specified, it will requires vsx to be enabled.
+
+- User: Kewen Lin | Time: 2024-03-21 02:25:27 UTC
+  Text: Currently the only pattern to match IEEE128 comparison is:
+
+;; IEEE 128-bit comparisons
+(define_insn "*cmp<mode>_hw"
+  [(set (match_operand:CCFP 0 "cc_reg_operand" "=y")
+	(compare:CCFP (match_operand:IEEE128 1 "altivec_register_operand" "v")
+		      (match_operand:IEEE128 2 "altivec_register_operand" "v")))]
+  "TARGET_FLOAT128_HW && FLOAT128_IEEE_P (<MODE>mode)"
+   "xscmpuqp %0,%1,%2"
+  [(set_attr "type" "veccmp")
+   (set_attr "size" "128")])
+
+It requires TARGET_FLOAT128_HW, so nothing can be used for matching.
+
+The below patch can fix this ICE, it makes no-vsx IEEE128 also go with libfunc call like !TARGET_FLOAT128_HW && FLOAT128_VECTOR_P (mode).
+
+diff --git a/gcc/config/rs6000/rs6000.cc b/gcc/config/rs6000/rs6000.cc
+index 5d975dab921..237d138faec 100644
+--- a/gcc/config/rs6000/rs6000.cc
++++ b/gcc/config/rs6000/rs6000.cc
+@@ -15329,7 +15329,7 @@ rs6000_generate_compare (rtx cmp, machine_mode mode)
+   rtx op0 = XEXP (cmp, 0);
+   rtx op1 = XEXP (cmp, 1);
+
+-  if (!TARGET_FLOAT128_HW && FLOAT128_VECTOR_P (mode))
++  if (!TARGET_FLOAT128_HW && FLOAT128_IEEE_P (mode))
+     comp_mode = CCmode;
+   else if (FLOAT_MODE_P (mode))
+     comp_mode = CCFPmode;
+@@ -15361,7 +15361,7 @@ rs6000_generate_compare (rtx cmp, machine_mode mode)
+
+   /* IEEE 128-bit support in VSX registers when we do not have hardware
+      support.  */
+-  if (!TARGET_FLOAT128_HW && FLOAT128_VECTOR_P (mode))
++  if (!TARGET_FLOAT128_HW && FLOAT128_IEEE_P (mode))
+     {
+       rtx libfunc = NULL_RTX;
+       bool check_nan = false;
+
+- User: GCC Commits | Time: 2024-05-21 02:02:48 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:c547e353597ac4e0af09c2faca8c5a16744dcea4commitr15-702-gc547e353597ac4e0af09c2faca8c5a16744dcea4Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Mon May 20 21:01:06 2024 -0500
+
+    rs6000: Fix ICE on IEEE128 long double without vsx [PR114402]
+    
+    AsPR114402shows, we supports IEEE128 format long double
+    even if there is no vsx support, but there is an ICE about
+    cbranch as the test case shows.  For now, we only supports
+    compare:CCFP pattern for IEEE128 fp if TARGET_FLOAT128_HW,
+    so in function rs6000_generate_compare we have a check with
+    !TARGET_FLOAT128_HW && FLOAT128_VECTOR_P (mode) to make
+    !TARGET_FLOAT128_HW IEEE128 fp handling go with libcall.
+    But unfortunately the IEEE128 without vsx support doesn't
+    meet FLOAT128_VECTOR_P (mode) so it goes further with an
+    unmatched compare:CCFP pattern which triggers ICE.
+    
+    So this patch is to make rs6000_generate_compare consider
+    IEEE128 without vsx as well then it can end up with libcall.PR target/114402gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.cc (rs6000_generate_compare): Make IEEE128
+            handling without vsx go with libcall.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr114402.c: New test.
+
+- User: Kewen Lin | Time: 2024-05-21 03:24:17 UTC
+  Text: Not a regression, it should be rare to adopt ieee long double but disabling vsx, so not backported.  Should be fixed on trunk.
+

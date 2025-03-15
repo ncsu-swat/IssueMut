@@ -1,0 +1,175 @@
+Bug Summary: Missing vectorizable_conversion(unsigned char -> double) for BB vectorizer
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Hongtao.liu | Time: 2023-05-29 02:35:32 UTC
+  Text: When Looking atPR109812, I noticed there's missing vectorizable_conversion for BB vectorizer when target doesn't support direct optab for unsigned char to double. But actually it can be vectorized via unsigned char -> short/int/long long -> double when vectorizable_conversion is ok for any of the immediate type.
+
+Currently, when modifier is NONE, vectorizable_conversion doesn't try any immediate type, it can be extended similar like WIDEN.
+
+ 5158    case NONE:
+ 5159      if (code != FIX_TRUNC_EXPR
+ 5160          && code != FLOAT_EXPR
+ 5161          && !CONVERT_EXPR_CODE_P (code))
+ 5162        return false;
+ 5163      if (supportable_convert_operation (code, vectype_out, vectype_in, &code1))
+ 5164        break;
+ 5165      /* FALLTHRU */
+
+void
+foo (double* __restrict a, unsigned char* b)
+{
+    a[0] = b[0];
+    a[1] = b[1];
+    a[2] = b[2];
+    a[3] = b[3];
+    a[4] = b[4];
+    a[5] = b[5];
+    a[6] = b[6];
+    a[7] = b[7];
+}
+
+missed:   conversion not supported by target.
+
+- User: Andrew Pinski | Time: 2023-05-29 03:28:51 UTC
+  Text: Confirmed.
+
+- User: Hongtao.liu | Time: 2023-05-29 05:53:56 UTC
+  Text: > Currently, when modifier is NONE, vectorizable_conversion doesn't try any
+> immediate type, it can be extended similar like WIDEN.
+>After gdb the testcase, the modifier is not NONE, it's widen from V8QI to V4DF, and failed.
+
+- User: Hongtao.liu | Time: 2023-05-29 06:14:46 UTC
+  Text: Even we have direct optab for unsigned char to long long, BB vectorizer failer to optimize
+
+void
+foo1 (long long* __restrict a, unsigned char* b)
+{
+    a[0] = b[0];
+    a[1] = b[1];
+    a[2] = b[2];
+    a[3] = b[3];
+    a[4] = b[4];
+    a[5] = b[5];
+    a[6] = b[6];
+    a[7] = b[7];
+}
+
+since we have vectype_out as V4DImode, but vectype_in as V8QImode as *vectype = SLP_TREE_VECTYPE (child);
+
+If manually change the testcase to
+
+void
+foo1 (long long* __restrict a, unsigned char* b)
+{
+    a[0] = b[0];
+    a[1] = b[1];
+    a[2] = b[2];
+    a[3] = b[3];
+}
+
+Then BB vectorizer can do vectorization, but still failed for
+
+void
+foo1 (double* __restrict a, unsigned char* b)
+{
+    a[0] = b[0];
+    a[1] = b[1];
+    a[2] = b[2];
+    a[3] = b[3];
+}
+
+So it looks there're 2 separate issue
+1. As mentioned in the PR, we can use intermediate type for vectorizable unsigned char to double.
+2. There's mismatch between vectype_out and vectype_in as SLP_TREE_VECTYPE (child);
+
+- User: Richard Biener | Time: 2023-05-30 07:57:08 UTC
+  Text: I think the easiest would be to handle this in pattern recog and piggy-back
+on the existing multi-step conversion support for the integral promotion
+whilst not relying on such for int<->float conversions.
+
+- User: Hongtao.liu | Time: 2023-05-30 09:50:31 UTC
+  Text: Do we know if the stmt belongs to any slp_node in pattern recog? slp_node use SLP_TREE_LANES for vectype which is different from vinfo->vector_mode. Different optabs should be checked according to both vectype_in and vectype_out, for non-slp case, assuming vec_pack/unpack are always used when lhs has different size from rhs, for slp case, sometimes vec_pack/unpack is used, somethings direct conversion is used.
+
+- User: GCC Commits | Time: 2023-06-21 02:33:21 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:6f19cf7526168f840fd22f6af3f0cb67efb90dc8commitr14-2007-g6f19cf7526168f840fd22f6af3f0cb67efb90dc8Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed May 31 11:20:46 2023 +0800
+
+    Use intermiediate integer type for float_expr/fix_trunc_expr when direct optab is not existed.
+    
+    We have already use intermidate type in case WIDEN, but not for NONE,
+    this patch extended that.
+    
+    gcc/ChangeLog:PR target/110018* tree-vect-stmts.cc (vectorizable_conversion): Use
+            intermiediate integer type for float_expr/fix_trunc_expr when
+            direct optab is not existed.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110018-1.c: New test.
+
+- User: Hongtao.liu | Time: 2023-06-21 02:38:48 UTC
+  Text: Fixed for GCC14.
+
+- User: GCC Commits | Time: 2023-06-21 14:35:09 UTC
+  Text: The master branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:b9401c3a323c59705eca177bf72c13c0d2f462b6commitr14-2020-gb9401c3a323c59705eca177bf72c13c0d2f462b6Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Wed Jun 21 16:34:39 2023 +0200
+
+    vect: Add testcases for unsigned conversions [PR110018]
+    
+    Also test convresions with unsigned types.PR target/110018gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110018-1.c: Use explicit signed types.
+            * gcc.target/i386/pr110018-2.c: New test.
+
+- User: GCC Commits | Time: 2023-06-26 07:30:34 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:77a50c772771f681085922b493922516c3c03e9acommitr14-2085-g77a50c772771f681085922b493922516c3c03e9aAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Sun Jun 25 11:35:09 2023 +0800
+
+    Don't use intermiediate type for FIX_TRUNC_EXPR when ftrapping-math.
+    
+    > > Hmm, good question.  GENERIC has a direct truncation to unsigned char
+    > > for example, the C standard generally says if the integral part cannot
+    > > be represented then the behavior is undefined.  So I think we should be
+    > > safe here (0x1.0p32 doesn't fit an int).
+    >
+    > We should be following Annex F (unspecified value plus "invalid" exception
+    > for out-of-range floating-to-integer conversions rather than undefined
+    > behavior).  But we don't achieve that very well at present (seebug 93806> comments 27-29 for examples of how such conversions produce wobbly
+    > values).
+    
+    That would mean guarding this with !flag_trapping_math would be the appropriate
+    thing to do.
+    
+    gcc/ChangeLog:PR tree-optimization/110371PR tree-optimization/110018* tree-vect-stmts.cc (vectorizable_conversion): Don't use
+            intermiediate type for FIX_TRUNC_EXPR when ftrapping-math.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110018-1.c: Add -fno-trapping-math to dg-options.
+            * gcc.target/i386/pr110018-2.c: Ditto.
+
+- User: GCC Commits | Time: 2023-06-26 07:49:28 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:1bfe7e5352d1f4ac525317454aca45aa80a517bacommitr14-2086-g1bfe7e5352d1f4ac525317454aca45aa80a517baAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Sun Jun 25 11:12:29 2023 +0800
+
+    Use cvt_op to save intermediate type operand instead of "subtle" vec_dest.
+    
+    When there're multiple operands in vec_oprnds0, vec_dest will be
+    overwrited to vectype_out, but in multi_step_cvt case, cvt_type is
+    expected. It caused an ICE when verify_gimple_in_cfg.
+    
+    gcc/ChangeLog:PR tree-optimization/110371PR tree-optimization/110018* tree-vect-stmts.cc (vectorizable_conversion): Use cvt_op to
+            save intermediate type operand instead of "subtle" vec_dest
+            for case NONE.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/pr110371.c: New test.
+

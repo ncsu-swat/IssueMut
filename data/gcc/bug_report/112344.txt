@@ -1,0 +1,275 @@
+Bug Summary: [14 Regression] Wrong code at -O2 on x86_64-pc-linux-gnu
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Junwei Zeng | Time: 2023-11-02 06:30:44 UTC
+  Text: I compiled the following code with gcc at -O2, and it produces the wrong code. 
+
+The correct output result should be 13, but 73 was output under -O2. 
+
+This bug seems to only exist on gcc-trunk. The gcc-tk used below is the earliest version I can use that triggers this bug.
+
+Compiler explorer:https://godbolt.org/z/8hq64asT5```c
+$ cat test.c
+int printf(const char *, ...);
+int a;
+void b() {
+  long c = 3;
+  unsigned int d = 50253292;
+  int e = 2147483648;
+  for (; a < 5; a++)
+    do {
+      e += 4;
+      d -= c;
+    } while (e < 20);
+  printf("%d\n", d);
+}
+int main() { b(); }
+$
+$ gcc-tk test.c -O2; ./test.c
+73
+$
+$ gcc-tk test.c -O0; ./test.c
+13
+$ gcc-tk test.c -O1; ./test.c
+13
+$ gcc-tk test.c -O3; ./test.c
+13
+$ gcc-tk test.c -Os; ./test.c
+13
+$ ccomp test.c -O1; ./a.out
+13
+$
+$ gcc-tk --version
+gcc (GCC) 14.0.0 20230922 (experimental) [masterr14-4213-gd35e12e1c0]
+Copyright (C) 2023 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+$
+$ ccomp --version
+The CompCert C verified compiler, version 3.12
+```
+
+- User: Andrew Pinski | Time: 2023-11-02 06:41:07 UTC
+  Text: Did you copy the correct testcase? Because it looks like you just copied the one fromPR 112305and the output is way different.
+
+- User: Andrew Pinski | Time: 2023-11-02 06:42:14 UTC
+  Text: Corrected testcase:
+```
+int printf(const char *, ...);
+void a() {
+  long b = 2036854775807;
+  char c = 3;
+  short d;
+  int e = -2147483648, f = 0;
+  for (; f < 7; f++)
+    while (e < 20) {
+      e += 2;
+      d = c -= b;
+    }
+  printf("%d\n", d);
+}
+int main() { a(); }
+```
+
+- User: Junwei Zeng | Time: 2023-11-02 06:47:45 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> Corrected testcase:
+> ```
+> int printf(const char *, ...);
+> void a() {
+>   long b = 2036854775807;
+>   char c = 3;
+>   short d;
+>   int e = -2147483648, f = 0;
+>   for (; f < 7; f++)
+>     while (e < 20) {
+>       e += 2;
+>       d = c -= b;
+>     }
+>   printf("%d\n", d);
+> }
+> int main() { a(); }
+> ```Sorry, I copied the wrong test case, the correct test case is the one in Compiler explorer, which is the one you mentioned.
+
+Compiler explorer:https://godbolt.org/z/8hq64asT5
+
+- User: Andrew Pinski | Time: 2023-11-02 06:49:18 UTC
+  Text: Confirmed.
+
+- User: Richard Biener | Time: 2023-11-02 10:06:59 UTC
+  Text: Hmm, I can't reproduce on HEAD, so maybe a duplicate ofPR112305.
+
+- User: Jakub Jelinek | Time: 2023-11-21 19:22:21 UTC
+  Text: Bisection shows this started withr14-4089-gd45ddc2c04e471d0dcee016b6edacc00b8341b16and still reproduces on latest trunk.
+-fsanitize=undefined doesn't report anything.
+Slightly cleaned up:
+int
+main ()
+{
+  long long b = 2036854775807LL;
+  signed char c = 3;
+  short d = 0;
+  int e = -2147483647 - 1, f;
+  for (f = 0; f < 7; f++)
+    while (e < 20)
+      {
+	e += 2;
+	d = c -= b;
+      }
+  if (d != 13)
+    __builtin_abort ();
+}
+
+- User: Richard Biener | Time: 2023-11-22 07:43:17 UTC
+  Text: Ah, it reproduces (a local patch hides the issue, the bisected rev. likely just exposes an existing issue).
+
+We're optimizing this to
+
+  <bb 2> [local count: 16873086]:
+
+  <bb 3> [local count: 105119324]:
+  # c_31 = PHI <3(2), c_51(3)>
+  # ivtmp_28 = PHI <7(2), ivtmp_49(3)>
+  _48 = (unsigned char) c_31;
+  _50 = _48 + 10;
+  c_51 = (signed char) _50;
+  ivtmp_49 = ivtmp_28 + 4294967295;
+  if (ivtmp_49 != 0)
+    goto <bb 3>; [85.71%]
+  else
+    goto <bb 4>; [14.29%]
+
+  <bb 4> [local count: 16873086]:
+  d_52 = (short int) _50;
+  if (d_52 != 13)
+
+and the issue is likely in final value replacement doing
+
+final value replacement:
+  e_9 = PHI <e_17(3)>
+ with expr: (e_31 + 2) + (int) ((19 - (unsigned int) e_31) / 2) * 2
+ final stmt:
+  e_9 = _7 + _20;
+
+
+final value replacement:
+  c_8 = PHI <c_18(3)>
+ with expr: (signed char) (((unsigned char) ((19 - (unsigned int) e_31) / 2) + (unsigned char) c_25) + 1)
+ final stmt:
+  c_8 = (signed char) _33;
+
+
+-fdisable-tree-sccp fixes this.
+
+- User: Richard Biener | Time: 2023-11-22 09:10:26 UTC
+  Text: thread2 comes along and threads the e_1 <= 19 jump from the entry
+"twice", resulting in bogus ranges to be used?
+
+Checking profitability of path (backwards):  bb:3 (2 insns) bb:9 (0 insns) (latch) bb:5 (3 insns) bb:4
+  Control statement insns: 2
+  Overall: 3 insns
+
+ Registering killing_def (path_oracle) e_43
+ Registering killing_def (path_oracle) _37
+ Registering killing_def (path_oracle) _42
+ Registering killing_def (path_oracle) _41
+ Registering killing_def (path_oracle) _40
+ Registering killing_def (path_oracle) _39
+ Registering killing_def (path_oracle) _38
+Checking profitability of path (backwards):
+  [3] Registering jump thread: (4, 5) incoming edge;  (5, 9) normal (9, 3) normal (back) (3, 4) nocopy;
+path: 4->5->9->3->4 SUCCESS
+
+- User: Richard Biener | Time: 2023-11-22 10:06:28 UTC
+  Text: In particular the final jump is miscalculated somehow, possibly path-ranger
+mishandles the situation.  For the loop header we thread through we
+first clear dependent ranges (good) but then do compute_ranges_in_phis
+(weird, we know the incoming edge?), doing
+
+      Value_Range r (TREE_TYPE (name));
+      if (range_defined_in_block (r, name, bb))
+        m_cache.set_range (name, r);
+
+where this ends up calling ssa_range_in_phi, resulting in
+
+[irange] int [1, 1]$69 = void
+
+
+Hmm, so we have
+
+_41 : [irange] int [1073741833, 1073741833]
+_42 : [irange] int [+INF, +INF]
+
+and
+
+    <bb 4> [local count: 105119324]:
+    _37 = e_1 + 2; 
+    _38 = (unsigned int) e_1;
+    _39 = 19 - _38;
+    _40 = _39 / 2;
+    _41 = (int) _40;
+    _42 = _41 * 2;
+
+so it's the e_9 replacement that is wrong.
+
+This is chrec_apply, applying the unsigned number of iterations (19 - (unsigned int) e_31) / 2 to the signed chrec {e_31 + 2, +, 2}_2.  This isn't without
+overflow when computing the overall increment from INT_MIN to 19 since that
+positive number cannot be represented in a signed integer type.
+
+- User: GCC Commits | Time: 2023-11-22 14:40:58 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:6bf66276e3e41d5d92f7b7260e98b6a111653805commitr14-5759-g6bf66276e3e41d5d92f7b7260e98b6a111653805Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Nov 22 11:10:41 2023 +0100
+
+    tree-optimization/112344 - wrong final value replacement
+    
+    When performing final value replacement chrec_apply that's used to
+    compute the overall effect of niters to a CHREC doesn't consider that
+    the overall increment of { -2147483648, +, 2 } doesn't fit in
+    a signed integer when the loop iterates until the value of the IV
+    of 20.  The following fixes this mistake, carrying out the multiply
+    and add in an unsigned type instead, avoiding undefined overflow
+    and thus later miscompilation by path range analysis.PR tree-optimization/112344* tree-chrec.cc (chrec_apply): Perform the overall increment
+            calculation and increment in an unsigned type.
+    
+            * gcc.dg/torture/pr112344.c: New testcase.
+
+- User: Richard Biener | Time: 2023-11-22 14:41:22 UTC
+  Text: Fixed.
+
+- User: GCC Commits | Time: 2023-11-24 07:50:25 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:a7d82b45edeed99a850595eee0e59d16c4df7affcommitr14-5813-ga7d82b45edeed99a850595eee0e59d16c4df7affAuthor: Richard Biener <rguenther@suse.de>
+Date:   Thu Nov 23 09:49:59 2023 +0100
+
+    tree-optimization/112344 - relax final value-replacement fix
+    
+    The following tries to reduce the number of cases we use an unsigned
+    type for the addition when we know the original signed increment was
+    OK which is when the total unsigned increment computed fits the signed
+    type as well.
+    
+    This fixes the observed testsuite fallout.PR tree-optimization/112344* tree-chrec.cc (chrec_apply): Only use an unsigned add
+            when the overall increment doesn't fit the signed type.
+
+- User: GCC Commits | Time: 2024-02-18 10:07:01 UTC
+  Text: The master branch has been updated by Dimitar Dimitrov <dimitar@gcc.gnu.org>:https://gcc.gnu.org/g:3796216bfa49b5ca288afe0760931a4c5b8ea346commitr14-9055-g3796216bfa49b5ca288afe0760931a4c5b8ea346Author: Dimitar Dimitrov <dimitar@dinux.eu>
+Date:   Thu Feb 15 21:02:37 2024 +0200
+
+    testsuite: Mark non-optimized variants as expensive
+    
+    When not optimized for speed, the test forPR112344takes several
+    seconds to execute on native x86_64, and 15 minutes on PRU target
+    simulator.  Thus mark those variants as expensive.  The -O2 variant
+    which originally triggered the PR is not expensive, hence it is
+    still run by default.PR middle-end/112344gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/torture/pr112344.c: Run non-optimized variants only
+            if expensive tests are allowed.
+    
+    Signed-off-by: Dimitar Dimitrov <dimitar@dinux.eu>
+

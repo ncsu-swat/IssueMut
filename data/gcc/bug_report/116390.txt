@@ -1,0 +1,360 @@
+Bug Summary: [15 regression] [avr] Another ICE for avrtiny and optimization
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 14.1.0
+Known to Fail: 
+
+Comments:
+- User: Detlef Vollmann | Time: 2024-08-16 11:52:41 UTC
+  Text: Createdattachment 58939[details]Produced by -freport-bug
+
+This ICE happened when I tried to strip down the source for <https://gcc.gnu.org/bugzilla/show_bug.cgi?id=116389>.
+
+For -O3 and -O4 it produces an ICE very similar to #116389 (the file for O3 is attached).
+For -O2 it produces:
+during RTL pass: final
+ice.cc: In function 'void badFoo()':
+ice.cc:70:1: internal compiler error: Segmentation fault
+   70 | }
+      | ^
+0x1cf6290 internal_error(char const*, ...)
+        /ssd1/build/src/gcc/gcc/diagnostic-global-context.cc:491
+0xfca7af crash_signal
+        /ssd1/build/src/gcc/gcc/toplev.cc:321
+0x7ff7ade1d58f ???
+        ./signal/../sysdeps/unix/sysv/linux/x86_64/libc_sigaction.c:0
+0xbf92e1 output_operand(rtx_def*, int)
+        /ssd1/build/src/gcc/gcc/final.cc:3624
+0xbf9ee0 output_asm_insn(char const*, rtx_def**)
+        /ssd1/build/src/gcc/gcc/final.cc:3524
+0x13e5557 output_movsisf(rtx_insn*, rtx_def**, int*)
+        /ssd1/build/src/gcc/gcc/config/avr/avr.cc:5923
+0xbfd340 final_scan_insn_1
+        /ssd1/build/src/gcc/gcc/final.cc:2773
+0xbfd908 final_scan_insn(rtx_insn*, _IO_FILE*, int, int, int*)
+        /ssd1/build/src/gcc/gcc/final.cc:2886
+0xbfdb37 final_1
+        /ssd1/build/src/gcc/gcc/final.cc:1977
+0xbfe634 rest_of_handle_final
+        /ssd1/build/src/gcc/gcc/final.cc:4239
+0xbfe634 execute
+        /ssd1/build/src/gcc/gcc/final.cc:4317
+
+and claims: "The bug is not reproducible, so it is likely a hardware or OS problem." (which is bogus, it's 100% reproducible).
+
+Due to this difference I submit this as separate bug, but feel free to mark it as duplicate of #116389.
+
+Here's the complete source for reference:
+
+--- start source
+struct MyStruct
+{
+    int i;
+};
+
+void f_ic(int, char);
+void f_pi(char const *, int);
+void f_iic(int, int, char);
+
+const MyStruct *f_rms();
+
+char *f_rcp();
+int f_ri();
+
+
+void badFoo()
+{
+    const MyStruct* ps = f_rms();
+    const char* pc = f_rcp();
+
+    unsigned n1 = f_rcp() - pc;
+
+    if (n1)
+    {
+        long n2 = n1 - ps->i;
+        if (n2 > 0)
+        {
+            if (f_ri())
+                n2 = n1;
+
+            if (f_ri())
+            {
+                f_iic(1, 2 * n2, ' ');
+            }
+            else
+                f_pi(pc, n2);
+        }
+        if (ps->i > 0)
+        {
+            if (n2 >= 0)
+                f_pi(pc + n2, ps->i);
+            else
+            {
+                f_ic(n2, ' ');
+            }
+        }
+
+        const int which = f_ri();
+        switch (which)
+        {
+        case 1:
+            if (f_ri())
+                f_rcp()[1] = ' ';
+            break;
+
+        case 2:
+            f_pi(f_rcp(), 1);
+            break;
+
+        case 3:
+            if (f_ri() && n1 < 0)
+                f_ic(n1, ' ');
+            else
+                f_rcp()[1] = ' ';
+            break;
+
+        }
+    }
+}
+--- end source
+
+- User: Georg-Johann Lay | Time: 2024-08-17 06:50:59 UTC
+  Text: This seems to be a bug in ext_dce, and it can be worked around with -fno-ext-dce.
+
+From .expand, there is this insn:
+
+(insn 27 26 0 (set (reg/v:SI 60 [ n2 ])
+        (zero_extend:SI (reg/v:HI 63 [ n1 ]))) "pr116390-i.cpp":33:20 -1
+     (nil))
+
+which .ext_dce turns into a paradoxical subreg:
+
+Processing insn:
+   27: r60:SI=zero_extend(r63:HI)
+      REG_DEAD r63:HI
+Trying to simplify pattern:
+(zero_extend:SI (reg/v:HI 63 [ n1 ]))
+rescanning insn with uid = 27.
+Successfully transformed to:
+(subreg:SI (reg/v:HI 63 [ n1 ]) 0)
+
+This paradoxical subreg it there until register allocation, which turns the insn into
+
+(insn 27 145 28 5 (set (mem/c:SI (plus:HI (reg/f:HI 28 r28)
+                (const_int 7 [0x7])) [4 %sfp+7 S4 A8])
+        (reg:SI 26 r26)) "pr116390-i.cpp":33:20 119 {*movsi_split}
+     (nil))
+
+and this is complete rubbish because R26:SI overlaps with the frame pointer R28:HI.
+
+Apart from that, representing a zero_extend as a paradoxical subreg is spoiling all respective combine patterns that combine shifts with zero_extends.  Are we supposed to rewrite all of them using paradoxical subregs?
+
+- User: GCC Commits | Time: 2024-08-17 11:27:44 UTC
+  Text: The master branch has been updated by Georg-Johann Lay <gjl@gcc.gnu.org>:https://gcc.gnu.org/g:4065d163151b07b274241377e71dad028576db88commitr15-2963-g4065d163151b07b274241377e71dad028576db88Author: Georg-Johann Lay <avr@gjlay.de>
+Date:   Sat Aug 17 12:49:42 2024 +0200
+
+    AVR: target/116390 - Fix an avrtiny asm out template.PR target/116390gcc/
+            * config/avr/avr.cc (avr_out_movsi_mr_r_reg_disp_tiny): Fix
+            output templates for the reg_base == reg_src and
+            reg_src == reg_base - 2 cases.
+    gcc/testsuite/
+            * gcc.target/avr/torture/pr116390.c: New test.
+
+- User: GCC Commits | Time: 2024-08-17 12:25:15 UTC
+  Text: The releases/gcc-14 branch has been updated by Georg-Johann Lay <gjl@gcc.gnu.org>:https://gcc.gnu.org/g:f3d9c120a1959c5b094001516c1e5cb4ba6f4080commitr14-10597-gf3d9c120a1959c5b094001516c1e5cb4ba6f4080Author: Georg-Johann Lay <avr@gjlay.de>
+Date:   Sat Aug 17 12:49:42 2024 +0200
+
+    AVR: target/116390 - Fix an avrtiny asm out template.PR target/116390gcc/
+            * config/avr/avr.cc (avr_out_movsi_mr_r_reg_disp_tiny): Fix
+            output templates for the reg_base == reg_src and
+            reg_src == reg_base - 2 cases.
+    gcc/testsuite/
+            * gcc.target/avr/torture/pr116390.c: New test.
+    
+    (cherry picked from commit 4065d163151b07b274241377e71dad028576db88)
+
+- User: Georg-Johann Lay | Time: 2024-08-17 12:26:07 UTC
+  Text: Fixed in v14.3+
+
+- User: Detlef Vollmann | Time: 2024-08-17 13:04:19 UTC
+  Text: Thanks for your patch.
+It solves the segfault ICE for -O2.
+But unfortunately  it doesn't solve the build for -O3 or -O4.
+It still produces the same error as before:
+
+avr-gcc -O4 -mmcu=avrtiny    -c -opr116390.opr116390.cpr116390.c: In function 'badFoo':pr116390.c:71:1: error: insn does not satisfy its constraints:
+   71 | }
+      | ^
+(insn 29 148 3 5 (set (mem/c:SI (plus:HI (reg/f:HI 28 r28)
+                (const_int 9 [0x9])) [4 %sfp+9 S4 A8])
+        (reg:SI 30 r30)) "pr116390.c":31:20 119 {*movsi_split}
+     (nil))
+during RTL pass: postreloadpr116390.c:71:1: internal compiler error: in extract_constrain_insn, at recog.cc:2783
+0x1a169d0 internal_error(char const*, ...)
+	/ssd1/build/src/gcc/gcc/diagnostic-global-context.cc:491
+0x63606b fancy_abort(char const*, int, char const*)
+	/ssd1/build/src/gcc/gcc/diagnostic.cc:1772
+0x4e7641 _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+	/ssd1/build/src/gcc/gcc/rtl-error.cc:108
+0x4e7667 _fatal_insn_not_found(rtx_def const*, char const*, int, char const*)
+	/ssd1/build/src/gcc/gcc/rtl-error.cc:118
+0x4e6199 extract_constrain_insn(rtx_insn*)
+	/ssd1/build/src/gcc/gcc/recog.cc:2783
+0xc0d3d6 reload_cse_simplify_operands
+	/ssd1/build/src/gcc/gcc/postreload.cc:396
+0xc0df65 reload_cse_simplify
+	/ssd1/build/src/gcc/gcc/postreload.cc:179
+0xc0df65 reload_cse_regs_1
+	/ssd1/build/src/gcc/gcc/postreload.cc:227
+0xc1009b reload_cse_regs
+	/ssd1/build/src/gcc/gcc/postreload.cc:65
+0xc1009b execute
+	/ssd1/build/src/gcc/gcc/postreload.cc:2366
+
+- User: Georg-Johann Lay | Time: 2024-08-17 13:13:07 UTC
+  Text: (In reply to Detlef Vollmann fromcomment #5)> Thanks for your patch.
+> It solves the segfault ICE for -O2.
+> But unfortunately  it doesn't solve the build for -O3 or -O4.
+> It still produces the same error as before:
+> 
+> avr-gcc -O4 -mmcu=avrtiny    -c -opr116390.opr116390.c
+>pr116390.c: In function 'badFoo':
+>pr116390.c:71:1: error: insn does not satisfy its constraints:
+>    71 | }
+>       | ^
+> (insn 29 148 3 5 (set (mem/c:SI (plus:HI (reg/f:HI 28 r28)
+>                 (const_int 9 [0x9])) [4 %sfp+9 S4 A8])
+>         (reg:SI 30 r30)) "pr116390.c":31:20 119 {*movsi_split}
+>      (nil))
+> during RTL pass: postreload
+>pr116390.c:71:1: internal compiler error: in extract_constrain_insn, at
+> recog.cc:2783IMO that isPR116389which is a regalloc issue or a problem with ext-dce, whereas this one is about a (now fixed) typo in the avr backend.  Notice that the error message changed.> 0x1a169d0 internal_error(char const*, ...)
+> 	/ssd1/build/src/gcc/gcc/diagnostic-global-context.cc:491
+> 0x63606b fancy_abort(char const*, int, char const*)
+> 	/ssd1/build/src/gcc/gcc/diagnostic.cc:1772
+> 0x4e7641 _fatal_insn(char const*, rtx_def const*, char const*, int, char
+> const*)
+> 	/ssd1/build/src/gcc/gcc/rtl-error.cc:108
+> 0x4e7667 _fatal_insn_not_found(rtx_def const*, char const*, int, char const*)
+> 	/ssd1/build/src/gcc/gcc/rtl-error.cc:118
+> 0x4e6199 extract_constrain_insn(rtx_insn*)
+> 	/ssd1/build/src/gcc/gcc/recog.cc:2783
+> 0xc0d3d6 reload_cse_simplify_operands
+> 	/ssd1/build/src/gcc/gcc/postreload.cc:396
+> 0xc0df65 reload_cse_simplify
+> 	/ssd1/build/src/gcc/gcc/postreload.cc:179
+> 0xc0df65 reload_cse_regs_1
+> 	/ssd1/build/src/gcc/gcc/postreload.cc:227
+> 0xc1009b reload_cse_regs
+> 	/ssd1/build/src/gcc/gcc/postreload.cc:65
+> 0xc1009b execute
+> 	/ssd1/build/src/gcc/gcc/postreload.cc:2366
+
+- User: Jeffrey A. Law | Time: 2024-08-17 19:16:49 UTC
+  Text: WRT the question in c#1.  A paradoxical subreg is the canonical way to say I want to view this pseudo (or expression) in a mode wider than its native mode and I don't care about the state of the bits outside its native mode.
+
+So when ext-dce finds an extension where the upper bits are not used, it'll convert it into a paradoxical subreg.  That's per design and from what I can see it's behaving correctly.
+
+It has always been advantageous if (when safe) patterns that accept zero/sign extension could also accept a paradoxical subreg.  With ext-dce it just make it even more useful to handle those cases.  You certainly don't have to convert everything, but it is useful to review the patterns and see if they can be safely used with a paradoxical subreg and extend those that look profitable to do so.
+
+As far as the register allocator issue.  I would suggest you look deeper into that since it could be either a register allocator bug or a bug in the backend.  I suggest first looking at the state after IRA to see if it is sensible.   If avr is still a reload target, note that we have a known bug with how reload handles paradoxical subregs that we're still working on.
+
+- User: Georg-Johann Lay | Time: 2024-08-17 20:37:18 UTC
+  Text: (In reply to Jeffrey A. Law fromcomment #7)> It has always been advantageous if (when safe) patterns that accept
+> zero/sign extension could also accept a paradoxical subreg.  With ext-dce it
+> just make it even more useful to handle those cases.I don't see how that would work, since extend has a different anatomy / rtx type than a subreg (extend is "e" whilst subreg is "ep").  Hence this would mean new patterns with subreg(s) instead of extend(s)?> As far as the register allocator issue.  I wouldsuggest you look deeper
+> into that since it could be either a register allocator bug or a bug in the
+> backend.  I suggest first looking at the state after IRA to see if it is
+> sensible.   If avr is still a reload target, note that we have a known bug
+> with how reload handles paradoxical subregs that we're still working on.The issue with the current PR was code like *(R28:HI + off) = R26:SI which can be handled by avr.cc, but the asm out function was bogus and used %2 in output_asm_insn() which was undefined, hence segmentation fault.
+
+While code like *(R28:HI + off) = R26:SI is silly, it can still be suppoprted.  This is different withPR116390that has xxx = R30:SI which is invalid, because R30 can hold one byte, R31 can hold one byte, and there are no more hard regs after that.
+
+As the transformations from ext-dce are supposed to be an optimization, the sensible thing to do in the register allocator would be to only ever touch the SUBREG_REG part of the subreg, i.e. only store (and allocate) HImode instead of the extended mode.  (The patch for the current PR assumes that *(R28:HI + off) = R26:SI originates from ext-dce and that the high 16 bits of R26:SI only contain garbage, and hence don't require being written to the stack slot.  But the right place would be RA only touching / allocating the required bytes).> note that we have a known bug with how reload handles paradoxical
+> subregs that we're still working on.IIUCPR116389is a DUP of some other PR?
+
+- User: Jeffrey A. Law | Time: 2024-08-17 21:04:42 UTC
+  Text: On 8/17/24 2:37 PM, gjl at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=116390> 
+> Georg-Johann Lay <gjl at gcc dot gnu.org> changed:
+> 
+>             What    |Removed                     |Added
+> ----------------------------------------------------------------------------
+>                   CC|                            |gjl at gcc dot gnu.org
+> 
+> ---Comment #8from Georg-Johann Lay <gjl at gcc dot gnu.org> ---
+> (In reply to Jeffrey A. Law fromcomment #7)
+>> It has always been advantageous if (when safe) patterns that accept
+>> zero/sign extension could also accept a paradoxical subreg.  With ext-dce it
+>> just make it even more useful to handle those cases.
+> I don't see how that would work, since extend has a different anatomy / rtx
+> type than a subreg (extend is "e" whilst subreg is "ep").  Hence this would
+> mean new patterns with subreg(s) instead of extend(s)?An appropriate match_operator can do this.> 
+> While code like *(R28:HI + off) = R26:SI is silly, it can still be suppoprted.
+> This is different withPR116390that has xxx = R30:SI which is invalid, because
+> R30 can hold one byte, R31 can hold one byte, and there are no more hard regs
+> after that.Which again, the generic code generally knows how to handle, meaning the 
+issue is most likely in the avr backend.> 
+> As the transformations from ext-dce are supposed to be an optimization, the
+> sensible thing to do in the register allocator would be to only ever touch the
+> SUBREG_REG part of the subreg, i.e. only store (and allocate) HImode instead of
+> the extended mode.  (The patch for the current PR assumes that *(R28:HI + off)
+> = R26:SI originates from ext-dce and that the high 16 bits of R26:SI only
+> contain garbage, and hence don't require being written to the stack slot.  But
+> the right place would be RA only touching / allocating the required bytes).Ideally the subregs get removed by tying the input and output together 
+resulting in a nop copy.> 
+>> note that we have a known bug with how reload handles paradoxical
+>> subregs that we're still working on.
+> IIUCPR116389is a DUP of some other PR?Hard to know since the root cause hasn't been determined yet.
+
+jeff
+
+- User: Detlef Vollmann | Time: 2024-08-18 15:21:37 UTC
+  Text: Just in case you don't already know it, this is the commit that
+caused this regression:
+<https://gcc.gnu.org/git/gitweb.cgi?p=gcc.git;h=88d16194d0c8a6bdc2896c8944bfbf3e6038c9d2>
+
+   Detlef
+
+- User: Georg-Johann Lay | Time: 2024-08-18 17:34:53 UTC
+  Text: This PR is about a segmentation fault, which has been fixed already by the commit above.
+
+The "insn does not satisfy its constraints" ICE you are seeing now isPR116389.  Please f'up toPR116389.
+
+- User: Georg-Johann Lay | Time: 2024-08-18 20:42:30 UTC
+  Text: (In reply to Detlef Vollmann fromcomment #10)> Just in case you don't already know it, this is the commit that
+> caused this regression:
+> <https://gcc.gnu.org/git/gitweb.cgi?p=gcc.git;
+> h=88d16194d0c8a6bdc2896c8944bfbf3e6038c9d2>As Jeff wrote incomment #7, the paradoxical subregs present since that change are as expected by that optimization.  The problem is that the register allocator doesn't treat them correctly (PR116389).
+
+The segmentation fault as reported above has been fixed withcomment #2.  So for what reason did you reopen this PR?
+
+- User: Detlef Vollmann | Time: 2024-08-19 08:56:45 UTC
+  Text: On 8/18/24 22:42, gjl at gcc dot gnu.org wrote:> The segmentation fault as reported above has been fixed withcomment #2.  So
+> for what reason did you reopen this PR?Sorry, I don't really know the procedures here.
+
+As it turns out, this PR actually reports two bugs, one for -O2
+with the error message in the description and one for -O3 and -O4
+for which the error message is in the attachment (created by
+-freport-bug).
+
+The first bug got resolved with your patch (thanks again!) and
+the second one seems to be a duplicate ofPR116389, which isn't
+fixed yet.
+
+So setting this PR to resolved/fixed seemed not appropriate to me.
+But I agree that resolved/duplicate isn't a really correct solution
+either.
+
+As I said, I don't know the GCC policy here, so feel free to set it
+to resolved/fixed again if you think that's correct.
+
+   Detlef
+
+- User: Georg-Johann Lay | Time: 2024-08-19 09:14:24 UTC
+  Text: (In reply to Detlef Vollmann fromcomment #13)> The first bug got resolved with your patch (thanks again!) and
+> the second one seems to be a duplicate ofPR116389, which isn't
+> fixed yet.Closed again as fixed.  The PR with -O3 / "insn does not satisfy its constraints internal compiler error: in extract_constrain_insn, at recog.cc:2783" is a different issue that has already been reported asPR116389(and which is still open to date).
+

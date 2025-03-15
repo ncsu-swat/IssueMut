@@ -1,0 +1,154 @@
+Bug Summary: ICE: in as_a, at machmode.h:381 with memset() on a _BitInt() at -O1 and above
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-01-17 20:33:01 UTC
+  Text: Createdattachment 57119[details]reduced testcase
+
+Compiler output:
+$ cc1 -quiet -O testcase.c 
+during GIMPLE pass: fre
+testcase.c: In function 'foo':
+testcase.c:8:1: internal compiler error: in as_a, at machmode.h:381
+    8 | }
+      | ^
+0x876149 scalar_int_mode as_a<scalar_int_mode>(machine_mode)
+        /repo/gcc-trunk/gcc/machmode.h:381
+0x876149 scalar_int_mode as_a<scalar_int_mode>(machine_mode)
+        /repo/gcc-trunk/gcc/machmode.h:379
+0x876149 vn_reference_lookup_3
+        /repo/gcc-trunk/gcc/tree-ssa-sccvn.cc:2972
+0x16226f7 walk_non_aliased_vuses(ao_ref*, tree_node*, bool, void* (*)(ao_ref*, tree_node*, void*), void* (*)(ao_ref*, tree_node*, void*, translate_flags*), tree_node* (*)(tree_node*), unsigned int&, void*)
+        /repo/gcc-trunk/gcc/tree-ssa-alias.cc:3914
+0x171a4ef vn_reference_lookup(tree_node*, tree_node*, vn_lookup_kind, vn_reference_s**, bool, tree_node**, tree_node*, bool)
+        /repo/gcc-trunk/gcc/tree-ssa-sccvn.cc:4023
+0x171e7e7 visit_reference_op_load
+        /repo/gcc-trunk/gcc/tree-ssa-sccvn.cc:5740
+0x171e7e7 visit_stmt
+        /repo/gcc-trunk/gcc/tree-ssa-sccvn.cc:6261
+0x171ee6b process_bb
+        /repo/gcc-trunk/gcc/tree-ssa-sccvn.cc:8025
+0x1720846 do_rpo_vn_1
+        /repo/gcc-trunk/gcc/tree-ssa-sccvn.cc:8626
+0x17223bb execute
+        /repo/gcc-trunk/gcc/tree-ssa-sccvn.cc:8787
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ xgcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/build-gcc-trunk-amd64A/gcc/xgcc
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-8193-20240117105849-g3340878009a-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240117 (experimental) (GCC)
+
+- User: Richard Biener | Time: 2024-01-18 08:14:47 UTC
+  Text: We're relying on INTEGRAL_TYPE_P (vr->type) -> vr->type has integer mode.
+
+- User: Richard Biener | Time: 2024-01-18 08:20:27 UTC
+  Text: unsigned buflen = TREE_INT_CST_LOW (TYPE_SIZE_UNIT (vr->type)) + 1;
+              if (INTEGRAL_TYPE_P (vr->type))
+                buflen = GET_MODE_SIZE (SCALAR_INT_TYPE_MODE (vr->type)) + 1;
+
+there's other spots using the pattern
+
+                      if (INTEGRAL_TYPE_P (type))
+                        sz = GET_MODE_SIZE (SCALAR_INT_TYPE_MODE (type));
+
+I wonder when GET_MODE_SIZE differs from TYPE_SIZE_UNIT?  PSImode?
+Packed bitfields?r10-6885-g5f9cd512c42786added the INTEGRAL_TYPE_P
+special-casing we now run into with the TYPE_SIZE_UNIT code being there
+before.
+
+Jakub, do you remember?
+
+- User: Jakub Jelinek | Time: 2024-01-18 09:34:21 UTC
+  Text: (In reply to Richard Biener fromcomment #2)>               unsigned buflen = TREE_INT_CST_LOW (TYPE_SIZE_UNIT (vr->type))
+> + 1;
+>               if (INTEGRAL_TYPE_P (vr->type))
+>                 buflen = GET_MODE_SIZE (SCALAR_INT_TYPE_MODE (vr->type)) + 1;
+> 
+> there's other spots using the pattern
+> 
+>                       if (INTEGRAL_TYPE_P (type))
+>                         sz = GET_MODE_SIZE (SCALAR_INT_TYPE_MODE (type));
+> 
+> I wonder when GET_MODE_SIZE differs from TYPE_SIZE_UNIT?  PSImode?I'm afraid I don't know either.> Packed bitfields?r10-6885-g5f9cd512c42786added the INTEGRAL_TYPE_P
+> special-casing we now run into with the TYPE_SIZE_UNIT code being there
+> before.
+> 
+> Jakub, do you remember?I bet the above comes from what the native_{encode,interpret}_int has been doing (and which has been tweaked for BITINT_TYPE).
+If we don't want to throw it away, we could just change it to
+if (INTEGRAL_TYPE_P (...) && TYPE_MODE (...) != BLKmode)
+
+- User: rguenther@suse.de | Time: 2024-01-18 10:06:17 UTC
+  Text: On Thu, 18 Jan 2024, jakub at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113459> 
+> ---Comment #3from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> (In reply to Richard Biener fromcomment #2)
+> >               unsigned buflen = TREE_INT_CST_LOW (TYPE_SIZE_UNIT (vr->type))
+> > + 1;
+> >               if (INTEGRAL_TYPE_P (vr->type))
+> >                 buflen = GET_MODE_SIZE (SCALAR_INT_TYPE_MODE (vr->type)) + 1;
+> > 
+> > there's other spots using the pattern
+> > 
+> >                       if (INTEGRAL_TYPE_P (type))
+> >                         sz = GET_MODE_SIZE (SCALAR_INT_TYPE_MODE (type));
+> > 
+> > I wonder when GET_MODE_SIZE differs from TYPE_SIZE_UNIT?  PSImode?
+> 
+> I'm afraid I don't know either.
+> 
+> > Packed bitfields?r10-6885-g5f9cd512c42786added the INTEGRAL_TYPE_P
+> > special-casing we now run into with the TYPE_SIZE_UNIT code being there
+> > before.
+> > 
+> > Jakub, do you remember?
+> 
+> I bet the above comes from what the native_{encode,interpret}_int has been
+> doing (and which has been tweaked for BITINT_TYPE).
+> If we don't want to throw it away, we could just change it to
+> if (INTEGRAL_TYPE_P (...) && TYPE_MODE (...) != BLKmode)Yeah, that might work.  There are a few occurances in tree-ssa-sccvn.cc
+that need such adjustment.
+
+- User: Jakub Jelinek | Time: 2024-01-18 11:45:11 UTC
+  Text: Createdattachment 57137[details]gcc14-pr113459.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-01-19 09:02:27 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:dcd5601c2b7298155c9a8e1bfb93ee8e952eca0bcommitr14-8276-gdcd5601c2b7298155c9a8e1bfb93ee8e952eca0bAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Jan 19 10:00:16 2024 +0100
+
+    sccvn: Don't use SCALAR_INT_TYPE_MODE on BLKmode BITINT_TYPEs [PR113459]
+    
+    sccvn uses GET_MODE_SIZE (SCALAR_INT_TYPE_MODE (type)) for INTEGER_TYPEs,
+    most likely because that is what native_{interpret,encode}_int used.
+    This obviously doesn't work for larger BITINT_TYPEs which have BLKmode
+    and the above ICEs on those.  native_{interpret,encode}_int checks whether
+    the BITINT_TYPE is medium/large/huge (i.e. an array of 2+ ABI limbs)
+    and uses TYPE_SIZE_UNIT for that case, otherwise SCALAR_INT_TYPE_MODE like
+    for the INTEGER_TYPE case.
+    
+    The following patch instead just uses SCALAR_INT_TYPE_MODE for non-BLKmode
+    TYPE_MODE and TYPE_SIZE_UNIT otherwise.
+    
+    2024-01-19  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113459* tree-ssa-sccvn.cc (vn_walk_cb_data::push_partial_def): Use
+            TREE_INT_CST_LOW of TYPE_SIZE_UNIT rather than GET_MODE_SIZE
+            of SCALAR_INT_TYPE_MODE if type has BLKmode.
+            (vn_reference_lookup_3): Likewise.  Formatting fix.
+    
+            * gcc.dg/bitint-73.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-01-19 09:05:08 UTC
+  Text: Fixed.
+

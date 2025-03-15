@@ -1,0 +1,243 @@
+Bug Summary: [15 regression] ICE on simple test case from r15-703-gb390b011569635
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Peter Bergner | Time: 2024-06-27 18:06:05 UTC
+  Text: Afterr15-703-gb390b011569635, we're seeing test casepr111380-2.c ICE on 32-bit BE compiles.  It hits the new gcc_assert from the commit above.  The failure looks like (ICEs for power4/5/6 and does not ICE for power7 and later):
+
+bergner@nilram:ICE$ cat ice.c 
+long __attribute__ ((target ("vsx")))
+foo (void)
+{
+  return 0;
+}
+
+bergner@nilram:ICE$ gcc -S -m32 -O2 -mcpu=power5 -mno-vsx ice.c 
+ice.c:3:1: internal compiler error: in rs6000_option_override_internal, at config/rs6000/rs6000.cc:3945
+    3 | {
+      | ^
+0x11e208d7 rs6000_option_override_internal
+	/home/bergner/gcc/gcc-fsf-mainline-rop-base/gcc/config/rs6000/rs6000.cc:3945
+0x11e8ba57 rs6000_valid_attribute_p
+	/home/bergner/gcc/gcc-fsf-mainline-rop-base/gcc/config/rs6000/rs6000.cc:24802
+0x10abbe0b handle_target_attribute
+	/home/bergner/gcc/gcc-fsf-mainline-rop-base/gcc/c-family/c-attribs.cc:5915
+...
+
+- User: Kewen Lin | Time: 2024-06-28 01:22:05 UTC
+  Text: Mine, thanks for reporting, it seems to expose something inconsistent, I'll look into it soon.
+
+- User: Kewen Lin | Time: 2024-06-28 09:07:33 UTC
+  Text: The assertion does expose an inconsistent combination !TARGET_ALTIVEC but TARGET_VSX wiht 32-bit target attribute -mvsx.  There is one special handling for altivec_abi:
+
+  /* Disable VSX and Altivec silently if the user switched cpus to power7 in a
+     target attribute or pragma which automatically enables both options,
+     unless the altivec ABI was set.  This is set by default for 64-bit, but
+     not for 32-bit.  Don't move this before the above code using ignore_masks,
+     since it can reset the cleared VSX/ALTIVEC flag again.  */
+  if (main_target_opt && !main_target_opt->x_rs6000_altivec_abi)
+    rs6000_isa_flags &= ~((OPTION_MASK_VSX | OPTION_MASK_ALTIVEC)
+			  & ~rs6000_isa_flags_explicit);
+
+// 32 bit has altivec_abi unset, so that's why it doesn't ICE at -m64.
+
+It would mask off altivec and vsx flag bit if they are not specified explicitly for 32-bit (which has altivec_abi unset). For the given case, vsx is explicitly specified, altivec is implicitly enabled as it's part of ISA_2_6_MASKS_SERVER. When hitting the above hunk, vsx is kept as it's explicitly enabled but altivec gets masked off. Then it results in an unexpected status that we have vsx but not altivec. The fix looks to guard altivec masking off by checking if vsx is explicitly specified.
+
+diff --git a/gcc/config/rs6000/rs6000.cc b/gcc/config/rs6000/rs6000.cc
+index cd14e5a34ed..a8a3b79dda0 100644
+--- a/gcc/config/rs6000/rs6000.cc
++++ b/gcc/config/rs6000/rs6000.cc
+@@ -3925,8 +3925,12 @@ rs6000_option_override_internal (bool global_init_p)
+      not for 32-bit.  Don't move this before the above code using ignore_masks,
+      since it can reset the cleared VSX/ALTIVEC flag again.  */
+   if (main_target_opt && !main_target_opt->x_rs6000_altivec_abi)
+-    rs6000_isa_flags &= ~((OPTION_MASK_VSX | OPTION_MASK_ALTIVEC)
+-                          & ~rs6000_isa_flags_explicit);
++    {
++      rs6000_isa_flags &= ~(OPTION_MASK_VSX & ~rs6000_isa_flags_explicit);
++      /* Don't mask off ALTIVEC if it is enabled by an explicit VSX.  */
++      if (!TARGET_VSX || !(rs6000_isa_flags_explicit & OPTION_MASK_VSX))
++        rs6000_isa_flags &= ~(OPTION_MASK_ALTIVEC & ~rs6000_isa_flags_explicit);
++    }
+
+   if (TARGET_CRYPTO && !TARGET_ALTIVEC)
+     {
+
+- User: Segher Boessenkool | Time: 2024-06-28 14:50:00 UTC
+  Text: Something like that.
+
+But why would we want to disable generation of VSX or VMX insns at all?
+This is similar to disabling generation of popcntd insns if you do not like
+those!
+
+Having generation of V*X insns enabled is completely independent of whether
+something special is done for them for inter-procedural things (ABI things
+or similar).  It sounds like the actual problem this code wants to tackle is
+one of those things, but instead it uses a heavy hammer?
+
+- User: Peter Bergner | Time: 2024-06-28 16:06:24 UTC
+  Text: (In reply to Kewen Lin fromcomment #2)> // 32 bit has altivec_abi unset, so that's why it doesn't ICE at -m64.Ah yes, that does explain the difference between 32-bit and 64-bit!
+...and that means it ICEs for 64-bit as well, both BE and LE with the following options:
+
+bergner@ltcden2-lp1:ICE$ gcc -S -m64 -O2 -mcpu=power5 -mabi=no-altivec bug.c 
+bug.c:3:1: internal compiler error: in rs6000_option_override_internal, at config/rs6000/rs6000.cc:3952
+    3 | {
+      | ^
+0x11e4f7a7 rs6000_option_override_internal
+	/home/bergner/gcc/gcc-fsf-mainline-rop/gcc/config/rs6000/rs6000.cc:3952
+0x11eb7f13 rs6000_valid_attribute_p
+	/home/bergner/gcc/gcc-fsf-mainline-rop/gcc/config/rs6000/rs6000.cc:24809
+0x10aace97 handle_target_attribute
+	/home/bergner/gcc/gcc-fsf-mainline-rop/gcc/c-family/c-attribs.cc:5915> diff --git a/gcc/config/rs6000/rs6000.cc b/gcc/config/rs6000/rs6000.cc
+> index cd14e5a34ed..a8a3b79dda0 100644
+> --- a/gcc/config/rs6000/rs6000.cc
+> +++ b/gcc/config/rs6000/rs6000.cc
+> @@ -3925,8 +3925,12 @@ rs6000_option_override_internal (bool global_init_p)
+>       not for 32-bit.  Don't move this before the above code using
+> ignore_masks,
+>       since it can reset the cleared VSX/ALTIVEC flag again.  */
+>    if (main_target_opt && !main_target_opt->x_rs6000_altivec_abi)
+> -    rs6000_isa_flags &= ~((OPTION_MASK_VSX | OPTION_MASK_ALTIVEC)
+> -                          & ~rs6000_isa_flags_explicit);
+> +    {
+> +      rs6000_isa_flags &= ~(OPTION_MASK_VSX & ~rs6000_isa_flags_explicit);Given this...> +      /* Don't mask off ALTIVEC if it is enabled by an explicit VSX.  */
+> +      if (!TARGET_VSX || !(rs6000_isa_flags_explicit & OPTION_MASK_VSX))TARGET_VSX is only true here if it was explictly used, so I think you can drop the "|| !(rs6000_isa_flags_explicit & OPTION_MASK_VSX)" part of this test.
+
+
+That said, how does your patch handle the following test case?
+
+long __attribute__ ((target ("no-altivec,vsx")))
+foo (void)
+{
+  return 0;
+}
+
+...currently, this compiles with with no error or warning message which seems wrong to me.
+
+- User: Segher Boessenkool | Time: 2024-06-28 18:13:47 UTC
+  Text: (In reply to Peter Bergner fromcomment #4)> bergner@ltcden2-lp1:ICE$ gcc -S -m64 -O2 -mcpu=power5 -mabi=no-altivec bug.c 
+> bug.c:3:1: internal compiler error: in rs6000_option_override_internal, at
+> config/rs6000/rs6000.cc:3952-mabi={no-,}altivec is only for the 32-bit ABIs.  All the 64-bit ABIs had either
+only compatible changes to support VMX, or only ever had support for it in the
+first place.> That said, how does your patch handle the following test case?
+> 
+> long __attribute__ ((target ("no-altivec,vsx")))
+> foo (void)
+> {
+>   return 0;
+> }It should hard error for it.  That combination is not valid.  VSX requires VMX.> ...currently, this compiles with with no error or warning message which
+> seems wrong to me.Yup.
+
+
+The only reason ever to disable VMX or similar, is if the target (OS) you are
+compiling for does (potentially) not support it.  The kernel usually.  But
+there can be userspace problems as well, {set,long}jmp and [gs]etcontext
+usually.  But if the target does support VMX (or VSX), the compiler should
+never disable generating it when it has a -mcpu= in effect that supports it!
+Even if the -mabi= does not support V*X, that only effects what is done at
+function boundaries!
+
+- User: Peter Bergner | Time: 2024-06-28 23:32:19 UTC
+  Text: (In reply to Segher Boessenkool fromcomment #5)> (In reply to Peter Bergner fromcomment #4)
+> > That said, how does your patch handle the following test case?
+> > 
+> > long __attribute__ ((target ("no-altivec,vsx")))
+> > foo (void)
+> > {
+> >   return 0;
+> > }
+> 
+> It should hard error for it.  That combination is not valid.  VSX requires
+> VMX.Agreed.  I think all invalid option combinations should be hard errors.> -mabi={no-,}altivec is only for the 32-bit ABIs.  All the 64-bit ABIs had
+> either only compatible changes to support VMX, or only ever had support for
+> it in the first place.In that case, -mabi=no-altivec should also be a hard error if -m64 is in effect.
+
+- User: Kewen Lin | Time: 2024-06-30 02:58:36 UTC
+  Text: (In reply to Segher Boessenkool fromcomment #3)> Something like that.
+> 
+> But why would we want to disable generation of VSX or VMX insns at all?
+> This is similar to disabling generation of popcntd insns if you do not like
+> those!
+> 
+> Having generation of V*X insns enabled is completely independent of whether
+> something special is done for them for inter-procedural things (ABI things
+> or similar).  It sounds like the actual problem this code wants to tackle is
+> one of those things, but instead it uses a heavy hammer?This adjustment was added since target attribute/pragma support (r0-104781-gfd438373cdd2a5), Mike may have more insightful comments on this. According to the comments around, it aims to avoid the error message when users specify a target attribute like cpu=power7 while the command line is being specified like -m32 -mcpu=power6 etc. Without this adjustment, the following check will raise error "target attribute or pragma changes AltiVec ABI".
+
+  if (TARGET_ELF)
+    {
+      if (!OPTION_SET_P (rs6000_altivec_abi)
+	  && (TARGET_64BIT || TARGET_ALTIVEC || TARGET_VSX))
+	{
+	  if (main_target_opt != NULL &&
+	      !main_target_opt->x_rs6000_altivec_abi)
+	    error ("target attribute or pragma changes AltiVec ABI");
+	  else
+	    rs6000_altivec_abi = 1;
+	}
+    }
+
+This adjustment silently disable this as it mask off altivec and vsx when they are not explicitly specified.
+
+(In reply to Peter Bergner fromcomment #4)> (In reply to Kewen Lin fromcomment #2)
+> 
+> > +      /* Don't mask off ALTIVEC if it is enabled by an explicit VSX.  */
+> > +      if (!TARGET_VSX || !(rs6000_isa_flags_explicit & OPTION_MASK_VSX))
+> 
+> TARGET_VSX is only true here if it was explictly used, so I think you can
+> drop the "|| !(rs6000_isa_flags_explicit & OPTION_MASK_VSX)" part of this
+> test.Good point, will adjust it accordingly.> That said, how does your patch handle the following test case?
+> 
+> long __attribute__ ((target ("no-altivec,vsx")))
+> foo (void)
+> {
+>   return 0;
+> }
+> 
+> ...currently, this compiles with with no error or warning message which
+> seems wrong to me.Good finding, but it is an separated issue, it shows one bug in our target attribute handling, filedPR115713.
+
+- User: Kewen Lin | Time: 2024-06-30 03:42:25 UTC
+  Text: > > -mabi={no-,}altivec is only for the 32-bit ABIs.  All the 64-bit ABIs had
+> > either only compatible changes to support VMX, or only ever had support for
+> > it in the first place.
+> In that case, -mabi=no-altivec should also be a hard error if -m64 is in
+> effect.FiledPR115714to track.
+
+- User: GCC Commits | Time: 2024-07-08 03:47:31 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:f90ca62566c1d20da585d95ced99f6a1903fc2cccommitr15-1889-gf90ca62566c1d20da585d95ced99f6a1903fc2ccAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Sun Jul 7 22:38:34 2024 -0500
+
+    rs6000: Consider explicit VSX when masking off ALTIVEC [PR115688]PR115688exposes an inconsistent state in which we have VSX
+    enabled but ALTIVEC disabled.  There is one hunk:
+    
+      if (main_target_opt && !main_target_opt->x_rs6000_altivec_abi)
+        rs6000_isa_flags &= ~((OPTION_MASK_VSX | OPTION_MASK_ALTIVEC)
+                              & ~rs6000_isa_flags_explicit);
+    
+    which disables both VSX and ALTIVEC together only considering
+    them explicitly set or not.  For the given case, VSX is explicitly
+    specified, altivec is implicitly enabled as it's part of set
+    ISA_2_6_MASKS_SERVER.  When falling into the above hunk, vsx is
+    kept as it's explicitly enabled but altivec gets masked off, it's
+    unexpected.
+    
+    This patch is to consider explicit VSX when masking off ALTIVEC,
+    not mask off it if TARGET_VSX and it's explicitly set.PR target/115688gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.cc (rs6000_option_override_internal): Consider
+            explicit VSX when masking off ALTIVEC.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr115688.c: New test.
+
+- User: Kewen Lin | Time: 2024-07-10 07:01:32 UTC
+  Text: Should be fixed on trunk.
+

@@ -1,0 +1,268 @@
+Issue Title: Clang WebAssembly - Wrong optimization with rotates
+Original Post: I'm currently writing a bytes-wap function in C++ targeting WebAssembly, since WASM doesn't have one built in.
+I noticed that clang (with O3) will detect a byteswap (in multiple variants) and inserts the following function:
+
+```wat
+  (func (;240;) (type 6) (param i32) (result i32)
+    local.get 0
+    i32.const 24
+    i32.shl
+    local.get 0
+    i32.const 65280
+    i32.and
+    i32.const 8
+    i32.shl
+    i32.or
+    local.get 0
+    i32.const 8
+    i32.shr_u
+    i32.const 65280
+    i32.and
+    local.get 0
+    i32.const 24
+    i32.shr_u
+    i32.or
+    i32.or)
+```
+
+I wanted to try out a different, shorter solution i found using rotates:
+```wat
+  (func (export "bswap") (param i32) (result i32)
+    (i32.or
+    (local.get 0)
+    (i32.const 0x00FF00FF)
+    (i32.and)
+    (i32.rotr (i32.const 8))
+
+    (local.get 0)
+    (i32.const 0xFF00FF00)
+    (i32.and)
+    (i32.rotl (i32.const 8))))
+```
+
+However when i write the C++ version of it:
+```c++
+inline u32 bswap(u32 x) {
+    return __builtin_rotateleft32((x & 0xFF00FF00), 8) 
+        | __builtin_rotateright32((x & 0x00FF00FF), 8);
+  }
+```
+
+It will still be replaced with the longer version from before.
+This seems to be a general issue with rotates of masked inputs, since a single rotate will also be "optimized" into a way longer version.
+For example:
+```c++
+inline u32 bswap(u32 x) {
+  return __builtin_rotateleft32((x & 0xFF00FF00), 8);
+}
+```
+
+Turns into:
+```wat
+  (func (;240;) (type 6) (param i32) (result i32)
+    local.get 0
+    i32.const 65280
+    i32.and
+    i32.const 8
+    i32.shl
+    local.get 0
+    i32.const 24
+    i32.shr_u
+    i32.or)
+```
+instead of:
+```wat
+  (func (;240;) (type 6) (param i32) (result i32)
+    local.get 0
+    i32.const -16711936
+    i32.and
+    i32.const 8
+    i32.rotl))
+```
+
+If i disable optimizations for this function with `[[clang::optnone]]`, it will keep the roate.
+
+Here is the example in compiler-explorer:
+[Masked Rotate](https://godbolt.org/#g:!((g:!((g:!((h:codeEditor,i:(filename:'1',fontScale:14,fontUsePx:'0',j:1,lang:c%2B%2B,selection:(endColumn:2,endLineNumber:6,positionColumn:2,positionLineNumber:6,selectionStartColumn:2,selectionStartLineNumber:6,startColumn:2,startLineNumber:6),source:'typedef+unsigned+int+u32%3B%0A%0A__attribute__((visibility(%22default%22),+export_name(%22test%22)))%0Ainline+u32+test(u32+x)+%7B%0A++++return+__builtin_rotateleft32((x+%26+0xFF00FF00),+8)%3B%0A%7D'),l:'5',n:'0',o:'C%2B%2B+source+%231',t:'0')),k:64.69189760488288,l:'4',m:73.21111768184507,n:'0',o:'',s:0,t:'0'),(g:!((g:!((h:compiler,i:(compiler:clang_trunk,deviceViewOpen:'1',filters:(b:'0',binary:'1',binaryObject:'1',commentOnly:'0',demangle:'0',directives:'0',execute:'1',intel:'0',libraryCode:'0',trim:'1'),flagsViewOpen:'1',fontScale:14,fontUsePx:'0',j:2,lang:c%2B%2B,libs:!(),options:'-O3+-nostdlib+--target%3Dwasm32',selection:(endColumn:21,endLineNumber:11,positionColumn:21,positionLineNumber:11,selectionStartColumn:21,selectionStartLineNumber:11,startColumn:21,startLineNumber:11),source:1),l:'5',n:'0',o:'+x86-64+clang+(trunk)+(Editor+%231)',t:'0')),header:(),k:21.41890869827826,l:'4',m:57.81420765027322,n:'0',o:'',s:0,t:'0'),(g:!((h:output,i:(editorid:1,fontScale:14,fontUsePx:'0',j:2,wrap:'1'),l:'5',n:'0',o:'Output+of+x86-64+clang+(trunk)+(Compiler+%232)',t:'0')),header:(),l:'4',m:42.18579234972678,n:'0',o:'',s:0,t:'0')),k:35.308102395117096,l:'3',n:'0',o:'',t:'0')),l:'2',m:100,n:'0',o:'',t:'0')),version:4)
+
+Is this a bug with the optimizer?
+And is there a way to keep the rotate but still optimize the rest of the function?
+
+Comment by llvmbot: @llvm/issue-subscribers-backend-webassembly
+Comment by pmatos: @HailToDodongo Thanks for the report. I was nerd-snipped by this one.
+
+The reason you are seeing an expansion of the rotate is due to a sequence of optimizations that fail to recognize in the end a rotate. 
+
+Clang transforms rotates into funnel shifts (fshl). Funnel-shifts are like rotate when the first two arguments are the same (see: https://llvm.org/docs/LangRef.html#llvm-fshl-intrinsic).
+
+However, Clang optimizes the funnel shift and generates the IR:
+```
+define linkonce_odr noundef i32 @_Z4testj(i32 noundef %0) #0 comdat {
+  %2 = and i32 %0, 65280
+  %3 = tail call i32 @llvm.fshl.i32(i32 %2, i32 %0, i32 8)
+  ret i32 %3
+}
+```
+
+This is correct from Clang's PoV. LLVM doesn't generate a rotate because the first and second arguments are not the same and therefore it expands it. I will try to understand better where the optimization is happening in Clang and if there's anything we can do about it.
+Comment by HailToDodongo: Thanks for looking into it!
+
+I also got the time to do some basic testing regarding the performance of the rotate-version of the byteswap.
+I couldn't get it to compile into my existing program (since clang replaces and inlines it).
+But i manually wrote a WASM file to test both variants in isolation.
+
+Both variants seem to perform almost the same, except for chrome, where the rotate takes 2x longer for some reason:
+
+  | FF (rotate) | FF (clang) | Chrome (rotate) | Chrome (clang) | Node 20 (rotate) | Node 20 (clang)
+-- | -- | -- | -- | -- | -- | --
+Average (ms) | 1,112.30 | 1,087.70 | 2,327.46 | 1,072.43 | 706.00 | 716.38
+stddev. (ms) | 11.96 | 12.52 | 48.67 | 34.22 | 25.24 | 19.50
+
+Tests where done with 250 million calls in 10 batches each.
+This will have the overhead of calling the WASM function from JS each time, but it should be good enough for a rough test.
+So i'm not sure anymore if it really is a bug in llvm :smile:
+
+For reference, the files used for testing:
+```html
+<!DOCTYPE html>
+<html>
+  <body>
+    <script>
+      async function main()
+      {
+        const wasmModule = await WebAssembly.compileStreaming(fetch("test.wasm"));
+        const instance = await WebAssembly.instantiate(wasmModule);
+        const {bswap32_clang, bswap32_rot} = instance.exports;
+        
+        for(let run=0; run<10; ++run) 
+        {
+          console.time("bswap");
+          let x=0;
+          for(let i=0; i<250_000_000; ++i) {
+             x |= bswap32_clang(i*run);
+            //x |= bswap32_rot(i*run);
+          }
+          console.timeEnd("bswap");
+          console.log(x);
+        }
+      }
+
+      main().catch(e => console.error(e));
+    </script>
+  </body>
+</html>
+```
+
+```wat
+(module
+  (type (;0;) (func (param i32) (result i32)))
+  (func (;0;) (type 0) (param i32) (result i32)
+    local.get 0
+    i32.const 24
+    i32.shl
+    local.get 0
+    i32.const 65280
+    i32.and
+    i32.const 8
+    i32.shl
+    i32.or
+    local.get 0
+    i32.const 8
+    i32.shr_u
+    i32.const 65280
+    i32.and
+    local.get 0
+    i32.const 24
+    i32.shr_u
+    i32.or
+    i32.or)
+  (func (;1;) (type 0) (param i32) (result i32)
+    local.get 0
+    i32.const 16711935
+    i32.and
+    i32.const 8
+    i32.rotr
+    local.get 0
+    i32.const -16711936
+    i32.and
+    i32.const 8
+    i32.rotl
+    i32.or)
+  (export "bswap32_clang" (func 0))
+  (export "bswap32_rot" (func 1)))
+```
+Comment by pmatos: Thanks @HailToDodongo for the benchmark. Although given your benchmarks maybe rotate doesn't make sense for O1, O2, O3, etc, it certainly still feels like it should be generated at Os and Oz. What do you think?
+
+I tracked down the optimization step to the llvm instcombine. It makes sense for most archs but not for wasm. I will have to continue the investigation tomorrow.
+Comment by dschuff: What architecture was this test run on? (does it have a rotate instruction?) Perhaps @jakobkummerow or one of the V8 folks might be interested in looking into the performance issue. It would be nice if the rotr instruction were at least no slower than the expansion. e.g. if it's the case that the architecture's rotate instruction is really just slow (e.g. maybe it's implemented in microcode or something) then it might make sense that V8 should just output the expanded version in the machine code.
+Comment by HailToDodongo: It was tested on x64 (AMD Ryzen 7 4800H, on linux).
+I don't think i have device with an architecture without a rotate and JS, so i can't test what happens in that case.
+But i might be able to verify it again on a different x86 PC.
+
+For llvm, i too think that the rotate feels more correct.
+WASM is platform independent, and the interpreter/re-compiler should know what to do on each arch.
+Comment by dschuff: Yeah, I agree and thinking about this more, I think we should try to make LLVM always use rotate when available and just file a bug on V8 for the performance issue. If they say anything that convinces us otherwise we can reconsider.
+Do you mind opening a bug at https://bugs.chromium.org/p/v8/ with your reproducer? That will get their attention better than being pinged here.
+Comment by pmatos: OK - I am working on a fix for this. Although it might require some further discussions since it's not very common to lower generic builtins to target specific intrinsics, I think. On the other hand, adding target specific code to instcombine is a no-no, so... 
+
+I find it easier in any case to discuss specific implementation details with a patch at hand so I will try to get something into phab soon.
+Comment by HailToDodongo: After some more investigation into chrome's performance, i noticed that the difference might be due to some (de-)optimizations on the JS part of my test during the run.
+After building a more careful test, both versions are now almost equal too, if you reload the page each time.
+
+I hosted a small static page if anyone wants to test the time (reload after each test-run):
+https://mbeboek.gitlab.io/wasm_byteswap_test/
+
+The code can be found here:
+https://gitlab.com/mbeboek/wasm_byteswap_test
+Comment by pmatos: > After some more investigation into chrome's performance, i noticed that the difference might be due to some (de-)optimizations on the JS part of my test during the run. After building a more careful test, both versions are now almost equal too, if you reload the page each time.
+> 
+> I hosted a small static page if anyone wants to test the time (reload after each test-run): https://mbeboek.gitlab.io/wasm_byteswap_test/
+> 
+> The code can be found here: https://gitlab.com/mbeboek/wasm_byteswap_test
+
+Thanks for the page.
+Using rotate seems to be clearly faster over here by more than 10% tbh. Chrome 113 on Linux.
+
+
+Comment by pmatos: Proposal for a fix in https://reviews.llvm.org/D150670
+
+Generated code for the original example above:
+```
+bswap:                                  # @bswap
+	.functype	bswap (i32) -> (i32)
+# %bb.0:                                # %entry
+	local.get	0
+	i32.const	16711935
+	i32.and
+	i32.const	8
+	i32.rotr
+	local.get	0
+	i32.const	-16711936
+	i32.and
+	i32.const	8
+	i32.rotl
+	i32.or
+                                        # fallthrough-return
+	end_function
+```
+Comment by dschuff: I ran the test on an M1 macbook, and found that in both cases a couple of the batch runs were slower (usually the 2nd and 3rd for some reason, not sure why... also the shift version more often has extra runs that are slow), but the rest of the runs were very similar in speed. On the "fast" runs (which seem more likely to measure the "true" speed of raw execution of the instructions), rotate is consistently slightly (~2.6%) faster. So I guess this is confirmation that we should just generate rotate in LLVM if we can.
+Comment by HailToDodongo: @dschuff  I noticed the varying time too, and i think they are a result of the JS code surrounding it.
+Also, just opening the devtools (i'm not logging anything) makes the tests run very slow.
+
+I've extended the test to include versions that have the loop inside WASM, which is a much more realistic scenario.
+
+I can now clearly see a **~25%**  improvement over shift, in both firefox and chrome.
+
+This almost seems a bit too much...
+I didn't see any mistakes in the WAT-loop code, but it would be a good idea if somebody else could check the code, if it is used to decide over potential changes.
+
+The updated test-page is still at https://mbeboek.gitlab.io/wasm_byteswap_test/ if you want to re-test on the M1, the WAT file is linked on that page.
+
+Comment by dschuff: I'm seeing about a 25% difference too. Maybe that's not too surprising given that if you ignore the const and local.get/set instructions, there are 9 logic instructions in the shift version vs only 5 in the rotate version?
+
+Opening devtools (other than the performance/profiling panel) puts the wasm engine in debugging mode, i.e. it uses the baseline compiler which is much slower but generates debuggable code. So yes, it's much slower (and sorry, there's no good UI to help you understand or control that... that's something we're working on).
+Comment by pmatos: I should be uploading a final patch fixing this very soon. Assigned this to me.
+Comment by pmatos: Just pushed a more complete patch for review including 64bit support and tests.
+Comment by pmatos: Pushed a fix: 9485d983a. 
+This was a generic change for all targets. I will also add some WebAssembly specific tests to ensure no regressions if the fix sticks. Lets give it a couple of days.
+Comment by pmatos: Closing this since the fix and tests for this landed.

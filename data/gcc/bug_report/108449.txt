@@ -1,0 +1,93 @@
+Bug Summary: [13 Regression] ICE in eliminate_unnecessary_stmts, at tree-ssa-dce.cc:1512
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: G. Steinmetz | Time: 2023-01-18 18:22:00 UTC
+  Text: Started between 20220904 and 20220911, at -O1+ :
+
+
+$ cat z1.c
+static int vfork();
+void f() { vfork(); }
+
+
+$ gcc-13-20230115 -c z1.c -O2
+z1.c:1:12: warning: 'vfork' used but never defined
+    1 | static int vfork();
+      |            ^~~~~
+during GIMPLE pass: cddce
+z1.c: In function 'f':
+z1.c:2:1: internal compiler error: in eliminate_unnecessary_stmts, at tree-ssa-dce.cc:1512
+    2 | void f() { vfork(); }
+      | ^~~~
+0xe0f0dc eliminate_unnecessary_stmts
+        ../../gcc/tree-ssa-dce.cc:1512
+0xe108bf perform_tree_ssa_dce
+        ../../gcc/tree-ssa-dce.cc:1945
+0xe11e55 tree_ssa_cd_dce
+        ../../gcc/tree-ssa-dce.cc:1986
+0xe11e55 execute
+        ../../gcc/tree-ssa-dce.cc:2069
+
+- User: Andrew Pinski | Time: 2023-01-18 19:14:16 UTC
+  Text: The assert that is being hit was added byr13-2518-ga262f969d6fd93.
+
+Confirmed.
+
+- User: Richard Biener | Time: 2023-01-19 07:43:10 UTC
+  Text: OK, so early we still have vfork() 'static' and maybe_special_function_p
+returns false.  But then check_global_declaration () comes along and does
+
+  /* Warn about any function declared static but not defined.  We don't
+     warn about variables, because many programs have static variables
+     that exist only to get some text into the object file.  */
+  if (TREE_CODE (decl) == FUNCTION_DECL
+      && DECL_INITIAL (decl) == 0
+      && DECL_EXTERNAL (decl)
+      && ! DECL_ARTIFICIAL (decl)
+      && ! TREE_PUBLIC (decl))
+    {
+      if (warning_suppressed_p (decl, OPT_Wunused))
+        ;
+      else if (snode->referred_to_p (/*include_self=*/false))
+        pedwarn (input_location, 0, "%q+F used but never defined", decl);
+      else
+        warning (OPT_Wunused_function, "%q+F declared %<static%> but never "
+                                       "defined", decl);
+      /* This symbol is effectively an "extern" declaration now.  */
+      TREE_PUBLIC (decl) = 1;
+
+which will result in maybe_special_function_p to return true.
+
+I suppose leaving the decl static might have an effect on the linker errors
+emitted for targets that require special asm ops for undefined external
+references, but then you should still get an error here.
+
+This mangling dates back to RMS atr0-3845-g7d429c41c5953f
+
+- User: GCC Commits | Time: 2023-01-23 07:27:36 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:106f99406312d7ed47434de53c180718225ffa5ecommitr13-5285-g106f99406312d7ed47434de53c180718225ffa5eAuthor: Richard Biener <rguenther@suse.de>
+Date:   Thu Jan 19 08:44:25 2023 +0100
+
+    tree-optimization/108449 - keep maybe_special_function_p behavior
+    
+    When we have a static declaration without definition we diagnose
+    that and turn it into an extern declaration.  That can alter
+    the outcome of maybe_special_function_p here and there's really
+    no point in doing that, so don't.PR tree-optimization/108449* cgraphunit.cc (check_global_declaration): Do not turn
+            undefined statics into externs.
+    
+            * gcc.dg/pr108449.c: New testcase.
+
+- User: Richard Biener | Time: 2023-01-23 07:28:04 UTC
+  Text: Fixed.
+
+- User: Martin Liška | Time: 2023-01-25 09:20:46 UTC
+  Text: Caused:https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108511
+

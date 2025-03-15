@@ -1,0 +1,252 @@
+Bug Summary: [12 Regression] Wrong code at -O2/3 since r12-1000-g6924b5e6bd3
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 10.5.0, 12.3.1, 13.2.1, 14.0
+Known to Fail: 11.1.0, 12.3.0, 13.2.0
+
+Comments:
+- User: Shaohua Li | Time: 2023-08-24 15:47:57 UTC
+  Text: gcc at -O2/3 produces the wrong code.
+
+Bisected tor12-1000-g6924b5e6bd3Compiler explorer:https://godbolt.org/z/9fo5dxxhf$ cat a.c
+int printf(const char *, ...);
+char a;
+int b[3][8];
+int c, e = 1, f, g;
+short d;
+int main() {
+  for (; e >= 0; e--) {
+    d = 1;
+    for (; d >= 0; d--) {
+      c = 0;
+      for (; c <= 1; c++) {
+        b[0][d * 2 + c + 1] = 0;
+        g = a <= '7';
+        b[g - 1 + d][c] ^= 1;
+      }
+    }
+  }
+  printf("%d\n", b[0][1]);
+}
+$
+$ gcc -O0 a.c && ./a.out
+1
+$ gcc -O2 a.c && ./a.out
+0
+$
+
+- User: Andrew Pinski | Time: 2023-08-24 17:59:05 UTC
+  Text: Reduced a little further:
+```
+int b[3][8];
+short d;
+volatile int t = 1;
+int main() {
+  int  g = t;
+  for (int e = 1; e >= 0; e--)   {
+    d = 1;
+    for (; d >= 0; d--) {
+        b[0][d * 2 + 1] = 0;
+        b[g - 1 + d][0] ^= 1;
+        b[0][d * 2 + 2] = 0;
+        b[g - 1 + d][1] ^= 1;
+    }
+  }
+  if (b[0][1] != 1)
+  __builtin_abort();
+}
+```
+
+Note this fails with GCC 11.1.0 with `-O2 -ftree-vectorize` but passes with `-O3` .
+
+- User: Richard Biener | Time: 2023-08-25 07:02:51 UTC
+  Text: We BB vectorize as follows
+
+   <bb 3> [local count: 118111600]:
+   # ivtmp_29 = PHI <ivtmp_23(9), 2(2)>
+-  b[0][3] = 0;
+   _39 = g_21;
++  vectp.26_37 = &b[_39][0];
++  vect__15.27_4 = MEM <vector(2) int> [(int *)vectp.26_37];
++  vect__18.28_45 = vect__15.27_4 ^ { 1, 1 };
+   _15 = b[_39][0];
+   _18 = _15 ^ 1;
+-  b[_39][0] = _18;
+-  b[0][4] = 0;
+   _48 = b[_39][1];
+   _49 = _48 ^ 1;
+-  b[_39][1] = _49;
+-  b[0][1] = 0;
++  vectp.30_46 = &b[_39][0];
++  MEM <vector(2) int> [(int *)vectp.30_46] = vect__18.28_45;
+   _5 = _42;
++  vectp.20_36 = &b[_5][0];
++  vect__6.21_24 = MEM <vector(2) int> [(int *)vectp.20_36];
++  vect__7.22_35 = vect__6.21_24 ^ { 1, 1 };
+   _6 = b[_5][0];
+   _7 = _6 ^ 1;
+-  b[_5][0] = _7;
+-  b[0][2] = 0;
++  MEM <vector(4) int> [(int *)&b + 4B] = { 0, 0, 0, 0 };
+   _10 = b[_5][1];
+   _11 = _10 ^ 1;
+-  b[_5][1] = _11;
++  vectp.24_31 = &b[_5][0];
++  MEM <vector(2) int> [(int *)vectp.24_31] = vect__7.22_35;
+   ivtmp_23 = ivtmp_29 - 1;
+   if (ivtmp_23 != 0)
+
+and the issue is that we somehow get data dependence wrong.  _39 is 1 and
+_5 is 0.  That means we have
+
+  b[0][3] = 0;
+  _39 = g_21;
+  _15 = b[_39][0];
+  _18 = _15 ^ 1;
+  b[1 /*_39*/][0] = _18;
+  b[0][4] = 0;
+  _48 = b[_39][1];
+  _49 = _48 ^ 1;
+  b[1 /*_39*/][1] = _49;
+  b[0][1] = 0;
+  _5 = _42;
+  _6 = b[0 /*_5*/][0];
+  _7 = _6 ^ 1;
+  b[0 /*_5*/][0] = _7;
+  b[0][2] = 0;
+  _10 = b[0 /*_5*/][1];
+  _11 = _10 ^ 1;
+  b[0 /*_5*/][1] = _11;
+
+I will have a look.
+
+- User: GCC Commits | Time: 2023-08-25 12:37:51 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:845ee9c7107956845e487cb123fa581d9c70ea1bcommitr14-3480-g845ee9c7107956845e487cb123fa581d9c70ea1bAuthor: Richard Biener <rguenther@suse.de>
+Date:   Fri Aug 25 13:37:30 2023 +0200
+
+    tree-optimization/111137 - dependence checking for SLP
+    
+    The following fixes a mistake with SLP dependence checking.  When
+    checking whether we can hoist loads to the first load place we
+    special-case stores of the same instance considering them sunk
+    to the last store place.  But we fail to consider that stores from
+    other SLP instances are sunk in a similar way.  This leads us to
+    miss the dependence between (A) and (B) in
+    
+      b[0][1] = 0;             (A)
+    ...
+      _6 = b[_5 /* 0 */][0];   (B')
+      _7 = _6 ^ 1;
+      b[_5 /* 0 */][0] = _7;
+      b[0][2] = 0;             (A')
+      _10 = b[_5 /* 0 */][1];  (B)
+      _11 = _10 ^ 1;
+      b[_5 /* 0 */][1] = _11;
+    
+    where the zeroing stores are sunk to (A') and the loads hoisted
+    to (B').  The following fixes this, treating grouped stores from
+    other instances similar to stores from our own instance.  The
+    difference is - and this is more conservative than necessary - that
+    we don't know which stores of a group are in which SLP instance
+    (though I believe either all of the grouped stores will be in
+    a single SLP instance or in none at the moment), so we don't
+    know which stores are sunk where.  We simply assume they are
+    all sunk to the last store we run into.  Likewise we do not take
+    into account that an SLP instance might be cancelled (or a grouped
+    store not actually belong to any instance).PR tree-optimization/111137* tree-vect-data-refs.cc (vect_slp_analyze_load_dependences):
+            Properly handle grouped stores from other SLP instances.
+    
+            * gcc.dg/torture/pr111137.c: New testcase.
+
+- User: Richard Biener | Time: 2023-08-25 12:54:33 UTC
+  Text: Fixed on trunk sofar.
+
+- User: GCC Commits | Time: 2023-11-24 15:13:27 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:4649121c8e3bae1315e265ad2e205990e39573c5commitr13-8095-g4649121c8e3bae1315e265ad2e205990e39573c5Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Aug 25 13:37:30 2023 +0200
+
+    tree-optimization/111137 - dependence checking for SLP
+    
+    The following fixes a mistake with SLP dependence checking.  When
+    checking whether we can hoist loads to the first load place we
+    special-case stores of the same instance considering them sunk
+    to the last store place.  But we fail to consider that stores from
+    other SLP instances are sunk in a similar way.  This leads us to
+    miss the dependence between (A) and (B) in
+    
+      b[0][1] = 0;             (A)
+    ...
+      _6 = b[_5 /* 0 */][0];   (B')
+      _7 = _6 ^ 1;
+      b[_5 /* 0 */][0] = _7;
+      b[0][2] = 0;             (A')
+      _10 = b[_5 /* 0 */][1];  (B)
+      _11 = _10 ^ 1;
+      b[_5 /* 0 */][1] = _11;
+    
+    where the zeroing stores are sunk to (A') and the loads hoisted
+    to (B').  The following fixes this, treating grouped stores from
+    other instances similar to stores from our own instance.  The
+    difference is - and this is more conservative than necessary - that
+    we don't know which stores of a group are in which SLP instance
+    (though I believe either all of the grouped stores will be in
+    a single SLP instance or in none at the moment), so we don't
+    know which stores are sunk where.  We simply assume they are
+    all sunk to the last store we run into.  Likewise we do not take
+    into account that an SLP instance might be cancelled (or a grouped
+    store not actually belong to any instance).PR tree-optimization/111137* tree-vect-data-refs.cc (vect_slp_analyze_load_dependences):
+            Properly handle grouped stores from other SLP instances.
+    
+            * gcc.dg/torture/pr111137.c: New testcase.
+    
+    (cherry picked from commit 845ee9c7107956845e487cb123fa581d9c70ea1b)
+
+- User: GCC Commits | Time: 2023-12-15 13:17:39 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:e35556c61bdeb9f41b4111fffb423a705232ab9ccommitr12-10043-ge35556c61bdeb9f41b4111fffb423a705232ab9cAuthor: Richard Biener <rguenther@suse.de>
+Date:   Fri Aug 25 13:37:30 2023 +0200
+
+    tree-optimization/111137 - dependence checking for SLP
+    
+    The following fixes a mistake with SLP dependence checking.  When
+    checking whether we can hoist loads to the first load place we
+    special-case stores of the same instance considering them sunk
+    to the last store place.  But we fail to consider that stores from
+    other SLP instances are sunk in a similar way.  This leads us to
+    miss the dependence between (A) and (B) in
+    
+      b[0][1] = 0;             (A)
+    ...
+      _6 = b[_5 /* 0 */][0];   (B')
+      _7 = _6 ^ 1;
+      b[_5 /* 0 */][0] = _7;
+      b[0][2] = 0;             (A')
+      _10 = b[_5 /* 0 */][1];  (B)
+      _11 = _10 ^ 1;
+      b[_5 /* 0 */][1] = _11;
+    
+    where the zeroing stores are sunk to (A') and the loads hoisted
+    to (B').  The following fixes this, treating grouped stores from
+    other instances similar to stores from our own instance.  The
+    difference is - and this is more conservative than necessary - that
+    we don't know which stores of a group are in which SLP instance
+    (though I believe either all of the grouped stores will be in
+    a single SLP instance or in none at the moment), so we don't
+    know which stores are sunk where.  We simply assume they are
+    all sunk to the last store we run into.  Likewise we do not take
+    into account that an SLP instance might be cancelled (or a grouped
+    store not actually belong to any instance).PR tree-optimization/111137* tree-vect-data-refs.cc (vect_slp_analyze_load_dependences):
+            Properly handle grouped stores from other SLP instances.
+    
+            * gcc.dg/torture/pr111137.c: New testcase.
+    
+    (cherry picked from commit 845ee9c7107956845e487cb123fa581d9c70ea1b)
+
+- User: Richard Biener | Time: 2024-06-20 09:13:44 UTC
+  Text: GCC 12.4 is being released, retargeting bugs to GCC 12.5.
+
+- User: Sam James | Time: 2024-10-26 01:32:52 UTC
+  Text: Fixed in 12.4.
+

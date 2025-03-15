@@ -1,0 +1,101 @@
+Bug Summary: -Wanalyzer-deref-before-check seen on Linux kernel due to inlining with -fno-delete-null-pointer-checks
+Product: gcc
+Component: analyzer
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Malcolm | Time: 2023-03-21 19:14:44 UTC
+  Text: Createdattachment 54724[details]Reproducer
+
+I'm seeing various -Wanalyzer-deref-before-check false positives on the Linux kernel; hopefully the attached is a representative reproducer for all of them.
+
+When compiled with:
+  -fanalyzer -fno-delete-null-pointer-checks -O2
+trunk falsely complains:
+
+In function 'bus_get',
+    inlined from 'bus_remove_file' at <source>:122:7,
+    inlined from 'remove_probe_files' at <source>:139:3,
+    inlined from 'bus_unregister' at <source>:150:3:
+<source>:105:6: warning: check of 'bus' for NULL after already dereferencing it [-Wanalyzer-deref-before-check]
+  105 |   if (bus) {
+      |      ^
+  'bus_unregister': events 1-2
+    |
+    |  147 |   if (bus->dev_root)
+    |      |       ~~~^~~~~~~~~~
+    |      |          |
+    |      |          (1) pointer 'bus' is dereferenced here
+    |......
+    |  150 |   remove_probe_files(bus);
+    |      |   ~       
+    |      |   |
+    |      |   (2) inlined call to 'remove_probe_files' from 'bus_unregister'
+    |
+    +--> 'remove_probe_files': event 3
+           |
+           |  139 |   bus_remove_file(bus, &bus_attr_drivers_autoprobe);
+           |      |   ^
+           |      |   |
+           |      |   (3) inlined call to 'bus_remove_file' from 'remove_probe_files'
+           |
+           +--> 'bus_remove_file': event 4
+                  |
+                  |  122 |   if (bus_get(bus)) {
+                  |      |       ^
+                  |      |       |
+                  |      |       (4) inlined call to 'bus_get' from 'bus_remove_file'
+                  |
+                  +--> 'bus_get': event 5
+                         |
+                         |  105 |   if (bus) {
+                         |      |      ^
+                         |      |      |
+                         |      |      (5) pointer 'bus' is checked for NULL here but it was already dereferenced at (1)
+                         |
+Compiler returned: 0
+
+Trunk:https://godbolt.org/z/ErKf6fz86
+
+- User: GCC Commits | Time: 2023-03-22 12:42:06 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:0c652ebbf79bd168766097f3ac4c1b3b79d68a43commitr13-6800-g0c652ebbf79bd168766097f3ac4c1b3b79d68a43Author: David Malcolm <dmalcolm@redhat.com>
+Date:   Wed Mar 22 08:40:34 2023 -0400
+
+    analyzer: fix false +ves from -Wanalyzer-deref-before-check due to inlining [PR109239]
+    
+    The patch has this effect on my integration tests of -fanalyzer:
+    
+      Comparison:
+        GOOD: 129        (17.70% -> 17.92%)
+         BAD: 600 -> 591 (-9)
+    
+    which is purely due to improvements to -Wanalyzer-deref-before-check
+    on the Linux kernel:
+    
+      -Wanalyzer-deref-before-check:
+        GOOD: 1        (4.55% -> 7.69%)
+         BAD: 21 -> 12 (-9)
+         Known false positives: 16 -> 10 (-6)
+           linux-5.10.162: 7 -> 1 (-6)
+         Suspected false positives: 3 -> 0 (-3)
+           linux-5.10.162: 3 -> 0 (-3)
+    
+    gcc/analyzer/ChangeLog:PR analyzer/109239* program-point.cc: Include "analyzer/inlining-iterator.h".
+            (program_point::effectively_intraprocedural_p): New function.
+            * program-point.h (program_point::effectively_intraprocedural_p):
+            New decl.
+            * sm-malloc.cc (deref_before_check::emit): Use it when rejecting
+            interprocedural cases, so that we reject interprocedural cases
+            that have become intraprocedural due to inlining.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/109239* gcc.dg/analyzer/deref-before-check-pr109239-linux-bus.c: New test.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2023-03-22 12:48:23 UTC
+  Text: Should be fixed by the above patch
+

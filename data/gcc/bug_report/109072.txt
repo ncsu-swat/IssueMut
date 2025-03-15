@@ -1,0 +1,429 @@
+Bug Summary: [12 Regression] SLP costs for vec duplicate too high since g:4963079769c99c4073adfd799885410ad484cbbe
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Tamar Christina | Time: 2023-03-08 22:32:22 UTC
+  Text: The following example
+
+---
+
+#include <arm_neon.h>
+
+float32x4_t f (float32x4_t v, float res)
+{
+  float data[4];
+  data[0] = res;
+  data[1] = res;
+  data[2] = res;
+  data[3] = res;
+  return vld1q_f32 (&data[0]);
+}
+
+---
+
+compiled with -Ofast fails to SLP starting with GCC 12.
+
+This used to generate:
+
+f:
+        dup     v0.4s, v1.s[0]
+        ret
+
+and now generates:
+
+f:
+        fmov    w5, s1
+        fmov    w1, s1
+        fmov    w4, s1
+        fmov    w0, s1
+        mov     x2, 0
+        mov     x3, 0
+        bfi     x2, x5, 0, 32
+        bfi     x3, x1, 0, 32
+        bfi     x2, x4, 32, 32
+        bfi     x3, x0, 32, 32
+        fmov    d0, x2
+        ins     v0.d[1], x3
+        ret
+
+The SLP costs went from:
+
+  Vector cost: 2
+  Scalar cost: 4
+
+to:
+
+  Vector cost: 12
+  Scalar cost: 4
+
+it looks like it's no longer costing it as a duplicate but instead 4 vec inserts.
+
+bisected to:
+
+commitg:4963079769c99c4073adfd799885410ad484cbbeAuthor: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Tue Feb 15 18:09:33 2022 +0000
+
+    vect+aarch64: Fix ldp_stp_* regressions
+
+    ldp_stp_1.c, ldp_stp_4.c and ldp_stp_5.c have been failing since
+    vectorisation was enabled at -O2.  In all three cases SLP is
+    generating vector code when scalar code would be better.
+
+....
+
+- User: Richard Sandiford | Time: 2023-03-09 14:13:37 UTC
+  Text: (In reply to Tamar Christina fromcomment #0)> The SLP costs went from:
+> 
+>   Vector cost: 2
+>   Scalar cost: 4
+> 
+> to:
+> 
+>   Vector cost: 12
+>   Scalar cost: 4
+> 
+> it looks like it's no longer costing it as a duplicate but instead 4 vec
+> inserts.We do cost it as a duplicate, but we only try to vectorize up to
+the stores, rather than up to the load back.  So we're costing
+the difference between:
+
+        fmov    s1, s0
+        stp     s1, s1, [x0]
+        stp     s1, s1, [x0, 8]
+
+(no idea why we have an fmov, pretend we don't) and:
+
+        fmov    s1, s0
+        dup     v1.4s, v1.s[0]
+        str     q1, [x0]
+
+If we want the latter as a general principle, the PR is
+easy to fix.  But if we don't, we'd need to make the
+vectoriser start at the load or (alternatively) fold
+to a constructor independently of vectorisation.
+
+- User: Tamar Christina | Time: 2023-03-09 14:30:14 UTC
+  Text: (In reply torsandifo@gcc.gnu.orgfromcomment #1)> (In reply to Tamar Christina fromcomment #0)
+> > The SLP costs went from:
+> > 
+> >   Vector cost: 2
+> >   Scalar cost: 4
+> > 
+> > to:
+> > 
+> >   Vector cost: 12
+> >   Scalar cost: 4
+> > 
+> > it looks like it's no longer costing it as a duplicate but instead 4 vec
+> > inserts.
+> We do cost it as a duplicate, but we only try to vectorize up to
+> the stores, rather than up to the load back.  So we're costing
+> the difference between:
+> 
+>         fmov    s1, s0
+>         stp     s1, s1, [x0]
+>         stp     s1, s1, [x0, 8]
+> 
+> (no idea why we have an fmov, pretend we don't) and:
+> 
+>         fmov    s1, s0
+>         dup     v1.4s, v1.s[0]
+>         str     q1, [x0]
+> 
+> If we want the latter as a general principle, the PR is
+> easy to fix.  But if we don't, we'd need to make the
+> vectoriser start at the load or (alternatively) fold
+> to a constructor independently of vectorisation.I thought the SLP algorithm was bottom up and stores were
+already sinks?  So is this maybe a bug?
+
+Ah, guess there are two problems.
+
+1. how did we end up with such poor scalar code, at least 5 instructions are unneeded (separate issue)
+2. The costing of the above, I guess I'm still slightly confused how we got to that cost.
+
+If it's costing purely on latency than the two are equivalent no? if you take throughput into account the first would win, but the difference in costs is still a lot higher then I would have expected.
+
+In this case:
+
+node 0x4f45480 1 times scalar_to_vec costs 4 in prologue
+
+seems quite high, but I guess it doesn't know that there's no regfile transfer?
+
+- User: Richard Sandiford | Time: 2023-03-09 14:46:29 UTC
+  Text: (In reply to Tamar Christina fromcomment #2)> I thought the SLP algorithm was bottom up and stores were
+> already sinks?Yeah, they are.  But the point is that we're vectorising
+the stores in isolation, with no knowledge of what happens
+later.  The reason the code here is particularly bad is
+that the array is later loaded into a vector.  But the
+vectoriser doesn't know that.> Ah, guess there are two problems.
+> 
+> 1. how did we end up with such poor scalar code, at least 5 instructions are
+> unneeded (separate issue)
+> 2. The costing of the above, I guess I'm still slightly confused how we got
+> to that costThe patch that introduce the regression uses an on-the-side costing
+scheme for store sequences.  If it thinks that the scalar code is
+better, it manipulates the vector body cost so that the body is twice
+as expensive as the scalar body.  The prologue cost (1 for the
+scalar_to_vec) is then added on top.> If it's costing purely on latency than the two are equivalent no? if you
+> take throughput into account the first would win, but the difference in
+> costs is still a lot higher then I would have expected.
+> 
+> In this case:
+> 
+> node 0x4f45480 1 times scalar_to_vec costs 4 in prologue
+> 
+> seems quite high, but I guess it doesn't know that there's no regfile
+> transfer?Which -mcpu/-mtune are you using?  For generic it's 1 rather than 4
+(so that the vector cost is 9 rather than 12, although still
+higher than the scalar cost).
+
+- User: Tamar Christina | Time: 2023-03-09 15:04:48 UTC
+  Text: (In reply torsandifo@gcc.gnu.orgfromcomment #3)> (In reply to Tamar Christina fromcomment #2)
+> > I thought the SLP algorithm was bottom up and stores were
+> > already sinks?
+> Yeah, they are.  But the point is that we're vectorising
+> the stores in isolation, with no knowledge of what happens
+> later.  The reason the code here is particularly bad is
+> that the array is later loaded into a vector.  But the
+> vectoriser doesn't know that.
+>Ah right, you meant use the loads as the seeds. yeah makes sense.> > Ah, guess there are two problems.
+> > 
+> > 1. how did we end up with such poor scalar code, at least 5 instructions are
+> > unneeded (separate issue)
+> > 2. The costing of the above, I guess I'm still slightly confused how we got
+> > to that cost
+> The patch that introduce the regression uses an on-the-side costing
+> scheme for store sequences.  If it thinks that the scalar code is
+> better, it manipulates the vector body cost so that the body is twice
+> as expensive as the scalar body.  The prologue cost (1 for the
+> scalar_to_vec) is then added on top.Ah, that makes sense.> > If it's costing purely on latency than the two are equivalent no? if you
+> > take throughput into account the first would win, but the difference in
+> > costs is still a lot higher then I would have expected.
+> > 
+> > In this case:
+> > 
+> > node 0x4f45480 1 times scalar_to_vec costs 4 in prologue
+> > 
+> > seems quite high, but I guess it doesn't know that there's no regfile
+> > transfer?
+> Which -mcpu/-mtune are you using?  For generic it's 1 rather than 4
+> (so that the vector cost is 9 rather than 12, although still
+> higher than the scalar cost).I was using neoverse-v1 which looks like matches neoverse-n2 in cost of 4, but neoverse-n1 has 6.  that really seems excessive..
+
+- User: Richard Sandiford | Time: 2023-03-09 16:22:34 UTC
+  Text: Following an off-list discussion: maybe one option (for now) would
+be to make the aarch64 builtins lowering code look for vld1s whose
+arguments are ADDR_EXPRs of local VAR_DECLs (or maybe even global
+VAR_DECLs).  It could stash those VAR_DECLs in a function-specific
+set and then the aarch64 costing code could look for stores to those
+VAR_DECLs.  If it sees such a store, it would aggressively promote
+a vector store, in the hope of later propagation and DSE.
+
+We could do this even when we don't actually lower the vld1,
+so that it would work for big-endian too.
+
+- User: Richard Sandiford | Time: 2023-03-09 17:35:35 UTC
+  Text: Testing a patch on those lines.
+
+- User: Richard Biener | Time: 2023-03-10 07:40:17 UTC
+  Text: (In reply torsandifo@gcc.gnu.orgfromcomment #1)> (In reply to Tamar Christina fromcomment #0)
+> > The SLP costs went from:
+> > 
+> >   Vector cost: 2
+> >   Scalar cost: 4
+> > 
+> > to:
+> > 
+> >   Vector cost: 12
+> >   Scalar cost: 4
+> > 
+> > it looks like it's no longer costing it as a duplicate but instead 4 vec
+> > inserts.
+> We do cost it as a duplicate, but we only try to vectorize up to
+> the stores, rather than up to the load back.  So we're costing
+> the difference between:
+> 
+>         fmov    s1, s0
+>         stp     s1, s1, [x0]
+>         stp     s1, s1, [x0, 8]
+> 
+> (no idea why we have an fmov, pretend we don't) and:
+> 
+>         fmov    s1, s0
+>         dup     v1.4s, v1.s[0]
+>         str     q1, [x0]
+> 
+> If we want the latter as a general principle, the PR is
+> easy to fix.  But if we don't, we'd need to make the
+> vectoriser start at the load or (alternatively) fold
+> to a constructor independently of vectorisation.Just to clarify, the vectorizer sees
+
+  <bb 2> [local count: 1073741824]:
+  data[0] = res_2(D);
+  data[1] = res_2(D);
+  data[2] = res_2(D);
+  data[3] = res_2(D);
+  _7 = MEM <__Float32x4_t> [(float * {ref-all})&data];
+  data ={v} {CLOBBER(eol)};
+  return _7;
+
+and indeed the SLP vectorizer does not consider vector typed loads as
+"sinks" to start SLP discovery from.  We could handle those the same
+as CONSTRUCTOR but then SLP discovery isn't prepared to follow
+"memory edges" (for must-aliases).  The question here would be
+whether for example SRA could have elided 'data', materializing
+the vector load as CONSTRUCTOR (I also have an old VN patch that
+would do this, but it has profitability issues so I never pushed it).
+
+Whatever you do with cost heuristics you'll find a testcase where that
+regresses.
+
+- User: Richard Sandiford | Time: 2023-03-10 08:50:49 UTC
+  Text: (In reply to Richard Biener fromcomment #7)> Whatever you do with cost heuristics you'll find a testcase where that
+> regresses.Yep.  That's the one true invariant of costing :-)
+
+I think a heuristic based on vld1 does make sense though.
+Code like the example is the recommended endian-agnostic way
+of initialising an ACLE vector, so we should try extra hard
+to vectorise stores that are later reloaded using vld1.
+
+A longer-term fix that avoids the need for costing would be good too.
+But costing seems like the easiest way of avoiding this particular
+regression (in a way that's suitable for GCC 12 and 13).
+
+- User: GCC Commits | Time: 2023-03-28 11:35:50 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:fcb411564a655a01f759eea3bb16bfd1bc879bfdcommitr13-6903-gfcb411564a655a01f759eea3bb16bfd1bc879bfdAuthor: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Tue Mar 28 12:34:51 2023 +0100
+
+    aarch64: Restore vectorisation of vld1 inputs [PR109072]
+    
+    Before GCC 12, we would vectorize:
+    
+      int32_t arr[] = { x, x, x, x };
+    
+    at -O3.  Vectorizing the store on its own is often a loss, particularly
+    for integers, sog:4963079769c99c4073adfd799885410ad484cbbesuppressed it.
+    This was necessary to fix regressions from enabling vectorisation at -O2,
+    
+    However, the vectorisation is important if the code subsequently loads
+    from the array using vld1:
+    
+      return vld1q_s32 (arr);
+    
+    This approach of initialising an array and loading from it is the
+    recommend endian-agnostic way of constructing an ACLE vector.
+    
+    As discussed in the PR notes, the general fix would be to fold the
+    store and load-back to a constructor (preferably before vectorisation).
+    But that's clearly not stage 4 material.
+    
+    This patch instead delays folding vld1 until after inlining and
+    records which decls a vld1 loads from.  It then treats vector
+    stores to those decls as free, on the optimistic assumption that
+    they will be removed later.  The patch also brute-forces
+    vectorization of plain constructor+store sequences, since some
+    of the CPU costs make that (dubiously) expensive even when the
+    store is discounted.
+    
+    Delaying folding showed that we were failing to update the vops.
+    The patch fixes that too.
+    
+    Thanks to Tamar for discussion & help with testing.
+    
+    gcc/PR target/109072* config/aarch64/aarch64-protos.h (aarch64_vector_load_decl): Declare.
+            * config/aarch64/aarch64.h (machine_function::vector_load_decls): New
+            variable.
+            * config/aarch64/aarch64-builtins.cc (aarch64_record_vector_load_arg):
+            New function.
+            (aarch64_general_gimple_fold_builtin): Delay folding of vld1 until
+            after inlining.  Record which decls are loaded from.  Fix handling
+            of vops for loads and stores.
+            * config/aarch64/aarch64.cc (aarch64_vector_load_decl): New function.
+            (aarch64_accesses_vector_load_decl_p): Likewise.
+            (aarch64_vector_costs::m_stores_to_vector_load_decl): New member
+            variable.
+            (aarch64_vector_costs::add_stmt_cost): If the function has a vld1
+            that loads from a decl, treat vector stores to those decls as
+            zero cost.
+            (aarch64_vector_costs::finish_cost): ...and in that case,
+            if the vector code does nothing more than a store, give the
+            prologue a zero cost as well.
+    
+    gcc/testsuite/PR target/109072* gcc.target/aarch64/pr109072_1.c: New test.
+            * gcc.target/aarch64/pr109072_2.c: Likewise.
+
+- User: Richard Sandiford | Time: 2023-03-28 12:59:35 UTC
+  Text: Fixed on trunk so far.
+
+- User: GCC Commits | Time: 2023-04-03 08:58:10 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:eff10fe7384d1504f2c92db1fd44c663f737f57dcommitr12-9383-geff10fe7384d1504f2c92db1fd44c663f737f57dAuthor: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Mon Apr 3 09:57:08 2023 +0100
+
+    aarch64: Restore vectorisation of vld1 inputs [PR109072]
+    
+    Before GCC 12, we would vectorize:
+    
+      int32_t arr[] = { x, x, x, x };
+    
+    at -O3.  Vectorizing the store on its own is often a loss, particularly
+    for integers, sog:4963079769c99c4073adfd799885410ad484cbbesuppressed it.
+    This was necessary to fix regressions from enabling vectorisation at -O2,
+    
+    However, the vectorisation is important if the code subsequently loads
+    from the array using vld1:
+    
+      return vld1q_s32 (arr);
+    
+    This approach of initialising an array and loading from it is the
+    recommend endian-agnostic way of constructing an ACLE vector.
+    
+    As discussed in the PR notes, the general fix would be to fold the
+    store and load-back to a constructor (preferably before vectorisation).
+    But that's clearly not stage 4 material.
+    
+    This patch instead delays folding vld1 until after inlining and
+    records which decls a vld1 loads from.  It then treats vector
+    stores to those decls as free, on the optimistic assumption that
+    they will be removed later.  The patch also brute-forces
+    vectorization of plain constructor+store sequences, since some
+    of the CPU costs make that (dubiously) expensive even when the
+    store is discounted.
+    
+    Delaying folding showed that we were failing to update the vops.
+    The patch fixes that too.
+    
+    Thanks to Tamar for discussion & help with testing.
+    
+    gcc/PR target/109072* config/aarch64/aarch64-protos.h (aarch64_vector_load_decl): Declare.
+            * config/aarch64/aarch64.h (machine_function::vector_load_decls): New
+            variable.
+            * config/aarch64/aarch64-builtins.cc (aarch64_record_vector_load_arg):
+            New function.
+            (aarch64_general_gimple_fold_builtin): Delay folding of vld1 until
+            after inlining.  Record which decls are loaded from.  Fix handling
+            of vops for loads and stores.
+            * config/aarch64/aarch64.cc (aarch64_vector_load_decl): New function.
+            (aarch64_accesses_vector_load_decl_p): Likewise.
+            (aarch64_vector_costs::m_stores_to_vector_load_decl): New member
+            variable.
+            (aarch64_vector_costs::add_stmt_cost): If the function has a vld1
+            that loads from a decl, treat vector stores to those decls as
+            zero cost.
+            (aarch64_vector_costs::finish_cost): ...and in that case,
+            if the vector code does nothing more than a store, give the
+            prologue a zero cost as well.
+    
+    gcc/testsuite/PR target/109072* gcc.target/aarch64/pr109072_1.c: New test.
+            * gcc.target/aarch64/pr109072_2.c: Likewise.
+    
+    (cherry picked from commit fcb411564a655a01f759eea3bb16bfd1bc879bfd)
+
+- User: Richard Sandiford | Time: 2023-04-03 09:03:58 UTC
+  Text: Fixed.
+

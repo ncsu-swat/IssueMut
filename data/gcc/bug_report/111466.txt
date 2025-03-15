@@ -1,0 +1,185 @@
+Bug Summary: RISC-V: redundant sign extensions despite ABI guarantees
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Vineet Gupta | Time: 2023-09-18 22:02:15 UTC
+  Text: Consider the test below:
+
+int foo(int unused, int n, unsigned y, unsigned delta){
+  int s = 0;
+  unsigned int x = 0;    // if int, sext elided
+  for (;x<n;x +=delta)
+    s += x+y;
+  return s;
+}
+
+-O2 -march=rv64gc_zba_zbb_zbs
+
+foo2:
+    sext.w    a6,a1            # 1
+    beq    a1,zero,.L4
+    li    a5,0
+    li    a0,0
+.L3:
+    addw    a4,a2,a5
+    addw    a5,a3,a5
+    addw    a0,a4,a0
+    bltu    a5,a6,.L3
+    ret
+.L4:
+    li    a0,0
+    ret
+
+I believe the SEXT.W is not semantically needed as a1 is supposed to be sign extended already at call site as per psABI [1]. I quote
+
+    "When passed in registers or on the stack, integer scalars narrower than XLEN bits are widened according to the sign of their type up to 32 bits, then sign-extended to XLEN bits"
+
+However currently RISC-V backend thinks otherwise: changing @x to int, causes the the sign extend to go away. I think both the cases should behave the same (and not generate SEXT.w) given the ABI clause above. Note that this manifests in initial RTL expand itself generating/or-not-generating the sign_extend so if it is unnecessary we can avoid late fixups in REE.
+
+Andrew Waterman confirmed that the ABI guarantees this and that the SEXT.W is redundant [1]
+
+[1]https://gcc.gnu.org/pipermail/gcc-patches/2023-September/630811.html
+
+- User: Vineet Gupta | Time: 2023-09-27 23:12:36 UTC
+  Text: So there are various aspects to tackling this issue.
+
+#1. REE reports failure as "missing definition(s)".
+
+This is because function args don't have an explicit def, they are just there.
+
+Cannot eliminate extension:
+(insn 12 6 13 2 (set (reg:DI 16 a6 [orig:138 n.1_15 ] [138])
+        (sign_extend:DI (reg:SI 11 a1 [orig:141 n ] [141])))  {extendsidi2}
+     (nil))
+ because of missing definition(s)
+
+#2. At Expand time there's an explicit sign_extend for the incoming function arg which is not needed per RISC-V ABI. Not generating these to begin with will require less fixup needs in REE and/or CSE.
+
+(insn 3 2 4 2 (set (reg/v:DI 141 [ n ])
+        (reg:DI 11 a1 [ n ]))
+
+(insn 12 6 13 2 (set (reg:DI 138 [ n.1_15 ])
+        (sign_extend:DI (subreg/u:SI (reg/v:DI 141 [ n ]) 0)))
+
+- User: Vineet Gupta | Time: 2023-09-28 21:23:54 UTC
+  Text: (In reply to Vineet Gupta fromcomment #1)> #1. REE reports failure as "missing definition(s)".
+> 
+> This is because function args don't have an explicit def, they are just
+> there.
+> 
+> Cannot eliminate extension:
+> (insn 12 6 13 2 (set (reg:DI 16 a6 [orig:138 n.1_15 ] [138])
+>         (sign_extend:DI (reg:SI 11 a1 [orig:141 n ] [141])))  {extendsidi2}
+>      (nil))
+>  because of missing definition(s)For addressing missing definition(s) there are a couple of approaches:
+
+#1a. Try to use Ajit Agarwal's REE updates [1] which is supposed to uses defined ABI interfaces and identify incoming args or return values. 
+  - however even the latest v8 series doesn't properly address the review comments - it hard codes the {ZERO,SIGN}_EXTEND in REE w/o actually querying the ABI
+  - requires both src and dest hard regs be the same which is often not the case. 
+  - But we can certainly use some concepts from this patch.
+
+
+#1b. To Jeff suggested [2][3] inserting dummy sign_extend in REE for the function args, which could be eliminated by REE.
+
+[1]https://gcc.gnu.org/pipermail/gcc-patches/2023-September/630935.html[2]https://gcc.gnu.org/pipermail/gcc-patches/2023-September/630899.html[3]https://gcc.gnu.org/pipermail/gcc-patches/2023-September/631543.html
+
+- User: Vineet Gupta | Time: 2023-09-28 21:44:45 UTC
+  Text: (In reply to Vineet Gupta fromcomment #1)> #2. At Expand time there's an explicit sign_extend for the incoming function
+> arg which is not needed per RISC-V ABI. Not generating these to begin with
+> will require less fixup needs in REE and/or CSE.
+> 
+> (insn 3 2 4 2 (set (reg/v:DI 141 [ n ])
+>         (reg:DI 11 a1 [ n ]))
+> 
+> (insn 12 6 13 2 (set (reg:DI 138 [ n.1_15 ])
+>         (sign_extend:DI (subreg/u:SI (reg/v:DI 141 [ n ]) 0)))Robin and I debugged this at GNU Cauldron and he narrowed it down to subreg promoted flag being cleared out which in turn causes the sign extend to be generated. As a hack if the flag is restored the sign extend goes away. The only issue is that flag clearing was introduced 30 years ago, albeit w/o any additional commentary and/or test.
+
+   commit 506980397227045212375e2dd2a1ae68a1afd481
+   Author: Richard Kenner <kenner@gcc.gnu.org>
+   Date:   Fri Jul 8 18:22:46 1994 -0400
+
+       (expand_expr, case CONVERT_EXPR): If changing signedness and we have a
+       promoted SUBREG, clear the promotion flag.
+    
+       From-SVN:r7686Interestingly reverting this change survive the rv64gc testsuite w/o any additional failures, so this seems to work at least for RISC-V, but may not on other arches/ABIs.
+
+I've posted an RFC for people familiar with the code to chime on this approach [1]
+
+[1]https://gcc.gnu.org/pipermail/gcc-patches/2023-September/631641.html
+
+- User: GCC Commits | Time: 2023-10-17 04:02:42 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:8eb9cdd142182aaa3ee39750924bc0a0491236c3commitr14-4676-g8eb9cdd142182aaa3ee39750924bc0a0491236c3Author: Vineet Gupta <vineetg@rivosinc.com>
+Date:   Mon Oct 16 21:59:09 2023 -0600
+
+    expr: don't clear SUBREG_PROMOTED_VAR_P flag for a promoted subreg [target/111466]
+    
+    RISC-V suffers from extraneous sign extensions, despite/given the ABI
+    guarantee that 32-bit quantities are sign-extended into 64-bit registers,
+    meaning incoming SI function args need not be explicitly sign extended
+    (so do SI return values as most ALU insns implicitly sign-extend too.)
+    
+    Existing REE doesn't seem to handle this well and there are various ideas
+    floating around to smarten REE about it.
+    
+    RISC-V also seems to correctly implement middle-end hook PROMOTE_MODE
+    etc.
+    
+    Another approach would be to prevent EXPAND from generating the
+    sign_extend in the first place which this patch tries to do.
+    
+    The hunk being removed was introduced way back in 1994 as
+       5069803972 ("expand_expr, case CONVERT_EXPR .. clear the promotion flag")
+    
+    This survived full testsuite run for RISC-V rv64gc with surprisingly no
+    fallouts: test results before/after are exactly same.
+    
+    |                               | # of unexpected case / # of unique unexpected case
+    |                               |          gcc |          g++ |     gfortran |
+    | rv64imafdc_zba_zbb_zbs_zicond/|  264 /    87 |    5 /     2 |   72 /    12 |
+    |    lp64d/medlow
+    
+    Granted for something so old to have survived, there must be a valid
+    reason. Unfortunately the original change didn't have additional
+    commentary or a test case. That is not to say it can't/won't possibly
+    break things on other arches/ABIs, hence the RFC for someone to scream
+    that this is just bonkers, don't do this ð
+    
+    I've explicitly CC'ed Jakub and Roger who have last touched subreg
+    promoted notes in expr.cc for insight and/or screaming ð
+    
+    Thanks to Robin for narrowing this down in an amazing debugging session
+    @ GNU Cauldron.
+    
+    ```
+    foo2:
+            sext.w  a6,a1             <-- this goes away
+            beq     a1,zero,.L4
+            li      a5,0
+            li      a0,0
+    .L3:
+            addw    a4,a2,a5
+            addw    a5,a3,a5
+            addw    a0,a4,a0
+            bltu    a5,a6,.L3
+            ret
+    .L4:
+            li      a0,0
+            ret
+    ```
+    
+    Signed-off-by: Vineet Gupta <vineetg@rivosinc.com>
+    Co-developed-by: Robin Dapp <rdapp.gcc@gmail.com>PR target/111466gcc/
+            * expr.cc (expand_expr_real_2): Do not clear SUBREG_PROMOTED_VAR_P.
+    
+    gcc/testsuite
+            * gcc.target/riscv/pr111466.c: New test.
+
+- User: Jeffrey A. Law | Time: 2023-10-19 15:57:44 UTC
+  Text: Fixed on the trunk now.
+

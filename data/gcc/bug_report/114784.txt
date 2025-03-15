@@ -1,0 +1,232 @@
+Bug Summary: [14 Regression] Inlining fails for always_inline inheriting constructor
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: missed-optimization, rejects-valid, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Daniel Bertalan | Time: 2024-04-19 20:05:49 UTC
+  Text: The code below has been reduced from SerenityOS's custom std::variant-like type. Its constructors are implemented by recursively inheriting from a helper class which adds a constructor that can take one of the stored types. This, however, creates a bunch of small constructors - each of which just end up calling into the set<T>() method - which don't necessarily get inlined. Our measurements showed that we can achieve up to 20% reduction in the run time of our test suite by marking these as __attribute__((always_inline)). (Like in most other similar issues, inlining is not a matter of correctness for us, we just want to overrule inlining heuristics).
+
+Ever since the GCC trunk of summer 2023, we have been getting compile errors about failing to inline these constructors ("call is unlikely and code size would grow"). Below is the smallest reproducer we could create for this issue (admittedly, it has UB, so not sure if it's the exact same issue as in the real code). Note that if we explicitly write out the constructor instead of inheriting it (even if it does the same thing), as shown by the long long overloads below, the issue goes away (compile with -std=c++20 -O2).
+
+See:https://godbolt.org/z/5hb584T9r---
+
+template <typename Base>
+struct VariantConstructors {
+  __attribute__((always_inline)) VariantConstructors(int t) {
+    base().set(t, {});
+  }
+  __attribute__((always_inline)) VariantConstructors(long long t) {
+    base().set(t, {});
+  }
+  Base base();
+};
+
+struct Variant : VariantConstructors<Variant> {
+  using VariantConstructors<Variant>::VariantConstructors;
+
+  __attribute__((always_inline)) Variant(long long v) : VariantConstructors(v) {}
+
+  template <typename T> void set(T &&, int);
+  char m_data;
+};
+
+struct ErrorOr {
+  ErrorOr(int v) : a(v) { }
+  ErrorOr(long long v) : a(v) { }
+  Variant a;
+};
+static ErrorOr run() {
+  ErrorOr x(0); // compiles with this line removed
+  ErrorOr y(0LL);
+  return 0;
+}
+int serenity_main() {
+    run();
+}
+
+---
+
+gcc -v output:
+
+GNU C++20 (Compiler-Explorer-Build-gcc-85c187b2127b937e211dfe46b4120d320ff661df-binutils-2.40) version 14.0.1 20240419 (experimental) (x86_64-linux-gnu)
+	compiled by GNU C version 11.4.0, GMP version 6.2.1, MPFR version 4.1.0, MPC version 1.2.1, isl version isl-0.24-GMP
+
+- User: Daniel Bertalan | Time: 2024-04-19 20:08:57 UTC
+  Text: Forgot to actually post the error message itself:
+
+In constructor 'ErrorOr::ErrorOr(int)',
+    inlined from 'ErrorOr run()' at <source>:29:10,
+    inlined from 'int serenity_main()' at <source>:32:8:
+<source>:13:39: error: inlining failed in call to 'always_inline' 'Variant::Variant(int) [inherited from VariantConstructors<Variant>]': call is unlikely and code size would grow
+   13 |   using VariantConstructors<Variant>::VariantConstructors;
+      |                                       ^~~~~~~~~~~~~~~~~~~
+<source>:22:20: note: called from here
+   22 |   ErrorOr(int v) : a(v) { }
+      |                    ^~~~
+
+- User: Jakub Jelinek | Time: 2024-04-19 20:21:24 UTC
+  Text: Started withr14-2149-gabdf0b6cdff5783b97f35ad61ae31433f0569dfdThat said, if you just fix the warning (i.e. remove the UB from serenity_main if it would ever return), then it compiles fine.  Say by adding return 0; statement.
+But adding [[gnu::cold]] attribute to serenity_main makes it error again.
+
+Honza, I thought always_inline should have precedence over decisions if it inlines into cold code or not etc.?
+Or maybe always_inline attribute is copied over to the inheriting constructors but DECL_DISREGARD_INLINE_LIMITS is not?
+
+template <typename Base>
+struct VariantConstructors {
+  __attribute__((always_inline)) VariantConstructors(int t) {
+    base().set(t, {});
+  }
+  __attribute__((always_inline)) VariantConstructors(long long t) {
+    base().set(t, {});
+  }
+  Base base();
+};
+
+struct Variant : VariantConstructors<Variant> {
+  using VariantConstructors<Variant>::VariantConstructors;
+
+  __attribute__((always_inline)) Variant(long long v) : VariantConstructors(v) {}
+
+  template <typename T> void set(T &&, int);
+  char m_data;
+};
+
+struct ErrorOr {
+  ErrorOr(int v) : a(v) { }
+  ErrorOr(long long v) : a(v) { }
+  Variant a;
+};
+static ErrorOr run() {
+  ErrorOr x(0); // compiles with this line removed
+  ErrorOr y(0LL);
+  return 0;
+}
+[[gnu::cold]] int serenity_main() {
+    run();
+    return 0;
+}
+
+- User: Jakub Jelinek | Time: 2024-04-19 20:42:34 UTC
+  Text: In the debugger I see it is the missing DECL_DISREGARD_INLINE_LIMITS flag:
+(gdb) p $1->function_decl.disregard_inline_limits
+$3 = 0
+(gdb) p $1->function_decl.declared_inline_flag
+$4 = 1
+(gdb) p lookup_attribute ("always_inline", $1->decl_common.attributes)
+$5 = (tree_node *) 0x7fffea2e5ac8
+(gdb) p debug_generic_stmt (decl_assembler_name ($1))
+_ZN7VariantCI119VariantConstructorsIS_EEi
+
+--- gcc/cp/method.cc.jj	2024-02-15 09:51:34.474065798 +0100
++++ gcc/cp/method.cc	2024-04-19 22:36:06.432859471 +0200
+@@ -3309,6 +3309,8 @@ implicitly_declare_fn (special_function_
+       constexpr_p = DECL_DECLARED_CONSTEXPR_P (inherited_ctor);
+       /* Also copy any attributes.  */
+       DECL_ATTRIBUTES (fn) = clone_attrs (DECL_ATTRIBUTES (inherited_ctor));
++      DECL_DISREGARD_INLINE_LIMITS (fn)
++	= DECL_DISREGARD_INLINE_LIMITS (inherited_ctor);
+     }
+ 
+   /* Add the "this" parameter.  */
+fixes this, the question is what other flags remembered from attributes we should copy.
+
+- User: Jakub Jelinek | Time: 2024-04-19 21:07:17 UTC
+  Text: Guess DECL_UNINLINABLE, maybe DECL_PRESERVE_P, TREE_USED, maybe DECL_USER_ALIGN/DECL_ALIGN, maybe DECL_WEAK, maybe DECL_NO_INSTRUMENT_FUNCTION_ENTRY_EXIT, DECL_NO_LIMIT_STACK.
+TREE_READONLY, DECL_PURE_P, TREE_THIS_VOLATILE (for const, pure and noreturn attributes) probably makes no sense, DECL_IS_RETURNS_TWICE neither (returns_twice ctor?).
+What about TREE_NOTHROW?
+DECL_FUNCTION_SPECIFIC_OPTIMIZATION, DECL_FUNCTION_SPECIFIC_TARGET...
+
+- User: Daniel Bertalan | Time: 2024-04-19 22:00:34 UTC
+  Text: I tried Jakub's patch (thank you for the super quick response!), it crashes if the constructor has non-type template parameters:
+
+
+template <typename> struct SpanImpl {
+  template <long> SpanImpl();
+};
+template <typename T> struct Span : SpanImpl<T> {
+  using SpanImpl<T>::SpanImpl;
+};
+
+Span<char> c = {};
+
+$ g++ -std=c++20 crash.cpp
+
+crash.cpp: In instantiation of 'struct Span<char>':
+crash.cpp:8:12:   required from here
+    8 | Span<char> c = {};
+      |            ^
+crash.cpp:5:22: internal compiler error: tree check: expected function_decl, have template_decl in implicitly_declare_fn, at cp/method.cc:3313
+    5 |   using SpanImpl<T>::SpanImpl;
+      |                      ^~~~~~~~
+
+- User: Jakub Jelinek | Time: 2024-04-22 11:14:14 UTC
+  Text: Createdattachment 58006[details]gcc14-pr114784.patch
+
+Adjusted patch.
+maybe_clone_body currently copies DECL_DISREGARD_INLINE_LIMITS,
+DECL_DLLIMPORT_P and DECL_VISIBILITY*, should those be copied too?
+And shouldn't some from the above list be copied in both places?
+
+- User: GCC Commits | Time: 2024-04-23 06:39:49 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:aa73eb97a1e3c84564fa71158d09f9c5582c4d2ecommitr14-10086-gaa73eb97a1e3c84564fa71158d09f9c5582c4d2eAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Apr 23 08:36:15 2024 +0200
+
+    c++: Copy over DECL_DISREGARD_INLINE_LIMITS flag to inheriting ctors [PR114784]
+    
+    The following testcase is rejected with
+    error: inlining failed in call to 'always_inline' '...': call is unlikely and code size would grow
+    errors.  The problem is that starting with ther14-2149change
+    we try to copy most of the attributes from the inherited to
+    inheriting ctor, but don't copy associated flags that decl_attributes
+    sets.
+    
+    Now, the other clone_attrs user, cp/optimize.cc (maybe_clone_body)
+    copies over
+          DECL_COMDAT (clone) = DECL_COMDAT (fn);
+          DECL_WEAK (clone) = DECL_WEAK (fn);
+          if (DECL_ONE_ONLY (fn))
+            cgraph_node::get_create (clone)->set_comdat_group (cxx_comdat_group (clone));
+          DECL_USE_TEMPLATE (clone) = DECL_USE_TEMPLATE (fn);
+          DECL_EXTERNAL (clone) = DECL_EXTERNAL (fn);
+          DECL_INTERFACE_KNOWN (clone) = DECL_INTERFACE_KNOWN (fn);
+          DECL_NOT_REALLY_EXTERN (clone) = DECL_NOT_REALLY_EXTERN (fn);
+          DECL_VISIBILITY (clone) = DECL_VISIBILITY (fn);
+          DECL_VISIBILITY_SPECIFIED (clone) = DECL_VISIBILITY_SPECIFIED (fn);
+          DECL_DLLIMPORT_P (clone) = DECL_DLLIMPORT_P (fn);
+          DECL_DISREGARD_INLINE_LIMITS (clone) = DECL_DISREGARD_INLINE_LIMITS (fn);
+    The following patch just copies DECL_DISREGARD_INLINE_LIMITS to fix
+    this exact bug, not really sure which other flags should be copied
+    and which shouldn't.
+    Plus there are tons of other flags, some of which might need to be copied
+    too, some of which might not, perhaps in both places, like:
+    DECL_UNINLINABLE, maybe DECL_PRESERVE_P, TREE_USED, maybe
+    DECL_USER_ALIGN/DECL_ALIGN, maybe DECL_WEAK, maybe
+    DECL_NO_INSTRUMENT_FUNCTION_ENTRY_EXIT, DECL_NO_LIMIT_STACK.
+    TREE_READONLY, DECL_PURE_P, TREE_THIS_VOLATILE (for const, pure and
+    noreturn attributes) probably makes no sense, DECL_IS_RETURNS_TWICE neither
+    (returns_twice ctor?).  What about TREE_NOTHROW?
+    DECL_FUNCTION_SPECIFIC_OPTIMIZATION, DECL_FUNCTION_SPECIFIC_TARGET...
+    
+    Anyway, another problem is that if inherited_ctor is a TEMPLATE_DECL, as
+    also can be seen in the using D<T>::D; case in the testcase, then
+    DECL_ATTRIBUTES (fn) = clone_attrs (DECL_ATTRIBUTES (inherited_ctor));
+    attempts to copy the attributes from the TEMPLATE_DECL which doesn't have
+    them.  The following patch copies them from STRIP_TEMPLATE (inherited_ctor)
+    which does.  E.g. DECL_DECLARED_CONSTEXPR_P works fine as the macro
+    itself uses STRIP_TEMPLATE too, but not 100% sure about other macros used
+    on inherited_ctor earlier.
+    
+    2024-04-23  Jakub Jelinek  <jakub@redhat.com>PR c++/114784* method.cc (implicitly_declare_fn): Call clone_attrs
+            on DECL_ATTRIBUTES on STRIP_TEMPLATE (inherited_ctor) rather than
+            inherited_ctor.  Also copy DECL_DISREGARD_INLINE_LIMITS flag from it.
+    
+            * g++.dg/cpp0x/inh-ctor39.C: New test.
+
+- User: Jakub Jelinek | Time: 2024-04-23 06:40:31 UTC
+  Text: Fixed.
+

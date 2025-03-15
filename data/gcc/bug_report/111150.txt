@@ -1,0 +1,132 @@
+Bug Summary: (vec CMP vec) != (vec CMP vec) should just produce (vec CMP vec) ^ (vec CMP vec)
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2023-08-25 06:28:43 UTC
+  Text: Take:
+```
+typedef int v4si __attribute((__vector_size__(4*sizeof(int))));
+v4si f2_(v4si a, v4si b, v4si c, v4si d)
+{
+  v4si X = a == b;
+  v4si Y = c == d;
+  return (X != Y);
+}
+
+```
+Currently we produce on x86_64 -O2:
+```
+        pcmpeqd %xmm1, %xmm0
+        pcmpeqd %xmm3, %xmm2
+        pxor    %xmm1, %xmm1
+        pcmpeqd %xmm2, %xmm0
+        pcmpeqd %xmm1, %xmm0
+```
+But we should produce:
+```
+        pcmpeqd %xmm1, %xmm0
+        pcmpeqd %xmm3, %xmm2
+        pxor    %xmm2, %xmm0
+```
+
+In forwprop1 we have:
+```
+  _1 = a_4(D) == b_5(D);
+  X_6 = VEC_COND_EXPR <_1, { -1, -1, -1, -1 }, { 0, 0, 0, 0 }>;
+  _2 = c_7(D) == d_8(D);
+  Y_9 = VEC_COND_EXPR <_2, { -1, -1, -1, -1 }, { 0, 0, 0, 0 }>;
+  _3 = X_6 != Y_9;
+```
+But we can push != further up since -1 != 0 is true.
+
+basically in scalar we have:
+(a ? -1 : 0) != (b ? -1 : 0)
+
+but we know that is really `(a^b) ? -1 : 0`
+
+Now in theory you could do the full expansion for this but I think we should just handle the case where we have -1 and 0.
+
+- User: GCC Commits | Time: 2024-07-17 16:58:58 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:44fcc1ca11e7ea35dc9fb25a5317346bc1eaf7b2commitr15-2106-g44fcc1ca11e7ea35dc9fb25a5317346bc1eaf7b2Author: Eikansh Gupta <quic_eikagupt@quicinc.com>
+Date:   Wed May 22 23:28:48 2024 +0530
+
+    MATCH: Simplify (a ? x : y) eq/ne (b ? x : y) [PR111150]
+    
+    This patch adds match pattern for `(a ? x : y) eq/ne (b ? x : y)`.
+    In forwprop1 pass, depending on the type of `a` and `b`, GCC produces
+    `vec_cond` or `cond_expr`. Based on the observation that `(x != y)` is
+    TRUE, the pattern can be optimized to produce `(a^b ? TRUE : FALSE)`.
+    
+    The patch adds match pattern for a, b:
+    (a ? x : y) != (b ? x : y) --> (a^b) ? TRUE  : FALSE
+    (a ? x : y) == (b ? x : y) --> (a^b) ? FALSE : TRUE
+    (a ? x : y) != (b ? y : x) --> (a^b) ? TRUE  : FALSE
+    (a ? x : y) == (b ? y : x) --> (a^b) ? FALSE : TRUEPR tree-optimization/111150gcc/ChangeLog:
+    
+            * match.pd (`(a ? x : y) eq/ne (b ? x : y)`): New pattern.
+            (`(a ? x : y) eq/ne (b ? y : x)`): New pattern.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/pr111150.c: New test.
+            * gcc.dg/tree-ssa/pr111150-1.c: New test.
+            * g++.dg/tree-ssa/pr111150.C: New test.
+    
+    Signed-off-by: Eikansh Gupta <quic_eikagupt@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-07-17 17:00:44 UTC
+  Text: Fixed.
+
+- User: GCC Commits | Time: 2024-07-17 21:48:19 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:3bbc8ea2e38d194fb5f2f52ab3f75301d4f84f06commitr15-2113-g3bbc8ea2e38d194fb5f2f52ab3f75301d4f84f06Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Jul 17 23:47:17 2024 +0200
+
+    testsuite: Fix uppr111150* tests on i686-linux [PR111150]
+    
+    The tests FAIL on i686-linux due to unexpected -Wpsabi diagnostics.
+    Fixed as usually by adding -Wno-psabi to dg-options.
+    
+    2024-07-17  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/111150* gcc.dg/tree-ssa/pr111150.c: Add -Wno-psabi to dg-options.
+            * g++.dg/tree-ssa/pr111150.C: Likewise.
+
+- User: Adhemerval Zanella | Time: 2024-07-25 19:06:30 UTC
+  Text: It seems that this change triggered an ICE with Linaro CI on arm 32 bit [1]:
+
+--
+Executing on host: /home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/builds/destdir/x86_64-pc-linux-gnu/bin/arm-eabi-g++   /home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/snapshots/gcc.git~master/gcc/testsuite/g++.dg/tree-ssa/pr111150.C  -mthumb -march=armv8.1-m.main+mve.fp+fp.dp -mtune=cortex-m55 -mfloat-abi=hard -mfpu=auto   -fdiagnostics-plain-output  -nostdinc++ -I/home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/builds/x86_64-pc-linux-gnu/arm-eabi/gcc-gcc.git~master-stage2/arm-eabi/libstdc++-v3/include/arm-eabi -I/home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/builds/x86_64-pc-linux-gnu/arm-eabi/gcc-gcc.git~master-stage2/arm-eabi/libstdc++-v3/include -I/home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/snapshots/gcc.git~master/libstdc++-v3/libsupc++ -I/home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/snapshots/gcc.git~master/libstdc++-v3/include/backward -I/home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/snapshots/gcc.git~master/libstdc++-v3/testsuite/util -fmessage-length=0  -std=gnu++98 -O1 -fdump-tree-forwprop1 -Wno-psabi  -S  -opr111150.s    (timeout = 600)
+spawn -ignore SIGHUP /home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/builds/destdir/x86_64-pc-linux-gnu/bin/arm-eabi-g++ /home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/snapshots/gcc.git~master/gcc/testsuite/g++.dg/tree-ssa/pr111150.C -mthumb -march=armv8.1-m.main+mve.fp+fp.dp -mtune=cortex-m55 -mfloat-abi=hard -mfpu=auto -fdiagnostics-plain-output -nostdinc++ -I/home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/builds/x86_64-pc-linux-gnu/arm-eabi/gcc-gcc.git~master-stage2/arm-eabi/libstdc++-v3/include/arm-eabi -I/home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/builds/x86_64-pc-linux-gnu/arm-eabi/gcc-gcc.git~master-stage2/arm-eabi/libstdc++-v3/include -I/home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/snapshots/gcc.git~master/libstdc++-v3/libsupc++ -I/home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/snapshots/gcc.git~master/libstdc++-v3/include/backward -I/home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/snapshots/gcc.git~master/libstdc++-v3/testsuite/util -fmessage-length=0 -std=gnu++98 -O1 -fdump-tree-forwprop1 -Wno-psabi -S -opr111150.s
+/home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/snapshots/gcc.git~master/gcc/testsuite/g++.dg/tree-ssa/pr111150.C: In function 'v4si f1_(v4si, v4si, v4si, v4si, v4si, v4si)':
+/home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/snapshots/gcc.git~master/gcc/testsuite/g++.dg/tree-ssa/pr111150.C:13:1: error: unrecognizable insn:
+(insn 22 21 26 2 (set (reg:V4SI 120 [ <retval> ])
+        (unspec:V4SI [
+                (reg:V4SI 136)
+                (reg:V4SI 137)
+                (subreg:V4BI (reg:HI 135) 0)
+            ] VPSELQ_S)) "/home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/snapshots/gcc.git~master/gcc/testsuite/g++.dg/tree-ssa/pr111150.C":12:17 -1
+     (nil))
+during RTL pass: vregs
+/home/tcwg-buildslave/workspace/tcwg_gnu_1/abe/snapshots/gcc.git~master/gcc/testsuite/g++.dg/tree-ssa/pr111150.C:13:1: internal compiler error: in extract_insn, at recog.cc:2848
+0x21fd635 internal_error(char const*, ...)
+	../../../../../../gcc/gcc/diagnostic-global-context.cc:491
+0x9a0958 fancy_abort(char const*, int, char const*)
+	../../../../../../gcc/gcc/diagnostic.cc:1725
+0x840e4d _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+	../../../../../../gcc/gcc/rtl-error.cc:108
+0x840e6f _fatal_insn_not_found(rtx_def const*, char const*, int, char const*)
+	../../../../../../gcc/gcc/rtl-error.cc:116
+0x83f76b extract_insn(rtx_insn*)
+	../../../../../../gcc/gcc/recog.cc:2848
+0xf1a805 instantiate_virtual_regs_in_insn
+	../../../../../../gcc/gcc/function.cc:1612
+0xf1a805 instantiate_virtual_regs
+	../../../../../../gcc/gcc/function.cc:1995
+0xf1a805 execute
+	../../../../../../gcc/gcc/function.cc:2042
+--
+

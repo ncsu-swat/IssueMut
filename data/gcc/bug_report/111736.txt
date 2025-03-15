@@ -1,0 +1,812 @@
+Bug Summary: Address sanitizer is not compatible with named address spaces
+Product: gcc
+Component: sanitizer
+
+  (show other bugs)
+Keywords: addr-space, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Uroš Bizjak | Time: 2023-10-09 11:53:10 UTC
+  Text: From [1], gcc is doing a KASAN check on a percpu address (when percpu access is implemented using named address spaces). This is not a "real" address, just an offset from the segment register.
+
+The testcase
+
+--cut here--
+int __seg_gs m;
+
+int foo (void)
+{
+  return m;
+}
+--cut here--
+
+does not show any special handling that would handle segment registers.
+
+[1]https://lore.kernel.org/lkml/CAHk-=wi6U-O1wdPOESuCE6QO2OaPu0hEzaig0uDOU4L5CREhug@mail.gmail.com/
+
+- User: Richard Biener | Time: 2023-10-09 12:31:36 UTC
+  Text: The "fix" is probably to not attempt to [K]ASAN any non-default address space access?
+
+- User: Alexander Monakov | Time: 2023-10-09 13:27:00 UTC
+  Text: Looks that way — even though __seg_gs AS is a subset of the generic AS, the compiler has no way to find out the base of __seg_gs.
+
+We already skip registering TLS data with ASan:
+
+__thread int x;
+
+int foo (void)
+{
+  return x;
+}
+
+- User: Alexander Monakov | Time: 2023-10-09 16:27:18 UTC
+  Text: Sorry, the second half of my comment is confusing. To clarify, ASan works fine for TLS data (the compiler knows that TLS base is at fs:0; libsanitizer uses some hacks to initialize shadow for TLS anyway, so it seems explicit registration is not needed).
+
+The difference is, &x produces an address in the generic address space by using the knowledge that fs:0 stores the segment base. For __seg_{fs,gs} that can't be done, and &m is the offset w.r.t segment base.
+
+- User: Richard Biener | Time: 2023-12-05 13:05:30 UTC
+  Text: testing patch
+
+- User: GCC Commits | Time: 2023-12-05 14:11:59 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:7e40497805c0831596334fe474112f991276e11bcommitr14-6184-g7e40497805c0831596334fe474112f991276e11bAuthor: Richard Biener <rguenther@suse.de>
+Date:   Tue Dec 5 14:00:43 2023 +0100
+
+    sanitizer/111736 - skip ASAN for globals in alternate address-spacePR sanitizer/111736* asan.cc (asan_protect_global): Do not protect globals
+            in non-generic address-space.
+
+- User: Richard Biener | Time: 2023-12-05 14:12:24 UTC
+  Text: Fixed (for globals).
+
+- User: Uroš Bizjak | Time: 2023-12-19 09:29:52 UTC
+  Text: (In reply to GCC Commits fromcomment #5)> The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:Can this patch be backported to gcc-13 branch?
+
+- User: Richard Biener | Time: 2023-12-19 10:06:37 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #7)> (In reply to GCC Commits fromcomment #5)
+> > The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:
+> 
+> Can this patch be backported to gcc-13 branch?Sure - I'll test/push it.
+
+- User: GCC Commits | Time: 2023-12-19 11:04:12 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:06ffe577036fa58968960afc62e16349fa43d496commitr13-8168-g06ffe577036fa58968960afc62e16349fa43d496Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Dec 5 14:00:43 2023 +0100
+
+    sanitizer/111736 - skip ASAN for globals in alternate address-spacePR sanitizer/111736* asan.cc (asan_protect_global): Do not protect globals
+            in non-generic address-space.
+    
+    (cherry picked from commit 7e40497805c0831596334fe474112f991276e11b)
+
+- User: Uroš Bizjak | Time: 2024-03-20 20:04:05 UTC
+  Text: Huh, is this really fixed?
+
+--cut here--
+extern int __seg_gs m;
+
+int foo (void)
+{
+  return m;
+}
+
+extern __thread int n;
+
+int bar (void)
+{
+  return n;
+}
+
+extern int o;
+
+int baz (void)
+{
+  return o;
+}
+--cut here--
+
+gcc -O2 -fsanitize=address:
+
+
+foo:
+.LASANPC0:
+.LFB0:
+        .cfi_startproc
+        movl    $m, %eax
+        movq    %rax, %rdx
+        andl    $7, %eax
+        shrq    $3, %rdx
+        addl    $3, %eax
+        movzbl  2147450880(%rdx), %edx
+        cmpb    %dl, %al
+        jl      .L2
+        testb   %dl, %dl
+        jne     .L13
+.L2:
+        movl    %gs:m(%rip), %eax
+        ret
+.L13:
+        pushq   %rax
+        .cfi_def_cfa_offset 16
+        movl    $m, %edi
+        call    __asan_report_load4
+        .cfi_endproc
+.LFE0:
+        .size   foo, .-foo
+        .p2align 4
+        .globl  bar
+        .type   bar, @function
+
+The memory access is still annotated with asan code.
+
+I did test patched gcc by building a kernel with named address spaces, but I'm not sure I did it correctly anymore - I was not able to boot recent -tip with KASAN and enabled named address spaces.
+
+- User: Uroš Bizjak | Time: 2024-03-20 21:45:16 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #10)> Huh, is this really fixed?IMO, this patch is also needed:
+
+--cut here--
+diff --git a/gcc/asan.cc b/gcc/asan.cc
+index cfe83106460..54dcc3a38db 100644
+--- a/gcc/asan.cc
++++ b/gcc/asan.cc
+@@ -2764,7 +2764,9 @@ instrument_derefs (gimple_stmt_iterator *iter, tree t,
+       && poly_int_tree_p (DECL_SIZE (inner), &decl_size)
+       && known_subrange_p (bitpos, bitsize, 0, decl_size))
+     {
+-      if (VAR_P (inner) && DECL_THREAD_LOCAL_P (inner))
++      if (VAR_P (inner)
++	  && (DECL_THREAD_LOCAL_P (inner)
++	      || !ADDR_SPACE_GENERIC_P (TYPE_ADDR_SPACE (TREE_TYPE (inner)))))
+ 	return;
+       /* If we're not sanitizing globals and we can tell statically that this
+ 	 access is inside a global variable, then there's no point adding
+--cut here--
+
+But unfortunately, it doesn't result in bootable kernel.
+
+- User: Uroš Bizjak | Time: 2024-03-21 06:44:31 UTC
+  Text: P1, I would *really* like this PR to be fixed for gcc-14, the new linux kernel support for named address spaces depend on this fix.
+
+- User: Richard Biener | Time: 2024-03-21 07:24:28 UTC
+  Text: The original testcase is fixed, appearantly slapping 'extern' on the int makes it not effective.
+
+Possibly better amend the
+
+  if (VAR_P (inner) && DECL_HARD_REGISTER (inner))
+    return;
+
+check though.  As indicated my fix fixed only VAR_DECL cases, there's
+still pointer-based accesses (MEM_REF) to consider.  So possibly even
+the following is necessary
+
+diff --git a/gcc/asan.cc b/gcc/asan.cc
+index 0fd7dd1f3ed..36f85757435 100644
+--- a/gcc/asan.cc
++++ b/gcc/asan.cc
+@@ -2747,7 +2747,8 @@ instrument_derefs (gimple_stmt_iterator *iter, tree t,
+       || maybe_ne (bitsize, size_in_bytes * BITS_PER_UNIT))
+     return;
+ 
+-  if (VAR_P (inner) && DECL_HARD_REGISTER (inner))
++  if ((VAR_P (inner) && DECL_HARD_REGISTER (inner))
++      || !ADDR_SPACE_GENERIC_P (TYPE_ADDR_SPACE (TREE_TYPE (inner))))
+     return;
+ 
+   poly_int64 decl_size;
+
+- User: Richard Biener | Time: 2024-03-21 07:26:55 UTC
+  Text: That also fixes
+
+int foo (int __seg_gs *m)
+{
+  return *m;
+}
+
+- User: Richard Biener | Time: 2024-03-21 07:45:25 UTC
+  Text: (In reply to Richard Biener fromcomment #13)> The original testcase is fixed, appearantly slapping 'extern' on the int
+> makes it not effective.
+> 
+> Possibly better amend the
+> 
+>   if (VAR_P (inner) && DECL_HARD_REGISTER (inner))
+>     return;
+> 
+> check though.  As indicated my fix fixed only VAR_DECL cases, there's
+> still pointer-based accesses (MEM_REF) to consider.  So possibly even
+> the following is necessary
+> 
+> diff --git a/gcc/asan.cc b/gcc/asan.cc
+> index 0fd7dd1f3ed..36f85757435 100644
+> --- a/gcc/asan.cc
+> +++ b/gcc/asan.cc
+> @@ -2747,7 +2747,8 @@ instrument_derefs (gimple_stmt_iterator *iter, tree t,
+>        || maybe_ne (bitsize, size_in_bytes * BITS_PER_UNIT))
+>      return;
+>  
+> -  if (VAR_P (inner) && DECL_HARD_REGISTER (inner))
+> +  if ((VAR_P (inner) && DECL_HARD_REGISTER (inner))
+> +      || !ADDR_SPACE_GENERIC_P (TYPE_ADDR_SPACE (TREE_TYPE (inner))))
+>      return;
+>  
+>    poly_int64 decl_size;I'm testing this now - can you see if it is enough to fix the kernel usecase?
+
+- User: Uroš Bizjak | Time: 2024-03-21 08:04:17 UTC
+  Text: (In reply to Richard Biener fromcomment #13)> The original testcase is fixed, appearantly slapping 'extern' on the int
+> makes it not effective.
+> 
+> Possibly better amend the
+> 
+>   if (VAR_P (inner) && DECL_HARD_REGISTER (inner))
+>     return;
+> 
+> check though.  As indicated my fix fixed only VAR_DECL cases, there's
+> still pointer-based accesses (MEM_REF) to consider.  So possibly even
+> the following is necessaryI must admit that to create the patch fromComment #11I just mindlessly searched for DECL_THREAD_LOCAL_P in asan.cc and amended the location with ADDR_SPACE_GENERIC_P check.
+
+However, ASAN should back off from annotating *any* gs: prefixed address. 
+
+I'll test your patch fromComment #13ASAP.
+
+- User: rguenther@suse.de | Time: 2024-03-21 08:35:03 UTC
+  Text: On Thu, 21 Mar 2024, ubizjak at gmail dot com wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=111736> 
+> ---Comment #16from Uro? Bizjak <ubizjak at gmail dot com> ---
+> (In reply to Richard Biener fromcomment #13)
+> > The original testcase is fixed, appearantly slapping 'extern' on the int
+> > makes it not effective.
+> > 
+> > Possibly better amend the
+> > 
+> >   if (VAR_P (inner) && DECL_HARD_REGISTER (inner))
+> >     return;
+> > 
+> > check though.  As indicated my fix fixed only VAR_DECL cases, there's
+> > still pointer-based accesses (MEM_REF) to consider.  So possibly even
+> > the following is necessary
+> 
+> I must admit that to create the patch fromComment #11I just mindlessly
+> searched for DECL_THREAD_LOCAL_P in asan.cc and amended the location with
+> ADDR_SPACE_GENERIC_P check.It might be that the DECL_THREAD_LOCAL_P handling is similarly broken
+in that
+
+int foo (int *p)
+{
+  return *p;
+}
+
+is instrumented even when p is a pointer to thread local storage?  But
+maybe that works fine and it handled in the runtime.  But of course
+the runtime can't handle non-generic address-spaces at all unless
+we can convert all those addresses to ones in the generic address-space
+(given suitable overlap of course).> However, ASAN should back off from annotating *any* gs: prefixed address. 
+> 
+> I'll test your patch fromComment #13ASAP.
+
+- User: Jakub Jelinek | Time: 2024-03-21 08:46:31 UTC
+  Text: (In reply torguenther@suse.defromcomment #17)> On Thu, 21 Mar 2024, ubizjak at gmail dot com wrote:
+> 
+> >https://gcc.gnu.org/bugzilla/show_bug.cgi?id=111736> > 
+> > ---Comment #16from Uro? Bizjak <ubizjak at gmail dot com> ---
+> > (In reply to Richard Biener fromcomment #13)
+> > > The original testcase is fixed, appearantly slapping 'extern' on the int
+> > > makes it not effective.
+> > > 
+> > > Possibly better amend the
+> > > 
+> > >   if (VAR_P (inner) && DECL_HARD_REGISTER (inner))
+> > >     return;
+> > > 
+> > > check though.  As indicated my fix fixed only VAR_DECL cases, there's
+> > > still pointer-based accesses (MEM_REF) to consider.  So possibly even
+> > > the following is necessary
+> > 
+> > I must admit that to create the patch fromComment #11I just mindlessly
+> > searched for DECL_THREAD_LOCAL_P in asan.cc and amended the location with
+> > ADDR_SPACE_GENERIC_P check.
+> 
+> It might be that the DECL_THREAD_LOCAL_P handling is similarly broken
+> in that
+> 
+> int foo (int *p)
+> {
+>   return *p;
+> }No, that is not broken.  __thread/thread_local is something that applies solely to variables.  If you take address of a TLS variable, the result is a normal address space pointer even if TLS uses separate address spaces.  Pointer to TLS var is e.g. on x86-64 load from %gs:0 with offset added to it, while load/store of a TLS var is load/store from %gs:offset.
+So, we actually wouldn't need to punt on DECL_THREAD_LOCAL_P variables, we can just check their addresses.
+We actually don't insert red zones in between the TLS var, so doing it wouldn't make significant sense.
+
+- User: Uroš Bizjak | Time: 2024-03-21 09:18:26 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #16)> (In reply to Richard Biener fromcomment #13)
+> > The original testcase is fixed, appearantly slapping 'extern' on the int
+> > makes it not effective.
+> > 
+> > Possibly better amend the
+> > 
+> >   if (VAR_P (inner) && DECL_HARD_REGISTER (inner))
+> >     return;
+> > 
+> > check though.  As indicated my fix fixed only VAR_DECL cases, there's
+> > still pointer-based accesses (MEM_REF) to consider.  So possibly even
+> > the following is necessary
+> 
+> I must admit that to create the patch fromComment #11I just mindlessly
+> searched for DECL_THREAD_LOCAL_P in asan.cc and amended the location with
+> ADDR_SPACE_GENERIC_P check.
+> 
+> However, ASAN should back off from annotating *any* gs: prefixed address. 
+> 
+> I'll test your patch fromComment #13ASAP.Weee, it works!
+
+Decompressing Linux... Parsing ELF... Performing relocations... done.
+Booting the kernel (entry_offset: 0x0000000000000000).
+[    0.000000] Linux version 6.8.0-11485-ge1826833c3a9 (uros@localhost) (xgcc (GCC) 14.0.1 20240321 (experimental) [masterr14-9588-g415091f0909], GNU ld version 2.40-14.fc39) #1 SMP PREEMPT_DYNAMIC Thu Mar 21 09:44:30 CET 2024
+...
+
+I have used slightly different patch:
+
+--cut here--
+diff --git a/gcc/asan.cc b/gcc/asan.cc
+index cfe83106460..026d079a4a1 100644
+--- a/gcc/asan.cc
++++ b/gcc/asan.cc
+@@ -2755,6 +2755,9 @@ instrument_derefs (gimple_stmt_iterator *iter, tree t,
+   if (VAR_P (inner) && DECL_HARD_REGISTER (inner))
+     return;
+ 
++  if (!ADDR_SPACE_GENERIC_P (TYPE_ADDR_SPACE (TREE_TYPE (inner))))
++    return;
++
+   poly_int64 decl_size;
+   if ((VAR_P (inner)
+        || (TREE_CODE (inner) == RESULT_DECL
+--cut here--
+
+Hard registers and named address spaces really have nothing in common.
+
+IMO, the fixes here should be applied to all release branches. Running KASAN sanitized kernel with the named AS is the ultimate test for this PR.
+
+- User: Jakub Jelinek | Time: 2024-03-21 09:26:33 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #19)> (In reply to Uroš Bizjak fromcomment #16)
+> > (In reply to Richard Biener fromcomment #13)
+> > > The original testcase is fixed, appearantly slapping 'extern' on the int
+> > > makes it not effective.
+> > > 
+> > > Possibly better amend the
+> > > 
+> > >   if (VAR_P (inner) && DECL_HARD_REGISTER (inner))
+> > >     return;
+> > > 
+> > > check though.  As indicated my fix fixed only VAR_DECL cases, there's
+> > > still pointer-based accesses (MEM_REF) to consider.  So possibly even
+> > > the following is necessary
+> > 
+> > I must admit that to create the patch fromComment #11I just mindlessly
+> > searched for DECL_THREAD_LOCAL_P in asan.cc and amended the location with
+> > ADDR_SPACE_GENERIC_P check.
+> > 
+> > However, ASAN should back off from annotating *any* gs: prefixed address. 
+> > 
+> > I'll test your patch fromComment #13ASAP.
+> 
+> Weee, it works!
+> 
+> Decompressing Linux... Parsing ELF... Performing relocations... done.
+> Booting the kernel (entry_offset: 0x0000000000000000).
+> [    0.000000] Linux version 6.8.0-11485-ge1826833c3a9 (uros@localhost)
+> (xgcc (GCC) 14.0.1 20240321 (experimental) [masterr14-9588-g415091f0909],
+> GNU ld version 2.40-14.fc39) #1 SMP PREEMPT_DYNAMIC Thu Mar 21 09:44:30 CET
+> 2024
+> ...
+> 
+> I have used slightly different patch:
+> 
+> --cut here--
+> diff --git a/gcc/asan.cc b/gcc/asan.cc
+> index cfe83106460..026d079a4a1 100644
+> --- a/gcc/asan.cc
+> +++ b/gcc/asan.cc
+> @@ -2755,6 +2755,9 @@ instrument_derefs (gimple_stmt_iterator *iter, tree t,
+>    if (VAR_P (inner) && DECL_HARD_REGISTER (inner))
+>      return;
+>  
+> +  if (!ADDR_SPACE_GENERIC_P (TYPE_ADDR_SPACE (TREE_TYPE (inner))))
+> +    return;
+> +Agreed, this looks better.
+
+Though, talking about address spaces, guess we also need to change ubsan.cc,
+so that for targetm.addr_space.zero_address_valid (as) case it actually doesn't try to
+verify the pointers aren't NULL (it still should check alignment).
+
+- User: Jakub Jelinek | Time: 2024-03-21 09:41:21 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #20)> Though, talking about address spaces, guess we also need to change ubsan.cc,
+> so that for targetm.addr_space.zero_address_valid (as) case it actually
+> doesn't try to
+> verify the pointers aren't NULL (it still should check alignment).I'll handle that.
+
+- User: GCC Commits | Time: 2024-03-21 09:49:23 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:134ef2a8cac1a5cc718739bd7d3b3472947c80d6commitr14-9590-g134ef2a8cac1a5cc718739bd7d3b3472947c80d6Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Mar 21 08:30:39 2024 +0100
+
+    tree-optimization/111736 - avoid address sanitizing of __seg_gs
+    
+    The following more thoroughly avoids address sanitizing accesses
+    to non-generic address-spaces.PR tree-optimization/111736* asan.cc (instrument_derefs): Do not instrument accesses
+            to non-generic address-spaces.
+    
+            * gcc.target/i386/pr111736.c: New testcase.
+
+- User: GCC Commits | Time: 2024-03-21 11:49:22 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:6d5eb47849bcf9aecefacf7d7e4767750b1ec83bcommitr13-8476-g6d5eb47849bcf9aecefacf7d7e4767750b1ec83bAuthor: Richard Biener <rguenther@suse.de>
+Date:   Thu Mar 21 08:30:39 2024 +0100
+
+    tree-optimization/111736 - avoid address sanitizing of __seg_gs
+    
+    The following more thoroughly avoids address sanitizing accesses
+    to non-generic address-spaces.PR tree-optimization/111736* asan.cc (instrument_derefs): Do not instrument accesses
+            to non-generic address-spaces.
+    
+            * gcc.target/i386/pr111736.c: New testcase.
+    
+    (cherry picked from commit 134ef2a8cac1a5cc718739bd7d3b3472947c80d6)
+
+- User: Jakub Jelinek | Time: 2024-03-21 12:56:10 UTC
+  Text: Createdattachment 57756[details]gcc14-pr111736-ubsan.patch
+
+Untested ubsan patch.
+
+- User: GCC Commits | Time: 2024-03-22 08:25:20 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:ddd4a3ca87410886b039cc225907b4f6e650082ecommitr14-9610-gddd4a3ca87410886b039cc225907b4f6e650082eAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Mar 22 09:23:44 2024 +0100
+
+    ubsan: Don't -fsanitize=null instrument __seg_fs/gs pointers [PR111736]
+    
+    On x86 and avr some address spaces allow 0 pointers (on avr actually
+    even generic as, but libsanitizer isn't ported to it and
+    I'm not convinced we should completely kill -fsanitize=null in that
+    case).
+    The following patch makes sure those aren't diagnosed for -fsanitize=null,
+    though they are still sanitized for -fsanitize=alignment.
+    
+    2024-03-22  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/111736* ubsan.cc (ubsan_expand_null_ifn, instrument_mem_ref): Avoid
+            SANITIZE_NULL instrumentation for non-generic address spaces
+            for which targetm.addr_space.zero_address_valid (as) is true.
+    
+            * gcc.dg/ubsan/pr111736.c: New test.
+
+- User: Uroš Bizjak | Time: 2024-03-25 09:13:44 UTC
+  Text: Do we also need to adjust TSAN? There is a bugreport that KCSAN does work correctly with the named address spaces.
+
+- User: Jakub Jelinek | Time: 2024-03-25 09:31:55 UTC
+  Text: I think it should.
+E.g. for
+int __seg_fs a;
+
+void
+foo (int __seg_fs *p)
+{
+  a = *p;
+}
+the instrumentation is
+  _5 = __builtin_return_address (0);
+  __builtin___tsan_func_entry (_5);
+  __builtin___tsan_read4 (p_3(D));
+  _1 = *p_3(D);
+  __builtin___tsan_write4 (&a);
+  a = _1;
+  __builtin___tsan_func_exit (); [tail call]
+but neither __tsan_read4 nor __tsan_write4 will know that the address they are passed are not from the generic address space.
+
+- User: Jakub Jelinek | Time: 2024-03-25 09:45:39 UTC
+  Text: Createdattachment 57807[details]gcc14-pr111736-tsan.patch
+
+Untested patch for tsan.
+
+- User: Uroš Bizjak | Time: 2024-03-25 10:20:15 UTC
+  Text: Do we also need to adjust TSAN? There is a bugreport that KCSAN does work correctly with the named address spaces.(In reply to Jakub Jelinek fromcomment #28)> Createdattachment 57807[details]> gcc14-pr111736-tsan.patch
+> 
+> Untested patch for tsan.Yes, this patch fixes the failure for linux kernel.
+
+- User: GCC Commits | Time: 2024-03-26 10:13:32 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:471967ab8b4c49338ba77defbe24b06cc51c0093commitr14-9667-g471967ab8b4c49338ba77defbe24b06cc51c0093Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Mar 26 11:06:15 2024 +0100
+
+    tsan: Don't instrument non-generic AS accesses [PR111736]
+    
+    Similar to the asan and ubsan changes, we shouldn't instrument non-generic
+    address space accesses with tsan, because we just have library functions
+    which take address of the objects as generic address space pointers, so they
+    can't handle anything else.
+    
+    2024-03-26  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/111736* tsan.cc (instrument_expr): Punt on non-generic address space
+            accesses.
+    
+            * gcc.dg/tsan/pr111736.c: New test.
+
+- User: GCC Commits | Time: 2024-03-30 03:55:24 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:05de873353ab9e94cda2b9e9561a82ca4e061c3fcommitr13-8520-g05de873353ab9e94cda2b9e9561a82ca4e061c3fAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Mar 22 09:23:44 2024 +0100
+
+    ubsan: Don't -fsanitize=null instrument __seg_fs/gs pointers [PR111736]
+    
+    On x86 and avr some address spaces allow 0 pointers (on avr actually
+    even generic as, but libsanitizer isn't ported to it and
+    I'm not convinced we should completely kill -fsanitize=null in that
+    case).
+    The following patch makes sure those aren't diagnosed for -fsanitize=null,
+    though they are still sanitized for -fsanitize=alignment.
+    
+    2024-03-22  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/111736* ubsan.cc (ubsan_expand_null_ifn, instrument_mem_ref): Avoid
+            SANITIZE_NULL instrumentation for non-generic address spaces
+            for which targetm.addr_space.zero_address_valid (as) is true.
+    
+            * gcc.dg/ubsan/pr111736.c: New test.
+    
+    (cherry picked from commit ddd4a3ca87410886b039cc225907b4f6e650082e)
+
+- User: GCC Commits | Time: 2024-03-30 03:55:34 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:85b2b99e56b6f54b3feb530b2492955486e3d389commitr13-8522-g85b2b99e56b6f54b3feb530b2492955486e3d389Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Mar 26 11:06:15 2024 +0100
+
+    tsan: Don't instrument non-generic AS accesses [PR111736]
+    
+    Similar to the asan and ubsan changes, we shouldn't instrument non-generic
+    address space accesses with tsan, because we just have library functions
+    which take address of the objects as generic address space pointers, so they
+    can't handle anything else.
+    
+    2024-03-26  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/111736* tsan.cc (instrument_expr): Punt on non-generic address space
+            accesses.
+    
+            * gcc.dg/tsan/pr111736.c: New test.
+    
+    (cherry picked from commit 471967ab8b4c49338ba77defbe24b06cc51c0093)
+
+- User: GCC Commits | Time: 2024-04-23 17:09:11 UTC
+  Text: The releases/gcc-12 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:61d1962e7c3c32da6962d9cb20f6fd996501f3f2commitr12-10387-g61d1962e7c3c32da6962d9cb20f6fd996501f3f2Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Dec 5 14:00:43 2023 +0100
+
+    sanitizer/111736 - skip ASAN for globals in alternate address-spacePR sanitizer/111736* asan.cc (asan_protect_global): Do not protect globals
+            in non-generic address-space.
+    
+    (cherry picked from commit 7e40497805c0831596334fe474112f991276e11b)
+
+- User: GCC Commits | Time: 2024-04-23 17:09:17 UTC
+  Text: The releases/gcc-12 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:e89b5ed62a5a06fb8918ffa1616f0f37c8d359c3commitr12-10388-ge89b5ed62a5a06fb8918ffa1616f0f37c8d359c3Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Mar 21 08:30:39 2024 +0100
+
+    tree-optimization/111736 - avoid address sanitizing of __seg_gs
+    
+    The following more thoroughly avoids address sanitizing accesses
+    to non-generic address-spaces.PR tree-optimization/111736* asan.cc (instrument_derefs): Do not instrument accesses
+            to non-generic address-spaces.
+    
+            * gcc.target/i386/pr111736.c: New testcase.
+    
+    (cherry picked from commit 134ef2a8cac1a5cc718739bd7d3b3472947c80d6)
+
+- User: GCC Commits | Time: 2024-04-23 17:09:23 UTC
+  Text: The releases/gcc-12 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:d6c62e4fb9a6d395599b7c78c831bace4bc7ff8fcommitr12-10389-gd6c62e4fb9a6d395599b7c78c831bace4bc7ff8fAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Mar 22 09:23:44 2024 +0100
+
+    ubsan: Don't -fsanitize=null instrument __seg_fs/gs pointers [PR111736]
+    
+    On x86 and avr some address spaces allow 0 pointers (on avr actually
+    even generic as, but libsanitizer isn't ported to it and
+    I'm not convinced we should completely kill -fsanitize=null in that
+    case).
+    The following patch makes sure those aren't diagnosed for -fsanitize=null,
+    though they are still sanitized for -fsanitize=alignment.
+    
+    2024-03-22  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/111736* ubsan.cc (ubsan_expand_null_ifn, instrument_mem_ref): Avoid
+            SANITIZE_NULL instrumentation for non-generic address spaces
+            for which targetm.addr_space.zero_address_valid (as) is true.
+    
+            * gcc.dg/ubsan/pr111736.c: New test.
+    
+    (cherry picked from commit ddd4a3ca87410886b039cc225907b4f6e650082e)
+
+- User: GCC Commits | Time: 2024-04-23 17:09:29 UTC
+  Text: The releases/gcc-12 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:48fd1c5791b47717dcd4fa5615bc07cf54e964a7commitr12-10390-g48fd1c5791b47717dcd4fa5615bc07cf54e964a7Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Mar 26 11:06:15 2024 +0100
+
+    tsan: Don't instrument non-generic AS accesses [PR111736]
+    
+    Similar to the asan and ubsan changes, we shouldn't instrument non-generic
+    address space accesses with tsan, because we just have library functions
+    which take address of the objects as generic address space pointers, so they
+    can't handle anything else.
+    
+    2024-03-26  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/111736* tsan.cc (instrument_expr): Punt on non-generic address space
+            accesses.
+    
+            * gcc.dg/tsan/pr111736.c: New test.
+    
+    (cherry picked from commit 471967ab8b4c49338ba77defbe24b06cc51c0093)
+
+- User: GCC Commits | Time: 2024-04-24 14:39:49 UTC
+  Text: The releases/gcc-11 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:b86b523fb53f5ffb0e3f3236fc526a587944d9eacommitr11-11349-gb86b523fb53f5ffb0e3f3236fc526a587944d9eaAuthor: Richard Biener <rguenther@suse.de>
+Date:   Tue Dec 5 14:00:43 2023 +0100
+
+    sanitizer/111736 - skip ASAN for globals in alternate address-space
+    
+    gcc/ChangeLog:PR sanitizer/111736* asan.c (asan_protect_global): Do not protect globals
+            in non-generic address-space.
+    
+    (cherry picked from commit 7e40497805c0831596334fe474112f991276e11b)
+
+- User: GCC Commits | Time: 2024-04-24 14:39:54 UTC
+  Text: The releases/gcc-11 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:b4e1aee01a2fa617cf74ab04cf0ab574761aaaeacommitr11-11350-gb4e1aee01a2fa617cf74ab04cf0ab574761aaaeaAuthor: Richard Biener <rguenther@suse.de>
+Date:   Thu Mar 21 08:30:39 2024 +0100
+
+    tree-optimization/111736 - avoid address sanitizing of __seg_gs
+    
+    The following more thoroughly avoids address sanitizing accesses
+    to non-generic address-spaces.
+    
+    gcc/ChangeLog:PR tree-optimization/111736* asan.c (instrument_derefs): Do not instrument accesses
+            to non-generic address-spaces.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr111736.c: New testcase.
+    
+    (cherry picked from commit 134ef2a8cac1a5cc718739bd7d3b3472947c80d6)
+
+- User: GCC Commits | Time: 2024-04-24 14:39:59 UTC
+  Text: The releases/gcc-11 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:624c3bb9ff762f196852dc77233610d1cdf7d7becommitr11-11351-g624c3bb9ff762f196852dc77233610d1cdf7d7beAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Mar 22 09:23:44 2024 +0100
+
+    ubsan: Don't -fsanitize=null instrument __seg_fs/gs pointers [PR111736]
+    
+    On x86 and avr some address spaces allow 0 pointers (on avr actually
+    even generic as, but libsanitizer isn't ported to it and
+    I'm not convinced we should completely kill -fsanitize=null in that
+    case).
+    The following patch makes sure those aren't diagnosed for -fsanitize=null,
+    though they are still sanitized for -fsanitize=alignment.
+    
+    2024-03-22  Jakub Jelinek  <jakub@redhat.com>
+    
+    gcc/ChangeLog:PR sanitizer/111736* ubsan.c (ubsan_expand_null_ifn, instrument_mem_ref): Avoid
+            SANITIZE_NULL instrumentation for non-generic address spaces
+            for which targetm.addr_space.zero_address_valid (as) is true.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/ubsan/pr111736.c: New test.
+    
+    (cherry picked from commit ddd4a3ca87410886b039cc225907b4f6e650082e)
+
+- User: GCC Commits | Time: 2024-04-24 14:40:05 UTC
+  Text: The releases/gcc-11 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:09910b6753427eeb3f6dded4fae3578851da7422commitr11-11352-g09910b6753427eeb3f6dded4fae3578851da7422Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Mar 26 11:06:15 2024 +0100
+
+    tsan: Don't instrument non-generic AS accesses [PR111736]
+    
+    Similar to the asan and ubsan changes, we shouldn't instrument non-generic
+    address space accesses with tsan, because we just have library functions
+    which take address of the objects as generic address space pointers, so they
+    can't handle anything else.
+    
+    2024-03-26  Jakub Jelinek  <jakub@redhat.com>
+    
+    gcc/ChangeLog:PR sanitizer/111736* tsan.c (instrument_expr): Punt on non-generic address space
+            accesses.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tsan/pr111736.c: New test.
+    
+    (cherry picked from commit 471967ab8b4c49338ba77defbe24b06cc51c0093)
+
+- User: Uroš Bizjak | Time: 2024-04-24 14:41:38 UTC
+  Text: Fixed everywhere.
+
+- User: Fedor Pchelkin | Time: 2024-05-20 19:53:51 UTC
+  Text: Hi,
+
+I'm facing upstream Linux kernel boot failures with KASAN enabled after recent x86/percpu updates. HEAD kernel commit is daa121128a2d2ac6006159e2c47676e4fcd21eab.
+
+The kernel is built with GCC 14.1.1 20240507. It's Arch Linux, package details here [1].
+
+The failing Linux kernel commit is f61f02d1ff78 ("x86/percpu: Re-enable named address spaces with KASAN for GCC 13.3+") [2].
+
+You see that the above kernel commit states that GCC 14 must be fixed with
+patches from this pull-request:
+
+    Note that the patch considers GCC 14 to be fixed - if somebody is
+    using snapshots of the GCC 14 before the fix, they should upgrade.
+
+I'm not familiar with GCC stable branches model but it seems to me that GCC 13.3 was fixed with patches from this pull-request while GCC 14.1 didn't get the fixes at the time. Or it did? frankly speaking, I haven't been able to figure it out for sure (and would be surprised if latest GCC 14 release didn't get the fixes before the kernel received an x86/percpu update regarding this issue).
+
+If GCC 14.1 is fixed then there is probably another issue found. However, I still think that if it was a real widespread problem, then somebody would have already reported it. So maybe my kernel-config is just weird :)
+
+I've attached a dmesg output and kernel config I use for testing.
+
+The failing code lines are decoded as following:
+__text_poke+0x493/0xd50:
+use_temporary_mm at arch/x86/kernel/alternative.c:1789 (discriminator 2)
+(inlined by) __text_poke at arch/x86/kernel/alternative.c:1904 (discriminator 2)
+
+This concerns a percpu variable access:
+
+static inline temp_mm_state_t use_temporary_mm(struct mm_struct *mm)
+{
+[...]
+	/*
+	 * Make sure not to be in TLB lazy mode, as otherwise we'll end up
+	 * with a stale address space WITHOUT being in lazy mode after
+	 * restoring the previous mm.
+	 */
+	if (this_cpu_read(cpu_tlbstate_shared.is_lazy))
+		leave_mm();
+
+
+[1]:https://gitlab.archlinux.org/archlinux/packaging/packages/gcc/-/blob/main/PKGBUILD?ref_type=heads[2]:https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=f61f02d1ff788ae5ad485ef8edd88d9c93557994
+
+- User: Fedor Pchelkin | Time: 2024-05-20 19:56:02 UTC
+  Text: Createdattachment 58253[details]kernel-config
+
+Kernel config used for building the kernel.
+
+- User: Fedor Pchelkin | Time: 2024-05-20 19:57:36 UTC
+  Text: Createdattachment 58254[details]dmesg-log
+
+The whole kernel log for booting failure.
+
+- User: Uroš Bizjak | Time: 2024-05-21 08:19:14 UTC
+  Text: Yes, I can confirm the Oops due to sanitization of %gs: prefixed variable:
+
+  307eee:	48 c7 c0 00 00 00 00 	mov    $0x0,%rax
+			307ef1: R_X86_64_32S	cpu_tlbstate_shared
+  307ef5:	48 ba 00 00 00 00 00 	movabs $0xdffffc0000000000,%rdx
+  307efc:	fc ff df 
+  307eff:	48 c1 e8 03          	shr    $0x3,%rax
+  307f03:	0f b6 04 10          	movzbl (%rax,%rdx,1),%eax
+  307f07:	84 c0                	test   %al,%al
+  307f09:	74 06                	je     307f11 <__text_poke+0x4a1>
+  307f0b:	0f 8e f0 07 00 00    	jle    308701 <__text_poke+0xc91>
+  307f11:	65 44 0f b6 35 00 00 	movzbl %gs:0x0(%rip),%r14d        # 307f1a <__text_poke+0x4aa>
+  307f18:	00 00 
+			307f16: R_X86_64_PC32	cpu_tlbstate_shared-0x4
+
+- User: Uroš Bizjak | Time: 2024-05-21 09:01:12 UTC
+  Text: Createdattachment 58259[details]Preprocessed file
+
+gcc -O2 -fsanitize=kernel-address -fasan-shadow-offset=0xdffffc0000000000 --param asan-instrumentation-with-call-threshold=10000 -fsanitize=bool -S alternative.i
+
+results in:
+
+	movabsq	$-2305847407260205056, %rdx
+	movl	$cpu_tlbstate_shared, %eax
+	shrq	$3, %rax
+	movzbl	(%rax,%rdx), %eax
+	testb	%al, %al
+	je	.L399
+	jle	.L473
+.L399:
+	movzbl	%gs:cpu_tlbstate_shared(%rip), %r14d
+	cmpb	$1, %r14b
+
+which is wrong. %gs: prefixed addresses should not be sanitized.
+
+- User: Uroš Bizjak | Time: 2024-05-21 09:03:56 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #46)> Createdattachment 58259[details]> Preprocessed file
+> 
+> gcc -O2 -fsanitize=kernel-address -fasan-shadow-offset=0xdffffc0000000000
+> --param asan-instrumentation-with-call-threshold=10000 -fsanitize=bool -S
+> alternative.iOmitting -fsanitize=bool compiles to:
+
+	movzbl	%gs:cpu_tlbstate_shared(%rip), %eax
+	testb	%al, %al
+
+where no sanitization is present with the above variable.
+
+- User: Richard Biener | Time: 2024-05-21 09:18:57 UTC
+  Text: Would have been nice to have a new bugreport for -fsanitize=bool.
+
+- User: Uroš Bizjak | Time: 2024-05-21 09:20:45 UTC
+  Text: (In reply to Richard Biener fromcomment #48)> Would have been nice to have a new bugreport for -fsanitize=bool.Will do in a moment.
+
+- User: Uroš Bizjak | Time: 2024-05-21 09:55:33 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #49)> Will do in a moment.PR 115172
+
+- User: Andrew Pinski | Time: 2024-08-24 20:40:11 UTC
+  Text: Recording since I noticed this while running the gcc testsuite with -g enabled,  the testcase ICEs with -g, but that isPR 100530.
+

@@ -1,0 +1,286 @@
+Bug Summary: [11/12/13/14/15 Regression] complex abs does not vectorise
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 5.5.0
+Known to Fail: 6.1.0
+
+Comments:
+- User: N/A | Time: 2024-06-29 15:34:46 UTC
+  Text: subroutine foo(a,b,n)
+  complex(kind(1d0))::a(*)
+  real(kind(1d0))::b(*)
+  integer::i,n
+
+  do i=1,n
+     b(i)=abs(a(i))**2
+  end do
+
+end subroutine foo
+
+fails to vectorise with "gfortran-14 -mavx2 -mfma -Ofast".
+
+I am very impressed that the **2 simply removes the sqrt, so the above code is simpler than the code without **2 (which also doesn't vectorise, and should). I am also impressed that
+
+  b(i)=a(i)*conjg(a(i))
+
+and
+
+  b(i)=real(a(i))*real(a(i))+aimag(a(i))*aimag(a(i))
+
+produce identical, vectorised, assembler. But the abs example ought to be the same too.
+
+- User: N/A | Time: 2024-06-29 15:54:50 UTC
+  Text: Looks like a wrong component was chosen.  I get nearly identical assembly with
+
+#include <complex.h>
+#include <math.h>
+
+void
+foo(double complex *a, double *b, int n)
+{
+  for (int i=0; i < n; i++)
+     b[i] = cabs(a[i]) * cabs(a[i]);
+}
+
+~/work/bin/gcc      -S -mavx2 -mfma -Ofast -o zc.s a.c
+~/work/bin/gfortran -S -mavx2 -mfma -Ofast -o zf.s -fno-underscore a.f90
+
+- User: Andrew Pinski | Time: 2024-06-29 17:47:20 UTC
+  Text: /app/example.cpp:7:19: note:   === vect_analyze_data_refs ===
+/app/example.cpp:7:19: missed:   not vectorized: no vectype for stmt: _4 = *_3;
+ scalar_type: complex doubleD.46
+/app/example.cpp:8:13: missed:   not vectorized: no vectype for stmt: _4 = *_3;
+ scalar_type: complex double
+
+
+Confirmed.
+
+- User: Andrew Pinski | Time: 2024-06-29 17:59:20 UTC
+  Text: So before forwprop3 we have:
+```
+  _10 = REALPART_EXPR <*_3>;
+  _9 = IMAGPART_EXPR <*_3>;
+  _4 = COMPLEX_EXPR <_10, _9>;
+  _5 = cabs (_4);
+  _6 = _1 * 8;
+  _7 = b_14(D) + _6;
+  reassocpow_18 = __builtin_powi (_5, 2);
+
+```
+
+After we get:
+```
+  _10 = REALPART_EXPR <*_3>;
+  _4 = *_3;
+  _9 = IMAGPART_EXPR <*_3>;
+  _5 = cabs (_4);
+  _6 = _1 * 8;
+  _7 = b_14(D) + _6;
+  reassocpow_18 = __builtin_powi (_5, 2);
+```
+Which undoes complex lowering.
+
+But then powcabs does:
+```
+  _10 = REALPART_EXPR <*_3>;
+  _4 = *_3;
+  _9 = IMAGPART_EXPR <*_3>;
+  cabs_8 = REALPART_EXPR <_4>;
+  cabs_17 = cabs_8 * cabs_8;
+  cabs_22 = IMAGPART_EXPR <_4>;
+  cabs_23 = cabs_22 * cabs_22;
+  cabs_24 = cabs_17 + cabs_23;
+  powroot_25 = __builtin_sqrt (cabs_24);
+  _5 = powroot_25;
+  _6 = _1 * 8;
+  _7 = b_14(D) + _6;
+  powmult_26 = _5 * _5;
+  reassocpow_18 = powmult_26;
+  *_7 = reassocpow_18;
+```
+Which redoes some of the complex lowering but misses undoing the undo of COMPLEX_EXPR<REAL<*3>, IMAG<*3>> ...
+
+This is a regression even as GCC 5 used to be able top vectorize it.
+
+- User: Richard Biener | Time: 2024-06-30 10:20:29 UTC
+  Text: I think this is a pass ordering issue between complex lowering, forwprop and powcabs.
+
+This is also a missed CSE opportunity in PREs VN instance:
+
+  _5 = REALPART_EXPR <(*a_9(D))[_1]>;
+  _2 = (*a_9(D))[_1];
+  _4 = IMAGPART_EXPR <(*a_9(D))[_1]>;
+  cabs_11 = REALPART_EXPR <_2>;
+
+here the realpart of _2 should have been CSEd to _5.
+
+I wonder if we shouldn't do CABS expansion during complex lowering instead?
+Both are technically to get closer to the target.
+
+I'm putting it on my TODO but I don't expect to have cycles to look at
+any of the above.
+
+- User: Andrew Pinski | Time: 2024-06-30 17:43:26 UTC
+  Text: (In reply to Richard Biener fromcomment #4)> I wonder if we shouldn't do CABS expansion during complex lowering instead?It would be one less pass around the IR too so it could speed up the compiler slightly. My todo list is too long right now too. Maybe I can put it above loop flattening.
+
+- User: Andrew Pinski | Time: 2024-06-30 18:20:13 UTC
+  Text: (In reply to Andrew Pinski fromcomment #5)> (In reply to Richard Biener fromcomment #4)
+> > I wonder if we shouldn't do CABS expansion during complex lowering instead?
+> 
+> It would be one less pass around the IR too so it could speed up the
+> compiler slightly. My todo list is too long right now too. Maybe I can put
+> it above loop flattening.Oh powcabs handles also powi expansion too so it won't remove the pass around the IR.
+
+Anyways I am going to take a stab at moving cabs expansion to complex lowering where it should be instead.
+
+- User: Andrew Pinski | Time: 2024-06-30 20:18:43 UTC
+  Text: Createdattachment 58544[details]Patch which I am testing
+
+I will add a few testcases too.
+
+- User: Andrew Pinski | Time: 2024-06-30 21:47:30 UTC
+  Text: I wonder if we could also add:
++/* cabs(x+0i) or cabs(0+xi) -> abs(x).  */
++(simplify
++ (CABS (complex:c @0 real_zerop@1))
++ (abs @0))
+
+
++ /* cabs(x+xi) -> fabs(x)*sqrt(2).  */
++ (simplify
++  (CABS (complex @0 @0))
++  (mult (abs @0) { build_real_truncate (type, dconst_sqrt2 ()); })))
+
+
+to the lowering part.
+
+let me look into doing that but it will be 3rd part to the patch series. Since we should have this info already ...
+
+- User: Andrew Pinski | Time: 2024-07-01 00:48:18 UTC
+  Text: (In reply to Andrew Pinski fromcomment #8)> I wonder if we could also add:
+> +/* cabs(x+0i) or cabs(0+xi) -> abs(x).  */
+> +(simplify
+> + (CABS (complex:c @0 real_zerop@1))
+> + (abs @0))
+> 
+> 
+> + /* cabs(x+xi) -> fabs(x)*sqrt(2).  */
+> + (simplify
+> +  (CABS (complex @0 @0))
+> +  (mult (abs @0) { build_real_truncate (type, dconst_sqrt2 ()); })))
+> 
+> 
+> to the lowering part.
+> 
+> let me look into doing that but it will be 3rd part to the patch series.
+> Since we should have this info already ...This is needed to get the same code generation as before for:
+```
+double f(double a, double c)
+{
+  _Complex double b = a;
+  b+= c;
+  return __builtin_cabs(b);
+}
+```
+
+- User: Andrew Pinski | Time: 2024-07-01 01:08:03 UTC
+  Text: (In reply to Andrew Pinski fromcomment #9)> (In reply to Andrew Pinski fromcomment #8)
+> > I wonder if we could also add:
+> > +/* cabs(x+0i) or cabs(0+xi) -> abs(x).  */
+> > +(simplify
+> > + (CABS (complex:c @0 real_zerop@1))
+> > + (abs @0))
+> > 
+> > 
+> > + /* cabs(x+xi) -> fabs(x)*sqrt(2).  */
+> > + (simplify
+> > +  (CABS (complex @0 @0))
+> > +  (mult (abs @0) { build_real_truncate (type, dconst_sqrt2 ()); })))
+> > 
+> > 
+> > to the lowering part.
+> > 
+> > let me look into doing that but it will be 3rd part to the patch series.
+> > Since we should have this info already ...
+> 
+> This is needed to get the same code generation as before for:
+> ```
+> double f(double a, double c)
+> {
+>   _Complex double b = a;
+>   b+= c;
+>   return __builtin_cabs(b);
+> }
+> ```And the other testcase that matters here:
+```
+double f(double a, double c)
+{
+  _Complex double d = __builtin_complex (a, a);
+  d+=__builtin_complex(1.0, 1.0);
+  return __builtin_cabs(d);
+}
+
+```
+
+- User: rguenther@suse.de | Time: 2024-07-01 06:38:54 UTC
+  Text: On Sun, 30 Jun 2024, pinskia at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=115710> 
+> ---Comment #8from Andrew Pinski <pinskia at gcc dot gnu.org> ---
+> I wonder if we could also add:
+> +/* cabs(x+0i) or cabs(0+xi) -> abs(x).  */
+> +(simplify
+> + (CABS (complex:c @0 real_zerop@1))
+> + (abs @0))
+> 
+> 
+> + /* cabs(x+xi) -> fabs(x)*sqrt(2).  */
+> + (simplify
+> +  (CABS (complex @0 @0))
+> +  (mult (abs @0) { build_real_truncate (type, dconst_sqrt2 ()); })))
+> 
+> 
+> to the lowering part.
+> 
+> let me look into doing that but it will be 3rd part to the patch series. Since
+> we should have this info already ...Complex lowering should use its lattice to do the usual simplifications,
+sure.  Having those simplification patterns would be OK as well
+of course.
+
+- User: Andrew Pinski | Time: 2024-07-01 22:24:03 UTC
+  Text: Patch series posted:https://inbox.sourceware.org/gcc-patches/20240701214657.3163066-1-quic_apinski@quicinc.com/T/#m57efaefcfff718bd712822ae490bb5aeba69a578
+
+- User: GCC Commits | Time: 2024-07-02 21:38:52 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:d8fe4f05ef448e6a136398d38c0f2170d3c6bb0dcommitr15-1797-gd8fe4f05ef448e6a136398d38c0f2170d3c6bb0dAuthor: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Sun Jun 30 12:57:14 2024 -0700
+
+    Move cabs expansion from powcabs to complex lowering [PR115710]
+    
+    Expanding cabs in powcab might be too late as forwprop might
+    recombine the load from a memory with the complex expr. Moving
+    instead to complex lowering allows us to use directly the real/imag
+    component from the loads instead. This allows for vectorization too.
+    
+    Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/115710gcc/ChangeLog:
+    
+            * tree-complex.cc (init_dont_simulate_again): Handle CABS.
+            (gimple_expand_builtin_cabs): New function, moved mostly
+            from tree-ssa-math-opts.cc.
+            (expand_complex_operations_1): Call gimple_expand_builtin_cabs.
+            * tree-ssa-math-opts.cc (gimple_expand_builtin_cabs): Remove.
+            (build_and_insert_binop): Remove.
+            (pass_data_expand_powcabs): Update comment.
+            (pass_expand_powcabs::execute): Don't handle CABS.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/cabs-1.c: New test.
+            * gcc.dg/tree-ssa/cabs-2.c: New test.
+            * gfortran.dg/vect/pr115710.f90: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-07-02 21:44:08 UTC
+  Text: Fixed on the trunk, I don't think this should be backported; it has too many moving parts of it.
+

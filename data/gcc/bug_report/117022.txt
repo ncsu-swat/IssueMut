@@ -1,0 +1,188 @@
+Bug Summary: [C2y] Implement N3355, Named loops
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Marek Polacek | Time: 2024-10-08 17:47:54 UTC
+  Text: See <https://www.open-std.org/jtc1/sc22/wg14/www/docs/n3355.htm>.
+
+- User: Marek Polacek | Time: 2024-10-08 17:48:15 UTC
+  Text: There is a request for a do-while example to be added editorially.
+
+- User: Jakub Jelinek | Time: 2024-10-08 18:10:03 UTC
+  Text: Createdattachment 59299[details]gcc15-pr117022-wip.patch
+
+My current WIP.  Still needs c-gimplify.cc support (right now it is parsed and some errors diagnosed but in the end gimplified as if it was innermost break or continue), testsuite coverage, guess some spellcheck suggestions when using wrong identifier which is close to the actual ones, and figure out how to diagnose trying to escape from OpenMP/OpenACC regions through break very_outer or continue very_outer, and see what we actually do and don't allow for OpenMP/OpenACC loops (the details for them will need to be standardized though in a couple of years); guess it is fine to pretend OpenMP outermost loop isn't named at least for now.  After all, any break/continue except from innermost collapsed loop will be invalid in OpenMP.
+
+- User: Jakub Jelinek | Time: 2024-10-09 16:44:02 UTC
+  Text: Createdattachment 59301[details]gcc15-pr117022-wip.patch
+
+Some further progress on this.  Still not handling correctly nested functions, I think I should move loop_names{,_hash} from parser to c-typeck.cc or c-decl.cc, and start writing testcases.  But this patch should already work for simple tests.
+
+- User: Jakub Jelinek | Time: 2024-10-10 17:17:03 UTC
+  Text: Createdattachment 59311[details]gcc15-pr117022.patch
+
+Full untested patch, which I'm going to test tonight.
+
+- User: GCC Commits | Time: 2024-10-15 18:47:15 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:50f27896adb272b40ab03a56fd192e74789bef97commitr15-4369-g50f27896adb272b40ab03a56fd192e74789bef97Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Oct 15 20:41:18 2024 +0200
+
+    c: Implement C2Y N3355 - Named Loops [PR117022]
+    
+    The following patch implements the C2Y N3355 - Named Loops paper.
+    
+    I've tried to implement it lazily, rather than proactively e.g. push
+    labels to a vector just in case the following statement is iteration
+    statement, switch statement or one of the loop pragmas followed by
+    iteration statement the patch just notes the last statement in
+    cur_stmt_list if any before c_parser_label/c_parser_all_labels and
+    passes it down to the iteration/switch statement parsing routines,
+    which then search backward for LABEL_EXPRs before they reach the given
+    stop statement.
+    
+    The patch then adds one extra argument to
+    {FOR,WHILE,DO,BREAK,CONTINUE,SWITCH}_STMT, which is set to a canonical
+    name LABEL_DECL (the last named label before the construct).
+    If one just refers to the innermost construct with a fancy name,
+    it is in the end parsed the same as break/continue without an identifier
+    (i.e. NULL_TREE argument), and if a loop or switch has name(s) but
+    break/continue to that isn't used, the name is set to NULL_TREE.
+    At c-gimplify.cc time the name is then pushed into a hash map mapping
+    it to a pair of labels.
+    
+    I've implemented it also for ObjC foreach loops (which have break/continue
+    handled during parsing, not during c-gimplify.cc).
+    
+    As for OpenMP/OpenACC, the patch right now pretends no OpenMP loop
+    has a name, until something different is decided in the standard.
+    As shown in the testcases, most break identifier/continue identifier
+    cases aren't really useful in OpenMP code, a break identifier or
+    continue identifier jumping out of an OpenMP region is certainly invalid
+    (such regions have to be single entry single exit, so escaping it
+    through goto/break lab/continue lab violates that), similarly break
+    is disallowed in the innermost OpenMP nested loop, just continue
+    is allowed, so the only thing that would make sense for OpenMP (second
+    gomp testcase) would be allowing to give name to the innermost
+    loop in OpenMP canonical loop nest (except that labels aren't allowed
+    in the syntax right now in between the loops) and only continue to
+    that label.  For collapse(1) loops that would be a label before
+    the #pragma or [[omp::directive (parallel for)]] etc.  And of course,
+    what already works fine in the patch is break/continue to non-OpenMP loops
+    nested in OpenMP loops.
+    
+    2024-10-12  Jakub Jelinek  <jakub@redhat.com>PR c/117022gcc/c-family/
+            * c-common.def (FOR_STMT, WHILE_STMT, DO_STMT, BREAK_STMT,
+            CONTINUE_STMT, SWITCH_STMT): Add an extra operand, *_NAME
+            and document it.
+            * c-common.h (bc_hash_map_t): New typedef.
+            (struct bc_state): Add bc_hash_map member.
+            (WHILE_NAME, DO_NAME, FOR_NAME, BREAK_NAME, CONTINUE_NAME,
+            SWITCH_STMT_NAME): Define.
+            * c-pretty-print.cc (c_pretty_printer::statement): Print
+            BREAK_STMT or CONTINUE_STMT operand if any.
+            * c-gimplify.cc (bc_hash_map): New static variable.
+            (note_named_bc, release_named_bc): New functions.
+            (save_bc_state): Save and clear bc_hash_map.
+            (restore_bc_state): Assert NULL and restore bc_hash_map.
+            (genericize_c_loop): Add NAME argument, call note_named_bc
+            and release_named_bc if non-NULL around the body walk.
+            (genericize_for_stmt, genericize_while_stmt, genericize_do_stmt):
+            Adjust callers of it.
+            (genericize_switch_stmt): Rename break_block variable to blab.
+            Call note_named_bc and release_named_bc if SWITCH_STMT_NAME is
+            non-NULL around the body walk.
+            (genericize_continue_stmt): Handle non-NULL CONTINUE_NAME.
+            (genericize_break_stmt): Handle non-NULL BREAK_NAME.
+            (c_genericize): Delete and clear bc_hash_map.
+    gcc/c/
+            * c-tree.h: Implement C2Y N3355 - Named loops.
+            (C_DECL_LOOP_NAME, C_DECL_SWITCH_NAME, C_DECL_LOOP_SWITCH_NAME_VALID,
+            C_DECL_LOOP_SWITCH_NAME_USED, IN_NAMED_STMT): Define.
+            (c_get_loop_names, c_release_loop_names, c_finish_bc_name): Declare.
+            (c_start_switch): Add NAME argument.
+            (c_finish_bc_stmt): Likewise.
+            * c-lang.h (struct language_function): Add loop_names and
+            loop_names_hash members.
+            * c-parser.cc (c_parser_external_declaration,
+            c_parser_declaration_or_fndef, c_parser_struct_or_union_specifier,
+            c_parser_parameter_declaration): Adjust c_parser_pragma caller.
+            (get_before_labels): New function.
+            (c_parser_compound_statement_nostart): Call get_before_labels when
+            needed, adjust c_parser_pragma and c_parser_statement_after_labels
+            callers.
+            (c_parser_statement): Call get_before_labels first and pass it to
+            c_parser_statement_after_labels.
+            (c_parser_bc_name): New function.
+            (c_parser_statement_after_labels): Add BEFORE_LABELS argument.  Pass
+            it down to c_parser_switch_statement, c_parser_while_statement,
+            c_parser_do_statement, c_parser_for_statement and c_parser_pragma.
+            Call c_parser_bc_name for RID_BREAK and RID_CONTINUE and pass it as
+            another argument to c_finish_bc_stmt.
+            (c_parser_if_body, c_parser_else_body): Call get_before_labels
+            early and pass it to c_parser_statement_after_labels.
+            (c_parser_switch_statement): Add BEFORE_LABELS argument.  Call
+            c_get_loop_names, if named, pass switch_name to c_start_switch,
+            mark it valid and set IN_NAMED_STMT bit in in_statement before
+            parsing body, otherwise clear IN_NAMED_STMT bit before that parsing.
+            Run c_release_loop_names at the end.
+            (c_parser_while_statement, c_parser_do_statement,
+            c_parser_for_statement): Add BEFORE_LABELS argument.  Call
+            c_get_loop_names, if named, mark it valid and set IN_NAMED_STMT bit
+            in in_statement before parsing body, otherwise clear IN_NAMED_STMT
+            before that parsing, arrange for the loop name if used to be
+            another *_STMT argument.
+            (c_parser_objc_class_instance_variables,
+            c_parser_objc_methodprotolist): Adjust c_parser_pragma callers.
+            (c_parser_pragma): Add BEFORE_LABELS argument.  Pass it down to
+            c_parser_for_statement, c_parser_while_statement or
+            c_parser_do_statement.
+            (c_parser_omp_loop_nest, c_maybe_parse_omp_decl): Adjust
+            c_parser_pragma callers.
+            * c-decl.cc (loop_names, loop_names_hash): New static variables.
+            (add_stmt): Set STATEMENT_LIST_HAS_LABEL after push_stmt_list rather
+            than before it.
+            (c_push_function_context): Save and clear loop_names and
+            loop_names_hash.
+            (c_pop_function_context): Release or delete, restore and clear
+            loop_names and loop_names_hash.
+            (c_get_loop_names, c_release_loop_names, c_finish_bc_name): New
+            functions.
+            * c-typeck.cc (c_start_switch): Add SWITCH_NAME argument, pass it down
+            to build_stmt.
+            (c_finish_bc_stmt): Add NAME argument.  Mark of IN_NAMED_STMT bit
+            of in_statement in swtiches.  Use label for IN_OBJC_FOREACH only if
+            name is NULL.  If name is non-NULL and C_DECL_LOOP_NAME and
+            C_DECL_SWITCH_NAME are both set, assume outer ObjC foreach and
+            dig labels from DECL_CHAIN of name.  Pass NAME to build_stmt
+            otherwise.
+    gcc/cp/
+            * semantics.cc (begin_while_stmt, begin_do_stmt, begin_for_stmt,
+            finish_break_stmt, finish_continue_stmt, begin_switch_stmt): Pass
+            another NULL_TREE to build_stmt calls.
+    gcc/testsuite/
+            * gcc.dg/c23-named-loops-1.c: New test.
+            * gcc.dg/c23-named-loops-5.c: New test.
+            * gcc.dg/c2y-named-loops-1.c: New test.
+            * gcc.dg/c2y-named-loops-2.c: New test.
+            * gcc.dg/c2y-named-loops-4.c: New test.
+            * gcc.dg/c2y-named-loops-5.c: New test.
+            * gcc.dg/c2y-named-loops-6.c: New test.
+            * gcc.dg/c2y-named-loops-7.c: New test.
+            * gcc.dg/gnu99-named-loops-1.c: New test.
+            * gcc.dg/gnu99-named-loops-2.c: New test.
+            * gcc.dg/gnu99-named-loops-3.c: New test.
+            * gcc.dg/gnu99-named-loops-4.c: New test.
+            * gcc.dg/gnu2y-named-loops-3.c: New test.
+            * gcc.dg/gomp/named-loops-1.c: New test.
+            * gcc.dg/gomp/named-loops-2.c: New test.
+            * objc.dg/named-loops-1.m: New test.
+
+- User: Jakub Jelinek | Time: 2024-10-15 18:48:20 UTC
+  Text: Implemented for GCC 15.1+.
+

@@ -1,0 +1,48 @@
+Issue Title: [mlir][python] Tracking of live operations fails.
+Original Post: I am running into a problem with the Python bindings of MLIR related to how `PyOperation`s track the underlying `Operation`s.
+
+If I understand things right, when a `PyOperation` is created, the pointer to the underlying `Operation` is tracked in [`PyMlirContext::liveOperations`](https://github.com/llvm/llvm-project/blob/3a4b1d17/mlir/lib/Bindings/Python/IRModule.h#L256) (e.g., [here](https://github.com/llvm/llvm-project/blob/3a4b1d17/mlir/lib/Bindings/Python/IRCore.cpp#L1092)). This is used (potentially among other things) to return the same `PyOperation` for existing `Operation`s, e.g., [here](https://github.com/llvm/llvm-project/blob/3a4b1d17/mlir/lib/Bindings/Python/IRCore.cpp#L1106-L1109).
+
+However, it is possible to obtain a `PyOperation` to an `Operation` that is then destroyed without the Python binding noticing, for example, by running a pass that deletes that `Operation`. At that point, `PyMlirContext::liveOperations` has an entry for an `Operation` that doesn't exist anymore. It is then possible that that memory location is used for a new `Operation` that is created through `PyOperation::createDetached` (for example, through [`PyOperation::clone`](https://github.com/llvm/llvm-project/blob/3a4b1d17/mlir/lib/Bindings/Python/IRCore.cpp#L1419), which is called by the Python-bound method [`_OperationBase.clone`](https://github.com/llvm/llvm-project/blob/3a4b1d17/mlir/lib/Bindings/Python/IRCore.cpp#L2930-L2934)). `PyMlirContext::liveOperations` thus contains the pointer of the previous operation that has been destroyed in the meantime and `PyOperation::createDetached` wants to add that same pointer again for a (supposedly not-yet-existing) "new" `Operation`. Accordingly, the [assertion](https://github.com/llvm/llvm-project/blob/3a4b1d17/mlir/lib/Bindings/Python/IRCore.cpp#L1116-L1117) in `PyOperation::createDetached` fails.
+
+I am unsure what the best way to fix this is. After a day of thinking about the problem, my best guess is to say that such a tracking is, in fact, not possible. My second best guess is to say that it is illegal to hold `PyOperation` to ops that could be modified by some other functions but (1) that seems quite error-prone and (2) I haven't been able to find out how to release the `PyOperation` that is causing the problem in my case. Before I spend more time to think about this topic, let me ask for input from the people that are more familiar with that part of the code: @stellaraccident, @teqdruid, @mikeurbach, @ftynse.
+
+Comment by llvmbot: 
+@llvm/issue-subscribers-mlir-python
+
+Author: Ingo Müller (ingomueller-net)
+
+<details>
+I am running into a problem with the Python bindings of MLIR related to how `PyOperation`s track the underlying `Operation`s.
+
+If I understand things right, when a `PyOperation` is created, the pointer to the underlying `Operation` is tracked in [`PyMlirContext::liveOperations`](https://github.com/llvm/llvm-project/blob/3a4b1d17/mlir/lib/Bindings/Python/IRModule.h#L256) (e.g., [here](https://github.com/llvm/llvm-project/blob/3a4b1d17/mlir/lib/Bindings/Python/IRCore.cpp#L1092)). This is used (potentially among other things) to return the same `PyOperation` for existing `Operation`s, e.g., [here](https://github.com/llvm/llvm-project/blob/3a4b1d17/mlir/lib/Bindings/Python/IRCore.cpp#L1106-L1109).
+
+However, it is possible to obtain a `PyOperation` to an `Operation` that is then destroyed without the Python binding noticing, for example, by running a pass that deletes that `Operation`. At that point, `PyMlirContext::liveOperations` has an entry for an `Operation` that doesn't exist anymore. It is then possible that that memory location is used for a new `Operation` that is created through `PyOperation::createDetached` (for example, through [`PyOperation::clone`](https://github.com/llvm/llvm-project/blob/3a4b1d17/mlir/lib/Bindings/Python/IRCore.cpp#L1419), which is called by the Python-bound method [`_OperationBase.clone`](https://github.com/llvm/llvm-project/blob/3a4b1d17/mlir/lib/Bindings/Python/IRCore.cpp#L2930-L2934)). `PyMlirContext::liveOperations` thus contains the pointer of the previous operation that has been destroyed in the meantime and `PyOperation::createDetached` wants to add that same pointer again for a (supposedly not-yet-existing) "new" `Operation`. Accordingly, the [assertion](https://github.com/llvm/llvm-project/blob/3a4b1d17/mlir/lib/Bindings/Python/IRCore.cpp#L1116-L1117) in `PyOperation::createDetached` fails.
+
+I am unsure what the best way to fix this is. After a day of thinking about the problem, my best guess is to say that such a tracking is, in fact, not possible. My second best guess is to say that it is illegal to hold `PyOperation` to ops that could be modified by some other functions but (1) that seems quite error-prone and (2) I haven't been able to find out how to release the `PyOperation` that is causing the problem in my case. Before I spend more time to think about this topic, let me ask for input from the people that are more familiar with that part of the code: @<!-- -->stellaraccident, @<!-- -->teqdruid, @<!-- -->mikeurbach, @<!-- -->ftynse.
+</details>
+
+Comment by mikeurbach: I think your analysis is spot on. If I am remembering correctly, @teqdruid and I hit exactly this issue a while ago, and nothing has changed in that regard. He is the real expert here, but this is something that we wanted to bring up in the MLIR workshop last week. I'll try to convey the solution in PyCDE, but maybe John can chime in.
+
+The goal was to support a workflow like this, without running into the issue you're describing:
+* create some operations via Python bindings
+* run some passes which mutate the IR
+* traverse the IR / create some new operations via Python bindings
+
+For this, PyCDE ends up maintaining its own in-memory cache, which is busted whenever we handoff to MLIR passes that may mutate the IR: https://github.com/llvm/circt/blob/2f8381cd1bdf4411e5354038258a17bd717b7130/frontends/PyCDE/src/system.py#L356
+Comment by stellaraccident: There were some recent (last six months or so) patches that tried to use the "invalidation" support in ops to do bulk invalidation (which servers the python op object from the underlying c++). But I don't know the status. I believe the thinking was that more here would fill more gaps. But all of our use cases are "builder style" so I haven't spent much time recently on it.
+
+Maybe @makslevental 
+Comment by makslevental: Caught red-handed; I did indeed implement "invalidation" here https://reviews.llvm.org/D155543 but didn't get it across the finish line. Was hoping I would be able to take care of it before anyone noticed but things keep getting "piled higher and deeper". Let me migrate that patch to a PR and we can discuss.
+Comment by ftynse: +1 for invalidation. I don't think we can realistically track _all_ potentially ways to delete operations in C++ from Python (I'd love to have that in C++ to start with, so much less pain debugging). Our model in bindings originally was "construct IR, then run passes". If handles to IR objects are needed after applying the pass manager, they must be obtained by re-traversing the transformed IR. We could consider some sort of scoped invalidation where only the handles to operations nested under the pass manager root get invalidated.
+
+Interestingly enough, this is a special case of the infamous "handle invalidation" problem that we've hit repeatedly in the transform dialect, with and without Python. We are now able to track through a subset of op replacements using pattern rewriter listeners, but this does not generalize to non pattern-based passes so the safer assumption would be to just invalidate everything under the pass root.
+
+cc @martin-luecke 
+Comment by teqdruid: > I think your analysis is spot on. If I am remembering correctly, @teqdruid and I hit exactly this issue a while ago, and nothing has changed in that regard. He is the real expert here, but this is something that we wanted to bring up in the MLIR workshop last week. I'll try to convey the solution in PyCDE, but maybe John can chime in
+
+Yeah, I've run into this a number of times. It's _extremely_ confusing to be debugging a Python class instance for op A only to learn that the MlirOperation is referring to a new op which is usually not even the same operation type! TBF, pointer invalidation is an issue in the C++ world as well.
+
+Mike is essentially correct about the PyCDE solution. We try our best not to expose raw MLIR Python class instances to the user, but Python is Python so there's only so much one can do to hide things. IIRC I did add a call to MLIR to force the entire C++ (Pybind) cache to get invalidated which (IIRC) notifies the Python class. PyCDE invalidates its own cache (by which point the liveOperations cache _should_ be empty), then for safety checks that it is indeed cleared, issues a warning if it isn't, then forces a cache invalidation. My memory is hazy since I did all this 1+ years ago. (I can barely remember what I had for breakfast.)
+
+Flushing the _entire_ cache is a bit heavy-handed. I once proposed that the Operation deconstructor should support calling a registered hook to inform anything that needs to know when an Operation has been erased. This method would work regardless of how said operation was deleted. IIRC the primary objection was performance-related -- adding a pointer null check is too much overhead in the common case wherein one wasn't using the callback. If callback was per-operation, that pointer addition to the Operation class would bloat the Operation memory. (I think it's more desirable to register it in the MLIRContext though.)

@@ -1,0 +1,136 @@
+Bug Summary: [13 Regression] ice in modify_call, at ipa-param-manipulation.cc:656 since r13-4685-g4834e9360f7bf42f
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2023-02-05 16:52:12 UTC
+  Text: For this C code:
+
+struct S1 {
+  signed f0;
+};
+struct S2 {
+  struct S1 f2;
+  short f8;
+} g_18;
+g_732, func_6_l_17;
+static *func_12();
+static func_6(struct S2 p_7) { func_12(func_6_l_17, p_7.f2, g_18, 0); }
+*func_12(int, struct S1 p_14) {
+  safe_lshift_func_int16_t_s_u();
+  safe_unary_minus_func_uint64_t_u();
+  g_732 = safe_mul_func_uint8_t_u_u(0, p_14);
+}
+main() {
+  struct S2 l_10 = {3};
+  func_6(l_10);
+}
+
+compiled by recent gcc, does this:
+
+$ /home/dcb36/gcc/results/bin/gcc -w -O2 -ftrivial-auto-var-init=zerobug881.c 
+during IPA pass: inlinebug881.c: In function ‘main’:bug881.c:18:3: internal compiler error: in modify_call, at ipa-param-manipulation.cc:656
+   18 |   func_6(l_10);
+      |   ^~~~~~~~~~~~
+0xb64d40 ipa_param_adjustments::modify_call(cgraph_edge*, bool)
+	../../trunk.d1/gcc/ipa-param-manipulation.cc:656
+
+The bug first seems to occur sometime betweeng:d0a3d55ae4a2656fandg:1530a9b1f45a7ceb
+
+- User: Richard Biener | Time: 2023-02-06 07:55:46 UTC
+  Text: Confirmed with just -O2.
+
+during IPA pass: inline
+t.i: In function 'main':
+t.i:18:3: internal compiler error: in modify_call, at ipa-param-manipulation.cc:656
+   18 |   func_6(l_10);
+      |   ^~~~~~~~~~~~
+0x129b0a1 ipa_param_adjustments::modify_call(cgraph_edge*, bool)
+        /home/rguenther/src/trunk/gcc/ipa-param-manipulation.cc:656
+0xec3b06 cgraph_edge::redirect_call_stmt_to_callee(cgraph_edge*)
+        /home/rguenther/src/trunk/gcc/cgraph.cc:1530
+0x16a9db7 redirect_all_calls(copy_body_data*, basic_block_def*)
+        /home/rguenther/src/trunk/gcc/tree-inline.cc:2990
+0x16aa5a3 copy_cfg_body
+        /home/rguenther/src/trunk/gcc/tree-inline.cc:3145
+0x16aadf8 copy_body
+        /home/rguenther/src/trunk/gcc/tree-inline.cc:3326
+0x16afd47 expand_call_inline
+        /home/rguenther/src/trunk/gcc/tree-inline.cc:5112
+0x16b0b2d gimple_expand_calls_inline
+        /home/rguenther/src/trunk/gcc/tree-inline.cc:5307
+0x16b12f3 optimize_inline_calls(tree_node*)
+        /home/rguenther/src/trunk/gcc/tree-inline.cc:5479
+0x12452ec inline_transform(cgraph_node*)
+        /home/rguenther/src/trunk/gcc/ipa-inline-transform.cc:790
+
+- User: Martin Liška | Time: 2023-02-06 09:23:22 UTC
+  Text: Started withr13-4685-g4834e9360f7bf42f.
+
+- User: Martin Jambor | Time: 2023-02-09 14:22:42 UTC
+  Text: What happens is that ipa_param_body_adjustments::modify_call_stmt
+is confused by the IPA-CP produced scalar constant where it expects a
+structure containing just one field of the corresponding type.
+
+It is easy to avoid the situation altogether with just the following
+but it means that the caller (in the example func_6) will not entirely
+lose the parameter even though we know its contents at compile time
+and could re-construct it for the purposes of the call (of func_12).
+But the behavior is not worse than GCC 12 and before, so the patch is
+probably the right thing to do in stage 4.
+
+
+diff --git a/gcc/ipa-sra.cc b/gcc/ipa-sra.cc
+index 7a2b4dc8608..822fd6262d6 100644
+--- a/gcc/ipa-sra.cc
++++ b/gcc/ipa-sra.cc
+@@ -3989,7 +3989,7 @@ push_param_adjustments_for_index (isra_func_summary *ifs, unsigned base_index,
+        {
+          ipa_argagg_value_list avl (ipcp_ts);
+          tree value = avl.get_value (base_index, pa->unit_offset);
+-         if (value)
++         if (value && !AGGREGATE_TYPE_P (pa->type))
+            {
+              if (dump_file)
+                fprintf (dump_file, "    - omitting component at byte "
+
+- User: Martin Jambor | Time: 2023-02-14 14:51:20 UTC
+  Text: I have proposed the fix on the mailing list:https://gcc.gnu.org/pipermail/gcc-patches/2023-February/611978.html
+
+- User: GCC Commits | Time: 2023-02-15 10:38:47 UTC
+  Text: The master branch has been updated by Martin Jambor <jamborm@gcc.gnu.org>:https://gcc.gnu.org/g:8b1b1b2d691d5cee4ebc40a01974ad5bccab22f9commitr13-6003-g8b1b1b2d691d5cee4ebc40a01974ad5bccab22f9Author: Martin Jambor <mjambor@suse.cz>
+Date:   Wed Feb 15 11:38:01 2023 +0100
+
+    ipa: Avoid IPA confusing scalar values and single-field aggregates (PR 108679)PR 108679testcase shows a situation when IPA-CP is able to track a
+    scalar constant in a single-field structure that is part of a bigger
+    structure.  This smaller structure is however also passed in a few
+    calls to other functions, but the two same-but-different entities,
+    originally placed at the same offset and with the same size, confuse
+    the mechanism that takes care of handling call statements after
+    IPA-SRA.
+    
+    I think that in stage 4 it is best to revert to GCC 12 behavior in this
+    particular case (when IPA-CP detects a constant in a single-field
+    structure or a single element array that is part of a bigger aggregate)
+    and the patch below does that.  If accepted, I plan to file a
+    missed-optimization bug to track that we could use the IPA-CP propagated
+    value to re-construct the small aggregate arguments.
+    
+    gcc/ChangeLog:
+    
+    2023-02-13  Martin Jambor  <mjambor@suse.cz>PR ipa/108679* ipa-sra.cc (push_param_adjustments_for_index): Do not omit
+            creation of non-scalar replacements even if IPA-CP knows their
+            contents.
+    
+    gcc/testsuite/ChangeLog:
+    
+    2023-02-13  Martin Jambor  <mjambor@suse.cz>PR ipa/108679* gcc.dg/ipa/pr108679.c: New test.
+
+- User: Martin Jambor | Time: 2023-02-15 10:40:51 UTC
+  Text: Fixed, thanks for reporting and reducing the testcase.
+

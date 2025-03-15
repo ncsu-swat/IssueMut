@@ -1,0 +1,539 @@
+Bug Summary: [11/12/13 Regression] UBSAN creates GIMPLE path with uninitialized variable
+Product: gcc
+Component: sanitizer
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Franz Sirl | Time: 2023-11-27 13:28:04 UTC
+  Text: Hi,
+
+this simple code:
+
+struct Cfg_t
+{
+        bool bX[8];
+};
+
+void Encode(const Cfg_t* pCfg)
+{
+        unsigned nCfg = 0;
+        for (unsigned j = 0; j < 8; j++) {
+                nCfg |= ((!pCfg->bX[j])?1:0) << (16 + j);
+        }
+}
+
+compiled with "gcc-trunk@r14+5779 -c -O2 -fsanitize=undefined -fno-sanitize=shift-base -fsanitize=bounds-strict -Wuninitialized"
+
+issues this warning:
+
+gcc_wuninitialized_bug.cpp: In function 'void Encode(const Cfg_t*)':
+gcc_wuninitialized_bug.cpp:11:38: warning: 'j.1' is used uninitialized [-Wuninitialized]
+   11 |                 nCfg |= ((!pCfg->bX[j])?1:0) << (16 + j);
+      |                            ~~~~~~~~~~^
+gcc_wuninitialized_bug.cpp:11:38: note: 'j.1' was declared here
+   11 |                 nCfg |= ((!pCfg->bX[j])?1:0) << (16 + j);
+      |                            ~~~~~~~~~~^
+
+
+This is a regression starting with gcc-9. gcc-7 and gcc-8 don't create an invalid path and thus don't warn.
+
+With -fdump-tree-all the .original dump looks like this:
+
+{
+  unsigned int nCfg = 0;
+
+  <<cleanup_point   unsigned int nCfg = 0;>>;
+  {
+    unsigned int j = 0;
+
+    <<cleanup_point     unsigned int j = 0;>>;
+    goto <D.3254>;
+    <D.3253>:;
+    <<cleanup_point <<< Unknown tree: expr_stmt
+      (void) (nCfg = TARGET_EXPR <D.3250, if (SAVE_EXPR <j + 16>;, SAVE_EXPR <j + 16> > 31;)
+        {
+          __builtin___ubsan_handle_shift_out_of_bounds (&*.Lubsan_data0, (bool) pCfg->bX[.UBSAN_BOUNDS (0B, SAVE_EXPR <j>, 8);, SAVE_EXPR <j>;] ? 0 : 1, (unsigned long) (SAVE_EXPR <j + 16>));
+        }
+      else
+        {
+          <<< Unknown tree: void_cst >>>
+        }, ((bool) pCfg->bX[.UBSAN_BOUNDS (0B, SAVE_EXPR <j>, 8);, SAVE_EXPR <j>;] ? 0 : 1) << SAVE_EXPR <j + 16>;>;, nCfg | (unsigned int) D.3250;) >>>>>;
+    <<cleanup_point (void) j++ >>;
+    <D.3254>:;
+    if (j <= 7) goto <D.3253>; else goto <D.3251>;
+    <D.3251>:;
+  }
+}
+
+And then in the .gimple dump:
+
+void Encode (const struct Cfg_t * pCfg)
+{
+  int D.3250;
+  unsigned int D.3255;
+  unsigned long iftmp.0;
+  unsigned int j.1;
+  int iftmp.2;
+  unsigned int nCfg;
+
+  nCfg = 0;
+  {
+    unsigned int j;
+
+    j = 0;
+    goto <D.3254>;
+    <D.3253>:
+    D.3255 = j + 16;
+    if (D.3255 > 31) goto <D.3256>; else goto <D.3257>;
+    <D.3256>:
+    _1 = (unsigned long) D.3255;
+    j.1 = j;
+    .UBSAN_BOUNDS (0B, j.1, 8);
+    _2 = pCfg->bX[j.1];
+    if (_2 != 0) goto <D.3260>; else goto <D.3261>;
+    <D.3260>:
+    iftmp.0 = 0;
+    goto <D.3262>;
+    <D.3261>:
+    iftmp.0 = 1;
+    <D.3262>:
+    __builtin___ubsan_handle_shift_out_of_bounds (&*.Lubsan_data0, iftmp.0, _1);
+    goto <D.3263>;
+    <D.3257>:
+    <D.3263>:
+    .UBSAN_BOUNDS (0B, j.1, 8);
+    _3 = pCfg->bX[j.1];
+    if (_3 != 0) goto <D.3265>; else goto <D.3266>;
+    <D.3265>:
+    iftmp.2 = 0;
+    goto <D.3267>;
+    <D.3266>:
+    iftmp.2 = 1;
+    <D.3267>:
+    D.3250 = iftmp.2 << D.3255;
+    _4 = (unsigned int) D.3250;
+    nCfg = nCfg | _4;
+    j = j + 1;
+    <D.3254>:
+    if (j <= 7) goto <D.3253>; else goto <D.3251>;
+    <D.3251>:
+  }
+}
+
+Clearly j.1 is initialized from j only in the D.3256 branch, the D.3257 branch misses the initialization.
+
+- User: Marek Polacek | Time: 2023-11-27 17:35:43 UTC
+  Text: Started withr267272==r9-4974-gdfd7fdca2ac17d:
+
+commit dfd7fdca2ac17d8b823a16700525824ca312ade0
+Author:     David Malcolm <dmalcolm@redhat.com>
+AuthorDate: Wed Dec 19 15:08:21 2018 +0000
+
+    C++: more location wrapper nodes (PR c++/43064,PR c++/43486)
+
+
+Probably mine.
+
+- User: Jakub Jelinek | Time: 2023-12-06 20:06:34 UTC
+  Text: struct S { bool s[8]; };
+
+void
+foo (const S *x)
+{
+  unsigned n = 0;
+  for (unsigned j = 0; j < 8; j++)
+    n |= ((!x->s[j]) ? 1 : 0) << (16 + j);
+}
+
+-O2 -fsanitize=shift-exponent,bounds-strict -Wuninitialized
+is all that is needed.
+Seems the SAVE_EXPR <j> used in the .UBSAN_BOUNDS call is evaluated separately both in
+the __builtin___ubsan_handle_shift_out_of_bounds argument and then later on again,
+but because the call is conditional and is gimplified first, j is initialized only in case 16 + j > 31 and uninitialized otherwise.
+
+Now, if I try:
+int bar (void);
+
+int
+baz (int x)
+{
+  return bar () << x;
+}
+we properly evaluate SAVE_EXPR <bar ()> first, then conditionally in __builtin___ubsan_handle_shift_out_of_bounds argument and again afterwards.
+So I guess the bug is that (x->s[j] ? 0 : 1) isn't considered as having side-effects
+by the shift sanitization.  And we then add the bounds-strict sanitization into it
+which definitely turns it into something with side-effects.
+
+- User: Jakub Jelinek | Time: 2023-12-06 20:57:36 UTC
+  Text: Actually no, ubsan_handle_shift is called here with
+SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[VIEW_CONVERT_EXPR<unsigned int>(j)] ? NON_LVALUE_EXPR <1> : NON_LVALUE_EXPR <0>>
+as op0.
+And what goes out of it + the whole LSHIFT_EXPR with instrumentation looks reasonable as well:
+if (SAVE_EXPR <16 + VIEW_CONVERT_EXPR<unsigned int>(j)>;, SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[VIEW_CONVERT_EXPR<unsigned int>(j)] ? NON_LVALUE_EXPR <1> : NON_LVALUE_EXPR <0>>;, SAVE_EXPR <16 + VIEW_CONVERT_EXPR<unsigned int>(j)> > 31;)
+  {
+    __builtin___ubsan_handle_shift_out_of_bounds (&*.Lubsan_data0, (unsigned long) (SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[VIEW_CONVERT_EXPR<unsigned int>(j)] ? NON_LVALUE_EXPR <1> : NON_LVALUE_EXPR <0>>), (unsigned long) (SAVE_EXPR <16 + VIEW_CONVERT_EXPR<unsigned int>(j)>));
+  }
+else
+  {
+    <<< Unknown tree: void_cst >>>
+  }, (SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[VIEW_CONVERT_EXPR<unsigned int>(j)] ? NON_LVALUE_EXPR <1> : NON_LVALUE_EXPR <0>>) << SAVE_EXPR <16 + VIEW_CONVERT_EXPR<unsigned int>(j)>;;
+i.e. the x->s[j] ? 0 : 1 is evaluated in SAVE_EXPR first, then 16 + j > 31 comparison, etc.
+
+Seems the problem happens during cp_fold, which when called on the COMPOUND_EXPR with
+SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[VIEW_CONVERT_EXPR<unsigned int>(j)] ? NON_LVALUE_EXPR <1> : NON_LVALUE_EXPR <0>>
+as first argument and
+SAVE_EXPR <16 + VIEW_CONVERT_EXPR<unsigned int>(j)> > 31
+second recurses using
+3113	      op0 = cp_fold_maybe_rvalue (TREE_OPERAND (x, 0), rval_ops, flags);
+on the first one and returns
+(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 0 : 1
+(i.e. extracts it out of the SAVE_EXPR).
+    case SAVE_EXPR:
+      /* A SAVE_EXPR might contain e.g. (0 * i) + (0 * j), which, after
+         folding, evaluates to an invariant.  In that case no need to wrap
+         this folded tree with a SAVE_EXPR.  */
+      r = cp_fold (TREE_OPERAND (x, 0), flags);
+      if (tree_invariant_p (r))
+        x = r;
+      break;
+And then because it thinks it is invariant (the COND_EXPR has for some reason TREE_READONLY set on it), it also drops it from the COMPOUND_EXPR.
+Now, guess there is some tree sharing (while c-ubsan.cc calls unshare_expr when it uses the expressions multiple times, the unsharing stops at SAVE_EXPR) and so when the bounds-strict instrumentation modifies it and adds important side-effect to it, it modifies both remaining copies of the SAVE_EXPR's argument.
+
+- User: Jakub Jelinek | Time: 2023-12-06 21:09:28 UTC
+  Text: BTW, the reason why cp_save_expr wrapped it into a SAVE_EXPR at first was that the
+COND_EXPR at that point wasn't TREE_READONLY, just non-side-effects and all 3 of its arguments were TREE_READONLY.
+Though, obviously if it wouldn't be wrapped in SAVE_EXPR at the beginning, it would probably work fine, as unshare_expr then would unshare the trees deeper.
+Dunno, perhaps instead of
++      r = cp_fold (TREE_OPERAND (x, 0));
++      if (tree_invariant_p (r))
++       x = r;
+for SAVE_EXPR we should do nothing, the SAVE_EXPR argument will be folded during cp_fold_r, and if we decided at some point to use a SAVE_EXPR, we better gimplify it that way.
+
+Other thoughts?
+
+- User: Jakub Jelinek | Time: 2023-12-06 21:10:05 UTC
+  Text: It has been added that way by Marek inr8-727-g6b6ae9eb9c06b6911573bb9a13cf98b5a7c98b78
+
+- User: Jakub Jelinek | Time: 2023-12-06 21:22:47 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #5)> It has been added that way by Marek in
+>r8-727-g6b6ae9eb9c06b6911573bb9a13cf98b5a7c98b78Yet another option would be to keep it, but x = unshare_expr (r);
+And perhaps first verify r doesn't have too many subtrees and punt in that case, so that the unsharing doesn't result in huge IL in pathological cases.
+
+- User: Jakub Jelinek | Time: 2023-12-06 21:33:41 UTC
+  Text: Actually
+--- gcc/cp/cp-gimplify.cc.jj	2023-12-05 09:06:06.112878408 +0100
++++ gcc/cp/cp-gimplify.cc	2023-12-06 22:32:46.379370223 +0100
+@@ -2906,7 +2906,14 @@ cp_fold (tree x, fold_flags_t flags)
+     fold_cache = hash_map<tree, tree>::create_ggc (101);
+ 
+   if (tree *cached = fold_cache->get (x))
+-    return *cached;
++    {
++      /* unshare_expr doesn't recurse into SAVE_EXPRs.  If SAVE_EXPR's
++	 argument has been folded into a tree invariant, make sure it is
++	 unshared.  SeePR112727.  */
++      if (TREE_CODE (x) == SAVE_EXPR && *cached != x)
++	return unshare_expr (*cached);
++      return *cached;
++    }
+ 
+   uid_sensitive_constexpr_evaluation_checker c;
+ 
+is what it really fixes.
+
+- User: GCC Commits | Time: 2023-12-08 19:57:54 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:6ddaf06e375e1c15dcda338697ab6ea457e6f497commitr14-6345-g6ddaf06e375e1c15dcda338697ab6ea457e6f497Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Dec 8 20:56:48 2023 +0100
+
+    c++: Unshare folded SAVE_EXPR arguments during cp_fold [PR112727]
+    
+    The following testcase is miscompiled because two ubsan instrumentations
+    run into each other.
+    The first one is the shift instrumentation.  Before the C++ FE calls
+    it, it wraps the 2 shift arguments with cp_save_expr, so that side-effects
+    in them aren't evaluated multiple times.  And, ubsan_instrument_shift
+    itself uses unshare_expr on any uses of the operands to make sure further
+    modifications in them don't affect other copies of them (the only not
+    unshared ones are the one the caller then uses for the actual operation
+    after the instrumentation, which means there is no tree sharing).
+    
+    Now, if there are side-effects in the first operand like say function
+    call, cp_save_expr wraps it into a SAVE_EXPR, and ubsan_instrument_shift
+    in this mode emits something like
+    if (..., SAVE_EXPR <foo ()>, SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., SAVE_EXPR <foo ()>, ...);
+    and caller adds
+    SAVE_EXPR <foo ()> << SAVE_EXPR <op1>
+    after it in a COMPOUND_EXPR.  So far so good.
+    
+    If there are no side-effects and cp_save_expr doesn't create SAVE_EXPR,
+    everything is ok as well because of the unshare_expr.
+    We have
+    if (..., SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., ptr->something[i], ...);
+    and
+    ptr->something[i] << SAVE_EXPR <op1>
+    where ptr->something[i] is unshared.
+    
+    In the testcase below, the !x->s[j] ? 1 : 0 expression is wrapped initially
+    into a SAVE_EXPR though, and unshare_expr doesn't unshare SAVE_EXPRs nor
+    anything used in them for obvious reasons, so we end up with:
+    if (..., SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 1 : 0>, SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 1 : 0>, ...);
+    and
+    SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 1 : 0> << SAVE_EXPR <op1>
+    So far good as well.  But later during cp_fold of the SAVE_EXPR we find
+    out that VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 0 : 1 is actually
+    invariant (has TREE_READONLY set) and so cp_fold simplifies the above to
+    if (..., SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., (bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 0 : 1, ...);
+    and
+    ((bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 0 : 1) << SAVE_EXPR <op1>
+    with the s[j] ARRAY_REFs and other expressions shared in between the two
+    uses (and obviously the expression optimized away from the COMPOUND_EXPR in
+    the if condition.
+    
+    Then comes another ubsan instrumentation at genericization time,
+    this time to instrument the ARRAY_REFs with strict bounds checking,
+    and replaces the s[j] in there with s[.UBSAN_BOUNDS (0B, SAVE_EXPR<j>, 8), SAVE_EXPR<j>]
+    As the trees are shared, it does that just once though.
+    And as the if body is gimplified first, the SAVE_EXPR<j> is evaluated inside
+    of the if body and when it is used again after the if, it uses a potentially
+    uninitialized value of j.1 (always uninitialized if the shift count isn't
+    out of bounds).
+    
+    The following patch fixes that by unshare_expr unsharing the folded argument
+    of a SAVE_EXPR if we've folded the SAVE_EXPR into an invariant and it is
+    used more than once.
+    
+    2023-12-08  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/112727* cp-gimplify.cc (cp_fold): If SAVE_EXPR has been previously
+            folded, unshare_expr what is returned.
+    
+            * c-c++-common/ubsan/pr112727.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-12-08 20:01:56 UTC
+  Text: Fixed on the trunk so far.
+
+- User: GCC Commits | Time: 2023-12-15 14:05:15 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:a982b9cb690a163434f1ac5a0901548b594205f2commitr13-8160-ga982b9cb690a163434f1ac5a0901548b594205f2Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Dec 8 20:56:48 2023 +0100
+
+    c++: Unshare folded SAVE_EXPR arguments during cp_fold [PR112727]
+    
+    The following testcase is miscompiled because two ubsan instrumentations
+    run into each other.
+    The first one is the shift instrumentation.  Before the C++ FE calls
+    it, it wraps the 2 shift arguments with cp_save_expr, so that side-effects
+    in them aren't evaluated multiple times.  And, ubsan_instrument_shift
+    itself uses unshare_expr on any uses of the operands to make sure further
+    modifications in them don't affect other copies of them (the only not
+    unshared ones are the one the caller then uses for the actual operation
+    after the instrumentation, which means there is no tree sharing).
+    
+    Now, if there are side-effects in the first operand like say function
+    call, cp_save_expr wraps it into a SAVE_EXPR, and ubsan_instrument_shift
+    in this mode emits something like
+    if (..., SAVE_EXPR <foo ()>, SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., SAVE_EXPR <foo ()>, ...);
+    and caller adds
+    SAVE_EXPR <foo ()> << SAVE_EXPR <op1>
+    after it in a COMPOUND_EXPR.  So far so good.
+    
+    If there are no side-effects and cp_save_expr doesn't create SAVE_EXPR,
+    everything is ok as well because of the unshare_expr.
+    We have
+    if (..., SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., ptr->something[i], ...);
+    and
+    ptr->something[i] << SAVE_EXPR <op1>
+    where ptr->something[i] is unshared.
+    
+    In the testcase below, the !x->s[j] ? 1 : 0 expression is wrapped initially
+    into a SAVE_EXPR though, and unshare_expr doesn't unshare SAVE_EXPRs nor
+    anything used in them for obvious reasons, so we end up with:
+    if (..., SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 1 : 0>, SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 1 : 0>, ...);
+    and
+    SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 1 : 0> << SAVE_EXPR <op1>
+    So far good as well.  But later during cp_fold of the SAVE_EXPR we find
+    out that VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 0 : 1 is actually
+    invariant (has TREE_READONLY set) and so cp_fold simplifies the above to
+    if (..., SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., (bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 0 : 1, ...);
+    and
+    ((bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 0 : 1) << SAVE_EXPR <op1>
+    with the s[j] ARRAY_REFs and other expressions shared in between the two
+    uses (and obviously the expression optimized away from the COMPOUND_EXPR in
+    the if condition.
+    
+    Then comes another ubsan instrumentation at genericization time,
+    this time to instrument the ARRAY_REFs with strict bounds checking,
+    and replaces the s[j] in there with s[.UBSAN_BOUNDS (0B, SAVE_EXPR<j>, 8), SAVE_EXPR<j>]
+    As the trees are shared, it does that just once though.
+    And as the if body is gimplified first, the SAVE_EXPR<j> is evaluated inside
+    of the if body and when it is used again after the if, it uses a potentially
+    uninitialized value of j.1 (always uninitialized if the shift count isn't
+    out of bounds).
+    
+    The following patch fixes that by unshare_expr unsharing the folded argument
+    of a SAVE_EXPR if we've folded the SAVE_EXPR into an invariant and it is
+    used more than once.
+    
+    2023-12-08  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/112727* cp-gimplify.cc (cp_fold): If SAVE_EXPR has been previously
+            folded, unshare_expr what is returned.
+    
+            * c-c++-common/ubsan/pr112727.c: New test.
+    
+    (cherry picked from commit 6ddaf06e375e1c15dcda338697ab6ea457e6f497)
+
+- User: GCC Commits | Time: 2023-12-16 00:38:24 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:2b8f9636c1b19fff7723995f2d58d41f3d30c46dcommitr12-10056-g2b8f9636c1b19fff7723995f2d58d41f3d30c46dAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Dec 8 20:56:48 2023 +0100
+
+    c++: Unshare folded SAVE_EXPR arguments during cp_fold [PR112727]
+    
+    The following testcase is miscompiled because two ubsan instrumentations
+    run into each other.
+    The first one is the shift instrumentation.  Before the C++ FE calls
+    it, it wraps the 2 shift arguments with cp_save_expr, so that side-effects
+    in them aren't evaluated multiple times.  And, ubsan_instrument_shift
+    itself uses unshare_expr on any uses of the operands to make sure further
+    modifications in them don't affect other copies of them (the only not
+    unshared ones are the one the caller then uses for the actual operation
+    after the instrumentation, which means there is no tree sharing).
+    
+    Now, if there are side-effects in the first operand like say function
+    call, cp_save_expr wraps it into a SAVE_EXPR, and ubsan_instrument_shift
+    in this mode emits something like
+    if (..., SAVE_EXPR <foo ()>, SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., SAVE_EXPR <foo ()>, ...);
+    and caller adds
+    SAVE_EXPR <foo ()> << SAVE_EXPR <op1>
+    after it in a COMPOUND_EXPR.  So far so good.
+    
+    If there are no side-effects and cp_save_expr doesn't create SAVE_EXPR,
+    everything is ok as well because of the unshare_expr.
+    We have
+    if (..., SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., ptr->something[i], ...);
+    and
+    ptr->something[i] << SAVE_EXPR <op1>
+    where ptr->something[i] is unshared.
+    
+    In the testcase below, the !x->s[j] ? 1 : 0 expression is wrapped initially
+    into a SAVE_EXPR though, and unshare_expr doesn't unshare SAVE_EXPRs nor
+    anything used in them for obvious reasons, so we end up with:
+    if (..., SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 1 : 0>, SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 1 : 0>, ...);
+    and
+    SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 1 : 0> << SAVE_EXPR <op1>
+    So far good as well.  But later during cp_fold of the SAVE_EXPR we find
+    out that VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 0 : 1 is actually
+    invariant (has TREE_READONLY set) and so cp_fold simplifies the above to
+    if (..., SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., (bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 0 : 1, ...);
+    and
+    ((bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 0 : 1) << SAVE_EXPR <op1>
+    with the s[j] ARRAY_REFs and other expressions shared in between the two
+    uses (and obviously the expression optimized away from the COMPOUND_EXPR in
+    the if condition.
+    
+    Then comes another ubsan instrumentation at genericization time,
+    this time to instrument the ARRAY_REFs with strict bounds checking,
+    and replaces the s[j] in there with s[.UBSAN_BOUNDS (0B, SAVE_EXPR<j>, 8), SAVE_EXPR<j>]
+    As the trees are shared, it does that just once though.
+    And as the if body is gimplified first, the SAVE_EXPR<j> is evaluated inside
+    of the if body and when it is used again after the if, it uses a potentially
+    uninitialized value of j.1 (always uninitialized if the shift count isn't
+    out of bounds).
+    
+    The following patch fixes that by unshare_expr unsharing the folded argument
+    of a SAVE_EXPR if we've folded the SAVE_EXPR into an invariant and it is
+    used more than once.
+    
+    2023-12-08  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/112727* cp-gimplify.cc (cp_fold): If SAVE_EXPR has been previously
+            folded, unshare_expr what is returned.
+    
+            * c-c++-common/ubsan/pr112727.c: New test.
+    
+    (cherry picked from commit 6ddaf06e375e1c15dcda338697ab6ea457e6f497)
+
+- User: GCC Commits | Time: 2023-12-17 13:55:42 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:97d6683f6aeda4916a89889bde4c051e55aac984commitr11-11156-g97d6683f6aeda4916a89889bde4c051e55aac984Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Dec 8 20:56:48 2023 +0100
+
+    c++: Unshare folded SAVE_EXPR arguments during cp_fold [PR112727]
+    
+    The following testcase is miscompiled because two ubsan instrumentations
+    run into each other.
+    The first one is the shift instrumentation.  Before the C++ FE calls
+    it, it wraps the 2 shift arguments with cp_save_expr, so that side-effects
+    in them aren't evaluated multiple times.  And, ubsan_instrument_shift
+    itself uses unshare_expr on any uses of the operands to make sure further
+    modifications in them don't affect other copies of them (the only not
+    unshared ones are the one the caller then uses for the actual operation
+    after the instrumentation, which means there is no tree sharing).
+    
+    Now, if there are side-effects in the first operand like say function
+    call, cp_save_expr wraps it into a SAVE_EXPR, and ubsan_instrument_shift
+    in this mode emits something like
+    if (..., SAVE_EXPR <foo ()>, SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., SAVE_EXPR <foo ()>, ...);
+    and caller adds
+    SAVE_EXPR <foo ()> << SAVE_EXPR <op1>
+    after it in a COMPOUND_EXPR.  So far so good.
+    
+    If there are no side-effects and cp_save_expr doesn't create SAVE_EXPR,
+    everything is ok as well because of the unshare_expr.
+    We have
+    if (..., SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., ptr->something[i], ...);
+    and
+    ptr->something[i] << SAVE_EXPR <op1>
+    where ptr->something[i] is unshared.
+    
+    In the testcase below, the !x->s[j] ? 1 : 0 expression is wrapped initially
+    into a SAVE_EXPR though, and unshare_expr doesn't unshare SAVE_EXPRs nor
+    anything used in them for obvious reasons, so we end up with:
+    if (..., SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 1 : 0>, SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 1 : 0>, ...);
+    and
+    SAVE_EXPR <!(bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 1 : 0> << SAVE_EXPR <op1>
+    So far good as well.  But later during cp_fold of the SAVE_EXPR we find
+    out that VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 0 : 1 is actually
+    invariant (has TREE_READONLY set) and so cp_fold simplifies the above to
+    if (..., SAVE_EXPR <op1> > const)
+     __ubsan_handle_shift_out_of_bounds (..., (bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 0 : 1, ...);
+    and
+    ((bool) VIEW_CONVERT_EXPR<const struct S *>(x)->s[j] ? 0 : 1) << SAVE_EXPR <op1>
+    with the s[j] ARRAY_REFs and other expressions shared in between the two
+    uses (and obviously the expression optimized away from the COMPOUND_EXPR in
+    the if condition.
+    
+    Then comes another ubsan instrumentation at genericization time,
+    this time to instrument the ARRAY_REFs with strict bounds checking,
+    and replaces the s[j] in there with s[.UBSAN_BOUNDS (0B, SAVE_EXPR<j>, 8), SAVE_EXPR<j>]
+    As the trees are shared, it does that just once though.
+    And as the if body is gimplified first, the SAVE_EXPR<j> is evaluated inside
+    of the if body and when it is used again after the if, it uses a potentially
+    uninitialized value of j.1 (always uninitialized if the shift count isn't
+    out of bounds).
+    
+    The following patch fixes that by unshare_expr unsharing the folded argument
+    of a SAVE_EXPR if we've folded the SAVE_EXPR into an invariant and it is
+    used more than once.
+    
+    2023-12-08  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/112727* cp-gimplify.c (cp_fold): If SAVE_EXPR has been previously
+            folded, unshare_expr what is returned.
+    
+            * c-c++-common/ubsan/pr112727.c: New test.
+    
+    (cherry picked from commit 6ddaf06e375e1c15dcda338697ab6ea457e6f497)
+
+- User: Richard Biener | Time: 2024-05-08 12:20:22 UTC
+  Text: Fixed I guess.
+

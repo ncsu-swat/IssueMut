@@ -1,0 +1,139 @@
+Bug Summary: [11/12 Regression] Useless movzx instruction emitted when loading 8 bits from 24 bit struct
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 12.2.0
+
+Comments:
+- User: John Zwinck | Time: 2023-01-24 11:01:25 UTC
+  Text: This code produces an extra instruction in GCC 11 and 12 (but not 10 or before):
+
+    #include <stdint.h>
+
+    struct S
+    {
+        uint8_t e1;
+        uint8_t e2;
+        uint8_t e3;
+    };
+
+    uint32_t f2(S s) { return s.e2; }
+
+The generated code is:
+
+        mov     eax, edi
+        movzx   eax, ah
+        movzx   eax, al
+        ret
+
+The movzx from "al" is useless: it zeros the high 24 bits of eax which are known to be zero after the prior movzx.  GCC 10 and earlier do not emit the useless instruction, and neither do GCC 11 or 12 if the struct contains 4 bytes instead of 3.
+
+Demo:https://godbolt.org/z/Wajo86GfM
+
+- User: Andrew Pinski | Time: 2023-01-24 13:15:45 UTC
+  Text: Confirmed:
+
+Trying 16 -> 6:
+   16: r86:QI#0=zero_extract(r87:HI,0x8,0x8)
+      REG_DEAD r87:HI
+    6: r84:SI=zero_extend(r86:QI)
+      REG_DEAD r86:QI
+Failed to match this instruction:
+(set (reg:SI 84 [ s.e2 ])
+    (zero_extract:SI (reg:HI 87)
+        (const_int 8 [0x8])
+        (const_int 8 [0x8])))
+
+- User: Andrew Pinski | Time: 2023-01-24 13:18:52 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> Confirmed:
+> 
+> Trying 16 -> 6:
+>    16: r86:QI#0=zero_extract(r87:HI,0x8,0x8)
+>       REG_DEAD r87:HI
+>     6: r84:SI=zero_extend(r86:QI)
+>       REG_DEAD r86:QI
+> Failed to match this instruction:
+> (set (reg:SI 84 [ s.e2 ])
+>     (zero_extract:SI (reg:HI 87)
+>         (const_int 8 [0x8])
+>         (const_int 8 [0x8])))Hmm, is this even valid RTL that combine is producing ...
+If there was a subreg to SI mode there from the HI mode reg, it would match correctly.
+
+- User: Hongtao.liu | Time: 2023-01-28 07:36:26 UTC
+  Text: > Hmm, is this even valid RTL that combine is producing ...If it's valid for different modes between zero_extract and mode of {loc}, we can directly add an insn to match that.
+
+The documents doesn't mention any requirement for mode {m} and {loc}
+
+2892@findex zero_extract
+2893@item (zero_extract:@var{m} @var{loc} @var{size} @var{pos})
+2894Like @code{sign_extract} but refers to an unsigned or zero-extended
+2895bit-field.  The same sequence of bits are extracted, but they
+2896are filled to an entire word with zeros instead of by sign-extension.
+2897
+2898Unlike @code{sign_extract}, this type of expressions can be lvalues
+2899in RTL; they may appear on the left side of an assignment, indicating
+2900insertion of a value into the specified bit-field.
+2901@end table
+
+- User: Andrew Pinski | Time: 2023-02-10 22:07:24 UTC
+  Text: ***Bug 108756has been marked as a duplicate of this bug. ***
+
+- User: Levo DeLellis | Time: 2023-02-10 22:34:59 UTC
+  Text: Here's a testcase for the same problem
+
+	struct T2 { bool a, b; };
+	static T2 test();
+	int myfunc() {
+		auto [a, b] = test();
+		return ((int)a<<1) + b;
+	}
+
+- User: Uroš Bizjak | Time: 2023-02-13 08:49:22 UTC
+  Text: Createdattachment 54454[details]patch to relax extract modes
+
+This patch relaxes extract and insert operand modes to no longer match op mode.
+
+- User: GCC Commits | Time: 2023-02-13 19:24:13 UTC
+  Text: The master branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:00b8a212ea2132fb68e42488317392346e169035commitr13-5969-g00b8a212ea2132fb68e42488317392346e169035Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Mon Feb 13 17:17:46 2023 +0100
+
+    i386: Relax extract location operand mode requirements [PR108516]
+    
+    Combine pass simplifies zero-extend of a zero-extract to:
+    
+    Trying 16 -> 6:
+       16: r86:QI#0=zero_extract(r87:HI,0x8,0x8)
+          REG_DEAD r87:HI
+        6: r84:SI=zero_extend(r86:QI)
+          REG_DEAD r86:QI
+    Failed to match this instruction:
+    (set (reg:SI 84 [ s.e2 ])
+        (zero_extract:SI (reg:HI 87)
+            (const_int 8 [0x8])
+            (const_int 8 [0x8])))
+    
+    which fails instruction recognision.  The pattern is valid, since there
+    is no requirement on the mode of the location operand.
+    
+    The patch relaxes location operand mode requirements of *extzv and *extv
+    insn patterns to allow all supported integer modes.  The patch also
+    adds support for a related sign-extend from zero-extracted operand.
+    
+    2023-02-13  UroÅ¡ Bizjak  <ubizjak@gmail.com>
+    
+    gcc/ChangeLog:PR target/108516* config/i386/predicates.md (extr_register_operand):
+            New special predicate.
+            * config/i386/i386.md (*extv<mode>): Use extr_register_operand
+            as operand 1 predicate.
+            (*exzv<mode>): Ditto.
+            (*extendqi<SWI24:mode>_ext_1): New insn pattern.
+    
+    gcc/testsuite/ChangeLog:PR target/108516* gcc.target/i386/pr108516-1.c: New test.
+            * gcc.target/i386/pr108516-2.c: Ditto.
+
+- User: Uroš Bizjak | Time: 2023-02-13 20:04:12 UTC
+  Text: Fixed.
+

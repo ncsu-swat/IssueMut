@@ -1,0 +1,523 @@
+Bug Summary: Output register of an "asm volatile goto" is incorrectly clobbered/discarded
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: inline-asm, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sean Christopherson | Time: 2024-02-14 17:19:01 UTC
+  Text: Createdattachment 57428[details]Intermediate output of the miscompiled file
+
+gcc-11 appears to have a bug that results in gcc incorrectly clobbering the output register of an "asm volatile goto".
+
+The failing asm blob is a sequence of VMREADs in the Linux kernel, with the outputs stored into a dynamically allocated structure whose lifecycle is far beyond the scope of the code in question:
+
+  vmcs12->guest_pdptr0 = vmcs_read64(GUEST_PDPTR0);
+  vmcs12->guest_pdptr1 = vmcs_read64(GUEST_PDPTR1);
+  vmcs12->guest_pdptr2 = vmcs_read64(GUEST_PDPTR2);
+  vmcs12->guest_pdptr3 = vmcs_read64(GUEST_PDPTR3);
+
+where vmcs_read64() eventually becomes:
+
+        asm volatile goto("1: vmread %[field], %[output]\n\t"
+                          "jna %l[do_fail]\n\t"
+
+                          _ASM_EXTABLE(1b, %l[do_exception])
+
+                          : [output] "=r" (value)
+                          : [field] "r" (field)
+                          : "cc"
+                          : do_fail, do_exception);
+
+        return value;
+
+  do_fail:
+        instrumentation_begin();
+        vmread_error(field);
+        instrumentation_end();
+        return 0;
+
+  do_exception:
+        kvm_spurious_fault();
+        return 0;
+
+
+The first three PDPTR VMREADs generate correctly, but the fourth effectively gets ignored, and '0' is written to vmcs12->guest_pdptr3.
+
+    3597:       mov    $0x280a,%r13d
+    359d:       vmread %r13,%r13
+    35a1:       jbe    3724 <sync_vmcs02_to_vmcs12+0x7c4>
+    35a7:       mov    %r13,0xd8(%rbx)
+    35ae:       jmp    396b <sync_vmcs02_to_vmcs12+0xa0b>
+    35b3:       mov    $0x280c,%r13d
+    35b9:       vmread %r13,%r13
+    35bd:       jbe    3705 <sync_vmcs02_to_vmcs12+0x7a5>
+    35c3:       mov    %r13,0xe0(%rbx)
+    35ca:       jmp    393a <sync_vmcs02_to_vmcs12+0x9da>
+    35cf:       mov    $0x280e,%r13d
+    35d5:       vmread %r13,%r13
+    35d9:       jbe    36e6 <sync_vmcs02_to_vmcs12+0x786>
+    35df:       mov    %r13,0xe8(%rbx)
+    35e6:       jmp    3909 <sync_vmcs02_to_vmcs12+0x9a9>
+    35eb:       mov    $0x2810,%eax
+    35f0:       vmread %rax,%rax        <= VMREAD to nowhere   
+    35f3:       jbe    36ca <sync_vmcs02_to_vmcs12+0x76a>
+    35f9:       xor    %r12d,%r12d      <= zeroing of output
+    35fc:       mov    %r12,0xf0(%rbx)  <= store to vmcs12->guest_pdptr3
+
+Replacing "asm volatile goto" with the following macro
+
+  #define asm_goto(x...) \
+          do { asm volatile goto(x); asm (""); } while (0)
+
+to force a second barrier generates functional code, although the attempt to miscompile the sequence is still evident, as the output of the affected VMREAD is unnecessarily bounced through an extra register:
+
+    35f8:       mov    $0x280a,%r13d
+    35fe:       vmread %r13,%r13
+    3602:       jbe    36b2 <sync_vmcs02_to_vmcs12+0x762>
+    3608:       mov    %r13,0xd8(%rbx)
+    360f:       jmp    3925 <sync_vmcs02_to_vmcs12+0x9d5>
+    3614:       mov    $0x280c,%r13d
+    361a:       vmread %r13,%r13
+    361e:       jbe    3693 <sync_vmcs02_to_vmcs12+0x743>
+    3620:       mov    %r13,0xe0(%rbx)
+    3627:       jmp    38f4 <sync_vmcs02_to_vmcs12+0x9a4>
+    362c:       mov    $0x280e,%r13d
+    3632:       vmread %r13,%r13
+    3636:       jbe    367a <sync_vmcs02_to_vmcs12+0x72a>
+    3638:       mov    %r13,0xe8(%rbx)
+    363f:       jmp    38c3 <sync_vmcs02_to_vmcs12+0x973>
+    3644:       mov    $0x2810,%eax
+    3649:       vmread %rax,%rax
+    364c:       jbe    3664 <sync_vmcs02_to_vmcs12+0x714>
+    364e:       mov    %rax,%r12
+    3651:       mov    %r12,0xf0(%rbx)
+
+The bug reproduces with two different 11.4.0 builds, on three different systems (Intel i7-9850H, Intel i7-13700K, AMD EPYC 7B12), all running Debian-based Linux.
+
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=gcc
+COLLECT_LTO_WRAPPER=/usr/lib/gcc/x86_64-linux-gnu/11/lto-wrapper
+OFFLOAD_TARGET_NAMES=nvptx-none:amdgcn-amdhsa
+OFFLOAD_TARGET_DEFAULT=1
+Target: x86_64-linux-gnu
+Configured with: ../src/configure -v --with-pkgversion='Ubuntu 11.4.0-1ubuntu1~22.04' --with-bugurl=file:///usr/share/doc/gcc-11/README.Bugs --enable-languages=c,ada,c++,go,brig,d,fortran,objc,obj-c++,m2 --prefix=/usr --with-gcc-major-version-only --program-suffix=-11 --program-prefix=x86_64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/lib --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --enable-bootstrap --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-gnu-unique-object --disable-vtable-verify --enable-plugin --enable-default-pie --with-system-zlib --enable-libphobos-checking=release --with-target-system-zlib=auto --enable-objc-gc=auto --enable-multiarch --disable-werror --enable-cet --with-arch-32=i686 --with-abi=m64 --with-multilib-list=m32,m64,mx32 --enable-multilib --with-tune=generic --enable-offload-targets=nvptx-none=/build/gcc-11-XeT9lY/gcc-11-11.4.0/debian/tmp-nvptx/usr,amdgcn-amdhsa=/build/gcc-11-XeT9lY/gcc-11-11.4.0/debian/tmp-gcn/usr --without-cuda-driver --enable-checking=release --build=x86_64-linux-gnu --host=x86_64-linux-gnu --target=x86_64-linux-gnu --with-build-config=bootstrap-lto-lean --enable-link-serialization=2
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 11.4.0 (Ubuntu 11.4.0-1ubuntu1~22.04)
+
+$ gcc-11 -v
+Using built-in specs.
+COLLECT_GCC=gcc-11
+COLLECT_LTO_WRAPPER=/usr/lib/gcc/x86_64-linux-gnu/11/lto-wrapper
+OFFLOAD_TARGET_NAMES=nvptx-none:amdgcn-amdhsa
+OFFLOAD_TARGET_DEFAULT=1
+Target: x86_64-linux-gnu
+Configured with: ../src/configure -v --with-pkgversion='Debian 11.4.0-4' --with-bugurl=file:///usr/share/doc/gcc-11/README.Bugs --enable-languages=c,ada,c++,go,brig,d,fortran,objc,obj-c++,m2 --prefix=/usr --with-gcc-major-version-only --program-suffix=-11 --program-prefix=x86_64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/lib --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --enable-bootstrap --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-gnu-unique-object --disable-vtable-verify --enable-plugin --enable-default-pie --with-system-zlib --enable-libphobos-checking=release --with-target-system-zlib=auto --enable-objc-gc=auto --enable-multiarch --disable-werror --enable-cet --with-arch-32=i686 --with-abi=m64 --with-multilib-list=m32,m64,mx32 --enable-multilib --with-tune=generic --enable-offload-targets=nvptx-none=/build/gcc-11-IBEKnH/gcc-11-11.4.0/debian/tmp-nvptx/usr,amdgcn-amdhsa=/build/gcc-11-IBEKnH/gcc-11-11.4.0/debian/tmp-gcn/usr --without-cuda-driver --enable-checking=release --build=x86_64-linux-gnu --host=x86_64-linux-gnu --target=x86_64-linux-gnu --with-build-config=bootstrap-lto-lean --enable-link-serialization=28
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 11.4.0 (Debian 11.4.0-4)
+
+- User: Jakub Jelinek | Time: 2024-02-14 18:00:48 UTC
+  Text: Bisection points tor12-5301-g045206450386bcd774db3bde0c696828402361c6making the problem go away,
+    3abc:	b8 10 28 00 00       	mov    $0x2810,%eax
+    3ac1:	0f 78 c0             	vmread %rax,%rax
+    3ac4:	0f 86 1e 01 00 00    	jbe    3be8 <sync_vmcs02_to_vmcs12+0x858>
+    3aca:	45 31 e4             	xor    %r12d,%r12d
+    3acd:	4c 89 a3 f0 00 00 00 	mov    %r12,0xf0(%rbx)
+to
+    3a4f:	b8 10 28 00 00       	mov    $0x2810,%eax
+    3a54:	0f 78 c0             	vmread %rax,%rax
+    3a57:	0f 86 1b 01 00 00    	jbe    3b78 <sync_vmcs02_to_vmcs12+0x808>
+    3a5d:	48 89 83 f0 00 00 00 	mov    %rax,0xf0(%rbx)
+
+- User: Linus Torvalds | Time: 2024-02-14 18:13:02 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #1)> Bisection points tor12-5301-g045206450386bcd774db3bde0c696828402361c6> making the problem go away,Well, that certainly explains why I can't see the problem with my gcc 13.2.1.
+
+It looks like that commit is in gcc-12.1.o and later:
+
+   git log --oneline --all --grep="tree-optimization/102880 - improve CD-DCE"
+
+only returns that one commit, and 
+
+   git name-rev --refs '*releases*' 045206450386b
+
+says "gcc-12.1.0~3038".
+
+So we could make our workaround option be something like
+
+   config GCC_ASM_GOTO_WORKAROUND
+     def_bool y
+     depends on CC_IS_GCC && GCC_VERSION < 120100
+
+but maybe there is some backporting policy with gcc that my quick git check missed?
+
+- User: Linus Torvalds | Time: 2024-02-14 18:16:54 UTC
+  Text: (In reply to Linus Torvalds fromcomment #2)
+>> So we could make our workaround option be something like
+> 
+>    config GCC_ASM_GOTO_WORKAROUND
+>      def_bool y
+>      depends on CC_IS_GCC && GCC_VERSION < 120100Actually, rather than add a new kernel config option, I'll just make the workaround conditional in our <linux/compiler-gcc.h> header file.
+
+But I'll wait for confirmation from gcc people that Jakub's bisection makes sense, and is the real fix, rather than just a change that just happens to hide the issue.
+
+- User: Jakub Jelinek | Time: 2024-02-14 18:21:45 UTC
+  Text: Bisection in the other direction doesn't make much sense, since asm goto with output operands is only supported in GCC 11 and later.
+
+Anyway, with gcc 11, I can see something fishy already during expansion:
+(jump_insn 927 926 1285 191 (parallel [
+            (set (reg:DI 385 [ value ])
+                (asm_operands/v:DI ("1: vmread %1, %0
+        jna %l2
+         .pushsection "__ex_table","a"
+ .balign 4
+ .long (1b) - .
+ .long (%l3) - .
+ .long 1
+ .popsection
+") ("=r") 0 [
+                        (reg:DI 386)
+                    ]
+                     [
+                        (asm_input:DI ("r") /home/sean/go/src/kernel.org/linux/arch/x86/kvm/vmx/vmx_ops.h:97)
+                    ]
+                     [
+                        (label_ref:DI 959)
+                        (label_ref:DI 965)
+                    ] /home/sean/go/src/kernel.org/linux/arch/x86/kvm/vmx/vmx_ops.h:97))
+            (clobber (reg:CC 17 flags))
+        ]) "/home/sean/go/src/kernel.org/linux/arch/x86/kvm/vmx/vmx_ops.h":97:2 -1
+     (insn_list:REG_LABEL_TARGET 1253 (insn_list:REG_LABEL_TARGET 959 (nil)))
+ -> 965)             
+;;  succ:       197 count:99052688 (estimated locally)
+;;              198 count:99052688 (estimated locally)
+;;              192 count:99052688 (estimated locally) (FALLTHRU)
+
+;; basic block 192, loop depth 0, count 99052688 (estimated locally), maybe hot
+;;  prev block 191, next block 193, flags: (NEW, REACHABLE, RTL, MODIFIED)
+;;  pred:       191 count:99052688 (estimated locally) (FALLTHRU)
+(note 1285 927 931 192 [bb 192] NOTE_INSN_BASIC_BLOCK)
+(jump_insn 931 1285 932 192 (set (pc)
+        (label_ref:DI 1253)) "/home/sean/go/src/kernel.org/linux/arch/x86/kvm/vmx/vmx_ops.h":97:2 807 {jump}
+     (nil)
+ -> 1253)
+;;  succ:       199 [always]  count:99052688 (estimated locally)
+...
+(code_label 1253 1251 1252 199 1127 (nil) [1 uses])
+(note 1252 1253 49 199 [bb 199] NOTE_INSN_BASIC_BLOCK)
+(insn 49 1252 930 199 (set (reg:DI 152 [ _241 ])
+        (reg/v:DI 151 [ value ])) "/home/sean/go/src/kernel.org/linux/arch/x86/kvm/vmx/vmx_ops.h":107:9 -1
+     (nil))
+(insn 930 49 968 199 (set (reg/v:DI 151 [ value ])
+        (reg:DI 385 [ value ])) "/home/sean/go/src/kernel.org/linux/arch/x86/kvm/vmx/vmx_ops.h":97:2 -1
+     (nil))
+;;  succ:       200 [always]  count:16508781 (estimated locally) (FALLTHRU)
+
+(code_label 968 930 969 200 1083 (nil) [5 uses])
+(note 969 968 970 200 [bb 200] NOTE_INSN_BASIC_BLOCK)
+(insn 970 969 971 200 (set (mem:DI (plus:DI (reg/v/f:DI 283 [ vmcs12 ])
+                (const_int 240 [0xf0])) [19 vmcs12_30(D)->guest_pdptr3+0 S8 A8])
+        (reg:DI 152 [ _241 ])) "/home/sean/go/src/kernel.org/linux/arch/x86/kvm/vmx/nested.c":4422:25 -1
+     (nil))
+;;  succ:       201 [always]  count:55029271 (estimated locally) (FALLTHRU)
+
+So, the asm goto sets pseudo 385 and in case it doesn't jump anywhere, it then goes
+into the 2 pseudo moves but they'd need to be reversed in order to store the asm goto
+output into gues_pdptr3.
+
+- User: Linus Torvalds | Time: 2024-02-14 18:25:37 UTC
+  Text: (In reply to Linus Torvalds fromcomment #2)
+>> So we could make our workaround option be something like
+> 
+>    config GCC_ASM_GOTO_WORKAROUND
+>      def_bool y
+>      depends on CC_IS_GCC && GCC_VERSION < 120100Replying to myself some more, since that kernel side workaround is actually in two parts: it does the extra empty inline asm as an extra barrier, but it *also* adds the 'volatile' to the asm with outputs to work around the other gcc bug.
+
+And that other fix ("Mark asm goto with outputs as volatile") is *not* in gcc-12.1.0. It has only made it into gcc-13.2.0 (and it's pending in the gcc-12 release branch if I read things right).
+
+I suspect that other bug doesn't affect Sean's kvm case, because the outputs are always used, but it could affect other kernel code.
+
+So we'd want to have at least gcc-13.2 to be safe.
+
+Hmm.
+
+We could make the "add volatile manually" be the default workaround, though, since it shouldn't matter.
+
+- User: Jakub Jelinek | Time: 2024-02-14 18:40:06 UTC
+  Text: insn 49 above is inserted in
+#1  0x0000000000d419db in emit_insn (x=0x7fffe6e921f8) at ../../gcc/emit-rtl.c:5106
+#2  0x0000000001895ab7 in ix86_expand_move (mode=E_DImode, operands=0x7fffffffd600) at ../../gcc/config/i386/i386-expand.c:368
+#3  0x0000000001de4226 in gen_movdi (operand0=0x7fffe6ec8108, operand1=0x7fffe6ec80f0) at ../../gcc/config/i386/i386.md:1935
+#4  0x0000000000db804f in insn_gen_fn::operator()<rtx_def*, rtx_def*> (this=0x2c6cd48 <insn_data+242536>) at ../../gcc/recog.h:407
+#5  0x0000000000d8f394 in emit_move_insn_1 (x=0x7fffe6ec8108, y=0x7fffe6ec80f0) at ../../gcc/expr.c:3766
+#6  0x0000000000d8fe7a in emit_move_insn (x=0x7fffe6ec8108, y=0x7fffe6ec80f0) at ../../gcc/expr.c:3936
+#7  0x00000000013b8a75 in emit_partition_copy (dest=0x7fffe6ec8108, src=0x7fffe6ec80f0, unsignedsrcp=1, sizeexp=<ssa_name 0x7fffe9cfc6c0 240>) at ../../gcc/tree-outof-ssa.c:259
+#8  0x00000000013b8c5b in insert_partition_copy_on_edge (e=<edge 0x7fffe7314000 (138 -> 145)>, dest=72, src=71, locus=2147592841) at ../../gcc/tree-outof-ssa.c:293
+#9  0x00000000013b9f0b in elim_create (g=0x7fffffffd8e0, T=72) at ../../gcc/tree-outof-ssa.c:729
+#10 0x00000000013ba0ab in eliminate_phi (e=<edge 0x7fffe7314000 (138 -> 145)>, g=0x7fffffffd8e0) at ../../gcc/tree-outof-ssa.c:771
+#11 0x00000000013baaa5 in expand_phi_nodes (sa=0x3169360 <SA>) at ../../gcc/tree-outof-ssa.c:1024
+later on insert_partition_copy_on_edge will insert_insn_on_edge on the 138 -> 145 edge, but the insertion remains uncommitted.
+Later on the asm goto expansion copies after_rtl_seq which contains (set (reg:DI 151) (reg:DI 385)) and calls insert_insn_on_edge on it too.
+But insert_insn_on_edge appends to the e->insns.r rather than prepends it which presumably is what we'd want for the asm goto case.
+
+- User: Jakub Jelinek | Time: 2024-02-14 19:07:04 UTC
+  Text: So, GCC 11 version:
+--- gcc/cfgexpand.c.jj	2023-05-09 12:59:04.381738365 +0200
++++ gcc/cfgexpand.c	2024-02-14 19:56:08.733150432 +0100
+@@ -3639,7 +3639,16 @@ expand_asm_stmt (gasm *stmt)
+ 		emit_insn (copy_insn (PATTERN (curr)));
+ 	      rtx_insn *copy = get_insns ();
+ 	      end_sequence ();
+-	      insert_insn_on_edge (copy, e);
++	      if (rtx_insn *prev = e->insns.r)
++		{
++		  /* Prepend copy before any other previously
++		     inserted insns on the edge rather than append.  */
++		  e->insns.r = NULL;
++		  insert_insn_on_edge (copy, e);
++		  insert_insn_on_edge (prev, e);
++		}
++	      else
++		insert_insn_on_edge (copy, e);
+ 	    }
+ 	}
+     }
+changes the emitted assembler:
+@@ -7328,7 +7328,7 @@ sync_vmcs02_to_vmcs12:
+ # 0 "" 2
+ #NO_APP
+ .L1127:
+-	xorl	%r12d, %r12d
++	movq	%rax, %r12
+ .L1083:
+ 	movq	%r12, 240(%rbx)
+ 	jmp	.L1047
+@@ -29897,7 +29897,7 @@ nested_vmx_vmexit:
+ # 0 "" 2
+ #NO_APP
+ .L5187:
+-	xorl	%r12d, %r12d
++	movq	%rax, %r12
+ .L5113:
+ 	movq	%r12, %rdx
+ 	movl	$7, %esi
+which is I believe exactly what we want.
+
+For GCC trunk the patch would be
+--- gcc/cfgexpand.cc.jj	2024-02-10 11:25:09.995474027 +0100
++++ gcc/cfgexpand.cc	2024-02-14 19:54:30.811505882 +0100
+@@ -3687,7 +3687,16 @@ expand_asm_stmt (gasm *stmt)
+ 		  copy = get_insns ();
+ 		  end_sequence ();
+ 		}
+-	      insert_insn_on_edge (copy, e);
++	      if (rtx_insn *prev = e->insns.r)
++		{
++		  /* Prepend copy before any other previously
++		     inserted insns on the edge rather than append.  */
++		  e->insns.r = NULL;
++		  insert_insn_on_edge (copy, e);
++		  insert_insn_on_edge (prev, e);
++		}
++	      else
++		insert_insn_on_edge (copy, e);
+ 	    }
+ 	}
+     }
+and with trunk it triggers (I mean the prev != NULL case) only on the nested_vmx_vmexit
+function and not the other one.
+Guess one could try to build whole kernel with instrumented gcc (just add
+FILE *f = fopen ("/tmp/asmgoto", "a");
+fprintf (f, "%s %s\n", main_input_filename ? main_input_filename : "-", current_function_name ());
+fclose (f);
+next to the e->insns.r = NULL; in the patch or so) to find out what else it affects.
+
+- User: Jakub Jelinek | Time: 2024-02-14 20:31:53 UTC
+  Text: Createdattachment 57430[details]gcc14-pr113921.patch
+
+Full untested trunk patch.
+
+- User: Richard Biener | Time: 2024-02-15 08:00:53 UTC
+  Text: So just to say all versions seem to be affected and the issue is just latent because of the rev we bisected to.
+
+- User: Jakub Jelinek | Time: 2024-02-15 08:21:21 UTC
+  Text: ***Bug 107385has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2024-02-15 14:56:31 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:2b4efc5db2aedb59196987300e14951d08cd7106commitr14-9012-g2b4efc5db2aedb59196987300e14951d08cd7106Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Feb 15 15:53:01 2024 +0100
+
+    expand: Fix handling of asm goto outputs vs. PHI argument adjustments [PR113921]
+    
+    The Linux kernel and the following testcase distilled from it is
+    miscompiled, because tree-outof-ssa.cc (eliminate_phi) emits some
+    fixups on some of the edges (but doesn't commit edge insertions).
+    Later expand_asm_stmt emits further instructions on the same edge.
+    Now the problem is that expand_asm_stmt uses insert_insn_on_edge
+    to add its own fixups, but that function appends to the existing
+    sequence on the edge if any.  And the bug triggers when the
+    fixup sequence emitted by eliminate_phi uses a pseudo which the
+    fixup sequence emitted by expand_asm_stmt later on sets.
+    So, we end up with
+      (set (reg A) (asm_operands ...))
+    and on one of the edges queued sequence
+      (set (reg C) (reg B)) // added by eliminate_phi
+      (set (reg B) (reg A)) // added by expand_asm_stmt
+    That is wrong, what we emit by expand_asm_stmt needs to be as close
+    to the asm_operands as possible (they aren't known until expand_asm_stmt
+    is called, the PHI fixup code assumes it is reg B which holds the right
+    value) and the PHI adjustments need to be done after it.
+    
+    So, the following patch introduces a prepend_insn_to_edge function and
+    uses it from expand_asm_stmt, so that we queue
+      (set (reg B) (reg A)) // added by expand_asm_stmt
+      (set (reg C) (reg B)) // added by eliminate_phi
+    instead and so the value from the asm_operands output propagates correctly
+    to the PHI result.
+    
+    2024-02-15  Jakub Jelinek  <jakub@redhat.com>PR middle-end/113921* cfgrtl.h (prepend_insn_to_edge): New declaration.
+            * cfgrtl.cc (insert_insn_on_edge): Clarify behavior in function
+            comment.
+            (prepend_insn_to_edge): New function.
+            * cfgexpand.cc (expand_asm_stmt): Use prepend_insn_to_edge instead of
+            insert_insn_on_edge.
+    
+            * gcc.target/i386/pr113921.c: New test.
+
+- User: GCC Commits | Time: 2024-02-15 15:14:55 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:4040d472825f203660371331c9e86cd75e30f8d2commitr13-8328-g4040d472825f203660371331c9e86cd75e30f8d2Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Feb 15 15:53:01 2024 +0100
+
+    expand: Fix handling of asm goto outputs vs. PHI argument adjustments [PR113921]
+    
+    The Linux kernel and the following testcase distilled from it is
+    miscompiled, because tree-outof-ssa.cc (eliminate_phi) emits some
+    fixups on some of the edges (but doesn't commit edge insertions).
+    Later expand_asm_stmt emits further instructions on the same edge.
+    Now the problem is that expand_asm_stmt uses insert_insn_on_edge
+    to add its own fixups, but that function appends to the existing
+    sequence on the edge if any.  And the bug triggers when the
+    fixup sequence emitted by eliminate_phi uses a pseudo which the
+    fixup sequence emitted by expand_asm_stmt later on sets.
+    So, we end up with
+      (set (reg A) (asm_operands ...))
+    and on one of the edges queued sequence
+      (set (reg C) (reg B)) // added by eliminate_phi
+      (set (reg B) (reg A)) // added by expand_asm_stmt
+    That is wrong, what we emit by expand_asm_stmt needs to be as close
+    to the asm_operands as possible (they aren't known until expand_asm_stmt
+    is called, the PHI fixup code assumes it is reg B which holds the right
+    value) and the PHI adjustments need to be done after it.
+    
+    So, the following patch introduces a prepend_insn_to_edge function and
+    uses it from expand_asm_stmt, so that we queue
+      (set (reg B) (reg A)) // added by expand_asm_stmt
+      (set (reg C) (reg B)) // added by eliminate_phi
+    instead and so the value from the asm_operands output propagates correctly
+    to the PHI result.
+    
+    2024-02-15  Jakub Jelinek  <jakub@redhat.com>PR middle-end/113921* cfgrtl.h (prepend_insn_to_edge): New declaration.
+            * cfgrtl.cc (insert_insn_on_edge): Clarify behavior in function
+            comment.
+            (prepend_insn_to_edge): New function.
+            * cfgexpand.cc (expand_asm_stmt): Use prepend_insn_to_edge instead of
+            insert_insn_on_edge.
+    
+            * gcc.target/i386/pr113921.c: New test.
+    
+    (cherry picked from commit 2b4efc5db2aedb59196987300e14951d08cd7106)
+
+- User: GCC Commits | Time: 2024-02-15 15:17:51 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:ba09da9787e8db8903b2b0f7c647c0d7af68bb74commitr12-10158-gba09da9787e8db8903b2b0f7c647c0d7af68bb74Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Feb 15 15:53:01 2024 +0100
+
+    expand: Fix handling of asm goto outputs vs. PHI argument adjustments [PR113921]
+    
+    The Linux kernel and the following testcase distilled from it is
+    miscompiled, because tree-outof-ssa.cc (eliminate_phi) emits some
+    fixups on some of the edges (but doesn't commit edge insertions).
+    Later expand_asm_stmt emits further instructions on the same edge.
+    Now the problem is that expand_asm_stmt uses insert_insn_on_edge
+    to add its own fixups, but that function appends to the existing
+    sequence on the edge if any.  And the bug triggers when the
+    fixup sequence emitted by eliminate_phi uses a pseudo which the
+    fixup sequence emitted by expand_asm_stmt later on sets.
+    So, we end up with
+      (set (reg A) (asm_operands ...))
+    and on one of the edges queued sequence
+      (set (reg C) (reg B)) // added by eliminate_phi
+      (set (reg B) (reg A)) // added by expand_asm_stmt
+    That is wrong, what we emit by expand_asm_stmt needs to be as close
+    to the asm_operands as possible (they aren't known until expand_asm_stmt
+    is called, the PHI fixup code assumes it is reg B which holds the right
+    value) and the PHI adjustments need to be done after it.
+    
+    So, the following patch introduces a prepend_insn_to_edge function and
+    uses it from expand_asm_stmt, so that we queue
+      (set (reg B) (reg A)) // added by expand_asm_stmt
+      (set (reg C) (reg B)) // added by eliminate_phi
+    instead and so the value from the asm_operands output propagates correctly
+    to the PHI result.
+    
+    2024-02-15  Jakub Jelinek  <jakub@redhat.com>PR middle-end/113921* cfgrtl.h (prepend_insn_to_edge): New declaration.
+            * cfgrtl.cc (insert_insn_on_edge): Clarify behavior in function
+            comment.
+            (prepend_insn_to_edge): New function.
+            * cfgexpand.cc (expand_asm_stmt): Use prepend_insn_to_edge instead of
+            insert_insn_on_edge.
+    
+            * gcc.target/i386/pr113921.c: New test.
+    
+    (cherry picked from commit 2b4efc5db2aedb59196987300e14951d08cd7106)
+
+- User: GCC Commits | Time: 2024-02-15 15:20:59 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:7a6e9e70ea88061981c5565c043985d8cde9ecc8commitr11-11239-g7a6e9e70ea88061981c5565c043985d8cde9ecc8Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Feb 15 15:53:01 2024 +0100
+
+    expand: Fix handling of asm goto outputs vs. PHI argument adjustments [PR113921]
+    
+    The Linux kernel and the following testcase distilled from it is
+    miscompiled, because tree-outof-ssa.cc (eliminate_phi) emits some
+    fixups on some of the edges (but doesn't commit edge insertions).
+    Later expand_asm_stmt emits further instructions on the same edge.
+    Now the problem is that expand_asm_stmt uses insert_insn_on_edge
+    to add its own fixups, but that function appends to the existing
+    sequence on the edge if any.  And the bug triggers when the
+    fixup sequence emitted by eliminate_phi uses a pseudo which the
+    fixup sequence emitted by expand_asm_stmt later on sets.
+    So, we end up with
+      (set (reg A) (asm_operands ...))
+    and on one of the edges queued sequence
+      (set (reg C) (reg B)) // added by eliminate_phi
+      (set (reg B) (reg A)) // added by expand_asm_stmt
+    That is wrong, what we emit by expand_asm_stmt needs to be as close
+    to the asm_operands as possible (they aren't known until expand_asm_stmt
+    is called, the PHI fixup code assumes it is reg B which holds the right
+    value) and the PHI adjustments need to be done after it.
+    
+    So, the following patch introduces a prepend_insn_to_edge function and
+    uses it from expand_asm_stmt, so that we queue
+      (set (reg B) (reg A)) // added by expand_asm_stmt
+      (set (reg C) (reg B)) // added by eliminate_phi
+    instead and so the value from the asm_operands output propagates correctly
+    to the PHI result.
+    
+    2024-02-15  Jakub Jelinek  <jakub@redhat.com>PR middle-end/113921* cfgrtl.h (prepend_insn_to_edge): New declaration.
+            * cfgrtl.c (insert_insn_on_edge): Clarify behavior in function
+            comment.
+            (prepend_insn_to_edge): New function.
+            * cfgexpand.c (expand_asm_stmt): Use prepend_insn_to_edge instead of
+            insert_insn_on_edge.
+    
+            * gcc.target/i386/pr113921.c: New test.
+    
+    (cherry picked from commit 2b4efc5db2aedb59196987300e14951d08cd7106)
+
+- User: Jakub Jelinek | Time: 2024-02-15 15:22:50 UTC
+  Text: Should be fixed now for GCC 14.1+, 13.3+, 12.4+ and 11.5.
+

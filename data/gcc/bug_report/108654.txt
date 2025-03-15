@@ -1,0 +1,205 @@
+Bug Summary: Incorrect codegen of RVV GCC
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2023-02-03 08:20:07 UTC
+  Text: #include "riscv_vector.h"
+
+void foo5_3 (int32_t * restrict in, int32_t * restrict out, size_t n, int cond)
+{
+  vint8m1_t v = *(vint8m1_t*)in;
+  *(vint8m1_t*)out = v;
+  vbool8_t v3 = *(vbool8_t*)in;
+  *(vbool8_t*)(out + 200) = v3;
+  vbool16_t v4 = *(vbool16_t *)in;
+  *(vbool16_t *)(out + 300) = v4;
+}
+
+ASM:
+foo5_3:
+        csrr    t0,vlenb
+        slli    t1,t0,1
+        csrr    a5,vlenb
+        sub     sp,sp,t1
+        slli    a3,a5,1
+        vl1re8.v        v24,0(a0)
+        add     a3,a3,sp
+        vs1r.v  v24,0(a1)
+        addi    a4,a1,800
+        sub     a5,a3,a5
+        vsetvli a3,zero,e8,m1,ta,ma
+        vsm.v   v24,0(a4)
+        vs1r.v  v24,0(a5)
+        addi    a1,a1,1200
+        csrr    t0,vlenb
+        slli    t1,t0,1
+        vsetvli a5,zero,e8,mf2,ta,ma
+        vsm.v   v24,0(a1)
+        add     sp,sp,t1
+        jr      ra
+
+There are 2 issues here:
+First, 2 vlm.v mask loads are missing which is incorrect code-gen.
+Second, the code quality is bad which is the duplicate bug filed here:https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108185
+
+- User: GCC Commits | Time: 2023-03-07 13:45:52 UTC
+  Text: The master branch has been updated by Kito Cheng <kito@gcc.gnu.org>:https://gcc.gnu.org/g:247cacc9e381d666a492dfa4ed61b7b19e2d008fcommitr13-6524-g247cacc9e381d666a492dfa4ed61b7b19e2d008fAuthor: Pan Li <pan2.li@intel.com>
+Date:   Tue Mar 7 20:05:15 2023 +0800
+
+    RISC-V: Bugfix for rvv bool mode precision adjustment
+    
+    Fix the bug of the rvv bool mode precision with the adjustment.
+    The bits size of vbool*_t will be adjusted to
+    [1, 2, 4, 8, 16, 32, 64] according to the rvv spec 1.0 isa. The
+    adjusted mode precison of vbool*_t will help underlying pass to
+    make the right decision for both the correctness and optimization.
+    
+    Given below sample code:
+    
+    void test_1(int8_t * restrict in, int8_t * restrict out)
+    {
+      vbool8_t v2 = *(vbool8_t*)in;
+      vbool16_t v5 = *(vbool16_t*)in;
+      *(vbool16_t*)(out + 200) = v5;
+      *(vbool8_t*)(out + 100) = v2;
+    }
+    
+    Before the precision adjustment:
+    
+    addi    a4,a1,100
+    vsetvli a5,zero,e8,m1,ta,ma
+    addi    a1,a1,200
+    vlm.v   v24,0(a0)
+    vsm.v   v24,0(a4)
+    // Need one vsetvli and vlm.v for correctness here.
+    vsm.v   v24,0(a1)
+    
+    After the precision adjustment:
+    
+    csrr    t0,vlenb
+    slli    t1,t0,1
+    csrr    a3,vlenb
+    sub     sp,sp,t1
+    slli    a4,a3,1
+    add     a4,a4,sp
+    sub     a3,a4,a3
+    vsetvli a5,zero,e8,m1,ta,ma
+    addi    a2,a1,200
+    vlm.v   v24,0(a0)
+    vsm.v   v24,0(a3)
+    addi    a1,a1,100
+    vsetvli a4,zero,e8,mf2,ta,ma
+    csrr    t0,vlenb
+    vlm.v   v25,0(a3)
+    vsm.v   v25,0(a2)
+    slli    t1,t0,1
+    vsetvli a5,zero,e8,m1,ta,ma
+    vsm.v   v24,0(a1)
+    add     sp,sp,t1
+    jr      ra
+    
+    However, there may be some optimization opportunates after
+    the mode precision adjustment. It can be token care of in
+    the RISC-V backend in the underlying separted PR(s).
+    
+    gcc/ChangeLog:PR target/108185PR target/108654* config/riscv/riscv-modes.def (ADJUST_PRECISION): Adjust VNx*BI
+            modes.
+            * config/riscv/riscv.cc (riscv_v_adjust_precision): New.
+            * config/riscv/riscv.h (riscv_v_adjust_precision): New.
+            * genmodes.cc (adj_precision): New.
+            (ADJUST_PRECISION): New.
+            (emit_mode_adjustments): Handle ADJUST_PRECISION.
+    
+    gcc/testsuite/ChangeLog:PR target/108185PR target/108654* gcc.target/riscv/rvv/base/pr108185-1.c: New test.
+            * gcc.target/riscv/rvv/base/pr108185-2.c: New test.
+            * gcc.target/riscv/rvv/base/pr108185-3.c: New test.
+            * gcc.target/riscv/rvv/base/pr108185-4.c: New test.
+            * gcc.target/riscv/rvv/base/pr108185-5.c: New test.
+            * gcc.target/riscv/rvv/base/pr108185-6.c: New test.
+            * gcc.target/riscv/rvv/base/pr108185-7.c: New test.
+            * gcc.target/riscv/rvv/base/pr108185-8.c: New test.
+    
+    Signed-off-by: Pan Li <pan2.li@intel.com>
+    Co-authored-by: Ju-Zhe Zhong <juzhe.zhong@rivai.ai>
+
+- User: GCC Commits | Time: 2023-03-23 08:40:48 UTC
+  Text: The master branch has been updated by Kito Cheng <kito@gcc.gnu.org>:https://gcc.gnu.org/g:3a982e07d28a46da81ee5b65b03a896d84b32a48commitr13-6826-g3a982e07d28a46da81ee5b65b03a896d84b32a48Author: Pan Li <pan2.li@intel.com>
+Date:   Wed Mar 8 15:33:33 2023 +0800
+
+    RISC-V: Bugfix for rvv bool mode size adjustment
+    
+    Fix the bug of the rvv bool mode size by the adjustment.
+    Besides the mode precision (aka bit size [1, 2, 4, 8, 16, 32, 64])
+    of the vbool*_t, the mode size (aka byte size) will be adjusted to
+    [1, 1, 1, 1, 2, 4, 8] according to the rvv spec 1.0 isa. The
+    adjustment will provide correct information for the underlying
+    redundant instruction elimiation.
+    
+    Given the below sample code:
+    {
+      vbool1_t v1 = *(vbool1_t*)in;
+      vbool64_t v2 = *(vbool64_t*)in;
+    
+      *(vbool1_t*)(out + 100) = v1;
+      *(vbool64_t*)(out + 200) = v2;
+    }
+    
+    Before the size adjustment:
+    csrr    t0,vlenb
+    slli    t1,t0,1
+    csrr    a3,vlenb
+    sub     sp,sp,t1
+    slli    a4,a3,1
+    add     a4,a4,sp
+    addi    a2,a1,100
+    vsetvli a5,zero,e8,m8,ta,ma
+    sub     a3,a4,a3
+    vlm.v   v24,0(a0)
+    vsm.v   v24,0(a2)
+    vsm.v   v24,0(a3)
+    addi    a1,a1,200
+    csrr    t0,vlenb
+    vsetvli a4,zero,e8,mf8,ta,ma
+    slli    t1,t0,1
+    vlm.v   v24,0(a3)
+    vsm.v   v24,0(a1)
+    add     sp,sp,t1
+    jr      ra
+    
+    After the size adjustment:
+    addi    a3,a1,100
+    vsetvli a4,zero,e8,m8,ta,ma
+    addi    a1,a1,200
+    vlm.v   v24,0(a0)
+    vsm.v   v24,0(a3)
+    vsetvli a5,zero,e8,mf8,ta,ma
+    vlm.v   v24,0(a0)
+    vsm.v   v24,0(a1)
+    ret
+    
+    Additionally, the size adjust cannot cover all possible combinations
+    of the vbool*_t code pattern like above. We will take a look into it
+    in another patches.PR 108185PR 108654gcc/ChangeLog:PR target/108654PR target/108185* config/riscv/riscv-modes.def (ADJUST_BYTESIZE): Adjust size
+            for vector mask modes.
+            * config/riscv/riscv.cc (riscv_v_adjust_bytesize): New.
+            * config/riscv/riscv.h (riscv_v_adjust_bytesize): New.
+    
+    gcc/testsuite/ChangeLog:PR target/108654PR target/108185* gcc.target/riscv/rvv/base/pr108185-1.c: Update.
+            * gcc.target/riscv/rvv/base/pr108185-2.c: Ditto.
+            * gcc.target/riscv/rvv/base/pr108185-3.c: Ditto.
+    
+    Signed-off-by: Pan Li <pan2.li@intel.com>
+    Co-authored-by: Ju-Zhe Zhong <juzhe.zhong@rivai.ai>
+
+- User: JuzheZhong | Time: 2023-03-25 02:31:47 UTC
+  Text: FIXED
+
+- User: JuzheZhong | Time: 2023-03-25 02:32:22 UTC
+  Text: Fixed
+

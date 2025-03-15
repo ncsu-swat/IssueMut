@@ -1,0 +1,110 @@
+Bug Summary: RISC-V: dwarf cfi_escape information is incorrect when use vlenb to get scalable frame
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: 曾治金 | Time: 2024-08-09 03:06:50 UTC
+  Text: Createdattachment 58884[details]risc-v vector dwarf cfi test case
+
+The commit bd93ef changes the chunk_num from 1 to TARGET_MIN_VLEN/128 if TARGET_MIN_VLEN is larger than 128 in riscv_convert_vector_bits. So it changes the value of BYTES_PER_RISCV_VECTOR. For example, before the commit bd93ef is merged and if TARGET_MIN_VLEN is 256, the value of BYTES_PER_RISCV_VECTOR should be [8, 8], but now [16, 16]. The value of riscv_bytes_per_vector_chunk and BYTES_PER_RISCV_VECTOR are no longer equal.
+
+Prologue and epilogue will use BYTES_PER_RISCV_VECTOR.coeffs[1] to estimate the vlenb register value in riscv_legitimize_poly_move, and dwarf2cfi will also get the estimated vlenb register value in riscv_dwarf_poly_indeterminate_value to calculate the number of times to multiply the vlenb register value.
+
+So need to change the factor from riscv_bytes_per_vector_chunk to BYTES_PER_RISCV_VECTOR, otherwise we will get the incorrect dwarf information. The incorrect example as follow:
+
+```
+csrr    t0,vlenb
+slli    t1,t0,1
+sub     sp,sp,t1
+
+.cfi_escape 0xf,0xb,0x72,0,0x92,0xa2,0x38,0,0x34,0x1e,0x23,0x50,0x22
+```
+
+The sequence '0x92,0xa2,0x38,0' means the vlenb register, '0x34' means the literal 4, '0x1e' means the multiply operation. But in fact, the vlenb register value just need to multiply the literal 2.
+
+
+My test case is in the attached file, the compile command is 'riscv64-unknown-linux-gnu-gcc -Ofast -march=rv64gcv -mabi=lp64d -S riscv_cfi_test.c -o riscv_cfi_test.S -Wall'。
+
+
+The following patch can fix the bug.
+```
+diff --git a/gcc/config/riscv/riscv.cc b/gcc/config/riscv/riscv.cc
+index 5fe4273beb7..e07adf91a9b 100644
+--- a/gcc/config/riscv/riscv.cc
++++ b/gcc/config/riscv/riscv.cc
+@@ -10773,12 +10773,14 @@ static unsigned int
+ riscv_dwarf_poly_indeterminate_value (unsigned int i, unsigned int *factor,
+                                      int *offset)
+ {
+-  /* Polynomial invariant 1 == (VLENB / riscv_bytes_per_vector_chunk) - 1.
+-     1. TARGET_MIN_VLEN == 32, polynomial invariant 1 == (VLENB / 4) - 1.
+-     2. TARGET_MIN_VLEN > 32, polynomial invariant 1 == (VLENB / 8) - 1.
++  /* Polynomial invariant 1 == (VLENB / BYTES_PER_RISCV_VECTOR) - 1.
++     1. TARGET_MIN_VLEN == 32, polynomial invariant
++         1 == (VLENB / (4 * riscv_vector_chunks)) - 1.
++     2. TARGET_MIN_VLEN > 32, polynomial invariant
++         1 == (VLENB / (8 * riscv_vector_chunks)) - 1.
+   */
+   gcc_assert (i == 1);
+-  *factor = riscv_bytes_per_vector_chunk;
++  *factor = BYTES_PER_RISCV_VECTOR.coeffs[1];
+   *offset = 1;
+   return RISCV_DWARF_VLENB;
+ }
+```
+
+- User: GCC Commits | Time: 2024-08-17 04:02:34 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:a11dcaff9fc94971188d54310d3053e9f68a0d3dcommitr15-2962-ga11dcaff9fc94971188d54310d3053e9f68a0d3dAuthor: æ¾æ²»é <zhijin.zeng@spacemit.com>
+Date:   Wed Aug 14 14:06:23 2024 +0800
+
+    RISC-V: Fix factor in dwarf_poly_indeterminate_value [PR116305]
+    
+    This patch is to fix the bug (BugId:116305) introduced by the commit
+    bd93ef for risc-v target.
+    
+    The commit bd93ef changes the chunk_num from 1 to TARGET_MIN_VLEN/128
+    if TARGET_MIN_VLEN is larger than 128 in riscv_convert_vector_bits. So
+    it changes the value of BYTES_PER_RISCV_VECTOR. For example, before
+    merging the commit bd93ef and if TARGET_MIN_VLEN is 256, the value
+    of BYTES_PER_RISCV_VECTOR should be [8, 8], but now [16, 16]. The value
+    of riscv_bytes_per_vector_chunk and BYTES_PER_RISCV_VECTOR are no longer
+    equal.
+    
+    Prologue will use BYTES_PER_RISCV_VECTOR.coeffs[1] to estimate the vlenb
+    register value in riscv_legitimize_poly_move, and dwarf2cfi will also
+    get the estimated vlenb register value in riscv_dwarf_poly_indeterminate_value
+    to calculate the number of times to multiply the vlenb register value.
+    
+    So need to change the factor from riscv_bytes_per_vector_chunk to
+    BYTES_PER_RISCV_VECTOR, otherwise we will get the incorrect dwarf
+    information. The incorrect example as follow:
+    
+    ```
+    csrr    t0,vlenb
+    slli    t1,t0,1
+    sub     sp,sp,t1
+    
+    .cfi_escape 0xf,0xb,0x72,0,0x92,0xa2,0x38,0,0x34,0x1e,0x23,0x50,0x22
+    ```
+    
+    The sequence '0x92,0xa2,0x38,0' means the vlenb register, '0x34' means
+    the literal 4, '0x1e' means the multiply operation. But in fact, the
+    vlenb register value just need to multiply the literal 2.PR target/116305gcc/ChangeLog:
+    
+            * config/riscv/riscv.cc (riscv_dwarf_poly_indeterminate_value): Take
+            BYTES_PER_RISCV_VECTOR for *factor instead of riscv_bytes_per_vector_chunk.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/base/scalable_vector_cfi.c: New test.
+    
+    Signed-off-by: Zhijin Zeng <zhijin.zeng@spacemit.com>
+
+- User: 曾治金 | Time: 2024-08-17 04:54:56 UTC
+  Text: Fix it in gcc repo a11dcaff9fc94971188d54310d3053e9f68a0d3d
+

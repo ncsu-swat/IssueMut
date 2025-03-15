@@ -1,0 +1,273 @@
+Bug Summary: [14 Regression][aarch64] ICE in process_uses_of_deleted_def, at rtl-ssa/changes.cc:252 since r14-6605-gc0911c6b357ba9
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Hao Liu | Time: 2023-12-20 03:12:03 UTC
+  Text: SPEC2017 525.x264 build failure. Options are: -O3 -mcpu=neoverse-n1 -funroll-loops -flto=32 --param early-inlining-insns=96  --param max-inline-insns-auto=64  --param inline-unit-growth=96
+
+The failure happens while doing LTO optimization:
+
+gcc -std=c99 ... -o ldecod_r
+
+during RTL pass: ldp_fusion
+ldecod_src/intra_chroma_pred.c: In function 'intrapred_chroma':
+ldecod_src/intra_chroma_pred.c:420:1: internal compiler error: in process_uses_of_deleted_def, at rtl-ssa/changes.cc:252
+  420 | }
+      | ^
+0x1ccbbab rtl_ssa::function_info::process_uses_of_deleted_def(rtl_ssa::set_info*)
+	../../gcc/gcc/rtl-ssa/changes.cc:252
+0x1cce34f rtl_ssa::function_info::change_insns(array_slice<rtl_ssa::insn_change*>)
+	../../gcc/gcc/rtl-ssa/changes.cc:799
+0x1371843 ldp_bb_info::fuse_pair(bool, unsigned int, int, rtl_ssa::insn_info*, rtl_ssa::insn_info*, base_cand&, rtl_ssa::insn_range_info const&)
+	../../gcc/gcc/config/aarch64/aarch64-ldp-fusion.cc:1520
+0x1374663 ldp_bb_info::try_fuse_pair(bool, unsigned int, rtl_ssa::insn_info*, rtl_ssa::insn_info*)
+	../../gcc/gcc/config/aarch64/aarch64-ldp-fusion.cc:2217
+0x1374a8f ldp_bb_info::merge_pairs(std::__cxx11::list<rtl_ssa::insn_info*, std::allocator<rtl_ssa::insn_info*> >&, std::__cxx11::list<rtl_ssa::insn_info*, std::allocator<rtl_ssa::insn_info*> >&, bool, unsigned int)
+	../../gcc/gcc/config/aarch64/aarch64-ldp-fusion.cc:2306
+0x1377bfb ldp_bb_info::transform_for_base(int, access_group&)
+	../../gcc/gcc/config/aarch64/aarch64-ldp-fusion.cc:2339
+0x1377bfb void ldp_bb_info::traverse_base_map<ordered_hash_map<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> >, access_group, simple_hashmap_traits<default_hash_traits<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> > >, access_group> > >(ordered_hash_map<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> >, access_group, simple_hashmap_traits<default_hash_traits<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> > >, access_group> >&)
+	../../gcc/gcc/config/aarch64/aarch64-ldp-fusion.cc:2398
+0x136e29b ldp_bb_info::transform()
+	../../gcc/gcc/config/aarch64/aarch64-ldp-fusion.cc:2406
+0x136e29b ldp_fusion_bb(rtl_ssa::bb_info*)
+	../../gcc/gcc/config/aarch64/aarch64-ldp-fusion.cc:2634
+0x136ee93 ldp_fusion()
+	../../gcc/gcc/config/aarch64/aarch64-ldp-fusion.cc:2643
+0x136eefb execute
+	../../gcc/gcc/config/aarch64/aarch64-ldp-fusion.cc:2693
+
+- User: Richard Biener | Time: 2023-12-20 08:02:11 UTC
+  Text: Needs a reduced testcase.
+
+- User: Manolis Tsamis | Time: 2023-12-20 10:21:13 UTC
+  Text: The following testcase, reduced from x264 intrapred_chroma_plane:
+
+typedef unsigned short uint16;
+
+void intrapred_chroma_plane(uint16 ***mb_preds, int* max_imgpel_values, int crx, int cry, int px) {
+  for (int uv = 0; uv < 2; uv++) {
+    uint16 **mb_pred = mb_preds[uv + 1];
+    uint16 **predU2 = &mb_pred[px - 2];
+    uint16 *upPred = &mb_pred[px][px];
+    int max_imgpel_value = max_imgpel_values[uv];
+
+    int ih = upPred[crx - 1];
+    for (int i = 0; i < crx*3; ++i)
+      ih += upPred[crx*3];
+
+    int iv = (mb_pred[cry - 1][px+1]);  
+    for (int i = 0; i < cry - 1; ++i) {
+      iv += (i + 1) * (*(mb_preds[uv][0]) - *(*predU2--));
+    }
+
+    for (int j = 0; j < cry; ++j)
+      for (int i = 0; i < crx; ++i)
+        mb_pred[j][i] = (uint16) (max_imgpel_value * ((i * ih + iv)));
+  }
+}
+
+reproduces the same ICE issue when compiled with:
+
+gcc -g -O2 -funroll-loops -fno-strict-aliasing intra_chroma_pred.c
+
+- User: Manolis Tsamis | Time: 2023-12-20 10:22:44 UTC
+  Text: Createdattachment 56908[details]Reduced testcase
+
+- User: Alex Coplan | Time: 2023-12-20 10:30:00 UTC
+  Text: Confirmed, thanks for the reduced testcase, I can take a look.
+
+- User: Alex Coplan | Time: 2023-12-20 10:44:09 UTC
+  Text: Also ICEs without -fno-strict-aliasing FWIW, so just -g -O2 -funroll-loops seems to be enough.
+
+- User: Manolis Tsamis | Time: 2023-12-20 10:48:26 UTC
+  Text: (In reply to Alex Coplan fromcomment #5)> Also ICEs without -fno-strict-aliasing FWIW, so just -g -O2 -funroll-loops
+> seems to be enough.On my local build it doesn't reproduce without -fno-strict-aliasing; I just double-checked (GCC master @ 4e0a467302fea56d63b7a6d17f99c0f388960dc7).
+
+- User: Alex Coplan | Time: 2023-12-20 10:59:34 UTC
+  Text: (In reply to Manolis Tsamis fromcomment #6)> (In reply to Alex Coplan fromcomment #5)
+> > Also ICEs without -fno-strict-aliasing FWIW, so just -g -O2 -funroll-loops
+> > seems to be enough.
+> 
+> On my local build it doesn't reproduce without -fno-strict-aliasing; I just
+> double-checked (GCC master @ 4e0a467302fea56d63b7a6d17f99c0f388960dc7).Hmm, that is odd, I definitely don't need that option even when built from the same commit.  How are you configuring GCC?  I suppose it doesn't matter since I can reproduce the problem as long as the fix works with/without -fno-strict-aliasing.
+
+- User: Manolis Tsamis | Time: 2023-12-20 11:03:06 UTC
+  Text: (In reply to Alex Coplan fromcomment #7)> (In reply to Manolis Tsamis fromcomment #6)
+> > (In reply to Alex Coplan fromcomment #5)
+> > > Also ICEs without -fno-strict-aliasing FWIW, so just -g -O2 -funroll-loops
+> > > seems to be enough.
+> > 
+> > On my local build it doesn't reproduce without -fno-strict-aliasing; I just
+> > double-checked (GCC master @ 4e0a467302fea56d63b7a6d17f99c0f388960dc7).
+> 
+> Hmm, that is odd, I definitely don't need that option even when built from
+> the same commit.  How are you configuring GCC?  I suppose it doesn't matter
+> since I can reproduce the problem as long as the fix works with/without
+> -fno-strict-aliasing.Odd indeed, but probably something with my configure flags as you mentioned. Here's what I use:
+
+        --enable-shared \
+        --enable-threads=posix \
+        --enable-checking=release \
+        --with-system-zlib \
+        --enable-__cxa_atexit \
+        --disable-libunwind-exceptions \
+        --enable-linker-build-id \
+        --enable-libstdcxx-backtrace \
+        --enable-plugin \
+        --enable-initfini-array \
+        --enable-gnu-indirect-function \
+        --with-isl \
+        --enable-lto \
+        --with-cpu=neoverse-n1 \
+        --disable-multilib \
+        --disable-bootstrap
+
+(I think the most uncommon one here is --with-cpu=neoverse-n1 ?)
+
+- User: Alex Coplan | Time: 2023-12-20 11:05:20 UTC
+  Text: (In reply to Manolis Tsamis fromcomment #8)> (In reply to Alex Coplan fromcomment #7)
+> > (In reply to Manolis Tsamis fromcomment #6)
+> > > (In reply to Alex Coplan fromcomment #5)
+> > > > Also ICEs without -fno-strict-aliasing FWIW, so just -g -O2 -funroll-loops
+> > > > seems to be enough.
+> > > 
+> > > On my local build it doesn't reproduce without -fno-strict-aliasing; I just
+> > > double-checked (GCC master @ 4e0a467302fea56d63b7a6d17f99c0f388960dc7).
+> > 
+> > Hmm, that is odd, I definitely don't need that option even when built from
+> > the same commit.  How are you configuring GCC?  I suppose it doesn't matter
+> > since I can reproduce the problem as long as the fix works with/without
+> > -fno-strict-aliasing.
+> 
+> Odd indeed, but probably something with my configure flags as you mentioned.
+> Here's what I use:
+> 
+>         --enable-shared \
+>         --enable-threads=posix \
+>         --enable-checking=release \
+>         --with-system-zlib \
+>         --enable-__cxa_atexit \
+>         --disable-libunwind-exceptions \
+>         --enable-linker-build-id \
+>         --enable-libstdcxx-backtrace \
+>         --enable-plugin \
+>         --enable-initfini-array \
+>         --enable-gnu-indirect-function \
+>         --with-isl \
+>         --enable-lto \
+>         --with-cpu=neoverse-n1 \
+>         --disable-multilib \
+>         --disable-bootstrap
+> 
+> (I think the most uncommon one here is --with-cpu=neoverse-n1 ?)Ah, that explains it.  I have a much more vanilla config, and indeed with -mcpu=neoverse-n1 then it needs -fno-strict-aliasing to reproduce.
+
+- User: Alex Coplan | Time: 2023-12-20 12:08:08 UTC
+  Text: So we have this RTL going into ldp_fusion2:
+
+  103: x16:DI=[x15:DI--]
+      REG_INC x15:DI
+  104: x16:SI=zero_extend([x16:DI])
+  105: x16:SI=x11:SI-x16:SI
+  106: x16:SI=x8:SI*x16:SI+x16:SI
+ 1117: {x26:DI=unspec[[x10:DI-0x30]] 39;x27:DI=unspec[[x10:DI-0x30]] 40;}
+ 1118: x27:SI=zero_extend([x27:DI])
+ 1119: x27:SI=x11:SI-x27:SI
+ 1048: x20:DI=[x10:DI-0x10]
+      REG_EQUIV [x10:DI-0x10]
+ 1049: x20:SI=zero_extend([x20:DI])
+ 1050: x20:SI=x11:SI-x20:SI
+ 1367: debug D#22 => x15:DI
+ 1025: x15:DI=[x15:DI]
+
+and we try to fuse (103,1025):
+
+fusing pair [L=1] (103,1025), base=15, hazards: (104,103), move_range: (103,103)
+  ldp: i103 has wb but subsequent i1025 has non-wb update of base (r15), dropping wb
+
+but we fail to update the debug insn 1367 which has a use of the def of x15 in i103 that we're deleting.
+
+- User: Alex Coplan | Time: 2024-01-18 15:08:39 UTC
+  Text: Testing a patch, sorry for the delay on this.
+
+- User: Alex Coplan | Time: 2024-01-19 09:18:03 UTC
+  Text: Patches submitted:https://gcc.gnu.org/pipermail/gcc-patches/2024-January/643430.htmlhttps://gcc.gnu.org/pipermail/gcc-patches/2024-January/643431.htmlhttps://gcc.gnu.org/pipermail/gcc-patches/2024-January/643432.html
+
+- User: GCC Commits | Time: 2024-01-23 16:50:55 UTC
+  Text: The master branch has been updated by Alex Coplan <acoplan@gcc.gnu.org>:https://gcc.gnu.org/g:cef6031694db1d68cf876e16e79dc5c2b9f649bdcommitr14-8368-gcef6031694db1d68cf876e16e79dc5c2b9f649bdAuthor: Alex Coplan <alex.coplan@arm.com>
+Date:   Tue Jan 16 21:20:20 2024 +0000
+
+    rtl-ssa: Provide easier access to debug uses [PR113089]
+    
+    This patch adds some accessors to set_info and use_info to make it
+    easier to get at and iterate through uses in debug insns.
+    
+    It is used by the aarch64 load/store pair fusion pass in a subsequent
+    patch to fixPR113089, i.e. to update debug uses in the pass.
+    
+    gcc/ChangeLog:PR target/113089* rtl-ssa/accesses.h (use_info::next_debug_insn_use): New.
+            (debug_insn_use_iterator): New.
+            (set_info::first_debug_insn_use): New.
+            (set_info::debug_insn_uses): New.
+            * rtl-ssa/member-fns.inl (use_info::next_debug_insn_use): New.
+            (set_info::first_debug_insn_use): New.
+            (set_info::debug_insn_uses): New.
+
+- User: GCC Commits | Time: 2024-01-23 16:51:03 UTC
+  Text: The master branch has been updated by Alex Coplan <acoplan@gcc.gnu.org>:https://gcc.gnu.org/g:49bfda6017e105df46fa8d12d7f067da423a1d3ccommitr14-8369-g49bfda6017e105df46fa8d12d7f067da423a1d3cAuthor: Alex Coplan <alex.coplan@arm.com>
+Date:   Mon Jan 15 17:13:06 2024 +0000
+
+    aarch64: Re-parent trailing nondebug base reg uses [PR113089]
+    
+    While working onPR113089, I realised we where missing code to re-parent
+    trailing nondebug uses of the base register in the case of cancelling
+    writeback in the load/store pair pass.  This patch fixes that.
+    
+    gcc/ChangeLog:PR target/113089* config/aarch64/aarch64-ldp-fusion.cc (ldp_bb_info::fuse_pair):
+            Update trailing nondebug uses of the base register in the case
+            of cancelling writeback.
+
+- User: GCC Commits | Time: 2024-01-23 16:51:08 UTC
+  Text: The master branch has been updated by Alex Coplan <acoplan@gcc.gnu.org>:https://gcc.gnu.org/g:3d82ebb696f50f02c6519c368118a019a460fa9ecommitr14-8370-g3d82ebb696f50f02c6519c368118a019a460fa9eAuthor: Alex Coplan <alex.coplan@arm.com>
+Date:   Tue Jan 16 21:20:45 2024 +0000
+
+    aarch64: Fix up debug uses in ldp/stp pass [PR113089]
+    
+    As the PR shows, we were missing code to update debug uses in the
+    load/store pair fusion pass.  This patch fixes that.
+    
+    The patch tries to give a complete treatment of the debug uses that will
+    be affected by the changes we make, and in particular makes an effort to
+    preserve debug info where possible, e.g. when re-ordering an update of
+    a base register by a constant over a debug use of that register.  When
+    re-ordering loads over a debug use of a transfer register, we reset the
+    debug insn.  Likewise when re-ordering stores over debug uses of mem.
+    
+    While doing this I noticed that try_promote_writeback used a strange
+    choice of move_range for the pair insn, in that it chose the previous
+    nondebug insn instead of the insn itself.  Since the insn is being
+    changed, these move ranges are equivalent (at least in terms of nondebug
+    insn placement as far as RTL-SSA is concerned), but I think it is more
+    natural to choose the pair insn itself.  This is needed to avoid
+    incorrectly updating some debug uses.
+    
+    gcc/ChangeLog:PR target/113089* config/aarch64/aarch64-ldp-fusion.cc (reset_debug_use): New.
+            (fixup_debug_use): New.
+            (fixup_debug_uses_trailing_add): New.
+            (fixup_debug_uses): New. Use it ...
+            (ldp_bb_info::fuse_pair): ... here.
+            (try_promote_writeback): Call fixup_debug_uses_trailing_add to
+            fix up debug uses of the base register that are affected by
+            folding in the trailing add insn.
+    
+    gcc/testsuite/ChangeLog:PR target/113089* gcc.c-torture/compile/pr113089.c: New test.
+
+- User: Alex Coplan | Time: 2024-01-23 16:55:38 UTC
+  Text: Should be fixed, thanks for the report.
+

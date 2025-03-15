@@ -1,0 +1,219 @@
+Bug Summary: [11/12 Regression] ICE with ABSU in backprop
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-checking, ice-on-valid-code, patch
+Known to Work: 10.1.0, 11.4.1, 12.3.1, 13.2.1, 14.0, 9.1.0, 9.3.0
+Known to Fail: 10.2.0, 11.4.0, 12.1.0, 12.3.0, 9.4.0, 9.5.0
+
+Comments:
+- User: Benji Smith | Time: 2023-06-24 00:55:37 UTC
+  Text: Createdattachment 55394[details]A preprocessed minimal repro of the VPABSD/VPMULLD issue
+
+The following code is a minimal repro of the issue when compiled using `gcc -mavx -O1`:
+
+#include <immintrin.h>
+
+__m128i do_stuff(__m128i XMM0) {
+	__m128i ABS0 = _mm_abs_epi32(XMM0);
+	__m128i MUL0 = _mm_mullo_epi32(ABS0, XMM0);
+	__m128i MUL1 = _mm_mullo_epi32(MUL0, MUL0);
+	return MUL1;
+}
+
+Godbolt link:https://godbolt.org/z/c6dK5jzcoThe ICE/crash prints:
+
+min_repro.c: In function ‘do_stuff’:
+min_repro.c:3:9: error: type mismatch in binary expression
+    3 | __m128i do_stuff(__m128i XMM0) {
+      |         ^~~~~~~~
+vector(4) unsigned int
+
+vector(4) unsigned int
+
+vector(4) int
+
+_6 = _5 * _7;
+during GIMPLE pass: backprop
+min_repro.c:3:9: internal compiler error: verify_gimple failed
+0x102003d verify_gimple_in_cfg(function*, bool, bool)
+        .././../gcc/gcc/tree-cfg.cc:5646
+0xebf8d0 execute_function_todo
+        .././../gcc/gcc/passes.cc:2098
+0xebfe3e execute_todo
+        .././../gcc/gcc/passes.cc:2152
+
+A bisect shows it started in 07b86ab138bf8be8cb331015cd2b9775c6856ac6, which is related to a previous bughttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=110108I have confirmed that this still repros in the latest trunk, 6b724427aa1ec9b690e40f5206572f57e1adeda8
+
+For triage/priority purposes: this issue was not from code I manually wrote, but was found by a fuzzer meant to test SIMD codegen
+
+- User: Andrew Pinski | Time: 2023-06-24 00:58:17 UTC
+  Text: -O1 -mavx
+
+- User: Andrew Pinski | Time: 2023-06-24 01:01:48 UTC
+  Text: This is a bug in backprop rather than a target issue.
+
+We start with:
+  _7 = VIEW_CONVERT_EXPR<vector(4) intD.6>(XMM0_2(D));
+  _8 = ABSU_EXPR <_7>;
+  _5 = VIEW_CONVERT_EXPR<vector(4) unsigned intD.9>(XMM0_2(D));
+  _6 = _5 * _8;
+  _3 = _6 * _6;
+  _4 = VIEW_CONVERT_EXPR<__m128iD.5706>(_3);
+
+
+And backprop changes it into:
+  _7 = VIEW_CONVERT_EXPR<vector(4) intD.6>(XMM0_2(D));
+  _8 = ABSU_EXPR <_7>;
+  _5 = VIEW_CONVERT_EXPR<vector(4) unsigned intD.9>(XMM0_2(D));
+  _6 = _5 * _7;
+  _3 = _6 * _6;
+  _4 = VIEW_CONVERT_EXPR<__m128iD.5706>(_3);
+
+But misses the conversion
+
+- User: Andrew Pinski | Time: 2023-06-24 02:06:59 UTC
+  Text: Here is a generic non-vector based testcase which shows the same issue with backprop:
+```
+int f(int a)
+{
+        unsigned b = a;
+        b =  ((unsigned)a)*(-(a<0)|1);
+        unsigned t = b*a;
+        return t*t;
+}
+```
+
+- User: Andrew Pinski | Time: 2023-06-24 02:09:55 UTC
+  Text: here is one that is reproduced even in GCC 10.1.0:
+```
+int f(int a)
+{
+        int c = c < 0 ? c : -c;
+        c = -c;
+        unsigned b =  c;
+        unsigned t = b*a;
+        return t*t;
+}
+```
+I suspect it was introduced when ABSU_EXPR was created.
+
+- User: Richard Biener | Time: 2023-07-07 10:45:42 UTC
+  Text: GCC 10 branch is being closed.
+
+- User: Andrew Pinski | Time: 2023-09-18 00:26:54 UTC
+  Text: I am going to fix this.
+
+- User: Andrew Pinski | Time: 2023-09-24 23:46:42 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2023-September/631257.html
+
+- User: GCC Commits | Time: 2023-09-25 07:08:10 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:2bbac12ea7bd8a3eef5382e1b13f6019df4ec03fcommitr14-4249-g2bbac12ea7bd8a3eef5382e1b13f6019df4ec03fAuthor: Andrew Pinski <apinski@marvell.com>
+Date:   Sat Sep 23 21:53:09 2023 -0700
+
+    FixPR 110386: backprop vs ABSU_EXPR
+    
+    The issue here is that when backprop tries to go
+    and strip sign ops, it skips over ABSU_EXPR but
+    ABSU_EXPR not only does an ABS, it also changes the
+    type to unsigned.
+    Since strip_sign_op_1 is only supposed to strip off
+    sign changing operands and not ones that change types,
+    removing ABSU_EXPR here is correct. We don't handle
+    nop conversions so this does cause any missed optimizations either.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/110386gcc/ChangeLog:
+    
+            * gimple-ssa-backprop.cc (strip_sign_op_1): Remove ABSU_EXPR.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/compile/pr110386-1.c: New test.
+            * gcc.c-torture/compile/pr110386-2.c: New test.
+
+- User: Andrew Pinski | Time: 2023-09-25 07:09:10 UTC
+  Text: Fixed on the trunk so far.
+
+- User: GCC Commits | Time: 2023-10-01 19:28:58 UTC
+  Text: The releases/gcc-13 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:b5fa95a3569f6ee66697876a3a380fef1b333f3dcommitr13-7927-gb5fa95a3569f6ee66697876a3a380fef1b333f3dAuthor: Andrew Pinski <apinski@marvell.com>
+Date:   Sat Sep 23 21:53:09 2023 -0700
+
+    FixPR 110386: backprop vs ABSU_EXPR
+    
+    The issue here is that when backprop tries to go
+    and strip sign ops, it skips over ABSU_EXPR but
+    ABSU_EXPR not only does an ABS, it also changes the
+    type to unsigned.
+    Since strip_sign_op_1 is only supposed to strip off
+    sign changing operands and not ones that change types,
+    removing ABSU_EXPR here is correct. We don't handle
+    nop conversions so this does cause any missed optimizations either.
+    
+    Committed to the GCC 13 branch after bootstrapped and
+    tested on x86_64-linux-gnu with no regressions.PR tree-optimization/110386gcc/ChangeLog:
+    
+            * gimple-ssa-backprop.cc (strip_sign_op_1): Remove ABSU_EXPR.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/compile/pr110386-1.c: New test.
+            * gcc.c-torture/compile/pr110386-2.c: New test.
+    
+    (cherry picked from commit 2bbac12ea7bd8a3eef5382e1b13f6019df4ec03f)
+
+- User: GCC Commits | Time: 2024-05-09 07:25:04 UTC
+  Text: The releases/gcc-12 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:f5c7306d7f039e5c74c5e82cf06610f0ae07a0e8commitr12-10434-gf5c7306d7f039e5c74c5e82cf06610f0ae07a0e8Author: Andrew Pinski <apinski@marvell.com>
+Date:   Sat Sep 23 21:53:09 2023 -0700
+
+    FixPR 110386: backprop vs ABSU_EXPR
+    
+    The issue here is that when backprop tries to go
+    and strip sign ops, it skips over ABSU_EXPR but
+    ABSU_EXPR not only does an ABS, it also changes the
+    type to unsigned.
+    Since strip_sign_op_1 is only supposed to strip off
+    sign changing operands and not ones that change types,
+    removing ABSU_EXPR here is correct. We don't handle
+    nop conversions so this does cause any missed optimizations either.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/110386gcc/ChangeLog:
+    
+            * gimple-ssa-backprop.cc (strip_sign_op_1): Remove ABSU_EXPR.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/compile/pr110386-1.c: New test.
+            * gcc.c-torture/compile/pr110386-2.c: New test.
+    
+    (cherry picked from commit 2bbac12ea7bd8a3eef5382e1b13f6019df4ec03f)
+
+- User: GCC Commits | Time: 2024-05-09 07:27:47 UTC
+  Text: The releases/gcc-11 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:dbfc2d075f10149bd94e16c1210ffe4bac7e60c3commitr11-11422-gdbfc2d075f10149bd94e16c1210ffe4bac7e60c3Author: Andrew Pinski <apinski@marvell.com>
+Date:   Sat Sep 23 21:53:09 2023 -0700
+
+    FixPR 110386: backprop vs ABSU_EXPR
+    
+    The issue here is that when backprop tries to go
+    and strip sign ops, it skips over ABSU_EXPR but
+    ABSU_EXPR not only does an ABS, it also changes the
+    type to unsigned.
+    Since strip_sign_op_1 is only supposed to strip off
+    sign changing operands and not ones that change types,
+    removing ABSU_EXPR here is correct. We don't handle
+    nop conversions so this does cause any missed optimizations either.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/110386gcc/ChangeLog:
+    
+            * gimple-ssa-backprop.c (strip_sign_op_1): Remove ABSU_EXPR.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/compile/pr110386-1.c: New test.
+            * gcc.c-torture/compile/pr110386-2.c: New test.
+    
+    (cherry picked from commit 2bbac12ea7bd8a3eef5382e1b13f6019df4ec03f)
+
+- User: Andrew Pinski | Time: 2024-05-09 07:28:56 UTC
+  Text: Fixed everywhere.
+

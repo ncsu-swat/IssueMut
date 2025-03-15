@@ -1,0 +1,254 @@
+Bug Summary: Volatile reads can be optimized away
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Antoni | Time: 2024-04-18 13:19:52 UTC
+  Text: In the following code:
+
+void test(int *ptr) {
+    *ptr = *(volatile int *)ptr;
+}
+
+The volatile read is optimized away and GCC produces the following asm:
+
+test(int*):
+        ret
+
+Godbolt link:https://gcc.godbolt.org/z/rabToGfqjClang produces the following code:
+
+test(int*):                              # @test(int*)
+        mov     eax, dword ptr [rdi]
+        ret
+
+which is likely to be the expected behavior.
+
+- User: Richard Biener | Time: 2024-04-18 13:21:22 UTC
+  Text: It's the combine pass that removes the seemingly noop-move.
+
+For QOI reasons GCC preserves volatile accesses elsewhere even when
+inconsistency is directly visible like here.
+
+- User: Jakub Jelinek | Time: 2024-04-18 13:21:55 UTC
+  Text: --- gcc/rtlanal.cc.jj	2024-02-24 12:45:28.674249100 +0100
++++ gcc/rtlanal.cc	2024-04-18 15:09:55.199499083 +0200
+@@ -1637,12 +1637,15 @@ set_noop_p (const_rtx set)
+     return true;
+ 
+   if (MEM_P (dst) && MEM_P (src))
+-    return rtx_equal_p (dst, src) && !side_effects_p (dst);
++    return (rtx_equal_p (dst, src)
++	    && !side_effects_p (dst)
++	    && !side_effects_p (src));
+ 
+   if (GET_CODE (dst) == ZERO_EXTRACT)
+-    return rtx_equal_p (XEXP (dst, 0), src)
+-	   && !BITS_BIG_ENDIAN && XEXP (dst, 2) == const0_rtx
+-	   && !side_effects_p (src);
++    return (rtx_equal_p (XEXP (dst, 0), src)
++	    && !BITS_BIG_ENDIAN && XEXP (dst, 2) == const0_rtx
++	    && !side_effects_p (src)
++	    && !side_effects_p (XEXP (dst, 0)));
+ 
+   if (GET_CODE (dst) == STRICT_LOW_PART)
+     dst = XEXP (dst, 0);
+should fix this.
+
+- User: Richard Biener | Time: 2024-04-18 13:23:16 UTC
+  Text: Confirmed.
+
+- User: Jakub Jelinek | Time: 2024-04-18 13:46:25 UTC
+  Text: Createdattachment 57983[details]gcc14-pr114768.patch
+
+Untested fix.
+
+- User: Segher Boessenkool | Time: 2024-04-18 13:53:13 UTC
+  Text: Createdattachment 57984[details]patch
+
+- User: Segher Boessenkool | Time: 2024-04-18 13:57:07 UTC
+  Text: Heh, crossed :-)  I can confirm my patch works (tested and everything).  I have
+no idea about zero_extract, which is a blight that should be eradicated tooth and
+nail!
+
+- User: GCC Commits | Time: 2024-04-19 06:48:29 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:9f295847a9c32081bdd0fe908ffba58e830a24fbcommitr14-10035-g9f295847a9c32081bdd0fe908ffba58e830a24fbAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Apr 19 08:47:53 2024 +0200
+
+    rtlanal: Fix set_noop_p for volatile loads or stores [PR114768]
+    
+    On the following testcase, combine propagates the mem/v load into mem store
+    with the same address and then removes it, because noop_move_p says it is a
+    no-op move.  If it was the other way around, i.e. mem/v store and mem load,
+    or both would be mem/v, it would be kept.
+    The problem is that rtx_equal_p never checks any kind of flags on the rtxes
+    (and I think it would be quite dangerous to change it at this point), and
+    set_noop_p checks side_effects_p on just one of the operands, not both.
+    In the MEM <- MEM set, it only checks it on the destination, in
+    store to ZERO_EXTRACT only checks it on the source.
+    
+    The following patch adds the missing side_effects_p checks.
+    
+    2024-04-19  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/114768* rtlanal.cc (set_noop_p): Don't return true for MEM <- MEM
+            sets if src has side-effects or for stores into ZERO_EXTRACT
+            if ZERO_EXTRACT operand has side-effects.
+    
+            * gcc.dg/pr114768.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-04-19 06:49:23 UTC
+  Text: Fixed for 14.1.
+
+- User: GCC Commits | Time: 2024-04-19 10:38:04 UTC
+  Text: The trunk branch has been updated by Thomas Schwinge <tschwinge@gcc.gnu.org>:https://gcc.gnu.org/g:9451b6c0a941dc44ca6f14ff8565d74fe56cca59commitr14-10039-g9451b6c0a941dc44ca6f14ff8565d74fe56cca59Author: Thomas Schwinge <tschwinge@baylibre.com>
+Date:   Fri Apr 19 12:32:03 2024 +0200
+
+    Enable 'gcc.dg/pr114768.c' for nvptx target [PR114768]
+    
+    Follow-up to commit 9f295847a9c32081bdd0fe908ffba58e830a24fb
+    "rtlanal: Fix set_noop_p for volatile loads or stores [PR114768]": nvptx does
+    behave in the exactly same way as expected; see 'diff' of before vs. after the
+    'gcc/rtlanal.cc' code changes:
+    
+        PASS: gcc.dg/pr114768.c (test for excess errors)
+        [-FAIL:-]{+PASS:+} gcc.dg/pr114768.c scan-rtl-dump final "\\(mem/v:"
+    
+        --- 0/pr114768.c.347r.final 2024-04-19 11:34:34.577037596 +0200
+        +++ ./pr114768.c.347r.final 2024-04-19 12:08:00.118312524 +0200
+        @@ -13,15 +13,27 @@
+         ;;  entry block defs        1 [%stack] 2 [%frame] 3 [%args]
+         ;;  exit block uses         1 [%stack] 2 [%frame]
+         ;;  regs ever live
+        -;;  ref usage      r1={1d,2u} r2={1d,2u} r3={1d,1u}
+        -;;    total ref usage 8{3d,5u,0e} in 1{1 regular + 0 call} insns.
+        +;;  ref usage      r1={1d,3u} r2={1d,3u} r3={1d,2u} r22={1d,1u} r23={1d,2u}
+        +;;    total ref usage 16{5d,11u,0e} in 4{4 regular + 0 call} insns.
+         (note 1 0 4 NOTE_INSN_DELETED)
+         (note 4 1 2 2 [bb 2] NOTE_INSN_BASIC_BLOCK)
+        -(note 2 4 3 2 NOTE_INSN_DELETED)
+        +(insn 2 4 3 2 (set (reg/v/f:DI 23 [ p ])
+        +        (unspec:DI [
+        +                (const_int 0 [0])
+        +            ] UNSPEC_ARG_REG)) "source-gcc/gcc/testsuite/gcc.dg/pr114768.c":8:1 14 {load_arg_regdi}
+        +     (nil))
+         (note 3 2 6 2 NOTE_INSN_FUNCTION_BEG)
+        -(note 6 3 10 2 NOTE_INSN_DELETED)
+        -(note 10 6 11 2 NOTE_INSN_EPILOGUE_BEG)
+        -(jump_insn 11 10 12 2 (return) "source-gcc/gcc/testsuite/gcc.dg/pr114768.c":10:1 289 {return}
+        +(insn 6 3 7 2 (set (reg:SI 22 [ _1 ])
+        +        (mem/v:SI (reg/v/f:DI 23 [ p ]) [1 MEM[(volatile int *)p_3(D)]+0 S4 A32])) "source-gcc/gcc/testsuite/gcc.dg/pr114768.c":9:8 6 {*movsi_insn}
+        +     (nil))
+        +(insn 7 6 10 2 (set (mem:SI (reg/v/f:DI 23 [ p ]) [1 *p_3(D)+0 S4 A32])
+        +        (reg:SI 22 [ _1 ])) "source-gcc/gcc/testsuite/gcc.dg/pr114768.c":9:6 6 {*movsi_insn}
+        +     (expr_list:REG_DEAD (reg/v/f:DI 23 [ p ])
+        +        (expr_list:REG_DEAD (reg:SI 22 [ _1 ])
+        +            (nil))))
+        +(note 10 7 13 2 NOTE_INSN_EPILOGUE_BEG)
+        +(note 13 10 11 3 [bb 3] NOTE_INSN_BASIC_BLOCK)
+        +(jump_insn 11 13 12 3 (return) "source-gcc/gcc/testsuite/gcc.dg/pr114768.c":10:1 289 {return}
+              (nil)
+          -> return)
+         (barrier 12 11 0)
+    
+        --- 0/pr114768.s    2024-04-19 11:34:34.577037596 +0200
+        +++ ./pr114768.s    2024-04-19 12:08:00.118312524 +0200
+        @@ -13,5 +13,10 @@
+         {
+            .reg.u64 %ar0;
+            ld.param.u64 %ar0, [%in_ar0];
+        +   .reg.u32 %r22;
+        +   .reg.u64 %r23;
+        +           mov.u64 %r23, %ar0;
+        +           ld.u32  %r22, [%r23];
+        +           st.u32  [%r23], %r22;
+            ret;
+         }PR testsuite/114768gcc/testsuite/
+            * gcc.dg/pr114768.c: Enable for nvptx target.
+
+- User: GCC Commits | Time: 2024-04-21 04:09:44 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:ab3b83afc149edda11fa3c7cbb3815606731003bcommitr13-8636-gab3b83afc149edda11fa3c7cbb3815606731003bAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Apr 19 08:47:53 2024 +0200
+
+    rtlanal: Fix set_noop_p for volatile loads or stores [PR114768]
+    
+    On the following testcase, combine propagates the mem/v load into mem store
+    with the same address and then removes it, because noop_move_p says it is a
+    no-op move.  If it was the other way around, i.e. mem/v store and mem load,
+    or both would be mem/v, it would be kept.
+    The problem is that rtx_equal_p never checks any kind of flags on the rtxes
+    (and I think it would be quite dangerous to change it at this point), and
+    set_noop_p checks side_effects_p on just one of the operands, not both.
+    In the MEM <- MEM set, it only checks it on the destination, in
+    store to ZERO_EXTRACT only checks it on the source.
+    
+    The following patch adds the missing side_effects_p checks.
+    
+    2024-04-19  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/114768* rtlanal.cc (set_noop_p): Don't return true for MEM <- MEM
+            sets if src has side-effects or for stores into ZERO_EXTRACT
+            if ZERO_EXTRACT operand has side-effects.
+    
+            * gcc.dg/pr114768.c: New test.
+    
+    (cherry picked from commit 9f295847a9c32081bdd0fe908ffba58e830a24fb)
+
+- User: Jakub Jelinek | Time: 2024-04-23 06:43:13 UTC
+  Text: Fixed for 13.3 too.
+
+- User: GCC Commits | Time: 2024-06-11 10:38:30 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:7d0673575aba5dfb41022897a882b9c386c332f4commitr12-10526-g7d0673575aba5dfb41022897a882b9c386c332f4Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Apr 19 08:47:53 2024 +0200
+
+    rtlanal: Fix set_noop_p for volatile loads or stores [PR114768]
+    
+    On the following testcase, combine propagates the mem/v load into mem store
+    with the same address and then removes it, because noop_move_p says it is a
+    no-op move.  If it was the other way around, i.e. mem/v store and mem load,
+    or both would be mem/v, it would be kept.
+    The problem is that rtx_equal_p never checks any kind of flags on the rtxes
+    (and I think it would be quite dangerous to change it at this point), and
+    set_noop_p checks side_effects_p on just one of the operands, not both.
+    In the MEM <- MEM set, it only checks it on the destination, in
+    store to ZERO_EXTRACT only checks it on the source.
+    
+    The following patch adds the missing side_effects_p checks.
+    
+    2024-04-19  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/114768* rtlanal.cc (set_noop_p): Don't return true for MEM <- MEM
+            sets if src has side-effects or for stores into ZERO_EXTRACT
+            if ZERO_EXTRACT operand has side-effects.
+    
+            * gcc.dg/pr114768.c: New test.
+    
+    (cherry picked from commit 9f295847a9c32081bdd0fe908ffba58e830a24fb)
+
+- User: Jakub Jelinek | Time: 2024-06-11 10:53:47 UTC
+  Text: Should be fixed for 12.4+ too.
+
+- User: GCC Commits | Time: 2024-06-20 13:23:31 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:1fc4a915c797d3a98a327dfc546948c5879336e0commitr11-11508-g1fc4a915c797d3a98a327dfc546948c5879336e0Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Apr 19 08:47:53 2024 +0200
+
+    rtlanal: Fix set_noop_p for volatile loads or stores [PR114768]
+    
+    On the following testcase, combine propagates the mem/v load into mem store
+    with the same address and then removes it, because noop_move_p says it is a
+    no-op move.  If it was the other way around, i.e. mem/v store and mem load,
+    or both would be mem/v, it would be kept.
+    The problem is that rtx_equal_p never checks any kind of flags on the rtxes
+    (and I think it would be quite dangerous to change it at this point), and
+    set_noop_p checks side_effects_p on just one of the operands, not both.
+    In the MEM <- MEM set, it only checks it on the destination, in
+    store to ZERO_EXTRACT only checks it on the source.
+    
+    The following patch adds the missing side_effects_p checks.
+    
+    2024-04-19  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/114768* rtlanal.c (set_noop_p): Don't return true for MEM <- MEM
+            sets if src has side-effects or for stores into ZERO_EXTRACT
+            if ZERO_EXTRACT operand has side-effects.
+    
+            * gcc.dg/pr114768.c: New test.
+    
+    (cherry picked from commit 9f295847a9c32081bdd0fe908ffba58e830a24fb)
+

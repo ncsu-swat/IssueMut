@@ -1,0 +1,170 @@
+Bug Summary: ICE when invoking strcmp multiple times with -fsanitize=undefined -O1 -fanalyzer -flto
+Product: gcc
+Component: analyzer
+
+  (show other bugs)
+Keywords: ice-on-valid-code, link-failure, lto, rejects-valid
+Known to Work: 12.3.0
+Known to Fail: 13.2.1
+
+Comments:
+- User: Gabriel Ravier | Time: 2024-03-20 15:26:10 UTC
+  Text: int main(){}
+
+int HMAP_unset_copy(const char *key) {
+    return __builtin_strcmp("a", key) + __builtin_strcmp("a", key);
+}
+
+Compiling this program with `-fsanitize=undefined -O1 -fanalyzer -flto` results in the following:
+
+<source>: In function 'HMAP_unset_copy':
+<source>:4:41: warning: check of 'key_4(D)' for NULL after already dereferencing it [-Wanalyzer-deref-before-check]
+    4 |     return __builtin_strcmp("a", key) + __builtin_strcmp("a", key);
+      |                                         ^
+  'HMAP_unset_copy': events 1-2
+    |
+    |    4 |     return __builtin_strcmp("a", key) + __builtin_strcmp("a", key);
+    |      |            ^                            ~
+    |      |            |                            |
+    |      |            |                            (2) pointer 'key_4(D)' is checked for NULL here but it was already dereferenced at (1)
+    |      |            (1) pointer 'key_4(D)' is dereferenced here
+    |
+during IPA pass: whole-program
+At top level:
+lto1: internal compiler error: in release_function_body, at cgraph.cc:1813
+0x221519c internal_error(char const*, ...)
+	???:0
+0x926a67 fancy_abort(char const*, int, char const*)
+	???:0
+0xa1a687 cgraph_node::release_body(bool)
+	???:0
+0xa1c2d2 cgraph_node::remove()
+	???:0
+0xcea661 symbol_table::remove_unreachable_nodes(_IO_FILE*)
+	???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+lto-wrapper: fatal error: /opt/compiler-explorer/gcc-snapshot/bin/gcc returned 1 exit status
+compilation terminated.
+/opt/compiler-explorer/gcc-trunk-20240320/bin/../lib/gcc/x86_64-linux-gnu/14.0.1/../../../../x86_64-linux-gnu/bin/ld: error: lto-wrapper failed
+collect2: error: ld returned 1 exit status
+Compiler returned: 1
+
+- User: Richard Biener | Time: 2024-03-21 09:35:32 UTC
+  Text: Confirmed also with GCC 13, works with GCC 12.
+
+The diagnostic is because of UBSAN instrumentation, it's already visible without -flto.
+
+The issue with the ICE is likely that the sanitizer computes dominance info at IPA time but fails to release it?
+
+I see in sm-malloc.cc:
+
+    /* Reject the warning if the deref's BB doesn't dominate that
+       of the check, so that we don't warn e.g. for shared cleanup
+       code that checks a pointer for NULL, when that code is sometimes
+       used before a deref and sometimes after.
+       Using the dominance code requires setting cfun.  */
+    auto_cfun sentinel (m_deref_enode->get_function ());
+    calculate_dominance_info (CDI_DOMINATORS);
+    if (!dominated_by_p (CDI_DOMINATORS,
+                         m_check_enode->get_supernode ()->m_bb,
+                         m_deref_enode->get_supernode ()->m_bb))
+      return false;
+
+    return ctxt.warn ("check of %qE for NULL after already"
+                      " dereferencing it",
+                      m_arg);
+
+but no free_dominance_info anywhere.  It would of course be quite expensive
+to re-compute all dominance info every time here, so analyzer needs to
+loop over all functions releasing dominance info when done.
+
+- User: David Malcolm | Time: 2024-03-22 15:09:49 UTC
+  Text: Createdattachment 57781[details]WIP patch for the the ICE
+
+The attached patch seems to fix the ICE.  AIUI I'm lazily creating dominance info as it's needed; calculate_dominance_info has this early exit:
+
+  if (dom_computed[dir_index] == DOM_OK)
+    {
+      checking_verify_dominators (dir);
+      return;
+    }
+
+and free_dominance_info has this early exit:
+
+  if (!dom_info_available_p (fn, dir))
+    return;
+
+So iterating through all funs with gimple bodies at the end of analyzer calling free_dominance_info on them ought to clean things up - and seems to fix the ICE.
+
+However I'm having trouble writing a regression test for this, with the combination of ubsan and lto: I get:
+
+output is /usr/bin/ld: cannot find -lubsan
+collect2: error: ld returned 1 exit status
+
+Ideas on fixing welcome.
+
+- User: Jakub Jelinek | Time: 2024-03-22 16:52:34 UTC
+  Text: (In reply to David Malcolm fromcomment #2)> However I'm having trouble writing a regression test for this, with the
+> combination of ubsan and lto: I get:
+> 
+> output is /usr/bin/ld: cannot find -lubsan
+> collect2: error: ld returned 1 exit statusThe test would need to go into gcc.dg/ubsan/ directory (or g++.dg/ubsan/ for C++), that is where the *.exp files arrange for -lubsan to be found.
+The test would of course then need to use analyzer effective target in it and
+add whatever dg-options are needed.
+
+- User: Jakub Jelinek | Time: 2024-03-22 16:56:58 UTC
+  Text: Or the option option would be try if it also ICEs without your patch with
+-fsanitize=undefined -fsanitize-trap=undefined -O1 -fanalyzer -flto , then you could put it into gcc.dg/analyzer/ and just use fsanitize_undefined effective target there.
+
+- User: David Malcolm | Time: 2024-03-22 18:34:22 UTC
+  Text: Thanks; I have it reproducing in DejaGnu now (and the ICE fix).
+
+Am looking at fixing the false postive.
+
+- User: GCC Commits | Time: 2024-03-23 13:53:31 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:80a0cb37456c49dbc25cca7cd554f78bc504373ecommitr14-9646-g80a0cb37456c49dbc25cca7cd554f78bc504373eAuthor: David Malcolm <dmalcolm@redhat.com>
+Date:   Sat Mar 23 09:52:38 2024 -0400
+
+    analyzer: fix ICE and false positive with -Wanalyzer-deref-before-check [PR114408]
+    
+    gcc/analyzer/ChangeLog:PR analyzer/114408* engine.cc (impl_run_checkers): Free up any dominance info that
+            we may have created.
+            * kf.cc (class kf_ubsan_handler): New.
+            (register_sanitizer_builtins): New.
+            (register_known_functions): Call register_sanitizer_builtins.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/114408* c-c++-common/analyzer/deref-before-check-pr114408.c: New test.
+            * c-c++-common/ubsan/analyzer-ice-pr114408.c: New test.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2024-03-23 14:00:01 UTC
+  Text: Should be fixed on trunk by the above patch.
+
+The ICE was introduced byr13-5261-g0d6f7b1dd62e9c9dccb0b9b673f9cc3238b7ea6dwhen fixingbug 108455.  Keeping open to track backporting to GCC 13.
+
+- User: GCC Commits | Time: 2024-05-09 17:12:28 UTC
+  Text: The releases/gcc-13 branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:96f7a3694c3e4c72af6258cc9b38bce30e609beecommitr13-8758-g96f7a3694c3e4c72af6258cc9b38bce30e609beeAuthor: David Malcolm <dmalcolm@redhat.com>
+Date:   Thu May 9 13:09:32 2024 -0400
+
+    analyzer: fix ICE and false positive with -Wanalyzer-deref-before-check [PR114408]
+    
+    Backported from commitr14-9646-g80a0cb37456c49(moving testcase to gcc.dg
+    and handling conflict in kf.cc)
+    
+    gcc/analyzer/ChangeLog:PR analyzer/114408* engine.cc (impl_run_checkers): Free up any dominance info that
+            we may have created.
+            * kf.cc (class kf_ubsan_handler): New.
+            (register_sanitizer_builtins): New.
+            (register_known_functions): Call register_sanitizer_builtins.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/114408* gcc.dg/analyzer/deref-before-check-pr114408.c: New test.
+            * c-c++-common/ubsan/analyzer-ice-pr114408.c: New test.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2024-05-09 17:49:32 UTC
+  Text: Should be fixed for GCC 13 (for the upcoming GCC 13.3) by the above patch.
+

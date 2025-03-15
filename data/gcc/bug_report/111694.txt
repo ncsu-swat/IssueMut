@@ -1,0 +1,193 @@
+Bug Summary: [13/14 Regression] Wrong behavior for signbit of negative zero when optimizing
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 12.3.0
+Known to Fail: 
+
+Comments:
+- User: Alon Zakai | Time: 2023-10-04 17:09:16 UTC
+  Text: This behaves incorrectly in 13.2.0 with -O1 and above, but is correct in 12, 11, and 10. It is also correct in 13.2.0 without optimizations.
+
+Testcase:
+
+
+#include <math.h>
+#include <stdio.h>
+
+void test(double l, double r) {
+  if (l == r && l == 0 && (signbit(l) || signbit(r))) {
+    puts("one is negative");
+  }
+}
+
+int main() {
+  test(0.0, -0.0);
+  test(-0.0, 0.0);
+}
+
+
+This should print "one is negative" twice, but only does so once in 13.2.0 with -O1:
+
+$ gcc-13 a.c -O1 ; ./a.out
+one is negative
+$ gcc-13 a.c -O0 ; ./a.out
+one is negative
+one is negative
+$
+
+- User: Alexander Monakov | Time: 2023-10-04 18:31:30 UTC
+  Text: Reduced:
+
+#define signbit(x) __builtin_signbit(x)
+
+static void test(double l, double r)
+{
+  if (l == r && (signbit(l) || signbit(r)))
+    ;
+  else
+    __builtin_abort();
+}
+
+int main()
+{
+  test(0.0, -0.0);
+}
+
+- User: Andrew Pinski | Time: 2023-10-04 19:09:25 UTC
+  Text: Confirmed. 
+
+
+EVRP removes the second __bultin_signbit incorrectly.
+Most likely due to:
+```
+
+Folding statement: if (_3 != 0)
+ Registering value_relation (l_11(D) == r_12(D)) on (2->3)
+```
+
+which then we get:
+```
+Predicate evaluates to: DON'T KNOW
+Matching expression match.pd:2679, gimple-match-2.cc:35
+Matching expression match.pd:2682, gimple-match-1.cc:66
+Matching expression match.pd:2689, gimple-match-2.cc:96
+Not folded
+Folding statement: _20 = __builtin_signbit (r_12(D));
+Queued stmt for removal.  Folds to: 0
+Folding statement: if (_20 != 0)
+gimple_simplified to if (0 != 0)
+gimple_simplified to if (0 != 0)
+Folded into: if (0 != 0)
+```
+
+For -O1 DOM does:
+```
+1>>> STMT 1 = _8 le_expr 0
+1>>> STMT 1 = _8 ge_expr 0
+1>>> STMT 1 = _8 eq_expr 0
+1>>> STMT 0 = _8 ne_expr 0
+0>>> COPY _8 = 0
+Optimizing statement _10 = __builtin_signbit (r_6(D));
+  Replaced 'r_6(D)' with constant '0.0'
+gimple_simplified to _10 = 0;
+  Folded to: _10 = 0;
+LKUP STMT _10 = 0
+==== ASGN _10 = 0
+Optimizing statement if (_10 != 0)
+  Replaced '_10' with constant '0'
+gimple_simplified to if (0 != 0)
+  Folded to: if (0 != 0)
+LKUP STMT 0 ne_expr 0
+<<<< STMT 0 = _8 ne_expr 0
+<<<< STMT 1 = _8 eq_expr 0
+<<<< STMT 1 = _8 ge_expr 0
+<<<< STMT 1 = _8 le_expr 0
+<<<< COPY _8 = 0
+```
+Which is wrong too.
+
+- User: Richard Biener | Time: 2023-10-05 07:37:55 UTC
+  Text: Looks like some frange / relation mistake then.
+
+- User: Andrew Macleod | Time: 2023-10-06 17:30:03 UTC
+  Text: (In reply to Richard Biener fromcomment #3)> Looks like some frange / relation mistake then.l_3(D)  [frange] double [-Inf, +Inf]
+Equivalence set : [l_3(D), r_4(D)]
+    <bb 3> :
+    _1 = __builtin_signbit (l_3(D));
+    if (_1 != 0)
+      goto <bb 6>; [INV]
+    else
+      goto <bb 4>; [INV]
+
+3->6  (T) _1 :  [irange] int [-INF, -1][1, +INF]
+3->6  (T) l_3(D) :      [frange] double [-Inf, -0.0 (-0x0.0p+0)]
+3->4  (F) _1 :  [irange] int [0, 0]
+3->4  (F) l_3(D) :      [frange] double [0.0 (0x0.0p+0), +Inf]
+
+    <bb 4> :
+    _2 = __builtin_signbit (r_4(D));
+
+Yeah, we know l_3 and r_4 are equivalent, and we also know that on the edge 3->4 l_3 has the range  double [0.0 (0x0.0p+0), +Inf]
+
+When we miss is that with an equivalence, we also have to put -0.0 back into the range.  We currently don't so we think we can fold the second signbit call.
+
+If I fix that, we then see 
+r_4(D)  [frange] double [-0.0 (-0x0.0p+0), +Inf]
+which prevents the folding.  
+
+I need to audit to see if there are other places where we may have to "adjust" equivalence range, or how best to deal with this in the general case.
+
+- User: GCC Commits | Time: 2023-10-09 17:10:19 UTC
+  Text: The master branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:b0892b1fc637fadf14d7016858983bc5776a1e69commitr14-4520-gb0892b1fc637fadf14d7016858983bc5776a1e69Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Mon Oct 9 10:15:07 2023 -0400
+
+    Ensure float equivalences include + and - zero.
+    
+    A floating point equivalence may not properly reflect both signs of
+    zero, so be pessimsitic and ensure both signs are included.PR tree-optimization/111694gcc/
+            * gimple-range-cache.cc (ranger_cache::fill_block_cache): Adjust
+            equivalence range.
+            * value-relation.cc (adjust_equivalence_range): New.
+            * value-relation.h (adjust_equivalence_range): New prototype.
+    
+            gcc/testsuite/
+            * gcc.dg/pr111694.c: New.
+
+- User: Andrew Macleod | Time: 2023-10-09 17:11:09 UTC
+  Text: fixed
+
+- User: Alexander Monakov | Time: 2023-10-09 17:18:18 UTC
+  Text: No backport for gcc-13 planned?
+
+- User: Andrew Macleod | Time: 2023-10-09 17:36:09 UTC
+  Text: (In reply to Alexander Monakov fromcomment #7)> No backport for gcc-13 planned?mmm, didn't realize were we propagating floating point equivalences around in 13.  similar patch should work there
+
+- User: Andrew Macleod | Time: 2023-10-09 19:37:08 UTC
+  Text: (In reply to Andrew Macleod fromcomment #8)> (In reply to Alexander Monakov fromcomment #7)
+> > No backport for gcc-13 planned?
+> 
+> mmm, didn't realize were we propagating floating point equivalences around
+> in 13.  similar patch should work thereTesting same patch on gcc13. will let it settle on trunk for a day or two first, then check it in if nothing shows up.    which it shouldn't :-)
+
+- User: GCC Commits | Time: 2023-10-11 20:45:59 UTC
+  Text: The releases/gcc-13 branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:f0efc4b25cba1bd35b08b7dfbab0f8fc81b55c66commitr13-7945-gf0efc4b25cba1bd35b08b7dfbab0f8fc81b55c66Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Mon Oct 9 13:40:15 2023 -0400
+
+    Ensure float equivalences include + and - zero.
+    
+    A floating point equivalence may not properly reflect both signs of
+    zero, so be pessimsitic and ensure both signs are included.PR tree-optimization/111694gcc/
+            * gimple-range-cache.cc (ranger_cache::fill_block_cache): Adjust
+            equivalence range.
+            * value-relation.cc (adjust_equivalence_range): New.
+            * value-relation.h (adjust_equivalence_range): New prototype.
+    
+            gcc/testsuite/
+            * gcc.dg/pr111694.c: New.
+
+- User: Andrew Macleod | Time: 2023-10-11 20:48:27 UTC
+  Text: now fixed on gcc 13 too.
+

@@ -1,0 +1,345 @@
+Bug Summary: RISC-V: Invalid vsetvli fusion
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Kito Cheng | Time: 2023-08-16 14:56:18 UTC
+  Text: Reduced case:
+```
+#include <riscv_vector.h>
+
+void foo(_Float16 y, int64_t *i64p)
+{
+  vint64m1_t vx =__riscv_vle64_v_i64m1 (i64p, 1);
+  vx = __riscv_vadd_vv_i64m1 (vx, vx, 1);
+  vfloat16m1_t vy =__riscv_vfmv_s_f_f16m1 (y, 1);
+  asm volatile ("# use %0 %1" : : "vr"(vx), "vr" (vy));
+}
+```
+
+Command to reproduce:
+$ riscv64-unknown-elf-gcc -O3 -march=rv64gczve64f_zvfh
+
+foo:
+        vsetivli        zero,1,e64,m1,ta,ma
+        vle64.v v1,0(a0)
+        vfmv.s.f        v2,fa0 # Will raise illegal instruction here, because we don't have F64 for vector 
+        vadd.vv v1,v1,v1
+        ret
+
+- User: JuzheZhong | Time: 2023-08-16 22:57:47 UTC
+  Text: confirm
+
+- User: GCC Commits | Time: 2023-08-17 06:21:15 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:29547511f7bae06f9f424f8c8583014878240016commitr14-3265-g29547511f7bae06f9f424f8c8583014878240016Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Thu Aug 17 13:59:06 2023 +0800
+
+    RISC-V: Fix incorrect VTYPE fusion for floating point scalar move insn[PR111037]
+    
+    void foo(_Float16 y, int64_t *i64p)
+    {
+      vint64m1_t vx =__riscv_vle64_v_i64m1 (i64p, 1);
+      vx = __riscv_vadd_vv_i64m1 (vx, vx, 1);
+      vfloat16m1_t vy =__riscv_vfmv_s_f_f16m1 (y, 1);
+      asm volatile ("# use %0 %1" : : "vr"(vx), "vr" (vy));
+    }
+    
+    zve64f:
+    foo:
+            vsetivli        zero,1,e16,mf4,ta,ma
+            vle64.v v1,0(a0)
+            vfmv.s.f        v2,fa0
+            vsetvli zero,zero,e64,m1,ta,ma
+            vadd.vv v1,v1,v1
+    
+    zve64d:
+    foo:
+            vsetivli        zero,1,e64,m1,ta,ma
+            vle64.v v1,0(a0)
+            vfmv.s.f        v2,fa0
+            vadd.vv v1,v1,v1
+    
+    gcc/ChangeLog:PR target/111037* config/riscv/riscv-vsetvl.cc (float_insn_valid_sew_p): New function.
+            (second_sew_less_than_first_sew_p): Fix bug.
+            (first_sew_less_than_second_sew_p): Ditto.
+    
+    gcc/testsuite/ChangeLog:PR target/111037* gcc.target/riscv/rvv/base/pr111037-1.c: New test.
+            * gcc.target/riscv/rvv/base/pr111037-2.c: New test.
+
+- User: Kito Cheng | Time: 2023-09-07 10:32:30 UTC
+  Text: Fixed
+
+- User: GCC Commits | Time: 2023-10-20 03:56:57 UTC
+  Text: The trunk branch has been updated by Lehua Ding <lhtin@gcc.gnu.org>:https://gcc.gnu.org/g:29331e72d0ce9fe8aabdeb8c320b99943b9e067acommitr14-4773-g29331e72d0ce9fe8aabdeb8c320b99943b9e067aAuthor: Lehua Ding <lehua.ding@rivai.ai>
+Date:   Fri Oct 20 10:22:43 2023 +0800
+
+    RISC-V: Refactor and cleanup vsetvl pass
+    
+    This patch refactors and cleanups the vsetvl pass in order to make the code
+    easier to modify and understand. This patch does several things:
+    
+    1. Introducing a virtual CFG for vsetvl infos and Phase 1, 2 and 3 only maintain
+       and modify this virtual CFG. Phase 4 performs insertion, modification and
+       deletion of vsetvl insns based on the virtual CFG. The basic block in the
+       virtual CFG is called vsetvl_block_info and the vsetvl information inside
+       is called vsetvl_info.
+    2. Combine Phase 1 and 2 into a single Phase 1 and unified the demand system,
+       this phase only fuse local vsetvl info in forward direction.
+    3. Refactor Phase 3, change the logic for determining whether to uplift vsetvl
+       info to a pred basic block to a more unified method that there is a vsetvl
+       info in the vsetvl defintion reaching in compatible with it.
+    4. Place all modification operations to the RTL in Phase 4 and Phase 5.
+       Phase 4 is responsible for inserting, modifying and deleting vsetvl
+       instructions based on fully optimized vsetvl infos. Phase 5 removes the avl
+       operand from the RVV instruction and removes the unused dest operand
+       register from the vsetvl insns.
+    
+    These modifications resulted in some testcases needing to be updated. The reasons
+    for updating are summarized below:
+    
+    1. more optimized
+       vlmax_back_prop-{25,26}.c
+       vlmax_conflict-{3,12}.c/vsetvl-{13,23}.c/vsetvl-23.c/
+       avl_single-{23,84,95}.c/pr109773-1.c
+    2. less unnecessary fusion
+       avl_single-46.c/imm_bb_prop-1.c/pr109743-2.c/vsetvl-18.c
+    3. local fuse direction (backward -> forward)
+       scalar_move-1.c
+    4. add some bugfix testcases.pr111037-{3,4}.c/pr111037-4.c
+       avl_single-{89,104,105,106,107,108,109}.cPR target/111037PR target/111234PR target/111725gcc/ChangeLog:
+    
+            * config/riscv/riscv-vsetvl.cc (bitmap_union_of_preds_with_entry): New.
+            (debug): Removed.
+            (compute_reaching_defintion): New.
+            (enum vsetvl_type): Moved.
+            (vlmax_avl_p): Moved.
+            (enum emit_type): Moved.
+            (vlmul_to_str): Moved.
+            (vlmax_avl_insn_p): Removed.
+            (policy_to_str): Moved.
+            (loop_basic_block_p): Removed.
+            (valid_sew_p): Removed.
+            (vsetvl_insn_p): Moved.
+            (vsetvl_vtype_change_only_p): Removed.
+            (after_or_same_p): Removed.
+            (before_p): Removed.
+            (anticipatable_occurrence_p): Removed.
+            (available_occurrence_p): Removed.
+            (insn_should_be_added_p): Removed.
+            (get_all_sets): Moved.
+            (get_same_bb_set): Moved.
+            (gen_vsetvl_pat): Removed.
+            (calculate_vlmul): Moved.
+            (get_max_int_sew): New.
+            (emit_vsetvl_insn): Removed.
+            (get_max_float_sew): New.
+            (eliminate_insn): Removed.
+            (insert_vsetvl): Removed.
+            (count_regno_occurrences): Moved.
+            (get_vl_vtype_info): Removed.
+            (enum def_type): Moved.
+            (validate_change_or_fail): Moved.
+            (change_insn): Removed.
+            (get_all_real_uses): Moved.
+            (get_forward_read_vl_insn): Removed.
+            (get_backward_fault_first_load_insn): Removed.
+            (change_vsetvl_insn): Removed.
+            (avl_source_has_vsetvl_p): Removed.
+            (source_equal_p): Moved.
+            (calculate_sew): Removed.
+            (same_equiv_note_p): Moved.
+            (get_expr_id): New.
+            (incompatible_avl_p): Removed.
+            (get_regno): New.
+            (different_sew_p): Removed.
+            (get_bb_index): New.
+            (different_lmul_p): Removed.
+            (has_no_uses): Moved.
+            (different_ratio_p): Removed.
+            (different_tail_policy_p): Removed.
+            (different_mask_policy_p): Removed.
+            (possible_zero_avl_p): Removed.
+            (enum demand_flags): New.
+            (second_ratio_invalid_for_first_sew_p): Removed.
+            (second_ratio_invalid_for_first_lmul_p): Removed.
+            (enum class): New.
+            (float_insn_valid_sew_p): Removed.
+            (second_sew_less_than_first_sew_p): Removed.
+            (first_sew_less_than_second_sew_p): Removed.
+            (class vsetvl_info): New.
+            (compare_lmul): Removed.
+            (second_lmul_less_than_first_lmul_p): Removed.
+            (second_ratio_less_than_first_ratio_p): Removed.
+            (DEF_INCOMPATIBLE_COND): Removed.
+            (greatest_sew): Removed.
+            (first_sew): Removed.
+            (second_sew): Removed.
+            (first_vlmul): Removed.
+            (second_vlmul): Removed.
+            (first_ratio): Removed.
+            (second_ratio): Removed.
+            (vlmul_for_first_sew_second_ratio): Removed.
+            (vlmul_for_greatest_sew_second_ratio): Removed.
+            (ratio_for_second_sew_first_vlmul): Removed.
+            (class vsetvl_block_info): New.
+            (DEF_SEW_LMUL_FUSE_RULE): New.
+            (always_unavailable): Removed.
+            (avl_unavailable_p): Removed.
+            (class demand_system): New.
+            (sew_unavailable_p): Removed.
+            (lmul_unavailable_p): Removed.
+            (ge_sew_unavailable_p): Removed.
+            (ge_sew_lmul_unavailable_p): Removed.
+            (ge_sew_ratio_unavailable_p): Removed.
+            (DEF_UNAVAILABLE_COND): Removed.
+            (same_sew_lmul_demand_p): Removed.
+            (propagate_avl_across_demands_p): Removed.
+            (reg_available_p): Removed.
+            (support_relaxed_compatible_p): Removed.
+            (demands_can_be_fused_p): Removed.
+            (earliest_pred_can_be_fused_p): Removed.
+            (vsetvl_dominated_by_p): Removed.
+            (avl_info::avl_info): Removed.
+            (avl_info::single_source_equal_p): Removed.
+            (avl_info::multiple_source_equal_p): Removed.
+            (DEF_SEW_LMUL_RULE): New.
+            (avl_info::operator=): Removed.
+            (avl_info::operator==): Removed.
+            (DEF_POLICY_RULE): New.
+            (avl_info::operator!=): Removed.
+            (avl_info::has_non_zero_avl): Removed.
+            (vl_vtype_info::vl_vtype_info): Removed.
+            (vl_vtype_info::operator==): Removed.
+            (DEF_AVL_RULE): New.
+            (vl_vtype_info::operator!=): Removed.
+            (vl_vtype_info::same_avl_p): Removed.
+            (vl_vtype_info::same_vtype_p): Removed.
+            (vl_vtype_info::same_vlmax_p): Removed.
+            (vector_insn_info::operator>=): Removed.
+            (vector_insn_info::operator==): Removed.
+            (class pre_vsetvl): New.
+            (vector_insn_info::parse_insn): Removed.
+            (vector_insn_info::compatible_p): Removed.
+            (vector_insn_info::skip_avl_compatible_p): Removed.
+            (vector_insn_info::compatible_avl_p): Removed.
+            (vector_insn_info::compatible_vtype_p): Removed.
+            (vector_insn_info::available_p): Removed.
+            (vector_insn_info::fuse_avl): Removed.
+            (vector_insn_info::fuse_sew_lmul): Removed.
+            (vector_insn_info::fuse_tail_policy): Removed.
+            (vector_insn_info::fuse_mask_policy): Removed.
+            (vector_insn_info::local_merge): Removed.
+            (vector_insn_info::global_merge): Removed.
+            (vector_insn_info::get_avl_or_vl_reg): Removed.
+            (vector_insn_info::update_fault_first_load_avl): Removed.
+            (vector_insn_info::dump): Removed.
+            (vector_infos_manager::vector_infos_manager): Removed.
+            (vector_infos_manager::create_expr): Removed.
+            (vector_infos_manager::get_expr_id): Removed.
+            (vector_infos_manager::all_same_ratio_p): Removed.
+            (vector_infos_manager::all_avail_in_compatible_p): Removed.
+            (vector_infos_manager::all_same_avl_p): Removed.
+            (vector_infos_manager::expr_set_num): Removed.
+            (vector_infos_manager::release): Removed.
+            (vector_infos_manager::create_bitmap_vectors): Removed.
+            (vector_infos_manager::free_bitmap_vectors): Removed.
+            (vector_infos_manager::dump): Removed.
+            (class pass_vsetvl): Adjust.
+            (pass_vsetvl::get_vector_info): Removed.
+            (pass_vsetvl::get_block_info): Removed.
+            (pass_vsetvl::update_vector_info): Removed.
+            (pass_vsetvl::update_block_info): Removed.
+            (pre_vsetvl::compute_avl_def_data): New.
+            (pass_vsetvl::simple_vsetvl): Removed.
+            (pass_vsetvl::compute_local_backward_infos): Removed.
+            (pass_vsetvl::need_vsetvl): Removed.
+            (pass_vsetvl::transfer_before): Removed.
+            (pass_vsetvl::transfer_after): Removed.
+            (pre_vsetvl::compute_vsetvl_def_data): New.
+            (pass_vsetvl::emit_local_forward_vsetvls): Removed.
+            (pass_vsetvl::prune_expressions): Removed.
+            (pass_vsetvl::compute_local_properties): Removed.
+            (pre_vsetvl::compute_lcm_local_properties): New.
+            (pass_vsetvl::earliest_fusion): Removed.
+            (pre_vsetvl::fuse_local_vsetvl_info): New.
+            (pass_vsetvl::vsetvl_fusion): Removed.
+            (pass_vsetvl::can_refine_vsetvl_p): Removed.
+            (pre_vsetvl::earliest_fuse_vsetvl_info): New.
+            (pass_vsetvl::refine_vsetvls): Removed.
+            (pass_vsetvl::cleanup_vsetvls): Removed.
+            (pass_vsetvl::commit_vsetvls): Removed.
+            (pass_vsetvl::pre_vsetvl): Removed.
+            (pass_vsetvl::get_vsetvl_at_end): Removed.
+            (local_avl_compatible_p): Removed.
+            (pass_vsetvl::local_eliminate_vsetvl_insn): Removed.
+            (pre_vsetvl::pre_global_vsetvl_info): New.
+            (get_first_vsetvl_before_rvv_insns): Removed.
+            (pass_vsetvl::global_eliminate_vsetvl_insn): Removed.
+            (pre_vsetvl::emit_vsetvl): New.
+            (pass_vsetvl::ssa_post_optimization): Removed.
+            (pre_vsetvl::cleaup): New.
+            (pre_vsetvl::remove_avl_operand): New.
+            (pass_vsetvl::df_post_optimization): Removed.
+            (pre_vsetvl::remove_unused_dest_operand): New.
+            (pass_vsetvl::init): Removed.
+            (pass_vsetvl::done): Removed.
+            (pass_vsetvl::compute_probabilities): Removed.
+            (pass_vsetvl::lazy_vsetvl): Adjust.
+            (pass_vsetvl::execute): Adjust.
+            * config/riscv/riscv-vsetvl.def (DEF_INCOMPATIBLE_COND): Removed.
+            (DEF_SEW_LMUL_RULE): New.
+            (DEF_SEW_LMUL_FUSE_RULE): Removed.
+            (DEF_POLICY_RULE): New.
+            (DEF_UNAVAILABLE_COND): Removed
+            (DEF_AVL_RULE): New demand type.
+            (sew_lmul): New demand type.
+            (ratio_only): New demand type.
+            (sew_only): New demand type.
+            (ge_sew): New demand type.
+            (ratio_and_ge_sew): New demand type.
+            (tail_mask_policy): New demand type.
+            (tail_policy_only): New demand type.
+            (mask_policy_only): New demand type.
+            (ignore_policy): New demand type.
+            (avl): New demand type.
+            (non_zero_avl): New demand type.
+            (ignore_avl): New demand type.
+            * config/riscv/t-riscv: Removed riscv-vsetvl.h
+            * config/riscv/riscv-vsetvl.h: Removed.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/base/scalar_move-1.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/avl_single-23.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/avl_single-46.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/avl_single-84.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/avl_single-89.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/avl_single-95.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/imm_bb_prop-1.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/pr109743-2.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/pr109773-1.c: Adjust.
+            * gcc.target/riscv/rvv/base/pr111037-1.c: Moved to...
+            * gcc.target/riscv/rvv/vsetvl/pr111037-1.c: ...here.
+            * gcc.target/riscv/rvv/base/pr111037-2.c: Moved to...
+            * gcc.target/riscv/rvv/vsetvl/pr111037-2.c: ...here.
+            * gcc.target/riscv/rvv/vsetvl/vlmax_back_prop-25.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/vlmax_back_prop-26.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/vlmax_conflict-12.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/vlmax_conflict-3.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/vsetvl-13.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/vsetvl-18.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/vsetvl-23.c: Adjust.
+            * gcc.target/riscv/rvv/vsetvl/avl_single-104.c: New test.
+            * gcc.target/riscv/rvv/vsetvl/avl_single-105.c: New test.
+            * gcc.target/riscv/rvv/vsetvl/avl_single-106.c: New test.
+            * gcc.target/riscv/rvv/vsetvl/avl_single-107.c: New test.
+            * gcc.target/riscv/rvv/vsetvl/avl_single-108.c: New test.
+            * gcc.target/riscv/rvv/vsetvl/avl_single-109.c: New test.
+            * gcc.target/riscv/rvv/vsetvl/pr111037-3.c: New test.
+            * gcc.target/riscv/rvv/vsetvl/pr111037-4.c: New test.
+

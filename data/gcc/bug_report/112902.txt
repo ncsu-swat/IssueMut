@@ -1,0 +1,121 @@
+Bug Summary: during GIMPLE pass: bitintlower ICE: in handle_operand_addr, at gimple-lower-bitint.cc:2110 with _BitInt() at -O
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-12-07 11:08:36 UTC
+  Text: Createdattachment 56825[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O testcase.c
+during GIMPLE pass: bitintlower
+testcase.c: In function 'foo':
+testcase.c:6:1: internal compiler error: in handle_operand_addr, at gimple-lower-bitint.cc:2110
+    6 | foo (void)
+      | ^~~
+0xd641f0 handle_operand_addr
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:2110
+0x25c9206 handle_operand_addr
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:2121
+0x25c94ff lower_muldiv_stmt
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:3340
+0x25dcbb6 gimple_lower_bitint
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:6398
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-6267-20231207094857-gbf38c6374b5-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-6267-20231207094857-gbf38c6374b5-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20231207 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2023-12-07 16:15:26 UTC
+  Text: b.0_1 = b;
+  _2 = -b.0_1;
+  _3 = (unsigned _BitInt(512)) _2;
+  a.1_4 = a;
+  a.2_5 = (unsigned _BitInt(512)) a.1_4;
+  _6 = _3 * a.2_5;
+  _7 = (_BitInt(512)) _6;
+  _11 = .MUL_OVERFLOW (_7, 40);
+  _8 = IMAGPART_EXPR <_11>;
+  _9 = (_BitInt(2048)) _8;
+  b = _9;
+and only _6 and _7 are marked as SSA_NAMEs which need underlying memory.
+That is incorrect, while handle_operand_addr handles casts and loads, so
+the fact that a.2_5 and a.1_4 aren't in m_names is ok, in the _3 case it is
+either _3 or _2 needs to be in m_names, if the former, then the load and negation and cast will be done in one loop and multiplication in another one, if the latter, load and negation will be done in one loop and cast with multiplication in another one.
+
+- User: Andrew Pinski | Time: 2023-12-07 20:16:33 UTC
+  Text: Confirmed.
+
+- User: GCC Commits | Time: 2023-12-08 08:04:05 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:f32e49add80cb3a22969b12034509d326aa69c5dcommitr14-6307-gf32e49add80cb3a22969b12034509d326aa69c5dAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Dec 8 09:03:18 2023 +0100
+
+    lower-bitint: Avoid merging non-mergeable stmt with cast and mergeable stmt [PR112902]
+    
+    Before bitint lowering, the IL has:
+      b.0_1 = b;
+      _2 = -b.0_1;
+      _3 = (unsigned _BitInt(512)) _2;
+      a.1_4 = a;
+      a.2_5 = (unsigned _BitInt(512)) a.1_4;
+      _6 = _3 * a.2_5;
+    on the first function.  Now, gimple_lower_bitint has an optimization
+    (when not -O0) that it avoids assigning underlying VAR_DECLs for certain
+    SSA_NAMEs where it is possible to lower it in a single loop (or straight
+    line code) rather than in multiple loops.
+    So, e.g. the multiplication above uses handle_operand_addr, which can deal
+    with INTEGER_CST arguments, loads but also casts, so it is fine
+    not to assign an underlying VAR_DECL for SSA_NAMEs a.1_4 and a.2_5, as
+    the multiplication can handle it fine.
+    The more problematic case is the other multiplication operand.
+    It is again a result of a (in this case narrowing) cast, so it is fine
+    not to assign VAR_DECL for _3.  Normally we can merge the load (b.0_1)
+    with the negation (_2) and even with the following cast (_3).  If _3
+    was used in a mergeable operation like addition, subtraction, negation,
+    &|^ or equality comparison, all of b.0_1, _2 and _3 could be without
+    underlying VAR_DECLs.
+    The problem is that the current code does that even when the cast is used
+    by a non-mergeable operation, and handle_operand_addr certainly can't handle
+    the mergeable operations feeding the rhs1 of the cast, for multiplication
+    we don't emit any loop in which it could appear, for other operations like
+    shifts or non-equality comparisons we emit loops, but either in the reverse
+    direction or with unpredictable indexes (for shifts).
+    So, in order to lower the above correctly, we need to have an underlying
+    VAR_DECL for either _2 or _3; if we choose _2, then the load and negation
+    would be done in one loop and extension handled as part of the
+    multiplication, if we choose _3, then the load, negation and cast are done
+    in one loop and the multiplication just uses the underlying VAR_DECL
+    computed by that.
+    It is far easier to do this for _3, which is what the following patch
+    implements.
+    It actually already had code for most of it, just it did that for widening
+    casts only (optimize unless the cast rhs1 is not SSA_NAME, or is SSA_NAME
+    defined in some other bb, or with more than one use, etc.).
+    This falls through into such code even for the narrowing or same precision
+    casts, unless the cast is used in a mergeable operation.
+    
+    2023-12-08  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/112902* gimple-lower-bitint.cc (gimple_lower_bitint): For a narrowing
+            or same precision cast don't set SSA_NAME_VERSION in m_names only
+            if use_stmt is mergeable_op or fall through into the check that
+            use is a store or rhs1 is not mergeable or other reasons prevent
+            merging.
+    
+            * gcc.dg/bitint-52.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-12-08 08:04:33 UTC
+  Text: Fixed.
+

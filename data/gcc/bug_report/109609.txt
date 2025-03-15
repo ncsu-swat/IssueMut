@@ -1,0 +1,359 @@
+Bug Summary: [12/13 Regression] tail call for function even when passing a ptr which references a local array still
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 12.2.1, 13.1.1, 14.0
+Known to Fail: 12.2.0, 13.1.0
+
+Comments:
+- User: Gabriel Burca | Time: 2023-04-24 19:34:01 UTC
+  Text: The following code prints uninitialized garbage when compiled with -O2 or -O3 in all versions of GCC 12 (including trunk). It works correctly in GCC 11. Replacing strncpy() with strncat() gives the same results, however when using the commented out strncpy() call, the output is as expected. See also how the generated assembly changes when the printf() inside the function is commented out.
+
+Expected output:
+Src: edcba
+Dst: edcba
+
+Actual output:
+Src: edcba
+Dst: <random uninitialized data>https://godbolt.org/z/5E51Gdh9sCompile args:
+g++ -O2 file.cpp
+
+8<----------- file.cpp --------------
+#include <cstring>
+#include <stdio.h>
+#include <algorithm>
+
+static constexpr unsigned N = 23;
+char dst[N + 1];
+
+void invert(const char *id) {
+  constexpr int MAX_LEN = 13;
+  char buf[MAX_LEN];
+  char *ptr = buf + sizeof(buf);  // start from the end of buf
+  *(--ptr) = '\0';                // terminate string
+  while (*id && ptr > buf) {
+    *(--ptr) = *(id++);           // copy id backwards
+  }
+  printf("Src: %s\n", ptr);
+  strncpy(dst, ptr, N);           // copy ptr/buf to dst
+  //strncpy(dst, ptr, std::min<size_t>(N, strlen(ptr)));
+}
+
+
+int main() {
+  invert("abcde");
+  printf("Dst: %s\n", dst);
+}
+8<----------- file.cpp --------------
+
+g++ -v -save-temps -O2 file.cpp
+Using built-in specs.
+COLLECT_GCC=/home/gb/.fighome/runtime/gcc/12.2.0-1/bin/g++
+COLLECT_LTO_WRAPPER=/home/gb/.fighome/runtime/gcc/12.2.0-1/bin/../libexec/gcc/x86_64-linux-gnu/12.2.0/lto-wrapper
+Target: x86_64-linux-gnu
+Configured with: ../gcc-12.2.0/configure --prefix /data/work/chhq-sudbld10-001-CENTOS7/15df1254b8bb2e5c/scratch/gcc/12.2.0/staging --build=x86_64-linux-gnu --disable-multilib --disable-multiarch --enable-clocale=gnu --enable-languages=c,c++,fortran --enable-ld=yes --enable-gold=yes --enable-libstdcxx-debug --enable-libstdcxx-time=yes --enable-linker-build-id --enable-lto --enable-plugins --enable-threads=posix --host=x86_64-linux-gnu --target=x86_64-linux-gnu --with-pkgversion=''\''internal_build'\''' --with-system-zlib --disable-werror --with-libelf=/data/work/chhq-sudbld10-001-CENTOS7/15df1254b8bb2e5c/scratch/gcc/12.2.0/build/libelf-0.8.13
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 12.2.0 ('internal_build')
+COLLECT_GCC_OPTIONS='-v' '-save-temps' '-O2' '-shared-libgcc' '-mtune=generic' '-march=x86-64'
+ /home/gb/.fighome/runtime/gcc/12.2.0-1/bin/../libexec/gcc/x86_64-linux-gnu/12.2.0/cc1plus -E -quiet -v -iprefix /home/gb/.fighome/runtime/gcc/12.2.0-1/bin/../lib/gcc/x86_64-linux-gnu/12.2.0/ -D_GNU_SOURCE file.cpp -mtune=generic -march=x86-64 -O2 -fpch-preprocess
+
+- User: Andrew Pinski | Time: 2023-04-24 19:38:15 UTC
+  Text: Note strcpy arguments cannot be overlapping if the dst overlaps with the src, then the behavior is undefined. I think you are hitting that undefined behavior here.
+
+- User: Andrew Pinski | Time: 2023-04-24 19:40:17 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> Note strcpy arguments cannot be overlapping if the dst overlaps with the
+> src, then the behavior is undefined. I think you are hitting that undefined
+> behavior here.I take that back, I read the source incorrectly at the time.
+
+- User: Jakub Jelinek | Time: 2023-04-24 19:47:53 UTC
+  Text: Started withr12-145-gd1d01a66012a93cc8cb7d
+
+- User: Andrew Pinski | Time: 2023-04-24 19:50:04 UTC
+  Text: Oh the problem is related to tail calls:
+
+  strncpy (&dst, ptr_30, 23); [tail call]
+
+That should not be marked as a tail call as buf is still alive during the call of strncpy.
+
+Simple workaround, add
+asm("":::"memory");
+
+Right before the end of invert.
+Or use -fno-optimize-sibling-calls
+
+Self contained testcase:
+```
+#define N 23
+#define MAX_LEN 13
+char dst[N + 1];
+
+void invert(const char *id) {
+  char buf[MAX_LEN];
+  char *ptr = buf + sizeof(buf);  // start from the end of buf
+  *(--ptr) = '\0';                // terminate string
+  while (*id && ptr > buf) {
+    *(--ptr) = *(id++);           // copy id backwards
+  }
+  __builtin_strncpy(dst, ptr, N);           // copy ptr/buf to dst
+ // asm("":::"memory"); // This "fixes" the issue.
+}
+
+
+int main() {
+  invert("abcde");
+  if (strcmp(dst, "edcba"))
+    __builtin_abort();
+}
+```
+
+- User: Jakub Jelinek | Time: 2023-04-24 19:52:05 UTC
+  Text: Yeah, exactly, the difference between the two revisions is first in tailc pass:
+---pr109609.C.202t.tailc_	2023-04-24 15:48:33.000000000 -0400
++++pr109609.C.202t.tailc	2023-04-24 15:49:08.000000000 -0400
+@@ -44,7 +44,7 @@ void invert (const char * id)
+   <bb 4> [local count: 137085153]:
+   # ptr_27 = PHI <ptr_10(3), &MEM <char[13]> [(void *)&buf + 12B](2)>
+   __builtin_printf ("Src: %s\n", ptr_27);
+-  __builtin_strncpy (&dst, ptr_27, 23);
++  __builtin_strncpy (&dst, ptr_27, 23); [tail call]
+   buf ={v} {CLOBBER};
+   return;
+ 
+Obviously, we shouldn't tail call strncpy when the second argument points into an automatic variable in the current function.
+
+- User: Andrew Pinski | Time: 2023-04-24 19:56:38 UTC
+  Text: Note, changing `ptr < buf` to `ptr != buf` still invokes the wrong code being generated.
+
+- User: Gabriel Burca | Time: 2023-04-24 20:30:52 UTC
+  Text: Here's the code that still fails with -O3 -fno-optimize-sibling-calls:
+
+```
+#include <string.h>
+#include <stdint.h>
+#define N 23
+#define MAX_LEN 13
+char dst[N + 1];
+
+void stringify(uint64_t id) {
+  char buf[MAX_LEN];
+  char *ptr = buf + sizeof(buf);  // start from the end of buf
+  *(--ptr) = '\0';                // terminate string
+  while (id && ptr > buf) {
+    *(--ptr) = static_cast<char>(id % 10) + '0';
+    id /= 10;
+  }
+  __builtin_strncpy(dst, ptr, N);           // copy ptr/buf to dst
+}
+
+int main() {
+  stringify(12345);
+  if (strcmp(dst, "12345"))
+    __builtin_abort();
+}
+```
+
+Notably this only fails with -O3, not with -O2
+
+- User: Jakub Jelinek | Time: 2023-04-24 20:52:39 UTC
+  Text: In that case it started withr12-382-ged3c43224cc4e378dBut maybe it would be better to track it separately.
+
+- User: Richard Biener | Time: 2023-04-25 06:30:47 UTC
+  Text: In any case it looks like I have to investigate.
+
+- User: Richard Biener | Time: 2023-04-25 07:06:08 UTC
+  Text: On the first testcase reverting the offending rev. shows that it causes
+
+   <bb 2> [local count: 137085152]:
+-  MEM[(char *)&buf + 12B] = 0;
+-  _19 = *id_8(D);
+-  if (_19 != 0)
++  _18 = *id_7(D);
++  if (_18 != 0)
+
+thus we DSE the store to the end.
+
+The issue is that the fnspec we have for strncpy says the access size
+is specified by argument 3 but what it specified there is the _maximum_
+size read, not the actual size.  So instead of "1cO313" it should be
+"1cO31 " ('1' is somewhat odd then, it says we copy 'src' to 'dst'
+but we only say the 'dst' write covers arg 3 size - I guess that's OK
+for points-to analysis, the additional zeros written do not have pointers,
+but if we use it differently it might be a wrong spec?)
+
+I'm scanning other builtins for similar issues.
+
+- User: Richard Biener | Time: 2023-04-25 07:15:05 UTC
+  Text: (In reply to Richard Biener fromcomment #10)> On the first testcase reverting the offending rev. shows that it causes
+> 
+>    <bb 2> [local count: 137085152]:
+> -  MEM[(char *)&buf + 12B] = 0;
+> -  _19 = *id_8(D);
+> -  if (_19 != 0)
+> +  _18 = *id_7(D);
+> +  if (_18 != 0)
+> 
+> thus we DSE the store to the end.
+> 
+> The issue is that the fnspec we have for strncpy says the access size
+> is specified by argument 3 but what it specified there is the _maximum_
+> size read, not the actual size.  So instead of "1cO313" it should be
+> "1cO31 " ('1' is somewhat odd then, it says we copy 'src' to 'dst'
+> but we only say the 'dst' write covers arg 3 size - I guess that's OK
+> for points-to analysis, the additional zeros written do not have pointers,
+> but if we use it differently it might be a wrong spec?)
+> 
+> I'm scanning other builtins for similar issues.Note a different fix would be to re-interpret the case of reads and
+say the size is _up to_ the specified length, thus use
+ao_ref_init_from_ptr_and_range instead of _and_size.
+
+strncat, stpncpy, strncmp, strnlen, strndup are affected similarly.
+
+for functions like memchr I'm not sure if we can assume all 'n' bytes are
+read (thus if that would cause known overread -> undefined behavior).
+
+Honza?  Any opinion?
+
+
+Fix for the testcase, but incomplete as noted above:
+
+diff --git a/gcc/builtins.cc b/gcc/builtins.cc
+index 0e06fa5b2e0..133707c1617 100644
+--- a/gcc/builtins.cc
++++ b/gcc/builtins.cc
+@@ -11562,11 +11562,12 @@ builtin_fnspec (tree callee)
+       case BUILT_IN_STPCPY_CHK:
+        return ".cO 1 ";
+       case BUILT_IN_STRNCPY:
++      case BUILT_IN_STRNCPY_CHK:
++       return "1cO31 ";
+       case BUILT_IN_MEMCPY:
+       case BUILT_IN_MEMMOVE:
+       case BUILT_IN_TM_MEMCPY:
+       case BUILT_IN_TM_MEMMOVE:
+-      case BUILT_IN_STRNCPY_CHK:
+       case BUILT_IN_MEMCPY_CHK:
+       case BUILT_IN_MEMMOVE_CHK:
+        return "1cO313";
+
+- User: Jakub Jelinek | Time: 2023-04-25 07:37:46 UTC
+  Text: I had a look at memcmp recently in the context ofPR109306and my understanding is that the function may but doesn't have to access all bytes from both arrays up to the given size.
+While for memchr, C17 contains:
+"The implementation shall behave as if it reads the characters sequentially and stops as soon as a matching character is found."
+and my reading of that is that it has to stop reading upon reaching the match, so in that case the read is always just up to the given size, not the whole size.
+While e.g. strchr doesn't say something similar and so it needs to be passed valid zero terminated string and can but doesn't have to read the whole string.
+
+- User: Jakub Jelinek | Time: 2023-04-25 07:42:44 UTC
+  Text: strncpy second argument is an array rather than necessarily a string and characters after '\0' are not copied, so if n is non-zero, it reads between 1 and n characters from the source array (not sure if a dumb implementation could try to read all characters and only copy those until '\0' inclusive though).
+
+- User: Richard Biener | Time: 2023-04-25 12:54:39 UTC
+  Text: Btw, looking at the user modref_access_analysis::get_access_for_fnspec it
+interprets the size as upper bound (also for 't').  Likewise for
+get_access_for_fnspec.  Just the check_fnspec use in tree-ssa-alias.cc interprets both as exact sizes.
+
+So a "conservative" fix that's backportable would simply adjust the
+tree-ssa-alias.cc use to behave similarly.
+
+- User: GCC Commits | Time: 2023-04-25 14:53:16 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:e8d00353017f895d03a9eabae3506fd126ce1a2dcommitr14-225-ge8d00353017f895d03a9eabae3506fd126ce1a2dAuthor: Richard Biener <rguenther@suse.de>
+Date:   Tue Apr 25 14:56:44 2023 +0200
+
+    tree-optimization/109609 - correctly interpret arg size in fnspec
+    
+    By majority vote and a hint from the API name which is
+    arg_max_access_size_given_by_arg_p this interprets a memory access
+    size specified as given as other argument such as for strncpy
+    in the testcase which has "1cO313" as specifying the _maximum_
+    size read/written rather than the exact size.  There are two
+    uses interpreting it that way already and one differing.  The
+    following adjusts the differing and clarifies the documentation.PR tree-optimization/109609* attr-fnspec.h (arg_max_access_size_given_by_arg_p):
+            Clarify semantics.
+            * tree-ssa-alias.cc (check_fnspec): Correctly interpret
+            the size given by arg_max_access_size_given_by_arg_p as
+            maximum, not exact, size.
+    
+            * gcc.dg/torture/pr109609.c: New testcase.
+
+- User: Richard Biener | Time: 2023-04-25 14:53:53 UTC
+  Text: Fixed on trunk sofar.
+
+- User: Gabriel Burca | Time: 2023-04-25 16:14:46 UTC
+  Text: Speaking of the size parameter, my workaround for the original issue was to pre-compute the size argument a different way. This however resulted in a warning that's both right and wrong. Here's the sample code that must be compiled with -O3 and -Wall:https://godbolt.org/z/jbf74994z```
+static constexpr unsigned N = 20;
+char dst[N + 1];
+
+int main() {
+  char buf[10];
+  char *src = buf + sizeof(buf);
+  *(--src) = 0;
+  *(--src) = 'a';
+  strncpy(dst, src, std::min<size_t>(N, strlen(src) + 1));
+
+//   constexpr volatile size_t n = std::min<size_t>(N, strlen(src) + 1);
+//   strncpy(dst, src, n);
+}
+```
+
+<source>: In function 'int main()':
+<source>:13:10: warning: 'char* strncpy(char*, const char*, size_t)' specified bound depends on the length of the source argument [-Wstringop-truncation]
+   13 |   strncpy(dst, src, std::min<size_t>(N, strlen(src) + 1));
+      |   ~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+<source>:13:47: note: length computed here
+   13 |   strncpy(dst, src, std::min<size_t>(N, strlen(src) + 1));
+      |                                         ~~~~~~^~~~~
+
+Sure, it depends on the src, but in a "good" way.
+
+The commented out code doesn't produce the warning. An alternative way to make the warning go away is to change to:
+
+char *src = buf + sizeof(buf) - 1;
+
+- User: GCC Commits | Time: 2023-04-26 09:34:02 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:df49e4602882eabe0642699fb71a70f6e120e263commitr13-7252-gdf49e4602882eabe0642699fb71a70f6e120e263Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Apr 25 14:56:44 2023 +0200
+
+    tree-optimization/109609 - correctly interpret arg size in fnspec
+    
+    By majority vote and a hint from the API name which is
+    arg_max_access_size_given_by_arg_p this interprets a memory access
+    size specified as given as other argument such as for strncpy
+    in the testcase which has "1cO313" as specifying the _maximum_
+    size read/written rather than the exact size.  There are two
+    uses interpreting it that way already and one differing.  The
+    following adjusts the differing and clarifies the documentation.PR tree-optimization/109609* attr-fnspec.h (arg_max_access_size_given_by_arg_p):
+            Clarify semantics.
+            * tree-ssa-alias.cc (check_fnspec): Correctly interpret
+            the size given by arg_max_access_size_given_by_arg_p as
+            maximum, not exact, size.
+    
+            * gcc.dg/torture/pr109609.c: New testcase.
+    
+    (cherry picked from commit e8d00353017f895d03a9eabae3506fd126ce1a2d)
+
+- User: GCC Commits | Time: 2023-04-26 10:41:26 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:2c7e89510fe41265b285e886d19f9895adf545e8commitr12-9474-g2c7e89510fe41265b285e886d19f9895adf545e8Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Apr 25 14:56:44 2023 +0200
+
+    tree-optimization/109609 - correctly interpret arg size in fnspec
+    
+    By majority vote and a hint from the API name which is
+    arg_max_access_size_given_by_arg_p this interprets a memory access
+    size specified as given as other argument such as for strncpy
+    in the testcase which has "1cO313" as specifying the _maximum_
+    size read/written rather than the exact size.  There are two
+    uses interpreting it that way already and one differing.  The
+    following adjusts the differing and clarifies the documentation.PR tree-optimization/109609* attr-fnspec.h (arg_max_access_size_given_by_arg_p):
+            Clarify semantics.
+            * tree-ssa-alias.cc (check_fnspec): Correctly interpret
+            the size given by arg_max_access_size_given_by_arg_p as
+            maximum, not exact, size.
+    
+            * gcc.dg/torture/pr109609.c: New testcase.
+    
+    (cherry picked from commit e8d00353017f895d03a9eabae3506fd126ce1a2d)
+
+- User: Richard Biener | Time: 2023-04-26 10:43:17 UTC
+  Text: Fixed.
+

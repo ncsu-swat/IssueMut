@@ -1,0 +1,125 @@
+Bug Summary: [14 Regression] ICE on valid code at -O2 and -O3 with "-fno-tree-dce -fno-tree-vrp" on x86_64-linux-gnu: in emit_move_insn, at expr.cc:4224
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2023-05-20 20:42:50 UTC
+  Text: This appears to be a very recent regression.
+
+[611] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/home/suz/suz-local/software/local/gcc-trunk/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --disable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20230520 (experimental) [masterr14-924-gd709841ae0f] (GCC)
+[612] %
+[612] % gcctk -O2 -fno-tree-dce -fno-tree-vrp small.c
+during RTL pass: expand
+small.c: In function ‘main’:
+small.c:5:17: internal compiler error: in emit_move_insn, at expr.cc:4224
+    5 |     short c = b && ((a || a) & (a * c));
+      |               ~~^~~~~~~~~~~~~~~~~~~~~~~
+0x758d96 emit_move_insn(rtx_def*, rtx_def*)
+        ../../gcc-trunk/gcc/expr.cc:4224
+0xba80fa expand_and(machine_mode, rtx_def*, rtx_def*, rtx_def*)
+        ../../gcc-trunk/gcc/expmed.cc:5484
+0xbbd7af expand_expr_real_2(separate_ops*, rtx_def*, machine_mode, expand_modifier)
+        ../../gcc-trunk/gcc/expr.cc:9829
+0xbc0a7d expand_expr_real_1(tree_node*, rtx_def*, machine_mode, expand_modifier, rtx_def**, bool)
+        ../../gcc-trunk/gcc/expr.cc:10800
+0xbbd4fb expand_expr_real(tree_node*, rtx_def*, machine_mode, expand_modifier, rtx_def**, bool)
+        ../../gcc-trunk/gcc/expr.cc:8999
+0xbbd4fb expand_expr(tree_node*, rtx_def*, machine_mode, expand_modifier)
+        ../../gcc-trunk/gcc/expr.h:310
+0xbbd4fb expand_expr_real_2(separate_ops*, rtx_def*, machine_mode, expand_modifier)
+        ../../gcc-trunk/gcc/expr.cc:9321
+0xbbe19e expand_expr_real_1(tree_node*, rtx_def*, machine_mode, expand_modifier, rtx_def**, bool)
+        ../../gcc-trunk/gcc/expr.cc:12152
+0xbb85ea expand_expr(tree_node*, rtx_def*, machine_mode, expand_modifier)
+        ../../gcc-trunk/gcc/expr.h:310
+0xbb85ea expand_single_bit_test
+        ../../gcc-trunk/gcc/expr.cc:12959
+0xbb85ea do_store_flag
+        ../../gcc-trunk/gcc/expr.cc:13166
+0xbb9019 expand_expr_real_2(separate_ops*, rtx_def*, machine_mode, expand_modifier)
+        ../../gcc-trunk/gcc/expr.cc:10251
+0xa93a0e expand_gimple_stmt_1
+        ../../gcc-trunk/gcc/cfgexpand.cc:3983
+0xa93a0e expand_gimple_stmt
+        ../../gcc-trunk/gcc/cfgexpand.cc:4044
+0xa984a0 expand_gimple_basic_block
+        ../../gcc-trunk/gcc/cfgexpand.cc:6106
+0xa9a407 execute
+        ../../gcc-trunk/gcc/cfgexpand.cc:6841
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+[613] %
+[613] % cat small.c
+int a;
+int main() {
+  int b = 1;
+  while (a) {
+    short c = b && ((a || a) & (a * c));
+  }
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2023-05-20 20:49:19 UTC
+  Text: Almost positive this is my bug.
+
+- User: Andrew Pinski | Time: 2023-05-20 21:06:25 UTC
+  Text: Simple one line fix:
+```
+apinski@xeond:~/src/upstream-gcc/gcc/objdir/gcc$ git diff
+diff --git a/gcc/expr.cc b/gcc/expr.cc
+index 2070198acda..02f24c00148 100644
+--- a/gcc/expr.cc
++++ b/gcc/expr.cc
+@@ -12956,7 +12956,7 @@ expand_single_bit_test (location_t loc, enum tree_code code,
+   intermediate_type = ops_unsigned ? unsigned_type : signed_type;
+   inner = fold_convert_loc (loc, intermediate_type, inner);
+
+-  rtx inner0 = expand_expr (inner, target, VOIDmode, EXPAND_NORMAL);
++  rtx inner0 = expand_expr (inner, NULL_RTX, VOIDmode, EXPAND_NORMAL);
+
+   inner0 = extract_bit_field (inner0, 1, bitnum, 1, target,
+                              operand_mode, mode, 0, NULL);
+
+```
+
+To explain what is happening is simple, target in this case is QImode but for inner we would need a SImode. Anyways the fix is not specify if we should use target as an hint here.
+
+- User: GCC Commits | Time: 2023-05-21 01:12:20 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:ee0f1f2294baaecfa0c038fe7e8361949d1ebd68commitr14-1020-gee0f1f2294baaecfa0c038fe7e8361949d1ebd68Author: Andrew Pinski <apinski@marvell.com>
+Date:   Sat May 20 21:14:23 2023 +0000
+
+    FixPR 109919: ICE in emit_move_insn with some bit tests
+    
+    The problem is I used expand_expr with the target but
+    we don't want to use the target here as it is the wrong
+    mode for the original expression. The testcase would ICE
+    deap down while trying to do a move to use the target.
+    Anyways just calling expand_expr with NULL_EXPR fixes
+    the issue.
+    
+    Committed as obvious after a bootstrap/test on x86_64-linux-gnu.PR middle-end/109919gcc/ChangeLog:
+    
+            * expr.cc (expand_single_bit_test): Don't use the
+            target for expand_expr.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/compile/pr109919-1.c: New test.
+
+- User: Andrew Pinski | Time: 2023-05-21 01:13:04 UTC
+  Text: Fixed.
+

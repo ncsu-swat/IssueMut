@@ -1,0 +1,184 @@
+Bug Summary: [14 Regression] Wrong code at -O2/3/s on x86_64-gnu since r14-3226-gd073e2d75d9
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: alias, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Shaohua Li | Time: 2023-09-17 13:09:17 UTC
+  Text: gcc at -O2/3/s produced the wrong code.
+
+Bisected tor14-3226-gd073e2d75d9Compiler explorer:https://godbolt.org/z/xWj9z8foe$ cat a.c
+int printf(const char *, ...);
+int a = 3, d, e;
+int *b = &a;
+char c;
+short f;
+const int **g;
+static long h(int **i, int **j) {
+  const int *k[46];
+  const int **l = &k[5];
+  *j = &e;
+  g = l;
+  for (; d; d = d + 1)
+    ;
+  **i = 0;
+  return f;
+}
+int main() {
+  int *m = &a;
+  h(&m, &m);
+  c = *b;
+  printf("%d\n", c);
+}
+$
+$ gcc -O0 a.c && ./a.out
+3
+$ gcc -O2 a.c && ./a.out
+0
+$
+
+- User: Andrew Pinski | Time: 2023-09-17 16:19:13 UTC
+  Text: Confirmed.
+
+The code must not take into account that *i and *j could alias ???????
+
+- User: Richard Biener | Time: 2023-09-18 09:14:03 UTC
+  Text: Hmm, so we look for a *(int **) here, reach the toplevel vop, skipping *j = &e?
+That should have conflicted.
+
+- User: Jakub Jelinek | Time: 2024-01-30 17:20:46 UTC
+  Text: Slightly reduced testcase:
+int a = 3, d, e;
+const int **g;
+
+static void
+foo (int **i, int **j)
+{
+  const int *k[46];
+  const int **l = &k[5];
+  *j = &e;
+  for (g = l; d; d = d + 1)
+    ;
+  **i = 0;
+}
+
+int
+main ()
+{
+  int *m = &a;
+  foo (&m, &m);
+  if (a != 3)
+    __builtin_abort ();
+}
+
+This goes wrong during PRE.
+
+- User: Jakub Jelinek | Time: 2024-01-30 17:53:09 UTC
+  Text: (In reply to Richard Biener fromcomment #2)> Hmm, so we look for a *(int **) here, reach the toplevel vop, skipping *j =
+> &e?
+> That should have conflicted.Seems we actually saw that.
+walk_non_aliased_vuses calls walker (vn_reference_lookup_2) on .MEM_8 vuse, that still returns NULL, then
+3909		  if (stmt_may_clobber_ref_p_1 (def_stmt, ref, tbaa_p))
+3910		    {
+3911		      if (!translate)
+3912			break;
+3913		      translate_flags disambiguate_only = TR_TRANSLATE;
+3914		      res = (*translate) (ref, vuse, data, &disambiguate_only);
+on the def_stmt:
+# .MEM_8 = VDEF <.MEM_7(D)>
+*j_1(D) = &e;
+returns true from stmt_may_clobber_ref_p_1, correctly saying that *j_1(D) store can clobber *i_1(D).
+But then walk_non_aliased_vuses calls
+3914		      res = (*translate) (ref, vuse, data, &disambiguate_only);
+a few lines later, translate is vn_reference_lookup_3.
+And vn_reference_lookup_3 calls vn_reference_lookup_2 here in:
+              tree *saved_last_vuse_ptr = data->last_vuse_ptr;
+              /* Do not update last_vuse_ptr in vn_reference_lookup_2.  */
+              data->last_vuse_ptr = NULL;
+              tree saved_vuse = vr->vuse;
+              hashval_t saved_hashcode = vr->hashcode;
+              void *res = vn_reference_lookup_2 (ref, gimple_vuse (def_stmt),
+                                                 data);
+              /* Need to restore vr->vuse and vr->hashcode.  */
+              vr->vuse = saved_vuse;
+              vr->hashcode = saved_hashcode;
+              data->last_vuse_ptr = saved_last_vuse_ptr;
+and def_stmt here is still the *j_1(D) = &e; statement, the problem is that gimple_vuse (def_stmt) in that case is .MEM_7(D), so it triggers ther14-3226if (SSA_NAME_IS_DEFAULT_DEF (vuse)) stuff at that point.  So, do we need to somehow
+arrange for the if (SSA_NAME_IS_DEFAULT_DEF (vuse)) code to be done solely when vn_reference_lookup_2 is called directly from walk_non_aliased_vuses and not when
+called from vn_reference_lookup_3?
+
+- User: Jakub Jelinek | Time: 2024-01-30 18:00:42 UTC
+  Text: This vn_reference_lookup_2 call from vn_reference_lookup_3 has been added forPR23094inr8-4877-gd7a160a45ea7ed09.
+
+- User: Jakub Jelinek | Time: 2024-01-30 18:09:46 UTC
+  Text: But then vnresult->result of &a (what is correctly believed to be in *i at the start of the function) is different from rhs of &e and so it doesn't return res;
+So, I'm afraid I don't know what's going on.
+
+- User: Richard Biener | Time: 2024-01-31 07:37:34 UTC
+  Text: I will have a look then.
+
+- User: Richard Biener | Time: 2024-01-31 09:48:03 UTC
+  Text: OK, so the issue is that we're recording the IPA result with the wrong VUSE since we're calling vn_reference_lookup_2 with !data->last_vuse_ptr but
+data->finish (vr->set, vr->base_set, v) inserts a hashtable entry with
+data->last_vuse.  Note it's somewhat unexpected that vn_reference_lookup_2
+performs hashtable insertion which is what causes the issue.  It's also
+not as easy as using the updated vuse since if we're coming from translation
+through a memcpy that would be wrong.  In fact we probably want to avoid
+doing any insertion if theres sth fishy going on (!data->last_vuse_ptr).
+
+The best fix would likely be to pre-insert all the IPA-CP known constants
+instead of trying to discover them "late".
+
+I'm testing the easy fix for now.
+
+- User: Richard Biener | Time: 2024-01-31 10:55:43 UTC
+  Text: (In reply to Richard Biener fromcomment #8)> The best fix would likely be to pre-insert all the IPA-CP known constants
+> instead of trying to discover them "late".
+> 
+> I'm testing the easy fix for now.Hmm.  gcc.dg/ipa/pr92497-1.c FAILs because of that.  We get
+
+__attribute__((noinline))
+int bar.constprop (struct a a)
+{
+  intD.6 a$aD.2808;
+  intD.6 D.2807;
+  struct a aD.2806;
+  intD.6 _4;
+
+  <bb 2> [local count: 1073741824]:
+  # .MEM_5 = VDEF <.MEM_2(D)>
+  aD.2806 = aD.2800;
+  # VUSE <.MEM_5>
+  a$a_3 = aD.2806.aD.2769;
+
+here and thus translate through the aggregate copy - the result should then
+be put on aD.2806 but of course only with .MEM_5.
+
+Maybe we can and should always use the default def here but I'm slightly
+uneasy with the ref adjustment, esp. since we're going to record
+for the saved operands (if those exist - the path where it goes wrong
+isn't translated).
+
+- User: Richard Biener | Time: 2024-01-31 11:31:37 UTC
+  Text: Hmm, I have another fix.
+
+- User: GCC Commits | Time: 2024-01-31 12:49:15 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:cfb3f666562fb4ab896a05c234a697afb63627a4commitr14-8655-gcfb3f666562fb4ab896a05c234a697afb63627a4Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Jan 31 10:42:48 2024 +0100
+
+    tree-optimization/111444 - avoid insertions when skipping defs
+    
+    The following avoids inserting expressions for IPA CP discovered
+    equivalences into the VN hashtables when we are optimistically
+    skipping may-defs in the attempt to prove it's redundant.PR tree-optimization/111444* tree-ssa-sccvn.cc (vn_reference_lookup_3): Do not use
+            vn_reference_lookup_2 when optimistically skipping may-defs.
+    
+            * gcc.dg/torture/pr111444.c: New testcase.
+
+- User: Richard Biener | Time: 2024-01-31 12:49:42 UTC
+  Text: Fixed.
+

@@ -1,0 +1,145 @@
+Bug Summary: ICE: in block_range, at gimple-range-cache.cc:1293 with -O -finstrument-functions -fnon-call-exceptions and _BitInt()
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 14.2.1, 15.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-09-30 04:44:40 UTC
+  Text: Createdattachment 59226[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O -finstrument-functions -fnon-call-exceptions testcase.c
+testcase.c: In function 'foo':
+testcase.c:11:5: warning: division by zero [-Wdiv-by-zero]
+   11 |   a /= 0;
+      |     ^~
+during GIMPLE pass: bitintlower
+testcase.c:5:1: internal compiler error: in block_range, at gimple-range-cache.cc:1293
+    5 | foo (_BitInt(31) c)
+      | ^~~
+0x2c3b8fe internal_error(char const*, ...)
+        /repo/gcc-trunk/gcc/diagnostic-global-context.cc:517
+0xe7d74f fancy_abort(char const*, int, char const*)
+        /repo/gcc-trunk/gcc/diagnostic.cc:1540
+0xe39b90 ranger_cache::block_range(vrange&, basic_block_def*, tree_node*, bool)
+        /repo/gcc-trunk/gcc/gimple-range-cache.cc:1293
+0x29f47a3 gimple_ranger::range_on_entry(vrange&, basic_block_def*, tree_node*)
+        /repo/gcc-trunk/gcc/gimple-range.cc:174
+0x29f786f gimple_ranger::range_of_expr(vrange&, tree_node*, gimple*)
+        /repo/gcc-trunk/gcc/gimple-range.cc:146
+0x2a0c841 fold_using_range::range_of_range_op(vrange&, gimple_range_op_handler&, fur_source&)
+        /repo/gcc-trunk/gcc/gimple-range-fold.cc:737
+0x2a0e502 fold_using_range::fold_stmt(vrange&, gimple*, fur_source&, tree_node*)
+        /repo/gcc-trunk/gcc/gimple-range-fold.cc:668
+0x29f52e1 gimple_ranger::fold_range_internal(vrange&, gimple*, tree_node*)
+        /repo/gcc-trunk/gcc/gimple-range.cc:277
+0x29f52e1 gimple_ranger::prefill_stmt_dependencies(tree_node*)
+        /repo/gcc-trunk/gcc/gimple-range.cc:416
+0x29f615a gimple_ranger::range_of_stmt(vrange&, gimple*, tree_node*)
+        /repo/gcc-trunk/gcc/gimple-range.cc:334
+0x29f7bb8 gimple_ranger::range_of_expr(vrange&, tree_node*, gimple*)
+        /repo/gcc-trunk/gcc/gimple-range.cc:142
+0x29cf8b1 range_to_prec
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:2180
+0x29d3f0b handle_operand_addr
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:2225
+0x29d4c6f lower_muldiv_stmt
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:3572
+0x29e96a1 gimple_lower_bitint
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:6930
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r15-3941-20240928092031-g2531f014fb2-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r15-3941-20240928092031-g2531f014fb2-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 15.0.0 20240928 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-09-30 09:21:17 UTC
+  Text: Interesting it does NOT ICE for aarch64.
+
+- User: Jakub Jelinek | Time: 2024-09-30 10:30:05 UTC
+  Text: The bitint lowering pass emits some gimple statements on edges (gsi_insert_on_edge) and the edge insertions are (intentionally) committed to edges only at the end of pass (gsi_commit_edge_inserts ()).
+So, what the gimple cache sees here is an SSA_NAME set in a stmt queued on edge.
+
+Either the range cache can be adjusted not to fail assertion in cases like that but just pretend it doesn't know the range of something not yet in the IL (perhaps under some flag), or I'll need to revamp the pass to repeat the handle_operand_addr and .{ADD,SUB}_OVERFLOW discovery to find out where range_to_prec -> range_of_expr would be actually called, remember it in some hash table or whatever data structure and then during actual pass don't use range_of_expr anymore and just look up what has been remembered.  If the former would be possible, I'd certainly prefer that.
+
+- User: Andrew Macleod | Time: 2024-09-30 14:06:09 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #2)> The bitint lowering pass emits some gimple statements on edges
+> (gsi_insert_on_edge) and the edge insertions are (intentionally) committed
+> to edges only at the end of pass (gsi_commit_edge_inserts ()).
+> So, what the gimple cache sees here is an SSA_NAME set in a stmt queued on
+> edge.
+> 
+> Either the range cache can be adjusted not to fail assertion in cases like
+> that but just pretend it doesn't know the range of something not yet in the
+> IL (perhaps under some flag), or I'll need to revamp the pass to repeat the
+> handle_operand_addr and .{ADD,SUB}_OVERFLOW discovery to find out where
+> range_to_prec -> range_of_expr would be actually called, remember it in some
+> hash table or whatever data structure and then during actual pass don't use
+> range_of_expr anymore and just look up what has been remembered.  If the
+> former would be possible, I'd certainly prefer that.It should be perfectly safe to return false instead of trapping on that line.  The routine already returns false if it can't produce a range on entry.   We've added similar functionality at other places to have stmts that are no yet in the IL, we just haven't tripped over this one before.
+
+- User: Jakub Jelinek | Time: 2024-09-30 16:57:57 UTC
+  Text: Createdattachment 59236[details]gcc15-pr116898.patch
+
+So like this?  Will test tonight.
+
+- User: Andrew Macleod | Time: 2024-09-30 17:11:55 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #4)> Createdattachment 59236[details]> gcc15-pr116898.patch
+> 
+> So like this?  Will test tonight.perfect.  consider it pre-pproved.
+
+- User: GCC Commits | Time: 2024-10-01 08:01:03 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:bdbd0607d5933cdecbf7e009a42f1d9486dddf44commitr15-3984-gbdbd0607d5933cdecbf7e009a42f1d9486dddf44Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Oct 1 09:49:49 2024 +0200
+
+    range-cache: Fix ICE on SSA_NAME with def_stmt not yet in the IL [PR116898]
+    
+    Some passes like the bitint lowering queue some statements on edges and only
+    commit them at the end of the pass.  If they use ranger at the same time,
+    the ranger might see such SSA_NAMEs and ICE on those.  The following patch
+    instead just punts on them.
+    
+    2024-10-01  Jakub Jelinek  <jakub@redhat.com>PR middle-end/116898* gimple-range-cache.cc (ranger_cache::block_range): If a SSA_NAME
+            with NULL def_bb isn't SSA_NAME_IS_DEFAULT_DEF, return false instead
+            of failing assertion.  Formatting fix.
+    
+            * gcc.dg/bitint-110.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-10-01 08:21:40 UTC
+  Text: Fixed on the trunk so far.
+
+- User: GCC Commits | Time: 2024-10-13 09:12:29 UTC
+  Text: The releases/gcc-14 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:3df53e5554c86bfbf7f7dbfd3052678eb03afcdbcommitr14-10770-g3df53e5554c86bfbf7f7dbfd3052678eb03afcdbAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Oct 1 09:49:49 2024 +0200
+
+    range-cache: Fix ICE on SSA_NAME with def_stmt not yet in the IL [PR116898]
+    
+    Some passes like the bitint lowering queue some statements on edges and only
+    commit them at the end of the pass.  If they use ranger at the same time,
+    the ranger might see such SSA_NAMEs and ICE on those.  The following patch
+    instead just punts on them.
+    
+    2024-10-01  Jakub Jelinek  <jakub@redhat.com>PR middle-end/116898* gimple-range-cache.cc (ranger_cache::block_range): If a SSA_NAME
+            with NULL def_bb isn't SSA_NAME_IS_DEFAULT_DEF, return false instead
+            of failing assertion.  Formatting fix.
+    
+            * gcc.dg/bitint-110.c: New test.
+    
+    (cherry picked from commit bdbd0607d5933cdecbf7e009a42f1d9486dddf44)
+
+- User: Jakub Jelinek | Time: 2024-10-15 08:36:35 UTC
+  Text: Fixed for 14.3 too.
+

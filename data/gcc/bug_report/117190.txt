@@ -1,0 +1,369 @@
+Bug Summary: [15 Regression] ICE on linux-6.11.3: in size_binop_loc, at fold-const.cc:2085
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2024-10-17 15:10:31 UTC
+  Text: Noticed ICE today when building linux-6.11.3 on gcc-master fromr15-4413-gb12c9ce245204a. Did not bisect.
+
+Reduced example:
+
+//$ cat font_ter16x32.c.c
+struct {
+  char data[];
+} fontdata_ter16x32 = { {
+
+                           8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                       } };
+
+
+$ ./gcc/xgcc -Bgcc -c font_ter16x32.c.c
+font_ter16x32.c.c:9:24: internal compiler error: in size_binop_loc, at fold-const.cc:2085
+    9 |                        } };
+      |                        ^
+0x2532b6f diagnostic_context::diagnostic_impl(rich_location*, diagnostic_metadata const*, diagnostic_option_id, char const*, __va_list_tag (*) [1], diagnostic_t)
+        ???:0
+0x2542409 internal_error(char const*, ...)
+        ???:0
+0x252fefa fancy_abort(char const*, int, char const*)
+        ???:0
+0xb2de61 size_binop_loc(unsigned int, tree_code, tree_node*, tree_node*)
+        ???:0
+0x13b3aed output_constructor(tree_node*, unsigned long, unsigned int, bool, oc_outer_state*)
+        ???:0
+0x13b2846 output_constant(tree_node*, unsigned long, unsigned int, bool, bool)
+        ???:0
+0x13b5057 assemble_variable_contents(tree_node*, char const*, bool, bool)
+        ???:0
+0x13bf416 assemble_variable(tree_node*, int, int, int)
+        ???:0
+0x13c3f81 varpool_node::assemble_decl()
+        ???:0
+0x9f2205 cgraph_order_sort::process()
+        ???:0
+0x9f3656 symbol_table::compile()
+        ???:0
+0x9f63be symbol_table::finalize_compilation_unit()
+        ???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ ./gcc/xgcc -Bgcc -v
+Reading specs from gcc/specs
+COLLECT_GCC=./gcc/xgcc
+COLLECT_LTO_WRAPPER=gcc/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /home/slyfox/dev/git/gcc/configure --disable-multilib --disable-bootstrap --disable-lto --disable-libsanitizer --disable-libstdcxx-pch --enable-languages=c,c++ --disable-libgomp --disable-libquadmath --disable-libvtv CFLAGS='-O1 -g0' CXXFLAGS='-O1 -g0' LDFLAGS='-O1 -g0'
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20241016 (experimental) (GCC)
+
+- User: Sergei Trofimovich | Time: 2024-10-17 15:16:09 UTC
+  Text: In case the minimal example is too mangled original code looks this way:
+
+-https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/linux/font.h#n74-https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/lib/fonts/font_ter16x32.c#n7// include/linux/font.h
+// ...
+struct font_data {
+	unsigned int extra[FONT_EXTRA_WORDS];
+	const unsigned char data[];
+} __packed;
+
+// lib/fonts/font_ter16x32.c
+// ...
+static const struct font_data fontdata_ter16x32 = {
+	{ 0, 0, FONTDATAMAX, 0 }, {
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x7f, 0xfc, 0x7f, 0xfc,
+	0x70, 0x1c, 0x70, 0x1c, 0x70, 0x1c, 0x70, 0x1c,
+        // ... a lot more
+
+- User: Jakub Jelinek | Time: 2024-10-17 20:53:26 UTC
+  Text: Createdattachment 59372[details]gcc15-pr117190.patch
+
+Untested fix.
+As the ICE shows, I think we need to use bitsize_int instead of size_int (or if index actually can be different types then build_int_cst (TREE_TYPE (index), ...),
+but I hope it is always bitsize).
+Except that when that is fixed, there is another ICE, the problem is that while thePR117177fix checked to ensure that there is INTEGER_CST for most of the flex array cases, for length 65 it actually didn't if there is redundant trailing comma.
+And now that I look atPR117177again, I was wrong that it peeks 4 token, the code was peeking just 3 tokens and so can peek one more (the c_parser_peek_nth_token numbers are 1 based, not 0, so argument 4 is fine).
+So, I think we can revertPR117177except for the test, do it differently, add another check and testcase.
+
+Unfortunately, I can't fully test this easily until Monday.
+
+- User: Jakub Jelinek | Time: 2024-10-17 20:55:36 UTC
+  Text: Another option would be to revertr15-4402andr15-4377and reapply once this fix is tested and approved.
+
+- User: Sam James | Time: 2024-10-18 12:21:05 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #3)> Another option would be to revertr15-4402andr15-4377and reapply once
+> this fix is tested and approved.Given 2 other PRs and these reverts help all known issues, I've done this downstream for now.
+
+- User: Frank Scheiner | Time: 2024-10-21 12:10:51 UTC
+  Text: This issue also affects cross-compilation for ia64 on x86_64 using the latest GCC snapshot (gcc-15-20241020), though for a different file in the Linux v6.12-rc4 (w/ia64) ([1]) sources, namely: lib/fonts/font_8x8.c.
+
+```
+[...]
+  CC      lib/fonts/font_8x8.o
+  CC      net/sched/sch_mq.o
+lib/fonts/font_8x8.c:2584:1: internal compiler error: in size_binop_loc, at fold-const.cc:2085
+ 2584 | };
+      | ^
+  CC [M]  drivers/char/ipmi/ipmi_si_hotmod.o
+[...]
+  AR      drivers/soc/loongson/built-in.a
+0x17a1200 internal_error(char const*, ...)
+	/usr/src/gcc/gcc/diagnostic-global-context.cc:517
+0x61909f fancy_abort(char const*, int, char const*)
+	/usr/src/gcc/gcc/diagnostic.cc:1551
+  CC      net/sched/sch_api.o
+  AR      drivers/soc/mediatek/built-in.a
+  AR      drivers/soc/microchip/built-in.a
+  CC      kernel/cgroup/freezer.o
+  CC      net/netlink/genetlink.o
+  AR      drivers/soc/nuvoton/built-in.a
+0x5eb81f size_binop_loc(unsigned int, tree_code, tree_node*, tree_node*)
+	/usr/src/gcc/gcc/fold-const.cc:2085
+  AR      drivers/soc/pxa/built-in.a
+  CC      drivers/pci/host-bridge.o
+0xf90739 array_size_for_constructor
+	/usr/src/gcc/gcc/varasm.cc:5490
+0xf90739 output_constructor_regular_field
+	/usr/src/gcc/gcc/varasm.cc:5660
+0xf90739 output_constructor
+	/usr/src/gcc/gcc/varasm.cc:5956
+0xf90a01 assemble_variable_contents
+	/usr/src/gcc/gcc/varasm.cc:2269
+0xf93297 assemble_variable(tree_node*, int, int, int)
+	/usr/src/gcc/gcc/varasm.cc:2448
+  AR      drivers/soc/amlogic/built-in.a
+0xf95cda varpool_node::assemble_decl()
+	/usr/src/gcc/gcc/varpool.cc:596
+0xf95cda varpool_node::assemble_decl()
+	/usr/src/gcc/gcc/varpool.cc:564
+0xf966ee symbol_table::output_variables()
+	/usr/src/gcc/gcc/varpool.cc:764
+0x7c014d symbol_table::compile()
+	/usr/src/gcc/gcc/cgraphunit.cc:2407
+0x7c2e37 symbol_table::compile()
+	/usr/src/gcc/gcc/cgraphunit.cc:2315
+0x7c2e37 symbol_table::finalize_compilation_unit()
+	/usr/src/gcc/gcc/cgraphunit.cc:2589
+  AR      drivers/soc/qcom/built-in.a
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+```
+
+[1]:https://github.com/johnny-mnemonic/linux-ia64/tree/v6.12-rc4-w-ia64
+
+- User: Frank Scheiner | Time: 2024-10-21 12:17:54 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #2)> Createdattachment 59372[details]> gcc15-pr117190.patch
+> 
+> Untested fix.Unfortunately applying the patch onto gcc-15-20241020 (01f50ebfd97a7bd17a4cc94c403a8e126986c02c) makes it only worse for my use case:
+
+```
+[...]
+  CC      init/main.o
+during RTL pass: dse2
+init/main.c: In function 'set_reset_devices':
+init/main.c:187:1: internal compiler error: Segmentation fault
+  187 | }
+      | ^
+0x17a1200 internal_error(char const*, ...)
+	/usr/src/gcc/gcc/diagnostic-global-context.cc:517
+0xc3918f crash_signal
+	/usr/src/gcc/gcc/toplev.cc:321
+0xc14ae0 poly_int_rtx_p(rtx_def const*, poly_int<1u, long>*)
+	/usr/src/gcc/gcc/rtl.h:2418
+0xc14ae0 simplify_context::simplify_binary_operation_1(rtx_code, machine_mode, rtx_def*, rtx_def*, rtx_def*, rtx_def*)
+	/usr/src/gcc/gcc/simplify-rtx.cc:2880
+0xc1748d simplify_context::simplify_binary_operation(rtx_code, machine_mode, rtx_def*, rtx_def*)
+	/usr/src/gcc/gcc/simplify-rtx.cc:2682
+0xc199fc simplify_binary_operation(rtx_code, machine_mode, rtx_def*, rtx_def*)
+	/usr/src/gcc/gcc/rtl.h:3503
+0xc199fc simplify_rtx(rtx_def const*)
+	/usr/src/gcc/gcc/simplify-rtx.cc:8136
+0x7ce297 cselib_expand_value_rtx_1
+	/usr/src/gcc/gcc/cselib.cc:2154
+0x7ce468 expand_loc
+	/usr/src/gcc/gcc/cselib.cc:1782
+0x7ce180 cselib_expand_value_rtx_1
+	/usr/src/gcc/gcc/cselib.cc:1945
+0x7cfa06 cselib_expand_value_rtx(rtx_def*, bitmap_head*, int)
+	/usr/src/gcc/gcc/cselib.cc:1842
+0x1578119 canon_address
+	/usr/src/gcc/gcc/dse.cc:1157
+0x15789c0 record_store
+	/usr/src/gcc/gcc/dse.cc:1431
+0x157ab3a scan_insn
+	/usr/src/gcc/gcc/dse.cc:2692
+0x157ab3a dse_step1
+	/usr/src/gcc/gcc/dse.cc:2809
+0x157ab3a rest_of_handle_dse
+	/usr/src/gcc/gcc/dse.cc:3726
+0x157ab3a execute
+	/usr/src/gcc/gcc/dse.cc:3799
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+make[3]: *** [scripts/Makefile.build:229: init/main.o] Error 1
+make[2]: *** [scripts/Makefile.build:478: init] Error 2
+make[1]: *** [/dev/shm/torvalds-linux/Makefile:1936: .] Error 2
+make: *** [Makefile:224: __sub-make] Error 2
+```
+...as it already breaks early on. Haven't yet tested reverting the mentioned commits.
+
+- User: Frank Scheiner | Time: 2024-10-21 13:01:50 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #3)> Another option would be to revertr15-4402andr15-4377and reapply once
+> this fix is tested and approved.Reverting both commits results in a working compiler:
+
+```
+# bski /usr/src/ski/ski-bootloader/ski-bootloader /boot/vmlinux-6.12.0-rc4-4714f12a36a0-ia64-ski-hp-sim-00037-g4714f12a36a0-dirty root=/dev/sda simscsi=./sd simeth=enp3s0f0 init=/root/bin/ski_test.bash PATH=/bin:/sbin:/usr/bin:/usr/sbin rw memblock=debug & 
+loading /boot/vmlinux-6.12.0-rc4-4714f12a36a0-ia64-ski-hp-sim-00037-g4714f12a36a0-dirty...
+probing initramfs ...
+initramfs not passed
+starting kernel...
+Linux version 6.12.0-4714f12a36a0-ia64-ski-hp-sim-g4714f12a36a0-dirty (root@dl380-g7) (ia64-linux-gcc (GCC) 15.0.0 20241020 (experimental), GNU ld (GNU Binutils) 2.43.1) #1 SMP PREEMPT Mon Oct 21 15:06:56 CEST 2024
+efi: EFI v1.0 by Hewlett-Packard
+efi: SALsystab=0x10a510 
+warning: unable to switch EFI into virtual mode (status=131)
+No I/O port range found in EFI memory map, falling back to AR.KR0 (0xffffc000000)
+printk: legacy console [simcons0] enabled
+[...]
+```
+
+- User: GCC Commits | Time: 2024-10-22 18:21:32 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:8f173da4520ddf64f3926580042f1103146bf0bdcommitr15-4551-g8f173da4520ddf64f3926580042f1103146bf0bdAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Oct 22 20:20:23 2024 +0200
+
+    varasm: Fix up RAW_DATA_CST handling in array_size_for_constructor [PR117190]
+    
+    CONSTRUCTOR indices for arrays have bitsize type, and ther15-4375patch actually got it right in 6 other spots, but not in this function,
+    where it used size_int rather than bitsize_int and so size_binop can ICE
+    on type mismatch.
+    
+    This is covered by the init-5.c testcase I've just posted, though the ICE
+    goes away when the C FE is fixed (and when it is not, there is another
+    ICE).
+    
+    2024-10-22  Jakub Jelinek  <jakub@redhat.com>PR c/117190* varasm.cc (array_size_for_constructor): For RAW_DATA_CST,
+            use bitsize_int rather than size_int.
+
+- User: Frank Scheiner | Time: 2024-10-22 20:11:42 UTC
+  Text: (In reply to GCC Commits fromcomment #8)> The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:
+> 
+>https://gcc.gnu.org/g:8f173da4520ddf64f3926580042f1103146bf0bdWorks splendid for my use case. Much obliged.
+
+- User: GCC Commits | Time: 2024-10-22 20:37:46 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:a6db5908a55adbef0a0dc1eb2a22743064fe17b8commitr15-4554-ga6db5908a55adbef0a0dc1eb2a22743064fe17b8Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Oct 22 22:36:03 2024 +0200
+
+    c: Better fix for speed up compilation of large char array initializers when not using #embed [PR117190]
+    
+    On Wed, Oct 16, 2024 at 11:09:32PM +0200, Jakub Jelinek wrote:
+    > Apparently my
+    > c: Speed up compilation of large char array initializers when not using #embed
+    > patch broke building glibc.
+    >
+    > The issue is that when using CPP_EMBED, we are guaranteed by the
+    > preprocessor that there is CPP_NUMBER CPP_COMMA before it and
+    > CPP_COMMA CPP_NUMBER after it (or CPP_COMMA CPP_EMBED), so RAW_DATA_CST
+    > never ends up at the end of arrays of unknown length.
+    > Now, the c_parser_initval optimization attempted to preserve that property
+    > rather than changing everything that e.g. inferes array number of elements
+    > from the initializer etc. to deal with RAW_DATA_CST at the end, but
+    > it didn't take into account the possibility that there could be
+    > CPP_COMMA followed by CPP_CLOSE_BRACE (where the CPP_COMMA is redundant).
+    >
+    > As we are peaking already at 4 tokens in that code, peeking more would
+    > require using raw tokens and that seems to be expensive doing it for
+    > every pair of tokens due to vec_free done when we are out of raw tokens.
+    
+    Sorry for rushing the previous patch too much, turns out I was wrong,
+    given that the c_parser_peek_nth_token numbering is 1 based, we can peek
+    also with c_parser_peek_nth_token (parser, 4) and the loop actually peeked
+    just at 3 tokens, not 4.
+    
+    So, I think it is better to revert the previous patch (but keep the new
+    test) and instead peek the 4th non-raw token, which is what the following
+    patch does.
+    
+    Additionally,PR117190shows one further spot which missed the peek of
+    the token after CPP_COMMA, in case it is incomplete array with exactly 65
+    elements with redundant comma after it, which this patch handles too.
+    
+    2024-10-22  Jakub Jelinek  <jakub@redhat.com>PR c/117190gcc/c/
+            * c-parser.cc (c_parser_initval): Revert 2024-10-17 changes.
+            Instead peek the 4th token and if it is not CPP_NUMBER,
+            handle it like 3rd token CPP_CLOSE_BRACE for orig_len == INT_MAX.
+            Also, check (2 + 2 * i)th raw token for the orig_len == INT_MAX
+            case and punt if it is not CPP_NUMBER.
+    gcc/testsuite/
+            * c-c++-common/init-5.c: New test.
+
+- User: Frank Scheiner | Time: 2024-10-22 21:36:45 UTC
+  Text: (In reply to GCC Commits fromcomment #10)> The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:
+> 
+>https://gcc.gnu.org/g:a6db5908a55adbef0a0dc1eb2a22743064fe17b8> 
+> commitr15-4554-ga6db5908a55adbef0a0dc1eb2a22743064fe17b8> Author: Jakub Jelinek <jakub@redhat.com>
+> Date:   Tue Oct 22 22:36:03 2024 +0200
+> 
+>     c: Better fix for speed up compilation of large char array initializers
+> when not using #embed [PR117190]Works the same, but in my case is actually slower than with the prior fix (only two tests so far per compiler):https://gcc.gnu.org/g:8f173da4520ddf64f3926580042f1103146bf0bdreal	7m55.154s
+user	57m31.140s
+sys	2m26.230s
+
+=> 1. Done with fresh clone.
+
+real	7m55.196s
+user	57m27.089s
+sys	2m26.544s
+
+=> 4. Done with mrpropered sources from 3.https://gcc.gnu.org/g:a6db5908a55adbef0a0dc1eb2a22743064fe17b8real	7m58.186s
+user	57m49.545s
+sys	2m28.443s
+
+=> 2. Done with fresh clone.
+
+real	7m58.135s
+user	57m49.629s
+sys	2m29.433s
+
+=> 3. Done with mrpropered sources from 2.
+
+- User: Jakub Jelinek | Time: 2024-10-23 07:34:43 UTC
+  Text: Should be fixed now.
+
+- User: Sam James | Time: 2024-10-23 15:40:14 UTC
+  Text: (In reply to Frank Scheiner fromcomment #11)
+
+I would file a new bug with preprocessed sources if you can identify a testcase which is slower.
+
+- User: Frank Scheiner | Time: 2024-10-23 17:22:03 UTC
+  Text: (In reply to Sam James fromcomment #13)> I would file a new bug with preprocessed sources if you can identify a
+> testcase which is slower.Preprocessed sources for a whole kernel build?
+
+- User: Sam James | Time: 2024-10-23 17:25:13 UTC
+  Text: I meant identify a single file which takes longer, possibly by using -time=/tmp/kernel to record how long each file takes on a good+bad build, then diffing the two.
+
+- User: Frank Scheiner | Time: 2024-10-23 18:04:07 UTC
+  Text: (In reply to Sam James fromcomment #15)> I meant identify a single file which takes longer, possibly by using
+> -time=/tmp/kernel to record how long each file takes on a good+bad build,
+> then diffing the two.That could be an interesting exercise though it can't be much per file if the whole build reproduces a difference of around 3 seconds between different GCCs with short of 8 mins for the whole build. But I'm also unsure if the timings for single files will reproduce well enough between builds. Hm, maybe with fixed processor frequency.
+
+Still, I don't expect that new results would contradict the existing results.
+
+- User: Sam James | Time: 2024-10-23 18:04:49 UTC
+  Text: It's not really actionable without some self-contained testcase like that, unless Jakub has some other idea.
+
+- User: Frank Scheiner | Time: 2024-10-23 18:18:42 UTC
+  Text: (In reply to Sam James fromcomment #17)> It's not really actionable without some self-contained testcase like that,
+> unless Jakub has some other idea.Oh, don't get me wrong, I don't urge anybody to do anything about that. My comment (#11) was simply meant as feedback as the commit message spoke of speed up.
+

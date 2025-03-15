@@ -1,0 +1,548 @@
+Bug Summary: gcc chokes on __has_cpp_attribute(clang::unsafe_buffer_usage)
+Product: gcc
+Component: preprocessor
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Rainer Orth | Time: 2024-02-20 09:01:46 UTC
+  Text: In Xcode 15.3 beta 3, <sys/cdefs.h> gained the equivalent of the following:
+
+$ cat cd2.c
+#ifndef __has_cpp_attribute
+#define __has_cpp_attribute(x) 0
+#endif
+
+#if __has_cpp_attribute(clang::unsafe_buffer_usage) 
+#define __has_safe_buffers 1
+#endif
+
+Unfortunately, this breaks quite a number of testcases with -std below c23:
+
+$ gcc -std=c11 -c cd2.c
+cd2.c:5:30: error: missing ')' after "__has_attribute"
+    5 | #if __has_cpp_attribute(clang::unsafe_buffer_usage)
+      |                              ^
+cd2.c:5:31: error:  ':' without preceding '?'
+    5 | #if __has_cpp_attribute(clang::unsafe_buffer_usage)
+      |                               ^
+
+while g++ always accepts it.  However, current clang/clang++ main always accepts
+it.
+
+- User: Iain Sandoe | Time: 2024-02-20 09:09:19 UTC
+  Text: Is this a clang extension (handling clang::xxxxx with -std= < c23)?
+
+i.e. if the header is not actually standard-conforming - perhaps there's time to get the released SDK fixed (did you raise a feedback?)
+
+- User: ro@CeBiTec.Uni-Bielefeld.DE | Time: 2024-02-20 09:11:28 UTC
+  Text: > ---Comment #1from Iain Sandoe <iains at gcc dot gnu.org> ---
+> Is this a clang extension (handling clang::xxxxx with -std= < c23)?I can't tell: I was waiting for the preprocessor maintainers to comment.> i.e. if the header is not actually standard-conforming - perhaps there's time
+> to get the released SDK fixed (did you raise a feedback?)Not yet, but I mean to.  However, it's better to have a clean
+understanding if the code is wrong first.
+
+- User: Jakub Jelinek | Time: 2024-02-20 09:17:09 UTC
+  Text: Only C23 supports the [[vendor::attr]] attributes,
+#if __has_c_attribute (clang::unsafe_buffer_usage)
+int i;
+#endif
+#if __has_cpp_attribute (clang::unsafe_buffer_usage)
+int j;
+#endif
+compiles just fine with the default -std=gnu17 or -std=gnu11 or -std=c23,
+just doesn't with -std=c11.
+Though, guess __has_c_attribute is just an extension in C11 (and __has_cpp_attribute is a C++ macro, not C), so maybe we could as an extension handle the scoped attributes in there, but not sure if it should then result in 0 for anything scoped, or just if not in gnu namespace.
+
+- User: Jakub Jelinek | Time: 2024-02-20 09:22:32 UTC
+  Text: Not to mention that predefining __has_cpp_attribute in such a public header isn't a good idea.
+They should take example from xxhash which does
+#ifdef __has_attribute
+# define XXH_HAS_ATTRIBUTE(x) __has_attribute(x)
+#else
+# define XXH_HAS_ATTRIBUTE(x) 0
+#endif
+
+/* C-language Attributes are added in C23. */
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ > 201710L) && defined(__has_c_attribute)
+# define XXH_HAS_C_ATTRIBUTE(x) __has_c_attribute(x)
+#else
+# define XXH_HAS_C_ATTRIBUTE(x) 0
+#endif
+
+#if defined(__cplusplus) && defined(__has_cpp_attribute)
+# define XXH_HAS_CPP_ATTRIBUTE(x) __has_cpp_attribute(x)
+#else
+# define XXH_HAS_CPP_ATTRIBUTE(x) 0
+#endif
+
+#if XXH_HAS_C_ATTRIBUTE(x)
+# define XXH_FALLTHROUGH [[fallthrough]]
+#elif XXH_HAS_CPP_ATTRIBUTE(x)
+# define XXH_FALLTHROUGH [[fallthrough]]
+#elif XXH_HAS_ATTRIBUTE(__fallthrough__)
+# define XXH_FALLTHROUGH __attribute__ ((fallthrough))
+#else
+# define XXH_FALLTHROUGH
+#endif
+
+- User: Iain Sandoe | Time: 2024-02-20 09:29:07 UTC
+  Text: perhaps this is also a clang regression - for Jakub's example with Xcode 15.1 :
+
+$ clang --version
+Apple clang version 15.0.0 (clang-1500.1.0.2.5)
+Target: x86_64-apple-darwin23.3.0
+
+master-wip-short-queue mini-05-son:gcc-master iainsandoe$ clang t.c -std=c11 -fsyntax-only
+t.c:2:29: error: missing ')' after ':'
+#if __has_c_attribute (clang::unsafe_buffer_usage)
+                            ^
+t.c:2:23: note: to match this '('
+#if __has_c_attribute (clang::unsafe_buffer_usage)
+                      ^
+t.c:5:5: error: function-like macro '__has_cpp_attribute' is not defined
+#if __has_cpp_attribute (clang::unsafe_buffer_usage)
+    ^
+2 errors generated.
+
+- User: Iain Sandoe | Time: 2024-02-20 09:31:11 UTC
+  Text: (In reply to Iain Sandoe fromcomment #5)> perhaps this is also a clang regression - for Jakub's example with Xcode
+> 15.1 :(xcode clang, that is, I did not test with upstream clang yet).
+
+- User: Jakub Jelinek | Time: 2024-02-20 09:35:49 UTC
+  Text: Well, my testcase didn't have those
+#ifdef __has_c_attribute
+and likewise for __has_cpp_attribute guards.
+
+- User: Jakub Jelinek | Time: 2024-02-20 09:43:11 UTC
+  Text: Anyway,
+#ifdef __has_c_attribute
+#if __has_c_attribute (clang::unsafe_buffer_usage)
+int i;
+#endif
+#endif
+#ifdef __has_cpp_attribute
+#if __has_cpp_attribute (clang::unsafe_buffer_usage)
+int j;
+#endif
+#endif
+fails to preprocess with GCC from 5.1 till trunk with -std=c11 and fails with clang 6 - 16 as well, just clang 17+ accepts it (and obviously the old versions of the compiler don't predefine those macros).  So, if they care about portability, they should fix it.
+
+- User: Jakub Jelinek | Time: 2024-02-20 09:44:34 UTC
+  Text: Ah, but they accept the version with __has_cpp_attribute only.
+
+- User: Iain Sandoe | Time: 2024-02-20 10:01:51 UTC
+  Text: indeed, it seems clang does not define __has_cpp_attribute for -std=c11 c compilations, whereas GCC does.
+
+- User: Iain Sandoe | Time: 2024-02-20 10:12:00 UTC
+  Text: looking at n2176 - C18 there is no mention of __has_c*
+looking at n3047 - C23 there is mention only of __has_c_attribute
+
+OTOH, there is no prohibition in declaring __has_cpp_attribute (c.f. an actual prohibition in declaring __cplusplus).
+
+So, perhaps this is a GCC extension that should only be applied to -std=gnucxx?
+
+- User: Iain Sandoe | Time: 2024-02-20 12:04:49 UTC
+  Text: further the manual says:
+
+"The special operator __has_cpp_attribute (operand) may be used in ‘#if’ and ‘#elif’ expressions in C++ code to test whether the attribute referenced by its operand is recognized by GCC"
+
+Which seems to be explicit about the use in C++ code (which makes me suspect that the availability in C mode might be unintentional).
+
+Currently it seems that libcpp makes __has_cpp_attribute an alias for __has_attribute, whereas __has_c_attribute is considered separate in the enumerations.
+
+- User: Jakub Jelinek | Time: 2024-02-21 13:58:47 UTC
+  Text: Ah, the thing is that while in -std=gnu* modes or -std=c23 the preprocessor recognizes CPP_SCOPE as one token, in -std=c{89,99,11,17} modes it doesn't, :: are 2 CPP_COLONs.
+So, we could either:
+--- gcc/c-family/c-lex.cc.jj	2024-01-03 12:07:02.171734141 +0100
++++ gcc/c-family/c-lex.cc	2024-02-21 14:30:37.247945782 +0100
+@@ -357,7 +357,24 @@ c_common_has_attribute (cpp_reader *pfil
+       do
+ 	nxt_token = cpp_peek_token (pfile, idx++);
+       while (nxt_token->type == CPP_PADDING);
+-      if (nxt_token->type == CPP_SCOPE)
++      if (!c_dialect_cxx ()
++	  && flag_iso
++	  && !flag_isoc23
++	  && nxt_token->type == CPP_COLON)
++	{
++	  do
++	    nxt_token = cpp_peek_token (pfile, idx++);
++	  while (nxt_token->type == CPP_PADDING);
++	  if (nxt_token->type == CPP_COLON)
++	    {
++	      /* __has_attribute (vendor::attr) in -std=c17 etc. modes.
++		 :: isn't CPP_SCOPE in there and [[vendor::attr]] will
++		 not work, only [[__extension__ vendor::attr]].  */
++	      have_scope = true;
++	      get_token_no_padding (pfile); // Eat first colon.
++	    }
++	}
++      if (nxt_token->type == CPP_SCOPE || have_scope)
+ 	{
+ 	  have_scope = true;
+ 	  get_token_no_padding (pfile); // Eat scope.
+but then on testcase like:
+#if __has_c_attribute (gnu::unused)
+[[gnu::unused]]
+#endif
+int i;
+#if __has_cpp_attribute (gnu::unused)
+[[gnu::unused]]
+#endif
+int j;
+fails to compile with e.g -std=c11:pr114007.c:2:1: warning: ‘gnu’ attribute ignored [-Wattributes]
+    2 | [[gnu::unused]]
+      | ^pr114007.c:2:6: error: expected ‘]’ before ‘:’ token
+    2 | [[gnu::unused]]
+      |      ^
+      |      ]pr114007.c:6:1: warning: ‘gnu’ attribute ignored [-Wattributes]
+    6 | [[gnu::unused]]
+      | ^pr114007.c:6:6: error: expected ‘]’ before ‘:’ token
+    6 | [[gnu::unused]]
+      |      ^
+      |      ]
+or we could force always returning 0 from __has_attribute/__has_cpp_attribute in that case, like:
+--- gcc/c-family/c-lex.cc.jj	2024-01-03 12:07:02.171734141 +0100
++++ gcc/c-family/c-lex.cc	2024-02-21 14:41:33.768992572 +0100
+@@ -357,7 +357,33 @@ c_common_has_attribute (cpp_reader *pfil
+       do
+ 	nxt_token = cpp_peek_token (pfile, idx++);
+       while (nxt_token->type == CPP_PADDING);
+-      if (nxt_token->type == CPP_SCOPE)
++      if (!c_dialect_cxx ()
++	  && flag_iso
++	  && !flag_isoc23
++	  && nxt_token->type == CPP_COLON)
++	{
++	  do
++	    nxt_token = cpp_peek_token (pfile, idx++);
++	  while (nxt_token->type == CPP_PADDING);
++	  if (nxt_token->type == CPP_COLON)
++	    /* __has_attribute (vendor::attr) in -std=c17 etc. modes.
++	       :: isn't CPP_SCOPE in there but 2 CPP_COLON tokens.  */
++	    have_scope = true;
++	}
++      if (have_scope)
++	{
++	  /* [[vendor::attr]] will not work, only
++	     [[__extension__ vendor::attr]] will.  Better always return 0
++	     for scoped attributes.  */
++	  get_token_no_padding (pfile); // Eat first colon.
++	  get_token_no_padding (pfile); // Eat second colon.
++	  nxt_token = get_token_no_padding (pfile);
++	  if (nxt_token->type != CPP_NAME)
++	    cpp_error (pfile, CPP_DL_ERROR,
++		       "attribute identifier required after scope");
++	  attr_name = NULL_TREE;
++	}
++      else if (nxt_token->type == CPP_SCOPE)
+ 	{
+ 	  have_scope = true;
+ 	  get_token_no_padding (pfile); // Eat scope.
+The drawback of the second patch is that then users in -std=c{89,99,11,17} modes don't have a way to query whether a certain scoped attribute is supported in the preprocessor if they are aware that they need to use [[__extension__ vendor::attr]] rather then
+[[vendor::attr]].  On the other side, e.g. in -std=gnu11 -pedantic-errors compilation
+we give 1 for __has_c_attribute (gnu::unused), but it is still rejected, just with -std=c11 it is rejected even without -Wpedantic.
+
+Maybe instead of loose_scope_p we should be using flag_iso && !flag_isoc23 and
+accept [[vendor: :attr]] in the -std=c{89,99,11,17} modes too (with pedwarn for the [[]] use), and on the other side reject [[__extension__ vendor: :attr]] in -std=c23
+or -std=gnu{89,99,11,17} modes, so that people don't feel using 2 colons rather than a scope is correct.  And then perhaps go with the first patch rather than second.
+
+Joseph/Richard, your thoughts on this?
+
+- User: Richard Sandiford | Time: 2024-02-21 14:15:24 UTC
+  Text: I might have misunderstood the suggestion and so be arguing against something that no-one is suggesting, but I think [[__extension__ …]] should accept the same things for all standard versions (C23, pre-C23, and GNU).  It was intended to be something that header files and macros could use without needing to be sensitive to the user's choice of standard.
+
+- User: Jakub Jelinek | Time: 2024-02-21 14:26:07 UTC
+  Text: (In reply to Richard Sandiford fromcomment #14)> I might have misunderstood the suggestion and so be arguing against
+> something that no-one is suggesting, but I think [[__extension__ …]] should
+> accept the same things for all standard versions (C23, pre-C23, and GNU). 
+> It was intended to be something that header files and macros could use
+> without needing to be sensitive to the user's choice of standard.That is still the case of [[__extension__ arm::streaming]] and similar.
+The only thing in the suggestion that would be only sometimes allowed would be
+[[__extension__ arm: :streaming]]
+(or [[__extension__ arm:/**/:streaming]] etc.
+which I'd hope nobody is planning to use in the header files.
+Basically, with the flag_iso && !flag_isoc23 modes, :: is not one token but 2, and while we in some cases could look at location info if they are adjacent in the source, if column info isn't accurate (too long lines or too many lines) that information is lost.
+Or of course if you'd strongly like to accept [[__extension__ arm: :streaming]] in all language modes (but it won't be accepted in C++ anyway), I'd at least like to see accepting [[arm::streaming]] in the flag_iso && !flag_isoc23 modes (with the usual pedwarn).
+If we only wanted adjacent ::s and nothing in between, perhaps the preprocessor could set some flag on one of the CPP_COLONs (or both) if otherwise for CPP_OPTION (pfile, scope) it would be creating CPP_SCOPE, and check that flag during attribute and __has*attribute parsing?
+
+- User: Joseph S. Myers | Time: 2024-02-21 17:04:54 UTC
+  Text: I think it's clear that __has_c_attribute(gnu::unused) should only return 1 if the [[gnu::unused]] syntax is actually parsed. (An unavoidable limitation if it might return 1 in pre-C23 modes is that if it's used with -pedantic / -pedantic-errors, such a usage of [[gnu::unused]] would then be diagnosed - since another principle is that -pedantic / -pedantic-errors should not affect semantics, in particular not change the return value of __has_c_attribute.)
+
+I also think that __has_c_attribute(gnu::unused) should always parse successfully in #if, even if it returns 0 in some cases.
+
+It's probably reasonable to accept :: in [[]] attributes in pre-C23 standard modes where those are two consecutive : tokens (the use of the [[]] syntax at all would result in a pedwarn-if-pedantic).
+
+Ideally there might be a marker on the tokens as suggested to indicate whether two such tokens would have been :: if in C23 mode, to avoid accepting other variants where the two tokens are separated in the sources. (The only reason it's not valid to produce a single preprocessing token in pre-C23 mode is to deal with corner cases such as ##-concatenating < :: > where the concatenations are valid in pre-C23 mode, producing digraphs equivalent to [], but invalid in C23 mode. Once the preprocessing tokens are converted to tokens, pre-C23 doesn't have any valid cases of two consecutive : tokens.)
+
+- User: Jakub Jelinek | Time: 2024-02-21 18:29:24 UTC
+  Text: Createdattachment 57483[details]gcc14-pr114007.patch
+
+So far very lightly tested fix.
+The FEs only use 8-bit flags on tokens unlike libcpp, so we are fairly tight on the bits there, fortunately PURE_ZERO is only used by C++ FE (though, set for both C/C++) and additionally only on CPP_NUMBERs, so reusing the same bit on CPP_COLON tokens in C FE + libcpp only (and only before C23 in strict modes) is I think fine.
+Still, the JOIN2(:,:) case works in C23 or GNU modes but not in the old modes,
+but that is because it is a preprocessor error, trying to paste tokens into something which is not a valid preprocessing token.  I'm not afraid people would try to use that widely if they want < C23 compatibility of attributes.
+
+- User: ro@CeBiTec.Uni-Bielefeld.DE | Time: 2024-02-22 08:48:21 UTC
+  Text: > ---Comment #17from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> Createdattachment 57483[details]>   -->https://gcc.gnu.org/bugzilla/attachment.cgi?id=57483&action=edit> gcc14-pr114007.patch>> So far very lightly tested fix.Thanks a lot for the patch.  I've now re-bootstrapped trunk on macOS 14
+with it applied instead of the local (incomplete) <sys/cdefs.h>
+workaround.  With one unrelated exception
+
++FAIL: gcc.dg/framework-1.c (test for excess errors)
+
+test results with Xcode 15.1 and 15.3 beta 3 are now identical.
+
+- User: fxcoudert@gmail.com | Time: 2024-02-22 09:45:27 UTC
+  Text: Hi Rainer,> Thanks a lot for the patch.  I've now re-bootstrapped trunk on macOS 14
+> with it applied instead of the local (incomplete) <sys/cdefs.h>
+> workaround.I haven’t yet tested Xcode 13.3 myself, and have only followed the PRs from far away. Are there any issues (SDK, linker, or otherwise) that we need to report to Apple? Or that are already reported but we want taken more seriously?
+
+I can use my channel through Homebrew to get them to prioritise it to some extent. It’s probably too late for 13.3 at this point, but we should get it fixed anyway for later.
+
+FX
+
+- User: fxcoudert@gmail.com | Time: 2024-02-22 09:45:27 UTC
+  Text: Hi Rainer,> Thanks a lot for the patch.  I've now re-bootstrapped trunk on macOS 14
+> with it applied instead of the local (incomplete) <sys/cdefs.h>
+> workaround.I haven’t yet tested Xcode 13.3 myself, and have only followed the PRs from far away. Are there any issues (SDK, linker, or otherwise) that we need to report to Apple? Or that are already reported but we want taken more seriously?
+
+I can use my channel through Homebrew to get them to prioritise it to some extent. It’s probably too late for 13.3 at this point, but we should get it fixed anyway for later.
+
+FX
+
+- User: ro@CeBiTec.Uni-Bielefeld.DE | Time: 2024-02-22 09:50:17 UTC
+  Text: > ---Comment #19from fxcoudert at gmail dot com <fxcoudert at gmail dot com> ---
+> Hi Rainer,>>> Thanks a lot for the patch.  I've now re-bootstrapped trunk on macOS 14
+>> with it applied instead of the local (incomplete) <sys/cdefs.h>
+>> workaround.>> I haven’t yet tested Xcode 13.3 myself, and have only followed the PRs from far
+> away. Are there any issues (SDK, linker, or otherwise) that we need to report
+> to Apple? Or that are already reported but we want taken more seriously?>> I can use my channel through Homebrew to get them to prioritise it to some
+> extent. It’s probably too late for 13.3 at this point, but we should get it
+> fixed anyway for later.I don't think so (otherwise I'd hopefully done it myself already ;-)
+
+The only issue left (the gcc.dg/framework-1.c failure) so far seems to
+be an issue with gcc not setting include paths correctly for frameworks.
+
+- User: Iain Sandoe | Time: 2024-02-22 09:52:19 UTC
+  Text: (In reply toro@CeBiTec.Uni-Bielefeld.DEfromcomment #21)> > ---Comment #19from fxcoudert at gmail dot com <fxcoudert at gmail dot com> ---> The only issue left (the gcc.dg/framework-1.c failure) so far seems to
+> be an issue with gcc not setting include paths correctly for frameworks.Please raise a separate BZ for that - it's a bit surprising (I would have expected more fails if that was not working).
+
+- User: ro@CeBiTec.Uni-Bielefeld.DE | Time: 2024-02-22 09:58:10 UTC
+  Text: > ---Comment #22from Iain Sandoe <iains at gcc dot gnu.org> ---
+> (In reply toro@CeBiTec.Uni-Bielefeld.DEfromcomment #21)
+>> > ---Comment #19from fxcoudert at gmail dot com <fxcoudert at gmail dot
+>> com> --->
+>>> The only issue left (the gcc.dg/framework-1.c failure) so far seems to
+>> be an issue with gcc not setting include paths correctly for frameworks.>> Please raise a separate BZ for that - it's a bit surprising (I would have
+> expected more fails if that was not working).Done now:PR target/114049, gcc.dg/framework-1.c FAILs with Xcode 15.3 beta 3.
+
+- User: Jakub Jelinek | Time: 2024-02-22 10:22:14 UTC
+  Text: (In reply tofxcoudert@gmail.comfromcomment #19)> I haven’t yet tested Xcode 13.3 myself, and have only followed the PRs from
+> far away. Are there any issues (SDK, linker, or otherwise) that we need to
+> report to Apple? Or that are already reported but we want taken more
+> seriously?Do they use [[clang::unsafe_buffer_usage]] then if __has_safe_buffers is defined
+even in -std=c11 etc. modes in the headers?
+Even clang errors on [[clang::unsafe_buffer_usage]] with -std=c11 -pedantic-errors...
+Though, guess not an issue for GCC itself, because if the parsing of __has_cpp_attribute is fixed, then GCC definitely will not yield 1 for clang::unsafe_buffer_usage attribute...
+
+- User: ro@CeBiTec.Uni-Bielefeld.DE | Time: 2024-02-22 10:31:23 UTC
+  Text: > ---Comment #24from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> (In reply tofxcoudert@gmail.comfromcomment #19)
+>> I haven’t yet tested Xcode 13.3 myself, and have only followed the PRs from
+>> far away. Are there any issues (SDK, linker, or otherwise) that we need to
+>> report to Apple? Or that are already reported but we want taken more
+>> seriously?>> Do they use [[clang::unsafe_buffer_usage]] then if __has_safe_buffers is
+> defined
+> even in -std=c11 etc. modes in the headers?they do AFAICS: their <sys/cdefs.h> has no provision for different C std
+versions (except the obvious like not using restrict before C99).
+
+The section in question is
+
+#if __has_cpp_attribute(clang::unsafe_buffer_usage)
+#define __has_safe_buffers 1
+#define __unsafe_buffer_usage [[clang::unsafe_buffer_usage]]
+#elif __has_attribute(unsafe_buffer_usage)
+#define __has_safe_buffers 1
+#define __unsafe_buffer_usage __attribute__((__unsafe_buffer_usage__))
+#else
+#define __has_safe_buffers 0
+#define __unsafe_buffer_usage
+#endif
+
+with a long comment explaining the use with clang -Wunsafe-buffer-usage.
+
+- User: Iain Sandoe | Time: 2024-02-22 10:34:43 UTC
+  Text: but from your initial post it's also guarded by:
+
+#ifndef __has_cpp_attribute
+#define __has_cpp_attribute(x) 0
+#endif
+
+so it will always be 0 for clang in C mode, since that does not define __has_cpp_attribute
+
+- User: GCC Commits | Time: 2024-02-22 18:33:47 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:37127ed975e09813eaa2d1cf1062055fce45dd16commitr14-9139-g37127ed975e09813eaa2d1cf1062055fce45dd16Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Feb 22 19:32:02 2024 +0100
+
+    c: Handle scoped attributes in __has*attribute and scoped attribute parsing changes in -std=c11 etc. modes [PR114007]
+    
+    We aren't able to parse __has_attribute (vendor::attr) (and __has_c_attribute
+    and __has_cpp_attribute) in strict C < C23 modes.  While in -std=gnu* modes
+    or in -std=c23 there is CPP_SCOPE token, in -std=c* (except for -std=c23)
+    there are is just a pair of CPP_COLON tokens.
+    The c-lex.cc hunk adds support for that.
+    
+    That leads to a question if we should return 1 or 0 from
+    __has_attribute (gnu::unused) or not, because while
+    [[gnu::unused]] is parsed fine in -std=gnu*/-std=c23 modes (sure, with
+    pedwarn for < C23), we do not parse it at all in -std=c* (except for
+    -std=c23), we only parse [[__extension__ gnu::unused]] there.  While
+    the __extension__ in there helps to avoid the pedwarn, I think it is
+    better to be consistent between GNU and strict C < C23 modes and
+    parse [[gnu::unused]] too; on the other side, I think parsing
+    [[__extension__ gnu : : unused]] is too weird and undesirable.
+    
+    So, the following patch adds a flag during preprocessing at the point
+    where we normally create CPP_SCOPE tokens out of 2 consecutive colons
+    on the first CPP_COLON to mark the consecutive case (as we are tight
+    on the bits, I've reused the PURE_ZERO flag, which is used just by the
+    C++ FE and only ever set (both C and C++) on CPP_NUMBER tokens, this
+    new flag has the same value and is only ever used on CPP_COLON tokens)
+    and instead of checking loose_scope_p argument (i.e. whether it is
+    [[__extension__ ...]] or not), it just parses CPP_SCOPE or CPP_COLON
+    with CLONE_SCOPE flag followed by another CPP_COLON the same.
+    The latter will never appear in >= C23 or -std=gnu* modes, though
+    guarding its use say with flag_iso && !flag_isoc23 && doesn't really
+    work because the __extension__ case temporarily clears flag_iso flag.
+    
+    This makes the -std=c11 etc. behavior more similar to -std=gnu11 or
+    -std=c23, the only difference I'm aware of are the
+     #define JOIN2(A, B) A##B
+     [[vendor JOIN2(:,:) attr]]
+     [[__extension__ vendor JOIN2(:,:) attr]]
+    cases, which are accepted in the latter modes, but results in error
+    in -std=c11; but the error is during preprocessing that :: doesn't
+    form a valid preprocessing token, which is true, so just don't do that if
+    you try to have __STRICT_ANSI__ && __STDC_VERSION__ <= 201710L
+    compatibility.
+    
+    2024-02-22  Jakub Jelinek  <jakub@redhat.com>PR c/114007gcc/
+            * doc/extend.texi: (__extension__): Remove comments about scope
+            tokens vs. two colons.
+    gcc/c-family/
+            * c-lex.cc (c_common_has_attribute): Parse 2 CPP_COLONs with
+            the first one with COLON_SCOPE flag the same as CPP_SCOPE.
+    gcc/c/
+            * c-parser.cc (c_parser_std_attribute): Remove loose_scope_p argument.
+            Instead of checking it, parse 2 CPP_COLONs with the first one with
+            COLON_SCOPE flag the same as CPP_SCOPE.
+            (c_parser_std_attribute_list): Remove loose_scope_p argument, don't
+            pass it to c_parser_std_attribute.
+            (c_parser_std_attribute_specifier): Adjust c_parser_std_attribute_list
+            caller.
+    gcc/testsuite/
+            * gcc.dg/c23-attr-syntax-6.c: Adjust testcase for :: being valid
+            even in -std=c11 even without __extension__ and : : etc. not being
+            valid anymore even with __extension__.
+            * gcc.dg/c23-attr-syntax-7.c: Likewise.
+            * gcc.dg/c23-attr-syntax-8.c: New test.
+    libcpp/
+            * include/cpplib.h (COLON_SCOPE): Define to PURE_ZERO.
+            * lex.cc (_cpp_lex_direct): When lexing CPP_COLON with another
+            colon after it, if !CPP_OPTION (pfile, scope) set COLON_SCOPE
+            flag on the first CPP_COLON token.
+
+- User: Jakub Jelinek | Time: 2024-02-22 18:34:15 UTC
+  Text: Fixed.
+
+- User: GCC Commits | Time: 2024-03-02 00:39:05 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:051cd2a3ee9ba9f47d640a10e96c79b6c5124736commitr13-8392-g051cd2a3ee9ba9f47d640a10e96c79b6c5124736Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Feb 22 19:32:02 2024 +0100
+
+    c: Handle scoped attributes in __has*attribute and scoped attribute parsing changes in -std=c11 etc. modes [PR114007]
+    
+    We aren't able to parse __has_attribute (vendor::attr) (and __has_c_attribute
+    and __has_cpp_attribute) in strict C < C23 modes.  While in -std=gnu* modes
+    or in -std=c23 there is CPP_SCOPE token, in -std=c* (except for -std=c23)
+    there are is just a pair of CPP_COLON tokens.
+    The c-lex.cc hunk adds support for that, but always returns 0 in that case
+    unlike the GCC 14+ version.
+    
+    2024-02-22  Jakub Jelinek  <jakub@redhat.com>PR c/114007gcc/c-family/
+            * c-lex.cc (c_common_has_attribute): Parse 2 CPP_COLONs with
+            the first one with COLON_SCOPE flag the same as CPP_SCOPE but
+            ensure 0 is returned then.
+    gcc/testsuite/
+            * gcc.dg/c23-attr-syntax-8.c: New test.
+    libcpp/
+            * include/cpplib.h (COLON_SCOPE): Define to PURE_ZERO.
+            * lex.cc (_cpp_lex_direct): When lexing CPP_COLON with another
+            colon after it, if !CPP_OPTION (pfile, scope) set COLON_SCOPE
+            flag on the first CPP_COLON token.
+    
+    (cherry picked from commit 37127ed975e09813eaa2d1cf1062055fce45dd16)
+
+- User: Jakub Jelinek | Time: 2024-03-04 12:10:29 UTC
+  Text: Should be now fixed for GCC 13.3+ too, though in that case I've committed a simplified version, which just parses the adjacent :: in __has_*attribute argument, but yields in that case 0 in the strict pre-C23 modes, while [[vendor::attr]] is rejected there.
+
+- User: GCC Commits | Time: 2024-06-11 10:37:11 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:c2cd5eefccf54074ea9f8dc677a9a05b8a880ae4commitr12-10512-gc2cd5eefccf54074ea9f8dc677a9a05b8a880ae4Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Feb 22 19:32:02 2024 +0100
+
+    c: Handle scoped attributes in __has*attribute and scoped attribute parsing changes in -std=c11 etc. modes [PR114007]
+    
+    We aren't able to parse __has_attribute (vendor::attr) (and __has_c_attribute
+    and __has_cpp_attribute) in strict C < C23 modes.  While in -std=gnu* modes
+    or in -std=c23 there is CPP_SCOPE token, in -std=c* (except for -std=c23)
+    there are is just a pair of CPP_COLON tokens.
+    The c-lex.cc hunk adds support for that, but always returns 0 in that case
+    unlike the GCC 14+ version.
+    
+    2024-02-22  Jakub Jelinek  <jakub@redhat.com>PR c/114007gcc/c-family/
+            * c-lex.cc (c_common_has_attribute): Parse 2 CPP_COLONs with
+            the first one with COLON_SCOPE flag the same as CPP_SCOPE but
+            ensure 0 is returned then.
+    gcc/testsuite/
+            * gcc.dg/c23-attr-syntax-8.c: New test.
+    libcpp/
+            * include/cpplib.h (COLON_SCOPE): Define to PURE_ZERO.
+            * lex.cc (_cpp_lex_direct): When lexing CPP_COLON with another
+            colon after it, if !CPP_OPTION (pfile, scope) set COLON_SCOPE
+            flag on the first CPP_COLON token.
+    
+    (cherry picked from commit 37127ed975e09813eaa2d1cf1062055fce45dd16)
+
+- User: Jakub Jelinek | Time: 2024-06-11 10:50:47 UTC
+  Text: Should be fixed for 12.4+ too (the same way as for 13.3).
+
+- User: GCC Commits | Time: 2024-06-20 13:22:21 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d241835c8f47031259280930449a3ba4d8eb8eeacommitr11-11495-gd241835c8f47031259280930449a3ba4d8eb8eeaAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Feb 22 19:32:02 2024 +0100
+
+    c: Handle scoped attributes in __has*attribute and scoped attribute parsing changes in -std=c11 etc. modes [PR114007]
+    
+    We aren't able to parse __has_attribute (vendor::attr) (and __has_c_attribute
+    and __has_cpp_attribute) in strict C < C23 modes.  While in -std=gnu* modes
+    or in -std=c23 there is CPP_SCOPE token, in -std=c* (except for -std=c23)
+    there are is just a pair of CPP_COLON tokens.
+    The c-lex.cc hunk adds support for that, but always returns 0 in that case
+    unlike the GCC 14+ version.
+    
+    2024-02-22  Jakub Jelinek  <jakub@redhat.com>PR c/114007gcc/c-family/
+            * c-lex.c (c_common_has_attribute): Parse 2 CPP_COLONs with
+            the first one with COLON_SCOPE flag the same as CPP_SCOPE but
+            ensure 0 is returned then.
+    gcc/testsuite/
+            * gcc.dg/c23-attr-syntax-8.c: New test.
+    libcpp/
+            * include/cpplib.h (COLON_SCOPE): Define to PURE_ZERO.
+            * lex.c (_cpp_lex_direct): When lexing CPP_COLON with another
+            colon after it, if !CPP_OPTION (pfile, scope) set COLON_SCOPE
+            flag on the first CPP_COLON token.
+    
+    (cherry picked from commit 37127ed975e09813eaa2d1cf1062055fce45dd16)
+

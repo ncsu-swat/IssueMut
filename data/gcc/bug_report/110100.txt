@@ -1,0 +1,170 @@
+Bug Summary: __builtin_aarch64_st64b stores to the wrong address
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: patch, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Ian Thompson | Time: 2023-06-02 22:18:14 UTC
+  Text: Createdattachment 55247[details]Preprocessed reproduction, compile with "aarch64-none-elf-gcc -march=armv8.7-a -c"
+
+On aarch64, the __arm_st64b function (which is just a thin wrapper around __builtin_aarch64_st64b) produces incorrect code which uses an uninitialized register as the address for an ST64B store instruction.
+
+A full preprocessed file is attached, but this snippet is sufficient to reproduce:
+
+#include <arm_acle.h>
+void do_st64b(data512_t data) {
+    __arm_st64b((void*)0x10000000, data);
+}
+
+Compiling with "aarch64-none-elf-gcc -O2 -march=armv8.7-a", I get the following assembly snippet:
+
+do_st64b:
+        ldp     x8, x9, [x0]
+        ldp     x10, x11, [x0, 16]
+        ldp     x12, x13, [x0, 32]
+        ldp     x14, x15, [x0, 48]
+        st64b   x8, [x1]
+        ret
+
+Notice that the st64b instruction uses the uninitialized register x1 as an address, and the constant 0x10000000 is not loaded. I turned optimizations on to keep the assembly small, but the same issue also occurs without optimizations.
+
+Digging a bit into aarch64-builtins.cc, it seems like AARCH64_LS64_BUILTIN_ST64B incorrectly declares the address register an output instead of an input, leading to the uninitialized register seen above.
+
+The builtins for LD64B, ST64BV, and ST64BV0 appear to be fine, it's just ST64B which has this issue.
+
+Initially discovered on Arm's build of the toolchain, but I can also reproduce on trunk and an official 13.1.0 release:
+aarch64-none-elf-gcc (Arm GNU Toolchain 12.2.Rel1 (Build arm-12.24)) 12.2.1 20221205
+
+- User: Andrew Pinski | Time: 2023-06-02 22:28:22 UTC
+  Text: Confirmed, you can get the similar wrong code with just:
+#include <arm_acle.h>
+void do_st64b(int *a, data512_t data) {
+    __arm_st64b((void*)(a+512), data);
+}
+
+- User: Alex Coplan | Time: 2023-06-06 09:43:54 UTC
+  Text: Testing a fix.
+
+- User: GCC Commits | Time: 2023-06-07 16:45:50 UTC
+  Text: The master branch has been updated by Alex Coplan <acoplan@gcc.gnu.org>:https://gcc.gnu.org/g:713613541254039a34e1dd8fd4a613a299af1fd6commitr14-1615-g713613541254039a34e1dd8fd4a613a299af1fd6Author: Alex Coplan <alex.coplan@arm.com>
+Date:   Tue Jun 6 11:04:45 2023 +0100
+
+    aarch64: Fix whitespace in ls64 builtin implementation [PR110100]
+    
+    The ls64 builtin code was using incorrect GNU style with eight spaces where
+    there should be a tab. Fixed thusly.
+    
+    gcc/ChangeLog:PR target/110100* config/aarch64/aarch64-builtins.cc (aarch64_init_ls64_builtins_types):
+            Replace eight consecutive spaces with tabs.
+            (aarch64_init_ls64_builtins): Likewise.
+            (aarch64_expand_builtin_ls64): Likewise.
+            * config/aarch64/aarch64.md (ld64b): Likewise.
+            (st64b): Likewise.
+            (st64bv): Likewise
+            (st64bv0): Likewise.
+
+- User: GCC Commits | Time: 2023-06-07 16:45:55 UTC
+  Text: The master branch has been updated by Alex Coplan <acoplan@gcc.gnu.org>:https://gcc.gnu.org/g:737a0b749a7bc3e7cb904ea2d4b18dc130514b85commitr14-1616-g737a0b749a7bc3e7cb904ea2d4b18dc130514b85Author: Alex Coplan <alex.coplan@arm.com>
+Date:   Tue Jun 6 11:52:19 2023 +0100
+
+    aarch64: Fix wrong code with st64b builtin [PR110100]
+    
+    The st64b pattern incorrectly had an output constraint on the register
+    operand containing the destination address for the store, leading to
+    wrong code. This patch fixes that.
+    
+    gcc/ChangeLog:PR target/110100* config/aarch64/aarch64-builtins.cc (aarch64_expand_builtin_ls64):
+            Use input operand for the destination address.
+            * config/aarch64/aarch64.md (st64b): Fix constraint on address
+            operand.
+    
+    gcc/testsuite/ChangeLog:PR target/110100* gcc.target/aarch64/acle/pr110100.c: New test.
+
+- User: Alex Coplan | Time: 2023-06-07 16:48:42 UTC
+  Text: Fixed on trunk for GCC 14, keeping open for backports (I think we need this back to GCC 12).
+
+- User: GCC Commits | Time: 2023-06-20 21:22:40 UTC
+  Text: The releases/gcc-13 branch has been updated by Alex Coplan <acoplan@gcc.gnu.org>:https://gcc.gnu.org/g:ff00fa1914e42d6b9c45cb36a5c99f94c4133cbacommitr13-7460-gff00fa1914e42d6b9c45cb36a5c99f94c4133cbaAuthor: Alex Coplan <alex.coplan@arm.com>
+Date:   Tue Jun 6 11:04:45 2023 +0100
+
+    aarch64: Fix whitespace in ls64 builtin implementation [PR110100]
+    
+    The ls64 builtin code was using incorrect GNU style with eight spaces where
+    there should be a tab. Fixed thusly.
+    
+    gcc/ChangeLog:PR target/110100* config/aarch64/aarch64-builtins.cc (aarch64_init_ls64_builtins_types):
+            Replace eight consecutive spaces with tabs.
+            (aarch64_init_ls64_builtins): Likewise.
+            (aarch64_expand_builtin_ls64): Likewise.
+            * config/aarch64/aarch64.md (ld64b): Likewise.
+            (st64b): Likewise.
+            (st64bv): Likewise
+            (st64bv0): Likewise.
+    
+    (cherry picked from commit 713613541254039a34e1dd8fd4a613a299af1fd6)
+
+- User: GCC Commits | Time: 2023-06-20 21:22:45 UTC
+  Text: The releases/gcc-13 branch has been updated by Alex Coplan <acoplan@gcc.gnu.org>:https://gcc.gnu.org/g:9df688cbf908adc43e92bd012dafa88680ea11dccommitr13-7461-g9df688cbf908adc43e92bd012dafa88680ea11dcAuthor: Alex Coplan <alex.coplan@arm.com>
+Date:   Tue Jun 6 11:52:19 2023 +0100
+
+    aarch64: Fix wrong code with st64b builtin [PR110100]
+    
+    The st64b pattern incorrectly had an output constraint on the register
+    operand containing the destination address for the store, leading to
+    wrong code. This patch fixes that.
+    
+    gcc/ChangeLog:PR target/110100* config/aarch64/aarch64-builtins.cc (aarch64_expand_builtin_ls64):
+            Use input operand for the destination address.
+            * config/aarch64/aarch64.md (st64b): Fix constraint on address
+            operand.
+    
+    gcc/testsuite/ChangeLog:PR target/110100* gcc.target/aarch64/acle/pr110100.c: New test.
+    
+    (cherry picked from commit 737a0b749a7bc3e7cb904ea2d4b18dc130514b85)
+
+- User: GCC Commits | Time: 2023-06-22 10:19:42 UTC
+  Text: The releases/gcc-12 branch has been updated by Alex Coplan <acoplan@gcc.gnu.org>:https://gcc.gnu.org/g:c0ab0d4af51382d9d8d4e6b026865842d8e06d7ecommitr12-9718-gc0ab0d4af51382d9d8d4e6b026865842d8e06d7eAuthor: Alex Coplan <alex.coplan@arm.com>
+Date:   Tue Jun 6 11:04:45 2023 +0100
+
+    aarch64: Fix whitespace in ls64 builtin implementation [PR110100]
+    
+    The ls64 builtin code was using incorrect GNU style with eight spaces where
+    there should be a tab. Fixed thusly.
+    
+    gcc/ChangeLog:PR target/110100* config/aarch64/aarch64-builtins.cc (aarch64_init_ls64_builtins_types):
+            Replace eight consecutive spaces with tabs.
+            (aarch64_init_ls64_builtins): Likewise.
+            (aarch64_expand_builtin_ls64): Likewise.
+            * config/aarch64/aarch64.md (ld64b): Likewise.
+            (st64b): Likewise.
+            (st64bv): Likewise
+            (st64bv0): Likewise.
+    
+    (cherry picked from commit 713613541254039a34e1dd8fd4a613a299af1fd6)
+
+- User: GCC Commits | Time: 2023-06-22 10:19:47 UTC
+  Text: The releases/gcc-12 branch has been updated by Alex Coplan <acoplan@gcc.gnu.org>:https://gcc.gnu.org/g:0112ed013847ca9dbef4ba21f1c3f94c5bbe310bcommitr12-9719-g0112ed013847ca9dbef4ba21f1c3f94c5bbe310bAuthor: Alex Coplan <alex.coplan@arm.com>
+Date:   Tue Jun 6 11:52:19 2023 +0100
+
+    aarch64: Fix wrong code with st64b builtin [PR110100]
+    
+    The st64b pattern incorrectly had an output constraint on the register
+    operand containing the destination address for the store, leading to
+    wrong code. This patch fixes that.
+    
+    gcc/ChangeLog:PR target/110100* config/aarch64/aarch64-builtins.cc (aarch64_expand_builtin_ls64):
+            Use input operand for the destination address.
+            * config/aarch64/aarch64.md (st64b): Fix constraint on address
+            operand.
+    
+    gcc/testsuite/ChangeLog:PR target/110100* gcc.target/aarch64/acle/pr110100.c: New test.
+    
+    (cherry picked from commit 737a0b749a7bc3e7cb904ea2d4b18dc130514b85)
+
+- User: Alex Coplan | Time: 2023-06-22 10:20:53 UTC
+  Text: Should be fixed on all affected branches, thanks for the report.
+

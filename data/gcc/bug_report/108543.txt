@@ -1,0 +1,166 @@
+Bug Summary: [10/11 Regression] ICE in build_call_expr_loc_array, at tree.cc:10686
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: G. Steinmetz | Time: 2023-01-25 17:47:54 UTC
+  Text: Started with r8 :
+
+
+$ cat z1.cc
+#include <vector>
+
+
+$ g++-13-20230122 -c z1.cc -fsanitize=address -fno-sanitize=kernel-address -fsanitize=pointer-subtract
+In file included from .../gcc-13-20230122/include/c++/13.0.1/vector:67,
+                 from z1.cc:1:
+.../gcc-13-20230122/include/c++/13.0.1/bits/stl_bvector.h: In function 'std::ptrdiff_t std::operator-(const _Bit_iterator_base&, const _Bit_iterator_base&)':
+.../gcc-13-20230122/include/c++/13.0.1/bits/stl_bvector.h:269:50: internal compiler error: Segmentation fault
+  269 |       return (int(_S_word_bit) * (__x._M_p - __y._M_p)
+      |                                                  ^~~~
+0xeb575f crash_signal
+        ../../gcc/toplev.cc:314
+0x114833e build_call_expr_loc_array(unsigned int, tree_node*, int, tree_node**)
+        ../../gcc/tree.cc:10686
+0x114842f build_call_expr_loc(unsigned int, tree_node*, int, ...)
+        ../../gcc/tree.cc:10719
+0x98b393 pointer_diff
+        ../../gcc/cp/typeck.cc:6728
+0x98b393 cp_build_binary_op(op_location_t const&, tree_code, tree_node*, tree_node*, int)
+        ../../gcc/cp/typeck.cc:5350
+0x7c8c8c build_new_op(op_location_t const&, tree_code, int, tree_node*, tree_node*, tree_node*, tree_node*, tree_node**, int)
+        ../../gcc/cp/call.cc:7369
+0x97de10 build_x_binary_op(op_location_t const&, tree_code, tree_node*, tree_code, tree_node*, tree_code, tree_node*, tree_node**, int)
+        ../../gcc/cp/typeck.cc:4722
+0x8d16e3 cp_parser_binary_expression
+        ../../gcc/cp/parser.cc:10283
+0x8d1eb4 cp_parser_assignment_expression
+        ../../gcc/cp/parser.cc:10444
+0x8d35f2 cp_parser_expression
+        ../../gcc/cp/parser.cc:10614
+0x8e50c1 cp_parser_primary_expression
+        ../../gcc/cp/parser.cc:5722
+0x8e8a76 cp_parser_postfix_expression
+        ../../gcc/cp/parser.cc:7731
+0x8fbfff cp_parser_unary_expression
+        ../../gcc/cp/parser.cc:9095
+0x8d0bff cp_parser_cast_expression
+        ../../gcc/cp/parser.cc:9999
+0x8d190c cp_parser_simple_cast_expression
+        ../../gcc/cp/parser.cc:32523
+0x8d190c cp_parser_binary_expression
+        ../../gcc/cp/parser.cc:10168
+0x8d1eb4 cp_parser_assignment_expression
+        ../../gcc/cp/parser.cc:10444
+0x8d35f2 cp_parser_expression
+        ../../gcc/cp/parser.cc:10614
+0x8e50c1 cp_parser_primary_expression
+        ../../gcc/cp/parser.cc:5722
+0x8e8a76 cp_parser_postfix_expression
+        ../../gcc/cp/parser.cc:7731
+
+- User: Marek Polacek | Time: 2023-01-25 18:30:58 UTC
+  Text: Confirmed, reducing...
+
+- User: Marek Polacek | Time: 2023-01-25 18:46:49 UTC
+  Text: struct _Bit_iterator_base {
+  long _M_p;
+  friend bool operator<(_Bit_iterator_base __x, _Bit_iterator_base __y) {
+    return &__x._M_p - &__y._M_p;
+  }
+};
+
+- User: Marek Polacek | Time: 2023-01-25 18:49:37 UTC
+  Text: Started withr255404.
+
+- User: Marek Polacek | Time: 2023-01-25 19:27:36 UTC
+  Text: I have a fix.
+
+- User: GCC Commits | Time: 2023-01-26 17:59:47 UTC
+  Text: The trunk branch has been updated by Marek Polacek <mpolacek@gcc.gnu.org>:https://gcc.gnu.org/g:a82ce9c8d155ecda2d1c647d5c588f29e21ef4a3commitr13-5399-ga82ce9c8d155ecda2d1c647d5c588f29e21ef4a3Author: Marek Polacek <polacek@redhat.com>
+Date:   Wed Jan 25 17:19:54 2023 -0500
+
+    opts: SANITIZE_ADDRESS wrongly cleared [PR108543]
+    
+    Here we crash on a null fndecl ultimately because we haven't defined
+    the built-ins described in sanitizer.def.  So
+    builtin_decl_explicit (BUILT_IN_ASAN_POINTER_SUBTRACT);
+    returns NULL_TREE, causing an ICE later.
+    
+    DEF_SANITIZER_BUILTIN only actually defines the built-ins when flag_sanitize
+    has SANITIZE_ADDRESS, or some of the other SANITIZE_*, but it doesn't check
+    SANITIZE_KERNEL_ADDRESS or SANITIZE_USER_ADDRESS.  Unfortunately, with
+    -fsanitize=address -fno-sanitize=kernel-address
+    or
+    -fsanitize=kernel-address -fno-sanitize=address
+    SANITIZE_ADDRESS ends up being unset from flag_sanitize even though
+    _USER/_KERNEL are set.  That's because -fsanitize=address means
+    SANITIZE_ADDRESS | SANITIZE_USER_ADDRESS and -fsanitize=kernel-address
+    is SANITIZE_ADDRESS | SANITIZE_KERNEL_ADDRESS but parse_sanitizer_options
+    does
+      flags &= ~sanitizer_opts[i].flag;
+    so the subsequent -fno- unsets SANITIZE_ADDRESS.  Then no sanitizer
+    built-ins are actually defined.
+    
+    I'm not sure why SANITIZE_ADDRESS isn't just SANITIZE_USER_ADDRESS |
+    SANITIZE_KERNEL_ADDRESS, I don't think we need 3 bits.PR middle-end/108543gcc/ChangeLog:
+    
+            * opts.cc (parse_sanitizer_options): Don't always clear SANITIZE_ADDRESS
+            if it was previously set.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/asan/pointer-subtract-5.c: New test.
+            * c-c++-common/asan/pointer-subtract-6.c: New test.
+            * c-c++-common/asan/pointer-subtract-7.c: New test.
+            * c-c++-common/asan/pointer-subtract-8.c: New test.
+
+- User: GCC Commits | Time: 2023-01-26 18:39:38 UTC
+  Text: The releases/gcc-12 branch has been updated by Marek Polacek <mpolacek@gcc.gnu.org>:https://gcc.gnu.org/g:786923f74d6adfaf572f3d7c0307c51c522567f9commitr12-9071-g786923f74d6adfaf572f3d7c0307c51c522567f9Author: Marek Polacek <polacek@redhat.com>
+Date:   Wed Jan 25 17:19:54 2023 -0500
+
+    opts: SANITIZE_ADDRESS wrongly cleared [PR108543]
+    
+    Here we crash on a null fndecl ultimately because we haven't defined
+    the built-ins described in sanitizer.def.  So
+    builtin_decl_explicit (BUILT_IN_ASAN_POINTER_SUBTRACT);
+    returns NULL_TREE, causing an ICE later.
+    
+    DEF_SANITIZER_BUILTIN only actually defines the built-ins when flag_sanitize
+    has SANITIZE_ADDRESS, or some of the other SANITIZE_*, but it doesn't check
+    SANITIZE_KERNEL_ADDRESS or SANITIZE_USER_ADDRESS.  Unfortunately, with
+    -fsanitize=address -fno-sanitize=kernel-address
+    or
+    -fsanitize=kernel-address -fno-sanitize=address
+    SANITIZE_ADDRESS ends up being unset from flag_sanitize even though
+    _USER/_KERNEL are set.  That's because -fsanitize=address means
+    SANITIZE_ADDRESS | SANITIZE_USER_ADDRESS and -fsanitize=kernel-address
+    is SANITIZE_ADDRESS | SANITIZE_KERNEL_ADDRESS but parse_sanitizer_options
+    does
+      flags &= ~sanitizer_opts[i].flag;
+    so the subsequent -fno- unsets SANITIZE_ADDRESS.  Then no sanitizer
+    built-ins are actually defined.
+    
+    I'm not sure why SANITIZE_ADDRESS isn't just SANITIZE_USER_ADDRESS |
+    SANITIZE_KERNEL_ADDRESS, I don't think we need 3 bits.PR middle-end/108543gcc/ChangeLog:
+    
+            * opts.cc (parse_sanitizer_options): Don't always clear SANITIZE_ADDRESS
+            if it was previously set.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/asan/pointer-subtract-5.c: New test.
+            * c-c++-common/asan/pointer-subtract-6.c: New test.
+            * c-c++-common/asan/pointer-subtract-7.c: New test.
+            * c-c++-common/asan/pointer-subtract-8.c: New test.
+    
+    (cherry picked from commit a82ce9c8d155ecda2d1c647d5c588f29e21ef4a3)
+
+- User: Marek Polacek | Time: 2023-01-26 18:46:26 UTC
+  Text: Fixed.
+

@@ -1,0 +1,174 @@
+Bug Summary: [11 Regression] restrict qualifier causes extra debug info to happen
+Product: gcc
+Component: debug
+
+  (show other bugs)
+Keywords: 
+Known to Work: 12.3.1, 13.2.1, 14.0, 4.9.1
+Known to Fail: 12.3.0, 13.2.0, 5.1.0
+
+Comments:
+- User: N/A | Time: 2023-08-20 09:19:01 UTC
+  Text: The the following code example, debug information is retained for `struct foo` even though that structure doesn't end up used:
+
+Compile as `gcc -g -S -o - in.c | grep field_number`
+
+```
+struct foo {
+	int field_number_1;
+	int field_number_2;
+	int field_number_3;
+	int field_number_4;
+	int field_number_5;
+};
+
+typedef int fun_t(struct foo *restrict);
+
+int main() {
+	return 0;
+}
+```
+
+Output:
+gcc -g -S -o - test.c | grep field_number
+        .ascii "field_number_1\0"
+        .ascii "field_number_2\0"
+        .ascii "field_number_3\0"
+        .ascii "field_number_4\0"
+        .ascii "field_number_5\0"
+
+
+
+When removing the `restrict` qualifier in the parameter of `funptr_t`, debug information is not included in the produced assembly (as one would expect).
+
+Here is a list of different declarations and where `struct foo` is leaked in gcc 12.1.0:> typedef int fun_t(struct foo *restrict);    // Leak
+> typedef int fun_t(struct foo *);            // No leak
+> typedef int (*fun_t)(struct foo *restrict); // Leak
+> typedef int (*fun_t)(struct foo *);         // No leak
+> extern int fun_t(struct foo *restrict);     // No leak
+> extern int fun_t(struct foo *);             // No leak
+> extern int (*fun_t)(struct foo *restrict);  // Leak
+> extern int (*fun_t)(struct foo *);          // No leak
+> static int fun_t(struct foo *restrict);     // No leak
+> static int fun_t(struct foo *);             // No leak
+> static int (*fun_t)(struct foo *restrict);  // Leak
+> static int (*fun_t)(struct foo *);          // Leak (even w/o restrict!)
+> int fun_t(struct foo *restrict);            // No leak
+> int fun_t(struct foo *);                    // No leak
+> int (*fun_t)(struct foo *restrict);         // Leak
+> int (*fun_t)(struct foo *);                 // Leak (even w/o restrict!)There is no difference when using `__restrict` or `__restrict__` instead.
+
+- User: Andrew Pinski | Time: 2023-08-20 09:24:58 UTC
+  Text: > static int (*fun_t)(struct foo *);          // Leak (even w/o restrict!)
+> int (*fun_t)(struct foo *);                 // Leak (even w/o restrict!)The above should include the foo debug information as those are variable definitions of a pointer to a function that has foo as an argument type.
+
+- User: N/A | Time: 2023-08-20 09:34:27 UTC
+  Text: @Andrew Pinski
+
+Of course: yes. I did make a mistake there, but only for this case:> int (*fun_t)(struct foo *);                 // Leak (even w/o restrict!)asm:
+...
+	.globl	fun_t
+	.section	.bss
+	.align 4
+	.type	fun_t, @object
+	.size	fun_t, 4
+fun_t:
+	.zero	4
+...
+
+
+
+In the other case:> static int (*fun_t)(struct foo *);          // Leak (even w/o restrict!)asm:
+...
+	# No data-symbol is generated for `fun_t`
+...
+
+
+
+Gcc actually doesn't generate a .bss-symbol for the static variable (since it's unused), but it still generates debug inforation for `struct foo`. So I guess strike `int (*fun_t)(struct foo *);` from the list, but keep `static int (*fun_t)(struct foo *);` which still leaks
+
+- User: Richard Biener | Time: 2023-08-21 08:30:45 UTC
+  Text: Confirmed.  This is because prune_unused_types_walk marks all restrict types as necessary.  There's also DW_TAG_shared_type that's not handled.
+
+- User: GCC Commits | Time: 2023-08-24 06:23:42 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:bd2c4d6d8fffd5a6dae5217d6076cc4190bab13dcommitr14-3421-gbd2c4d6d8fffd5a6dae5217d6076cc4190bab13dAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Aug 21 10:34:30 2023 +0200
+
+    debug/111080 - avoid outputting debug info for unused restrict qualified type
+    
+    The following applies some maintainance with respect to type qualifiers
+    and kinds added by later DWARF standards to prune_unused_types_walk.
+    The particular case in the bug is not handling (thus marking required)
+    all restrict qualified type DIEs.  I've found more DW_TAG_*_type that
+    are unhandled, looked up the DWARF docs and added them as well based
+    on common sense.PR debug/111080* dwarf2out.cc (prune_unused_types_walk): Handle
+            DW_TAG_restrict_type, DW_TAG_shared_type, DW_TAG_atomic_type,
+            DW_TAG_immutable_type, DW_TAG_coarray_type, DW_TAG_unspecified_type
+            and DW_TAG_dynamic_type as to only output them when referenced.
+    
+            * gcc.dg/debug/dwarf2/pr111080.c: New testcase.
+
+- User: GCC Commits | Time: 2023-08-24 07:10:16 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:fb6d61299159275246052c72c6e3666b36d5b333commitr13-7750-gfb6d61299159275246052c72c6e3666b36d5b333Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Aug 21 10:34:30 2023 +0200
+
+    debug/111080 - avoid outputting debug info for unused restrict qualified type
+    
+    The following applies some maintainance with respect to type qualifiers
+    and kinds added by later DWARF standards to prune_unused_types_walk.
+    The particular case in the bug is not handling (thus marking required)
+    all restrict qualified type DIEs.  I've found more DW_TAG_*_type that
+    are unhandled, looked up the DWARF docs and added them as well based
+    on common sense.PR debug/111080* dwarf2out.cc (prune_unused_types_walk): Handle
+            DW_TAG_restrict_type, DW_TAG_shared_type, DW_TAG_atomic_type,
+            DW_TAG_immutable_type, DW_TAG_coarray_type, DW_TAG_unspecified_type
+            and DW_TAG_dynamic_type as to only output them when referenced.
+    
+            * gcc.dg/debug/dwarf2/pr111080.c: New testcase.
+    
+    (cherry picked from commit bd2c4d6d8fffd5a6dae5217d6076cc4190bab13d)
+
+- User: Richard Biener | Time: 2023-08-24 07:10:53 UTC
+  Text: Fixed on trunk and for GCC 13.3 sofar.
+
+- User: GCC Commits | Time: 2023-12-15 13:17:45 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:5c3ab44771d0524140cf2ce5de594fcf7fefcd6fcommitr12-10044-g5c3ab44771d0524140cf2ce5de594fcf7fefcd6fAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Aug 21 10:34:30 2023 +0200
+
+    debug/111080 - avoid outputting debug info for unused restrict qualified type
+    
+    The following applies some maintainance with respect to type qualifiers
+    and kinds added by later DWARF standards to prune_unused_types_walk.
+    The particular case in the bug is not handling (thus marking required)
+    all restrict qualified type DIEs.  I've found more DW_TAG_*_type that
+    are unhandled, looked up the DWARF docs and added them as well based
+    on common sense.PR debug/111080* dwarf2out.cc (prune_unused_types_walk): Handle
+            DW_TAG_restrict_type, DW_TAG_shared_type, DW_TAG_atomic_type,
+            DW_TAG_immutable_type, DW_TAG_coarray_type, DW_TAG_unspecified_type
+            and DW_TAG_dynamic_type as to only output them when referenced.
+    
+            * gcc.dg/debug/dwarf2/pr111080.c: New testcase.
+    
+    (cherry picked from commit bd2c4d6d8fffd5a6dae5217d6076cc4190bab13d)
+
+- User: GCC Commits | Time: 2024-06-21 09:22:38 UTC
+  Text: The releases/gcc-11 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:80ded4e8f871c98481bab912997034b9d24b1c96commitr11-11527-g80ded4e8f871c98481bab912997034b9d24b1c96Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Aug 21 10:34:30 2023 +0200
+
+    debug/111080 - avoid outputting debug info for unused restrict qualified type
+    
+    The following applies some maintainance with respect to type qualifiers
+    and kinds added by later DWARF standards to prune_unused_types_walk.
+    The particular case in the bug is not handling (thus marking required)
+    all restrict qualified type DIEs.  I've found more DW_TAG_*_type that
+    are unhandled, looked up the DWARF docs and added them as well based
+    on common sense.PR debug/111080* dwarf2out.c (prune_unused_types_walk): Handle
+            DW_TAG_restrict_type, DW_TAG_shared_type, DW_TAG_atomic_type,
+            DW_TAG_immutable_type, DW_TAG_coarray_type, DW_TAG_unspecified_type
+            and DW_TAG_dynamic_type as to only output them when referenced.
+    
+            * gcc.dg/debug/dwarf2/pr111080.c: New testcase.
+
+- User: Richard Biener | Time: 2024-06-21 09:38:08 UTC
+  Text: Fixed.
+

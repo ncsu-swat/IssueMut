@@ -1,0 +1,107 @@
+Bug Summary: -Wanalyzer-tainted-size false positive seen in Linux kernel's drivers/char/ipmi/ipmi_devintf.c
+Product: gcc
+Component: analyzer
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Malcolm | Time: 2023-12-08 22:26:05 UTC
+  Text: Createdattachment 56837[details]Reduced reproducer
+
+With the kernel plugin, this test erroenously reports:
+
+In function 'call_copy_from_user',
+    inlined from 'handle_send_req' at gcc.dg/plugin/taint-drivers-char-ipmi-ipmi_devintf.c:35:7:
+gcc.dg/plugin/taint-drivers-char-ipmi-ipmi_devintf.c:19:7: warning: use of attacker-controlled value as size without upper-bounds checking [CWE-129] [-Wanalyzer-tainted-size]
+   19 |   n = copy_from_user(to, from, n); /* { dg-bogus "use of attacker-controlled value as size without upper-bounds checking" } */
+      |       ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+  'ipmi_ioctl': events 1-4
+    |
+    |   41 | ipmi_ioctl(void* arg)
+    |      | ^~~~~~~~~~
+    |      | |
+    |      | (1) entry to 'ipmi_ioctl'
+    |......
+    |   44 |   if (call_copy_from_user(&msg, arg, sizeof(msg))) {
+    |      |      ~
+    |      |      |
+    |      |      (2) following 'false' branch (when 'n == 0')...
+    |......
+    |   48 |   return handle_send_req(&msg);
+    |      |          ~~~~~~~~~~~~~~~~~~~~~
+    |      |          |
+    |      |          (3) ...to here
+    |      |          (4) calling 'handle_send_req' from 'ipmi_ioctl'
+    |
+    +--> 'handle_send_req': events 5-8
+           |
+           |   29 | handle_send_req(struct ipmi_msg* msg)
+           |      | ^~~~~~~~~~~~~~~
+           |      | |
+           |      | (5) entry to 'handle_send_req'
+           |......
+           |   32 |   if (msg->data_len > 272) {
+           |      |      ~
+           |      |      |
+           |      |      (6) following 'false' branch...
+           |......
+           |   35 |   if (call_copy_from_user(buf, msg->data, msg->data_len)) {
+           |      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+           |      |       |
+           |      |       (7) ...to here
+           |      |       (8) inlined call to 'call_copy_from_user' from 'handle_send_req'
+           |
+           +--> 'call_copy_from_user': event 9
+                  |
+                  |   19 |   n = copy_from_user(to, from, n); /* { dg-bogus "use of attacker-controlled value as size without upper-bounds checking" } */
+                  |      |       ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+                  |      |       |
+                  |      |       (9) use of attacker-controlled value as size without upper-bounds checking
+                  |
+
+
+despite the value being sanitized at event (6).
+
+- User: GCC Commits | Time: 2024-01-24 15:12:32 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:b6e537571c21d8f0bc276d7afa156d6d4a54a1c9commitr14-8390-gb6e537571c21d8f0bc276d7afa156d6d4a54a1c9Author: David Malcolm <dmalcolm@redhat.com>
+Date:   Wed Jan 24 10:11:09 2024 -0500
+
+    analyzer kernel plugin: implement __check_object_size [PR112927]PR analyzer/112927reports a false positive from -Wanalyzer-tainted-size
+    seen on the Linux kernel's drivers/char/ipmi/ipmi_devintf.c with the
+    analyzer kernel plugin.
+    
+    The issue is that in:
+    
+    (A):
+      if (msg->data_len > 272) {
+        return -90;
+      }
+    
+    (B):
+      n = msg->data_len;
+      __check_object_size(to, n);
+      n = copy_from_user(to, from, n);
+    
+    the analyzer is treating __check_object_size as having arbitrary side
+    effects, and, in particular could modify msg->data_len.  Hence the
+    sanitization that occurs at (A) above is treated as being for a
+    different value than the size obtained at (B), hence the bogus warning
+    at the call to copy_from_user.
+    
+    Fixed by extending the analyzer kernel plugin to "teach" it that
+    __check_object_size has no side effects.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/112927* gcc.dg/plugin/analyzer_kernel_plugin.c
+            (class known_function___check_object_size): New.
+            (kernel_analyzer_init_cb): Register it.
+            * gcc.dg/plugin/plugin.exp: Add taint-pr112927.c.
+            * gcc.dg/plugin/taint-pr112927.c: New test.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2024-01-24 18:49:47 UTC
+  Text: Should be fixed on trunk for GCC 14 by the above patch; marking as resolved.
+

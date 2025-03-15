@@ -1,0 +1,202 @@
+Bug Summary: Redundant VSETVL after optimized code of RVV
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Li Pan | Time: 2023-04-25 01:07:22 UTC
+  Text: Assume we have a sample code as below.
+
+
+#include "riscv_vector.h"
+
+void f (int8_t * restrict in, int8_t * restrict out, int n, int m, int cond)
+{
+  size_t vl = 101;
+  if (cond)
+    vl = m * 2;
+  else
+    vl = m * 2 * vl;
+
+  for (size_t i = 0; i < n; i++)
+    {
+      vint8mf8_t v = __riscv_vle8_v_i8mf8 (in + i, vl);
+      __riscv_vse8_v_i8mf8 (out + i, v, vl);
+
+      vbool64_t mask = __riscv_vlm_v_b64 (in + i + 100, vl);
+
+      vint8mf8_t v2 = __riscv_vle8_v_i8mf8_tumu (mask, v, in + i + 100, vl);
+      __riscv_vse8_v_i8mf8 (out + i + 100, v2, vl);
+    }
+
+  for (size_t i = 0; i < n; i++)
+    {
+      vint8mf8_t v = __riscv_vle8_v_i8mf8 (in + i + 300, vl);
+      __riscv_vse8_v_i8mf8 (out + i + 300, v, vl);
+    }
+}
+
+Currently the upstream will generate the code as below with *-march=rv64gcv -O3 -frename-registers* options. It looks like the last vsetvl of .L4 bb is redundant.
+
+f:
+        slliw   a3,a3,1
+        bne     a4,zero,.L2
+        li      a5,101
+        mul     a3,a3,a5
+.L2:
+        addi    a4,a1,100
+        add     t1,a0,a2
+        mv      t0,a0
+        beq     a2,zero,.L1
+        vsetvli zero,a3,e8,mf8,tu,mu
+.L4:
+        addi    a6,t0,100
+        addi    a7,a4,-100
+        vle8.v  v1,0(t0)
+        addi    t0,t0,1
+        vse8.v  v1,0(a7)
+        vlm.v   v0,0(a6)
+        vle8.v  v1,0(a6),v0.t
+        vse8.v  v1,0(a4)
+        addi    a4,a4,1
+        bne     t0,t1,.L4
+        addi    a0,a0,300
+        addi    a1,a1,300
+        add     a2,a0,a2
+        vsetvli zero,a3,e8,mf8,ta,ma   // <= redundant ?
+.L5:
+        vle8.v  v2,0(a0)
+        addi    a0,a0,1
+        vse8.v  v2,0(a1)
+        addi    a1,a1,1
+        bne     a2,a0,.L5
+.L1:
+        ret
+
+- User: GCC Commits | Time: 2023-05-05 13:18:36 UTC
+  Text: The master branch has been updated by Kito Cheng <kito@gcc.gnu.org>:https://gcc.gnu.org/g:d875d75653ed67e125e70dd8530182ce7872af65commitr14-503-gd875d75653ed67e125e70dd8530182ce7872af65Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Fri May 5 14:33:44 2023 +0800
+
+    RISC-V: FixPR109615This patch is to fix following case:
+    void f (int8_t * restrict in, int8_t * restrict out, int n, int m, int cond)
+    {
+      size_t vl = 101;
+      if (cond)
+        vl = m * 2;
+      else
+        vl = m * 2 * vl;
+    
+      for (size_t i = 0; i < n; i++)
+        {
+          vint8mf8_t v = __riscv_vle8_v_i8mf8 (in + i, vl);
+          __riscv_vse8_v_i8mf8 (out + i, v, vl);
+    
+          vbool64_t mask = __riscv_vlm_v_b64 (in + i + 100, vl);
+    
+          vint8mf8_t v2 = __riscv_vle8_v_i8mf8_tumu (mask, v, in + i + 100, vl);
+          __riscv_vse8_v_i8mf8 (out + i + 100, v2, vl);
+        }
+    
+      for (size_t i = 0; i < n; i++)
+        {
+          vint8mf8_t v = __riscv_vle8_v_i8mf8 (in + i + 300, vl);
+          __riscv_vse8_v_i8mf8 (out + i + 300, v, vl);
+        }
+    }
+    
+    The value of "vl" is coming from different blocks so it will be wrapped as a PHI node of each
+    block.
+    
+    In the first loop, the "vl" source is a PHI node from bb 4.
+    In the second loop, the "vl" source is a PHI node from bb 5.
+    since bb 5 is dominated by bb 4, the PHI input of "vl" in the second loop is the PHI node of "vl"
+    in bb 4.
+    So when 2 "vl" PHI node are both degenerate PHI node (the phi->num_inputs () == 1) and their only
+    input are same, it's safe for us to consider they are compatible.
+    
+    This patch is only optimize degenerate PHI since it's safe and simple optimization.
+    
+    non-dengerate PHI are considered as incompatible unless the PHI are the same in RTL_SSA.
+    TODO: non-generate PHI is complicated, we can support it when it is necessary in the future.
+    
+    Before this patch:
+    
+    ...
+    .L2:
+            addi    a4,a1,100
+            add     t1,a0,a2
+            mv      t0,a0
+            beq     a2,zero,.L1
+            vsetvli zero,a3,e8,mf8,tu,mu
+    .L4:
+            addi    a6,t0,100
+            addi    a7,a4,-100
+            vle8.v  v1,0(t0)
+            addi    t0,t0,1
+            vse8.v  v1,0(a7)
+            vlm.v   v0,0(a6)
+            vle8.v  v1,0(a6),v0.t
+            vse8.v  v1,0(a4)
+            addi    a4,a4,1
+            bne     t0,t1,.L4
+            addi    a0,a0,300
+            addi    a1,a1,300
+            add     a2,a0,a2
+            vsetvli zero,a3,e8,mf8,ta,ma
+    .L5:
+            vle8.v  v2,0(a0)
+            addi    a0,a0,1
+            vse8.v  v2,0(a1)
+            addi    a1,a1,1
+            bne     a2,a0,.L5
+    .L1:
+            ret
+    
+    After this patch:
+    
+    ...
+    .L2:
+            addi    a4,a1,100
+            add     t1,a0,a2
+            mv      t0,a0
+            beq     a2,zero,.L1
+            vsetvli zero,a3,e8,mf8,tu,mu
+    .L4:
+            addi    a6,t0,100
+            addi    a7,a4,-100
+            vle8.v  v1,0(t0)
+            addi    t0,t0,1
+            vse8.v  v1,0(a7)
+            vlm.v   v0,0(a6)
+            vle8.v  v1,0(a6),v0.t
+            vse8.v  v1,0(a4)
+            addi    a4,a4,1
+            bne     t0,t1,.L4
+            addi    a0,a0,300
+            addi    a1,a1,300
+            add     a2,a0,a2
+    .L5:
+            vle8.v  v2,0(a0)
+            addi    a0,a0,1
+            vse8.v  v2,0(a1)
+            addi    a1,a1,1
+            bne     a2,a0,.L5
+    .L1:
+            retPR target/109615gcc/ChangeLog:
+    
+            * config/riscv/riscv-vsetvl.cc (avl_info::multiple_source_equal_p): Add
+            denegrate PHI optmization.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/vsetvl/avl_single-74.c: Adapt testcase.
+            * gcc.target/riscv/rvv/vsetvl/vsetvl-11.c: Ditto.
+            * gcc.target/riscv/rvv/vsetvl/pr109615.c: New test.
+
+- User: Li Pan | Time: 2024-01-18 03:00:06 UTC
+  Text: Fixed.
+

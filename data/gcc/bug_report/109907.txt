@@ -1,0 +1,891 @@
+Bug Summary: Missed optimization for bit extraction (uses shift instead of single bit-test)
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Georg-Johann Lay | Time: 2023-05-19 10:10:10 UTC
+  Text: Createdattachment 55116[details]C test case.
+
+The following missed optimization occurs with current v14 master and also with older versions of the compiler:
+
+$ avr-gcc ext.c -dumpbase "" -save-temps -dp -mmcu=atmega128 -c -Os
+
+Functons like
+
+uint8_t cset_32bit31 (uint32_t x)
+{
+    return (x & (1ul << 31)) ? 1 : 0; // bloat
+}
+
+that extract a single bit might generate very expensive code like:
+
+cset_32bit31:
+	movw r26,r24	 ;  18	[c=4 l=1]  *movhi/0
+	movw r24,r22	 ;  19	[c=4 l=1]  *movhi/0
+	lsl r27	 ;  24	[c=16 l=4]  *ashrsi3_const/3
+	sbc r24,r24
+	mov r25,r24
+	movw r26,r24
+	andi r24,lo8(1)	 ;  12	[c=4 l=1]  andqi3/1
+	ret		 ;  22	[c=0 l=1]  return
+
+where the following 3 instructions would suffice.  This is smaller, faster and imposes no additioal register pressure:
+
+	bst r25,7	 ;  16	[c=4 l=3]  *extzv/4
+	clr r24
+	bld r24,0
+
+What also would work is loading 0 or 1 depending on a single bit like:
+
+LDI  r24, 0  # R24 = 0
+SBRC r25, 7  # Skip next instruction if R25.7 == 0.
+LDI  r24, 1  # R24 = 1
+
+The bloat also occurs when the complement of the bit is extracted like in
+
+uint8_t cset_32bit30_not (uint32_t x)
+{
+    return (x & (1ul << 30)) ? 0 : 1; // bloat 
+}
+
+cset_32bit30_not:
+	movw r26,r24	 ;  19	[c=4 l=1]  *movhi/0
+	movw r24,r22	 ;  20	[c=4 l=1]  *movhi/0
+	ldi r18,30	 ;  25	[c=44 l=7]  *lshrsi3_const/3
+	1:	
+	lsr r27
+	ror r26
+	ror r25
+	ror r24
+	dec r18	
+	brne 1b	
+	ldi r18,1	 ;  7	[c=32 l=2]  xorsi3/2
+	eor r24,r18
+	andi r24,lo8(1)	 ;  13	[c=4 l=1]  andqi3/1
+	ret		 ;  23	[c=0 l=1]  return
+
+This case is even worse because it's a loop of 30 single bit-shifts to extract the bit.  Again, skipping one instrauction depending on a bit was possible:
+
+LDI  r24, 1  # R24 = 1
+SBRC r25, 6  # Skip next instruction if R25.7 == 0.
+LDI  r24, 0  # R24 = 0
+
+or
+
+LDI  r24, 0  # R24 = 0
+SBRS r25, 6  # Skip next instruction if R25.7 == 1.
+LDI  r24, 1  # R24 = 1
+
+or extract one bit using the T-flag:
+
+BST r25, 6     # SREG.T = R25.6
+LDI r24, 0xff  # R24 = 0xff
+BLD r24, 0     # R24.0 = SREG.T
+COM r24        # R24 = R24 ^ 0xff
+
+-------------------------------------------------------
+
+Configured with: --target=avr --disable-nls --with-dwarf2 --with-gnu-as --with-gnu-ld --disable-shared --enable-languages=c,c++
+
+gcc version 14.0.0 20230518 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2023-05-19 14:14:06 UTC
+  Text: I was just touching that area in the middle end and had noticed it didn't do any cost analysis....
+
+- User: Andrew Pinski | Time: 2023-05-19 15:42:25 UTC
+  Text: Confirmed. I am going to try to fix this. 
+
+The code which does this is in expr.cc and starts with the following comment:
+  /* If this is an equality or inequality test of a single bit, we can
+     do this by shifting the bit being tested to the low-order bit and
+     masking the result with the constant 1.  If the condition was EQ,
+     we xor it with 1.  This does not require an scc insn and is faster
+     than an scc insn even if we have it.
+
+Which makes it sound like it is always true but it is not as shown by the avr generated code.
+
+- User: Andrew Pinski | Time: 2023-05-19 15:45:51 UTC
+  Text: Note this code has been in expr.cc since before 1992 even :).
+
+- User: Andrew Pinski | Time: 2023-05-19 20:03:50 UTC
+  Text: For cset_32bit30_not with some patches which I will be posting, I get:
+        bst r25,6        ;  23  [c=4 l=3]  *extzv/4
+        clr r24
+        bld r24,0
+        ldi r25,lo8(1)   ;  24  [c=4 l=1]  movqi_insn/1
+        eor r24,r25      ;  25  [c=4 l=1]  *xorqi3
+/* epilogue start */
+        ret              ;  28  [c=0 l=1]  return
+
+Which is better than what was there before.
+
+The way I get this is to use BIT_FIELD_REF inside fold_single_bit_test .
+
+The first one I suspect load_extend_op for SImode returning SIGN_EXTEND for avr.
+
+- User: Andrew Pinski | Time: 2023-05-19 20:12:07 UTC
+  Text: Createdattachment 55121[details]patch set
+
+here is the patch set that improves cset_32bit30_not . I am still looking into improving the other one.
+
+- User: Georg-Johann Lay | Time: 2023-05-19 20:41:51 UTC
+  Text: (In reply to Andrew Pinski fromcomment #4)> For cset_32bit30_not with some patches which I will be posting, I get:
+>         bst r25,6        ;  23  [c=4 l=3]  *extzv/4
+>         clr r24
+>         bld r24,0
+>         ldi r25,lo8(1)   ;  24  [c=4 l=1]  movqi_insn/1
+>         eor r24,r25      ;  25  [c=4 l=1]  *xorqi3
+> /* epilogue start */
+>         ret              ;  28  [c=0 l=1]  return
+> 
+> Which is better than what was there before.Quite impressive improvement.  Maybe the last step can be achieved with a combiner pattern that combines extzv with a bit flip.
+
+One problem is usually that there is no canonical form (sometimes zero_extract, sometimes shift+and, sometimes with subregs for extraction or paradoxical subregs for wider types, different behaviour for MSB, etc.).
+
+avr's extzv currently reads
+
+(define_expand "extzv"
+  [(set (match_operand:QI 0 "register_operand")
+        (zero_extract:QI (match_operand:QI 1 "register_operand")
+                         (match_operand:QI 2 "const1_operand")
+                         (match_operand:QI 3 "const_0_to_7_operand")))])
+
+Maybe QI for op1 is not optimal, but it's not possible to use mode iterator because there's only one gen_extzv.  Dunno if VOIDmode would help or is sane.> The first one I suspect load_extend_op for SImode returning SIGN_EXTEND for
+> avr.It's not implemented for avr, thus UNKNOWN as of defaults.h.
+
+- User: Andrew Pinski | Time: 2023-05-19 20:55:32 UTC
+  Text: (In reply to Georg-Johann Lay fromcomment #6)> (define_expand "extzv"
+>   [(set (match_operand:QI 0 "register_operand")
+>         (zero_extract:QI (match_operand:QI 1 "register_operand")
+>                          (match_operand:QI 2 "const1_operand")
+>                          (match_operand:QI 3 "const_0_to_7_operand")))])
+> 
+> Maybe QI for op1 is not optimal, but it's not possible to use mode iterator
+> because there's only one gen_extzv.  Dunno if VOIDmode would help or is sane.Note extzv pattern has been deprecate since 4.8 withr0-120368-gd2eeb2d179a435which added extzv<mode> and co as being supported. So maybe moving over to using that instead on avr backend might help here ...
+
+- User: Georg-Johann Lay | Time: 2023-05-19 20:59:27 UTC
+  Text: avr.md has this:> ;; ??? do_store_flag emits a hard-coded right shift to extract a bit without
+> ;; even considering rtx_costs, extzv, or a bit-test.  SeePR55181for an example.And I already tried to work around it in that PR, but forgot about it...
+
+- User: Andrew Pinski | Time: 2023-05-20 00:46:48 UTC
+  Text: (In reply to Georg-Johann Lay fromcomment #6)> Quite impressive improvement.  Maybe the last step can be achieved with a
+> combiner pattern that combines extzv with a bit flip.
+> 
+> One problem is usually that there is no canonical form (sometimes
+> zero_extract, sometimes shift+and, sometimes with subregs for extraction or
+> paradoxical subregs for wider types, different behaviour for MSB, etc.).Right, In this case combine tries:
+(set (reg/i:QI 24 r24)
+    (zero_extract:QI (xor:QI (reg:QI 54)
+            (const_int 64 [0x40]))
+        (const_int 1 [0x1])
+        (const_int 6 [0x6])))
+
+Which puts the xor inside the zero_extract even but I think you could handle that once my patch set goes in.
+
+- User: Andrew Pinski | Time: 2023-05-20 05:09:29 UTC
+  Text: I applied the patches now after approval,r14-1014-gc5df248509b48is the one that makes the difference here.
+I am not working on improving the ^1 part though so leaving it open for that.
+
+- User: Georg-Johann Lay | Time: 2023-05-20 07:36:49 UTC
+  Text: I tried with the test case, but the expensive shifts are still there except for the cset_32bit30_not case, which improved as noted above.
+
+cset_32bit30 however goes from the 3-instruction code to:
+
+cset_32bit30:
+	movw r26,r24	 ;  19	[c=4 l=2]  *movsi/0
+	movw r24,r22
+	ldi r18,30	 ;  26	[c=44 l=7]  *lshrsi3_const/3
+	1:	
+	lsr r27
+	ror r26
+	ror r25
+	ror r24
+	dec r18	
+	brne 1b	
+	andi r24,lo8(1)	 ;  21	[c=4 l=1]  *andqi3/1
+	ret		 ;  24	[c=0 l=1]  return
+
+So we are back where we started? All except one case use expensive shift.
+
+- User: Georg-Johann Lay | Time: 2023-05-20 07:50:12 UTC
+  Text: ...my bad, I tried "extzv<mode>", which didn't work out as expected.
+
+So we have shifts : bit-extract = 3 : 2.
+
+Is it worth trying to write combine patterns to catch this?  Or will there be better lowering for the remaining caases?
+
+- User: Andrew Pinski | Time: 2023-05-20 22:23:33 UTC
+  Text: (In reply to Georg-Johann Lay fromcomment #12)> ...my bad, I tried "extzv<mode>", which didn't work out as expected.
+> 
+> So we have shifts : bit-extract = 3 : 2.
+> 
+> Is it worth trying to write combine patterns to catch this?  Or will there
+> be better lowering for the remaining caases?So for the `a < 0` (which is the same as `a >> negbit` which you wrote originally; cset_32bit31, cset_24bit23 and cset_32bit31_not), I noticed it got expanded using arithmetic shift right followed by an `and` rather than a logical shift right, even on x86.PR 108847shows the behavior there. I will go and look into fixing that PR in next few days. I will check back the resulting AVR code generation (and the initial RTL) for those 3 cases after I fix the shifting issue to see if there is anything else to do.
+
+- User: Andrew Pinski | Time: 2023-05-20 22:40:11 UTC
+  Text: Actually I take back on what is going on those 3. But I will be looking into it.
+
+
+  x.0_1 = (signed long) x_4(D);
+  _2 = x.0_1 >> 31;
+  _3 = (unsigned char) _2;
+  _5 = _3 & 1;
+
+That is what is causing arithmetic shift but we only need the first bit in the end.
+If we optimized that to:
+  x.0_1 = (unsigned long) x_4(D);
+  _2 = x.0_1 >> 31;
+  _3 = (unsigned char) _2;
+  _5 = _3 & 1;
+
+similar to:
+uint8_t cset_32bit31_1 (uint32_t x)
+{
+    if (x & (1ull<<31))
+      return 1;
+  return 0;
+}
+
+Then there is still an issue. I have some ideas of how to handling the first case but I might need a few weeks.
+
+Note GCC 14 code generation here is similar now to GCC 4.5.x so that is the good news that this part is not a regression.
+
+- User: Andrew Pinski | Time: 2023-05-21 05:15:59 UTC
+  Text: So there is another way of fixing this. take:
+Trying 6 -> 12:
+    6: r49:SI=r50:SI>>0x1f
+      REG_DEAD r50:SI
+   12: r24:QI=r49:SI#0&0x1
+      REG_DEAD r49:SI
+Failed to match this instruction:
+(set (reg/i:QI 24 r24)
+    (neg:QI (subreg:QI (ashiftrt:SI (reg:SI 50)
+                (const_int 31 [0x1f])) 0)))
+
+It is correct but maybe the subreg should combine with the shift and change it just (lshiftrt:QI (subreg:QI (reg:SI 50)) (const_int 7)) . Once combine does that, then maybe that could match ...
+
+
+What is interesting is subreg1 does the splitting for HI mode .
+
+Maybe Roger could look improving that since he was touching it recently for avr IIRC.
+
+- User: Andrew Pinski | Time: 2023-05-21 05:36:35 UTC
+  Text: (In reply to Andrew Pinski fromcomment #14)> Actually I take back on what is going on those 3. But I will be looking into
+> it.
+> 
+> 
+>   x.0_1 = (signed long) x_4(D);
+>   _2 = x.0_1 >> 31;
+>   _3 = (unsigned char) _2;
+>   _5 = _3 & 1;we could pattern match this on the gimple using something like:
+(simplify
+ (bit_and (convert? (rshift (nop_convert? @1) INTEGER_CST@2)) integer_onep)
+ (if (wi::to_wide (@2) == TYPE_PRECISION (TREE_TYPE (@0)) - 1)
+ (with
+  { tree utype = unsigned_type_for (type); }
+  (convert (rshift (convert:utype @1) @2)))
+
+
+But that still fails because combine really does not like subregs:
+Trying 6 -> 12:
+    6: r47:SI=r48:SI 0>>0x1f
+      REG_DEAD r48:SI
+   12: r24:QI=r47:SI#0
+      REG_DEAD r47:SI
+Failed to match this instruction:
+(set (reg/i:QI 24 r24)
+    (subreg:QI (lshiftrt:SI (reg:SI 48)
+            (const_int 31 [0x1f])) 0))
+
+- User: Georg-Johann Lay | Time: 2023-05-21 09:09:49 UTC
+  Text: Createdattachment 55129[details]Patch for AVR backend: combine patterns, "extzv<mode>", test case
+
+For now I have the attaches patch that resolves all cases of the included test-case.  Iknow that the maintainers are not very fond of such combine patterns though...
+
+<log>
+Provide more patterns to improve extracting (negated) single bits.
+Deprecated insn "extzv" is replaced by "extzv<mode>".  The patterns now
+also allow lower I/O memory because both the insns and the instructions
+for I/O like SBIC/SBIS and the ones for REGs like SBRC/SBRS.
+Even in the presence of "extzv<mode>" there is no canonical form for
+single bit extractions, even less for extracting the insersed bit.
+So more than one mathod is provided.
+
+gcc/PR target/109907* config/avr/avr-protos.h (avr_out_extr, avr_out_extr_not): New protos.
+	* config/avr/avr.cc (avr_out_extr, avr_out_extr_not): New functions.
+	(avr_adjust_insn_length) [ADJUST_LEN_EXTR_NOT, ADJUST_LEN_EXTR]:
+	Handle cases.
+	* config/avr/avr.md (adjust_len) [extr, extr_not]: Add to define_attr.
+	(extzv): Turn into extzv<mode>.
+	(MSB): New mode attribute.
+	(*extzv_split, *extzv): Allow lower I/O addresses in operand 1.
+	Unify constraints to a single case, as avr_out_extr() will now
+	handle the alternatives.
+	(*extzv.not_split, *extzv_not): New insn and its post-reload split.
+	(*extzv.subreg.<mode>, *extzv.neg.subreg-msb.<mode>, *extzv<mode>.ge):
+	New insns and post-reload splits.
+	(*extzv.xor, *extzv.io.lsr): New insns and pre-reload split.
+	* config/avr/constraints.md (Yil): New constraint for reg or low I/O.
+	* config/avr/predicates.md (reg_or_low_io_operand, const7_operand)
+	(const15_operand, const23_operand, const31_operand)
+	(const_0_to_7_operand, const_0_to_15_operand, const_0_to_23_operand)
+	(const_0_to_31_operand): New predicates.
+
+gcc/testsuite/PR target/109907* gcc.target/avr/pr109907.c: New test.
+</log>
+
+- User: Georg-Johann Lay | Time: 2023-05-21 09:55:37 UTC
+  Text: (In reply to Andrew Pinski fromcomment #16)> But that still fails because combine really does not like subregs:
+> [...]
+> Failed to match this instruction:
+> (set (reg/i:QI 24 r24)
+>      (subreg:QI (lshiftrt:SI (reg:SI 48)
+>                 (const_int 31 [0x1f])) 0))Eons ago I solved the canonicalization problem during combine as follow:
+
+Prior to recog_for_combine, there was a target hook that could canonicalize combined rtx's to a canonical form.  This was achieved by means of special split patterns (wrapped in some unspec_canonicalize and insn condition).  If there was a match, combine would proceed with the canonicalized form.
+
+IMO, trying to target-independent canonicalize in combine itself just works to some degree, because combine is well in target-specigic land, and targets are very different.
+
+;; Combine's "smart" method to extract the MSB.
+(define_insn_and_split "*extzv.neg.subreg-msb.<mode>"
+  [(set (match_operand:QI 0 "register_operand"                          "=r")
+        (neg:QI (subreg:QI
+                 (ashiftrt:HISI (match_operand:HISI 1 "register_operand" "r")
+                                (match_operand:QI 2 "const<MSB>_operand" "n"))
+                 0)))]
+   ""
+   "#"
+   "&& reload_completed"
+   [; "*extzv"
+    (parallel [(set (match_dup 0)
+                    (zero_extract:QI (match_dup 1)
+                                     (const_int 1)
+                                     (match_dup 2)))
+               (clobber (reg:CC REG_CC))])]
+   {
+     ...;
+   })
+
+Such patterns work, bit the problem is that you are pushing combine away from a (target-)canonical form.
+
+Next best match would be a pre-reload matching split.  If that works, it might be superior to a post-reload split, but it happens at split1 which runs after reload.
+
+The closest match to canonicalization are the non-matching splits that will run during combine.  The problem with these is that such splits must have very special for (like split 1 pattern into exactly 2, additional restrictios apply), and in many cases non-matching splits will fail or are not possible.
+
+Such a target-specific canonicalization would push combine towards a target-canonical form, instead of encouraging it to go further astray and try even more crazy, none-canonical combinations.
+
+- User: Georg-Johann Lay | Time: 2023-05-23 09:58:59 UTC
+  Text: Createdattachment 55139[details]C test case, insert bits in place
+
+This testcase is fromPR82931.  It transfers one bit to the same bit-position in the output:
+
+typedef __UINT8_TYPE__ uint8_t;
+
+#define Bit8Mask ((uint8_t) BitMask)
+
+void merge1_8 (uint8_t *dst, const uint8_t *src)
+{
+    *dst = (*src & BitMask) | (*dst & ~ Bit8Mask);
+}
+
+void merge2_8 (uint8_t *dst, const uint8_t *src)
+{
+    *dst ^= (*dst ^ *src) & Bit8Mask;
+}
+
+combine detects in merge1_8 that this is a bit insertion, but fails because the input is MEM:
+
+Failed to match this instruction:
+(set (zero_extract:QI (mem:QI (reg/v/f:HI 48 [ dst ]) [0 *dst_8(D)+0 S1 A8])
+                      (const_int 1 [0x1])
+                      (const_int 4 [0x4]))
+     (lshiftrt:QI (reg:QI 50)
+                  (const_int 4 [0x4])))
+
+So maybe this is a missed opportunity in combine, or combine cannot split away the MEM because it doesn't have a pseudo handy (combine cannot pop new pseudos).
+
+The target could handle this: Supply an insn that matches, and then split the MEM in split1 to a new pseudo.  No need to say, that's not an optimal solution.
+
+In merge2_8, combine doesn't even recognize a bit insertion.  The closest is a combine or 3 insns that resemble the input:
+
+Failed to match this instruction:
+(set (reg:QI 53)
+     (ior:QI (and:QI (reg:QI 43 [ _1 ])
+                     (const_int -17 [0xffffffffffffffef]))
+             (and:QI (reg:QI 51 [ *src_6(D) ])
+                     (const_int 16 [0x10]))))
+
+Again, the backend could provide a pattern for this.  Dunno why combine fails; maybe because a bit-insertion requires that the output operand maches the input operand that gets ANDed with -17.
+
+- User: Georg-Johann Lay | Time: 2023-05-26 08:49:38 UTC
+  Text: Here is a testcase similar to the one fromPR55181, where the first test is for the sign bit:
+
+unsigned char lfsr32_mpp_sign (unsigned long number)
+{
+  unsigned char b = 0;
+  if (number & (1UL << 31)) b--;
+  if (number & (1UL << 29)) b++;
+  if (number & (1UL << 13)) b++;
+  return b;
+}
+
+unsigned char lfsr32_ppp_sign (unsigned long number)
+{
+  unsigned char b = 0;
+  if (number & (1UL << 31)) b++;
+  if (number & (1UL << 29)) b++;
+  if (number & (1UL << 13)) b++;
+  return b;
+}
+
+What then happens is:
+
+expr.cc::do_store_flag()
+expmed.cc::emit_store_flag_force()
+expmed.cc::emit_store_flag()
+expmed.cc::emit_store_flag_1()
+
+the latter then does:
+
+      if (STORE_FLAG_VALUE == 1 || normalizep)
+        /* If we are supposed to produce a 0/1 value, we want to do
+           a logical shift from the sign bit to the low-order bit; for
+           a -1/0 value, we do an arithmetic shift.  */
+        op0 = expand_shift (RSHIFT_EXPR, int_mode, op0,
+                            GET_MODE_BITSIZE (int_mode) - 1,
+                            subtarget, normalizep != -1);
+
+"normalizep" is true because ops->type has a precision of 1, and STORE_FLAG_VALUE is the default of 1.
+
+Nowhere is there any cost computation or consideration whether extzv could do the trick.
+
+- User: Georg-Johann Lay | Time: 2023-05-26 11:14:38 UTC
+  Text: One more test:
+
+unsigned char lfsr32_mpp_ge0 (unsigned long number)
+{
+  unsigned char b = 0;
+  if (number >= 0) b--;
+  if (number & (1UL << 29)) b++;
+  if (number & (1UL << 13)) b++;
+
+  return b;
+}
+
+with -Os -mmcu=atmega128 -dp it generates:
+
+lfsr32_ppp_ge0:
+	push r16		 ;  85	[c=4 l=1]  pushqi1/0
+	push r17		 ;  86	[c=4 l=1]  pushqi1/0
+/* prologue: function */
+/* frame size = 0 */
+/* stack size = 2 */
+	movw r16,r22	 ;  93	[c=4 l=1]  *movhi/0
+	movw r18,r24	 ;  94	[c=4 l=1]  *movhi/0
+	movw r22,r18	 ;  82	[c=4 l=2]  *movsi/0
+	movw r20,r16
+	clr r20		 ;  83	[c=16 l=4]  *andsi3/1
+	clr r21	
+	clr r22	
+	andi r23,32
+	ldi r24,lo8(1)	 ;  68	[c=4 l=1]  movqi_insn/1
+	sbrc r17,5	 ;  84	[c=28 l=2]  *sbrx_branchsi
+	rjmp .L18	
+	or r20,r21	 ;  75	[c=16 l=3]  *cmpsi/0
+	or r20,r22
+	or r20,r23
+	breq .L19		 ;  77	[c=12 l=1]  *branch
+	ldi r24,0		 ;  73	[c=4 l=1]  movqi_insn/0
+.L19:
+	neg r24		 ;  72	[c=4 l=1]  *negqi2
+.L17:
+/* epilogue start */
+	pop r17		 ;  89	[c=4 l=1]  popqi
+	pop r16		 ;  90	[c=4 l=1]  popqi
+	ret		 ;  91	[c=0 l=1]  return_from_epilogue
+.L18:
+	or r20,r21	 ;  69	[c=16 l=3]  *cmpsi/0
+	or r20,r22
+	or r20,r23
+	brne .L17		 ;  71	[c=12 l=1]  *branch
+	ldi r24,0		 ;  67	[c=4 l=1]  movqi_insn/0
+	rjmp .L17		 ;  95	[c=4 l=1]  jump
+
+so it does arithmetic on 32-bit variables (one AND and two COMPAREs) in 28 instructions, use more stack and high register pressure.  An optimal code would require just 8 instructions and additional register pressure of just 1 byte for the output:
+
+lfsr32_mpp_ge0:
+/* prologue: function */
+/* frame size = 0 */
+/* stack size = 0 */
+	clr  R26     ;; b lives in R26, number lives in R25:R22.
+	sbrs R25, 7  ;; Skip next if number.31 = 1
+	dec  R26
+	sbrc R25, 5  ;; Skip next if number.29 = 0
+	inc  R26
+	sbrc R23, 5  ;; Skip next if number.13 = 0
+	inc  R26
+	mov  R24, r26
+/* epilogue start */
+	ret
+
+- User: Andrew Pinski | Time: 2023-05-26 15:21:25 UTC
+  Text: (In reply to Georg-Johann Lay fromcomment #20)> What then happens is:
+> 
+> expr.cc::do_store_flag()
+> expmed.cc::emit_store_flag_force()
+> expmed.cc::emit_store_flag()
+> expmed.cc::emit_store_flag_1()
+> 
+> the latter then does:
+> 
+>       if (STORE_FLAG_VALUE == 1 || normalizep)
+>         /* If we are supposed to produce a 0/1 value, we want to do
+>            a logical shift from the sign bit to the low-order bit; for
+>            a -1/0 value, we do an arithmetic shift.  */
+>         op0 = expand_shift (RSHIFT_EXPR, int_mode, op0,
+>                             GET_MODE_BITSIZE (int_mode) - 1,
+>                             subtarget, normalizep != -1);
+> 
+> "normalizep" is true because ops->type has a precision of 1, and
+> STORE_FLAG_VALUE is the default of 1.
+> 
+> Nowhere is there any cost computation or consideration whether extzv could
+> do the trick.Thanks for tracking down where the shift is expanded to. Let me try to use extract_bit_field there instead (which should produce the better code).
+
+- User: Georg-Johann Lay | Time: 2023-05-26 16:08:42 UTC
+  Text: Thank you so much for looking into this.
+
+For the test case fromcomment #21though, the problem is somewhere in tree optimizations.> unsigned char lfsr32_mpp_ge0 (unsigned long number)
+> {
+>   unsigned char b = 0;
+>   if (number >= 0) b--;
+>   if (number & (1UL << 29)) b++;
+>   if (number & (1UL << 13)) b++;
+> 
+>   return b;
+> }The -fdump-tree-optimized dump reads:
+
+;; Function lfsr32_mpp_ge0 (lfsr32_mpp_ge0, funcdef_no=0, decl_uid=1880, cgraph_uid=1, symbol_order=0)
+
+unsigned char lfsr32_mpp_ge0 (long unsigned int number)
+{
+  unsigned char b;
+  long unsigned int _1;
+  long unsigned int _2;
+  _Bool _3;
+  unsigned char _8;
+  _Bool _9;
+  unsigned char _10;
+  unsigned char _11;
+
+  <bb 2> [local count: 1073741824]:
+  _1 = number_5(D) & 536870912;
+  _2 = number_5(D) & 8192;
+  if (_2 != 0)
+    goto <bb 4>; [50.00%]
+  else
+    goto <bb 3>; [50.00%]
+
+  <bb 3> [local count: 536870912]:
+  _9 = _1 == 0;
+  _10 = (unsigned char) _9;
+  _11 = -_10;
+  goto <bb 5>; [100.00%]
+
+  <bb 4> [local count: 536870913]:
+  _3 = _1 != 0;
+  _8 = (unsigned char) _3;
+
+  <bb 5> [local count: 1073741824]:
+  # b_4 = PHI <_11(3), _8(4)>
+  return b_4;
+}
+
+The ANDs are expanded by expand_binop() and later passes have to deal with the 32-bit arithmnetic.  combine finds one combination of andsi3 into "*sbrx_and_branch<mode>_split" with mode=si, but apart from that the mess still lives in asm.
+
+- User: Andrew Pinski | Time: 2023-05-26 23:11:13 UTC
+  Text: (In reply to Georg-Johann Lay fromcomment #23)> Thank you so much for looking into this.
+> 
+> For the test case fromcomment #21though, the problem is somewhere in tree
+> optimizations.
+> 
+> > unsigned char lfsr32_mpp_ge0 (unsigned long number)
+> > {
+> >   unsigned char b = 0;
+> >   if (number >= 0) b--;
+> >   if (number & (1UL << 29)) b++;
+> >   if (number & (1UL << 13)) b++;
+> > 
+> >   return b;
+> > }
+> 
+> The -fdump-tree-optimized dump reads:
+> 
+> ;; Function lfsr32_mpp_ge0 (lfsr32_mpp_ge0, funcdef_no=0, decl_uid=1880,
+> cgraph_uid=1, symbol_order=0)
+> 
+> unsigned char lfsr32_mpp_ge0 (long unsigned int number)
+> {
+>   unsigned char b;
+>   long unsigned int _1;
+>   long unsigned int _2;
+>   _Bool _3;
+>   unsigned char _8;
+>   _Bool _9;
+>   unsigned char _10;
+>   unsigned char _11;
+> 
+>   <bb 2> [local count: 1073741824]:
+>   _1 = number_5(D) & 536870912;
+>   _2 = number_5(D) & 8192;
+>   if (_2 != 0)
+>     goto <bb 4>; [50.00%]
+>   else
+>     goto <bb 3>; [50.00%]
+> 
+>   <bb 3> [local count: 536870912]:
+>   _9 = _1 == 0;
+>   _10 = (unsigned char) _9;
+>   _11 = -_10;
+>   goto <bb 5>; [100.00%]
+> 
+>   <bb 4> [local count: 536870913]:
+>   _3 = _1 != 0;
+>   _8 = (unsigned char) _3;
+> 
+>   <bb 5> [local count: 1073741824]:
+>   # b_4 = PHI <_11(3), _8(4)>
+>   return b_4;
+> }Oh yes this is where myhttps://gcc.gnu.org/pipermail/gcc-patches/2023-May/619068.htmlpatch actually solves.
+It should be able to detect that _1 has a non-zero bits of just one bit set and expand using single_bit_test for _3.  
+
+For an example we get:
+;; Generating RTL for gimple basic block 3
+
+;; _11 = -_10;
+
+(insn 10 9 11 (set (reg:QI 51)
+        (zero_extract:QI (subreg:QI (reg:SI 43 [ _1 ]) 3)
+            (const_int 1 [0x1])
+            (const_int 5 [0x5]))) "t21.c":5:6 -1
+     (nil))
+
+(insn 11 10 12 (set (reg:QI 53)
+        (const_int 1 [0x1])) "t21.c":5:6 -1
+     (nil))
+
+(insn 12 11 13 (set (reg:QI 52)
+        (xor:QI (reg:QI 51)
+            (reg:QI 53))) "t21.c":5:6 -1
+     (nil))
+
+(insn 13 12 0 (set (reg/v:QI 48 [ <retval> ])
+        (neg:QI (reg:QI 52))) "t21.c":5:6 -1
+     (nil))
+
+
+Which is exactly what you want right?
+
+Overall we get:
+```
+lfsr32_mpp_ge0:
+        push r16
+        push r17
+/* prologue: function */
+/* frame size = 0 */
+/* stack size = 2 */
+.L__stack_usage = 2
+        mov r16,r22
+        mov r17,r23
+        mov r18,r24
+        mov r19,r25
+        mov r27,r19
+        mov r26,r18
+        mov r25,r17
+        mov r24,r16
+        clr r24
+        clr r25
+        clr r26
+        andi r27,32
+        bst r27,5
+        clr r24
+        bld r24,0
+        sbrs r17,5
+        subi r24,lo8(-(-1))
+.L1:
+/* epilogue start */
+        pop r17
+        pop r16
+        ret
+```
+
+Which is much better than it was before (still could be improved more though but that is for a different time).
+
+To finish this patch up, I am supposed to do some cost modelling and such which I might get to this weekend.
+
+
+Even for aarch64 we do slightly better:
+```
+lfsr32_mpp_ge0:
+        and     x1, x0, 536870912
+        tbnz    x0, 13, .L2
+        cmp     x1, 0
+        csetm   w0, eq
+        and     w0, w0, 255
+        ret
+.L2:
+        cmp     x1, 0
+        cset    w0, ne
+        ret
+```
+
+
+```
+lfsr32_mpp_ge0:
+        and     x1, x0, 536870912
+        tbnz    x0, 13, .L2
+        ubfx    x0, x1, 29, 1
+        eor     w0, w0, 1
+        neg     w0, w0
+        and     w0, w0, 255
+        ret
+.L2:
+        ubfx    x0, x1, 29, 1
+        and     w0, w0, 255
+        ret
+```
+
+Though if there would be a way to remove the first and's, that would be best (and the last and, the last one is still there because of fuzziness with combine trying to do ne there still).
+
+Note even though it does increase in size, the cost of cset on some processors is 2 cycles rather than 1.
+
+- User: Andrew Pinski | Time: 2023-05-26 23:34:10 UTC
+  Text: Createdattachment 55175[details]Patch which fixes `signed < 0`
+
+This patch improvescomment #20.
+
+- User: Andrew Pinski | Time: 2023-05-26 23:49:10 UTC
+  Text: (In reply to Andrew Pinski fromcomment #25)> Createdattachment 55175[details]> Patch which fixes `signed < 0`
+> 
+> This patch improvescomment #20.Note this patch does not work for the case of normalizep == -1 but I have a fix for that.
+
+- User: Andrew Pinski | Time: 2023-05-27 00:36:26 UTC
+  Text: I should note the middle-end could also improve here:
+  /* If we are comparing a double-word integer with zero or -1, we can
+     convert the comparison into one involving a single word.  */
+  if (is_int_mode (mode, &int_mode)
+      && GET_MODE_BITSIZE (int_mode) == BITS_PER_WORD * 2
+      && (!MEM_P (op0) || ! MEM_VOLATILE_P (op0)))
+
+In the case of SImode, GET_MODE_BITSIZE is 32 while BITS_PER_WORD is just 8. We could use a loop (to generate the and/ior) if GET_MODE_BITSIZE (int_mode) is a (non-1) multiple of BITS_PER_WORD instead of the 1 expand_binop.
+
+But that is left for another person to do. That would also improve thecomment #20case too.
+
+Avr might be the only target which supports a mode size that is *4 of the BIT_PER_WORD fully.
+
+- User: Andrew Pinski | Time: 2023-05-27 04:02:39 UTC
+  Text: (In reply to Andrew Pinski fromcomment #26)> (In reply to Andrew Pinski fromcomment #25)
+> > Createdattachment 55175[details]> > Patch which fixes `signed < 0`
+> > 
+> > This patch improvescomment #20.
+> 
+> Note this patch does not work for the case of normalizep == -1 but I have a
+> fix for that.Also note this patch improves (a lot):
+```
+unsigned char f(long long t)
+{
+        return t < 0;
+}
+```
+Down to:
+```
+f:
+/* prologue: function */
+/* frame size = 0 */
+/* stack size = 0 */
+.L__stack_usage = 0
+        mov r24,r25
+        rol r24
+        clr r24
+        rol r24
+/* epilogue start */
+        ret
+```
+Rather than what it was in GCC 13:
+```
+f:
+        push r16
+        ldi r16,lo8(63)
+        rcall __lshrdi3
+        mov r24,r18
+pop r16
+        ret
+```
+
+- User: Andrew Pinski | Time: 2023-05-27 20:09:55 UTC
+  Text: (In reply to Andrew Pinski fromcomment #25)> Createdattachment 55175[details]> Patch which fixes `signed < 0`
+> 
+> This patch improvescomment #20.I ran into a code generation regression with this patch on x86_64. I have a patch to fix that but it might take sometime to submit both.
+
+- User: GCC Commits | Time: 2023-06-11 09:22:40 UTC
+  Text: The master branch has been updated by Georg-Johann Lay <gjl@gcc.gnu.org>:https://gcc.gnu.org/g:20643513b8dd34c07f2b0fccf119153a30735f66commitr14-1694-g20643513b8dd34c07f2b0fccf119153a30735f66Author: Georg-Johann Lay <avr@gjlay.de>
+Date:   Sat Jun 10 23:21:13 2023 +0200
+
+    target/19907: Overhaul bit extractions.
+    
+    o Logical right shift that shifts the MSB to position 0 can be performed in
+      such a way that the input operand constraint can be relaxed from "0" to "r".
+      This results in less register pressure.  Moreover, no scratch register is
+      required in that case.
+    
+    o The deprecated "extzv" pattern is replaced by "extzv<mode>" that allows
+      inputs of scalar integer modes of different sizes (1 up to 4 bytes).
+    
+    o Existing patterns are adjusted to the more generic "extzv<mode>" pattern.
+      Some patterns are added as the middle-end has been reworked to spot
+      more bit-extraction opportunities.
+    
+    o A C function is used to print the asm for bit extractions, which is more
+      convenient for complex output logic.
+    
+    The generated code is still not optimal because RTL optimizers might still
+    prefer arithmetic like shift over bit-extractions.  For test cases see
+    alsoPR36884andPR55181.
+    
+    gcc/PR target/109907* config/avr/avr.md (adjust_len) [extr, extr_not]: New elements.
+            (MSB, SIZE): New mode attributes.
+            (any_shift): New code iterator.
+            (*lshr<mode>3_split, *lshr<mode>3, lshr<mode>3)
+            (*lshr<mode>3_const_split): Add constraint alternative for
+            the case of shift-offset = MSB.  Ditch "length" attribute.
+            (extzv<mode): New. replaces extzv.  Adjust following patterns.
+            Use avr_out_extr, avr_out_extr_not to print asm.
+            (*extzv.subreg.<mode>, *extzv.<mode>.subreg, *extzv.xor)
+            (*extzv<mode>.ge, *neg.ashiftrt<mode>.msb, *extzv.io.lsr7): New.
+            * config/avr/constraints.md (C15, C23, C31, Yil): New
+            * config/avr/predicates.md (reg_or_low_io_operand)
+            (const7_operand, reg_or_low_io_operand)
+            (const15_operand, const_0_to_15_operand)
+            (const23_operand, const_0_to_23_operand)
+            (const31_operand, const_0_to_31_operand): New.
+            * config/avr/avr-protos.h (avr_out_extr, avr_out_extr_not): New.
+            * config/avr/avr.cc (avr_out_extr, avr_out_extr_not): New funcs.
+            (lshrqi3_out, lshrhi3_out, lshrpsi3_out, lshrsi3_out): Adjust
+            MSB case to new insn constraint "r" for operands[1].
+            (avr_adjust_insn_length) [ADJUST_LEN_EXTR_NOT, ADJUST_LEN_EXTR]:
+            Handle these cases.
+            (avr_rtx_costs_1): Adjust cost for a new pattern.
+    gcc/testsuite/PR target/109907* gcc.target/avr/pr109907.c: New test.
+            * gcc.target/avr/torture/pr109907-1.c: New test.
+            * gcc.target/avr/torture/pr109907-2.c: New test.
+
+- User: Georg-Johann Lay | Time: 2023-06-11 09:26:53 UTC
+  Text: Fixed in v14 for now.
+
+The backend does all it can do.  Non-optimal code is usually due to middleend and RTL optimizers coming up with sub-optimal expansions.
+

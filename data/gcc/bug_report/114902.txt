@@ -1,0 +1,579 @@
+Bug Summary: [14 Regression] wrong code at -O3 with "-fno-tree-vrp -fno-expensive-optimizations -fno-tree-dominator-opts" on x86_64-linux-gnu
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 14.0
+
+Comments:
+- User: Zhendong Su | Time: 2024-04-30 22:13:13 UTC
+  Text: It appears to be a recent regression as it doesn't reproduce with 13.2. 
+
+Compiler Explorer:https://godbolt.org/z/7ssP5W57E[587] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240430 (experimental) (GCC) 
+[588] % 
+[588] % gcctk -O3 -fno-tree-vrp -fno-expensive-optimizations -fno-tree-dominator-opts small.c
+[589] % ./a.out
+Floating point exception
+[590] % 
+[590] % gcctk -O3 small.c; ./a.out
+[591] % 
+[591] % cat small.c
+volatile int a, c;
+unsigned b = 1;
+int main() {
+  for (; a < 2; a++)
+    if (a)
+      for (; c < 2; c++) {
+        int d = -1, e = -(-d & ~b), f = -~(1 && b % a);
+        a % f || a;
+        if (d <= e)
+          e = a;
+        a = e;
+      }
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2024-05-01 02:06:36 UTC
+  Text: Confirmed.
+
+Here is a testcase which does not depedent on division by zero trapping:
+```
+
+volatile int a, c;
+unsigned b = 1;
+int main() {
+  a = 1;
+  for (; c < 2; c++) {
+    unsigned t = 1 & ~b;
+    int e = -t;
+    int f = -~(!!(1 % a));
+    if (a == 0) __builtin_trap();
+    if (e >= -1)
+      e = 1;
+    a = e;
+  }
+  return 0;
+}
+```
+
+The testcase works on aarch64-linux-gnu with no issues.
+
+The difference between GCC 13 and 14 is on the gimple level but the code looks correct there.
+
+In GCC 13 .optimized has:
+```
+  b.0_1 = b;
+  _2 = b.0_1 & 1;
+  _3 = _2 + 4294967295;
+  e_16 = (int) _3;
+  _13 = e_16 >= -1;
+  e_11 = _13 ? 1 : e_16;
+```
+
+
+While in 14  .optimized has:
+```
+  b.0_1 = b;
+  _2 = ~b.0_1;
+  t_13 = _2 & 1;
+  _3 = -t_13;
+  e_14 = (int) _3;
+  _10 = e_14 >= -1;
+  e_9 = _10 ? 1 : e_14;
+```
+
+Both are valid and correct.
+But then it goes wrong after that.
+I have not looked where though.
+
+- User: Andrew Pinski | Time: 2024-05-01 02:22:16 UTC
+  Text: Looks like the issue is during combine.
+
+After combine we have:
+```
+   12: r113:SI=[`b']
+   13: r112:SI=~r113:SI
+      REG_DEAD r113:SI
+      REG_EQUAL ~[`b']
+   14: NOTE_INSN_DELETED
+   15: {r109:SI=sign_extract(r112:SI,0x1,0);clobber flags:CC;}
+      REG_UNUSED flags:CC
+   18: NOTE_INSN_DELETED
+   19: NOTE_INSN_DELETED
+   22: r117:SI=0x1
+   21: flags:CCZ=cmp(zero_extract(r112:SI,0x1,0),0)
+      REG_DEAD r112:SI
+   23: r106:SI={(flags:CCZ==0)?r109:SI:r117:SI}
+      REG_DEAD r117:SI
+      REG_DEAD r109:SI
+      REG_DEAD flags:CCZ
+      REG_EQUAL {(flags:CCZ==0)?r109:SI:0x1}
+```
+
+insn 21 is wrong.
+
+
+
+```
+
+Trying 15 -> 18:
+   15: {r109:SI=sign_extract(r112:SI,0x1,0);clobber flags:CC;}
+      REG_DEAD r112:SI
+      REG_UNUSED flags:CC
+   18: flags:CCGC=cmp(r109:SI,0xffffffffffffffff)
+Failed to match this instruction:
+(parallel [
+        (set (reg:CCZ 17 flags)
+            (compare:CCZ (zero_extract:SI (reg:SI 112 [ _2 ])
+                    (const_int 1 [0x1])
+                    (const_int 0 [0]))
+                (const_int 0 [0])))
+        (set (reg/v:SI 109 [ eD.2798 ])
+            (sign_extract:SI (reg:SI 112 [ _2 ])
+                (const_int 1 [0x1])
+                (const_int 0 [0])))
+    ])
+Failed to match this instruction:
+(parallel [
+        (set (reg:CCZ 17 flags)
+            (compare:CCZ (zero_extract:SI (reg:SI 112 [ _2 ])
+                    (const_int 1 [0x1])
+                    (const_int 0 [0]))
+                (const_int 0 [0])))
+        (set (reg/v:SI 109 [ eD.2798 ])
+            (sign_extract:SI (reg:SI 112 [ _2 ])
+                (const_int 1 [0x1])
+                (const_int 0 [0])))
+    ])
+Failed to match this instruction:
+(parallel [
+        (set (reg:CCZ 17 flags)
+            (compare:CCZ (and:SI (reg:SI 112 [ _2 ])
+                    (const_int 1 [0x1]))
+                (const_int 0 [0])))
+        (set (reg/v:SI 109 [ eD.2798 ])
+            (sign_extract:SI (reg:SI 112 [ _2 ])
+                (const_int 1 [0x1])
+                (const_int 0 [0])))
+    ])
+Failed to match this instruction:
+(parallel [
+        (set (reg:CCZ 17 flags)
+            (compare:CCZ (and:SI (reg:SI 112 [ _2 ])
+                    (const_int 1 [0x1]))
+                (const_int 0 [0])))
+        (set (reg/v:SI 109 [ eD.2798 ])
+            (sign_extract:SI (reg:SI 112 [ _2 ])
+                (const_int 1 [0x1])
+                (const_int 0 [0])))
+    ])
+Successfully matched this instruction:
+(set (reg/v:SI 109 [ eD.2798 ])
+    (sign_extract:SI (reg:SI 112 [ _2 ])
+        (const_int 1 [0x1])
+        (const_int 0 [0])))
+Successfully matched this instruction:
+(set (reg:CCZ 17 flags)
+    (compare:CCZ (zero_extract:SI (reg:SI 112 [ _2 ])
+            (const_int 1 [0x1])
+            (const_int 0 [0]))
+        (const_int 0 [0])))
+Successfully matched this instruction:
+(set (reg:QI 115 [ _10 ])
+    (ne:QI (reg:CCZ 17 flags)
+        (const_int 0 [0])))
+allowing combination of insns 15 and 18
+original costs 4 + 4 = 12
+replacement costs 4 + 4 = 12
+modifying other_insn    19: r115:QI=flags:CCZ!=0
+      REG_DEAD flags:CCGC
+deferring rescan insn with uid = 19.
+modifying insn i2    15: {r109:SI=sign_extract(r112:SI,0x1,0);clobber flags:CC;}
+      REG_UNUSED flags:CC
+deferring rescan insn with uid = 15.
+modifying insn i3    18: flags:CCZ=cmp(zero_extract(r112:SI,0x1,0),0)
+      REG_DEAD r112:SI
+deferring rescan insn with uid = 18.
+```
+
+We go from CCGC with a sign_extend to a zero_extend with CCZ. that can't be right.
+
+- User: Andrew Pinski | Time: 2024-05-01 02:34:44 UTC
+  Text: Note this is almost definitely a latent bug exposed by some change. Might be interesting to see what change exposed it but not so much really.
+
+- User: Andrew Pinski | Time: 2024-05-01 05:12:13 UTC
+  Text: here is a reduced testcase:
+```
+
+[[gnu::noipa]]
+int f(int b)
+{
+    int tt1 = ~b;
+    int t = 1 & tt1;
+    int e = -t;
+    int tt = e >= -1;
+    if (tt) return 0;
+    __builtin_trap();
+}
+
+int main()
+{
+  for(int i = -1;i < 2; i++)
+    f(i);
+}
+```
+
+Note ` -O1 -fno-tree-fre -fno-tree-forwprop -fno-tree-ccp  -fno-tree-dominator-opts` is needed to reproduce it with this one. The generate gimple is the same between GCC 13 and 14 here.
+
+But the first difference is in combine:
+```
+Trying 7 -> 8:
+    7: {r106:SI=r105:SI&0x1;clobber flags:CC;}
+      REG_DEAD r105:SI
+      REG_UNUSED flags:CC
+    8: {r107:SI=-r106:SI;clobber flags:CC;}
+      REG_DEAD r106:SI
+      REG_UNUSED flags:CC
+Successfully matched this instruction:
+(parallel [
+        (set (reg:SI 107 [ e_5 ])
+            (sign_extract:SI (reg:SI 105 [ tt1_3 ])
+                (const_int 1 [0x1])
+                (const_int 0 [0])))
+        (clobber (reg:CC 17 flags))
+    ])
+allowing combination of insns 7 and 8
+original costs 4 + 4 = 8
+replacement cost 4
+deferring deletion of insn with uid = 7.
+modifying insn i3     8: {r107:SI=sign_extract(r105:SI,0x1,0);clobber flags:CC;}
+      REG_DEAD r105:SI
+
+```
+
+This is correct but it goes down hill after like as I mentioned incomment #2.
+
+So it does look like a latent bug after all.
+
+
+If someone does a bisect of this testcase, I am 99% sure you findr14-4810-ge28869670c9879is where the failure was introduced. For the original testcase and the one incomment #1might find a different commit due to gimple level being different.
+
+- User: Andrew Pinski | Time: 2024-05-01 05:29:42 UTC
+  Text: (In reply to Andrew Pinski fromcomment #4)> here is a reduced testcase:> Note ` -O1 -fno-tree-fre -fno-tree-forwprop -fno-tree-ccp 
+> -fno-tree-dominator-opts`This testcase is broken in GCC 13 for mips64-linux-gnu with the added option -march=octeon.
+And it has been broken since at least 4.9.4.
+        andi    $4,$4,0x1
+        xori    $4,$4,0x1
+        teq     $4,0
+        j       $31
+        move    $2,$0
+
+That is:
+$4 = $4 & 0x1
+$4 = $4 ^ 1
+trapif $4 == 0
+
+That is the earliest compiler version I could test where I Know that sign_extract shows up in RTL.
+
+- User: Segher Boessenkool | Time: 2024-05-03 08:14:38 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> Looks like the issue is during combine.
+> 
+> We go from CCGC with a sign_extend to a zero_extend with CCZ. that can't be
+> right.Why is that not correct?  zero_extend is preferred over sign_extend, and both
+are equivalent when only checking for zero.
+
+Is there something wrong in target code here, perhaps?
+
+- User: Andrew Pinski | Time: 2024-05-03 08:38:37 UTC
+  Text: (In reply to Segher Boessenkool fromcomment #6)> (In reply to Andrew Pinski fromcomment #2)
+> > Looks like the issue is during combine.
+> > 
+> > We go from CCGC with a sign_extend to a zero_extend with CCZ. that can't be
+> > right.
+> 
+> Why is that not correct?  zero_extend is preferred over sign_extend, and both
+> are equivalent when only checking for zero.For Equality they are equivalent yes. But when doing `a >=s 0` a sign extend/extract will cause different results from a zero extend/extract.> Is there something wrong in target code here, perhaps?For arm, x86 and mips?
+
+For testcase incomment #4on x86_64:
+Before combine we start with:
+```
+(insn 16 15 17 2 (parallel [
+            (set (reg:SI 106 [ t_4 ])
+                (and:SI (reg:SI 105 [ tt1_3 ])
+                    (const_int 1 [0x1])))
+            (clobber (reg:CC 17 flags))
+        ]) "/app/example.cpp":6:9 617 {*andsi_1}
+     (expr_list:REG_DEAD (reg:SI 105 [ tt1_3 ])
+        (expr_list:REG_UNUSED (reg:CC 17 flags)
+            (nil))))
+(insn 17 16 20 2 (parallel [
+            (set (reg:SI 107 [ e_5 ])
+                (neg:SI (reg:SI 106 [ t_4 ])))
+            (clobber (reg:CC 17 flags))
+        ]) "/app/example.cpp":7:9 804 {*negsi_1}
+     (expr_list:REG_DEAD (reg:SI 106 [ t_4 ])
+        (expr_list:REG_UNUSED (reg:CC 17 flags)
+            (nil))))
+(insn 20 17 21 2 (set (reg:CCGC 17 flags)
+        (compare:CCGC (reg:SI 107 [ e_5 ])
+            (const_int -1 [0xffffffffffffffff]))) "/app/example.cpp":8:16 11 {*cmpsi_1}
+     (expr_list:REG_DEAD (reg:SI 107 [ e_5 ])
+        (nil)))
+(insn 21 20 22 2 (set (reg:QI 109)
+        (ge:QI (reg:CCGC 17 flags)
+            (const_int 0 [0]))) "/app/example.cpp":8:16 1125 {*setcc_qi}
+     (expr_list:REG_DEAD (reg:CCGC 17 flags)
+        (nil)))
+(insn 22 21 23 2 (set (reg:SI 108 [ _1 ])
+        (zero_extend:SI (reg:QI 109))) "/app/example.cpp":8:16 169 {*zero_extendqisi2}
+     (expr_list:REG_DEAD (reg:QI 109)
+        (nil)))
+(insn 23 22 24 2 (set (reg:CCZ 17 flags)
+        (compare:CCZ (reg:SI 108 [ _1 ])
+            (const_int 0 [0]))) "/app/example.cpp":9:8 7 {*cmpsi_ccno_1}
+     (expr_list:REG_DEAD (reg:SI 108 [ _1 ])
+        (nil)))
+(jump_insn 24 23 30 2 (set (pc)
+        (if_then_else (eq (reg:CCZ 17 flags)
+                (const_int 0 [0]))
+            (label_ref 30)
+            (pc))) "/app/example.cpp":9:8 1130 {*jcc}
+     (expr_list:REG_DEAD (reg:CCZ 17 flags)
+        (int_list:REG_BR_PROB 7 (nil)))
+ -> 30)
+```
+
+We first combine 16->17 into:
+```
+(parallel [
+        (set (reg:SI 107 [ e_5 ])
+            (sign_extract:SI (reg:SI 105 [ tt1_3 ])
+                (const_int 1 [0x1])
+                (const_int 0 [0])))
+        (clobber (reg:CC 17 flags))
+    ])
+```
+which is correct and good
+
+And then when combining 17 -> 20 combine does:
+Trying 17 -> 20:
+   17: {r107:SI=sign_extract(r105:SI,0x1,0);clobber flags:CC;}
+      REG_DEAD r105:SI
+      REG_UNUSED flags:CC
+   20: flags:CCGC=cmp(r107:SI,0xffffffffffffffff)
+      REG_DEAD r107:SI
+Successfully matched this instruction:
+(set (reg:CCZ 17 flags)
+    (compare:CCZ (zero_extract:SI (reg:SI 105 [ tt1_3 ])
+            (const_int 1 [0x1])
+            (const_int 0 [0]))
+        (const_int 0 [0])))
+Successfully matched this instruction:
+(set (reg:QI 109)
+    (ne:QI (reg:CCZ 17 flags)
+        (const_int 0 [0])))
+
+Which is also replacing insn 21 incorrectly.
+We go from `-(a&1) >= -1` (which is always true) to `(a&1) != 0`.
+Maybe we go to `(a&1) <= 1` (still always true) and we mess up somehow to `(a & 1) != 0`
+
+- User: Richard Biener | Time: 2024-05-07 07:45:59 UTC
+  Text: GCC 14.1 is being released, retargeting bugs to GCC 14.2.
+
+- User: Segher Boessenkool | Time: 2024-05-09 09:48:47 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> We go from CCGC with a sign_extend to a zero_extend with CCZ. that can't be
+> right.Why not?  We prefer zero_extend whenever it has the same result.
+
+- User: Segher Boessenkool | Time: 2024-05-09 09:49:17 UTC
+  Text: (_extract, btw.)
+
+- User: Segher Boessenkool | Time: 2024-05-14 20:09:08 UTC
+  Text: So, is there a simplified testcase that *actually* shows any *actual* problem?
+
+- User: Andrew Pinski | Time: 2024-05-14 22:04:01 UTC
+  Text: ***Bug 115092has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2024-05-15 16:44:24 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:0b93a0ae153ef70a82ff63e67926a01fdab9956bcommitr15-520-g0b93a0ae153ef70a82ff63e67926a01fdab9956bAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 15 18:37:17 2024 +0200
+
+    combine: Fix up simplify_compare_const [PR115092]
+    
+    The following testcases are miscompiled (with tons of GIMPLE
+    optimization disabled) because combine sees GE comparison of
+    1-bit sign_extract (i.e. something with [-1, 0] value range)
+    with (const_int -1) (which is always true) and optimizes it into
+    NE comparison of 1-bit zero_extract ([0, 1] value range) against
+    (const_int 0).
+    The reason is that simplify_compare_const first (correctly)
+    simplifies the comparison to
+    GE (ashift:SI something (const_int 31)) (const_int -2147483648)
+    and then an optimization for when the second operand is power of 2
+    triggers.  That optimization is fine for power of 2s which aren't
+    the signed minimum of the mode, or if it is NE, EQ, GEU or LTU
+    against the signed minimum of the mode, but for GE or LT optimizing
+    it into NE (or EQ) against const0_rtx is wrong, those cases
+    are always true or always false (but the function doesn't have
+    a standardized way to tell callers the comparison is now unconditional).
+    
+    The following patch just disables the optimization in that case.
+    
+    2024-05-15  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/114902PR rtl-optimization/115092* combine.cc (simplify_compare_const): Don't optimize
+            GE op0 SIGNED_MIN or LT op0 SIGNED_MIN into NE op0 const0_rtx or
+            EQ op0 const0_rtx.
+    
+            * gcc.dg/pr114902.c: New test.
+            * gcc.dg/pr115092.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-05-15 16:54:49 UTC
+  Text: Fixed for 15.1+ so far.
+
+- User: GCC Commits | Time: 2024-06-04 14:26:22 UTC
+  Text: The releases/gcc-14 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:14a7296d04474055bfe1d7f130dceac6dabf390dcommitr14-10276-g14a7296d04474055bfe1d7f130dceac6dabf390dAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 15 18:37:17 2024 +0200
+
+    combine: Fix up simplify_compare_const [PR115092]
+    
+    The following testcases are miscompiled (with tons of GIMPLE
+    optimization disabled) because combine sees GE comparison of
+    1-bit sign_extract (i.e. something with [-1, 0] value range)
+    with (const_int -1) (which is always true) and optimizes it into
+    NE comparison of 1-bit zero_extract ([0, 1] value range) against
+    (const_int 0).
+    The reason is that simplify_compare_const first (correctly)
+    simplifies the comparison to
+    GE (ashift:SI something (const_int 31)) (const_int -2147483648)
+    and then an optimization for when the second operand is power of 2
+    triggers.  That optimization is fine for power of 2s which aren't
+    the signed minimum of the mode, or if it is NE, EQ, GEU or LTU
+    against the signed minimum of the mode, but for GE or LT optimizing
+    it into NE (or EQ) against const0_rtx is wrong, those cases
+    are always true or always false (but the function doesn't have
+    a standardized way to tell callers the comparison is now unconditional).
+    
+    The following patch just disables the optimization in that case.
+    
+    2024-05-15  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/114902PR rtl-optimization/115092* combine.cc (simplify_compare_const): Don't optimize
+            GE op0 SIGNED_MIN or LT op0 SIGNED_MIN into NE op0 const0_rtx or
+            EQ op0 const0_rtx.
+    
+            * gcc.dg/pr114902.c: New test.
+            * gcc.dg/pr115092.c: New test.
+    
+    (cherry picked from commit 0b93a0ae153ef70a82ff63e67926a01fdab9956b)
+
+- User: Jakub Jelinek | Time: 2024-06-04 14:28:30 UTC
+  Text: Fixed.
+
+- User: GCC Commits | Time: 2024-06-11 06:17:28 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:8deaab6f79768700e1bf05fe6af83b185f678b7fcommitr13-8833-g8deaab6f79768700e1bf05fe6af83b185f678b7fAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 15 18:37:17 2024 +0200
+
+    combine: Fix up simplify_compare_const [PR115092]
+    
+    The following testcases are miscompiled (with tons of GIMPLE
+    optimization disabled) because combine sees GE comparison of
+    1-bit sign_extract (i.e. something with [-1, 0] value range)
+    with (const_int -1) (which is always true) and optimizes it into
+    NE comparison of 1-bit zero_extract ([0, 1] value range) against
+    (const_int 0).
+    The reason is that simplify_compare_const first (correctly)
+    simplifies the comparison to
+    GE (ashift:SI something (const_int 31)) (const_int -2147483648)
+    and then an optimization for when the second operand is power of 2
+    triggers.  That optimization is fine for power of 2s which aren't
+    the signed minimum of the mode, or if it is NE, EQ, GEU or LTU
+    against the signed minimum of the mode, but for GE or LT optimizing
+    it into NE (or EQ) against const0_rtx is wrong, those cases
+    are always true or always false (but the function doesn't have
+    a standardized way to tell callers the comparison is now unconditional).
+    
+    The following patch just disables the optimization in that case.
+    
+    2024-05-15  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/114902PR rtl-optimization/115092* combine.cc (simplify_compare_const): Don't optimize
+            GE op0 SIGNED_MIN or LT op0 SIGNED_MIN into NE op0 const0_rtx or
+            EQ op0 const0_rtx.
+    
+            * gcc.dg/pr114902.c: New test.
+            * gcc.dg/pr115092.c: New test.
+    
+    (cherry picked from commit 0b93a0ae153ef70a82ff63e67926a01fdab9956b)
+
+- User: GCC Commits | Time: 2024-06-11 10:38:52 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:840bc6741680a9c4b58fa1005f19a5d2e7d4be1fcommitr12-10530-g840bc6741680a9c4b58fa1005f19a5d2e7d4be1fAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 15 18:37:17 2024 +0200
+
+    combine: Fix up simplify_compare_const [PR115092]
+    
+    The following testcases are miscompiled (with tons of GIMPLE
+    optimization disabled) because combine sees GE comparison of
+    1-bit sign_extract (i.e. something with [-1, 0] value range)
+    with (const_int -1) (which is always true) and optimizes it into
+    NE comparison of 1-bit zero_extract ([0, 1] value range) against
+    (const_int 0).
+    The reason is that simplify_compare_const first (correctly)
+    simplifies the comparison to
+    GE (ashift:SI something (const_int 31)) (const_int -2147483648)
+    and then an optimization for when the second operand is power of 2
+    triggers.  That optimization is fine for power of 2s which aren't
+    the signed minimum of the mode, or if it is NE, EQ, GEU or LTU
+    against the signed minimum of the mode, but for GE or LT optimizing
+    it into NE (or EQ) against const0_rtx is wrong, those cases
+    are always true or always false (but the function doesn't have
+    a standardized way to tell callers the comparison is now unconditional).
+    
+    The following patch just disables the optimization in that case.
+    
+    2024-05-15  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/114902PR rtl-optimization/115092* combine.cc (simplify_compare_const): Don't optimize
+            GE op0 SIGNED_MIN or LT op0 SIGNED_MIN into NE op0 const0_rtx or
+            EQ op0 const0_rtx.
+    
+            * gcc.dg/pr114902.c: New test.
+            * gcc.dg/pr115092.c: New test.
+    
+    (cherry picked from commit 0b93a0ae153ef70a82ff63e67926a01fdab9956b)
+
+- User: GCC Commits | Time: 2024-06-20 13:23:52 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:82bb4ee090342f2b787661420f701f2e0bf6624acommitr11-11512-g82bb4ee090342f2b787661420f701f2e0bf6624aAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 15 18:37:17 2024 +0200
+
+    combine: Fix up simplify_compare_const [PR115092]
+    
+    The following testcases are miscompiled (with tons of GIMPLE
+    optimization disabled) because combine sees GE comparison of
+    1-bit sign_extract (i.e. something with [-1, 0] value range)
+    with (const_int -1) (which is always true) and optimizes it into
+    NE comparison of 1-bit zero_extract ([0, 1] value range) against
+    (const_int 0).
+    The reason is that simplify_compare_const first (correctly)
+    simplifies the comparison to
+    GE (ashift:SI something (const_int 31)) (const_int -2147483648)
+    and then an optimization for when the second operand is power of 2
+    triggers.  That optimization is fine for power of 2s which aren't
+    the signed minimum of the mode, or if it is NE, EQ, GEU or LTU
+    against the signed minimum of the mode, but for GE or LT optimizing
+    it into NE (or EQ) against const0_rtx is wrong, those cases
+    are always true or always false (but the function doesn't have
+    a standardized way to tell callers the comparison is now unconditional).
+    
+    The following patch just disables the optimization in that case.
+    
+    2024-05-15  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/114902PR rtl-optimization/115092* combine.c (simplify_compare_const): Don't optimize
+            GE op0 SIGNED_MIN or LT op0 SIGNED_MIN into NE op0 const0_rtx or
+            EQ op0 const0_rtx.
+    
+            * gcc.dg/pr114902.c: New test.
+            * gcc.dg/pr115092.c: New test.
+    
+    (cherry picked from commit 0b93a0ae153ef70a82ff63e67926a01fdab9956b)
+

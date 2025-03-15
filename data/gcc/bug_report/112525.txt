@@ -1,0 +1,125 @@
+Bug Summary: fail to eliminate unused store
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jiu Fu Guo | Time: 2023-11-14 06:40:18 UTC
+  Text: For below code:
+```
+typedef struct teststruct
+{
+  double d;
+  int arr[15]; /* for ppc64le example foo1, 14: foo is just blr. 15: foo has 8 'std's */
+} teststruct;
+
+int
+foo (int a, teststruct p)
+{
+  if (a > 0)
+    return 1;
+  return 2;
+}
+
+void
+foo1 (teststruct p)
+{
+}
+```
+
+Some instructions are generated to store "p" to stack (stored to areas of arg pointer/virtual_incoming_pointer).
+But those stores are not eliminated.
+
+For example, on ppc64le, below code is generated:
+```
+foo1:
+.LFB1:
+        .cfi_startproc
+        std 3,32(1)
+        std 4,40(1)
+        std 5,48(1)
+        std 6,56(1)
+        std 7,64(1)
+      	std 8,72(1)
+	std 9,80(1)
+	std 10,88(1)
+	blr
+```
+Those 'std's are dead actually.
+
+- User: Jiu Fu Guo | Time: 2023-11-14 06:48:19 UTC
+  Text: (In reply to Jiu Fu Guo fromcomment #0)> For below code:
+> ```
+> typedef struct teststruct
+> {
+>   double d;
+>   int arr[15]; /* for ppc64le example foo1, 14: foo is just blr. 15: foo has
+> 8 'std's */
+> } teststruct;Here, if the code is "int arr[14];", the struct is just passed via registers (in foo function); and in the expander pass, they are stored to frame area. 
+If the code is "int arr[15];",  the struct is passed through registers partially, and the other partial is through memory; and in the expander pass, they are stored to the area which is pointed via arg pointer.
+
+In DSE pass, the 'dead' stores to 'frame' can be eliminated.
+
+- User: Andrew Pinski | Time: 2023-11-14 06:49:48 UTC
+  Text: And more
+
+- User: Jiu Fu Guo | Time: 2023-11-14 07:01:17 UTC
+  Text: One possible method is fixing DSE to let is able to remove those 'store's.
+(but need to take care of the case that is using 'arg_pointer' to pass parameters.)
+
+
+Another method: there is a patchhttps://gcc.gnu.org/pipermail/gcc-patches/2023-October/634500.htmlwhich introduces lighter-expander-sra (this patch is only for struct parameter now). We may enhance this patch to avoid storing the unused parameters.
+
+- User: Richard Biener | Time: 2023-11-14 07:44:10 UTC
+  Text: I wonder if optimizing for "unused" parameters is worth it (usually IPA SRA will elide them).  "unused" could be computed by cfgexpand walking the body, but
+we do expect to be able to inspect those parameters with -g, so care has to
+be taken that this works at all optimization levels.
+
+- User: Richard Biener | Time: 2023-11-14 07:45:27 UTC
+  Text: On x86 calling conventions seem to avoid this issue.
+
+- User: Jiu Fu Guo | Time: 2023-11-15 01:49:14 UTC
+  Text: (In reply to Jiu Fu Guo fromcomment #3)> One possible method is fixing DSE to let is able to remove those 'store's.
+> (but need to take care of the case that is using 'arg_pointer' to pass
+> parameters.)
+>Some 'store's to the incoming argument area (arg_pointer_rtx) may not safe to be removed:
+For example: call memset on X86_64 , the insn(s) maybe:
+  134: [argp+0x8]=r134:SI
+  135: [argp+0x4]=0x1
+  136: [argp]=r132:SI
+  137: ax:SI=call [`memset'] argc:0xc
+      REG_CALL_DECL `memset'
+      REG_EH_REGION 0
+
+insn(s) 134/135/136 can not be removed.
+
+- User: GCC Commits | Time: 2023-12-19 05:18:55 UTC
+  Text: The master branch has been updated by Jiu Fu Guo <guojiufu@gcc.gnu.org>:https://gcc.gnu.org/g:4759383245ac97a5c83c0272f0a831f2a26ea5c1commitr14-6674-g4759383245ac97a5c83c0272f0a831f2a26ea5c1Author: Jiufu Guo <guojiufu@linux.ibm.com>
+Date:   Tue Dec 19 13:03:06 2023 +0800
+
+    treat argp-based mem as frame related in dse
+    
+    The issue mentioned inPR112525would be able to be handled by
+    updating dse.cc to treat arg_pointer_rtx similarly with frame_pointer_rtx.https://gcc.gnu.org/bugzilla/show_bug.cgi?id=30271#c10also mentioned
+    this idea.
+    
+    And arpg area may be used to pass argument to callee. So, it would
+    be needed to check if call insns are using that mem.PR rtl-optimization/112525PR target/30271gcc/ChangeLog:
+    
+            * dse.cc (get_group_info): Add arg_pointer_rtx as frame_related.
+            (check_mem_read_rtx): Add parameter to indicate if it is checking mem
+            for call insn.
+            (scan_insn): Add mem checking on call usage.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr112525.c: New test.
+            * gcc.target/powerpc/pr30271.c: New test.
+
+- User: Jiu Fu Guo | Time: 2024-01-04 00:47:07 UTC
+  Text: Fix committed.
+

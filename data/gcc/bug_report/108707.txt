@@ -1,0 +1,137 @@
+Bug Summary: suboptimal allocation with same memory op for many different instructions.
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: missed-optimization, ra
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Hongtao.liu | Time: 2023-02-08 03:11:30 UTC
+  Text: #include<immintrin.h>
+
+void
+foo (__m512* pv, float* __restrict ps, int n, __m512* pdest,
+__m512* p1, __m512* p2, __m512* p3)
+{
+    __m512 a = _mm512_setzero_ps ();
+    __m512 b = a;
+    __m512 c = a;
+    for (int i = 0; i != n ;i++)
+    {
+        a = _mm512_fmadd_ps (p1[i], pv[i], a);
+        b = _mm512_fmadd_ps (p2[i], pv[i], b);
+        c = _mm512_fmadd_ps (p3[i], pv[i], c);
+    }
+    pdest[0] = a;
+    pdest[1] = b;
+    pdest[2] = c;
+}
+
+g++ -O2 -mavx512f -S
+
+got 
+
+.L3:
+        vmovaps (%r8,%rax), %zmm3
+        vmovaps (%r9,%rax), %zmm4
+        vmovaps (%rsi,%rax), %zmm5
+        vfmadd231ps     (%rdi,%rax), %zmm3, %zmm2
+        vfmadd231ps     (%rdi,%rax), %zmm4, %zmm1
+        vfmadd231ps     (%rdi,%rax), %zmm5, %zmm0
+        addq    $64, %rax
+        cmpq    %rax, %rdx
+        jne     .L3
+
+It would be better to load (%rdi, %rax) into a zmm then
+
+.L3:
+        vmovaps (%rdi,%rax), %zmm0
+        vfmadd231ps     (%r8,%rax), %zmm0, %zmm3
+        vfmadd231ps     (%r9,%rax), %zmm0, %zmm2
+        vfmadd231ps     (%rsi,%rax), %zmm0, %zmm1
+        addq    $64, %rax
+        cmpq    %rax, %rdx
+        jne     .L3
+
+- User: Hongtao.liu | Time: 2023-02-08 03:15:05 UTC
+  Text: It's related to memory_move_cost, in RA
+
+1466  /* If this insn loads a parameter from its stack slot, then it
+1467     represents a savings, rather than a cost, if the parameter is
+1468     stored in memory.  Record this fact.
+1469
+1470     Similarly if we're loading other constants from memory (constant
+1471     pool, TOC references, small data areas, etc) and this is the only
+1472     assignment to the destination pseudo.
+1473
+1474     Don't do this if SET_SRC (set) isn't a general operand, if it is
+1475     a memory requiring special instructions to load it, decreasing
+1476     mem_cost might result in it being loaded using the specialized
+1477     instruction into a register, then stored into stack and loaded
+1478     again from the stack.  SeePR52208.
+1479
+1480     Don't do this if SET_SRC (set) has side effect.  SeePR56124.  */
+1481  if (set != 0 && REG_P (SET_DEST (set)) && MEM_P (SET_SRC (set))
+1482      && (note = find_reg_note (insn, REG_EQUIV, NULL_RTX)) != NULL_RTX
+1483      && ((MEM_P (XEXP (note, 0))
+1484           && !side_effects_p (SET_SRC (set)))
+1485          || (CONSTANT_P (XEXP (note, 0))
+1486              && targetm.legitimate_constant_p (GET_MODE (SET_DEST (set)),
+1487                                                XEXP (note, 0))
+1488              && REG_N_SETS (REGNO (SET_DEST (set))) == 1))
+1489      && general_operand (SET_SRC (set), GET_MODE (SET_SRC (set)))
+1490      /* LRA does not use equiv with a symbol for PIC code.  */
+1491      && (! ira_use_lra_p || ! pic_offset_table_rtx
+1492          || ! contains_symbol_ref_p (XEXP (note, 0))))
+1493    {
+1494      enum reg_class cl = GENERAL_REGS;
+1495      rtx reg = SET_DEST (set);
+1496      int num = COST_INDEX (REGNO (reg));
+1497
+1498      COSTS (costs, num)->mem_cost
+1499        -= ira_memory_move_cost[GET_MODE (reg)][cl][1] * frequency;
+1500      record_address_regs (GET_MODE (SET_SRC (set)),
+1501                           MEM_ADDR_SPACE (SET_SRC (set)),
+1502                           XEXP (SET_SRC (set), 0), 0, MEM, SCRATCH,
+1503                           frequency * 2);
+1504      counted_mem = true;
+
+we use GENERAL_REGS for E_V16SFmode move cost which should be inaccurate, i think when preferred regclass is unknown, we'd better use NO_REGS.
+
+ 588            /* Costs for NO_REGS are used in cost calculation on the
+ 589               1st pass when the preferred register classes are not
+ 590               known yet.  In this case we take the best scenario.  */
+
+- User: Richard Biener | Time: 2023-02-09 13:38:51 UTC
+  Text: I've filed a duplicate PR about this at some point, but I can't find it right now.
+
+- User: Hongtao.liu | Time: 2023-03-09 05:58:52 UTC
+  Text: Createdattachment 54614[details]0001.patch
+
+- User: Hongtao.liu | Time: 2023-03-09 05:59:27 UTC
+  Text: Createdattachment 54615[details]0002.patch
+
+- User: Hongtao.liu | Time: 2023-03-09 05:59:49 UTC
+  Text: Createdattachment 54616[details]0003.patch
+
+- User: Hongtao.liu | Time: 2023-03-09 06:00:08 UTC
+  Text: 3 patches pending for GCC14.
+
+- User: GCC Commits | Time: 2023-04-23 01:57:27 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:0368d169492017cfab5622d38b15be94154d458ccommitr14-172-g0368d169492017cfab5622d38b15be94154d458cAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Feb 8 12:42:27 2023 +0800
+
+    Use NO_REGS in cost calculation when the preferred register class are not known yet.
+    
+    gcc/ChangeLog:PR rtl-optimization/108707* ira-costs.cc (scan_one_insn): Use NO_REGS instead of
+            GENERAL_REGS when preferred reg_class is not known.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr108707.c: New test.
+
+- User: Hongtao.liu | Time: 2023-11-01 05:29:48 UTC
+  Text: Fixed in GCC14.
+

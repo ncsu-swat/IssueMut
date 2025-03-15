@@ -1,0 +1,127 @@
+Bug Summary: [15 regression] RISC-V: Error when building glibc from source since r15-4377-gf9bac238840
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: rejects-valid
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Edwin Lu | Time: 2024-10-16 19:06:28 UTC
+  Text: Our postcommit is failing to build all linux targets sincer15-4377-gf9bac238840with the error: 
+
+cp1258.c:551:13: error: size of array 'verify2' is negative
+  551 | typedef int verify2[(NELEMS (from_ucs4) == FROM_IDX_FF) - 1];
+      |             ^~~~~~~
+make[3]: *** [../o-iterator.mk:9: /scratch/ewlu/ci/triage/baseline/build-failure/build-glibc-linux-rv32imafdc-ilp32d/iconvdata/cp1258.os] Error 1https://github.com/patrick-rivos/gcc-postcommit-ci/issues/1937This is attempting to build glibc 2.39 at hash ef321e23c20eebc6d6fb4044425c00e6df27b05f with the stage1 cc1/xgcc 
+
+Tested locally onr15-4393-g69b2d523b10and confirmed error.
+
+glibc configure:
+/scratch/ewlu/ci/triage/baseline/hash-f9bac238840155e1539aa68daf1507ea63c9ed80/../glibc/configure --host=riscv32-unknown-linux-gnu --prefix=/usr --disable-werror --enable-shared --enable-obsolete-rpc --with-headers=/scratch/ewlu/ci/triage/baseline/hash-f9bac238840155e1539aa68daf1507ea63c9ed80/../linux-headers/include --enable-multilib --enable-kernel=3.0.0 --libdir=/usr/lib32/ilp32d libc_cv_slibdir=/lib32/ilp32d libc_cv_rtlddir=/lib
+
+- User: Jakub Jelinek | Time: 2024-10-16 19:37:18 UTC
+  Text: Do you have preprocessed source + gcc command line?
+
+- User: Jakub Jelinek | Time: 2024-10-16 19:47:56 UTC
+  Text: Ah,
+unsigned char foo[] = {
+  0xc8, 0xc9, 0xca, 0xcb, 0x00, 0xcd, 0xce, 0xcf,
+  0x00, 0xd1, 0x00, 0xd3, 0xd4, 0x00, 0xd6, 0xd7,
+  0xd8, 0xd9, 0xda, 0xdb, 0xdc, 0x00, 0x00, 0xdf,
+  0xe0, 0xe1, 0xe2, 0x00, 0xe4, 0xe5, 0xe6, 0xe7,
+  0xe8, 0xe9, 0xea, 0xeb, 0x00, 0xed, 0xee, 0xef,
+  0x00, 0xf1, 0x00, 0xf3, 0xf4, 0x00, 0xf6, 0xf7,
+  0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0x00, 0x00, 0xff,
+  0x00, 0x00, 0xc3, 0xe3, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+typedef int bar[sizeof (foo) == 72 ? 1 : -1];
+reproduces it.
+The size of the initializer actually emitted is correct, just sizeof and .size are wrong.
+
+- User: Jakub Jelinek | Time: 2024-10-16 20:23:55 UTC
+  Text: Ah, the problem is in the trailing comma before }.
+Because CPP_EMBED guarantees a CPP_NUMBER CPP_COMMA before it and CPP_COMMA CPP_NUMBER
+after it, this new code wanted to do the same, because clearly we don't derive the right size if the last CONSTRUCTOR_ELT is RAW_DATA_CST.
+But it is wrong to check just that next token is CPP_COMMA for the arrays of unspecified width, it really needs to be CPP_COMMA followed by CPP_NUMBER.
+
+- User: Sergei Trofimovich | Time: 2024-10-16 23:25:35 UTC
+  Text: I suspect a similar regression on python-3.12.7. Bisected to the same `gcc` commit.
+
+The reproducer:
+
+  # build gcc
+  $ ~/dev/git/gcc/configure --disable-multilib --disable-bootstrap --disable-lto --disable-libsanitizer --disable-libstdcxx-pch --enable-languages=c,c++ --disable-libgomp --disable-libquadmath --disable-libvtv 'CFLAGS=-O1 -g0' 'CXXFLAGS=-O1 -g0' 'LDFLAGS=-O1 -g0' --prefix=/tmp/gb/__i__
+  $ make -j$(nproc)
+  $ make install -j$(nproc)
+
+  # build python
+  $ wgethttps://www.python.org/ftp/python/3.12.7/Python-3.12.7.tar.xz$ tar xf Python-3.12.7.tar.xz
+  $ cd Python-3.12.7
+  $ ./configure CC=$PWD/../__i__/bin/gcc CXX=$PWD/../__i__/bin/g++
+  $ make
+
+./_bootstrap_python ./Programs/_freeze_module.py abc ./Lib/abc.py Python/frozen_modules/abc.h
+Fatal Python error: _PyImport_InitCore: failed to initialize importlib
+Python runtime state: preinitialized
+ImportError: Frozen object named '_frozen_importlib' is invalid
+
+Current thread 0x00007f77c28efb80 (most recent call first):
+  <no Python frame>
+make: *** [Makefile:1311: Python/frozen_modules/abc.h] Error 1
+
+$ $PWD/../__i__/bin/gcc -v
+Using built-in specs.
+COLLECT_GCC=/tmp/gb/Python-3.12.7/../__i__/bin/gcc
+COLLECT_LTO_WRAPPER=/tmp/gb/__i__/libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /home/slyfox/dev/git/gcc/configure --disable-multilib --disable-bootstrap --disable-lto --disable-libsanitizer --disable-libstdcxx-pch --enable-languages=c,c++ --disable-libgomp --disable-libquadmath --disable-libvtv CFLAGS='-O1 -g0' CXXFLAGS='-O1 -g0' LDFLAGS='-O1 -g0' --prefix=/tmp/gb/__i__ : (reconfigured) /home/slyfox/dev/git/gcc/configure --disable-multilib --disable-bootstrap --disable-lto --disable-libsanitizer --disable-libstdcxx-pch --enable-languages=c,c++ --disable-libgomp --disable-libquadmath --disable-libvtv CFLAGS='-O1 -g0' CXXFLAGS='-O1 -g0' LDFLAGS='-O1 -g0' --prefix=/tmp/gb/__i__
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20241016 (experimental) (GCC)
+
+- User: GCC Commits | Time: 2024-10-17 05:00:20 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:96ba5e5663d4390a7e69735ce3c9de657fc543fccommitr15-4402-g96ba5e5663d4390a7e69735ce3c9de657fc543fcAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Oct 17 06:59:31 2024 +0200
+
+    c: Fix up speed up compilation of large char array initializers when not using #embed [PR117177]
+    
+    Apparently my
+    c: Speed up compilation of large char array initializers when not using #embed
+    patch broke building glibc.
+    
+    The issue is that when using CPP_EMBED, we are guaranteed by the
+    preprocessor that there is CPP_NUMBER CPP_COMMA before it and
+    CPP_COMMA CPP_NUMBER after it (or CPP_COMMA CPP_EMBED), so RAW_DATA_CST
+    never ends up at the end of arrays of unknown length.
+    Now, the c_parser_initval optimization attempted to preserve that property
+    rather than changing everything that e.g. inferes array number of elements
+    from the initializer etc. to deal with RAW_DATA_CST at the end, but
+    it didn't take into account the possibility that there could be
+    CPP_COMMA followed by CPP_CLOSE_BRACE (where the CPP_COMMA is redundant).
+    
+    As we are peaking already at 4 tokens in that code, peeking more would
+    require using raw tokens and that seems to be expensive doing it for
+    every pair of tokens due to vec_free done when we are out of raw tokens.
+    
+    So, the following patch instead determines the case where we want
+    another INTEGER_CST element after it after consuming the tokens, and just
+    arranges for another process_init_element.
+    
+    2024-10-17  Jakub Jelinek  <jakub@redhat.com>PR c/117177gcc/c/
+            * c-parser.cc (c_parser_initval): Instead of doing
+            orig_len == INT_MAX checks before consuming tokens to set
+            last = 1, check it after consuming it and if not followed
+            by CPP_COMMA CPP_NUMBER, call process_init_element once
+            more with the last CPP_NUMBER.
+    gcc/testsuite/
+            * c-c++-common/init-4.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-10-17 05:05:00 UTC
+  Text: Should be fixed now.
+
+- User: Sergei Trofimovich | Time: 2024-10-17 07:23:16 UTC
+  Text: The change fixed python-3.12.7 build failure for me. Thank you!
+

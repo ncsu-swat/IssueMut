@@ -1,0 +1,206 @@
+Bug Summary: wrong code with __builtin_sub_overflow_p() and _BitInt() at -O2 and above
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-02-22 04:28:45 UTC
+  Text: Createdattachment 57485[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -O2 testcase.c
+$ ./a.out
+Aborted
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-9117-20240221083607-g5772ea772d1-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-9117-20240221083607-g5772ea772d1-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240221 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-02-22 04:45:01 UTC
+  Text: Confirmed.  -fno-tree-vrp "fixes" it though.
+I have not looked into why though.
+
+- User: Andrew Pinski | Time: 2024-02-22 04:51:30 UTC
+  Text: ` -fdisable-tree-evrp -fdisable-tree-vrp1` also fixes it.
+
+EVRP and VRP1 changes:
+  _3 = IMAGPART_EXPR <_8>;
+  _4 = (_Bool) _3;
+  _5 = (unsigned _BitInt(8671)) _4;
+
+into
+  _7 = .SUB_OVERFLOW (_2, 0);
+  _3 = IMAGPART_EXPR <_7>;
+  _4 = (unsigned _BitInt(8671)) _3;
+
+Which looks fine.
+
+Then bitlower looks to go wrong.
+
+- User: Zdenek Sojka | Time: 2024-02-22 11:39:32 UTC
+  Text: Createdattachment 57496[details]probaly related testcase
+
+$ x86_64-pc-linux-gnu-gcc -O2 testcase2.c
+$ ./a.out 
+Aborted
+
+- User: Jakub Jelinek | Time: 2024-02-22 12:51:37 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> ` -fdisable-tree-evrp -fdisable-tree-vrp1` also fixes it.
+> 
+> EVRP and VRP1 changes:
+>   _3 = IMAGPART_EXPR <_8>;
+>   _4 = (_Bool) _3;
+>   _5 = (unsigned _BitInt(8671)) _4;
+> 
+> into
+>   _7 = .SUB_OVERFLOW (_2, 0);
+>   _3 = IMAGPART_EXPR <_7>;
+>   _4 = (unsigned _BitInt(8671)) _3;
+> 
+> Which looks fine.
+> 
+> Then bitlower looks to go wrong.The result of the first multiplication is clearly equal to the third argument and VRP doesn't know anything extra on it, so it is something from the sub_overflow_p that goes wrong and computes 1 instead of 0 into the second multiplication.  But strangely
+__attribute__((noipa)) unsigned _BitInt(8671)
+foo (unsigned _BitInt(512) x)
+{
+  return __builtin_sub_overflow_p (x, 0, (unsigned _BitInt(255)) 0);
+}
+
+int
+main ()
+{
+  if (foo (0xfffa46471e7c2dd60000000000000000uwb) != 0uwb)
+    __builtin_abort ();
+}
+works fine (and that has what seems to be the same generated code from bitint lowering for the sub overflow).
+
+- User: Jakub Jelinek | Time: 2024-02-22 13:07:52 UTC
+  Text: Ah, there is one difference, for the
+unsigned
+foo (unsigned _BitInt(8671) x, unsigned y, unsigned _BitInt(512) z)
+{
+  unsigned _BitInt (8671) r
+    = x * __builtin_sub_overflow_p (y * z, 0, (unsigned _BitInt(255)) 0);
+  return r;
+}
+
+int
+main ()
+{
+  if (foo (1, 1, 0xfffa46471e7c2dd60000000000000000wb))
+    __builtin_abort ();
+}
+case bitint lowering chooses the same source and destination array, as source it is ulong[8] - 8 limbs of unsigned _BitInt(512), as destination ulong[8] as well, 4 limbs for the __real__ part and 4 limbs for the overflow flag (0/1).
+But I don't see anything wrong with that in the bitintlower1 dump, all the bitint.3 loads are done before the stores to the same location.
+
+- User: Jakub Jelinek | Time: 2024-02-22 13:24:33 UTC
+  Text: Ah, I actually see the what's wrong.
+The destination store for the first limb in the loop look correct:
+  if (_14 <= 3)
+    goto <bb 6>; [80.00%]
+  else
+    goto <bb 7>; [20.00%]
+
+  <bb 6> [local count: 1073741824]:
+  bitint.3[_14] = _21;
+  
+  <bb 7> [local count: 1073741824]:
+i.e. if _14 is 0 or 2, we store something, otherwise we don't, because result __real__ only has 4 limbs.
+But the second limb store is wrong:
+  if (_27 <= 3)
+    goto <bb 12>; [80.00%]
+  else
+    goto <bb 15>; [20.00%]
+
+  <bb 12> [local count: 1073741824]:
+  if (_27 < 3)
+    goto <bb 14>; [80.00%]
+  else
+    goto <bb 13>; [20.00%]
+
+  <bb 13> [local count: 1073741824]:
+  bitint.3[_27] = _30;
+  goto <bb 15>; [100.00%]
+
+  <bb 14> [local count: 858993464]:
+  MEM[(unsigned long *)&bitint.3 + 24B] = _30;
+
+  <bb 15> [local count: 1073741824]:
+It should be the other way around, if _27 < 3 (aka if it is 1), store bitint.3[_27] = _30; , if it is 3, MEM[(unsigned long *)&bitint.3 + 24B] = _30; and if it is > 3, don't store anything.  I'm also surprised it doesn't mask off the most significant bit.
+
+- User: Jakub Jelinek | Time: 2024-02-22 14:23:59 UTC
+  Text: Createdattachment 57499[details]gcc14-pr114040.patch
+
+So far only smoke tested patch.
+
+- User: GCC Commits | Time: 2024-02-23 10:37:07 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:be1f2bc4522f772184a4d16d8f3fec75baed89cfcommitr14-9150-gbe1f2bc4522f772184a4d16d8f3fec75baed89cfAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Feb 23 11:36:15 2024 +0100
+
+    bitintlower: Fix .{ADD,SUB}_OVERFLOW lowering [PR114040]
+    
+    The following testcases show 2 bugs in the .{ADD,SUB}_OVERFLOW lowering,
+    both related to storing of the REALPART_EXPR part of the result.
+    On the first testcase prec is 255, prec_limbs is 4 and for the second limb
+    in the loop the store of the REALPART_EXPR of .USUBC (_30) is stored through:
+      if (_27 <= 3)
+        goto <bb 12>; [80.00%]
+      else
+        goto <bb 15>; [20.00%]
+    
+      <bb 12> [local count: 1073741824]:
+      if (_27 < 3)
+        goto <bb 14>; [80.00%]
+      else
+        goto <bb 13>; [20.00%]
+    
+      <bb 13> [local count: 1073741824]:
+      bitint.3[_27] = _30;
+      goto <bb 15>; [100.00%]
+    
+      <bb 14> [local count: 858993464]:
+      MEM[(unsigned long *)&bitint.3 + 24B] = _30;
+    
+      <bb 15> [local count: 1073741824]:
+    The first check is right, as prec_limbs is 4, we don't want to store
+    bitint.3[4] or above at all, those limbs are just computed for the overflow
+    checking and nothing else, so _27 > 4 leads to no store.
+    But the other condition is exact opposite of what should be done, if
+    the current index of the second limb (_27) is < 3, then it should
+      bitint.3[_27] = _30;
+    and if it is == 3, it should
+      MEM[(unsigned long *)&bitint.3 + 24B] = _30;
+    and (especially important for the targets which would bitinfo.extended = 1)
+    should actually in this case zero extend it from the 63 bits to 64, that is
+    the handling of the partial limb.  The if_then_if_then_else helper if
+    there are 2 conditions sets m_gsi to be at the start of the
+    edge_true_false->dest bb, i.e. when the first condition is true and second
+    false, and that is where we store the SSA_NAME indexed limb store, so the
+    condition needs to be reversed.
+    
+    The following patch does that and adds the cast as well, the usual
+    assumption that already handle_operand has the partial limb type doesn't
+    have to be true here, because the source operand could have much larger
+    precision than the REALPART_EXPR of the lhs.
+    
+    2024-02-23  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114040* gimple-lower-bitint.cc (bitint_large_huge::lower_addsub_overflow):
+            Use EQ_EXPR rather than LT_EXPR for g2 condition and change its
+            probability from likely to unlikely.  When handling the true true
+            store, first cast to limb_access_type and then to l's type.
+    
+            * gcc.dg/torture/bitint-60.c: New test.
+            * gcc.dg/torture/bitint-61.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-23 10:40:13 UTC
+  Text: Fixed.
+

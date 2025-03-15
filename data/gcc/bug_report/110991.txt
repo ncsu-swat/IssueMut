@@ -1,0 +1,168 @@
+Bug Summary: [14 Regression] Dead Code Elimination Regression at -O2 since r14-1135-gc53f51005de
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Scherrer Svenja | Time: 2023-08-11 13:08:42 UTC
+  Text: static unsigned char a;
+static char b;
+void foo(void);
+int main() {
+  a = 25;
+  for (; a > 13; --a)
+    b = a > 127 ?: a << 3;
+  if (!b)
+    foo();
+}
+
+gcc-3a13884b23a (trunk) -O2 cannot eliminate the call to foo but gcc-releases/gcc-13.1.0 -O2 can.
+-----------------------------------------------------------------------
+gcc-3a13884b23ae32b43d56d68a9c6bd4ce53d60017 -O2 case.c -S -o case.s
+--------- OUTPUT ---------
+main:
+.LFB0:
+	.cfi_startproc
+	movd	.LC0(%rip), %xmm0
+	movd	.LC1(%rip), %xmm1
+	xorl	%eax, %eax
+.L2:
+	addl	$1, %eax
+	movdqa	%xmm0, %xmm2
+	paddb	%xmm1, %xmm0
+	cmpl	$3, %eax
+	jne	.L2
+	movdqa	%xmm2, %xmm0
+	movb	$13, a(%rip)
+	paddb	%xmm2, %xmm0
+	paddb	%xmm0, %xmm0
+	movdqa	%xmm0, %xmm1
+	paddb	%xmm0, %xmm1
+	pxor	%xmm0, %xmm0
+	pcmpgtb	%xmm2, %xmm0
+	movd	.LC2(%rip), %xmm2
+	pand	%xmm0, %xmm2
+	pandn	%xmm1, %xmm0
+	por	%xmm2, %xmm0
+	movd	%xmm0, %eax
+	sarl	$24, %eax
+	movb	%al, b(%rip)
+	testb	%al, %al
+	je	.L10
+	xorl	%eax, %eax
+	ret
+.L10:
+	pushq	%rax
+	.cfi_def_cfa_offset 16
+	call	foo
+	xorl	%eax, %eax
+	popq	%rdx
+	.cfi_def_cfa_offset 8
+	ret
+---------- END OUTPUT ---------
+
+-----------------------------------------------------------------------
+gcc-2b98cc24d6af0432a74f6dad1c722ce21c1f7458 -O2 case.c -S -o case.s
+--------- OUTPUT ---------
+main:
+.LFB0:
+	.cfi_startproc
+	movb	$112, b(%rip)
+	xorl	%eax, %eax
+	movb	$13, a(%rip)
+	ret
+---------- END OUTPUT ---------
+
+-----------------------------------------------------------------------
+Bisects tor14-1135-gc53f51005de
+
+- User: Uroš Bizjak | Time: 2023-08-11 15:59:34 UTC
+  Text: For gcc-13, fre4 pass is able to simplify the scalar code, but nothing simplifies vectorized code in gcc-14.
+
+- User: Andrew Pinski | Time: 2023-08-12 18:06:21 UTC
+  Text: What is interesting is -O3 unrolls the loop in cunroll and the loop becomes a nothing as everything can be almost constant folded away ... Maybe that is something which can be tuned for -O2 and unrolling ...
+
+- User: Richard Biener | Time: 2023-08-14 07:28:29 UTC
+  Text: So the difference is that GCC 14 vectorizes the loop and that vectorized loop is not completely unrolled because
+
+Loop 1 likely iterates at most 2 times.
+Estimating sizes for loop 1
+ BB: 3, after_exit: 0
+  size:   1 _34 = vect_vec_iv_.15_33 + { 252, 252, 252, 252 };
+  size:   0 vect_a.16_35 = VIEW_CONVERT_EXPR<vector(4) signed char>(vect_vec_iv_.15_33);
+  size:   1 vect_iftmp.17_36 = vect_a.16_35 << 3;
+  size:   1 mask__23.18_38 = vect_a.16_35 < { 0, 0, 0, 0 };
+  size:   1 vect_iftmp.19_40 = VEC_COND_EXPR <mask__23.18_38, { 1, 1, 1, 1 }, vect_iftmp.17_36>;
+  size:   1 ivtmp_44 = ivtmp_43 + 1;
+   Induction variable computation will be folded away.
+  size:   2 if (ivtmp_44 < 3)
+   Exit condition will be eliminated in peeled copies.
+   Exit condition will be eliminated in last copy.
+   Constant conditional.
+ BB: 9, after_exit: 1
+size: 7-3, last_iteration: 7-3
+  Loop size: 7
+  Estimated size after unrolling: 8
+Not unrolling loop 1: size would grow.
+
+when we still have a loop there's nothing that can fully elide things.
+Without vectorization we have
+
+Loop 2 likely iterates at most 11 times.
+Estimating sizes for loop 2
+ BB: 10, after_exit: 0
+  size:   0 a.2_13 = (signed char) a.6_22;
+   Induction variable computation will be folded away.
+  size:   2 if (a.2_13 < 0)
+   Constant conditional.
+ BB: 13, after_exit: 1
+ BB: 12, after_exit: 0
+  size:   1 _26 = a.6_22 + 255;
+   Induction variable computation will be folded away.
+  size:   1 ivtmp_27 = ivtmp_4 - 1;
+   Induction variable computation will be folded away.
+  size:   2 if (ivtmp_27 != 0)
+   Exit condition will be eliminated in peeled copies.
+   Exit condition will be eliminated in last copy.
+   Constant conditional. 
+ BB: 11, after_exit: 0
+  size:   1 iftmp.0_12 = a.2_13 << 3;
+   Induction variable computation will be folded away.
+size: 7-7, last_iteration: 7-7
+  Loop size: 7
+  Estimated size after unrolling: 1
+
+unrolling relies on constant_after_peeling which relies on SCEV which
+doesn't handle vector IVs.
+
+I have a patch improving it to
+
+size: 7-4, last_iteration: 7-4
+  Loop size: 7
+  Estimated size after unrolling: 6
+
+IIRC I also had a patch more appropriately "propagating" constness at some point.
+
+- User: GCC Commits | Time: 2023-08-15 09:09:07 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:bcdbedb3e6083ad01d844ed97cf19645c1ef6568commitr14-3216-gbcdbedb3e6083ad01d844ed97cf19645c1ef6568Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Aug 14 09:31:18 2023 +0200
+
+    tree-optimization/110991 - unroll size estimate after vectorization
+    
+    The following testcase shows that we are bad at identifying inductions
+    that will be optimized away after vectorizing them because SCEV doesn't
+    handle vectorized defs.  The following rolls a simpler identification
+    of SSA cycles covering a PHI and an assignment with a binary operator
+    with a constant second operand.PR tree-optimization/110991* tree-ssa-loop-ivcanon.cc (constant_after_peeling): Handle
+            VIEW_CONVERT_EXPR <op>, handle more simple IV-like SSA cycles
+            that will end up constant.
+    
+            * gcc.dg/tree-ssa/cunroll-16.c: New testcase.
+
+- User: Richard Biener | Time: 2023-08-15 09:09:20 UTC
+  Text: Fixed.
+

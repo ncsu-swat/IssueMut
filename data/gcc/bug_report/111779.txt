@@ -1,0 +1,152 @@
+Bug Summary: Fail to vectorize the struct include struct
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2023-10-12 07:31:39 UTC
+  Text: #include <stdbool.h>
+#include <assert.h>
+struct C
+{
+    int c;
+    int d;
+    bool f :1;
+    float e;
+};
+
+struct A
+{
+  unsigned int a;
+  unsigned char c1, c2;
+  bool b1 : 1;
+  bool b2 : 1;
+  bool b3 : 1;
+  struct C b4;
+};
+
+void
+foo (const struct A * __restrict x, int y)
+{
+  int s = 0, i = 0;
+  for (i = 0; i < y; ++i)
+    {
+      const struct A a = x[i];
+      s += a.b4.f ? 1 : 0;
+    }
+  assert (s == 0);
+    //__builtin_abort ();
+}
+
+int
+main ()
+{
+  struct A x[100];
+  int i;
+  __builtin_memset (x, -1, sizeof (x));
+  for (i = 0; i < 100; i++)
+    {
+      x[i].b1 = false;
+      x[i].b2 = false;
+      x[i].b3 = false;
+      x[i].b4.f = false;
+    }
+  foo (x, 100);
+  return 0;
+}https://godbolt.org/z/KWb7c1n5hBoth SVE GCC and RVV GCC failed to vectorize it.
+But Clang succeed on vectorization.
+
+- User: Richard Biener | Time: 2023-10-12 08:45:51 UTC
+  Text: The issue is the aggregate copy:
+
+t.c:26:22: missed:  not vectorized: more than one data ref in stmt: a = *_3;
+
+which SRA fails to scalarize:
+
+  <bb 3> [local count: 955630224]:
+  # s_23 = PHI <s_18(3), 0(2)>
+  # i_25 = PHI <i_20(3), 0(2)>
+  _1 = (long unsigned int) i_25;
+  _2 = _1 * 24;
+  _3 = x_16(D) + _2;
+  a = *_3;
+  _4 = BIT_FIELD_REF <a.b4, 8, 64>;
+  _12 = _4 & 1;
+  _6 = (int) _12;
+  s_18 = _6 + s_23;
+  a ={v} {CLOBBER(eol)};
+  i_20 = i_25 + 1;
+  if (y_14(D) > i_20)
+
+Candidate (2778): a
+...
+! Disqualifying a - No scalar replacements to be created.
+
+the BIT_FIELD_REF is already created by early folding in optimize_bit_field_compare folding (int) a.b4.f != 0
+
+    s = ((int) NON_LVALUE_EXPR <BIT_FIELD_REF <a.b4, 8, 64>> & 1) + s;
+
+SRA could handle BIT_FIELD_REFs just fine - esp. quantities with
+a byte size.  And then this folding is just premature...
+
+Removing the folding that handles BF != CST fixes it.  I know removing
+all of it, esp. BF != BF will regress some stuff.  I'll put this half-way
+patch through testing.
+
+diff --git a/gcc/fold-const.cc b/gcc/fold-const.cc
+index 82299bb7f1d..3db383360d6 100644
+--- a/gcc/fold-const.cc
++++ b/gcc/fold-const.cc
+@@ -4695,7 +4695,7 @@ optimize_bit_field_compare (location_t loc, enum tree_code code,
+     return 0;
+ 
+   if (const_p)
+-    rreversep = lreversep;
++    return 0;
+   else
+    {
+      /* If this is not a constant, we can only do something if bit positions,
+
+- User: Richard Biener | Time: 2023-10-12 09:17:49 UTC
+  Text: Ah, did that already, it regressed, I filedPR108070for it.
+
+- User: Richard Biener | Time: 2023-10-12 10:45:21 UTC
+  Text: I posted a patch for SRA.
+
+- User: GCC Commits | Time: 2023-10-13 06:34:53 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:6decda1a35be5764101987c210b5693a0d914e58commitr14-4612-g6decda1a35be5764101987c210b5693a0d914e58Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Oct 12 11:34:57 2023 +0200
+
+    tree-optimization/111779 - Handle some BIT_FIELD_REFs in SRA
+    
+    The following handles byte-aligned, power-of-two and byte-multiple
+    sized BIT_FIELD_REF reads in SRA.  In particular this should cover
+    BIT_FIELD_REFs created by optimize_bit_field_compare.
+    
+    For gcc.dg/tree-ssa/ssa-dse-26.c we now SRA the BIT_FIELD_REF
+    appearing there leading to more DSE, fully eliding the aggregates.
+    
+    This results in the same false positive -Wuninitialized as the
+    older attempt to remove the folding from optimize_bit_field_compare,
+    fixed by initializing part of the aggregate unconditionally.PR tree-optimization/111779gcc/
+            * tree-sra.cc (sra_handled_bf_read_p): New function.
+            (build_access_from_expr_1): Handle some BIT_FIELD_REFs.
+            (sra_modify_expr): Likewise.
+            (make_fancy_name_1): Skip over BIT_FIELD_REF.
+    
+    gcc/fortran/
+            * trans-expr.cc (gfc_trans_assignment_1): Initialize
+            lhs_caf_attr and rhs_caf_attr codimension flag to avoid
+            false positive -Wuninitialized.
+    
+    gcc/testsuite/
+            * gcc.dg/tree-ssa/ssa-dse-26.c: Adjust for more DSE.
+            * gcc.dg/vect/vect-pr111779.c: New testcase.
+
+- User: Richard Biener | Time: 2023-10-13 06:47:08 UTC
+  Text: This should be fixed now.
+

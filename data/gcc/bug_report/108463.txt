@@ -1,0 +1,650 @@
+Bug Summary: [13 Regression] ICE: in cselib_subst_to_values, at cselib.cc:2148 with -O2 -fsched2-use-superblocks -g
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 12.2.1
+Known to Fail: 13.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-01-19 11:35:53 UTC
+  Text: Createdattachment 54306[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O2 -fsched2-use-superblocks -g testcase.c 
+testcase.c: In function 'foo':
+testcase.c:5:1: note: the ABI for passing parameters with 32-byte alignment has changed in GCC 4.6
+    5 | foo (V v)
+      | ^~~
+testcase.c:5:1: warning: AVX vector argument without AVX enabled changes the ABI [-Wpsabi]
+during RTL pass: sched2
+testcase.c:9:1: internal compiler error: in cselib_subst_to_values, at cselib.cc:2148
+    9 | }
+      | ^
+0x6ce4f5 cselib_subst_to_values(rtx_def*, machine_mode)
+        /repo/gcc-trunk/gcc/cselib.cc:2148
+0xf0fa26 cselib_subst_to_values(rtx_def*, machine_mode)
+        /repo/gcc-trunk/gcc/cselib.cc:2193
+0xf139dd cselib_subst_to_values_from_insn(rtx_def*, machine_mode, rtx_insn*)
+        /repo/gcc-trunk/gcc/cselib.cc:2264
+0x25c87c2 add_insn_mem_dependence
+        /repo/gcc-trunk/gcc/sched-deps.cc:1741
+0x25cd060 sched_analyze_2
+        /repo/gcc-trunk/gcc/sched-deps.cc:2688
+0x25cd0e9 sched_analyze_2
+        /repo/gcc-trunk/gcc/sched-deps.cc:2806
+0x25cdd3e sched_analyze_insn
+        /repo/gcc-trunk/gcc/sched-deps.cc:2960
+0x25d0595 deps_analyze_insn(deps_desc*, rtx_insn*)
+        /repo/gcc-trunk/gcc/sched-deps.cc:3683
+0x25d364e sched_analyze(deps_desc*, rtx_insn*, rtx_insn*)
+        /repo/gcc-trunk/gcc/sched-deps.cc:3836
+0x25d46d0 schedule_ebb(rtx_insn*, rtx_insn*, bool)
+        /repo/gcc-trunk/gcc/sched-ebb.cc:505
+0x25d4cc2 schedule_ebbs()
+        /repo/gcc-trunk/gcc/sched-ebb.cc:655
+0x137eb1c rest_of_handle_sched2
+        /repo/gcc-trunk/gcc/sched-rgn.cc:3749
+0x137eb1c execute
+        /repo/gcc-trunk/gcc/sched-rgn.cc:3890
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r13-5254-20230119100051-g05b9868b182-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/13.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r13-5254-20230119100051-g05b9868b182-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 13.0.1 20230119 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2023-01-19 11:52:42 UTC
+  Text: Started withr13-5252-g3c99493bf39a7fef9213e
+
+- User: Jakub Jelinek | Time: 2023-01-26 17:28:10 UTC
+  Text: From what I can see, ther13-5252change removed for DEBUG_INSNs two things, one is the
+cselib_lookup_from_insn call with 1 as create and the other is the shallow_copy_rtx + cselib_subst_to_values_from_insn.
+As nothing really used t for the debug insns and cselib_subst_to_values_from_insn shouldn't create new VALUEs and the like (well, there is:
+      /* This used to happen for autoincrements, but we deal with them
+         properly now.  Remove the if stmt for the next release.  */
+      if (! e)
+        {
+          /* Assign a value that doesn't match any other.  */
+          e = new_cselib_val (next_uid, GET_MODE (x), x);
+        }
+which nobody removed so far), I think the shallow_copy_rtx + cselib_subst_to_values_from_insn are just waste of resources (allocates various rtxes nobody looks at).
+But the cselib_lookup_from_insn actually creates new VALUEs (and mark them as coming from DEBUG_INSNs), so I think we need to do that.
+E.g. in the testcase from this PR (can be even simplified to:
+typedef int __attribute__((__vector_size__ (32))) V;
+int a;
+
+void
+foo (V v)
+{
+  a--;
+  v = (V) v;
+}
+) after expansion:
+(debug_insn 5 2 6 2 (debug_marker) "pr108463.c":7:3 -1
+     (nil))
+(insn 6 5 7 2 (parallel [
+            (set (mem/c:SI (symbol_ref:DI ("a") [flags 0x2]  <var_decl 0x7fb055a70cf0 a>) [1 a+0 S4 A32])
+                (plus:SI (mem/c:SI (symbol_ref:DI ("a") [flags 0x2]  <var_decl 0x7fb055a70cf0 a>) [1 a+0 S4 A32])
+                    (const_int -1 [0xffffffffffffffff])))
+            (clobber (reg:CC 17 flags))
+        ]) "pr108463.c":7:4 240 {*addsi_1}
+     (nil))
+(debug_insn 7 6 8 2 (debug_marker) "pr108463.c":8:3 -1
+     (nil))
+(debug_insn 8 7 0 2 (var_location:BLK v (mem/c:BLK (reg/f:DI 16 argp) [1 v+0 S32 A256])) "pr108463.c":8:5 -1
+     (nil))
+and before scheduling:
+(debug_insn 5 2 6 2 (debug_marker) "pr108463.c":7:3 -1
+     (nil))
+(insn 6 5 7 2 (parallel [
+            (set (mem/c:SI (symbol_ref:DI ("a") [flags 0x2]  <var_decl 0x7fb055a70cf0 a>) [1 a+0 S4 A32])
+                (plus:SI (mem/c:SI (symbol_ref:DI ("a") [flags 0x2]  <var_decl 0x7fb055a70cf0 a>) [1 a+0 S4 A32])
+                    (const_int -1 [0xffffffffffffffff])))
+            (clobber (reg:CC 17 flags))
+        ]) "pr108463.c":7:4 240 {*addsi_1}
+     (expr_list:REG_UNUSED (reg:CC 17 flags)
+        (nil)))
+(debug_insn 7 6 8 2 (debug_marker) "pr108463.c":8:3 -1
+     (nil))
+(debug_insn 8 7 13 2 (var_location:BLK v (mem/c:BLK (plus:DI (reg/f:DI 7 sp)
+            (const_int 8 [0x8])) [1 v+0 S32 A256])) "pr108463.c":8:5 -1
+     (nil))
+(jump_insn 14 13 15 2 (simple_return) "pr108463.c":9:1 1006 {simple_return_internal}
+     (nil)
+when ignoring notes.  Without the cselib_lookup_from_insn call, we ICE in cselib_subst_to_values because it is the only spot in the IL that mentions the sp
+register, so we haven't created a VALUE for it otherwise.
+
+Unfortunately, while:
+--- gcc/sched-deps.cc.jj	2023-01-19 09:58:50.971227752 +0100
++++ gcc/sched-deps.cc	2023-01-26 18:11:00.185963813 +0100
+@@ -2605,7 +2605,14 @@ sched_analyze_2 (class deps_desc *deps,
+ 
+     case MEM:
+       {
+-	if (!DEBUG_INSN_P (insn))
++	if (0 && DEBUG_INSN_P (insn) && sched_deps_info->use_cselib)
++	  {
++	    machine_mode address_mode = get_address_mode (x);
++
++	    cselib_lookup_from_insn (XEXP (x, 0), address_mode, 1,
++				     GET_MODE (x), insn);
++	  }
++	else if (!DEBUG_INSN_P (insn))
+ 	  {
+ 	    /* Reading memory.  */
+ 	    rtx_insn_list *u;
+fixes this PR, it breaks againPR106746.
+So I think we really need to understand what is going on withPR106746.
+
+- User: Jakub Jelinek | Time: 2023-01-26 17:28:59 UTC
+  Text: Oops, ignore the 0 && part in the above patch, I've added that while trying to get the ICE on this PR back.
+
+- User: Jakub Jelinek | Time: 2023-01-26 18:33:06 UTC
+  Text: So, seems during the code added by above patch without the 0 && new_cselib_val creates a value on DEBUG_INSNs for:
+1) (mem:SI (plus:DI (reg/f:DI 7 sp)
+        (const_int NN)) [1  S4 A64])
+   for NN 76 to 132 inclusive in steps of 4, except for 104 and 120
+2) (plus:DI (reg/f:DI 7 sp) (const_int NN))
+   for NN 72 to 132 inclusive in steps of 4, and for 200 and 264
+3) (symbol_ref:DI ("a") [flags 0x2]  <var_decl 0x7fffea13ad80 a>)
+4) complex expressions like:
+(plus:DI (plus:DI (ashift:DI (zero_extend:DI (and:SI (mem:SI (plus:DI (reg/f:DI 7 sp)
+                            (const_int 132 [0x84])) [1  S4 A32])
+                    (const_int 15 [0xf])))
+            (const_int 2 [0x2]))
+        (reg/f:DI 7 sp))
+    (const_int 8 [0x8]))
+
+Now, I strongly doubt anything looks up for normal insns the large expressions in 4) category, because they aren't valid in normal insns, so it will be 1), 2) or 3) that affect the scheduling.
+
+- User: Jakub Jelinek | Time: 2023-01-26 20:00:50 UTC
+  Text: I've now tried:
+--- sched-deps.cc.jj7	2023-01-19 09:58:50.971227752 +0100
++++ sched-deps.cc	2023-01-26 20:58:30.036035079 +0100
+@@ -2498,7 +2498,10 @@ sched_analyze_1 (class deps_desc *deps,
+ 	  pending_mem = deps->pending_read_mems;
+ 	  while (pending)
+ 	    {
+-	      if (anti_dependence (pending_mem->element (), t)
++bool b = anti_dependence (pending_mem->element (), t);
++if (sched_deps_info->use_cselib && !DEBUG_INSN_P (insn) && !DEBUG_INSN_P (pending->insn ()))
++fprintf (stderr, "anti_dependence %d\n", b);
++	      if (b
+ 		  && ! sched_insns_conditions_mutex_p (insn, pending->insn ()))
+ 		note_mem_dep (t, pending_mem->element (), pending->insn (),
+ 			      DEP_ANTI);
+@@ -2511,7 +2514,10 @@ sched_analyze_1 (class deps_desc *deps,
+ 	  pending_mem = deps->pending_write_mems;
+ 	  while (pending)
+ 	    {
+-	      if (output_dependence (pending_mem->element (), t)
++bool b = output_dependence (pending_mem->element (), t);
++if (sched_deps_info->use_cselib && !DEBUG_INSN_P (insn) && !DEBUG_INSN_P (pending->insn ()))
++fprintf (stderr, "output_dependence %d\n", b);
++	      if (b
+ 		  && ! sched_insns_conditions_mutex_p (insn, pending->insn ()))
+ 		note_mem_dep (t, pending_mem->element (),
+ 			      pending->insn (),
+@@ -2605,7 +2611,14 @@ sched_analyze_2 (class deps_desc *deps,
+ 
+     case MEM:
+       {
+-	if (!DEBUG_INSN_P (insn))
++	if (DEBUG_INSN_P (insn) && sched_deps_info->use_cselib)
++	  {
++	    machine_mode address_mode = get_address_mode (x);
++
++	    cselib_lookup_from_insn (XEXP (x, 0), address_mode, 1,
++				     GET_MODE (x), insn);
++	  }
++	else if (!DEBUG_INSN_P (insn))
+ 	  {
+ 	    /* Reading memory.  */
+ 	    rtx_insn_list *u;
+@@ -2630,7 +2643,10 @@ sched_analyze_2 (class deps_desc *deps,
+ 	    pending_mem = deps->pending_read_mems;
+ 	    while (pending)
+ 	      {
+-		if (read_dependence (pending_mem->element (), t)
++bool b = read_dependence (pending_mem->element (), t);
++if (sched_deps_info->use_cselib && !DEBUG_INSN_P (insn) && !DEBUG_INSN_P (pending->insn ()))
++fprintf (stderr, "read_dependence %d\n", b);
++		if (b
+ 		    && ! sched_insns_conditions_mutex_p (insn,
+ 							 pending->insn ()))
+ 		  note_mem_dep (t, pending_mem->element (),
+@@ -2645,7 +2661,10 @@ sched_analyze_2 (class deps_desc *deps,
+ 	    pending_mem = deps->pending_write_mems;
+ 	    while (pending)
+ 	      {
+-		if (true_dependence (pending_mem->element (), VOIDmode, t)
++bool b = true_dependence (pending_mem->element (), VOIDmode, t);
++if (sched_deps_info->use_cselib && !DEBUG_INSN_P (insn) && !DEBUG_INSN_P (pending->insn ()))
++fprintf (stderr, "true_dependence %d\n", b);
++		if (b
+ 		    && ! sched_insns_conditions_mutex_p (insn,
+ 							 pending->insn ()))
+ 		  note_mem_dep (t, pending_mem->element (),
+@@ -3817,7 +3836,10 @@ sched_analyze (class deps_desc *deps, rt
+   rtx_insn *insn;
+ 
+   if (sched_deps_info->use_cselib)
++{
+     cselib_init (CSELIB_RECORD_MEMORY);
++fprintf (stderr, "cselib_init\n");
++}
+ 
+   deps_start_bb (deps, head);
+ 
+and I see with it a few differences in the output (-g0 to -g):
+@@ -603,8 +603,8 @@ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+-true_dependence 0
+-true_dependence 0
++true_dependence 1
++true_dependence 1
+ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+@@ -616,8 +616,8 @@ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+-true_dependence 0
+-true_dependence 0
++true_dependence 1
++true_dependence 1
+ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+@@ -630,8 +630,8 @@ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+-true_dependence 0
+-true_dependence 0
++true_dependence 1
++true_dependence 1
+ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+@@ -645,8 +645,8 @@ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+-true_dependence 0
+-true_dependence 0
++true_dependence 1
++true_dependence 1
+ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+@@ -735,7 +735,7 @@ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+-true_dependence 0
++true_dependence 1
+ true_dependence 1
+ read_dependence 0
+ read_dependence 0
+@@ -757,7 +757,7 @@ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+ true_dependence 1
+-true_dependence 0
++true_dependence 1
+ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+@@ -801,8 +801,8 @@ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+ read_dependence 0
+-true_dependence 0
+-true_dependence 0
++true_dependence 1
++true_dependence 1
+ anti_dependence 1
+ anti_dependence 0
+ anti_dependence 1
+So, apparently only differences (on this testcase) for true_dependence, will need to debug in detail what is different in those cases.
+
+- User: Jakub Jelinek | Time: 2023-01-26 20:26:59 UTC
+  Text: The first two differences are between insns 1204 vs. 1116 and 1204 vs. 1095:
+(insn 1095 1094 1097 2 (set (mem/c:V4SI (plus:DI (reg/f:DI 7 sp)
+                (const_int -104 [0xffffffffffffff98])) [1  S16 A128])
+        (reg:V4SI 22 xmm2 [227])) "pr106746.c":27:5 1809 {movv4si_internal}
+     (expr_list:REG_DEAD (reg:V4SI 22 xmm2 [227])
+        (nil)))
+(insn 1116 1115 1118 2 (set (mem/c:V4SI (plus:DI (reg/f:DI 7 sp)
+                (const_int -88 [0xffffffffffffffa8])) [1  S16 A128])
+        (reg:V4SI 22 xmm2 [247])) "pr106746.c":27:5 1809 {movv4si_internal}
+     (expr_list:REG_DEAD (reg:V4SI 22 xmm2 [247])
+        (nil)))
+(insn 1204 1118 1189 2 (set (reg:SI 0 ax [250])
+        (mem:SI (plus:DI (reg/f:DI 7 sp)
+                (const_int 120 [0x78])) [1  S4 A128])) "pr106746.c":27:5 83 {*movsi_internal}
+     (expr_list:REG_EQUIV (mem:SI (plus:DI (reg/f:DI 19 frame)
+                (const_int -208 [0xffffffffffffff30])) [1  S4 A128])
+        (nil)))
+4 bytes at sp + 120 can't alias with 16 bytes at sp - 104 or 16 bytes at sp - 88
+when sp isn't modified in between and all 3 are in the same bb.
+So 1 returned from true_dependence looks incorrect (the -g case).
+
+- User: Jakub Jelinek | Time: 2023-01-27 11:26:32 UTC
+  Text: So, on the first difference without -g the 2 memories are
+(gdb) p pending_mem->element ()
+$1 = (mem/c:V4SI (plus:DI (value/c:DI 2:2 @0x39559d8/0x39359d0)
+        (const_int -472 [0xfffffffffffffe28])) [1  S16 A128])
+(gdb) p debug_rtx (t)
+(mem:SI (plus:DI (value/c:DI 2:2 @0x39559d8/0x39359d0)
+        (const_int -264 [0xfffffffffffffef8])) [1  S4 A128])
+where they use the same VALUE and so it is clear that there is no overlap between them.
+value/c 2:2 is SP_DERIVED_VALUE_P value with no locs, introduced inr10-7515-g2c0fa3ecf70d199af.
+While with -g we see on the same case:
+(gdb) p debug_rtx (pending_mem->element ())
+(mem/c:V4SI (plus:DI (value/c:DI 2:2 @0x3958808/0x3938800)
+        (const_int -472 [0xfffffffffffffe28])) [1  S16 A128])
+$3 = void
+(gdb) p debug_rtx (t)
+(mem:SI (plus:DI (value:DI 3:3946 @0x3958820/0x3938830)
+        (const_int 120 [0x78])) [1  S4 A128])
+where value/c 2:2 is the same thing, and value 3:3946 has a single loc
+with loc (reg/f:DI 7 sp) and setting insn
+(insn/f 1250 1002 1251 2 (parallel [
+            (set (reg/f:DI 7 sp)
+                (plus:DI (reg/f:DI 7 sp)
+                    (const_int -384 [0xfffffffffffffe80])))
+            (clobber (reg:CC 17 flags))
+            (clobber (mem:BLK (scratch) [0  A8]))
+        ]) "pr106746.c":15:1 1344 {pro_epilogue_adjust_stack_add_di}
+     (expr_list:REG_UNUSED (reg:CC 17 flags)
+        (expr_list:REG_CFA_ADJUST_CFA (set (reg/f:DI 7 sp)
+                (plus:DI (reg/f:DI 7 sp)
+                    (const_int -384 [0xfffffffffffffe80])))
+            (nil))))
+
+Now, there are only 2 sp changing instructions, 1250 doing sp = sp - 384 and
+another one in the epilogue sp = sp + 384.
+
+Both of the values are created early when seeing the 1250 instruction:
+cselib lookup (scratch) => 1:43
+cselib value 2:2 0x463f520 (reg/f:DI 7 sp)
+
+cselib lookup (reg/f:DI 7 sp) => 2:2
+cselib value 3:3946 0x463f550 (plus:DI (reg/f:DI 7 sp)
+    (const_int -384 [0xfffffffffffffe80]))
+in both -g and -g0 cases.
+
+- User: Jakub Jelinek | Time: 2023-01-27 11:47:27 UTC
+  Text: Ah, the difference is that in the -g0 case, value 3:3946 has 2 locs still at the true_dependence spot of 1204 vs. 1116 instructions, one (reg/f:DI 7 sp) like
+in the -g case, but also
+(plus:DI (value/c:DI 2:2 @0x39559d8/0x39359d0)
+    (const_int -384 [0xfffffffffffffe80]))
+which is what makes it through ther10-7515logic map back to 2:2 + optional offset based address.
+In the -g case it is there initially too, but removed in:
+#0  unchain_one_elt_loc_list (pl=0x3968820) at ../../gcc/cselib.cc:427
+#1  0x00000000006dc6e9 in discard_useless_locs (x=0x39e24b8, info=0x0) at ../../gcc/cselib.cc:675
+#2  0x00000000006e5624 in hash_table<cselib_hasher, false, xcallocator>::traverse_noresize<void*, &(discard_useless_locs(cselib_val**, void*))> (this=0x38edbc0, argument=0x0)
+    at ../../gcc/hash-table.h:1173
+#3  0x00000000006e4749 in hash_table<cselib_hasher, false, xcallocator>::traverse<void*, &(discard_useless_locs(cselib_val**, void*))> (this=0x38edbc0, argument=0x0)
+    at ../../gcc/hash-table.h:1194
+#4  0x00000000006dc83f in remove_useless_values () at ../../gcc/cselib.cc:725
+#5  0x00000000006e353c in cselib_process_insn (insn=0x7fffea3272c0) at ../../gcc/cselib.cc:3195
+#6  0x0000000002617521 in deps_analyze_insn (deps=0x7fffffffd890, insn=0x7fffea3272c0) at ../../gcc/sched-deps.cc:3801
+#7  0x00000000026177b2 in sched_analyze (deps=0x7fffffffd890, head=0x7fffe9f3e440, tail=0x7fffea31bf30) at ../../gcc/sched-deps.cc:3858
+#8  0x000000000261ba36 in schedule_ebb (head=0x7fffe9f3e440, tail=0x7fffea31bf30, modulo_scheduling=false) at ../../gcc/sched-ebb.cc:505
+#9  0x000000000261bf02 in schedule_ebbs () at ../../gcc/sched-ebb.cc:655
+when processing insn 1116.
+Now, remove_useless_values is guarded:
+3189	  if (n_useless_values > MAX_USELESS_VALUES
+3190	      /* remove_useless_values is linear in the hash table size.  Avoid
+3191	         quadratic behavior for very large hashtables with very few
+3192		 useless elements.  */
+3193	      && ((unsigned int)n_useless_values
+3194		  > (cselib_hash_table->elements () - n_debug_values) / 4))
+3195	    remove_useless_values ();
+On that particular insn 1116, I see:
+                                 -g0   -g
+n_useless_values                  30   33
+cselib_hash_table->elements ()   113  147
+n_debug_values                     0   31
+#define MAX_USELESS_VALUES 32
+147 - 31 is 116, so even that one is 3 larger than in the -g0 case.
+
+- User: Jakub Jelinek | Time: 2023-01-27 11:52:47 UTC
+  Text: Note, we already distinguish between n_useless_values and n_useless_debug_values:
+  if (had_locs && cselib_useless_value_p (v))
+    {
+      if (setting_insn && DEBUG_INSN_P (setting_insn))
+        n_useless_debug_values++;
+      else
+        n_useless_values++;
+      values_became_useless = 1;
+    }
+so the important thing is find out which value created only in the -g case didn't get marked with setting_insn && DEBUG_INSN_P (setting_insn).
+
+- User: Jakub Jelinek | Time: 2023-01-27 16:47:54 UTC
+  Text: I've put a watchpoint on n_useless_values and it seems it first diverges (assuming it should be the same between -g and -g0) when processing the
+(insn:TI 1074 1073 1087 2 (set (mem/c:V4SI (plus:DI (reg/f:DI 7 sp)
+                (const_int -120 [0xffffffffffffff88])) [1  S16 A128])
+        (reg:V4SI 22 xmm2 [207])) "pr106746.c":27:5 1809 {movv4si_internal}
+     (expr_list:REG_DEAD (reg:V4SI 22 xmm2 [207])
+        (nil)))
+store (I'm using --parm min-non-debug-insn=1000).
+Now, this is the first store to memory after the huge debug_insn with 16 MEMs in it.
+When processing this store, cselib_invalidate_mem is called on the
+(mem/c:V4SI (plus:DI (reg/f:DI 7 sp) (const_int -120 [0xffffffffffffff88])) [1  S16 A128])
+MEM, and increments n_useless_values by different number of times.
+
+What seems very wrong that in addition to MEMs like one from:
+(insn 1066 1180 1067 2 (set (reg:SI 22 xmm2 [orig:202 VIEW_CONVERT_EXPR<int[16]>(vectmp.9)[_27] ] [202])
+        (mem/j:SI (plus:DI (plus:DI (mult:DI (reg:DI 4 si [200])
+                        (const_int 4 [0x4]))
+                    (reg/f:DI 7 sp))
+                (const_int 8 [0x8])) [1 VIEW_CONVERT_EXPR<int[16]>(vectmp.9)[_27]+0 S4 A32])) "pr106746.c":27:5 83 {*movsi_internal}
+     (expr_list:REG_DEAD (reg:DI 4 si [200])
+        (nil)))
+(where it is hard(er) to guess if they overlap or not) it invalidates tons of MEMs which clearly can't overlap with the store MEM, like:
+(mem/c:V8HI (value:DI 81:4114 @0x3958f70/0x39396d0) [3 v+32 S16 A256])
+where value 81:4114 has locs->loc of
+(plus:DI (value/c:DI 2:2 @0x3958808/0x3938800)
+    (const_int -216 [0xffffffffffffff28]))
+and
+(gdb) p debug_rtx (reg_values[7]->elt->locs->loc)
+(reg/f:DI 7 sp)
+(gdb) p debug_rtx (reg_values[7]->elt->locs->next->loc)
+(plus:DI (value/c:DI 2:2 @0x3958808/0x3938800)
+    (const_int -384 [0xfffffffffffffe80]))
+So, say get_addr should be able to canonicalize that
+(value:DI 81:4114 @0x3958f70/0x39396d0)
+not to
+(plus:DI (value/c:DI 2:2 @0x3958808/0x3938800)
+    (const_int -216 [0xffffffffffffff28]))
+which it returns, but to
+(plus:DI (reg/f:DI 7 sp)
+    (const_int 168 [0xa8]))
+which can then be successfully compared to the other mem.
+
+- User: Jakub Jelinek | Time: 2023-01-27 17:31:28 UTC
+  Text: Anyway, seems that cselib_invalidate_mem on
+(mem/c:V4SI (plus:DI (reg/f:DI 7 sp) (const_int -120 [0xffffffffffffff88])) [1  S16 A128])
+invalidates all the entries from first_containing_mem chain, except for MEMs with
+MEM_EXPRs, so
+(mem/c:QI (value:DI 66:6567 @0x3958e08/0x3939400) [0 c+0 S1 A8])
+(mem/c:V1TI (value:DI 14:3463223136 @0x3958928/0x3938a40) [1 foo0_v512u32_0+48 S16 (mem/c:V1TI (value:DI 11:3463223120 @0x39588e0/0x39389b0) [1 foo0_v512u32_0+32 S16 A256])
+(mem/c:V1TI (value:DI 8:3463223104 @0x3958898/0x3938920) [1 foo0_v512u32_0+16 S16 A128])
+(mem/c:V1TI (value:DI 4:3463218702 @0x3955a08/0x3935a30) [1 foo0_v512u32_0+0 S16 A512])
+everything else goes away.  The function is called with n_useless_values 4 and increments it to 14 in the -g0 case and to 17 in the -g case.
+
+- User: Jakub Jelinek | Time: 2023-01-27 18:12:36 UTC
+  Text: So, the reason for the -g0 vs. -g differences is that we create while processing the huge DEBUG_INSN among other things 3 MEMs for
+(mem:SI (plus:DI (reg:DI sp) (const_int some_offset)) [1  S4 A256])
+(at that point still find, they have DEBUG_INSN setting_insn).
+But later on we promote those debug only VALUEs to non-DEBUG in:
+#0  promote_debug_loc (l=0x3968e60) at ../../gcc/cselib.cc:395
+#1  0x00000000006df636 in cselib_lookup_mem (x=0x7fffe9f49210, create=0) at ../../gcc/cselib.cc:1697
+#2  0x00000000006e13e6 in cselib_lookup_1 (x=0x7fffe9f49210, mode=E_SImode, create=0, memmode=E_VOIDmode) at ../../gcc/cselib.cc:2398
+#3  0x00000000006e166d in cselib_lookup (x=0x7fffe9f49210, mode=E_SImode, create=0, memmode=E_VOIDmode) at ../../gcc/cselib.cc:2456
+#4  0x00000000006dd28e in rtx_equal_for_cselib_1 (x=0x7fffe9f49210, y=0x7fffe9f3fbe8, memmode=E_VOIDmode, depth=0) at ../../gcc/cselib.cc:954
+#5  0x00000000006e4301 in cselib_hasher::equal (v=0x3938fb0, x_arg=0x7fffffffc110) at ../../gcc/cselib.cc:146
+#6  0x00000000006e4662 in hash_table<cselib_hasher, false, xcallocator>::find_slot_with_hash (this=0x38edbc0, comparable=@0x7fffffffc130: 0x7fffffffc110, hash=96, insert=INSERT)
+    at ../../gcc/hash-table.h:1077
+#7  0x00000000006dc507 in cselib_find_slot (mode=E_SImode, x=0x7fffe9f3fbe8, hash=96, insert=INSERT, memmode=E_VOIDmode) at ../../gcc/cselib.cc:640
+#8  0x00000000006df6c8 in cselib_lookup_mem (x=0x7fffe9f3fbe8, create=1) at ../../gcc/cselib.cc:1707
+#9  0x00000000006e13e6 in cselib_lookup_1 (x=0x7fffe9f3fbe8, mode=E_SImode, create=1, memmode=E_VOIDmode) at ../../gcc/cselib.cc:2398
+#10 0x00000000006e166d in cselib_lookup (x=0x7fffe9f3fbe8, mode=E_SImode, create=1, memmode=E_VOIDmode) at ../../gcc/cselib.cc:2456
+#11 0x00000000006e29ad in cselib_record_sets (insn=0x7fffe9f21cc0) at ../../gcc/cselib.cc:2957
+#12 0x00000000006e3505 in cselib_process_insn (insn=0x7fffe9f21cc0) at ../../gcc/cselib.cc:3184
+This is when processing non-DEBUG_INSN, but the only reason we lookup stuff there is because the debug only VALUE is seen in the hash table
+and compared to a VALUE actually seen in the non-DEBUG_INSN.
+So, I wonder if we shouldn't with some global flag or what temporarily disable the promotion of debug locs in non-create mode while doing the comparisons of existing hash table values.  But not sure where exactly.
+
+- User: Jakub Jelinek | Time: 2023-01-27 19:07:39 UTC
+  Text: Createdattachment 54364[details]gcc13-pr108463.patch
+
+Untested fix.
+
+- User: Jakub Jelinek | Time: 2023-01-30 17:10:51 UTC
+  Text: Createdattachment 54374[details]gcc13-pr108463-1.patch
+
+Additional untested patch (likely stage1 material) to avoid considering
+SP_DERIVED_VALUE_P values as useless when they have no locs, but Pmode REG_VALUES (STACK_POINTER_REGNUM) still has that VALUE plus constant among its
+locs.
+
+- User: Jakub Jelinek | Time: 2023-01-30 17:14:17 UTC
+  Text: Createdattachment 54375[details]gcc13-pr108463-2.patch
+
+Additional untested patch (likely stage1 material) to treat SP_DERIVED_VALUE_P and SP_DERIVED_VALUE_P + CONST_INT VALUEs as sp based at least before pro_and_epilogue or for !frame_pointer_needed.
+
+Additionally, I think we want to change alias.cc (get_addr) so that perhaps
+again before pro_and_epilogue or for !frame_pointer_needed it would canonicalize VALUEs with SP_DERIVED_VALUE_P or SP_DERIVED_VALUE_P + CONST_INT to sp + CONST_INT if possible.
+
+- User: GCC Commits | Time: 2023-02-02 12:56:24 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:465a9c51e7d5bafa7a81195b5af20f2a54f22210commitr13-5652-g465a9c51e7d5bafa7a81195b5af20f2a54f22210Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Feb 2 13:52:45 2023 +0100
+
+    sched-deps, cselib: Fix up some -fcompare-debug issues and regressions [PR108463]
+    
+    On Sat, Jan 14, 2023 at 08:26:00AM -0300, Alexandre Oliva via Gcc-patches wrote:
+    > The testcase used to get scheduled differently depending on the
+    > presence of debug insns with MEMs.  It's not clear to me why those
+    > MEMs affected scheduling, but the cselib pre-canonicalization of the
+    > MEM address is not used at all when analyzing debug insns, so the
+    > memory allocation and lookup are pure waste.  Somehow, avoiding that
+    > waste fixes the problem, or makes it go latent.
+    
+    Unfortunately, this patch breaks the following testcase.
+    The code in sched_analyze_2 did 2 things:
+    1) cselib_lookup_from_insn
+    2) shallow_copy_rtx + cselib_subst_to_values_from_insn
+    Now, 1) is precondition of 2), we can only subst the VALUEs if we
+    have actually looked the address up, but as can be seen on that testcase,
+    we are relying on at least the 1) to be done because we subst the values
+    later on even on DEBUG_INSNs and actually use those when needed.
+    cselib_subst_to_values_from_insn mostly just replaces stuff in the
+    returned rtx, except for:
+          /* This used to happen for autoincrements, but we deal with them
+             properly now.  Remove the if stmt for the next release.  */
+          if (! e)
+            {
+              /* Assign a value that doesn't match any other.  */
+              e = new_cselib_val (next_uid, GET_MODE (x), x);
+            }
+    which is like that since 2011, I hope it is never reachable and we should
+    in stage1 replace that with gcc_assert or just remove (then it will
+    segfault on following
+          return e->val_rtx;
+    ).
+    
+    So, I (as done in the patch below) reinstalled the 1) and not 2) for
+    DEBUG_INSNs.  This fixed the new testcase, but broke again thePR106746testcases.
+    
+    I've spent a day debugging that and found the problem is that as documented
+    in a large comment in cselib.cc above n_useless_values variable definition,
+    we spend quite a few effort on making sure that VALUEs created on
+    DEBUG_INSNs don't affect the cselib decisions for non-DEBUG_INSNs such as
+    pruning of useless values etc., but if a VALUE created that way is then
+    looked up/needed from non-DEBUG_INSNs, we promote it to non-debug.
+    
+    The reason for -fcompare-debug failure is that there is one large DEBUG_INSN
+    with 16 MEMs in it mostly with addresses that so far didn't appear in the IL
+    otherwise.  Later on, we see an instruction storing into MEM destination
+    and invalidate that MEM.  Unfortunately, there is a bug caused by the
+    introduction of SP_DERIVED_VALUE_P where alias.cc isn't able to disambiguate
+    MEMs with sp + optional offset in address vs. MEMs with address being a
+    VALUE having SP_DERIVED_VALUE_P + constant (or the SP_DERIVED_VALUE_P
+    itself), which ought to be possible when REG_VALUES (REGNO
+    (stack_pointer_rtx)) has SP_DERIVED_VALUE_P + constant location.  Not sure
+    if I should try to fix that in stage4 or defer for stage1.
+    Anyway, the cselib_invalidate_mem call because of this invalidates basically
+    all MEMs with the exception of 5 which have MEM_EXPRs that guarantee
+    non-aliasing with the sp based store.
+    Unfortunately, n_useless_values which in my understanding should be always
+    the same between -g and -g0 compilations diverges, has 3 more useless values
+    for -g.
+    
+    Now, these were initially VALUEs created for DEBUG_INSN lookups.  As I said,
+    cselib.cc has code to promote such VALUEs (well, their location elements) to
+    non-debug if they are looked up from non-DEBUG_INSNs.  The problem is that
+    when looking some completely unrelated MEM from a non-DEBUG_INSN we run into
+    a hash collision and so call cselib_hasher::equal to check if the unrelated
+    MEM is equal to the one from DEBUG_INSN only element.  The equal static
+    member function calls rtx_equal_for_cselib_1 and if that returns true,
+    promotes the location to non-DEBUG, otherwise returns false.  So far so
+    good.  But rtx_equal_for_cselib_1 internally performs various other cselib
+    lookups, all done with the non-DEBUG_INSN cselib_current_insn, so they
+    all promote to non-debug.  And that is wrong, because if it was -g0
+    compilation, such hashtable entry wouldn't be there at all (or would be
+    but wouldn't contain that locs element), so with -g0 we wouldn't call
+    that rtx_equal_for_cselib_1 at all.  So, I think we need to pretend
+    that such lookup which only happens with -g and not -g0 actually comes
+    from some DEBUG_INSN (note, the lookups rtx_equal_for_cselib_1 does
+    are always with create = 0).
+    The cselib.cc part of the patch does that.
+    
+    BTW, I'm not really sure how:
+              if (num_mems < param_max_cselib_memory_locations
+                  && ! canon_anti_dependence (x, false, mem_rtx,
+                                              GET_MODE (mem_rtx), mem_addr))
+                {
+                  has_mem = true;
+                  num_mems++;
+                  p = &(*p)->next;
+                  continue;
+                }
+    num_mems cap can actually work correctly for -fcompare-debug,
+    I'd think we would need to differentiate between num_debug_mems and
+    num_mems depending on if setting_insn is non-NULL DEBUG_INSN or not.
+    That was one of my suspicions on this testcase, but the number of MEMs
+    was small enough for the param in either case (especially because of
+    the above mentioned missed non-aliasings).  But as implemented, I think
+    if we have tons of non-aliased MEMs from DEBUG_INSN setting_insns,
+    we could unchain lots more non-DEBUG MEMs with -g than with -g0.
+    
+    2023-02-02  Jakub Jelinek  <jakub@redhat.com>PR debug/106746PR rtl-optimization/108463PR target/108484* cselib.cc (cselib_current_insn): Move declaration earlier.
+            (cselib_hasher::equal): For debug only locs, temporarily override
+            cselib_current_insn to their l->setting_insn for the
+            rtx_equal_for_cselib_1 call, so that unsuccessful comparisons don't
+            promote some debug locs.
+            * sched-deps.cc (sched_analyze_2) <case MEM>: For MEMs in DEBUG_INSNs
+            when using cselib call cselib_lookup_from_insn on the address but
+            don't substitute it.
+    
+            * gcc.dg/pr108463.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-02-02 12:57:25 UTC
+  Text: Should be fixed now.
+

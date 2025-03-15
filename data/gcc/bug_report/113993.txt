@@ -1,0 +1,343 @@
+Bug Summary: ICE: in get_no_error_domain, at tree-call-cdce.cc:815 with __builtin_exp2f32x() at -O1 and above
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 13.2.1, 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-02-19 14:08:49 UTC
+  Text: Createdattachment 57460[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O testcase.c
+during GIMPLE pass: cdce
+testcase.c: In function 'foo':
+testcase.c:2:1: internal compiler error: in get_no_error_domain, at tree-call-cdce.cc:815
+    2 | foo (int i)
+      | ^~~
+0x82d40f get_no_error_domain
+        /repo/gcc-trunk/gcc/tree-call-cdce.cc:815
+0x82d40f gen_shrink_wrap_conditions
+        /repo/gcc-trunk/gcc/tree-call-cdce.cc:852
+0x1544693 shrink_wrap_one_built_in_call
+        /repo/gcc-trunk/gcc/tree-call-cdce.cc:1101
+0x1544693 shrink_wrap_conditional_dead_built_in_calls
+        /repo/gcc-trunk/gcc/tree-call-cdce.cc:1213
+0x1544693 execute
+        /repo/gcc-trunk/gcc/tree-call-cdce.cc:1292
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-9059-20240219001746-ge42287eaed2-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-9059-20240219001746-ge42287eaed2-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240219 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-02-19 22:07:01 UTC
+  Text: Confirmed.
+
+Here are the ones which need to be handled in get_no_error_domain for the fNx types as far as I can tell:
+cosh
+exp
+exp2
+
+- User: Jakub Jelinek | Time: 2024-02-19 23:28:43 UTC
+  Text: I believe BUILT_IN_{COSH,SINH,EXP{,M1,2}}F{32,64}X.
+BUILT_IN_{COSH,SINH,EXP{,M1,2,10},POW10}L cases all are also very conservative (sure, it is documented that way).
+
+- User: Jakub Jelinek | Time: 2024-02-19 23:31:11 UTC
+  Text: Createdattachment 57467[details]gcc14-pr113993-wip.patch
+
+WIP patch.
+
+- User: Andrew Pinski | Time: 2024-02-19 23:36:17 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #3)> Createdattachment 57467[details]> gcc14-pr113993-wip.patch
+> 
+> WIP patch.I know this might be a stupid question but I notice this handles 96 and 128bit but not double double support. Or the fall back to the double enough for that?
+
+- User: Jakub Jelinek | Time: 2024-02-19 23:49:28 UTC
+  Text: (In reply to Andrew Pinski fromcomment #4)> (In reply to Jakub Jelinek fromcomment #3)
+> > Createdattachment 57467[details]> > gcc14-pr113993-wip.patch
+> > 
+> > WIP patch.
+> 
+> I know this might be a stupid question but I notice this handles 96 and
+> 128bit but not double double support. Or the fall back to the double enough
+> for that?As documented, it can be conservatively smaller.  I've left out e.g. the motorola extended (which has exponent range -16382 to 16384 rather than -16381 to 16384 like
+intel extended or IEEE quad has) and the *BSD Intel as well, though I bet unnecessarily.  Seems all the get_no_error_domain stuff actually only cares about is the maximum exponent (which is why all the Intel extended long double domains are the same as IEEE quad).  So, maybe I should simplify it by doing (for whatever being long_double or float64x):
+if (REAL_MODE_FORMAT (TYPE_MODE (whatever_type_node))->emax == 16384)
+  return get_no_error_domain (BUILT_IN_WHATEVERF128);
+return get_no_error_domain (BUILT_IN_WHATEVERF64);
+Anyway, given that ibm extended has emax 1024 like double (obviously it can't have higher exponent than double), the double versions are actually exact, not conservatively correct.
+
+- User: Jakub Jelinek | Time: 2024-02-20 00:05:30 UTC
+  Text: Following is much shorter:
+--- gcc/tree-call-cdce.cc.jj	2024-01-03 11:51:37.654646209 +0100
++++ gcc/tree-call-cdce.cc	2024-02-20 01:04:42.896987568 +0100
+@@ -677,14 +677,14 @@ gen_conditions_for_pow (gcall *pow_call,
+    Since IEEE only sets minimum requirements for long double format,
+    different long double formats exist under different implementations
+    (e.g, 64 bit double precision (DF), 80 bit double-extended
+-   precision (XF), and 128 bit quad precision (QF) ).  For simplicity,
++   precision (XF), and 128 bit quad precision (TF) ).  For simplicity,
+    in this implementation, the computed bounds for long double assume
+-   64 bit format (DF), and are therefore conservative.  Another
+-   assumption is that single precision float type is always SF mode,
+-   and double type is DF mode.  This function is quite
+-   implementation specific, so it may not be suitable to be part of
+-   builtins.cc.  This needs to be revisited later to see if it can
+-   be leveraged in x87 assembly expansion.  */
++   64 bit format (DF) except when it is IEEE quad or extended with the same
++   emax, and are therefore sometimes conservative.  Another assumption is
++   that single precision float type is always SF mode, and double type is DF
++   mode.  This function is quite implementation specific, so it may not be
++   suitable to be part of builtins.cc.  This needs to be revisited later
++   to see if it can be leveraged in x87 assembly expansion.  */
+ 
+ static inp_domain
+ get_no_error_domain (enum built_in_function fnc)
+@@ -723,10 +723,10 @@ get_no_error_domain (enum built_in_funct
+                          89, true, false);
+     case BUILT_IN_COSH:
+     case BUILT_IN_SINH:
+-    case BUILT_IN_COSHL:
+-    case BUILT_IN_SINHL:
+     case BUILT_IN_COSHF64:
+     case BUILT_IN_SINHF64:
++    case BUILT_IN_COSHF32X:
++    case BUILT_IN_SINHF32X:
+       /* cosh: (-710, +710)  */
+       return get_domain (-710, true, false,
+                          710, true, false);
+@@ -735,6 +735,16 @@ get_no_error_domain (enum built_in_funct
+       /* coshf128: (-11357, +11357)  */
+       return get_domain (-11357, true, false,
+ 			 11357, true, false);
++    case BUILT_IN_COSHL:
++    case BUILT_IN_SINHL:
++      if (REAL_MODE_FORMAT (TYPE_MODE (long_double_type_node))->emax == 16384)
++	return get_no_error_domain (BUILT_IN_COSHF128);
++      return get_no_error_domain (BUILT_IN_COSH);
++    case BUILT_IN_COSHF64X:
++    case BUILT_IN_SINHF64X:
++      if (REAL_MODE_FORMAT (TYPE_MODE (float64x_type_node))->emax == 16384)
++	return get_no_error_domain (BUILT_IN_COSHF128);
++      return get_no_error_domain (BUILT_IN_COSH);
+     /* Log functions: (0, +inf)  */
+     CASE_FLT_FN (BUILT_IN_LOG):
+     CASE_FLT_FN_FLOATN_NX (BUILT_IN_LOG):
+@@ -763,10 +773,10 @@ get_no_error_domain (enum built_in_funct
+                          88, true, false);
+     case BUILT_IN_EXP:
+     case BUILT_IN_EXPM1:
+-    case BUILT_IN_EXPL:
+-    case BUILT_IN_EXPM1L:
+     case BUILT_IN_EXPF64:
+     case BUILT_IN_EXPM1F64:
++    case BUILT_IN_EXPF32X:
++    case BUILT_IN_EXPM1F32X:
+       /* exp: (-inf, 709)  */
+       return get_domain (-1, false, false,
+                          709, true, false);
+@@ -775,6 +785,16 @@ get_no_error_domain (enum built_in_funct
+       /* expf128: (-inf, 11356)  */
+       return get_domain (-1, false, false,
+ 			 11356, true, false);
++    case BUILT_IN_EXPL:
++    case BUILT_IN_EXPM1L:
++      if (REAL_MODE_FORMAT (TYPE_MODE (long_double_type_node))->emax == 16384)
++	return get_no_error_domain (BUILT_IN_EXPF128);
++      return get_no_error_domain (BUILT_IN_EXP);
++    case BUILT_IN_EXPF64X:
++    case BUILT_IN_EXPM1F64X:
++      if (REAL_MODE_FORMAT (TYPE_MODE (float64x_type_node))->emax == 16384)
++	return get_no_error_domain (BUILT_IN_EXPF128);
++      return get_no_error_domain (BUILT_IN_EXP);
+     case BUILT_IN_EXP2F16:
+       /* exp2f16: (-inf, 16)  */
+       return get_domain (-1, false, false,
+@@ -785,8 +805,8 @@ get_no_error_domain (enum built_in_funct
+       return get_domain (-1, false, false,
+                          128, true, false);
+     case BUILT_IN_EXP2:
+-    case BUILT_IN_EXP2L:
+     case BUILT_IN_EXP2F64:
++    case BUILT_IN_EXP2F32X:
+       /* exp2: (-inf, 1024)  */
+       return get_domain (-1, false, false,
+                          1024, true, false);
+@@ -794,6 +814,14 @@ get_no_error_domain (enum built_in_funct
+       /* exp2f128: (-inf, 16384)  */
+       return get_domain (-1, false, false,
+ 			 16384, true, false);
++    case BUILT_IN_EXP2L:
++      if (REAL_MODE_FORMAT (TYPE_MODE (long_double_type_node))->emax == 16384)
++	return get_no_error_domain (BUILT_IN_EXP2F128);
++      return get_no_error_domain (BUILT_IN_EXP2);
++    case BUILT_IN_EXP2F64X:
++      if (REAL_MODE_FORMAT (TYPE_MODE (float64x_type_node))->emax == 16384)
++	return get_no_error_domain (BUILT_IN_EXP2F128);
++      return get_no_error_domain (BUILT_IN_EXP2);
+     case BUILT_IN_EXP10F:
+     case BUILT_IN_POW10F:
+       /* exp10f: (-inf, 38)  */
+@@ -801,11 +829,16 @@ get_no_error_domain (enum built_in_funct
+                          38, true, false);
+     case BUILT_IN_EXP10:
+     case BUILT_IN_POW10:
+-    case BUILT_IN_EXP10L:
+-    case BUILT_IN_POW10L:
+       /* exp10: (-inf, 308)  */
+       return get_domain (-1, false, false,
+                          308, true, false);
++    case BUILT_IN_EXP10L:
++    case BUILT_IN_POW10L:
++      if (REAL_MODE_FORMAT (TYPE_MODE (long_double_type_node))->emax == 16384)
++	/* exp10l: (-inf, 4932)  */
++	return get_domain (-1, false, false,
++			   4932, true, false);
++      return get_no_error_domain (BUILT_IN_EXP10);
+     /* sqrt: [0, +inf)  */
+     CASE_FLT_FN (BUILT_IN_SQRT):
+     CASE_FLT_FN_FLOATN_NX (BUILT_IN_SQRT):
+
+- User: Jakub Jelinek | Time: 2024-02-20 09:06:09 UTC
+  Text: Createdattachment 57468[details]gcc14-pr113993.patch
+
+Full untested patch.
+
+- User: GCC Commits | Time: 2024-02-22 09:20:22 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:7ed800c9c94b57077ba5911974a63bc06a5e1c35commitr14-9132-g7ed800c9c94b57077ba5911974a63bc06a5e1c35Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Feb 22 10:19:15 2024 +0100
+
+    call-cdce: Add missing BUILT_IN_*F{32,64}X handling and improve BUILT_IN_*L [PR113993]
+    
+    The following testcase ICEs, because can_test_argument_range
+    returns true for BUILT_IN_{COSH,SINH,EXP{,M1,2}}{F32X,F64X}
+    among many other builtins, but get_no_error_domain doesn't handle
+    those.
+    
+    float32x_type_node when supported in GCC always has DFmode, so that
+    case is easy (and call-cdce assumes that SFmode is IEEE float and DFmode
+    is IEEE double).  So *F32X is simply handled by adding those cases
+    next to *F64.
+    float64x_type_node when supported in GCC by definition has a mode
+    with larger precision and exponent range than DFmode, so it can be XFmode,
+    TFmode or KFmode.  I went through all the l/f128 suffixed builtins and
+    verified that the float128x_type_node no error domain range is actually
+    identical to the Intel extended long double no error domain range; it isn't
+    that surprising, both IEEE quad and Intel/Motorola extended have the same
+    exponent range [-16381, 16384] (well, Motorola -16382 probably because of
+    different behavior for denormals, but that has nothing to do with
+    get_no_error_domain which is about large inputs overflowing into +-Inf
+    or triggering NaN, denormals could in theory do something solely for sqrt
+    and even that is fine).  In theory some target could have different larger
+    type, so for *F64X the code verifies that
+    REAL_MODE_FORMAT (TYPE_MODE (float64x_type_node))->emax == 16384
+    and if so, uses the *F128 domains, otherwise falls back to the non-suffixed
+    ones (aka *F64), that is certainly the conservative minimum.
+    While at it, the patch also changes the *L suffixed cases to do pretty much
+    the same, the comment said that the function just assumes for *L
+    the *F64 ranges, but that is unnecessarily conservative.
+    All we currently have for long double is:
+    1) IEEE quad (emax 16384, *F128 ranges)
+    2) XFmode Intel/Motorola extended (emax 16384, same as *F128 ranges)
+    3) IBM extended (double double, emax 1024, the extra precision doesn't
+       really help and the domains are the same as for *F64)
+    4) same as double (*F64 again)
+    So, the patch uses also for *L
+    REAL_MODE_FORMAT (TYPE_MODE (long_double_type_node))->emax == 16384
+    checks and either tail recurses into the *F128 case for that or to
+    non-suffixed (aka *F64) case otherwise.
+    BUILT_IN_*F128X not handled because no target has those and it doesn't
+    seem something is on the horizon and who knows what would be used for that.
+    Thus, all we get this wrong for are probably VAX floats or something
+    similar, no intent from me to look at that, that is preexisting issue.
+    
+    BTW, I'm surprised we don't have BUILT_IN_EXP10F{16,32,64,128,32X,64X,128X}
+    builtins, seems glibc has those (sure, I think except *16 and *128x).
+    
+    2024-02-22  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113993* tree-call-cdce.cc (get_no_error_domain): Handle
+            BUILT_IN_{COSH,SINH,EXP{,M1,2}}{F32X,F64X}.  Handle
+            BUILT_IN_{COSH,SINH,EXP{,M1,2}}L for
+            REAL_MODE_FORMAT (TYPE_MODE (long_double_type_node))->emax == 16384
+            the as the F128 suffixed cases, otherwise as non-suffixed ones.
+            Handle BUILT_IN_{EXP,POW}10L for
+            REAL_MODE_FORMAT (TYPE_MODE (long_double_type_node))->emax == 16384
+            as (-inf, 4932).
+    
+            * gcc.dg/tree-ssa/pr113993.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-22 09:20:54 UTC
+  Text: Fixed.
+
+- User: GCC Commits | Time: 2024-03-02 00:39:01 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:856a66a672a1fd7feb2dee7e7aca21118016063fcommitr13-8391-g856a66a672a1fd7feb2dee7e7aca21118016063fAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Feb 22 10:19:15 2024 +0100
+
+    call-cdce: Add missing BUILT_IN_*F{32,64}X handling and improve BUILT_IN_*L [PR113993]
+    
+    The following testcase ICEs, because can_test_argument_range
+    returns true for BUILT_IN_{COSH,SINH,EXP{,M1,2}}{F32X,F64X}
+    among many other builtins, but get_no_error_domain doesn't handle
+    those.
+    
+    float32x_type_node when supported in GCC always has DFmode, so that
+    case is easy (and call-cdce assumes that SFmode is IEEE float and DFmode
+    is IEEE double).  So *F32X is simply handled by adding those cases
+    next to *F64.
+    float64x_type_node when supported in GCC by definition has a mode
+    with larger precision and exponent range than DFmode, so it can be XFmode,
+    TFmode or KFmode.  I went through all the l/f128 suffixed builtins and
+    verified that the float128x_type_node no error domain range is actually
+    identical to the Intel extended long double no error domain range; it isn't
+    that surprising, both IEEE quad and Intel/Motorola extended have the same
+    exponent range [-16381, 16384] (well, Motorola -16382 probably because of
+    different behavior for denormals, but that has nothing to do with
+    get_no_error_domain which is about large inputs overflowing into +-Inf
+    or triggering NaN, denormals could in theory do something solely for sqrt
+    and even that is fine).  In theory some target could have different larger
+    type, so for *F64X the code verifies that
+    REAL_MODE_FORMAT (TYPE_MODE (float64x_type_node))->emax == 16384
+    and if so, uses the *F128 domains, otherwise falls back to the non-suffixed
+    ones (aka *F64), that is certainly the conservative minimum.
+    While at it, the patch also changes the *L suffixed cases to do pretty much
+    the same, the comment said that the function just assumes for *L
+    the *F64 ranges, but that is unnecessarily conservative.
+    All we currently have for long double is:
+    1) IEEE quad (emax 16384, *F128 ranges)
+    2) XFmode Intel/Motorola extended (emax 16384, same as *F128 ranges)
+    3) IBM extended (double double, emax 1024, the extra precision doesn't
+       really help and the domains are the same as for *F64)
+    4) same as double (*F64 again)
+    So, the patch uses also for *L
+    REAL_MODE_FORMAT (TYPE_MODE (long_double_type_node))->emax == 16384
+    checks and either tail recurses into the *F128 case for that or to
+    non-suffixed (aka *F64) case otherwise.
+    BUILT_IN_*F128X not handled because no target has those and it doesn't
+    seem something is on the horizon and who knows what would be used for that.
+    Thus, all we get this wrong for are probably VAX floats or something
+    similar, no intent from me to look at that, that is preexisting issue.
+    
+    BTW, I'm surprised we don't have BUILT_IN_EXP10F{16,32,64,128,32X,64X,128X}
+    builtins, seems glibc has those (sure, I think except *16 and *128x).
+    
+    2024-02-22  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113993* tree-call-cdce.cc (get_no_error_domain): Handle
+            BUILT_IN_{COSH,SINH,EXP{,M1,2}}{F32X,F64X}.
+    
+            * gcc.dg/tree-ssa/pr113993.c: New test.
+    
+    (cherry picked from commit 7ed800c9c94b57077ba5911974a63bc06a5e1c35)
+
+- User: Jakub Jelinek | Time: 2024-03-04 12:12:42 UTC
+  Text: Fixed also for GCC 13.3+, though in that case I haven't changed the behavior for *l builtins, just added *f32x and *f64x builtin support.
+

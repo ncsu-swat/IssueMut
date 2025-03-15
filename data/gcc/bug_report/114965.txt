@@ -1,0 +1,301 @@
+Bug Summary: [13 Regression] wrong code generated for Emacs/Gnulib strftime (regression from 13.2)
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 12.3.0
+Known to Fail: 13.1.0
+
+Comments:
+- User: Paul Eggert | Time: 2024-05-06 22:17:55 UTC
+  Text: Createdattachment 58111[details]Test with "gcc -O2 u5.i; ./a.out". The output should be a "123   " line.
+
+I ran into this problem when building newish GNU Emacs with gcc (GCC) 14.0.1 20240411 (Red Hat 14.0.1-0) on x86-64.
+
+GCC generates incorrect code for emacs/lib/nstrftime.c, which is taken from Gnulib. The incorrect code causes some of Emacs's own test cases ("make check") to fail. Possibly you'll see a similar problem with glibc strftime, though I haven't tested this.
+
+A stripped-down version of the problem is attached. Compile and run it with:
+
+  gcc -O2 u5.i
+  ./a.out
+
+The output is "123000", but it should be "123   " - that is, three spaces should follow the "123" instead of three zeros.
+
+Looking at the generated code, it appears that GCC gets confused by the complicated logic involving the 'pad' local variable, switch statements, etc. The code generated for line 62 behaves as if (pad == '0' || pad == '+') is true, even though it is false because pad == '_'.
+
+Compiling without -O2 makes the problem go away. The problem does not occur with GCC 13.2.0, which I built myself. Nor does it occur with gcc (GCC) 8.5.0 20210514 (Red Hat 8.5.0-4).
+
+- User: Andrew Pinski | Time: 2024-05-06 23:05:24 UTC
+  Text: Createdattachment 58112[details]Slightly reduced
+
+- User: Andrew Pinski | Time: 2024-05-06 23:07:07 UTC
+  Text: Confirmed.
+
+- User: Andrew Pinski | Time: 2024-05-06 23:08:36 UTC
+  Text: Createdattachment 58113[details]Reduced all the way
+
+here is a much simplier reduction. This passes at -O0 and fails at -O2.
+
+It also fails for GCC 13.1.0 at -O1 and above.
+
+- User: Andrew Pinski | Time: 2024-05-06 23:10:51 UTC
+  Text: Note my reduction fails at -O1 and above while the original only failed at -O2 and above. Also the original only failed with GCC 14+ while my reduction fails with GCC 13+.
+
+- User: Andrew Pinski | Time: 2024-05-06 23:35:06 UTC
+  Text: Oh I see where the bug is coming from.
+
+reassociation is turning:
+  _2 = pad_6 == 48;
+  _3 = pad_6 == 43;
+  _4 = _2 | _3;
+
+Into:
+  _11 = (unsigned char) pad_6;
+  _12 = (int) _11;
+  _13 = 290271069732864 >> _12;
+  _14 = _13 & 1;
+  _15 = _14 == 0;
+  _16 = ~_15;
+  _4 = _16;
+
+Which is invalid as pad_6 could be greater than 64.
+
+
+Rank for pad_6 is 393216
+Rank for _3 is 393217
+Rank for _2 is 393217
+Matching expression match.pd:179, gimple-match-8.cc:45
+Matching expression match.pd:179, gimple-match-8.cc:45
+Matching expression match.pd:2243, gimple-match-5.cc:20
+Applying pattern match.pd:219, generic-match-1.cc:3159
+Matching expression match.pd:2833, generic-match-4.cc:22
+Matching expression match.pd:2840, generic-match-3.cc:38
+Matching expression match.pd:2845, generic-match-2.cc:23
+Matching expression match.pd:2833, generic-match-4.cc:22
+Matching expression match.pd:2840, generic-match-3.cc:38
+Matching expression match.pd:2845, generic-match-2.cc:23
+Matching expression match.pd:2835, gimple-match-2.cc:35
+Matching expression match.pd:2838, gimple-match-1.cc:66
+Matching expression match.pd:2845, gimple-match-2.cc:96
+Matching expression match.pd:2243, generic-match-7.cc:21
+Matching expression match.pd:2835, generic-match-4.cc:36
+Matching expression match.pd:2838, generic-match-3.cc:53
+Matching expression match.pd:2845, generic-match-2.cc:23
+Optimizing range tests pad_6 -[43, 43] and -[48, 48]
+ into _15
+Transforming _4 = _2 | _3;
+ into _4 = _16;
+Rank for _11 is 393217
+Rank for _12 is 393218
+Rank for _13 is 393219
+
+- User: Andrew Pinski | Time: 2024-05-06 23:45:09 UTC
+  Text: Reduded testcase that fails at -O1 (but passes at -O2):
+```
+
+[[gnu::noipa]]
+static void g(char pad1) {
+    if (pad1 != '0' && pad1 != '+' && pad1 != '_')
+      __builtin_unreachable();
+    if (pad1 == '0' || pad1 == '+')
+        __builtin_trap();
+}
+char buf[4000];
+int main(void) { g('_'); }
+
+```
+
+But it definitely comes down to reassociation incorrectly thinking that (here) that pad1 could only be 43 or 48. While it could be also 93 ('_').
+
+- User: Sam James | Time: 2024-05-07 04:45:46 UTC
+  Text: (In reply to Andrew Pinski fromcomment #6)> Reduded testcase that fails at -O1 (but passes at -O2):
+> ```
+> 
+> [[gnu::noipa]]
+> static void g(char pad1) {
+>     if (pad1 != '0' && pad1 != '+' && pad1 != '_')
+>       __builtin_unreachable();
+>     if (pad1 == '0' || pad1 == '+')
+>         __builtin_trap();
+> }
+> char buf[4000];
+> int main(void) { g('_'); }
+> 
+> ```
+>Bisect for this testcase with releases/gcc-12 vs releases/gcc-13 givesr13-2876-g2460f7cdef7ef9.
+
+I will do the trunk one from Paul next.
+
+- User: Sam James | Time: 2024-05-07 09:49:32 UTC
+  Text: For Paul's on 13 vs 14, I getr14-3414-g0cfc9c953d0221.
+
+- User: Jakub Jelinek | Time: 2024-05-07 11:25:22 UTC
+  Text: It is thePR63464optimization gone wrong.
+
+- User: Jakub Jelinek | Time: 2024-05-07 11:49:46 UTC
+  Text: Untested fix.
+If entry_test_needed, earlier code ensures that exp is in [lowi, high] range,
+so the optimization is ok.  But without it, we need to ensure that if we lower
+lowi we can still do the shifts safely.
+r in this case is [43,43][48,48][95,95], so we don't need entry test if we
+subtract the low bound (43), but 95 is too high for 64-bit prec.
+--- gcc/tree-ssa-reassoc.cc.jj	2023-10-15 23:04:06.181422840 +0200
++++ gcc/tree-ssa-reassoc.cc	2024-05-07 13:46:42.722966813 +0200
+@@ -3414,7 +3414,8 @@ optimize_range_tests_to_bit_test (enum t
+ 	     We can avoid then subtraction of the minimum value, but the
+ 	     mask constant could be perhaps more expensive.  */
+ 	  if (compare_tree_int (lowi, 0) > 0
+-	      && compare_tree_int (high, prec) < 0)
++	      && compare_tree_int (high, prec) < 0
++	      && (entry_test_needed || wi::ltu_p (r.upper_bound (), prec)))
+ 	    {
+ 	      int cost_diff;
+ 	      HOST_WIDE_INT m = tree_to_uhwi (lowi);
+
+- User: Jakub Jelinek | Time: 2024-05-07 16:24:30 UTC
+  Text: Createdattachment 58121[details]gcc15-pr114965.patch
+
+Full untested fix.
+
+- User: Paul Eggert | Time: 2024-05-07 16:38:35 UTC
+  Text: Thanks for fixing GCC.
+
+I installed into Gnulib a patch that clarifies strftime's implementation, and this also works around the GCC bug. It'll take some time for this to propagate out, though, as Gnulib is a source code library and each package incorporates Gnulib code when it sees fit. The patch is here:https://git.savannah.gnu.org/cgit/gnulib.git/commit/?id=4121ae7ad2859331447fe719d255e3d22953f327
+
+- User: GCC Commits | Time: 2024-05-08 08:18:23 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:9adec2d91e62a479474ae79df5b455fd4b8463bacommitr15-315-g9adec2d91e62a479474ae79df5b455fd4b8463baAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 8 10:17:32 2024 +0200
+
+    reassoc: Fix up optimize_range_tests_to_bit_test [PR114965]
+    
+    The optimize_range_tests_to_bit_test optimization normally emits a range
+    test first:
+              if (entry_test_needed)
+                {
+                  tem = build_range_check (loc, optype, unshare_expr (exp),
+                                           false, lowi, high);
+                  if (tem == NULL_TREE || is_gimple_val (tem))
+                    continue;
+                }
+    so during the bit test we already know that exp is in the [lowi, high]
+    range, but skips it if we have range info which tells us this isn't
+    necessary.
+    Also, normally it emits shifts by exp - lowi counter, but has an
+    optimization to use just exp counter if the mask isn't a more expensive
+    constant in that case and lowi is > 0 and high is smaller than prec.
+    
+    The following testcase is miscompiled because the two abnormal cases
+    are triggered.  The range of exp is [43, 43][48, 48][95, 95], so we on
+    64-bit arch decide we don't need the entry test, because 95 - 43 < 64.
+    And we also decide to use just exp as counter, because the range test
+    tests just for exp == 43 || exp == 48, so high is smaller than 64 too.
+    Because 95 is in the exp range, we can't do that, we'd either need to
+    do a range test first, i.e.
+    if (exp - 43U <= 48U - 43U) if ((1UL << exp) & mask1))
+    or need to subtract lowi from the shift counter, i.e.
+    if ((1UL << (exp - 43)) & mask2)
+    but can't do both unless r.upper_bound () is < prec.
+    
+    The following patch ensures that.
+    
+    2024-05-08  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114965* tree-ssa-reassoc.cc (optimize_range_tests_to_bit_test): Don't try to
+            optimize away exp - lowi subtraction from shift count unless entry
+            test is emitted or unless r.upper_bound () is smaller than prec.
+    
+            * gcc.c-torture/execute/pr114965.c: New test.
+
+- User: GCC Commits | Time: 2024-05-08 08:19:19 UTC
+  Text: The releases/gcc-14 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d54151df3ba0ee3203e0b8cb8f8fcd168a766c51commitr14-10184-gd54151df3ba0ee3203e0b8cb8f8fcd168a766c51Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 8 10:17:32 2024 +0200
+
+    reassoc: Fix up optimize_range_tests_to_bit_test [PR114965]
+    
+    The optimize_range_tests_to_bit_test optimization normally emits a range
+    test first:
+              if (entry_test_needed)
+                {
+                  tem = build_range_check (loc, optype, unshare_expr (exp),
+                                           false, lowi, high);
+                  if (tem == NULL_TREE || is_gimple_val (tem))
+                    continue;
+                }
+    so during the bit test we already know that exp is in the [lowi, high]
+    range, but skips it if we have range info which tells us this isn't
+    necessary.
+    Also, normally it emits shifts by exp - lowi counter, but has an
+    optimization to use just exp counter if the mask isn't a more expensive
+    constant in that case and lowi is > 0 and high is smaller than prec.
+    
+    The following testcase is miscompiled because the two abnormal cases
+    are triggered.  The range of exp is [43, 43][48, 48][95, 95], so we on
+    64-bit arch decide we don't need the entry test, because 95 - 43 < 64.
+    And we also decide to use just exp as counter, because the range test
+    tests just for exp == 43 || exp == 48, so high is smaller than 64 too.
+    Because 95 is in the exp range, we can't do that, we'd either need to
+    do a range test first, i.e.
+    if (exp - 43U <= 48U - 43U) if ((1UL << exp) & mask1))
+    or need to subtract lowi from the shift counter, i.e.
+    if ((1UL << (exp - 43)) & mask2)
+    but can't do both unless r.upper_bound () is < prec.
+    
+    The following patch ensures that.
+    
+    2024-05-08  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114965* tree-ssa-reassoc.cc (optimize_range_tests_to_bit_test): Don't try to
+            optimize away exp - lowi subtraction from shift count unless entry
+            test is emitted or unless r.upper_bound () is smaller than prec.
+    
+            * gcc.c-torture/execute/pr114965.c: New test.
+    
+    (cherry picked from commit 9adec2d91e62a479474ae79df5b455fd4b8463ba)
+
+- User: Jakub Jelinek | Time: 2024-05-08 08:20:38 UTC
+  Text: Fixed for 14.2+ and 15.1+.
+
+- User: GCC Commits | Time: 2024-05-09 04:27:00 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:44d84db11ab724c34a8b1f8c0e06da1cc78439a2commitr13-8735-g44d84db11ab724c34a8b1f8c0e06da1cc78439a2Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 8 10:17:32 2024 +0200
+
+    reassoc: Fix up optimize_range_tests_to_bit_test [PR114965]
+    
+    The optimize_range_tests_to_bit_test optimization normally emits a range
+    test first:
+              if (entry_test_needed)
+                {
+                  tem = build_range_check (loc, optype, unshare_expr (exp),
+                                           false, lowi, high);
+                  if (tem == NULL_TREE || is_gimple_val (tem))
+                    continue;
+                }
+    so during the bit test we already know that exp is in the [lowi, high]
+    range, but skips it if we have range info which tells us this isn't
+    necessary.
+    Also, normally it emits shifts by exp - lowi counter, but has an
+    optimization to use just exp counter if the mask isn't a more expensive
+    constant in that case and lowi is > 0 and high is smaller than prec.
+    
+    The following testcase is miscompiled because the two abnormal cases
+    are triggered.  The range of exp is [43, 43][48, 48][95, 95], so we on
+    64-bit arch decide we don't need the entry test, because 95 - 43 < 64.
+    And we also decide to use just exp as counter, because the range test
+    tests just for exp == 43 || exp == 48, so high is smaller than 64 too.
+    Because 95 is in the exp range, we can't do that, we'd either need to
+    do a range test first, i.e.
+    if (exp - 43U <= 48U - 43U) if ((1UL << exp) & mask1))
+    or need to subtract lowi from the shift counter, i.e.
+    if ((1UL << (exp - 43)) & mask2)
+    but can't do both unless r.upper_bound () is < prec.
+    
+    The following patch ensures that.
+    
+    2024-05-08  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114965* tree-ssa-reassoc.cc (optimize_range_tests_to_bit_test): Don't try to
+            optimize away exp - lowi subtraction from shift count unless entry
+            test is emitted or unless r.upper_bound () is smaller than prec.
+    
+            * gcc.c-torture/execute/pr114965.c: New test.
+    
+    (cherry picked from commit 9adec2d91e62a479474ae79df5b455fd4b8463ba)
+
+- User: Jakub Jelinek | Time: 2024-05-09 08:19:13 UTC
+  Text: Fixed also for 13.3.
+

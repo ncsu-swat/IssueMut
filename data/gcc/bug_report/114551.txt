@@ -1,0 +1,119 @@
+Bug Summary: [14 Regression] wrong code at -O3 on x86_64-linux-gnu since r14-2944
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 13.2.0, 14.0
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2024-04-01 19:31:35 UTC
+  Text: It appears to be a recent regression as it does not reproduce for 13.2 and earlier. 
+
+Compiler Explorer:https://godbolt.org/z/q3hrz8MW1[587] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.1 20240401 (experimental) (GCC) 
+[588] % 
+[588] % gcctk -O2 small.c; ./a.out
+[589] % 
+[589] % gcctk -O3 small.c
+[590] % ./a.out
+Segmentation fault
+[591] % 
+[591] % cat small.c
+int a, b[4], c, d, e, f;
+int main() {
+  a--;
+  for (f = 3; f >= 0; f--) {
+    for (e = 0; e < 4; e++)
+      c = 0;
+    for (; c < 4; c++) {
+      d = f && a > 0 && f > (2147483647 - a) ? 0 : b[f];
+      continue;
+    }
+  }
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2024-04-01 20:45:18 UTC
+  Text: Confirmed.
+
+- User: Jakub Jelinek | Time: 2024-04-02 13:22:02 UTC
+  Text: Started withr14-2944-g3d48c11ad082def8ee237e5778d8a5d569bff96da is -1, so the testcase shouldn't do much except almost empty loops with a few iterations.
+The continue in there seems to be important, but dunno why, it is effectively just a goto to the immediately next statement; perhaps the continue predictor affects it?
+
+- User: Andrew Pinski | Time: 2024-04-02 23:43:39 UTC
+  Text: The first major difference with/without continue is the moving of `f > (2147483647 - a)` checkout of the loop via lim2 in the case of not having the continue.
+
+You can replace the inner most loop with:
+```
+    for (; c < 4; c++) {
+      [[unlikely]];
+      d = f && a > 0 && f > (2147483647 - a) ? 0 : b[f];
+    }
+```
+
+Also so yes it is the continue predictor that is coming into play.
+
+- User: Andrew Pinski | Time: 2024-04-03 03:44:03 UTC
+  Text: Note you can remove continue/[[unlikely]]` and reproduce it with `-O3 -fdisable-tree-lim2`.
+
+Also note disabling VRP2, `-fdisable-tree-vrp2` allows the code to pass which gets me the feeling like maybe lsplit is not rewriting the check to be overflow safe.
+
+- User: Andrew Pinski | Time: 2024-04-03 03:46:11 UTC
+  Text: Found potential split point: if (f.12_35 <= _25)
+ { 3 + I*-1 } le_expr 2147483647 - _2
+Applying pattern match.pd:6064, generic-match-4.cc:1699
+
+- User: Richard Biener | Time: 2024-04-03 12:27:51 UTC
+  Text: It can be reproduced with -O2 -funswitch-loops -fsplit-loops.
+
+Loop splitting emits
+
+  <bb 2> [local count: 14598063]:
+  a.0_1 = a;
+  _2 = a.0_1 + -1;
+  a = _2;
+  _24 = _2 <= 0;
+  _10 = 2147483647 - _2;
+  if (_10 <= 2)
+
+and the 2147483647 - _2 expression then overflows, so that's definitely
+wrong.  This is built here:
+
+        /* Build a condition that will skip the first loop when the
+           guard condition won't ever be true (or false).  */
+        gimple_seq stmts2;
+        border = force_gimple_operand (border, &stmts2, true, NULL_TREE);
+        if (stmts2)              
+
+or rather in split_at_bb_p and put into '*border'
+
+- User: GCC Commits | Time: 2024-04-04 07:00:20 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:e152177b362143465e2b9d721ea632cae3f13445commitr14-9781-ge152177b362143465e2b9d721ea632cae3f13445Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Apr 3 14:53:30 2024 +0200
+
+    tree-optimization/114551 - loop splitting and undefined overflow
+    
+    When loop splitting hoists a guard computation it needs to make sure
+    that can be safely evaluated at this place when it was previously
+    only conditionally evaluated.  The following fixes this for the
+    case of undefined overflow.PR tree-optimization/114551* tree-ssa-loop-split.cc (split_loop): If the guard is
+            only conditionally evaluated rewrite computations with
+            possibly undefined overflow to unsigned arithmetic.
+    
+            * gcc.dg/torture/pr114551.c: New testcase.
+
+- User: Richard Biener | Time: 2024-04-04 07:01:48 UTC
+  Text: Fixed on trunk, but the problem is surely latent.  I'm queueing for a GCC 13 backport but will not bother with it further.
+
+- User: Richard Biener | Time: 2024-05-06 12:06:53 UTC
+  Text: Too awkward to backport, depend on rewrite_to_defined_overflow API re-org.  Fixed in GCC 14.
+

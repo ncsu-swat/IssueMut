@@ -1,0 +1,177 @@
+Bug Summary: [11 Regression] LIM reissuing a violatile store when it cannot/should not
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 10.4.0, 11.3.1, 12.2.1, 13.0
+Known to Fail: 11.1.0, 11.3.0, 12.2.0
+
+Comments:
+- User: Franz Sirl | Time: 2023-02-16 15:25:36 UTC
+  Text: Hi,
+
+this small example
+
+extern volatile int *x;
+static int gCrc;
+
+static int crc16Add(int crc, int b) __attribute__((noinline));
+static int crc16Add(int crc, int b)
+{
+  return crc + b;
+}
+
+void f(int data, int dataSz)
+{
+  int i;
+
+  for(i=0;i<dataSz;i++)
+  {
+    gCrc = crc16Add(gCrc, data);
+    *x = data;
+  }
+}
+
+adds an extra volatile access after the loop (ARM assembler, but x64 shows the same problem):
+
+f(int, int):
+        mov     r2, r1
+        cmp     r2, #0
+        ble     .L8
+        push    {r3, r4, r5, lr}
+        movw    r5, #:lower16:.LANCHOR0
+        movt    r5, #:upper16:.LANCHOR0
+        movw    r4, #:lower16:x
+        movt    r4, #:upper16:x
+        mov     r1, r0
+        movs    r3, #0
+        ldr     r0, [r5]
+        ldr     r4, [r4]
+.L5:
+        adds    r3, r3, #1
+        bl      crc16Add(int, int)
+        cmp     r2, r3
+        str     r1, [r4]  @ <-- the last store here
+        bne     .L5
+        str     r0, [r5]
+        str     r1, [r4]  @ <-- is duplicated here
+        pop     {r3, r4, r5, pc}
+.L8:
+        bx      lr
+
+
+The tree dumps shows the extra access is added during the lim2 pass.
+Compiling with -fno-tree-loop-im avoids the invalid extra access to volatile memory.
+
+I'm not enough of a language lawyer to be sure that the extra volatile access is invalid in C/C++, but at least it's a bad optimization.
+
+- User: Andrew Pinski | Time: 2023-02-16 17:20:59 UTC
+  Text: Confirmed.
+
+Re-issueing dependent store of *x.1_3 from loop 1 on exit 3 -> 4
+Moving statement
+gCrc_lsm.9 = gCrc;
+(cost 0) out of loop 1.
+
+- User: Franz Sirl | Time: 2023-02-16 17:27:41 UTC
+  Text: Started with commit b6ff3ddecfa93d53867afaaa078f85fc848abbbd:
+
+tree-optimization/94988 - enhance SM some more
+
+This enhances store-order preserving store motion to handle the case
+of non-invariant dependent stores in the sequence of unconditionally
+executed stores on exit by re-issueing them as part of the sequence
+of stores on the exit.  This fixes the observed regression of
+gcc.target/i386/pr64110.c which relies on store-motion of 'b'
+for a loop like
+
+  for (int i = 0; i < j; ++i)
+    *b++ = x;
+
+where for correctness we now no longer apply store-motion.  With
+the patch we emit the correct
+
+  tem = b;
+  for (int i = 0; i < j; ++i)
+    {
+      tem = tem + 1;
+      *tem = x;
+    }
+  b = tem;
+  *tem = x;
+
+preserving the original order of stores.  A testcase reflecting
+the miscompilation done by earlier GCC is added as well.
+
+This also fixes the reported ICE inPR95025and adds checking code
+to catch it earlier - the issue was not-supported refs propagation
+leaving stray refs in the sequence.
+
+2020-05-11  Richard Biener  <rguenther@suse.de>PR tree-optimization/94988PR tree-optimization/95025* tree-ssa-loop-im.c (seq_entry): Make a struct, add from.
+(sm_seq_push_down): Take extra parameter denoting where we
+moved the ref to.
+(execute_sm_exit): Re-issue sm_other stores in the correct
+order.
+(sm_seq_valid_bb): When always executed, allow sm_other to
+prevail inbetween sm_ord and record their stored value.
+(hoist_memory_references): Adjust refs_not_supported propagation
+and prune sm_other from the end of the ordered sequences.
+
+* gcc.dg/torture/pr94988.c: New testcase.
+* gcc.dg/torture/pr95025.c: Likewise.
+* gcc.dg/torture/pr95045.c: Likewise.
+* g++.dg/asan/pr95025.C: New testcase.
+
+- User: Richard Biener | Time: 2023-02-17 08:00:34 UTC
+  Text: Mine.
+
+- User: GCC Commits | Time: 2023-02-17 11:38:53 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:4c4f0f7acd6b96ee744ef598cbea5c7046a33654commitr13-6114-g4c4f0f7acd6b96ee744ef598cbea5c7046a33654Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Feb 17 12:36:44 2023 +0100
+
+    tree-optimization/108821 - store motion and volatiles
+    
+    The following fixes store motion to not re-issue volatile stores
+    to preserve TBAA behavior since that will result in the number
+    of volatile accesses changing.PR tree-optimization/108821* tree-ssa-loop-im.cc (sm_seq_valid_bb): We can also not
+            move volatile accesses.
+    
+            * gcc.dg/tree-ssa/ssa-lim-24.c: New testcase.
+
+- User: Richard Biener | Time: 2023-02-17 11:39:29 UTC
+  Text: Fixed on trunk sofar.
+
+- User: GCC Commits | Time: 2023-03-15 09:48:19 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:dbbbaed64f39aae57f5f167174121c1be9d18282commitr12-9261-gdbbbaed64f39aae57f5f167174121c1be9d18282Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Feb 17 12:36:44 2023 +0100
+
+    tree-optimization/108821 - store motion and volatiles
+    
+    The following fixes store motion to not re-issue volatile stores
+    to preserve TBAA behavior since that will result in the number
+    of volatile accesses changing.PR tree-optimization/108821* tree-ssa-loop-im.cc (sm_seq_valid_bb): We can also not
+            move volatile accesses.
+    
+            * gcc.dg/tree-ssa/ssa-lim-24.c: New testcase.
+    
+    (cherry picked from commit 4c4f0f7acd6b96ee744ef598cbea5c7046a33654)
+
+- User: GCC Commits | Time: 2023-05-02 13:24:53 UTC
+  Text: The releases/gcc-11 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:bd0192968999661d103bb9d974a8ad3be4ef3d9bcommitr11-10681-gbd0192968999661d103bb9d974a8ad3be4ef3d9bAuthor: Richard Biener <rguenther@suse.de>
+Date:   Fri Feb 17 12:36:44 2023 +0100
+
+    tree-optimization/108821 - store motion and volatiles
+    
+    The following fixes store motion to not re-issue volatile stores
+    to preserve TBAA behavior since that will result in the number
+    of volatile accesses changing.PR tree-optimization/108821* tree-ssa-loop-im.c (sm_seq_valid_bb): We can also not
+            move volatile accesses.
+    
+            * gcc.dg/tree-ssa/ssa-lim-24.c: New testcase.
+    
+    (cherry picked from commit 4c4f0f7acd6b96ee744ef598cbea5c7046a33654)
+
+- User: Richard Biener | Time: 2023-05-02 13:26:13 UTC
+  Text: Fixed.  Thanks for reporting.
+

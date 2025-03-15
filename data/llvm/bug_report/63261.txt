@@ -1,0 +1,324 @@
+Issue Title: [OMPT] Testing OpenMP locks dispatches callbacks with wrong kind
+Original Post: # [OMPT] Testing OpenMP locks dispatches callbacks with wrong kind
+
+## Description
+
+The OMPT interface offers several methods for tracking OpenMP locks. Two important ones are the callbacks `ompt_callback_mutex_acquire` and `ompt_callback_mutex_acquired` . These callbacks let us keep track if a thread tries to test or acquire an initialied lock. 
+
+We ran into an issue in [Score-P](https://www.vi-hps.org/projects/score-p/) with an OpenMP example ([simple_lock.1.c](https://github.com/OpenMP/Examples/blob/main/synchronization/sources/simple_lock.1.c)) where the method `omp_test_lock` is used to acquire a lock. 
+After a bit of investigation, we noticed that both `ompt_callback_mutex_acquire` and  `ompt_callback_mutex_acquired` are dispatched with the incorrect `kind`. Instead of `ompt_mutex_test_lock` / `ompt_mutex_test_nest_lock`, we see `ompt_mutex_lock` / `ompt_mutex_nest_lock` when the functions `omp_test_lock` / `omp_test_nest_lock` are called.
+
+This behaviour is non-conforming with the OpenMP specifications, where it states [[Link](https://www.openmp.org/spec-html/5.1/openmpsu184.html#x230-2630003.9.6)]:
+> The above callbacks occur in the task that encounters the lock function. The kind argument of these callbacks is `ompt_mutex_test_lock` when the events arise from an `omp_test_lock` region while it is `ompt_mutex_test_nest_lock` when the events arise from an `omp_test_nest_lock` region.
+
+In our testing, we were able to reproduce the issue with Clang 13.0.1, 15.0.6 and 16.0.3. Older versions were not tested. Other compilers based on LLVM, more specifically ROCm and Intel oneAPI, are affected as well. 
+
+Hopefully this information will help you fix the issue. If you need more information, I will be happy to help.
+
+## Reproducer
+
+A reproducer can be found below. Here, we register an OMPT interface with the following callbacks:
+- `ompt_callback_thread_begin`
+- `ompt_callback_lock_init`
+- `ompt_callback_lock_destroy`
+- `ompt_callback_mutex_acquire`
+- `ompt_callback_mutex_acquired`
+- `ompt_callback_mutex_released`
+
+We use the `thread_begin` callback to set a unique identifier for our threads. The other callbacks are mostly present to print out our information. The important callbacks here are `ompt_callback_mutex_acquire` and  `ompt_callback_mutex_acquired`.
+
+The code includes a main function where we acquire a lock via `omp_test_lock` / `omp_test_nest_lock`, do some dummy work and release the lock afterwards. At the end of the program, we check inside of `my_finalize_tool` if we encountered `ompt_mutex_test_lock` / `ompt_mutex_test_nest_lock`. If that's not the case, we abort via an assertion. 
+
+Running the reproducer, we get the following output:
+```console
+$ clang -fopenmp error_omp_test_lock.c 
+$ ./a.out 
+[ompt_start_tool] tid = -1 | omp_version 201611 | runtime_version = 'LLVM OMP version: 5.0.20140926'
+[my_initialize_tool] tid = -1 | initial_device_num 0
+[lock_init_cb] tid = 1 | kind = lock | wait_id = 140729574265216 | codeptr_ra = 0x40128a
+[mutex_acquire_cb] tid = 1 | kind = lock | wait_id = 140729574265216 | codeptr_ra = 0x401355
+[mutex_acquire_cb] tid = 2 | kind = lock | wait_id = 140729574265216 | codeptr_ra = 0x401355
+[mutex_acquired_cb] tid = 1 | kind = lock | wait_id = 140729574265216 | codeptr_ra = 0x401355
+[mutex_released_cb] tid = 1 | kind = lock | wait_id = 140729574265216 | codeptr_ra = 0x401387
+[mutex_acquire_cb] tid = 2 | kind = lock | wait_id = 140729574265216 | codeptr_ra = 0x401355
+[mutex_acquired_cb] tid = 2 | kind = lock | wait_id = 140729574265216 | codeptr_ra = 0x401355
+[mutex_released_cb] tid = 2 | kind = lock | wait_id = 140729574265216 | codeptr_ra = 0x401387
+[lock_destroy_cb] tid = 1 | kind = lock | wait_id = 140729574265216 | codeptr_ra = 0x4012ce
+[lock_init_cb] tid = 1 | kind = nest_lock | wait_id = 140729574265208 | codeptr_ra = 0x4012d7
+[mutex_acquire_cb] tid = 1 | kind = nest_lock | wait_id = 140729574265208 | codeptr_ra = 0x4013b5
+[mutex_acquired_cb] tid = 1 | kind = nest_lock | wait_id = 140729574265208 | codeptr_ra = 0x4013b5
+[mutex_acquire_cb] tid = 1 | kind = nest_lock | wait_id = 140729574265208 | codeptr_ra = 0x401245
+[mutex_acquire_cb] tid = 2 | kind = nest_lock | wait_id = 140729574265208 | codeptr_ra = 0x4013b5
+[mutex_released_cb] tid = 1 | kind = nest_lock | wait_id = 140729574265208 | codeptr_ra = 0x4013e6
+[mutex_acquire_cb] tid = 2 | kind = nest_lock | wait_id = 140729574265208 | codeptr_ra = 0x4013b5
+[mutex_acquired_cb] tid = 2 | kind = nest_lock | wait_id = 140729574265208 | codeptr_ra = 0x4013b5
+[mutex_acquire_cb] tid = 2 | kind = nest_lock | wait_id = 140729574265208 | codeptr_ra = 0x401245
+[mutex_released_cb] tid = 2 | kind = nest_lock | wait_id = 140729574265208 | codeptr_ra = 0x4013e6
+[lock_destroy_cb] tid = 1 | kind = nest_lock | wait_id = 140729574265208 | codeptr_ra = 0x40131b
+[my_finalize_tool] tid = 1
+a.out: error_omp_test_lock.c:217: void my_finalize_tool(ompt_data_t *): Assertion `ompt_mutex_test_lock_kind_encountered == 1' failed.
+Aborted
+```
+
+Source code:
+```c
+#include <assert.h>
+#include <inttypes.h>
+#include <omp.h>
+#include <omp-tools.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <unistd.h>
+
+/********************
+ * Main Code
+ ********************/
+
+void skip() {
+    // Placeholder function for skipping work
+    sleep(1);
+}
+
+void nest_work(omp_nest_lock_t* lck)
+{
+    omp_set_nest_lock(lck);
+    sleep(1);
+    omp_unset_nest_lock(lck);
+}
+
+
+int main() {
+    // Test simple OpenMP locks
+    omp_lock_t lck;
+    omp_init_lock(&lck);
+
+#pragma omp parallel shared(lck) num_threads(2)
+    {
+        while (!omp_test_lock(&lck)) {
+            skip();
+        }
+        sleep(1);
+	omp_unset_lock(&lck);
+    }
+
+    omp_destroy_lock(&lck);
+
+    // Test nested OpenMP locks
+    omp_nest_lock_t nest_lck;
+    omp_init_nest_lock(&nest_lck);
+
+#pragma omp parallel shared(nest_lck) num_threads(2)
+    {
+        while (!omp_test_nest_lock(&nest_lck)) {
+            skip();
+        }
+        nest_work(&nest_lck);
+	omp_unset_nest_lock(&nest_lck);
+    }
+
+    omp_destroy_nest_lock(&nest_lck);
+
+    return 0;
+}
+
+/********************
+ * OMPT Code
+ ********************/
+
+int32_t               ompt_mutex_test_lock_kind_encountered = 0;
+_Thread_local int32_t ompt_tool_tid = -1; /* thread counter. >= 1 after thread_begin  */
+
+static const char *
+mutex2string(ompt_mutex_t t)
+{
+    switch (t)
+    {
+    case ompt_mutex_lock:
+        return "lock";
+    case ompt_mutex_test_lock:
+        return "test_lock";
+    case ompt_mutex_nest_lock:
+        return "nest_lock";
+    case ompt_mutex_test_nest_lock:
+        return "test_nest_lock";
+    case ompt_mutex_critical:
+        return "critical";
+    case ompt_mutex_atomic:
+        return "atomic";
+    case ompt_mutex_ordered:
+        return "ordered";
+    }
+    assert(false);
+    return "";
+}
+
+static const char *
+scope_endpoint2string(ompt_scope_endpoint_t t)
+{
+    switch (t)
+    {
+    case ompt_scope_begin:
+        return "begin";
+    case ompt_scope_end:
+        return "end";
+    case ompt_scope_beginend:
+        return "beginend";
+    }
+    assert(false);
+    return "";
+}
+
+void thread_begin_cb(ompt_thread_t thread_type,
+                     ompt_data_t *thread_data)
+{
+    assert(ompt_tool_tid == -1);
+    static atomic_int_least32_t thread_counter = 1; // ompt_tool_tid >= 1
+    ompt_tool_tid = atomic_fetch_add(&thread_counter, 1);
+    thread_data->value = ompt_tool_tid;
+}
+
+void lock_init_cb(ompt_mutex_t kind,
+                  unsigned int hint,
+                  unsigned int impl,
+                  ompt_wait_id_t wait_id,
+                  const void *codeptr_ra)
+{
+    printf("[%s] tid = %" PRId32 " | kind = %s | wait_id = %" PRIu64 " | codep `ompt_callback_mutetr_ra = %p\n",
+           __FUNCTION__,
+           ompt_tool_tid,
+           mutex2string(kind),
+           wait_id,
+           codeptr_ra);
+}
+
+void lock_destroy_cb(ompt_mutex_t kind,
+                     ompt_wait_id_t wait_id,
+                     const void *codeptr_ra)
+{
+    printf("[%s] tid = %" PRId32 " | kind = %s | wait_id = %" PRIu64 " | codeptr_ra = %p\n",
+           __FUNCTION__,
+           ompt_tool_tid,
+           mutex2string(kind),
+           wait_id,
+           codeptr_ra);
+}
+
+void mutex_acquire_cb(ompt_mutex_t kind,
+                      unsigned int hint,
+                      unsigned int impl,
+                      ompt_wait_id_t wait_id,
+                      const void *codeptr_ra)
+{
+    printf("[%s] tid = %" PRId32 " | kind = %s | wait_id = %" PRIu64 " | codeptr_ra = %p\n",
+           __FUNCTION__,
+           ompt_tool_tid,
+           mutex2string(kind),
+           wait_id,
+           codeptr_ra);
+    if( kind == ompt_mutex_test_lock || kind == ompt_mutex_test_nest_lock )
+    {
+        ompt_mutex_test_lock_kind_encountered = 1;
+    }
+}
+
+void mutex_acquired_cb(ompt_mutex_t kind,
+                       ompt_wait_id_t wait_id,
+                       const void *codeptr_ra)
+{
+    printf("[%s] tid = %" PRId32 " | kind = %s | wait_id = %" PRIu64 " | codeptr_ra = %p\n",
+           __FUNCTION__,
+           ompt_tool_tid,
+           mutex2string(kind),
+           wait_id,
+           codeptr_ra);
+    if( kind == ompt_mutex_test_lock || kind == ompt_mutex_test_nest_lock )
+    {
+        ompt_mutex_test_lock_kind_encountered = 1;
+    }
+}
+
+void mutex_released_cb(ompt_mutex_t kind,
+                       ompt_wait_id_t wait_id,
+                       const void *codeptr_ra)
+{
+    printf("[%s] tid = %" PRId32 " | kind = %s | wait_id = %" PRIu64 " | codeptr_ra = %p\n",
+           __FUNCTION__,
+           ompt_tool_tid,
+           mutex2string(kind),
+           wait_id,
+           codeptr_ra);
+}
+
+static int
+my_initialize_tool(ompt_function_lookup_t lookup,
+                   int initial_device_num,
+                   ompt_data_t *tool_data)
+{
+    printf("[%s] tid = %" PRId32 " | initial_device_num %d\n",
+           __FUNCTION__,
+           ompt_tool_tid,
+           initial_device_num);
+    ompt_set_callback_t set_callback =
+        (ompt_set_callback_t)lookup("ompt_set_callback");
+
+    set_callback(ompt_callback_thread_begin, (ompt_callback_t)&thread_begin_cb);
+    set_callback(ompt_callback_lock_init, (ompt_callback_t)&lock_init_cb);
+    set_callback(ompt_callback_lock_destroy, (ompt_callback_t)&lock_destroy_cb);
+    set_callback(ompt_callback_mutex_acquire, (ompt_callback_t)&mutex_acquire_cb);
+    set_callback(ompt_callback_mutex_acquired, (ompt_callback_t)&mutex_acquired_cb);
+    set_callback(ompt_callback_mutex_released, (ompt_callback_t)&mutex_released_cb);
+
+    return 1; /* non-zero indicates success */
+}
+
+static void
+my_finalize_tool(ompt_data_t *tool_data)
+{
+    printf("[%s] tid = %" PRId32 "\n",
+           __FUNCTION__,
+           ompt_tool_tid);
+    assert( ompt_mutex_test_lock_kind_encountered == 1 );
+}
+
+ompt_start_tool_result_t *
+ompt_start_tool(unsigned int omp_version,
+                const char *runtime_version)
+{
+    setbuf(stdout, NULL);
+    printf("[%s] tid = %" PRId32 " | omp_version %d | runtime_version = \'%s\'\n",
+           __FUNCTION__,
+           ompt_tool_tid,
+           omp_version,
+           runtime_version);
+    static ompt_start_tool_result_t tool = {&my_initialize_tool,
+                                            &my_finalize_tool,
+                                            ompt_data_none};
+    return &tool;
+}
+```
+
+Comment by Thyre: Looking at where the callbacks are dispatched, this should be a straight-forward fix if I'm not missing something.
+
+For `omp_test_lock`, the first callback with `ompt_mutex_lock` is dispatched [here](https://github.com/llvm/llvm-project/blob/main/openmp/runtime/src/kmp_csupport.cpp#L3153):
+```cpp
+if (ompt_enabled.ompt_callback_mutex_acquire) {
+    ompt_callbacks.ompt_callback(ompt_callback_mutex_acquire)(
+        ompt_mutex_lock, omp_lock_hint_none,
+        __ompt_get_mutex_impl_type(user_lock),
+        (ompt_wait_id_t)(uintptr_t)user_lock, codeptr);
+  }
+```
+We can see the same thing with the other callback [here](https://github.com/llvm/llvm-project/blob/main/openmp/runtime/src/kmp_csupport.cpp#L3176):
+```cpp
+    if (ompt_enabled.ompt_callback_mutex_acquired) {
+      ompt_callbacks.ompt_callback(ompt_callback_mutex_acquired)(
+          ompt_mutex_lock, (ompt_wait_id_t)(uintptr_t)user_lock, codeptr);
+    }
+```
+We _should_ be able to replace `ompt_mutex_lock` with `ompt_mutex_test_lock` here without any issues, right?
+
+In `__kmpc_test_nest_lock` ([here](https://github.com/llvm/llvm-project/blob/main/openmp/runtime/src/kmp_csupport.cpp#L3245)), we _should_ be able to do the same changes, just with `ompt_mutex_nest_lock` -> `ompt_mutex_test_nest_lock`.
+Comment by llvmbot: @llvm/issue-subscribers-openmp
+Comment by Thyre: https://reviews.llvm.org/D153032
+Comment by Thyre: Fixed with https://github.com/llvm/llvm-project/commit/124d36e09332e28b807cdd38eb587a74335ce91e

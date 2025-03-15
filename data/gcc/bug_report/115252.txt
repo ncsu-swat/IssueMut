@@ -1,0 +1,87 @@
+Bug Summary: The SLP vectorizer failed to perform automatic vectorization on pixel_sub_wxh of x264
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Hanke Zhang | Time: 2024-05-28 01:29:39 UTC
+  Text: Test case: (fromhttps://github.com/mirror/x264/blob/master/common/dct.c) 
+
+void pixel_sub_wxh(int16_t *diff, uint8_t *pix1, uint8_t *pix2) {
+  for (int y = 0; y < 4; y++) {
+    for (int x = 0; x < 4; x++)
+      diff[x + y * 4] = pix1[x] - pix2[x];
+    pix1 += 16;
+    pix2 += 32;
+  }
+}
+
+This is a simplified version, as the original code will inlined and some of the parameters are constant.
+
+When compiling the function with `-O3 -mavx2`, . But after that, the code in it should be vectorized
+
+
+When I compiled with `-O3 -mavx2/-msse4.2`, the inner loop will be unrolled and SLP vectorizer failed to vectorize it, and I got the following message when adding
+`-fopt-info-vec-all`.
+
+<source>:6:21: optimized: loop vectorized using 8 byte vectors
+<source>:6:21: optimized:  loop versioned for vectorization because of
+possible aliasing
+<source>:5:6: note: vectorized 1 loops in function.
+<source>:5:6: note: ***** Analysis failed with vector mode V8SI
+<source>:5:6: note: ***** The result for vector mode V32QI would be the same
+<source>:5:6: note: ***** Re-trying analysis with vector mode V16QI
+<source>:5:6: note: ***** Analysis failed with vector mode V16QI
+<source>:5:6: note: ***** Re-trying analysis with vector mode V8QI
+<source>:5:6: note: ***** Analysis failed with vector mode V8QI
+<source>:5:6: note: ***** Re-trying analysis with vector mode V4QI
+<source>:5:6: note: ***** Analysis failed with vector mode V4QI
+
+If I manually use the type declaration provided by `immintrin.h` to
+rewrite the code, the code is as follows (which I hope the SLP
+vectorizer to be able to do)
+
+void pixel_sub_wxh_vec(int16_t *diff, uint8_t *pix1, uint8_t *pix2) {
+  for (int y = 0; y < 4; y++) {
+    __v4hi pix1_v = {pix1[0], pix1[1], pix1[2], pix1[3]};
+    __v4hi pix2_v = {pix2[0], pix2[1], pix2[2], pix2[3]};
+    __v4hi diff_v = pix1_v - pix2_v;
+    *(long long *)(diff + y * 4) = (long long)diff_v;
+    pix1 += 16;
+    pix2 += 32;
+  }
+}
+
+
+I raised this issue in Gcc mailling list already, and Biner gave some analysis, that is, pix1 and pix2 are both uint8_t type, and their iterations are scalar, so this issue will exist, but I still submit a bug here and hope to follow up.
+
+- User: Richard Biener | Time: 2024-05-28 06:38:14 UTC
+  Text: Thanks for the report.  I am working on improvements in this area.
+
+- User: GCC Commits | Time: 2024-05-29 11:05:41 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:f46eaad445e680034df51bd0dec4e6c7b1f372a4commitr15-896-gf46eaad445e680034df51bd0dec4e6c7b1f372a4Author: Richard Biener <rguenther@suse.de>
+Date:   Mon May 27 16:04:35 2024 +0200
+
+    tree-optimization/115252 - enhance peeling for gaps avoidance
+    
+    Code generation for contiguous load vectorization can already deal
+    with generalized avoidance of loading from a gap.  The following
+    extends detection of peeling for gaps requirement with that,
+    gets rid of the old special casing of a half load and makes sure
+    when we do access the gap we have peeling for gaps enabled.PR tree-optimization/115252* tree-vect-stmts.cc (get_group_load_store_type): Enhance
+            detecting the number of cases where we can avoid accessing a gap
+            during code generation.
+            (vectorizable_load): Remove old half-vector peeling for gap
+            avoidance which is now redundant.  Add gap-aligned case where
+            it's OK to access the gap.  Add assert that we have peeling for
+            gaps enabled when we access a gap.
+    
+            * gcc.dg/vect/slp-gap-1.c: New testcase.
+
+- User: Richard Biener | Time: 2024-05-29 11:11:54 UTC
+  Text: This testcase should be fixed now.
+

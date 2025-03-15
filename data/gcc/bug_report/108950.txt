@@ -1,0 +1,144 @@
+Bug Summary: [11 Regression] ICE: verify_gimple failed (error: conversion of register to a different size in 'view_convert_expr'; error: type mismatch in 'widen_sum_expr') since r11-418-g584a3c080bbd6e
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 11.3.1, 12.2.1, 13.0
+Known to Fail: 11.3.0, 12.2.0
+
+Comments:
+- User: Arseny Solokha | Time: 2023-02-27 12:46:48 UTC
+  Text: gcc 13.0.1 20230226 snapshot (g:e6d39f68d03c46637ca6e1bede3d28eae6278df3) ICEs when compiling the following testcase w/ -O1:
+
+int m;
+short int n;
+
+__attribute__ ((simd)) int
+foo (void)
+{
+  m += n;
+  m += n;
+}
+
+% aarch64-linux-gnu-gcc-13 -O1 -c t0pgrthf.c
+t0pgrthf.c: In function 'foo.simdclone.0':
+t0pgrthf.c:5:1: error: conversion of register to a different size in 'view_convert_expr'
+    5 | foo (void)
+      | ^~~
+VIEW_CONVERT_EXPR<int>(n.0_1);
+
+_21 = VIEW_CONVERT_EXPR<int>(n.0_1);
+t0pgrthf.c:5:1: error: type mismatch in 'widen_sum_expr'
+vector(4) int
+vector(4) int
+vector(4) int
+vect_patt_19.21_28 = _25 w+ vect_m_lsm.20_27;
+during GIMPLE pass: vect
+t0pgrthf.c:5:1: internal compiler error: verify_gimple failed
+0xf7c152 verify_gimple_in_cfg(function*, bool, bool)
+	/var/tmp/portage/cross-aarch64-linux-gnu/gcc-13.0.1_p20230226/work/gcc-13-20230226/gcc/tree-cfg.cc:5648
+0xe39450 execute_function_todo
+	/var/tmp/portage/cross-aarch64-linux-gnu/gcc-13.0.1_p20230226/work/gcc-13-20230226/gcc/passes.cc:2091
+0xe3993e execute_todo
+	/var/tmp/portage/cross-aarch64-linux-gnu/gcc-13.0.1_p20230226/work/gcc-13-20230226/gcc/passes.cc:2145
+
+- User: Martin Liška | Time: 2023-02-27 15:47:39 UTC
+  Text: Started withr11-418-g584a3c080bbd6e.
+
+- User: Richard Biener | Time: 2023-02-28 10:40:20 UTC
+  Text: I will have a look.
+
+- User: Richard Biener | Time: 2023-02-28 14:30:26 UTC
+  Text: It's because we do
+
+  if (slp_node
+      && !(!single_defuse_cycle
+           && !lane_reduc_code_p
+           && reduction_type != FOLD_LEFT_REDUCTION))
+    for (i = 0; i < (int) op.num_ops; i++)
+      if (!vect_maybe_update_slp_op_vectype (slp_op[i], vectype_op[i]))
+        {
+          if (dump_enabled_p ())
+            dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
+                             "incompatible vector types for invariants\n");
+          return false;
+        }
+
+for the invariant lower precision op of the reduction.  Arguably that's
+not efficient.  We're detecting a widen_sum from
+
+  n.0_1 = n;
+  _2 = (int) n.0_1;
+  m_lsm.19_13 = m;
+
+  <bb 3> [local count: 1073741824]:
+  # iter.6_8 = PHI <0(2), iter.6_9(5)>
+  # m_lsm.19_12 = PHI <m_lsm.19_13(2), _5(5)>
+  # ivtmp_7 = PHI <2(2), ivtmp_18(5)>
+  _4 = _2 + m_lsm.19_12;
+
+which is where we could fix this.  I have a patch for the reduction code
+for now.
+
+- User: GCC Commits | Time: 2023-03-01 07:37:49 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:e3837b6f6c28a1d2cea3a69efbda795ea3fb8816commitr13-6384-ge3837b6f6c28a1d2cea3a69efbda795ea3fb8816Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Feb 28 15:34:27 2023 +0100
+
+    tree-optimization/108950 - widen-sum reduction ICE
+    
+    When we end up with a widen-sum with an invariant smaller operand
+    the reduction code uses a wrong vector type for it, causing
+    IL checking ICEs.  The following fixes that and the inefficiency
+    of using a widen-sum with a widenend invariant operand as well
+    by actually performing the check the following comment wants.PR tree-optimization/108950* tree-vect-patterns.cc (vect_recog_widen_sum_pattern):
+            Check oprnd0 is defined in the loop.
+            * tree-vect-loop.cc (vectorizable_reduction): Record all
+            operands vector types, compute that of invariants and
+            properly update their SLP nodes.
+    
+            * gcc.dg/vect/pr108950.c: New testcase.
+
+- User: GCC Commits | Time: 2023-03-15 09:48:24 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:f4e4108dd005084fc1c88bba14fda6b200e70daacommitr12-9262-gf4e4108dd005084fc1c88bba14fda6b200e70daaAuthor: Richard Biener <rguenther@suse.de>
+Date:   Tue Feb 28 15:34:27 2023 +0100
+
+    tree-optimization/108950 - widen-sum reduction ICE
+    
+    When we end up with a widen-sum with an invariant smaller operand
+    the reduction code uses a wrong vector type for it, causing
+    IL checking ICEs.  The following fixes that and the inefficiency
+    of using a widen-sum with a widenend invariant operand as well
+    by actually performing the check the following comment wants.PR tree-optimization/108950* tree-vect-patterns.cc (vect_recog_widen_sum_pattern):
+            Check oprnd0 is defined in the loop.
+            * tree-vect-loop.cc (vectorizable_reduction): Record all
+            operands vector types, compute that of invariants and
+            properly update their SLP nodes.
+    
+            * gcc.dg/vect/pr108950.c: New testcase.
+    
+    (cherry picked from commit e3837b6f6c28a1d2cea3a69efbda795ea3fb8816)
+
+- User: GCC Commits | Time: 2023-05-09 10:31:30 UTC
+  Text: The releases/gcc-11 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:d4cbcb9e45c6d45cdbc15583e1a418c13150d8c7commitr11-10752-gd4cbcb9e45c6d45cdbc15583e1a418c13150d8c7Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Feb 28 15:34:27 2023 +0100
+
+    tree-optimization/108950 - widen-sum reduction ICE
+    
+    When we end up with a widen-sum with an invariant smaller operand
+    the reduction code uses a wrong vector type for it, causing
+    IL checking ICEs.  The following fixes that and the inefficiency
+    of using a widen-sum with a widenend invariant operand as well
+    by actually performing the check the following comment wants.PR tree-optimization/108950* tree-vect-patterns.c (vect_recog_widen_sum_pattern):
+            Check oprnd0 is defined in the loop.
+            * tree-vect-loop.c (vectorizable_reduction): Record all
+            operands vector types, compute that of invariants and
+            properly update their SLP nodes.
+    
+            * gcc.dg/vect/pr108950.c: New testcase.
+    
+    (cherry picked from commit e3837b6f6c28a1d2cea3a69efbda795ea3fb8816)
+
+- User: Richard Biener | Time: 2023-05-09 10:31:48 UTC
+  Text: Fixed.
+

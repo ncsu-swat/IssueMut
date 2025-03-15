@@ -1,0 +1,341 @@
+Bug Summary: calling convention incompatibility with vendor compiler for V9
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ABI, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Rainer Orth | Time: 2024-03-21 13:00:02 UTC
+  Text: I've been informed of a case where gcc generates code for struct return with
+floating-point members that violates the SPARC V9 ABI (SCD 2.4.1): consider the
+attached testcase:
+
+$ gcc -m64 -O2 -c fpret.c
+$ cc -m64 -O2 caller.c
+$ gcc -m64 -o cc-gcc caller.o fpret.o
+$ ./cc-gcc
+sum2:  x[0] = -nan x[1] = -nan
+sum2x: x = 0 y = 1
+
+With gcc, sum2 places the return value into %o0/%o1
+
+sum2()
+    sum2:                   9c 03 bf 60  add       %sp, -0xa0, %sp
+    sum2+0x4:               90 10 20 00  clr       %o0
+    sum2+0x8:               92 10 23 ff  mov       0x3ff, %o1
+    sum2+0xc:               93 2a 70 34  sllx      %o1, 0x34, %o1
+    sum2+0x10:              81 c3 e0 08  retl
+    sum2+0x14:              9c 03 a0 a0  add       %sp, 0xa0, %sp
+
+while cc uses %d0/%d2 instead:
+
+sum2()
+    sum2:                   1b 00 00 00  sethi     %hi(0x0), %o5
+    sum2+0x4:               81 b0 0c 00  fzerod    %d0
+    sum2+0x8:               c1 3b a8 7f  std       %d0, [%sp + 0x87f]
+    sum2+0xc:               98 13 60 00  or        %o5, 0x0, %o4
+    sum2+0x10:              97 2b 30 0c  sllx      %o4, 0xc, %o3
+    sum2+0x14:              c5 1a e0 00  ldd       [%o3], %d2
+    sum2+0x18:              81 c3 e0 08  retl
+    sum2+0x1c:              c5 3b a8 87  std       %d2, [%sp + 0x887]
+
+I believe this in line with SCD 2.4.1:
+
+* 3P-13 states
+
+  Structure or Union return values
+
+  Structure and union return types up to thirty-two bytes in size are returned in registers. The registers are assigned as if
+  the value was being passed as the first argument to a function with a known prototype.
+
+* and p. 3P-12 has
+
+  Structure or union types larger than eight bytes, and up to sixteen bytes in size are assigned to two consecutive
+  parameter array words, and align according to the alignment requirements of the structure or at least to an eight-byte
+boundary.
+
+* If I read the table on p. 3P-11 correctly, those parameter array words should
+  map to %d0/%d2 for double args, just as cc does.
+
+- User: Rainer Orth | Time: 2024-03-21 13:01:34 UTC
+  Text: Createdattachment 57757[details]testcase
+
+- User: Eric Botcazou | Time: 2024-03-21 14:54:24 UTC
+  Text: IMO that's not clear:
+
+"Structure or union types are always left-justified, whether stored in registers or memory. The individual fields of a structure (or containing storage unit in the case of bit fields) are subject to promotion into registers based on their type using the same rules as apply to scalar values (with the addition that a single-precision floating-point number assigned to the left half of an argument slot will be promoted into the corresponding even-numbered float register.). Any union type being passed directly is subject to promotion into the appropriate integer register(s)."
+
+I don't see how "The individual fields |...] are subject to promotion into registers based on their type using the same rules as apply to scalar values" applies to an array field, since its type is not scalar.
+
+Admittedly, this does not directly apply to a structure field either, but I think that GCC does apply the rule recursively in this case.
+
+AFAIK we have never implemented this interpretation for array fields, so I wonder whether it's not too late now.
+
+- User: ro@CeBiTec.Uni-Bielefeld.DE | Time: 2024-03-21 15:08:04 UTC
+  Text: I've now also found p. 3P-10:
+
+%f0 through %f7		Floating-point fields from structure return
+(%d0 through %d6)       values with a total size of 32 bytes or less
+(%q0 and %q4)           appear in the floating-point registers.
+
+and
+
+%o0 through %o5		Outgoing non-floating-point parameters slots use
+                        up to 6 corresponding out registers. Arguments
+                        beyond the sixth extended-word appear on the stack.
+
+The second line seems pretty clear that the %o[0-5] registers are only
+for non-fp parameter slots, while the first could be interpreted either
+way (fp *fields only* or fp fields in general).
+
+While compatibility with the vendor compiler is a strong argument, in
+the end the ABI remains the reference.
+
+- User: Eric Botcazou | Time: 2024-03-24 10:42:14 UTC
+  Text: My reading is that the ABI has overlooked this case though, so it is up to the implementation to make its opinion.  That of the vendor's compiler is probably more in line with the spirit of the calling conventions, but GCC's has been so for a quarter of a century now.
+
+- User: Eric Botcazou | Time: 2024-03-25 09:02:03 UTC
+  Text: Createdattachment 57806[details]Tentative fix
+
+- User: Jakub Kulik | Time: 2024-03-27 09:49:37 UTC
+  Text: Thank you for the proposed fix! I tested it with several programs that I used to find/reproduce the issue and it seems to work now (I talked about this with Rainer initially).
+
+As for the ABI being potentially unclear, I am in no way a SPARCv9 ABI expert, so I asked internally, and was told that the ABI should be clear about this case:
+
+"""
+See page 3P-10 (PDF page 46) where it says this:
+
+%f0,%f1,%f2,%f3
+(%d0, %d2)
+(%q0)
+Floating-point return values appear in the floating-point registers. Single-precision values occupy %f0; double-precision values occupy %d0; quad-precision values occupy %q0. (Refer to the SPARCTM Architecture Manual, Version 9 for details on the register numbering scheme). Otherwise, these are scratch registers.
+
+and
+
+%f0 through %f7
+(%d0 through %d6)
+(%q0 and %q4)
+Floating-point fields from structure return values with a total size of 32 bytes or less appear in the floating-point registers.
+
+Then on page 3P-13 (PDF page 49) it says this:
+Structure or Union return values
+Structure and union return types up to thirty-two bytes in size are returned in registers. The registers are assigned as if the value was being passed as the first argument to a function with a known prototype.
+
+So we have to refer back to "Structure and Union arguments" on page 3P-12 (PDF page 48) where it says:
+
+"Structure or union types are always left-justified, whether stored in registers or memory. *The individual fields of a structure (or containing storage unit in the case of bit fields) are subject to promotion into registers based on their type using the same rules as apply to scalar values* (with the addition that a single-precision floating-point number assigned to the left half of an argument slot will be promoted into the corresponding even-numbered float register.)." [sic; emphasis added.] 
+"""
+
+- User: Jakub Kulik | Time: 2024-03-27 09:56:45 UTC
+  Text: Hmm, I just realized that you referred to the same sections, so my previous comment might not make it clearer...
+
+- User: Eric Botcazou | Time: 2024-03-27 10:13:05 UTC
+  Text: > Hmm, I just realized that you referred to the same sections, so my previous
+> comment might not make it clearer...Yes, the fields in question have array types so the rules about scalar values do not obviously apply to them.  This is a bit of circular reasoning but, if the rule had been crystal clear, GCC would have implemented it at some point during the last quarter of century.  My interpretation is that the writers of the ABI document probably overlooked the specific cases of arrays, which cannot appear as types of standalone parameters but can as types of fields in structures.
+
+- User: Eric Botcazou | Time: 2024-03-27 10:16:56 UTC
+  Text: > Thank you for the proposed fix! I tested it with several programs that I
+> used to find/reproduce the issue and it seems to work now (I talked about
+> this with Rainer initially).OK, thanks for the testing!
+
+- User: Jakub Kulik | Time: 2024-04-17 14:06:35 UTC
+  Text: Sorry for longer response.
+
+I asked internally again and was told by a colleague who was in the room when the spec was created, that: "the intent was (and is) that the individual elements/atoms/fundamental types that make up a small structure, no matter how those elements/atoms/fundamental types are aggregated within the structure, are passed in registers appropriate for the fundamental type in question. (That is, pointers and integral types are passed in the %o registers, and floating point types are passed in the floating-point registers.) So a structure that contains an array of two floats is treated the same as a structure that contains two floats."
+
+That said, he agreed that the spec could perhaps be better written. He also added:
+
+Page 3P-11 says this, under "Function Argument Passing":
+
+"It is convenient to describe parameter linkage in terms of an array. Conceptually, parameters are assigned into an array of extended words, left-to-right, with an occasional “hole” to satisfy alignment restrictions. Typically, most parameter values will be “promoted” from their memory locations into registers, and most calls are expected to execute this way with less overhead."
+
+There is then a diagram that shows the correspondence between parameter registers and the parameter array.
+
+On page 3P-12, under "Structure and Union arguments", it says this:
+
+"Structure or union types up to eight bytes in size are assigned to one parameter array word, and align to eight-byte boundaries.
+
+"Structure or union types larger than eight bytes, and up to sixteen bytes in size are assigned to two consecutive parameter array words, and align according to the alignment requirements of the structure or at least to an eight-byte boundary."
+
+So perhaps instead of saying "The individual fields of a structure ... are subject to promotion into registers based on their type using the same rules as apply to scalar values" the spec should have said "The individual parameter array words assigned to a structure ... are subject to promotion into registers based on their type using the same rules as apply to scalar values."
+
+- User: Jakub Kulik | Time: 2024-04-17 14:08:37 UTC
+  Text: > This is a bit of circular reasoning but, if the rule had been crystal clear,
+> GCC would have implemented it at some point during the last quarter of
+> century.I see. I guess it's also not a common enough use case to pass small structs with float arrays between programs and libraries (potentially compiled with different compilers).
+
+That said, for example libffi implements the ABI as was intended (it's how I originally found this issue).
+
+- User: Eric Botcazou | Time: 2024-04-23 08:31:34 UTC
+  Text: Rainer, what's your take on this?  Should we proceed and change the ABI on Solaris for GCC 14?
+
+- User: ro@CeBiTec.Uni-Bielefeld.DE | Time: 2024-04-23 11:34:40 UTC
+  Text: > ---Comment #12from Eric Botcazou <ebotcazou at gcc dot gnu.org> ---
+> Rainer, what's your take on this?  Should we proceed and change the ABI on
+> Solaris for GCC 14?I think so, yes:
+
+* Binary compatibility with the Studio compilers is pretty important IMO.
+
+* Even though the SCD wording isn't really clear, the intent seems to
+  match what Studio cc does according to the colleague on the spec group
+  Jakub cited.
+
+* There's no point in waiting beyond GCC 14, I believe: this will break
+  compatiblity with GCC <= 13 no matter what.
+
+* Besides, Solaris is pretty quick picking up new GCC releases these
+  days, so they'll bundle GCC 14.1.0 not long after it's released, so
+  the benefit will be immediate.
+
+* I'm a tad uncertain about what to do on Linux/sparc64, though: while
+  it mostly has followed the SCD, there are exceptions (e.g. sizeof
+  (long double)) and no vendor compiler to be compatible with.  So
+  making the same change there would only mean breaking compatibility
+  with older GCCs (and clang) for little gain.
+
+- User: Eric Botcazou | Time: 2024-04-24 07:26:56 UTC
+  Text: OK, thanks, let's go ahead for Solaris then, but I agree that we'd better do nothing for other platforms at this point.
+
+Do you happen to have some spare cycles to conduct a testing cycle of the above tentative fix?  It only affects the 64-bit ABI so a sparc64/sparcv9 one would be sufficient (Unfortunately I no longer have access to my SPARC/Solaris setup and haven't tried the Compile Farm yet).
+
+- User: ro@CeBiTec.Uni-Bielefeld.DE | Time: 2024-04-24 07:31:45 UTC
+  Text: > ---Comment #14from Eric Botcazou <ebotcazou at gcc dot gnu.org> ---
+> OK, thanks, let's go ahead for Solaris then, but I agree that we'd better do
+> nothing for other platforms at this point.Right, I forgot that there are others (and I cannot test any of them at
+this point; I don't even know if current BSDs still support SPARC at all).> Do you happen to have some spare cycles to conduct a testing cycle of the above
+> tentative fix?  It only affects the 64-bit ABI so a sparc64/sparcv9 one would
+> be sufficient (Unfortunately I no longer have access to my SPARC/Solaris setup
+> and haven't tried the Compile Farm yet).Sure: I've kept one half of the T8-1 hosting the new Solaris 11.4/SPARC
+cfarm node to myself ;-)  I've also got a Linux/sparc64 LDom around
+since the cfarm instance has been very unstable lately.
+
+- User: ro@CeBiTec.Uni-Bielefeld.DE | Time: 2024-04-24 12:17:04 UTC
+  Text: > ---Comment #15from ro at CeBiTec dot Uni-Bielefeld.DE <ro at CeBiTec dot
+> Uni-Bielefeld.DE> ---
+>> ---Comment #14from Eric Botcazou <ebotcazou at gcc dot gnu.org> ---
+>> Do you happen to have some spare cycles to conduct a testing cycle of the above
+>> tentative fix?  It only affects the 64-bit ABI so a sparc64/sparcv9 one would
+>> be sufficient (Unfortunately I no longer have access to my SPARC/Solaris setup
+>> and haven't tried the Compile Farm yet).>> Sure: I've kept one half of the T8-1 hosting the new Solaris 11.4/SPARC
+> cfarm node to myself ;-)  I've also got a Linux/sparc64 LDom around
+> since the cfarm instance has been very unstable lately.The sparc-sun-solaris2.11 bootstrap (both multilibs) has just completed
+successfully without regressions.
+
+However, sparc/sol2.h needed an #undef to fix
+
+In file included from ./tm.h:27,
+                 from /vol/gcc/src/hg/master/local/gcc/gencheck.cc:23:
+/vol/gcc/src/hg/master/local/gcc/config/sparc/sol2.h:460:9: error: "SUN_V9_ABI_COMPATIBILITY" redefined [-Werror]
+  460 | #define SUN_V9_ABI_COMPATIBILITY 1
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~
+In file included from ./tm.h:24:
+/vol/gcc/src/hg/master/local/gcc/config/sparc/sparc.h:1705:9: note: this is the location of the previous definition
+ 1705 | #define SUN_V9_ABI_COMPATIBILITY 0
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~
+
+The sparc64-unknown-linux-gnu one will be running for a couple more
+hours, though.
+
+Btw., I thought about running gcc.dg/compat against Studio 12.6 cc.  I'd
+started trying some time ago, but got distracted.  At the very least, I
+needed -features=extensions -DSKIP_COMPLEX_INT for a considerable part
+of that testsuite to compile at all, for the likes of
+
+"/vol/gcc/src/hg/master/local/gcc/testsuite/gcc.dg/compat/pr102024_test.h", line 7: zero-sized struct/union
+
+"/vol/gcc/src/hg/master/local/gcc/testsuite/gcc.dg/compat/struct-layout-1.h", line 197: invalid type combination
+
+- User: Eric Botcazou | Time: 2024-04-24 12:29:51 UTC
+  Text: > The sparc-sun-solaris2.11 bootstrap (both multilibs) has just completed
+> successfully without regressions.
+> 
+> However, sparc/sol2.h needed an #undef to fix
+> 
+> In file included from ./tm.h:27,
+>                  from /vol/gcc/src/hg/master/local/gcc/gencheck.cc:23:
+> /vol/gcc/src/hg/master/local/gcc/config/sparc/sol2.h:460:9: error:
+> "SUN_V9_ABI_COMPATIBILITY" redefined [-Werror]
+>   460 | #define SUN_V9_ABI_COMPATIBILITY 1
+>       |         ^~~~~~~~~~~~~~~~~~~~~~~~
+> In file included from ./tm.h:24:
+> /vol/gcc/src/hg/master/local/gcc/config/sparc/sparc.h:1705:9: note: this is
+> the location of the previous definition
+>  1705 | #define SUN_V9_ABI_COMPATIBILITY 0
+>       |         ^~~~~~~~~~~~~~~~~~~~~~~~Thanks, fixed.> The sparc64-unknown-linux-gnu one will be running for a couple more
+> hours, though.The change should be a no-op for this platform.> Btw., I thought about running gcc.dg/compat against Studio 12.6 cc.  I'd
+> started trying some time ago, but got distracted.  At the very least, I
+> needed -features=extensions -DSKIP_COMPLEX_INT for a considerable part
+> of that testsuite to compile at all, for the likes of
+> 
+> "/vol/gcc/src/hg/master/local/gcc/testsuite/gcc.dg/compat/pr102024_test.h",
+> line 7: zero-sized struct/union
+> 
+> "/vol/gcc/src/hg/master/local/gcc/testsuite/gcc.dg/compat/struct-layout-1.h",
+> line 197: invalid type combinationI used to do that on a regular basis 20 years ago, which led to:https://gcc.gnu.org/gcc-3.4/sparc-abi.htmlbut I lost access to Sun Studio at some point.
+
+- User: ro@CeBiTec.Uni-Bielefeld.DE | Time: 2024-04-24 12:34:39 UTC
+  Text: > ---Comment #17from Eric Botcazou <ebotcazou at gcc dot gnu.org> ---
+>> The sparc-sun-solaris2.11 bootstrap (both multilibs) has just completed
+>> successfully without regressions.
+>> 
+>> However, sparc/sol2.h needed an #undef to fix[...]> Thanks, fixed.great, thanks.>> The sparc64-unknown-linux-gnu one will be running for a couple more
+>> hours, though.>> The change should be a no-op for this platform.True.  However, I'd rather wait for the bootstrap to complete.  Should
+be sometime tonight...>> Btw., I thought about running gcc.dg/compat against Studio 12.6 cc.  I'd
+>> started trying some time ago, but got distracted.  At the very least, I
+>> needed -features=extensions -DSKIP_COMPLEX_INT for a considerable part
+>> of that testsuite to compile at all, for the likes of
+>> 
+>> "/vol/gcc/src/hg/master/local/gcc/testsuite/gcc.dg/compat/pr102024_test.h",
+>> line 7: zero-sized struct/union
+>> 
+>> "/vol/gcc/src/hg/master/local/gcc/testsuite/gcc.dg/compat/struct-layout-1.h",
+>> line 197: invalid type combination>> I used to do that on a regular basis 20 years ago, which led to:
+>https://gcc.gnu.org/gcc-3.4/sparc-abi.html> but I lost access to Sun Studio at some point.FWIW, cfarm216, the new Solaris 11.4/SPARC compile farm host, does have
+Studio 12.6 installed.  Right now, it's only the FCS version, but I hope
+to get access to the studiosupport repo in the future.  Besides, I've
+checked the testcase that prompted this PR with previous Studio versions
+quite some time back and their behaviour in this regard is unchanged.
+
+- User: ro@CeBiTec.Uni-Bielefeld.DE | Time: 2024-04-25 09:29:27 UTC
+  Text: > ---Comment #18from ro at CeBiTec dot Uni-Bielefeld.DE <ro at CeBiTec dot
+> Uni-Bielefeld.DE> ---
+>> ---Comment #17from Eric Botcazou <ebotcazou at gcc dot gnu.org> ---[...]>>> The sparc64-unknown-linux-gnu one will be running for a couple more
+>>> hours, though.
+>>
+>> The change should be a no-op for this platform.>> True.  However, I'd rather wait for the bootstrap to complete.  Should
+> be sometime tonight...That's finished now, too, and as expected there were no regressions.
+
+- User: GCC Commits | Time: 2024-04-25 10:48:19 UTC
+  Text: The master branch has been updated by Eric Botcazou <ebotcazou@gcc.gnu.org>:https://gcc.gnu.org/g:1d238c84025aaef1641e4000bd2a8f4328b474ddcommitr14-10119-g1d238c84025aaef1641e4000bd2a8f4328b474ddAuthor: Eric Botcazou <ebotcazou@adacore.com>
+Date:   Thu Apr 25 12:44:14 2024 +0200
+
+    Fix calling convention incompatibility with vendor compiler
+    
+    For the 20th anniversary ofhttps://gcc.gnu.org/gcc-3.4/sparc-abi.html,
+    a new calling convention incompatibility with the vendor compiler (and
+    the ABI) has been discovered in 64-bit mode, affecting small structures
+    containing arrays of floating-point components.  The decision has been
+    made to fix it on Solaris only at this point.
+    
+    gcc/PR target/114416* config/sparc/sparc.h (SUN_V9_ABI_COMPATIBILITY): New macro.
+            * config/sparc/sol2.h (SUN_V9_ABI_COMPATIBILITY): Redefine it.
+            * config/sparc/sparc.cc (fp_type_for_abi): New predicate.
+            (traverse_record_type): Use it to spot floating-point types.
+            (compute_fp_layout): Also deal with array types.
+    
+    gcc/testsuite/
+            * gcc.target/sparc/small-struct-1.c: New test.
+            * gcc.target/sparc/pr105573.c: Rename to...
+            * gcc.target/sparc/20230425-1.c: ...this.
+            * gcc.target/sparc/pr109541.c: Rename to...
+            * gcc.target/sparc/20230607-1.c: ...this
+
+- User: Eric Botcazou | Time: 2024-04-25 10:56:33 UTC
+  Text: Fixed on Solaris for GCC 14 and later.
+
+- User: Jakub Kulik | Time: 2024-04-25 11:01:28 UTC
+  Text: Eric and Rainer, thank you both very much for all that testing and the fix.
+

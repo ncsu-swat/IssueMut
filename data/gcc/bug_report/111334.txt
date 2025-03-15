@@ -1,0 +1,823 @@
+Bug Summary: [14 regression] ICE is reported during the combine pass optimization
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: chenglulu | Time: 2023-09-08 03:17:20 UTC
+  Text: Createdattachment 55852[details]test
+
+- User: chenglulu | Time: 2023-09-08 03:20:01 UTC
+  Text: $ gcc test.c -o - -S -O1
+
+test.c: 在函数‘add_startpgm’中:
+test.c:33:1: 编译器内部错误：在 simplify_subreg 中，于 simplify-rtx.cc:7538
+   33 | }
+      | ^
+0x13506f4 simplify_context::simplify_subreg(machine_mode, rtx_def*, machine_mode, poly_int<1u, unsigned long>)
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/simplify-rtx.cc:7537
+0x1351ea3 simplify_context::simplify_subreg(machine_mode, rtx_def*, machine_mode, poly_int<1u, unsigned long>)
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/simplify-rtx.cc:7787
+0x135264c simplify_context::simplify_gen_subreg(machine_mode, rtx_def*, machine_mode, poly_int<1u, unsigned long>)
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/simplify-rtx.cc:7858
+0xd1684f simplify_gen_subreg(machine_mode, rtx_def*, machine_mode, poly_int<1u, unsigned long>)
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/rtl.h:3549
+0x1e4aa06 if_then_else_cond
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/combine.cc:9400
+0x1e4a21e if_then_else_cond
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/combine.cc:9265
+0x1e3ddb8 combine_simplify_rtx
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/combine.cc:5748
+0x1e3d79a subst
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/combine.cc:5609
+0x1e3df1f combine_simplify_rtx
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/combine.cc:5769
+0x1e3d79a subst
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/combine.cc:5609
+0x1e3d50d subst
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/combine.cc:5536
+0x1e35f40 try_combine
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/combine.cc:3339
+0x1e305a0 combine_instructions
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/combine.cc:1285
+0x1e5addb rest_of_handle_combine
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/combine.cc:15063
+0x1e5ae98 execute
+	/home/chenglulu/work/loongisa-toolchain/gcc-upstream/gcc/combine.cc:15107
+
+- User: chenglulu | Time: 2023-09-08 03:26:32 UTC
+  Text: This problem occurred after adding ther14-3511optimization.
+
+However, during the debugging process, it was discovered that it was due to the attempt to generate rtx during the combine pass optimization.
+
+(set (reg:DI 124)
+    (zero_extend:DI (subreg:QI (umod:SI (reg:DI 122 [ reg ])
+                (ior:DI (if_then_else:DI (eq:DI (reg:DI 114)
+                            (const_int 0 [0]))
+                        (reg:DI 112)
+                        (const_int 0 [0]))
+                    (reg:DI 118))) 0)))
+
+During the optimization process, the function simplify_context::simplify_subreg will make the following judgments:
+
+rtx
+simplify_context::simplify_subreg (machine_mode outermode, rtx op,
+				   machine_mode innermode, poly_uint64 byte)
+{
+  /* Little bit of sanity checking.  */
+  gcc_assert (innermode != VOIDmode);
+  gcc_assert (outermode != VOIDmode);
+  gcc_assert (innermode != BLKmode);
+  gcc_assert (outermode != BLKmode);
+
+  gcc_assert (GET_MODE (op) == innermode
+	      || GET_MODE (op) == VOIDmode);
+...
+
+op is (reg:DI 122 [ reg ]) but innermode is SI_mode,so wrong.
+
+- User: chenglulu | Time: 2023-09-08 03:52:31 UTC
+  Text: This involves the template <optab>di3_fake:
+(define_insn "<optab>di3_fake"
+  [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+        (sign_extend:DI
+          (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+                      (match_operand:DI 2 "register_operand" "r,r,r"))))]
+  ""
+{
+  return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+}
+  [(set_attr "type" "idiv")
+   (set_attr "mode" "SI")
+   (set (attr "enabled")
+      (if_then_else
+        (match_test "!!which_alternative == loongarch_check_zero_div_p()")
+        (const_string "yes")
+        (const_string "no")))])
+
+
+I think there is a problem with the implementation of this template. 
+First, the instructions generated in the template are [u]div.w[u], etc. The description of such instructions in the instruction manual is that if the upper 32 bits are not extended by the 31st bit sign then the result is uncertain.
+The second port, I don't know if the following is correct.
+          (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+                      (match_operand:DI 2 "register_operand" "r,r,r"))))]
+I try to modify this template：
+(define_insn "<optab>di3_fake"
+  [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+        (sign_extend:DI
+          (unspec:SI [(any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+                      (match_operand:DI 2 "register_operand" "r,r,r"))]
+           UNSPEC_ANY_DIV)))]
+  ""
+{
+  return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+}
+  [(set_attr "type" "idiv")
+   (set_attr "mode" "SI")
+   (set (attr "enabled")
+      (if_then_else
+        (match_test "!!which_alternative == loongarch_check_zero_div_p()")
+        (const_string "yes")
+        (const_string "no")))])
+
+This problem can be solved. But I don't know if what I'm doing is correct．．．
+
+- User: Andrew Pinski | Time: 2023-09-08 03:58:56 UTC
+  Text: (In reply to chenglulu fromcomment #3)> This involves the template <optab>di3_fake:
+> (define_insn "<optab>di3_fake"
+>   [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+>         (sign_extend:DI
+>           (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+>                       (match_operand:DI 2 "register_operand" "r,r,r"))))]That pattern definitely looks broken.
+Divide's operands' mode must match the mode of the divide IIRC.
+
+- User: Xi Ruoyao | Time: 2023-09-08 04:39:03 UTC
+  Text: (In reply to chenglulu fromcomment #3)> This involves the template <optab>di3_fake:
+> (define_insn "<optab>di3_fake"
+>   [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+>         (sign_extend:DI
+>           (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+>                       (match_operand:DI 2 "register_operand" "r,r,r"))))]
+>   ""
+> {
+>   return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+> }
+>   [(set_attr "type" "idiv")
+>    (set_attr "mode" "SI")
+>    (set (attr "enabled")
+>       (if_then_else
+>         (match_test "!!which_alternative == loongarch_check_zero_div_p()")
+>         (const_string "yes")
+>         (const_string "no")))])
+> 
+> 
+> I think there is a problem with the implementation of this template. 
+> First, the instructions generated in the template are [u]div.w[u], etc. The
+> description of such instructions in the instruction manual is that if the
+> upper 32 bits are not extended by the 31st bit sign then the result is
+> uncertain.I think this reason alone makes the pattern looks very wrong.
+
+I'll take a look...
+
+- User: Xi Ruoyao | Time: 2023-09-08 04:45:53 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #5)> (In reply to chenglulu fromcomment #3)
+> > This involves the template <optab>di3_fake:
+> > (define_insn "<optab>di3_fake"
+> >   [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+> >         (sign_extend:DI
+> >           (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+> >                       (match_operand:DI 2 "register_operand" "r,r,r"))))]
+> >   ""
+> > {
+> >   return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+> > }
+> >   [(set_attr "type" "idiv")
+> >    (set_attr "mode" "SI")
+> >    (set (attr "enabled")
+> >       (if_then_else
+> >         (match_test "!!which_alternative == loongarch_check_zero_div_p()")
+> >         (const_string "yes")
+> >         (const_string "no")))])
+> > 
+> > 
+> > I think there is a problem with the implementation of this template. 
+> > First, the instructions generated in the template are [u]div.w[u], etc. The
+> > description of such instructions in the instruction manual is that if the
+> > upper 32 bits are not extended by the 31st bit sign then the result is
+> > uncertain.
+> 
+> I think this reason alone makes the pattern looks very wrong.
+> 
+> I'll take a look...Hmm, I guess we should just make di3_fake an UNSPEC because there is no way to use div.w and its friends out of <optab:any_div><mode>3.
+
+- User: chenglulu | Time: 2023-09-08 06:02:01 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #6)> (In reply to Xi Ruoyao fromcomment #5)
+> > (In reply to chenglulu fromcomment #3)
+> > > This involves the template <optab>di3_fake:
+> > > (define_insn "<optab>di3_fake"
+> > >   [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+> > >         (sign_extend:DI
+> > >           (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+> > >                       (match_operand:DI 2 "register_operand" "r,r,r"))))]
+> > >   ""
+> > > {
+> > >   return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+> > > }
+> > >   [(set_attr "type" "idiv")
+> > >    (set_attr "mode" "SI")
+> > >    (set (attr "enabled")
+> > >       (if_then_else
+> > >         (match_test "!!which_alternative == loongarch_check_zero_div_p()")
+> > >         (const_string "yes")
+> > >         (const_string "no")))])
+> > > 
+> > > 
+> > > I think there is a problem with the implementation of this template. 
+> > > First, the instructions generated in the template are [u]div.w[u], etc. The
+> > > description of such instructions in the instruction manual is that if the
+> > > upper 32 bits are not extended by the 31st bit sign then the result is
+> > > uncertain.
+> > 
+> > I think this reason alone makes the pattern looks very wrong.
+> > 
+> > I'll take a look...
+> 
+> Hmm, I guess we should just make di3_fake an UNSPEC because there is no way
+> to use div.w and its friends out of <optab:any_div><mode>3.I agree with your idea, so I tried changing it to something like this.Do you think it's okay for me to change like this?
+
+
+(define_insn "<optab>di3_fake"
+  [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+        (sign_extend:DI
+          (unspec:SI [(any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+                      (match_operand:DI 2 "register_operand" "r,r,r"))]
+           UNSPEC_ANY_DIV)))]
+  ""
+{
+  return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+}
+  [(set_attr "type" "idiv")
+   (set_attr "mode" "SI")
+   (set (attr "enabled")
+      (if_then_else
+        (match_test "!!which_alternative == loongarch_check_zero_div_p()")
+        (const_string "yes")
+        (const_string "no")))])
+
+- User: chenglulu | Time: 2023-09-08 06:18:48 UTC
+  Text: (In reply to Andrew Pinski fromcomment #4)> (In reply to chenglulu fromcomment #3)
+> > This involves the template <optab>di3_fake:
+> > (define_insn "<optab>di3_fake"
+> >   [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+> >         (sign_extend:DI
+> >           (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+> >                       (match_operand:DI 2 "register_operand" "r,r,r"))))]
+> 
+> That pattern definitely looks broken.
+> Divide's operands' mode must match the mode of the divide IIRC.OK, thanks! So the compilation failure is caused by an error in this template, right? （Sorry, I don't understand the optimization of this combine）
+
+- User: Xi Ruoyao | Time: 2023-09-08 06:39:29 UTC
+  Text: (In reply to chenglulu fromcomment #7)> (In reply to Xi Ruoyao fromcomment #6)
+> > (In reply to Xi Ruoyao fromcomment #5)
+> > > (In reply to chenglulu fromcomment #3)
+> > > > This involves the template <optab>di3_fake:
+> > > > (define_insn "<optab>di3_fake"
+> > > >   [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+> > > >         (sign_extend:DI
+> > > >           (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+> > > >                       (match_operand:DI 2 "register_operand" "r,r,r"))))]
+> > > >   ""
+> > > > {
+> > > >   return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+> > > > }
+> > > >   [(set_attr "type" "idiv")
+> > > >    (set_attr "mode" "SI")
+> > > >    (set (attr "enabled")
+> > > >       (if_then_else
+> > > >         (match_test "!!which_alternative == loongarch_check_zero_div_p()")
+> > > >         (const_string "yes")
+> > > >         (const_string "no")))])
+> > > > 
+> > > > 
+> > > > I think there is a problem with the implementation of this template. 
+> > > > First, the instructions generated in the template are [u]div.w[u], etc. The
+> > > > description of such instructions in the instruction manual is that if the
+> > > > upper 32 bits are not extended by the 31st bit sign then the result is
+> > > > uncertain.
+> > > 
+> > > I think this reason alone makes the pattern looks very wrong.
+> > > 
+> > > I'll take a look...
+> > 
+> > Hmm, I guess we should just make di3_fake an UNSPEC because there is no way
+> > to use div.w and its friends out of <optab:any_div><mode>3.
+> 
+> I agree with your idea, so I tried changing it to something like this.Do you
+> think it's okay for me to change like this?
+> 
+> 
+> (define_insn "<optab>di3_fake"
+>   [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+>         (sign_extend:DI
+>           (unspec:SI [(any_div:SI (match_operand:DI 1 "register_operand"
+> "r,r,0")
+>                       (match_operand:DI 2 "register_operand" "r,r,r"))]
+>            UNSPEC_ANY_DIV)))]
+>   ""
+> {
+>   return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+> }
+>   [(set_attr "type" "idiv")
+>    (set_attr "mode" "SI")
+>    (set (attr "enabled")
+>       (if_then_else
+>         (match_test "!!which_alternative == loongarch_check_zero_div_p()")
+>         (const_string "yes")
+>         (const_string "no")))])I'm not sure if we can use a single UNSPEC_ANY_DIV value for 4 different operations (I'm afraid it will make a further CSE pass believe "a % b" is same as "a / b" but maybe I'm wrong here).
+
+I came up with a more detailed template:
+
+diff --git a/gcc/config/loongarch/loongarch.md b/gcc/config/loongarch/loongarch.md
+index 75f641b38ee..d162013695f 100644
+--- a/gcc/config/loongarch/loongarch.md
++++ b/gcc/config/loongarch/loongarch.md
+@@ -64,6 +64,9 @@ (define_c_enum "unspec" [
+   UNSPEC_CRC
+   UNSPEC_CRCC
+ 
++  ;; {div,mod}.w{,u} with bad input
++  UNSPEC_BAD_DIVW
++
+   UNSPEC_LOAD_FROM_GOT
+   UNSPEC_PCALAU12I
+   UNSPEC_ORI_L_LO12
+@@ -880,7 +883,7 @@ (define_expand "<optab><mode>3"
+ 		     (match_operand:GPR 2 "register_operand")))]
+   ""
+ {
+- if (GET_MODE (operands[0]) == SImode)
++ if (TARGET_64BIT && GET_MODE (operands[0]) == SImode)
+   {
+     rtx reg1 = gen_reg_rtx (DImode);
+     rtx reg2 = gen_reg_rtx (DImode);
+@@ -917,10 +920,16 @@ (define_insn "*<optab><mode>3"
+ 
+ (define_insn "<optab>di3_fake"
+   [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+-	(sign_extend:DI
+-	  (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+-		      (match_operand:DI 2 "register_operand" "r,r,r"))))]
+-  ""
++	(if_then_else
++	  (and (eq (match_operand:DI 1 "register_operand" "r,r,0")
++		   (sign_extend:DI (subreg:SI (match_dup 1) 0)))
++	       (eq (match_operand:DI 2 "register_operand" "r,r,r")
++		   (sign_extend:DI (subreg:SI (match_dup 2) 0))))
++	  (sign_extend:DI
++	    (any_div:SI (subreg:SI (match_dup 1) 0)
++			(subreg:SI (match_dup 2) 0)))
++	  (unspec:DI [(const_int 0)] UNSPEC_BAD_DIVW)))]
++  "TARGET_64BIT"
+ {
+   return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+ }
+
+- User: Xi Ruoyao | Time: 2023-09-08 06:47:37 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #9)>  (define_insn "<optab>di3_fake"
+>    [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+> -	(sign_extend:DI
+> -	  (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+> -		      (match_operand:DI 2 "register_operand" "r,r,r"))))]
+> -  ""
+> +	(if_then_else
+> +	  (and (eq (match_operand:DI 1 "register_operand" "r,r,0")
+> +		   (sign_extend:DI (subreg:SI (match_dup 1) 0)))
+> +	       (eq (match_operand:DI 2 "register_operand" "r,r,r")
+> +		   (sign_extend:DI (subreg:SI (match_dup 2) 0))))
+> +	  (sign_extend:DI
+> +	    (any_div:SI (subreg:SI (match_dup 1) 0)
+> +			(subreg:SI (match_dup 2) 0)))
+> +	  (unspec:DI [(const_int 0)] UNSPEC_BAD_DIVW)))]With this the compiler will still believe all bad {div,mod}.w{,u} instructions generate the exactly same unspecified value.  But I don't think this is really relevant: if a program depends on the unspecified value (no matter one value or multiple values) it's already wrong.
+
+If we are really "paranoid" about this we can make 4 UNSPEC_BAD_* constants and use [(match_dup 1) (match_dup 2)] instead of [(const_int 0)].> +  "TARGET_64BIT"
+>  {
+>    return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+>  }
+
+- User: chenglulu | Time: 2023-09-08 06:53:07 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #10)> (In reply to Xi Ruoyao fromcomment #9)
+> 
+> >  (define_insn "<optab>di3_fake"
+> >    [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+> > -	(sign_extend:DI
+> > -	  (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+> > -		      (match_operand:DI 2 "register_operand" "r,r,r"))))]
+> > -  ""
+> > +	(if_then_else
+> > +	  (and (eq (match_operand:DI 1 "register_operand" "r,r,0")
+> > +		   (sign_extend:DI (subreg:SI (match_dup 1) 0)))
+> > +	       (eq (match_operand:DI 2 "register_operand" "r,r,r")
+> > +		   (sign_extend:DI (subreg:SI (match_dup 2) 0))))
+> > +	  (sign_extend:DI
+> > +	    (any_div:SI (subreg:SI (match_dup 1) 0)
+> > +			(subreg:SI (match_dup 2) 0)))
+> > +	  (unspec:DI [(const_int 0)] UNSPEC_BAD_DIVW)))]
+> 
+> With this the compiler will still believe all bad {div,mod}.w{,u}I think this is already defined as UNSPEC. Isn’t the simpler the logic, the better?> instructions generate the exactly same unspecified value.  But I don't think
+> this is really relevant: if a program depends on the unspecified value (no
+> matter one value or multiple values) it's already wrong.
+> 
+> If we are really "paranoid" about this we can make 4 UNSPEC_BAD_* constants
+> and use [(match_dup 1) (match_dup 2)] instead of [(const_int 0)].
+> 
+> > +  "TARGET_64BIT"
+> >  {
+> >    return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+> >  }
+
+- User: Xi Ruoyao | Time: 2023-09-08 06:58:56 UTC
+  Text: (In reply to chenglulu fromcomment #11)> (In reply to Xi Ruoyao fromcomment #10)
+> > (In reply to Xi Ruoyao fromcomment #9)
+> > 
+> > >  (define_insn "<optab>di3_fake"
+> > >    [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+> > > -	(sign_extend:DI
+> > > -	  (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+> > > -		      (match_operand:DI 2 "register_operand" "r,r,r"))))]
+> > > -  ""
+> > > +	(if_then_else
+> > > +	  (and (eq (match_operand:DI 1 "register_operand" "r,r,0")
+> > > +		   (sign_extend:DI (subreg:SI (match_dup 1) 0)))
+> > > +	       (eq (match_operand:DI 2 "register_operand" "r,r,r")
+> > > +		   (sign_extend:DI (subreg:SI (match_dup 2) 0))))
+> > > +	  (sign_extend:DI
+> > > +	    (any_div:SI (subreg:SI (match_dup 1) 0)
+> > > +			(subreg:SI (match_dup 2) 0)))
+> > > +	  (unspec:DI [(const_int 0)] UNSPEC_BAD_DIVW)))]
+> > 
+> > With this the compiler will still believe all bad {div,mod}.w{,u}
+> 
+> I think this is already defined as UNSPEC. Isn’t the simpler the logic, the
+> better?Yes, I think we should just use 4 different UNSPEC_ values and the simple version.  But I've not find a way to use 4 different UNSPEC_ values in the RTL template except duplicating everything 4 times...
+
+- User: chenglulu | Time: 2023-09-08 07:03:28 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #12)> (In reply to chenglulu fromcomment #11)
+> > (In reply to Xi Ruoyao fromcomment #10)
+> > > (In reply to Xi Ruoyao fromcomment #9)
+> > > 
+> > > >  (define_insn "<optab>di3_fake"
+> > > >    [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+> > > > -	(sign_extend:DI
+> > > > -	  (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+> > > > -		      (match_operand:DI 2 "register_operand" "r,r,r"))))]
+> > > > -  ""
+> > > > +	(if_then_else
+> > > > +	  (and (eq (match_operand:DI 1 "register_operand" "r,r,0")
+> > > > +		   (sign_extend:DI (subreg:SI (match_dup 1) 0)))
+> > > > +	       (eq (match_operand:DI 2 "register_operand" "r,r,r")
+> > > > +		   (sign_extend:DI (subreg:SI (match_dup 2) 0))))
+> > > > +	  (sign_extend:DI
+> > > > +	    (any_div:SI (subreg:SI (match_dup 1) 0)
+> > > > +			(subreg:SI (match_dup 2) 0)))
+> > > > +	  (unspec:DI [(const_int 0)] UNSPEC_BAD_DIVW)))]
+> > > 
+> > > With this the compiler will still believe all bad {div,mod}.w{,u}
+> > 
+> > I think this is already defined as UNSPEC. Isn’t the simpler the logic, the
+> > better?
+> 
+> Yes, I think we should just use 4 different UNSPEC_ values and the simple
+> version.  But I've not find a way to use 4 different UNSPEC_ values in the
+> RTL template except duplicating everything 4 times...I still have a question that I don't quite understand, that is, why that the four generated strings are equivalent when using an UNSPEC name? My template names are different, and they will not be automatically matched during optimization.???
+
+- User: Xi Ruoyao | Time: 2023-09-08 07:04:52 UTC
+  Text: I'm trying
+
+diff --git a/gcc/config/loongarch/loongarch.md b/gcc/config/loongarch/loongarch.md
+index 75f641b38ee..44d9b99b2f5 100644
+--- a/gcc/config/loongarch/loongarch.md
++++ b/gcc/config/loongarch/loongarch.md
+@@ -64,6 +64,12 @@ (define_c_enum "unspec" [
+   UNSPEC_CRC
+   UNSPEC_CRCC
+ 
++  ;; 32-bit divisions can produce unspecified value if TARGET_64BIT
++  UNSPEC_DIV_W
++  UNSPEC_UDIV_W
++  UNSPEC_MOD_W
++  UNSPEC_UMOD_W
++
+   UNSPEC_LOAD_FROM_GOT
+   UNSPEC_PCALAU12I
+   UNSPEC_ORI_L_LO12
+@@ -461,6 +467,8 @@ (define_code_iterator neg_bitwise [and ior])
+ ;; This code iterator allows unsigned and signed division to be generated
+ ;; from the same template.
+ (define_code_iterator any_div [div udiv mod umod])
++(define_code_attr ANY_DIV [(div "DIV") (udiv "UDIV")
++			   (mod "MOD") (umod "UMOD")])
+ 
+ ;; This code iterator allows addition and subtraction to be generated
+ ;; from the same template.
+@@ -918,8 +926,9 @@ (define_insn "*<optab><mode>3"
+ (define_insn "<optab>di3_fake"
+   [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+ 	(sign_extend:DI
+-	  (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+-		      (match_operand:DI 2 "register_operand" "r,r,r"))))]
++	  (unspec:SI [(match_operand:DI 1 "register_operand" "r,r,0")
++		      (match_operand:DI 2 "register_operand" "r,r,r")]
++		     UNSPEC_<ANY_DIV>)))]
+   ""
+ {
+   return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+
+But:
+
+../../gcc/gcc/config/loongarch/loongarch.md:931:23: error: invalid decimal constant "UNSPEC_<ANY_DIV>"
+
+- User: Xi Ruoyao | Time: 2023-09-08 07:16:46 UTC
+  Text: (In reply to chenglulu fromcomment #13)> (In reply to Xi Ruoyao fromcomment #12)
+> > (In reply to chenglulu fromcomment #11)
+> > > (In reply to Xi Ruoyao fromcomment #10)
+> > > > (In reply to Xi Ruoyao fromcomment #9)
+> > > > 
+> > > > >  (define_insn "<optab>di3_fake"
+> > > > >    [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+> > > > > -	(sign_extend:DI
+> > > > > -	  (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+> > > > > -		      (match_operand:DI 2 "register_operand" "r,r,r"))))]
+> > > > > -  ""
+> > > > > +	(if_then_else
+> > > > > +	  (and (eq (match_operand:DI 1 "register_operand" "r,r,0")
+> > > > > +		   (sign_extend:DI (subreg:SI (match_dup 1) 0)))
+> > > > > +	       (eq (match_operand:DI 2 "register_operand" "r,r,r")
+> > > > > +		   (sign_extend:DI (subreg:SI (match_dup 2) 0))))
+> > > > > +	  (sign_extend:DI
+> > > > > +	    (any_div:SI (subreg:SI (match_dup 1) 0)
+> > > > > +			(subreg:SI (match_dup 2) 0)))
+> > > > > +	  (unspec:DI [(const_int 0)] UNSPEC_BAD_DIVW)))]
+> > > > 
+> > > > With this the compiler will still believe all bad {div,mod}.w{,u}
+> > > 
+> > > I think this is already defined as UNSPEC. Isn’t the simpler the logic, the
+> > > better?
+> > 
+> > Yes, I think we should just use 4 different UNSPEC_ values and the simple
+> > version.  But I've not find a way to use 4 different UNSPEC_ values in the
+> > RTL template except duplicating everything 4 times...
+> 
+> I still have a question that I don't quite understand, that is, why that the
+> four generated strings are equivalent when using an UNSPEC name? My template
+> names are different, and they will not be automatically matched during
+> optimization.???Oh I get it, you mean
+
+ (define_insn "<optab>di3_fake"
+   [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+ 	(sign_extend:DI
+-	  (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+-		      (match_operand:DI 2 "register_operand" "r,r,r"))))]
++	  (unspec:DI [(any_div:DI
++			(match_operand:DI 1 "register_operand" "r,r,0")
++			(match_operand:DI 2 "register_operand" "r,r,r"))]
++		     UNSPEC_ANY_DIV)))]
+   ""
+ {
+   return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+
+Good idea! I think it's better than my stupid hacks :).
+
+I'd been thinking about:
+
+ (define_insn "<optab>di3_fake"
+   [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+ 	(sign_extend:DI
+-	  (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+-		      (match_operand:DI 2 "register_operand" "r,r,r"))))]
++	  (unspec:DI [(match_operand:DI 1 "register_operand" "r,r,0")
++		      (match_operand:DI 2 "register_operand" "r,r,r")]
++		     UNSPEC_ANY_DIV)))]
+   ""
+ {
+   return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+
+and this is just wrong.
+
+- User: chenglulu | Time: 2023-09-09 07:16:54 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #15)> (In reply to chenglulu fromcomment #13)
+> > (In reply to Xi Ruoyao fromcomment #12)
+> > > (In reply to chenglulu fromcomment #11)
+> > > > (In reply to Xi Ruoyao fromcomment #10)
+> > > > > (In reply to Xi Ruoyao fromcomment #9)
+> > > > > 
+> > > > > >  (define_insn "<optab>di3_fake"
+> > > > > >    [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+> > > > > > -	(sign_extend:DI
+> > > > > > -	  (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+> > > > > > -		      (match_operand:DI 2 "register_operand" "r,r,r"))))]
+> > > > > > -  ""
+> > > > > > +	(if_then_else
+> > > > > > +	  (and (eq (match_operand:DI 1 "register_operand" "r,r,0")
+> > > > > > +		   (sign_extend:DI (subreg:SI (match_dup 1) 0)))
+> > > > > > +	       (eq (match_operand:DI 2 "register_operand" "r,r,r")
+> > > > > > +		   (sign_extend:DI (subreg:SI (match_dup 2) 0))))
+> > > > > > +	  (sign_extend:DI
+> > > > > > +	    (any_div:SI (subreg:SI (match_dup 1) 0)
+> > > > > > +			(subreg:SI (match_dup 2) 0)))
+> > > > > > +	  (unspec:DI [(const_int 0)] UNSPEC_BAD_DIVW)))]
+> > > > > 
+> > > > > With this the compiler will still believe all bad {div,mod}.w{,u}
+> > > > 
+> > > > I think this is already defined as UNSPEC. Isn’t the simpler the logic, the
+> > > > better?
+> > > 
+> > > Yes, I think we should just use 4 different UNSPEC_ values and the simple
+> > > version.  But I've not find a way to use 4 different UNSPEC_ values in the
+> > > RTL template except duplicating everything 4 times...
+> > 
+> > I still have a question that I don't quite understand, that is, why that the
+> > four generated strings are equivalent when using an UNSPEC name? My template
+> > names are different, and they will not be automatically matched during
+> > optimization.???
+> 
+> Oh I get it, you mean
+> 
+>  (define_insn "<optab>di3_fake"
+>    [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+>  	(sign_extend:DI
+> -	  (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+> -		      (match_operand:DI 2 "register_operand" "r,r,r"))))]
+> +	  (unspec:DI [(any_div:DI
+> +			(match_operand:DI 1 "register_operand" "r,r,0")
+> +			(match_operand:DI 2 "register_operand" "r,r,r"))]
+> +		     UNSPEC_ANY_DIV)))]
+>    ""
+>  {
+>    return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+> 
+> Good idea! I think it's better than my stupid hacks :).
+> 
+> I'd been thinking about:
+> 
+>  (define_insn "<optab>di3_fake"
+>    [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+>  	(sign_extend:DI
+> -	  (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+> -		      (match_operand:DI 2 "register_operand" "r,r,r"))))]
+> +	  (unspec:DI [(match_operand:DI 1 "register_operand" "r,r,0")
+> +		      (match_operand:DI 2 "register_operand" "r,r,r")]
+> +		     UNSPEC_ANY_DIV)))]
+>    ""
+>  {
+>    return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+> 
+> and this is just wrong.Is it better to modify it this way?
+
+--- a/gcc/config/loongarch/loongarch.md
++++ b/gcc/config/loongarch/loongarch.md
+@@ -60,6 +60,7 @@ (define_c_enum "unspec" [
+   ;; Stack tie
+   UNSPEC_TIE
+ 
++  UNSPEC_ANY_DIV
+   ;; CRC
+   UNSPEC_CRC
+   UNSPEC_CRCC
+@@ -900,7 +901,7 @@ (define_expand "<optab><mode>3"
+                     (match_operand:GPR 2 "register_operand")))]
+   ""
+ {
+- if (GET_MODE (operands[0]) == SImode)
++ if (GET_MODE (operands[0]) == SImode && TARGET_64BIT)
+   {
+     rtx reg1 = gen_reg_rtx (DImode);
+     rtx reg2 = gen_reg_rtx (DImode);
+@@ -938,9 +939,12 @@ (define_insn "*<optab><mode>3"
+ (define_insn "<optab>di3_fake"
+   [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+        (sign_extend:DI
+-         (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+-                     (match_operand:DI 2 "register_operand" "r,r,r"))))]
+-  ""
++         (unspec:SI
++          [(subreg:SI
++            (any_div:DI (match_operand:DI 1 "register_operand" "r,r,0")
++                        (match_operand:DI 2 "register_operand" "r,r,r")) 0)]
++         UNSPEC_ANY_DIV)))]
++  "TARGET_64BIT"
+ {
+   return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+
+- User: Xi Ruoyao | Time: 2023-09-09 07:47:20 UTC
+  Text: I think the proper description should be:
+
+diff --git a/gcc/config/loongarch/loongarch.md b/gcc/config/loongarch/loongarch.md
+index 75f641b38ee..000d17b0ba6 100644
+--- a/gcc/config/loongarch/loongarch.md
++++ b/gcc/config/loongarch/loongarch.md
+@@ -64,6 +64,8 @@ (define_c_enum "unspec" [
+   UNSPEC_CRC
+   UNSPEC_CRCC
+ 
++  UNSPEC_DIV_W_OPERAND
++
+   UNSPEC_LOAD_FROM_GOT
+   UNSPEC_PCALAU12I
+   UNSPEC_ORI_L_LO12
+@@ -892,7 +894,7 @@ (define_expand "<optab><mode>3"
+     emit_insn (gen_rtx_SET (reg1, operands[1]));
+     emit_insn (gen_rtx_SET (reg2, operands[2]));
+ 
+-    emit_insn (gen_<optab>di3_fake (rd, reg1, reg2));
++    emit_insn (gen_<optab>si3_extended (rd, reg1, reg2));
+     emit_insn (gen_rtx_SET (operands[0],
+ 			    simplify_gen_subreg (SImode, rd, DImode, 0)));
+     DONE;
+@@ -915,11 +917,14 @@ (define_insn "*<optab><mode>3"
+ 	(const_string "yes")
+ 	(const_string "no")))])
+ 
+-(define_insn "<optab>di3_fake"
++(define_insn "<optab>si3_extended"
+   [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+ 	(sign_extend:DI
+-	  (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+-		      (match_operand:DI 2 "register_operand" "r,r,r"))))]
++	  (any_div:SI
++	    (unspec:SI [(match_operand:DI 1 "register_operand" "r,r,0")]
++		       UNSPEC_DIV_W_OPERAND)
++	    (unspec:SI [(match_operand:DI 2 "register_operand" "r,r,r")]
++		       UNSPEC_DIV_W_OPERAND))))]
+   ""
+ {
+   return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+
+i. e. we define "UNSPEC_DIV_W_OPERAND" as a "machine-specific operation": if the input is a sign-extended 32-bit value, the operation extracts the low 32-bit; otherwise, it produces random junks.
+
+Note that the behavior actually depends on the values of operand[1] and operands[2], not the result of operand[1] / operand[2].  So we should put unspec inside any_div, not outside.
+
+(I've not included the TARGET_64BIT change here, it should be done anyway.)
+
+BTW is LA664 improved to handle non-properly-extended inputs with div.w?
+
+- User: chenglulu | Time: 2023-09-09 08:24:32 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #17)> I think the proper description should be:
+> 
+> diff --git a/gcc/config/loongarch/loongarch.md
+> b/gcc/config/loongarch/loongarch.md
+> index 75f641b38ee..000d17b0ba6 100644
+> --- a/gcc/config/loongarch/loongarch.md
+> +++ b/gcc/config/loongarch/loongarch.md
+> @@ -64,6 +64,8 @@ (define_c_enum "unspec" [
+>    UNSPEC_CRC
+>    UNSPEC_CRCC
+>  
+> +  UNSPEC_DIV_W_OPERAND
+> +
+>    UNSPEC_LOAD_FROM_GOT
+>    UNSPEC_PCALAU12I
+>    UNSPEC_ORI_L_LO12
+> @@ -892,7 +894,7 @@ (define_expand "<optab><mode>3"
+>      emit_insn (gen_rtx_SET (reg1, operands[1]));
+>      emit_insn (gen_rtx_SET (reg2, operands[2]));
+>  
+> -    emit_insn (gen_<optab>di3_fake (rd, reg1, reg2));
+> +    emit_insn (gen_<optab>si3_extended (rd, reg1, reg2));
+>      emit_insn (gen_rtx_SET (operands[0],
+>  			    simplify_gen_subreg (SImode, rd, DImode, 0)));
+>      DONE;
+> @@ -915,11 +917,14 @@ (define_insn "*<optab><mode>3"
+>  	(const_string "yes")
+>  	(const_string "no")))])
+>  
+> -(define_insn "<optab>di3_fake"
+> +(define_insn "<optab>si3_extended"
+>    [(set (match_operand:DI 0 "register_operand" "=r,&r,&r")
+>  	(sign_extend:DI
+> -	  (any_div:SI (match_operand:DI 1 "register_operand" "r,r,0")
+> -		      (match_operand:DI 2 "register_operand" "r,r,r"))))]
+> +	  (any_div:SI
+> +	    (unspec:SI [(match_operand:DI 1 "register_operand" "r,r,0")]
+> +		       UNSPEC_DIV_W_OPERAND)
+> +	    (unspec:SI [(match_operand:DI 2 "register_operand" "r,r,r")]
+> +		       UNSPEC_DIV_W_OPERAND))))]
+>    ""
+>  {
+>    return loongarch_output_division ("<insn>.w<u>\t%0,%1,%2", operands);
+> 
+> i. e. we define "UNSPEC_DIV_W_OPERAND" as a "machine-specific operation": if
+> the input is a sign-extended 32-bit value, the operation extracts the low
+> 32-bit; otherwise, it produces random junks.
+> 
+> Note that the behavior actually depends on the values of operand[1] and
+> operands[2], not the result of operand[1] / operand[2].  So we should put
+> unspec inside any_div, not outside.
+> 
+> (I've not included the TARGET_64BIT change here, it should be done anyway.)
+> 
+> BTW is LA664 improved to handle non-properly-extended inputs with div.w?This problem has been fixed on LA664．
+I don't quite understand why this operation is still needed in !TARGET_64BIT?
+
+- User: Xi Ruoyao | Time: 2023-09-09 09:52:05 UTC
+  Text: (In reply to chenglulu fromcomment #18)> This problem has been fixed on LA664．
+> I don't quite understand why this operation is still needed in !TARGET_64BIT?It's not needed with !TARGET_64BIT.  I just meant I didn't added TARGET_64BIT because the diff was only for a quick discussion.
+
+- User: GCC Commits | Time: 2023-09-14 01:06:34 UTC
+  Text: The master branch has been updated by LuluCheng <chenglulu@gcc.gnu.org>:https://gcc.gnu.org/g:9a033b9feffc9d97d5acfe8ca3cd16359f4b714bcommitr14-3974-g9a033b9feffc9d97d5acfe8ca3cd16359f4b714bAuthor: Lulu Cheng <chenglulu@loongson.cn>
+Date:   Mon Sep 11 16:20:29 2023 +0800
+
+    LoongArch: Fix bug of '<optab>di3_fake'.PR target/111334gcc/ChangeLog:
+    
+            * config/loongarch/loongarch.md: Fix bug of '<optab>di3_fake'.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/loongarch/pr111334.c: New test.
+
+- User: chenglulu | Time: 2023-09-14 01:17:20 UTC
+  Text: fixed
+

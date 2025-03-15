@@ -1,0 +1,245 @@
+Issue Title: [analyzer] CStringChecker strlen should trust global constant initializers
+Original Post: For constant global variables, we trust their initializers (if present):
+```C++
+const char * const p = "abc";
+const char s[] = "woof";
+```
+The CStringChecker when models "strlen" calls, it handles them by the `evalstrLengthCommon` function, which ensures preconditions of the call and acquires and binds the result: `strLength`.
+That value is provided by the `getCStringLength` call, which should under the hood calculate the real length if possible.
+Currently, it calculates it for string literals (aka. `strlen("foof")`), but not if the argument is a variable: `strlen(s)`, or `strlen(p)`.
+This handler switch looks similar to how extents are calculated in MemRegion.cpp:getStaticSize.
+
+Anyways, in general, if the const VarRegion is in the `GlobalImmutableSpaceRegion` memory space and has initializer, and the initializer expression there is "simple", we should just use that instead of the variable.
+By "simple" I mean, if it's a StringLiteral after stipping implicit paren casts, I guess.
+
+https://godbolt.org/z/4nKx6b3rc
+```C++
+void clang_analyzer_dump(int);
+typedef typeof(sizeof(int)) size_t;
+size_t strlen(const char *);
+
+const char text[] = "asdasdasd";
+const char * const p = "asdasdasd";
+const char * const q = p + 2;
+
+void top(void) {
+  clang_analyzer_dump(strlen("asdasdasd")); // should be 9
+  clang_analyzer_dump(strlen(text)); // should be 9
+  clang_analyzer_dump(strlen(p)); // should be 9
+  clang_analyzer_dump(strlen(q)); // ideally, it should be 7, but it's fine if we don't know.
+}
+```
+
+Comment by llvmbot: 
+@llvm/issue-subscribers-clang-static-analyzer
+
+<details>
+For constant global variables, we trust their initializers (if present):
+```C++
+const char *p = "abc";
+const char s[] = "woof";
+```
+The CStringChecker when models "strlen" calls, it handles them by the `evalstrLengthCommon` function, which ensures preconditions of the call and acquires and binds the result: `strLength`.
+That value is provided by the `getCStringLength` call, which should under the hood calculate the real length if possible.
+Currently, it calculates it for string literals (aka. `strlen("foof")`), but not if the argument is a variable: `strlen(s)`, or `strlen(p)`.
+This handler switch looks similar to how extents are calculated in MemRegion.cpp:getStaticSize.
+
+Anyways, in general, if the const VarRegion is in the `GlobalImmutableSpaceRegion` memory space and has initializer, and the initializer expression there is "simple", we should just use that instead of the variable.
+By "simple" I mean, if it's a StringLiteral after stipping implicit paren casts, I guess.
+
+https://godbolt.org/z/v9vT75n4W
+```C++
+void clang_analyzer_dump(int);
+typedef typeof(sizeof(int)) size_t;
+size_t strlen(const char *);
+
+const char text[] = "asdasdasd";
+const char *p = "asdasdasd";
+const char *q = p + 2;
+
+void top(void) {
+  clang_analyzer_dump(strlen("asdasdasd")); // should be 9
+  clang_analyzer_dump(strlen(text)); // should be 9
+  clang_analyzer_dump(strlen(p)); // should be 9
+  clang_analyzer_dump(strlen(q)); // ideally, it should be 7, but it's fine if we don't know.
+}
+```
+</details>
+
+Comment by llvmbot: 
+@llvm/issue-subscribers-good-first-issue
+
+<details>
+For constant global variables, we trust their initializers (if present):
+```C++
+const char *p = "abc";
+const char s[] = "woof";
+```
+The CStringChecker when models "strlen" calls, it handles them by the `evalstrLengthCommon` function, which ensures preconditions of the call and acquires and binds the result: `strLength`.
+That value is provided by the `getCStringLength` call, which should under the hood calculate the real length if possible.
+Currently, it calculates it for string literals (aka. `strlen("foof")`), but not if the argument is a variable: `strlen(s)`, or `strlen(p)`.
+This handler switch looks similar to how extents are calculated in MemRegion.cpp:getStaticSize.
+
+Anyways, in general, if the const VarRegion is in the `GlobalImmutableSpaceRegion` memory space and has initializer, and the initializer expression there is "simple", we should just use that instead of the variable.
+By "simple" I mean, if it's a StringLiteral after stipping implicit paren casts, I guess.
+
+https://godbolt.org/z/v9vT75n4W
+```C++
+void clang_analyzer_dump(int);
+typedef typeof(sizeof(int)) size_t;
+size_t strlen(const char *);
+
+const char text[] = "asdasdasd";
+const char *p = "asdasdasd";
+const char *q = p + 2;
+
+void top(void) {
+  clang_analyzer_dump(strlen("asdasdasd")); // should be 9
+  clang_analyzer_dump(strlen(text)); // should be 9
+  clang_analyzer_dump(strlen(p)); // should be 9
+  clang_analyzer_dump(strlen(q)); // ideally, it should be 7, but it's fine if we don't know.
+}
+```
+</details>
+
+Comment by DimitryAndric: With:
+
+```c++
+const char text[] = "asdasdasd";
+```
+
+you can indeed assume that `text` is always the same. However, with:
+
+```c++
+const char *p = "asdasdasd";
+const char *q = p + 2;
+```
+
+only the strings pointed to are constant, not the pointers themselves! I.e., at runtime I could do in some function:
+
+```c++
+void f()
+{
+   p = "something else";
+}
+```
+
+and your assumption would no longer hold.
+
+In this case I think you can only do this when the pointers themselves are also `const`, so:
+
+```c++
+const char *const pc = "reallyreallyconst";
+const char *const qc = pc + 2;
+```
+
+Comment by steakhal: Yea, I wanted to have it const of course. Thanks.
+Updated the issue.
+Comment by luamfb: I was looking at the pre-existing regression tests to find out how to test this behavior, and came across these, at `clang/test/Analysis/string.c`:
+
+```
+void strlen_constant1(void) {
+  const char *a = "123";
+  clang_analyzer_eval(strlen(a) == 3); // expected-warning{{TRUE}}
+}
+
+void strlen_constant2(char x) {
+  char a[] = "123";
+  clang_analyzer_eval(strlen(a) == 3); // expected-warning{{TRUE}}
+
+  a[0] = x;
+  clang_analyzer_eval(strlen(a) == 3); // expected-warning{{UNKNOWN}}
+}
+```
+These tests are already passing. I've also tried adding:
+
+```
+void clang_analyzer_dump(int);
+
+void strlen_constant1(void) {
+  const char *a = "123";
+  clang_analyzer_dump(strlen(a)); // expected-warning {{3 S32b [debug.ExprInspection]}}
+  clang_analyzer_eval(strlen(a) == 3); // expected-warning{{TRUE}}
+}
+
+void strlen_constant2(char x) {
+  char a[] = "123";
+  clang_analyzer_dump(strlen(a)); // expected-warning {{3 S32b [debug.ExprInspection]}}
+  clang_analyzer_eval(strlen(a) == 3); // expected-warning{{TRUE}}
+
+  a[0] = x;
+  clang_analyzer_eval(strlen(a) == 3); // expected-warning{{UNKNOWN}}
+}
+```
+The tests still pass. Does this mean the analyzer is already working as intended? I'm new to LLVM, so I'm not sure.
+Comment by steakhal: > I was looking at the pre-existing regression tests to find out how to test this behavior, and came across these, at `clang/test/Analysis/string.c`:
+> 
+> ```
+> void strlen_constant1(void) {
+>   const char *a = "123";
+>   clang_analyzer_eval(strlen(a) == 3); // expected-warning{{TRUE}}
+> }
+> 
+> void strlen_constant2(char x) {
+>   char a[] = "123";
+>   clang_analyzer_eval(strlen(a) == 3); // expected-warning{{TRUE}}
+> 
+>   a[0] = x;
+>   clang_analyzer_eval(strlen(a) == 3); // expected-warning{{UNKNOWN}}
+> }
+> ```
+> These tests are already passing. I've also tried adding:
+> 
+> ```
+> void clang_analyzer_dump(int);
+> 
+> void strlen_constant1(void) {
+>   const char *a = "123";
+>   clang_analyzer_dump(strlen(a)); // expected-warning {{3 S32b [debug.ExprInspection]}}
+>   clang_analyzer_eval(strlen(a) == 3); // expected-warning{{TRUE}}
+> }
+> 
+> void strlen_constant2(char x) {
+>   char a[] = "123";
+>   clang_analyzer_dump(strlen(a)); // expected-warning {{3 S32b [debug.ExprInspection]}}
+>   clang_analyzer_eval(strlen(a) == 3); // expected-warning{{TRUE}}
+> 
+>   a[0] = x;
+>   clang_analyzer_eval(strlen(a) == 3); // expected-warning{{UNKNOWN}}
+> }
+> ```
+> The tests still pass. Does this mean the analyzer is already working as intended? I'm new to LLVM, so I'm not sure.
+
+In the examples I have in the description we have constant global arrays, initialized by some literal. The example fails to produce the expected result noted by the comments there.
+In your examples those are local variables, thus this ticket doesn't apply for them.
+Comment by luamfb: Sorry, I didn't notice they had to be global. Using global constants the tests fail indeed.
+Can you assign this issue to me? It seems I'm not allowed to assign it to myself.
+Comment by code-Gambler: This is the getCStringLength function.
+
+```c++
+static inline uint32_t getCStringLength(ArrayRef<uint8_t> Data) {
+  const char *S = reinterpret_cast<const char *>(Data.data());
+  return strlen(S) + 1;
+}
+```
+
+If we change it to something like this
+
+
+```c++
+    std::size_t length = 0;
+    while (*S != '\0') {
+        ++length;
+        ++S;
+    }
+
+    return length;
+```
+
+ I'm new to LLVM, as matter of fact I am also new to the open source community as well.
+
+Comment by luamfb: @code-Gambler I believe you have the wrong function, the one mentioned in this issue is in `CStringChecker.cpp`.
+Anyhow, I've submitted a PR (https://github.com/llvm/llvm-project/pull/68368) that solves this issue, I'd appreciate it if someone could review it.
+Comment by NagyDonat: @luamfb Thanks for the commit! I assigned this issue to you and gave a review on the commit.
+Comment by luamfb: PR https://github.com/llvm/llvm-project/pull/68368 has already been merged, so I believe this issue can be closed.
+Comment by NagyDonat: I agree, I'm closing this issue because PR https://github.com/llvm/llvm-project/pull/68368 fixed it.

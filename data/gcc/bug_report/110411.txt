@@ -1,0 +1,184 @@
+Bug Summary: ICE on simple memcpy test case when allowing generation of vector pair load/store insns
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 11.0, 12.0, 13.0, 14.0
+
+Comments:
+- User: Peter Bergner | Time: 2023-06-26 14:54:15 UTC
+  Text: bergner@ltcden2-lp1:~$ cat bug.c
+#include <string.h>
+
+struct s {
+  long a;
+  long b;
+  long c;
+  long d: 1;
+};
+unsigned long ptr;
+
+void
+bug (struct s *dst)
+{
+  struct s *src = (struct s *)(ptr & ~0xFUL);
+  memcpy (dst, src, sizeof(struct s));
+}
+
+bergner@ltcden2-lp1:~$ gcc -S -O2 -mcpu=power10 -mblock-ops-vector-pair bug.c
+during RTL pass: final
+bug.c: In function 'bug':
+bug.c:16:1: internal compiler error: output_operand: invalid expression as operand
+   16 | }
+      | ^
+0x10dea57b output_operand_lossage(char const*, ...)
+	/home/bergner/gcc/gcc-fsf-mainline-base/gcc/final.cc:3190
+0x10dee2bb output_addr_const(_IO_FILE*, rtx_def*)
+	/home/bergner/gcc/gcc-fsf-mainline-base/gcc/final.cc:3787
+...
+
+- User: Peter Bergner | Time: 2023-06-26 14:58:14 UTC
+  Text: I'll note this was reported by our Linux kernel team.
+
+The problem here is the expression we assign to src ends up looking like an altivec and:DI memory address and that type of address is invalid for a lxvp/stxvp instruction.  fwprop seems to be creating it:
+
+propagating insn 7 into insn 9, replacing:
+(set (reg:DI 123 [ src ])
+    (and:DI (reg:DI 122)
+        (reg:DI 124 [ ptr ])))
+successfully matched this instruction to anddi3_mask:
+(set (reg:DI 123 [ src ])
+    (and:DI (reg:DI 124 [ ptr ])
+        (const_int -16 [0xfffffffffffffff0])))
+rescanning insn with uid = 9.
+updating insn 9 in-place
+verify found no changes in insn with uid = 9.
+
+propagating insn 9 into insn 10, replacing:
+(set (reg:OO 125 [ MEM <char[1:32]> [(void *)src_4] ])
+    (mem:OO (reg:DI 123 [ src ]) [0 MEM <char[1:32]> [(void *)src_4]+0 S32 A128]))
+successfully matched this instruction to *movoo:
+(set (reg:OO 125 [ MEM <char[1:32]> [(void *)src_4] ])
+    (mem:OO (and:DI (reg:DI 124 [ ptr ])
+            (const_int -16 [0xfffffffffffffff0])) [0 MEM <char[1:32]> [(void *)src_4]+0 S32 A128]))
+
+
+Clearly, movoo shouldn't allow these types of addresses.
+
+- User: Peter Bergner | Time: 2023-06-26 15:05:32 UTC
+  Text: Failure goes back to GCC 11, which is the start of P10 code generation, so not a regression.  The work around is to use the -mno-block-ops-vector-pair option, which is the default.
+
+- User: Peter Bergner | Time: 2023-06-26 16:29:14 UTC
+  Text: Jeevitha is going to look at fixing this for us.
+
+- User: GCC Commits | Time: 2023-08-31 10:49:06 UTC
+  Text: The master branch has been updated by jeevitha <jeevitha@gcc.gnu.org>:https://gcc.gnu.org/g:9ea1248604d7b65009af32103814332f35bd33e2commitr14-3592-g9ea1248604d7b65009af32103814332f35bd33e2Author: Jeevitha <jeevitha@linux.ibm.com>
+Date:   Thu Aug 31 05:40:18 2023 -0500
+
+    rs6000: Don't allow AltiVec address in movoo & movxo pattern [PR110411]
+    
+    There are no instructions that do traditional AltiVec addresses (i.e.
+    with the low four bits of the address masked off) for OOmode and XOmode
+    objects. The solution is to modify the constraints used in the movoo and
+    movxo pattern to disallow these types of addresses, which assists LRA in
+    resolving this issue. Furthermore, the mode size 16 check has been
+    removed in vsx_quad_dform_memory_operand to allow OOmode and XOmode, and
+    quad_address_p already handles less than size 16.
+    
+    2023-08-31  Jeevitha Palanisamy  <jeevitha@linux.ibm.com>
+    
+    gcc/PR target/110411* config/rs6000/mma.md (define_insn_and_split movoo): Disallow
+            AltiVec address operands.
+            (define_insn_and_split movxo): Likewise.
+            * config/rs6000/predicates.md (vsx_quad_dform_memory_operand): Remove
+            redundant mode size check.
+    
+    gcc/testsuite/PR target/110411* gcc.target/powerpc/pr110411-1.c: New testcase.
+            * gcc.target/powerpc/pr110411-2.c: New testcase.
+
+- User: GCC Commits | Time: 2023-11-14 13:37:53 UTC
+  Text: The releases/gcc-13 branch has been updated by jeevitha <jeevitha@gcc.gnu.org>:https://gcc.gnu.org/g:4b1f59c1c1ca9bc24fbf7dbfce81a99153b3a933commitr13-8064-g4b1f59c1c1ca9bc24fbf7dbfce81a99153b3a933Author: Jeevitha <jeevitha@linux.ibm.com>
+Date:   Thu Aug 31 05:40:18 2023 -0500
+
+    rs6000: Don't allow AltiVec address in movoo & movxo pattern [PR110411]
+    
+    There are no instructions that do traditional AltiVec addresses (i.e.
+    with the low four bits of the address masked off) for OOmode and XOmode
+    objects. The solution is to modify the constraints used in the movoo and
+    movxo pattern to disallow these types of addresses, which assists LRA in
+    resolving this issue. Furthermore, the mode size 16 check has been
+    removed in vsx_quad_dform_memory_operand to allow OOmode and XOmode, and
+    quad_address_p already handles less than size 16.
+    
+    2023-08-31  Jeevitha Palanisamy  <jeevitha@linux.ibm.com>
+    
+    gcc/PR target/110411* config/rs6000/mma.md (define_insn_and_split movoo): Disallow
+            AltiVec address operands.
+            (define_insn_and_split movxo): Likewise.
+            * config/rs6000/predicates.md (vsx_quad_dform_memory_operand): Remove
+            redundant mode size check.
+    
+    gcc/testsuite/PR target/110411* gcc.target/powerpc/pr110411-1.c: New testcase.
+            * gcc.target/powerpc/pr110411-2.c: New testcase.
+    
+    (cherry picked from commit 9ea1248604d7b65009af32103814332f35bd33e2)
+
+- User: GCC Commits | Time: 2024-02-27 07:03:49 UTC
+  Text: The releases/gcc-12 branch has been updated by jeevitha <jeevitha@gcc.gnu.org>:https://gcc.gnu.org/g:e8c1c2b6c220bc3518c11e11af5a8c6ca1cdf7e8commitr12-10181-ge8c1c2b6c220bc3518c11e11af5a8c6ca1cdf7e8Author: Jeevitha <jeevitha@linux.ibm.com>
+Date:   Thu Aug 31 05:40:18 2023 -0500
+
+    rs6000: Don't allow AltiVec address in movoo & movxo pattern [PR110411]
+    
+    There are no instructions that do traditional AltiVec addresses (i.e.
+    with the low four bits of the address masked off) for OOmode and XOmode
+    objects. The solution is to modify the constraints used in the movoo and
+    movxo pattern to disallow these types of addresses, which assists LRA in
+    resolving this issue. Furthermore, the mode size 16 check has been
+    removed in vsx_quad_dform_memory_operand to allow OOmode and XOmode, and
+    quad_address_p already handles less than size 16.
+    
+    2023-08-31  Jeevitha Palanisamy  <jeevitha@linux.ibm.com>
+    
+    gcc/PR target/110411* config/rs6000/mma.md (define_insn_and_split movoo): Disallow
+            AltiVec address operands.
+            (define_insn_and_split movxo): Likewise.
+            * config/rs6000/predicates.md (vsx_quad_dform_memory_operand): Remove
+            redundant mode size check.
+    
+    gcc/testsuite/PR target/110411* gcc.target/powerpc/pr110411-1.c: New testcase.
+            * gcc.target/powerpc/pr110411-2.c: New testcase.
+    
+    (cherry picked from commit 9ea1248604d7b65009af32103814332f35bd33e2)
+
+- User: GCC Commits | Time: 2024-02-27 08:51:48 UTC
+  Text: The releases/gcc-11 branch has been updated by jeevitha <jeevitha@gcc.gnu.org>:https://gcc.gnu.org/g:41af48a1750635a72c48a5809e713d9dd14d9655commitr11-11257-g41af48a1750635a72c48a5809e713d9dd14d9655Author: Jeevitha <jeevitha@linux.ibm.com>
+Date:   Thu Aug 31 05:40:18 2023 -0500
+
+    rs6000: Don't allow AltiVec address in movoo & movxo pattern [PR110411]
+    
+    There are no instructions that do traditional AltiVec addresses (i.e.
+    with the low four bits of the address masked off) for OOmode and XOmode
+    objects. The solution is to modify the constraints used in the movoo and
+    movxo pattern to disallow these types of addresses, which assists LRA in
+    resolving this issue. Furthermore, the mode size 16 check has been
+    removed in vsx_quad_dform_memory_operand to allow OOmode and XOmode, and
+    quad_address_p already handles less than size 16.
+    
+    2023-08-31  Jeevitha Palanisamy  <jeevitha@linux.ibm.com>
+    
+    gcc/PR target/110411* config/rs6000/mma.md (define_insn_and_split movoo): Disallow
+            AltiVec address operands.
+            (define_insn_and_split movxo): Likewise.
+            * config/rs6000/predicates.md (vsx_quad_dform_memory_operand): Remove
+            redundant mode size check.
+    
+    gcc/testsuite/PR target/110411* gcc.target/powerpc/pr110411-1.c: New testcase.
+            * gcc.target/powerpc/pr110411-2.c: New testcase.
+    
+    (cherry picked from commit 9ea1248604d7b65009af32103814332f35bd33e2)
+
+- User: Jeevitha | Time: 2024-02-27 15:29:42 UTC
+  Text: Fixed
+

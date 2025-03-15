@@ -1,0 +1,117 @@
+Bug Summary: [15 Regression] rv64gcv ICE: segfault during GIMPLE pass: vect
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, needs-bisection
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-07-16 20:48:12 UTC
+  Text: Testcase:
+int a;
+_Bool b[307];
+int main() {
+  unsigned c = 40;
+  for (unsigned char e = 0; e < 0307; e += 9729)
+    a *= (b[e] ? 40713359501991 : 0) >= c;
+}
+
+Command/backtrace:> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc red.c -O3 -march=rv64gcvduring GIMPLE pass: vect
+red.c: In function 'main':
+red.c:3:5: internal compiler error: Segmentation fault
+    3 | int main() {
+      |     ^~~~
+0x2dc5285 internal_error(char const*, ...)
+        ../../../gcc/gcc/diagnostic-global-context.cc:491
+0x137f503 crash_signal
+        ../../../gcc/gcc/toplev.cc:319
+0x745f6dc4251f ???
+        ./signal/../sysdeps/unix/sysv/linux/x86_64/libc_sigaction.c:0
+0x1670e87 vect_create_epilog_for_reduction
+        ../../../gcc/gcc/tree-vect-loop.cc:6084
+0x16742e9 vectorizable_live_operation(vec_info*, _stmt_vec_info*, _slp_tree*, _slp_instance*, int, bool, vec<stmt_info_for_cost, va_heap, vl_ptr>*)
+        ../../../gcc/gcc/tree-vect-loop.cc:10900
+0x161e6cd can_vectorize_live_stmts
+        ../../../gcc/gcc/tree-vect-stmts.cc:13102
+0x16517ff vect_transform_stmt(vec_info*, _stmt_vec_info*, gimple_stmt_iterator*, _slp_tree*, _slp_instance*)
+        ../../../gcc/gcc/tree-vect-stmts.cc:13522
+0x169dd4d vect_schedule_slp_node
+        ../../../gcc/gcc/tree-vect-slp.cc:9884
+0x16b4c25 vect_schedule_slp_node
+        ../../../gcc/gcc/tree-vect-slp.cc:9671
+0x16b4c25 vect_schedule_scc
+        ../../../gcc/gcc/tree-vect-slp.cc:10174
+0x16b5d07 vect_schedule_slp(vec_info*, vec<_slp_instance*, va_heap, vl_ptr> const&)
+        ../../../gcc/gcc/tree-vect-slp.cc:10267
+0x167ff04 vect_transform_loop(_loop_vec_info*, gimple*)
+        ../../../gcc/gcc/tree-vect-loop.cc:12151
+0x16c6aa1 vect_transform_loops
+        ../../../gcc/gcc/tree-vectorizer.cc:1007
+0x16c7213 try_vectorize_loop_1
+        ../../../gcc/gcc/tree-vectorizer.cc:1153
+0x16c7213 try_vectorize_loop
+        ../../../gcc/gcc/tree-vectorizer.cc:1183
+0x16c789c execute
+        ../../../gcc/gcc/tree-vectorizer.cc:1299
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+Godbolt:https://godbolt.org/z/PcfxKhr11Found via fuzzer.
+
+- User: Andrew Pinski | Time: 2024-07-16 21:11:49 UTC
+  Text: Confirmed. Cleaned up testcase:
+```
+int a;
+_Bool *b;
+void f() {
+  int t = a;
+  for (int e = 0; e < 2048; e ++)
+  {
+    if (!b[e])
+      t = 0;
+  }
+  a = t;
+}
+```
+
+- User: Richard Biener | Time: 2024-07-17 09:34:12 UTC
+  Text: I will have a look,
+
+(gdb) p debug (cond_node)
+t.c:3:6: note: node (constant) 0x5a76f60 (max_nunits=1, refcnt=1) vector(4) unsigned char
+t.c:3:6: note:  { 0 }
+
+not sure how this happened, it seems STMT_VINFO_REDUC_IDX got "off".
+
+t.c:3:6: note: node 0x5a76e30 (max_nunits=4, refcnt=2) vector(4) int
+t.c:3:6: note: op template: patt_31 = _4 != 0 ? t_14 : 0;
+t.c:3:6: note:  [l] stmt 0 patt_31 = _4 != 0 ? t_14 : 0;
+t.c:3:6: note:  children 0x5a76ec8 0x5a76f60 0x5a76ff8 0x5a77090
+
+The stmts reduc_idx is 1 which is OK.  Ah, but we have four children
+for this frankenstein COND_EXPR which still has a GENERIC first operand.
+Partial transitions haunt us here ...
+
+- User: GCC Commits | Time: 2024-07-17 11:19:56 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:24689b84b8ec0c74c2b9a72ec4fb467069806bdacommitr15-2093-g24689b84b8ec0c74c2b9a72ec4fb467069806bdaAuthor: Richard Biener <rguenther@suse.de>
+Date:   Wed Jul 17 11:42:13 2024 +0200
+
+    tree-optimization/115959 - ICE with SLP condition reduction
+    
+    The following fixes how during reduction epilogue generation we
+    gather conditional compares for condition reductions, thereby
+    following the reduction chain via STMT_VINFO_REDUC_IDX.  The issue
+    is that SLP nodes for COND_EXPRs can have either three or four
+    children dependent on whether we have legacy GENERIC expressions
+    in the transitional pattern GIMPLE for the COND_EXPR condition.PR tree-optimization/115959* tree-vect-loop.cc (vect_create_epilog_for_reduction):
+            Get at the REDUC_IDX child in a safer way for COND_EXPR
+            nodes.
+    
+            * gcc.dg/vect/pr115959.c: New testcase.
+
+- User: Richard Biener | Time: 2024-07-17 11:20:10 UTC
+  Text: Fixed.
+

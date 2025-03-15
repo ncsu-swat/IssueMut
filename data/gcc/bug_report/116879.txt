@@ -1,0 +1,155 @@
+Bug Summary: [14 Regression] ICE on valid code at -O2 with "-ftree-vectorize -fallow-store-data-races -fno-tree-ch -ftree-loop-distribution" on x86_64-linux-gnu: verify_ssa failed
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-checking, ice-on-valid-code, needs-bisection
+Known to Work: 13.1.0, 13.3.0, 15.0
+Known to Fail: 14.1.0, 14.2.0
+
+Comments:
+- User: Zhendong Su | Time: 2024-09-28 20:20:04 UTC
+  Text: Compiler Explorer:https://godbolt.org/z/xjrGMhMqM[658] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240928 (experimental) (GCC) 
+[659] % 
+[659] % gcctk -O2 small.c; ./a.out
+[660] % 
+[660] % gcctk -O2 -ftree-vectorize -fallow-store-data-races -fno-tree-ch -ftree-loop-distribution small.c
+small.c: In function ‘main’:
+small.c:3:5: error: definition in block 4 does not dominate use in block 8
+    3 | int main() {
+      |     ^~~~
+for SSA_NAME: .MEM_12 in statement:
+.MEM_3 = PHI <.MEM_12(8)>
+PHI argument
+.MEM_12
+for PHI node
+.MEM_3 = PHI <.MEM_12(8)>
+during GIMPLE pass: vect
+small.c:3:5: internal compiler error: verify_ssa failed
+0x25e55a5 internal_error(char const*, ...)
+        ../../gcc-trunk/gcc/diagnostic-global-context.cc:517
+0x1452a3e verify_ssa(bool, bool)
+        ../../gcc-trunk/gcc/tree-ssa.cc:1203
+0x107e515 execute_function_todo
+        ../../gcc-trunk/gcc/passes.cc:2108
+0x107edbe execute_todo
+        ../../gcc-trunk/gcc/passes.cc:2155
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+[661] % 
+[661] % cat small.c
+static int b;
+int *a, c, *d = &c;
+int main() {
+  int e = 0;
+  for (; e < 8; e = (char)(e + 1)) {
+    int *f = &b, g[8], h = 0;
+    for (; h < 8; h++)
+      g[h] = 0;
+    --*f != (*d = g[0] || a);
+  }
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2024-09-28 21:28:21 UTC
+  Text: Confirmed. Fails in GCC 14.x too with -fchecking.
+
+- User: Richard Biener | Time: 2024-09-30 11:21:28 UTC
+  Text: Mine.  The first correct PHI is created by slpeel_tree_duplicate_loop_to_edge_cfg here:
+
+      /* For the main loop exit preserve the LC PHI nodes.  For vectorization
+         we need them to continue or finalize reductions.  Since we do not
+         copy the loop exit blocks we have to materialize PHIs at the
+         new destination before redirecting edges.  */
+      for (auto gsi_from = gsi_start_phis (loop_exit->dest);
+           !gsi_end_p (gsi_from); gsi_next (&gsi_from))
+        {
+          tree res = gimple_phi_result (*gsi_from);
+          create_phi_node (copy_ssa_name (res), new_preheader);
+
+and the 2nd broken one later by
+
+                  tree new_res = copy_ssa_name (gimple_phi_result (from_phi));
+                  gphi *lcssa_phi = create_phi_node (new_res, new_preheader);
+                  SET_PHI_ARG_DEF_ON_EDGE (lcssa_phi, loop_exit, new_arg);
+                  adjust_phi_and_debug_stmts (to_phi, loop_entry, new_res);
+
+where the issue is I think that we have a stray virtual PHI in the loop
+and if-conversion doesn't do anything to this loop but we accept it now
+with code in the "latch" where the latch now consists of two blocks.
+
+When we want to support general uncounted loops we probably have to merge
+some of the multi/single-edge handling code in peeling again.
+
+I'll fix this up in vect_analyze_loop_form now and for GCC 14.
+
+- User: Richard Biener | Time: 2024-09-30 11:37:25 UTC
+  Text: I'll note it is loop distribution that leaves around the forwarder which
+CFG cleanup is not able to remove (because it has a PHI, pass_merge_phi would).
+We might want to enhance CFG cleanup to handle the case of a single incoming
+edge to SRC and a DEST without PHIs (we can then simply move the PHIs without
+any problem).
+
+  <bb 8> [local count: 134202633]:
+  # .MEM_13 = PHI <.MEM_52(20), .MEM_12(7)>
+  # b_lsm.5_23 = PHI <b_lsm.5_24(20), _2(7)>
+  # ivtmp_15 = PHI <9(20), ivtmp_30(7)>
+  ivtmp_30 = ivtmp_15 - 1;
+  if (ivtmp_30 != 0)
+    goto <bb 4>; [88.89%]
+  else
+    goto <bb 9>; [11.11%]
+
+
+  <bb 4> [local count: 1073741823]:
+  # .MEM_12 = PHI <.MEM_13(8)>
+  _2 = b_lsm.5_23 + -1;
+
+  <bb 7> [local count: 119292720]:
+  goto <bb 8>;
+
+- User: GCC Commits | Time: 2024-09-30 14:20:04 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:18e905b461a7138185cf4f0efde4a4e1214fb798commitr15-3960-g18e905b461a7138185cf4f0efde4a4e1214fb798Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Sep 30 13:38:28 2024 +0200
+
+    tree-optimization/116879 - failure to recognize non-empty latch
+    
+    When we relaxed the vectorizers constraint on loop structure verifying
+    the emptiness of the latch became too lose as can be seen in the case
+    forPR116879where the latch effectively contains two basic-blocks
+    which one being an unmerged forwarder that's not empty.PR tree-optimization/116879* tree-vect-loop.cc (vect_analyze_loop_form): Scan all
+            blocks that form the latch.
+    
+            * gcc.dg/pr116879.c: New testcase.
+
+- User: Richard Biener | Time: 2024-09-30 14:20:29 UTC
+  Text: Fixed on trunk sofar.
+
+- User: GCC Commits | Time: 2024-10-13 10:42:57 UTC
+  Text: The releases/gcc-14 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:ae4b9dcff314644d8d6660b7d8649a4911cb88f8commitr14-10776-gae4b9dcff314644d8d6660b7d8649a4911cb88f8Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Sep 30 13:38:28 2024 +0200
+
+    tree-optimization/116879 - failure to recognize non-empty latch
+    
+    When we relaxed the vectorizers constraint on loop structure verifying
+    the emptiness of the latch became too lose as can be seen in the case
+    forPR116879where the latch effectively contains two basic-blocks
+    which one being an unmerged forwarder that's not empty.PR tree-optimization/116879* tree-vect-loop.cc (vect_analyze_loop_form): Scan all
+            blocks that form the latch.
+    
+            * gcc.dg/pr116879.c: New testcase.
+    
+    (cherry picked from commit 18e905b461a7138185cf4f0efde4a4e1214fb798)
+
+- User: Richard Biener | Time: 2024-10-13 10:53:53 UTC
+  Text: Fixed.
+

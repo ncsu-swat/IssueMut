@@ -1,0 +1,261 @@
+Bug Summary: [13 Regression] error: ‘bit_field_ref’ of non-mode-precision operand
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2023-02-06 19:50:32 UTC
+  Text: For this C code:
+
+union {
+  signed f1 : 7;
+  signed f2 : 2
+} func_6_l_2225;
+g_139, g_417, func_6___trans_tmp_7;
+main() {
+  for (; g_417; g_417 -= 1) {
+    func_6_l_2225.f1 = g_139;
+    func_6_l_2225.f2 ^= func_6___trans_tmp_7;
+  }
+}
+
+Compiled by recent gcc, does this:
+
+$ ~/gcc/results/bin/gcc -c -O2 -wbug882.cbug882.c: In function ‘main’:bug882.c:6:1: error: ‘bit_field_ref’ of non-mode-precision operand
+    6 | main() {
+      | ^~~~
+_ifc__31 = BIT_FIELD_REF <_2, 2, 0>;
+during GIMPLE pass: ifcvtbug882.c:6:1: internal compiler error: verify_gimple failed
+
+$ ~/gcc/results/bin/gcc -v 2>&1 | fgrep exp
+gcc version 13.0.1 20230206 (experimental) (45e01229af33a3dc) 
+$
+
+The bug first seems to occur sometime between date 20221002
+and 20221028.
+
+- User: Andrew Pinski | Time: 2023-02-06 19:54:59 UTC
+  Text: Most likelyr13-3219-g25413fdb2ac2493321
+
+- User: Andrew Pinski | Time: 2023-02-06 20:16:33 UTC
+  Text: From:
+  func_6_l_2225.f1 = _2;
+  _3 = func_6_l_2225.f2;
+  _4 = (signed char) _3;
+  _7 = _4 ^ _6;
+  _8 = (<unnamed-signed:2>) _7;
+  func_6_l_2225.f2 = _8;
+
+To:
+
+  _ifc__34 = func_6_l_2225.D.2741;
+  _ifc__35 = BIT_INSERT_EXPR <_ifc__34, _2, 0 (7 bits)>;
+  _ifc__31 = BIT_FIELD_REF <_2, 2, 0>;
+  _4 = (signed char) _ifc__31;
+  _7 = _4 ^ _6;
+  _8 = (<unnamed-signed:2>) _7;
+  _ifc__33 = BIT_INSERT_EXPR <_ifc__35, _8, 0 (2 bits)>;
+  func_6_l_2225.D.2742 = _ifc__33;
+
+Yes it is trying to use the type of "func_6_l_2225.f1" as the insert point rather than a full byte sized.
+
+Confirmed.
+
+- User: Jakub Jelinek | Time: 2023-02-08 11:49:02 UTC
+  Text: Slightly cleaned up:
+
+union U { signed int d : 7; signed int e : 2; } u;
+int a, b;
+
+void
+foo (void)
+{
+  for (int i = 0; i < 64; i++)
+    {
+      u.d = a;
+      u.e ^= b;
+    }
+}
+
+Yes, indeed started withr13-3219-g25413fdb2ac2493321.
+
+- User: Jakub Jelinek | Time: 2023-02-08 12:15:32 UTC
+  Text: I think the bug is in the match.pd
+/* Simplify a bit extraction from a bit insertion for the cases with
+   the inserted element fully covering the extraction or the insertion
+   not touching the extraction.  */
+(simplify
+ (BIT_FIELD_REF (bit_insert @0 @1 @ipos) @rsize @rpos)
+ (with
+  {
+    unsigned HOST_WIDE_INT isize;
+    if (INTEGRAL_TYPE_P (TREE_TYPE (@1)))
+      isize = TYPE_PRECISION (TREE_TYPE (@1));
+    else
+      isize = tree_to_uhwi (TYPE_SIZE (TREE_TYPE (@1)));
+  }
+  (switch
+   (if (wi::leu_p (wi::to_wide (@ipos), wi::to_wide (@rpos))
+        && wi::leu_p (wi::to_wide (@rpos) + wi::to_wide (@rsize),
+                      wi::to_wide (@ipos) + isize))
+    (BIT_FIELD_REF @1 @rsize { wide_int_to_tree (bitsizetype,
+                                                 wi::to_wide (@rpos)
+                                                 - wi::to_wide (@ipos)); }))
+   (if (wi::geu_p (wi::to_wide (@ipos),
+                   wi::to_wide (@rpos) + wi::to_wide (@rsize))
+        || wi::geu_p (wi::to_wide (@rpos),
+                      wi::to_wide (@ipos) + isize))
+    (BIT_FIELD_REF @0 @rsize @rpos)))))
+which folds
+  _ifc__35 = BIT_INSERT_EXPR <_ifc__34, _2, 0 (7 bits)>;
+  _ifc__31 = BIT_FIELD_REF <_ifc__35, 2, 0>;
+where 34/35 have unsigned char type, 31 signed:2 and 2 signed:7.
+
+So, in this case it wants to extract low 2 bits out of the 7 bits _2 which is invalid
+because _2 doesn't have mode precision.  If it tried to extract 7 bits out of it, we have:
+(simplify
+ (BIT_FIELD_REF @0 @1 integer_zerop)
+ (if (tree_int_cst_equal (@1, TYPE_SIZE (TREE_TYPE (@0))))
+  (view_convert @0)))
+simplification but that one wouldn't trigger, because those signed:2 types have TYPE_SIZE 8 rather than 7, only TYPE_PRECISION of 7.
+
+- User: Andrew Pinski | Time: 2023-02-08 12:18:56 UTC
+  Text: Oh I might have a fix for this already just didn't have a testcase for the upstream compiler at the time.
+
+- User: Jakub Jelinek | Time: 2023-02-08 12:41:52 UTC
+  Text: (In reply to Andrew Pinski fromcomment #5)> Oh I might have a fix for this already just didn't have a testcase for the
+> upstream compiler at the time.Note, it is just the first case from the above because @0 already ought to be guaranteed to have mode precision because BIT_INSERT_EXPR requires it too.
+On the other side, we should for the first case differentiate between @1 has mode precision, then we can do what we do right now, or when isize == rsize and
+rpos == ipos (then we can just simplify to possibly casted @1) and finally otherwise, IMHO we should just punt.
+
+- User: Andrew Pinski | Time: 2023-02-08 16:26:50 UTC
+  Text: I did mention about this exact match.pd pattern issue inbug 88739 comment #63, I have a slightly simplified patch from that one referenced there too.
+
+- User: Andrew Pinski | Time: 2023-02-08 16:40:45 UTC
+  Text: Createdattachment 54433[details]Patch which I had around and will be testing
+
+I had this patch around while I was working on full bitfield lowering.
+
+- User: Andrew Pinski | Time: 2023-02-08 21:15:19 UTC
+  Text: Patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2023-February/611594.html
+
+- User: GCC Commits | Time: 2023-02-09 15:07:09 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:44f308e59bfa0f93ae05b17e257d8563c12399fdcommitr13-5757-g44f308e59bfa0f93ae05b17e257d8563c12399fdAuthor: Andrew Pinski <apinski@marvell.com>
+Date:   Thu Feb 9 16:03:54 2023 +0100
+
+    match.pd: When simplifying BFR of an insert, require a mode precision integral type [PR108688]
+    
+    The same problem asPR 88739has crept in but
+    this time in match.pd when simplifying bit_field_ref of
+    an bit_insert. That is we are generating a BIT_FIELD_REF
+    of a non-mode-precision integral type.PR tree-optimization/108688* match.pd (bit_field_ref [bit_insert]): Avoid generating
+            BIT_FIELD_REFs of non-mode-precision integral operands.
+    
+            * gcc.c-torture/compile/pr108688-1.c: New test.
+
+- User: GCC Commits | Time: 2023-02-09 15:11:43 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:bcca64d70ce91e29717fb70cff252639df6902becommitr13-5758-gbcca64d70ce91e29717fb70cff252639df6902beAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Feb 9 16:07:40 2023 +0100
+
+    match.pd: Simplify BFR of insert when extracting exactly all inserted bits [PR108688]
+    
+    On Thu, Feb 09, 2023 at 09:16:17AM +0100, Richard Biener via Gcc-patches wrote:
+    > Hmm.  Can we handle the case of the extraction exactly covering the
+    > insertion separately then and simplify to plain @1?
+    
+    I was suggesting that in the PR.  Here it is as an incremental patch
+    on top of Andrew's patch.
+    
+    On the newly added testcase the ifcvt-folding difference without/with the
+    incremental patch is:
+    ---pr108688.c.171t.ifcvt_      2023-02-09 10:47:30.169916845 +0100
+    +++pr108688.c.171t.ifcvt       2023-02-09 10:48:44.942793453 +0100
+    @@ -25,6 +25,8 @@ Number of blocks in CFG: 11
+     Number of blocks to update: 5 ( 45%)
+    
+    +Applying pattern match.pd:7487, gimple-match.cc:243200
+    +Applying pattern match.pd:3987, gimple-match.cc:75423
+     Matching expression match.pd:1677, gimple-match.cc:209
+     Applying pattern match.pd:1733, gimple-match.cc:109481
+     Matching expression match.pd:2393, gimple-match.cc:852
+    @@ -70,7 +72,6 @@ void foo ()
+       signed char _29;
+       <unnamed-signed:7> _30;
+       unsigned int ivtmp_33;
+    -  <unnamed-signed:7> _ifc__35;
+       unsigned char _ifc__37;
+       unsigned char _ifc__38;
+       unsigned char _ifc__39;
+    @@ -91,8 +92,7 @@ void foo ()
+       _2 = (<unnamed-signed:7>) a.0_1;
+       _ifc__38 = u.D.2741;
+       _ifc__39 = BIT_INSERT_EXPR <_ifc__38, _2, 0 (7 bits)>;
+    -  _ifc__35 = BIT_FIELD_REF <_ifc__39, 7, 0>;
+    -  _4 = (signed char) _ifc__35;
+    +  _4 = (signed char) _2;
+       b.1_5 = b;
+       _6 = (signed char) b.1_5;
+       _7 = _4 ^ _6;
+    
+    2023-02-09  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/108688* match.pd (bit_field_ref [bit_insert]): Simplify BIT_FIELD_REF
+            of BIT_INSERT_EXPR extracting exactly all inserted bits even
+            when without mode precision.  Formatting fixes.
+    
+            * gcc.c-torture/compile/pr108688-1.c: Add PR number as comment.
+            * gcc.dg/pr108688.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-02-09 15:15:40 UTC
+  Text: Should be fixed now.
+
+- User: GCC Commits | Time: 2023-02-10 17:46:47 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:a5453c659bce698d80f5aebdab5ab0eba39b1ed6commitr12-9153-ga5453c659bce698d80f5aebdab5ab0eba39b1ed6Author: Andrew Pinski <apinski@marvell.com>
+Date:   Thu Feb 9 16:03:54 2023 +0100
+
+    match.pd: When simplifying BFR of an insert, require a mode precision integral type [PR108688]
+    
+    The same problem asPR 88739has crept in but
+    this time in match.pd when simplifying bit_field_ref of
+    an bit_insert. That is we are generating a BIT_FIELD_REF
+    of a non-mode-precision integral type.PR tree-optimization/108688* match.pd (bit_field_ref [bit_insert]): Avoid generating
+            BIT_FIELD_REFs of non-mode-precision integral operands.
+    
+            * gcc.c-torture/compile/pr108688-1.c: New test.
+    
+    (cherry picked from commit 44f308e59bfa0f93ae05b17e257d8563c12399fd)
+
+- User: GCC Commits | Time: 2023-05-02 20:14:35 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d87adfe1a6455025eb3ae787a6da245a62cdb446commitr11-10710-gd87adfe1a6455025eb3ae787a6da245a62cdb446Author: Andrew Pinski <apinski@marvell.com>
+Date:   Thu Feb 9 16:03:54 2023 +0100
+
+    match.pd: When simplifying BFR of an insert, require a mode precision integral type [PR108688]
+    
+    The same problem asPR 88739has crept in but
+    this time in match.pd when simplifying bit_field_ref of
+    an bit_insert. That is we are generating a BIT_FIELD_REF
+    of a non-mode-precision integral type.PR tree-optimization/108688* match.pd (bit_field_ref [bit_insert]): Avoid generating
+            BIT_FIELD_REFs of non-mode-precision integral operands.
+    
+            * gcc.c-torture/compile/pr108688-1.c: New test.
+    
+    (cherry picked from commit 44f308e59bfa0f93ae05b17e257d8563c12399fd)
+
+- User: GCC Commits | Time: 2023-05-03 15:21:25 UTC
+  Text: The releases/gcc-10 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:0200ac49e6281fd86ad391b539a4f564ca44e397commitr10-11364-g0200ac49e6281fd86ad391b539a4f564ca44e397Author: Andrew Pinski <apinski@marvell.com>
+Date:   Thu Feb 9 16:03:54 2023 +0100
+
+    match.pd: When simplifying BFR of an insert, require a mode precision integral type [PR108688]
+    
+    The same problem asPR 88739has crept in but
+    this time in match.pd when simplifying bit_field_ref of
+    an bit_insert. That is we are generating a BIT_FIELD_REF
+    of a non-mode-precision integral type.PR tree-optimization/108688* match.pd (bit_field_ref [bit_insert]): Avoid generating
+            BIT_FIELD_REFs of non-mode-precision integral operands.
+    
+            * gcc.c-torture/compile/pr108688-1.c: New test.
+    
+    (cherry picked from commit 44f308e59bfa0f93ae05b17e257d8563c12399fd)
+

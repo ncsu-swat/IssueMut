@@ -1,0 +1,118 @@
+Bug Summary: [13 Regression] -Wanalyzer-use-of-uninitialized-value false positive seen in haproxy's sink_rotate_file_backed_ring
+Product: gcc
+Component: analyzer
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Malcolm | Time: 2023-02-03 18:25:46 UTC
+  Text: Consider:
+
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+struct ring
+{
+    char buf[1024];
+};
+
+int test (const char *name)
+{
+	struct ring ring;
+	int fd;
+	int ret;
+
+	fd = open(name, O_RDONLY);
+	if (fd < 0)
+		return 0;
+
+	ret = read(fd, &ring, sizeof(ring));
+	close(fd);
+
+	if (ret != sizeof(ring))
+        	return 1;
+
+	if (ring.buf[0] > 1)
+        	return 2;
+    return 3;
+}
+
+Currently trunk emits this false positive:
+
+<source>: In function 'test':
+<source>:26:21: warning: use of uninitialized value 'ring.buf[0]' [CWE-457] [-Wanalyzer-use-of-uninitialized-value]
+   26 |         if (ring.buf[0] > 1)
+      |             ~~~~~~~~^~~
+  'test': events 1-6
+    |
+    |   12 |         struct ring ring;
+    |      |                     ^~~~
+    |      |                     |
+    |      |                     (1) region created on stack here
+    |......
+    |   17 |         if (fd < 0)
+    |      |            ~         
+    |      |            |
+    |      |            (2) following 'false' branch (when 'fd >= 0')...
+    |......
+    |   20 |         ret = read(fd, &ring, sizeof(ring));
+    |      |               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    |      |               |
+    |      |               (3) ...to here
+    |......
+    |   23 |         if (ret != sizeof(ring))
+    |      |            ~         
+    |      |            |
+    |      |            (4) following 'false' branch (when 'ret == 1024')...
+    |......
+    |   26 |         if (ring.buf[0] > 1)
+    |      |             ~~~~~~~~~~~
+    |      |                     |
+    |      |                     (5) ...to here
+    |      |                     (6) use of uninitialized value 'ring.buf[0]' here
+    |
+Compiler returned: 0https://godbolt.org/z/3sMhxej6PLooks like the analyzer might not "know" that when "read" returns the input size, that the buffer is fully populated.
+
+- User: David Malcolm | Time: 2023-02-03 18:27:06 UTC
+  Text: Seems to be a regression relative to 12.2
+
+- User: GCC Commits | Time: 2023-02-07 21:11:29 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:c300e251f5b22d15b126f3c643cd55a119994e48commitr13-5733-gc300e251f5b22d15b126f3c643cd55a119994e48Author: David Malcolm <dmalcolm@redhat.com>
+Date:   Tue Feb 7 16:10:20 2023 -0500
+
+    analyzer: fix -Wanalyzer-use-of-uninitialized-value false +ve on "read" [PR108661]
+    
+    My integration testing shows many false positives from
+    -Wanalyzer-use-of-uninitialized-value.
+    
+    One cause turns out to be that as ofr13-1404-g97baacba963c06fd_state_machine::on_stmt recognizes calls to "read", and returns true,
+    so that region_model::on_call_post doesn't call handle_unrecognized_call
+    on them, and so the analyzer erroneously "thinks" that the buffer
+    pointed to by "read" is never touched by the "read" call.
+    
+    This works for "fread" because sm-file.cc implements kf_fread, which
+    handles calls to "fread" by clobbering the buffer pointed to.  In the
+    long term we should probably be smarter about this and bifurcate the
+    analysis to consider e.g. errors vs full reads vs partial reads, etc
+    (which I'm tracking inPR analyzer/108689).
+    
+    In the meantime, this patch adds a kf_read for "read" analogous to the
+    one for "fread", fixing 6 false positives seen in git-2.39.0 and
+    2 in haproxy-2.7.1.
+    
+    gcc/analyzer/ChangeLog:PR analyzer/108661* sm-fd.cc (class kf_read): New.
+            (register_known_fd_functions): Register "read".
+            * sm-file.cc (class kf_fread): Update comment.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/108661* gcc.dg/analyzer/fread-pr108661.c: New test.
+            * gcc.dg/analyzer/read-pr108661.c: New test.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2023-02-07 21:25:32 UTC
+  Text: Should be fixed by the above commit.
+

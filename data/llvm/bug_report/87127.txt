@@ -1,0 +1,73 @@
+Issue Title: [RISCV] Relocation truncated to fit with -O0 on very large functions.
+Original Post: clang -O0 implicitly passes -mrelax-all. This causes the MC layer to relax all jumps to the longest form possible. Except we don't convert uncompressed relative jumps to indirect since that requires a temporary register.
+
+The CodeGen layer carefully measured the function size and relaxed any branches and unconditional branches that it needed to, but it is not aware of the relaxation the MC layer is going to do for -mrelax-all.
+
+If the function is sufficiently large, relaxing the branches in the MC layer may cause some unconditional jump to go out of range leading to a linking failure.
+
+I believe the branch relaxation was added to the MC layer to make things easier for programmers writing handwritten assembly so they didn't have to worry about the small offset of conditional branches. Maybe we should disable it when assembling CodeGen output?
+
+cc: @preames @MaskRay @jrtc27 @kito-cheng @asb 
+
+Comment by llvmbot: 
+@llvm/issue-subscribers-clang-driver
+
+Author: Craig Topper (topperc)
+
+<details>
+clang -O0 implicitly passes -mno-relax-all. This causes the MC layer to relax all jumps to the longest form possible. Except we don't convert uncompressed relative jumps to indirect since that requires a temporary register.
+
+The CodeGen layer carefully measured the function size and relaxed any branches and unconditional branches that it needed to, but it is not aware of the relaxation the MC layer is going to do for -mrelax-all.
+
+If the function is sufficiently large, relaxing the branches in the MC layer may cause some unconditional jump to go out of range leading to a linking failure.
+
+I believe the branch relaxation was added to the MC layer to make things easier for programmers writing handwritten assembly so they didn't have to worry about the small offset of conditional branches. Maybe we should disable it when assembling CodeGen output?
+
+cc: @<!-- -->preames @<!-- -->MaskRay @<!-- -->jrtc27 @<!-- -->kito-cheng @<!-- -->asb 
+</details>
+
+Comment by topperc: Oh but disabling branch relaxation for compilation may expose that BranchRelaxation doesn't know how RISC-V inserts NOPs to align basic blocks or loops. I have a bug in my internal database, but it doesn't say if we had previously observed a failure from it.
+Comment by asb: > I believe the branch relaxation was added to the MC layer to make things easier for programmers writing handwritten assembly so they didn't have to worry about the small offset of conditional branches.
+
+Yes, but IIRC the overriding justification is because GNU has this behaviour so if we fail to support it we risk not being able to handle handwritten assembly that was written with `gas` in mind.
+
+> Maybe we should disable it when assembling CodeGen output?
+
+We'd still have issues if someone compiled at -O0 and used `-save-temps` or otherwise emitted a .s first wouldn't we?
+
+Could we not have getInstSizeInBytes return an appropriately large value for branches if `-mrelax-all` is set (obviously more plumbing may be needed to make this queryable)?
+Comment by topperc: > > I believe the branch relaxation was added to the MC layer to make things easier for programmers writing handwritten assembly so they didn't have to worry about the small offset of conditional branches.
+> 
+> Yes, but IIRC the overriding justification is because GNU has this behaviour so if we fail to support it we risk not being able to handle handwritten assembly that was written with `gas` in mind.
+
+Yeah I'm not proposing removing it for assembly.
+
+> 
+> > Maybe we should disable it when assembling CodeGen output?
+> 
+> We'd still have issues if someone compiled at -O0 and used `-save-temps` or otherwise emitted a .s first wouldn't we?
+
+The -O0 -mrelax-all behavior doesn't apply when assembling a .s file.
+
+Someone pointed me to this patch that proposed removing the -O0 -mrelax-all behavior years ago https://reviews.llvm.org/D21830
+Comment by topperc: > Could we not have getInstSizeInBytes return an appropriately large value for branches if -mrelax-all is set (obviously more plumbing may be needed to make this queryable)?
+
+I'm not sure this would work. When BranchRelaxation relaxes a conditional branch, it inverts the condition and creates a very short branch over an unconditional jump. That very short branch is still subject to relaxation by the MC layer which will invert it again and create another unconditional jump.
+Comment by topperc: Passing `-mllvm -riscv-asm-relax-branches=false` causes linker errors like `relocation R_RISCV_RVC_BRANCH out of range: 414 is not in [-256, 255]; references '.LBB2_58'`
+
+So we are dependent on some of the MC layer relaxation in addition to the BranchRelaxation pass.
+Comment by MaskRay: To summarize the issue: there is a code size regression for -O0 after https://reviews.llvm.org/D108961, e.g. `blt` is replaced with `bge; b` even when it is unnecessary.
+
+I do hope that GNU assembler will provide a way to turn off the magic relaxation.
+
+> Except we don't convert uncompressed relative jumps to indirect since that requires a temporary register.
+
+This kinda looks more like a self-inflicted problem:(
+
+---
+
+-O0 implying -mrelax-all is weird on its own.
+binutils doesn't seem to do this.
+https://reviews.llvm.org/D21830 wanted to drop this behavior, but did not get review / or author lost interest.
+
+#88538 will opt RISC-V out of the undesired behavior. It LGTM.

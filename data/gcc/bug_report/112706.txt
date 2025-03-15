@@ -1,0 +1,145 @@
+Bug Summary: missed simplification in FRE
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jan Hubicka | Time: 2023-11-24 19:52:34 UTC
+  Text: Compiling the following testcase (simplified from repeated std::vector::push_back expansion):
+
+int *ptr;
+void link_error ();
+void
+test ()
+{
+
+        int *ptr1 = ptr + 10;
+        int *ptr2 = ptr + 20;
+        if (ptr1 == ptr2)
+                link_error ();
+}
+
+with gcc -O2 t.C -fdump-tree-all-details
+one can check that link_error is optimized away really late:
+
+jh@ryzen4:/tmp> grep link_error a-t.C*
+....
+a-t.C.106t.cunrolli:  link_error ();
+a-t.C.107t.backprop:  link_error ();
+a-t.C.108t.phiprop:  link_error ();
+a-t.C.109t.forwprop2:link_error ();
+
+this is too late for some optimization to catch up (in the case of std::vector we end up missing DSE since the transform is delayed to forwprop3)
+
+I think this is something value numbering should catch.
+
+- User: Andrew Pinski | Time: 2023-11-24 19:58:46 UTC
+  Text: This should have been even folded during CCP1.
+
+```
+/* For equality and subtraction, this is also true with wrapping overflow.  */
+(for op (eq ne minus)
+ (simplify
+  (op (plus:c @0 @2) (plus:c @1 @2))
+  (if (ANY_INTEGRAL_TYPE_P (TREE_TYPE (@0))
+       && (TYPE_OVERFLOW_UNDEFINED (TREE_TYPE (@0))
+	   || TYPE_OVERFLOW_WRAPS (TREE_TYPE (@0))))
+   (op @0 @1))))
+```
+
+Should be extended for PointerPlus or done for it.
+
+That is:
+```
+(for op  (eq ne)
+ (simplify
+  (op (pointer_plus @0 @1) (pointer_plus @0 @2))
+  (op @1 @2))
+
+```
+
+That should fix it during CCP1 (and fre).
+
+- User: Andrew Pinski | Time: 2023-11-24 21:36:50 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> That is:
+> ```
+> (for op  (eq ne)
+>  (simplify
+>   (op (pointer_plus @0 @1) (pointer_plus @0 @2))
+>   (op @1 @2))
+> 
+> ```Note I am missing a extra `)` but then I Noticed in the full testcase (that is located inhttps://gcc.gnu.org/pipermail/gcc-patches/2023-November/638130.html) which was originally reported we still end up with:
+```
+  _76 = _71 + 4;
+  # .MEM_154 = VDEF <.MEM_153>
+  x_3(D)->D.25942._M_implD.25172.D.25249._M_finishD.25175 = _76;
+  # .MEM_7 = VDEF <.MEM_154>
+  D.26033 = 0;
+  # .MEM_157 = VDEF <.MEM_7>
+  *_76 = 0;
+  # PT = nonlocal escaped 
+  _82 = _71 + 8;
+  # .MEM_158 = VDEF <.MEM_157>
+  x_3(D)->D.25942._M_implD.25172.D.25249._M_finishD.25175 = _82;
+  # .MEM_8 = VDEF <.MEM_158>
+  D.26033 ={v} {CLOBBER(eol)};
+  # .MEM_9 = VDEF <.MEM_8>
+  D.26034 = 0;
+  if (_66 != _82)
+```
+After pre (note the first comparison is gone but not the second one and maybe a 3rd). So this patch helps but it looks like a PRE/VN improvement is still needed to fix the others.
+
+- User: Jan Hubicka | Time: 2023-11-24 21:52:39 UTC
+  Text: Thanks, new pattern looks like noticeable improvement :)
+Base+offset is effective for alias analysis and I suppose it happens
+reasonably enough for compares as well.>   _76 = _71 + 4;
+>   # .MEM_154 = VDEF <.MEM_153>
+>   x_3(D)->D.25942._M_implD.25172.D.25249._M_finishD.25175 = _76;
+>   # .MEM_7 = VDEF <.MEM_154>
+>   D.26033 = 0;
+>   # .MEM_157 = VDEF <.MEM_7>
+>   *_76 = 0;
+>   # PT = nonlocal escaped 
+>   _82 = _71 + 8;
+>   # .MEM_158 = VDEF <.MEM_157>
+>   x_3(D)->D.25942._M_implD.25172.D.25249._M_finishD.25175 = _82;
+>   # .MEM_8 = VDEF <.MEM_158>
+>   D.26033 ={v} {CLOBBER(eol)};
+>   # .MEM_9 = VDEF <.MEM_8>
+>   D.26034 = 0;
+>   if (_66 != _82)
+> ```
+> After pre (note the first comparison is gone but not the second one and maybe a
+> 3rd). So this patch helps but it looks like a PRE/VN improvement is still
+> needed to fix the others.I think it is missing predication in VN. At each execution of CCP or VN
+we work out one conditional to be true, but we stil account both paths
+for the value number of the pointer used in next compare.
+
+If vector used base+size pair instead of base+endptr VRP would help
+here, but we can't vrp finish-start range...
+
+- User: Richard Biener | Time: 2023-11-27 08:03:07 UTC
+  Text: I will have a look.
+
+- User: Richard Biener | Time: 2023-11-27 08:43:28 UTC
+  Text: As Andrew says (forwprop builds trees and feeds it fold-const.cc which eventually gets it).
+
+- User: GCC Commits | Time: 2023-11-27 09:43:51 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:d9abaa8d58f5729925b1db735d4723a9ea825eaacommitr14-5872-gd9abaa8d58f5729925b1db735d4723a9ea825eaaAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Nov 27 09:45:04 2023 +0100
+
+    tree-optimization/112706 - missed simplification of condition
+    
+    We lack a match.pd pattern recognizing ptr + o ==/!= ptr + o'.
+    The following extends handling we have for integral types to
+    pointers.PR tree-optimization/112706* match.pd (ptr + o ==/!=/- ptr + o'): New patterns.
+    
+            * gcc.dg/tree-ssa/pr112706.c: New testcase.
+
+- User: Richard Biener | Time: 2023-11-27 09:44:17 UTC
+  Text: Fixed.
+

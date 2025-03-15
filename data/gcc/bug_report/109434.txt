@@ -1,0 +1,101 @@
+Bug Summary: [12 Regression] std::optional weird -Wmaybe-uninitialized and behaviour with -O2
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: diagnostic, wrong-code
+Known to Work: 10.1.0, 11.1.0, 12.2.1, 13.0
+Known to Fail: 12.1.0, 12.2.0
+
+Comments:
+- User: Tomáš Pecka | Time: 2023-04-06 11:32:10 UTC
+  Text: Createdattachment 54816[details]reproducer
+
+Hello,
+
+I've seen a compile warning on a code (see attachment) that looks bogus. 
+
+  In file included from optional.cpp:2:
+  In member function ‘constexpr bool std::_Optional_base_impl<_Tp, _Dp>::_M_is_engaged() const [with _Tp = int; _Dp = std::_Optional_base<int, true, true>]’,
+      inlined from ‘constexpr bool std::optional<_Tp>::has_value() const [with _Tp = int]’ at /usr/include/c++/12.2.1/optional:988:35,
+      inlined from ‘int main()’ at optional.cpp:21:63:
+  /usr/include/c++/12.2.1/optional:471:58: warning: ‘*(unsigned char*)((char*)&optInt + offsetof(std::optional<int>,std::optional<int>::<unnamed>.std::_Optional_base<int, true, true>::_M_payload.std::_Optional_payload<int, true, true, true>::<unnamed>.std::_Optional_payload_base<int>::_M_engaged))’ may be used uninitialized [-Wmaybe-uninitialized]
+    471 |       { return static_cast<const _Dp*>(this)->_M_payload._M_engaged; }
+        |                                                          ^~~~~~~~~~
+  optional.cpp: In function ‘int main()’:
+  optional.cpp:15:24: note: ‘*(unsigned char*)((char*)&optInt + offsetof(std::optional<int>,std::optional<int>::<unnamed>.std::_Optional_base<int, true,   true>::_M_payload.std::_Optional_payload<int, true, true, true>::<unnamed>.std::_Optional_payload_base<int>::_M_engaged))’ was declared here
+     15 |     std::optional<int> optInt;
+        |                        ^~~~~~
+
+The warning is present only when compiling with -Wall -O2. When I run the executable, I see unexpected weird output, e.g.
+
+  catch 56
+  val=72704.000000
+
+which look like some uninitialized variable is really there. When run under valgrind, I see reports about unitialized variables.
+
+Code seems to be working correctly when compiled with -O1 or lower and the executable seem to be behaving expectedly as well.
+Compiling and executing under clang++ works as well regardless of the optimization level. 
+I don't have older versions of g++ (< 12) but compiling the attached code on godbolt with g++ 11 and lower does not trigger any warning.
+
+Interesting part is that declaring optDbl as std::optional<int> makes the code behave correctly.
+
+- User: Andrew Pinski | Time: 2023-04-06 11:52:08 UTC
+  Text: DSE2 removes the original store:
+
+  optInt = {};
+  optInt = foo ();
+
+
+  Deleted dead store: optInt = {};
+
+Even though foo can throw ...
+
+Confirmed.
+
+- User: Richard Biener | Time: 2023-04-11 12:41:22 UTC
+  Text: Hmm, we did fix such an issue already .. let me take a look.
+
+- User: Richard Biener | Time: 2023-04-11 12:55:48 UTC
+  Text: So the issue is that clear_bytes_written_by doesn't handle exceptions properly
+and that's thru initialize_ao_ref_for_dse.
+
+- User: GCC Commits | Time: 2023-04-12 06:49:27 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:6e3e708dbadaae7b504af7fc4410015624793f02commitr13-7143-g6e3e708dbadaae7b504af7fc4410015624793f02Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Apr 11 15:06:59 2023 +0200
+
+    tree-optimization/109434 - bogus DSE of throwing call LHS
+    
+    The byte tracking of call LHS didn't properly handle possibly
+    throwing calls correctly which cases bogus DSE and in turn, for the
+    testcase a bogus uninit diagnostic and (unreliable) wrong-code.PR tree-optimization/109434* tree-ssa-dse.cc (initialize_ao_ref_for_dse): Properly
+            handle possibly throwing calls when processing the LHS
+            and may-defs are not OK.
+    
+            * g++.dg/opt/pr109434.C: New testcase.
+
+- User: Richard Biener | Time: 2023-04-12 06:52:38 UTC
+  Text: Fixed on trunk sofar.
+
+- User: Tomáš Pecka | Time: 2023-04-13 07:44:37 UTC
+  Text: I can confirm that the bug now does not appear in our application code that I simplified into attached code. Tested on commit df7f55cb2ae.
+Thank you!
+
+- User: GCC Commits | Time: 2023-04-17 10:45:09 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:3d2210dafd872e8470e2a6ae5eea74d2669bc055commitr12-9415-g3d2210dafd872e8470e2a6ae5eea74d2669bc055Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Apr 11 15:06:59 2023 +0200
+
+    tree-optimization/109434 - bogus DSE of throwing call LHS
+    
+    The byte tracking of call LHS didn't properly handle possibly
+    throwing calls correctly which cases bogus DSE and in turn, for the
+    testcase a bogus uninit diagnostic and (unreliable) wrong-code.PR tree-optimization/109434* tree-ssa-dse.cc (initialize_ao_ref_for_dse): Properly
+            handle possibly throwing calls when processing the LHS
+            and may-defs are not OK.  Add mode to initialize a may-def.
+            (dse_optimize_stmt): Query may-defs.
+    
+            * g++.dg/opt/pr109434.C: New testcase.
+
+- User: Richard Biener | Time: 2023-04-17 10:47:15 UTC
+  Text: Fixed.
+

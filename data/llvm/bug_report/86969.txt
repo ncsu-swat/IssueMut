@@ -1,0 +1,150 @@
+Issue Title: [analyzer] Many duplicated ArrayBoundV2 reports
+Original Post: Recently I had a look at the diff what a clang-18 upgrade would bring, and it turns out we have some inflation in terms of ArrayBoundV2 bug reports.
+
+ When I looked at the cases, I started wondering how useful the new "duplicates" are, and I think they are not too relevant.
+Here is an example to illustrate the case:
+https://godbolt.org/z/jozGzj9zv
+```c++
+[[noreturn]] void myabort(); 
+
+int rng();
+int getIndex() {
+  switch (rng()) {
+    case 1: return -152;
+    case 2: return -160;
+    case 3: return -168;
+    default: myabort();
+  }
+}
+
+void top(char *p, int n) {
+  char arr[100];
+  p = arr;
+  while (rng()) {
+    p[getIndex()] = 10; // 3 warnings: Out of bound access to memory preceding 'arr'
+  }
+}
+```
+
+I've seen the pattern multiple times, that we have an expression for which we raise the same exact issue, but with a different index in the note. I'd argue that fixing one of these would fix the rest too, thus raising this multiple times for different indexes is questionable.
+
+This isn't an issue that I see frequently, but I think the "uniqueing location" is for solving this/similar situations.
+
+@NagyDonat Have you seen patterns like this? Do you agree that we should unique these reports?
+
+Comment by llvmbot: 
+@llvm/issue-subscribers-clang-static-analyzer
+
+Author: Balazs Benics (steakhal)
+
+<details>
+Recently I had a look at the diff what a clang-18 upgrade would bring, and it turns out we have some inflation in terms of ArrayBoundV2 bug reports.
+
+ When I looked at the cases, I started wondering how useful the new "duplicates" are, and I think they are not too relevant.
+Here is an example to illustrate the case:
+
+```c++
+[[noreturn]] void myabort(); 
+
+int rng();
+int getIndex() {
+  switch (rng()) {
+    case 1: return -152;
+    case 2: return -160;
+    case 3: return -168;
+    default: myabort();
+  }
+}
+
+void top(char *p, int n) {
+  char arr[100];
+  p = arr;
+  while (rng()) {
+    p[getIndex()] = 10; // 3 warnings: Out of bound access to memory preceding 'arr'
+  }
+}
+```
+
+I've seen the pattern multiple times, that we have an expression for which we raise the same exact issue, but with a different index in the note. I'd argue that fixing one of these would fix the rest too, thus raising this multiple times for different indexes is questionable.
+
+This isn't an issue that I see frequently, but I think the "uniqueing location" is for solving this/similar situations.
+
+@<!-- -->NagyDonat Have you seen patterns like this? Do you agree that we should unique these reports?
+</details>
+
+Comment by NagyDonat: Good question, I'm summarizing my immediate thoughts below (feel free to continue the discussion if you feel that I didn't cover something or you have other ideas).
+
+The difficulty is that in the individual reports the analyzer will show concrete details (e.g. reports the concrete index in notes) that are specific to that particular report. (As a wild guess I'd say that the report numbers are inflated now because the checker reports more details and the previously identical "out of bounds access here" reports became distinct.)
+
+I feel that in the path-sensitive paradigm the "natural" behavior is to report these findings separately. Merging/discarding findings with a uniqueing location is a "dirty" operation: it handles the finalized report as immutable objects and makes the remaining reports inaccurate in the sense that they'll emphasize specific details that are not representative for the whole merged group.
+
+This could lead to ugly whack-a-mole situations in certain cases when e.g. there are many bug paths that all produce out-of-bounds access in the same location (e.g. the element access method of a custom vector class) -- the checker reports just a single bug, the user whacks it, the checker reports a second bug etc.
+
+Adding a uniqueing location could have been the "least evil" solution if this issue produced truly unacceptable amounts of spam, but IMO it's still an "evil" solution that hides and obfuscates the true behavior of the checker, so I'd prefer to avoid implementing it.
+
+By the way, I think that in your concrete example the "right" (and very difficult) solution would've been that we recognize that these three branches of the exploded graph just differ in the value of one single location and unify them into a single branch where the value is symbolic with three potential values.
+
+Implementing this would be prohibitively complex in the current architecture where `nonloc::ConcreteInt` is completely separated from a `nonloc::SymbolVal` with a few possible values, but if concrete integers were symbolic values with an 1-element range, then we could perform a check that merges sibling branches where the states only differ in constraints about one single symbol. There would be difficulties even in that case (e.g. bug path visitors don't understand state merges and they would still report inaccurate things), so this is a "nice to think about, won't be implemented" remark.
+Comment by steakhal: WDYT @haoNoQ and @Xazax-hun ?
+Comment by Xazax-hun: This is a tough question. On one hand we do not want to flood our users with duplicate warnings, on the other hand, if we happen to pick the wrong representative (that happens to be on an infeasible path) after the uniqueing process, the user might dismiss a legitimate error. 
+
+I think this might be a UI problem. I wish we had a UI that would show warnings like these grouped. That being said, I think the same problem could happen with other existing checks, like memory leaks. We just pick one of the paths where the memory was leaked, and it might be an infeasible path. So, existing practice in the analyzer seems to suggest that we prefer to do the uniqueing. This makes me slightly biased towards that for the sake of consistency.
+Comment by haoNoQ: I'm actually surprised that we fail to deduplicate these. I thought we're already supposed to deduplicate by warning text, not by last-path-note text.
+Comment by NagyDonat: We _do_ deduplicate by warning text, but my commits made the warning text more detailed (in particular, it reports the wrong index if it's concrete), so these warnings are no longer unified.
+
+If we want to restore the deduplication, we'd need to either
+- restore the old vague messages,
+- write a complex "merge messages" algorithm or
+- accept that the report "families" are represented by an arbitrary member with a too-specific error message.
+Comment by steakhal: To me it sounds like we shouldn't need to "generalize" messages once they were made specific to the bug by adding more context.
+
+I don't see significant problem with only showing one deterministic "arbitrary" representative of warnings of the same kind, for pretty much the same issue for the same location.
+We could always prefer shorter path reports of such a group.
+Comment by NagyDonat: I agree with @haoNoQ that:
+> I think this might be a UI problem. I wish we had a UI that would show warnings like these grouped.
+
+Deduplication (keep one and discard the rest) is a good solution when the reports are completely equivalent and the duplication is only caused by technical details. If the reports are similar, but not identical (each of them provides some new information), then the core/backend should return them all and the frontend/UI layers should handle them as an collapsible/expandable group.
+
+I could accept something like `--agressively-deduplicate` or `--discard-similar-reports` that reduces these groups to a single element (for situations where there isn't a separate frontend or it doesn't support grouped display). However, I think this should be off-by-default, because the "silently discard similar reports" behavior is counter-intuitive and hard to notice; while "too many similar reports" is a visible situation that can be handled by activating a flag (if the UI is not good enough to provide a "best of both" solution).
+Comment by steakhal: > I could accept something like `--agressively-deduplicate` or `--discard-similar-reports` that reduces these groups to a single element (for situations where there isn't a separate frontend or it doesn't support grouped display). However, I think this should be off-by-default, because the "silently discard similar reports" behavior is counter-intuitive and hard to notice; while "too many similar reports" is a visible situation that can be handled by activating a flag (if the UI is not good enough to provide a "best of both" solution).
+
+Alright. The flag sounds right.
+Comment by NagyDonat: Now that I re-read this issue after two weeks, I feel that its priority is relatively low compared to other problems of ArrayBoundV2. (You write that "This isn't an issue that I see frequently" and even when this appears, the superfluous reports are not FPs but only somewhat redundant copies.)
+
+I'll keep this issue in mind and there is a chance that I'll resolve it especially if I feel that this is more widespread (e.g. analogous issues appear with other checkers); but right now there are many other plans where I feel that my work would be more impactful.
+
+OTOH if somebody else is interested in implementing this "group similar reports and discard all but one of them" flag, then I'd be happy to help with code review.
+Comment by steakhal: > Now that I re-read this issue after two weeks, I feel that its priority is relatively low compared to other problems of ArrayBoundV2. (You write that "This isn't an issue that I see frequently" and even when this appears, the superfluous reports are not FPs but only somewhat redundant copies.)
+> 
+> I'll keep this issue in mind and there is a chance that I'll resolve it especially if I feel that this is more widespread (e.g. analogous issues appear with other checkers); but right now there are many other plans where I feel that my work would be more impactful.
+> 
+> OTOH if somebody else is interested in implementing this "group similar reports and discard all but one of them" flag, then I'd be happy to help with code review.
+
+Makes sense.
+It doesn't affect us directly because we decided to postpone upgrading the OOBv2 (by basically taking a copy and using that from clang-17) because we had issues. We also have a patch for the `BitwiseShiftChecker` to not apply the shift post-conditions, because that caused 8x slowdowns on different workloads when using Z3 refutation.
+The easiest was to split these from the upgrade and deal with them later.
+
+Because of this, this isn't an issue for now. I don't want to push this burden on you, we will fix this downstream and if we have some time we may push a PR.
+I'm happy that we agreed on a solution. That's good enough for me.
+Comment by steakhal: Now that we are done with the upgrade, we did extensive evaluation of the changes, and it appears that in many cases the reports improve but they are frequently duplicated. At times, while in the past we had 1 report, now we have 78. Other times, 1 report is replaced by 36 new one, clearly corresponding to the same issue - but only differing in the simulated index we reach the bug.
+
+I still find this a serious problem w.r.t. this checker. I may come back proposing a patch fixing this later.
+I just wanted to reopen this discussion as I spent some time looking at the effects.
+Comment by NagyDonat: Ok, I will investigate this more thoroughly. When you first opened this issue I was dismissive (I thought that it's just a natural consequence of the intended checker behavior), but ~ a month ago I recalled this for some reason and realized that it *is* suspicious somehow.
+Comment by NagyDonat: I thought about this issue and I think I can resolve it. My rough plan is that:
+1. I will introduce `ArrayBoundBugReport` as a subclass of `PathSensitiveBugReport` which has a custom `Profile` method and ensures that these very similar reports are sorted into the same report equivalence class.
+2. I'll add a noop-by-default virtual method `selectedAsRepresentative()` to the base class `BugReport` and ensure that it is called when a certain bug report is selected as the representative of a bug report equivalence class.
+3. Define `ArrayBoundBugReport::selectedAsRepresentative()` to
+   - remove the specific negative byte offset value from the long message of the bug report, which looks like "Access of <region> at negative byte offset -123" (because different bug reports will have different numbers, so the "representative" cannot represent them all in this aspect)
+   - add a note like "this issue is also reached through 77 other code paths".
+
+This way we can display the exact (and potentially helpful) information in the common case when the report doesn't have "clones", but we don't display inaccurate (too specific) information in the case when we have to summarize a family of similar (but not identical) reports.
+
+I think I can implement this in a reasonably generic way that can be potentially reused in other checkers that may produce similar issues in the future.
+
+@steakhal What do you think about this?
+Comment by NagyDonat: By the way is this issue limited to negative offsets, or did you see similar with positive offsets/indices as well?
+Comment by NagyDonat: Actually, I ended up with creating a very simple commit that just avoids printing the offset value: https://github.com/llvm/llvm-project/pull/98621
+
+It is definitely possible to implement the trickier solution that examines the bug reports in the equivalence class (and I think there are lots of opportunities in this area for further improvements), but I felt that in this particular case it's better to just simplify the diagnostic and don't print this detail.
+Comment by steakhal: Closed by https://github.com/llvm/llvm-project/commit/2bc38dc30bc9baad610925d7e90e724a9d09ee7d

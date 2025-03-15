@@ -1,0 +1,438 @@
+Issue Title: [OMPT] `ompt_callback_target_data_op_emi` does not pass allocated pointer in callback
+Original Post: ## Description
+
+Recently, LLVM has added parts of the target callbacks of the OMPT interface. During tests, I found a regression compared to the implementation previously found in ROCm and aomp.
+
+The callback `ompt_callback_target_data_op` is called when memory is allocated on a selected target device. 
+The `optype` matches `ompt_target_data_alloc`. We get the number of bytes allocated, but do not receive the allocated pointer both during `ompt_scope_begin` or `ompt_scope_end` in the `_emi` callbacks. Instead, both pointers have a value of 0 when using `omp_target_alloc`. When using `#pragma omp target enter data map([...])` the field `src_addr` is set to the host pointer, but we still do not get the device pointer. The pointer is correctly set on data operations and during the delete operation. 
+
+It's worth noting that the OpenMP specifications do not specifically state that those pointers need to be passed to the callbacks. 
+However, without those pointers, tools have a hard time tracking memory allocations correctly, only knowing the amount of memory.
+
+Other runtimes (NVHPC, ROCm) solve this issue by passing the allocated pointer during `ompt_target_data_alloc` with `endpoint = ompt_scope_end` 
+
+_Note:_ The callback `ompt_callback_target_data_op` also doesn't pass the pointer to the tools interface. However, since the callback is dispatched before the actual allocation I wouldn't necessarily consider this as an issue. ROCm and aomp have dispatched the callbacks the same way. Only NVHPC somehow knows the allocated pointer already and passes it in both cases.
+
+## Reproducer
+
+The following code can be used to reproduce the issue. The OMPT interface was mostly copied from an aomp smoke test with small changes to prevent the tool to abort on `omp_target_alloc`. 
+
+```c
+#include <omp.h>
+#include <stdio.h>
+#include <assert.h>
+
+// Tool related code below
+#include <omp-tools.h>
+
+// From openmp/runtime/test/ompt/callback.h
+#define register_ompt_callback_t(name, type)                                   \
+  do {                                                                         \
+    type f_##name = &on_##name;                                                \
+    if (ompt_set_callback(name, (ompt_callback_t)f_##name) == ompt_set_never)  \
+      printf("0: Could not register callback '" #name "'\n");                  \
+  } while (0)
+
+#define register_ompt_callback(name) register_ompt_callback_t(name, name##_t)
+
+ompt_id_t  next_op_id = 0x8000000000000001;
+
+// OMPT entry point handles
+static ompt_set_callback_t ompt_set_callback = 0;
+
+// OMPT callbacks
+
+// Synchronous callbacks
+static void on_ompt_callback_device_initialize
+        (
+                int device_num,
+                const char *type,
+                ompt_device_t *device,
+                ompt_function_lookup_t lookup,
+                const char *documentation
+        ) {
+    printf("Callback Init: device_num=%d type=%s device=%p lookup=%p doc=%p\n",
+           device_num, type, device, lookup, documentation);
+}
+
+static void on_ompt_callback_device_finalize
+        (
+                int device_num
+        ) {
+    printf("Callback Fini: device_num=%d\n", device_num);
+}
+
+static void on_ompt_callback_device_load
+        (
+                int device_num,
+                const char *filename,
+                int64_t offset_in_file,
+                void *vma_in_file,
+                size_t bytes,
+                void *host_addr,
+                void *device_addr,
+                uint64_t module_id
+        ) {
+    printf("Callback Load: device_num:%d filename:%s host_adddr:%p device_addr:%p bytes:%lu\n",
+           device_num, filename, host_addr, device_addr, bytes);
+}
+
+
+static void on_ompt_callback_target_data_op_emi
+        (
+                ompt_scope_endpoint_t endpoint,
+                ompt_data_t *target_task_data,
+                ompt_data_t *target_data,
+                ompt_id_t *host_op_id,
+                ompt_target_data_op_t optype,
+                void *src_addr,
+                int src_device_num,
+                void *dest_addr,
+                int dest_device_num,
+                size_t bytes,
+                const void *codeptr_ra
+        ) {
+    assert(codeptr_ra != 0);
+    // Both src and dest must not be null
+    if (endpoint == ompt_scope_begin) *host_op_id = next_op_id++;
+    printf("  Callback DataOp EMI: endpoint=%d optype=%d target_task_data=%p (0x%lx) target_data=%p (0x%lx) host_op_id=%p (0x%lx) src=%p src_device_num=%d "
+           "dest=%p dest_device_num=%d bytes=%lu code=%p\n",
+           endpoint, optype,
+           target_task_data, target_task_data ? target_task_data->value : 0,
+           target_data, target_data ? target_data->value : 0,
+           host_op_id, *host_op_id,
+           src_addr, src_device_num,
+           dest_addr, dest_device_num, bytes, codeptr_ra);
+}
+
+
+static void on_ompt_callback_target_emi
+        (
+                ompt_target_t kind,
+                ompt_scope_endpoint_t endpoint,
+                int device_num,
+                ompt_data_t *task_data,
+                ompt_data_t *target_task_data,
+                ompt_data_t *target_data,
+                const void *codeptr_ra
+        ) {
+    assert(codeptr_ra != 0);
+    if (endpoint == ompt_scope_begin) target_data->value = next_op_id++;
+    printf("Callback Target EMI: kind=%d endpoint=%d device_num=%d task_data=%p (0x%lx) target_task_data=%p (0x%lx) target_data=%p (0x%lx) code=%p\n",
+           kind, endpoint, device_num,
+           task_data, task_data->value,
+           target_task_data, target_task_data->value,
+           target_data, target_data->value,
+           codeptr_ra);
+}
+
+static void on_ompt_callback_target_submit_emi
+        (
+                ompt_scope_endpoint_t endpoint,
+                ompt_data_t *target_data,
+                ompt_id_t *host_op_id,
+                unsigned int requested_num_teams
+        ) {
+    printf("  Callback Submit EMI: endpoint=%d  req_num_teams=%d target_data=%p (0x%lx) host_op_id=%p (0x%lx)\n",
+           endpoint, requested_num_teams,
+           target_data, target_data->value,
+           host_op_id, *host_op_id);
+}
+
+// Init functions
+int ompt_initialize(
+        ompt_function_lookup_t lookup,
+        int initial_device_num,
+        ompt_data_t *tool_data)
+{
+    ompt_set_callback = (ompt_set_callback_t) lookup("ompt_set_callback");
+
+    if (!ompt_set_callback) return 0; // failed
+
+    register_ompt_callback(ompt_callback_device_initialize);
+    register_ompt_callback(ompt_callback_device_finalize);
+    register_ompt_callback(ompt_callback_device_load);
+    register_ompt_callback(ompt_callback_target_data_op_emi);
+    register_ompt_callback(ompt_callback_target_emi);
+    register_ompt_callback(ompt_callback_target_submit_emi);
+
+    return 1; //success
+}
+
+void ompt_finalize(ompt_data_t *tool_data)
+{
+}
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+ompt_start_tool_result_t *ompt_start_tool(
+        unsigned int omp_version,
+        const char *runtime_version)
+{
+    static ompt_start_tool_result_t ompt_start_tool_result = {&ompt_initialize,&ompt_finalize, 0};
+    return &ompt_start_tool_result;
+}
+#ifdef __cplusplus
+}
+#endif
+
+/* Main program */
+int main(void)
+{
+    int *dev_ptr = omp_target_alloc(sizeof(int), 0);
+#pragma omp target
+    {
+        printf("dev_ptr on device 0 = %p\n", dev_ptr);
+    }
+    omp_target_free(dev_ptr, 0);
+
+    int host_arr[1];
+    printf("host_arr on host = %p\n", host_arr);
+#pragma omp target enter data map(to : host_arr[ : 1])
+#pragma omp target
+    {
+        printf("host_arr on device 0 = %p\n", host_arr);
+    }
+#pragma omp target exit data map(from : host_arr[ : 1])
+    return 0;
+}
+```
+
+Running the tool with Clang, we see the following output:
+```console
+$ clang --version 
+clang version 18.0.0 (https://github.com/llvm/llvm-project.git 52ac71f92d38f75df5cb88e9c090ac5fd5a71548)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/software/software/LLVM/git/bin
+$ clang -fopenmp -fopenmp-targets=nvptx64 -g -O3 reproducer.c
+$ ./a.out
+Callback Init: device_num=0 type=sm_75 device=0x55e06fd314b0 lookup=0x7fea9e79bd60 doc=(nil)
+  Callback DataOp EMI: endpoint=1 optype=1 target_task_data=(nil) (0x0) target_data=0x7fea9e62a7a8 (0x0) host_op_id=0x7fea9e62a7c0 (0x8000000000000001) src=(nil) src_device_num=1 dest=(nil) dest_device_num=0 bytes=4 code=0x7fea9e6ae7d3
+  Callback DataOp EMI: endpoint=2 optype=1 target_task_data=(nil) (0x0) target_data=0x7fea9e62a7a8 (0x0) host_op_id=0x7fea9e62a7c0 (0x8000000000000001) src=(nil) src_device_num=1 dest=(nil) dest_device_num=0 bytes=4 code=0x7fea9e6ae7d3
+Callback Load: device_num:0 filename:(null) host_adddr:0x55e06fc6b778 device_addr:(nil) bytes:20856
+Callback Target EMI: kind=1 endpoint=1 device_num=0 task_data=0x55e06fcee540 (0x0) target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000002) code=0x55e06fc6a5ed
+  Callback Submit EMI: endpoint=1  req_num_teams=1 target_data=0x7fea9e62a7a8 (0x8000000000000002) host_op_id=0x7fea9e62a7a0 (0x0)
+  Callback Submit EMI: endpoint=2  req_num_teams=1 target_data=0x7fea9e62a7a8 (0x8000000000000002) host_op_id=0x7fea9e62a7a0 (0x0)
+dev_ptr on device 0 = 0x7fea6fa00000
+Callback Target EMI: kind=1 endpoint=2 device_num=0 task_data=0x55e06fcee540 (0x0) target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000002) code=0x55e06fc6a5ed
+  Callback DataOp EMI: endpoint=1 optype=4 target_task_data=(nil) (0x0) target_data=0x7fea9e62a7a8 (0x0) host_op_id=0x7fea9e62a7c0 (0x8000000000000003) src=0x7fea6fa00000 src_device_num=0 dest=(nil) dest_device_num=-1 bytes=0 code=0x7fea9e6ae8ac
+  Callback DataOp EMI: endpoint=2 optype=4 target_task_data=(nil) (0x0) target_data=0x7fea9e62a7a8 (0x0) host_op_id=0x7fea9e62a7c0 (0x8000000000000003) src=0x7fea6fa00000 src_device_num=0 dest=(nil) dest_device_num=-1 bytes=0 code=0x7fea9e6ae8ac
+host_arr on host = 0x7ffc7204474c
+Callback Target EMI: kind=2 endpoint=1 device_num=-1 task_data=0x55e06fcee540 (0x0) target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000004) code=0x55e06fc6a66f
+  Callback DataOp EMI: endpoint=1 optype=1 target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000004) host_op_id=0x7fea9e62a7c0 (0x8000000000000005) src=0x7ffc7204474c src_device_num=1 dest=(nil) dest_device_num=0 bytes=4 code=0x7fea9e6a63a3
+  Callback DataOp EMI: endpoint=2 optype=1 target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000004) host_op_id=0x7fea9e62a7c0 (0x8000000000000005) src=0x7ffc7204474c src_device_num=1 dest=(nil) dest_device_num=0 bytes=4 code=0x7fea9e6a63a3
+  Callback DataOp EMI: endpoint=1 optype=2 target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000004) host_op_id=0x7fea9e62a7c0 (0x8000000000000006) src=0x7ffc7204474c src_device_num=1 dest=0x7fea6fa00000 dest_device_num=0 bytes=4 code=0x7fea9e6a631e
+  Callback DataOp EMI: endpoint=2 optype=2 target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000004) host_op_id=0x7fea9e62a7c0 (0x8000000000000006) src=0x7ffc7204474c src_device_num=1 dest=0x7fea6fa00000 dest_device_num=0 bytes=4 code=0x7fea9e6a631e
+Callback Target EMI: kind=2 endpoint=2 device_num=-1 task_data=0x55e06fcee540 (0x0) target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000004) code=0x55e06fc6a66f
+Callback Target EMI: kind=1 endpoint=1 device_num=0 task_data=0x55e06fcee540 (0x0) target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000007) code=0x55e06fc6a70f
+  Callback Submit EMI: endpoint=1  req_num_teams=1 target_data=0x7fea9e62a7a8 (0x8000000000000007) host_op_id=0x7fea9e62a7a0 (0x0)
+  Callback Submit EMI: endpoint=2  req_num_teams=1 target_data=0x7fea9e62a7a8 (0x8000000000000007) host_op_id=0x7fea9e62a7a0 (0x0)
+host_arr on device 0 = 0x7fea6fa00000
+Callback Target EMI: kind=1 endpoint=2 device_num=0 task_data=0x55e06fcee540 (0x0) target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000007) code=0x55e06fc6a70f
+Callback Target EMI: kind=3 endpoint=1 device_num=-1 task_data=0x55e06fcee540 (0x0) target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000008) code=0x55e06fc6a770
+  Callback DataOp EMI: endpoint=1 optype=3 target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000008) host_op_id=0x7fea9e62a7c0 (0x8000000000000009) src=0x7fea6fa00000 src_device_num=0 dest=0x7ffc7204474c dest_device_num=1 bytes=4 code=0x7fea9e6afd7f
+  Callback DataOp EMI: endpoint=2 optype=3 target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000008) host_op_id=0x7fea9e62a7c0 (0x8000000000000009) src=0x7fea6fa00000 src_device_num=0 dest=0x7ffc7204474c dest_device_num=1 bytes=4 code=0x7fea9e6afd7f
+  Callback DataOp EMI: endpoint=1 optype=4 target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000008) host_op_id=0x7fea9e62a7c0 (0x800000000000000a) src=0x7fea6fa00000 src_device_num=0 dest=(nil) dest_device_num=-1 bytes=0 code=0x7fea9e6a775a
+  Callback DataOp EMI: endpoint=2 optype=4 target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000008) host_op_id=0x7fea9e62a7c0 (0x800000000000000a) src=0x7fea6fa00000 src_device_num=0 dest=(nil) dest_device_num=-1 bytes=0 code=0x7fea9e6a775a
+Callback Target EMI: kind=3 endpoint=2 device_num=-1 task_data=0x55e06fcee540 (0x0) target_task_data=0x55e06fd17818 (0x0) target_data=0x7fea9e62a7a8 (0x8000000000000008) code=0x55e06fc6a770
+Callback Fini: device_num=0
+```
+
+Notice that the field `dest` stays `(nil)` for the whole allocation process. This isn't the case with other runtimes:
+
+**ROCm 5.6:**
+```console
+$ amdclang --version
+AMD clang version 16.0.0 (https://github.com/RadeonOpenCompute/llvm-project roc-5.6.0 23243be997b2f3651a41597d7a41441fff8ade4ac59ac)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/rocm-5.6.0/llvm/bin
+$ amdclang -fopenmp -fopenmp-targets=amdgcn-amd-amdhsa -Xopenmp-target=amdgcn-amd-amdhsa -march=gfx90a reproducer.c
+$ ./a.out
+Callback Init: device_num=0 type=AMD gfx90a device=0x6f2110 lookup=0x149ffb94b370 doc=(nil)
+  Callback DataOp EMI: endpoint=1 optype=1 target_task_data=(nil) (0x0) target_data=0x149ffbb277b8 (0x0) host_op_id=0x149ffbb27760 (0x8000000000000001) src=(nil) src_device_num=8 dest=(nil) dest_device_num=0 bytes=4 code=0x149ffc1135fe
+  Callback DataOp EMI: endpoint=2 optype=1 target_task_data=(nil) (0x0) target_data=0x149ffbb277b8 (0x0) host_op_id=0x149ffbb27760 (0x8000000000000001) src=(nil) src_device_num=8 dest=0x149ffaa00000 dest_device_num=0 bytes=4 code=0x149ffc1135fe
+Callback Load: device_num:0 filename:(null) host_adddr:0x200ee0 device_addr:(nil) bytes:27296
+Callback Target EMI: kind=1 endpoint=1 device_num=0 task_data=0x2c1b80 (0x0) target_task_data=0x2c2f98 (0x0) target_data=0x149ffbb277b8 (0x8000000000000002) code=0x2094c2
+  Callback Submit EMI: endpoint=1  req_num_teams=0 target_data=0x149ffbb277b8 (0x8000000000000002) host_op_id=0x149ffbb27760 (0x8000000000000001)
+dev_ptr on device 0 = 0x149ffaa00000
+  Callback Submit EMI: endpoint=2  req_num_teams=0 target_data=0x149ffbb277b8 (0x8000000000000002) host_op_id=0x149ffbb27760 (0x8000000000000001)
+Callback Target EMI: kind=1 endpoint=2 device_num=0 task_data=0x2c1b80 (0x0) target_task_data=0x2c2f98 (0x0) target_data=0x149ffbb277b8 (0x8000000000000002) code=0x2094c2
+  Callback DataOp EMI: endpoint=1 optype=4 target_task_data=(nil) (0x0) target_data=0x149ffbb277b8 (0x0) host_op_id=0x149ffbb27760 (0x8000000000000003) src=0x149ffaa00000 src_device_num=0 dest=(nil) dest_device_num=-1 bytes=0 code=0x149ffc101782
+  Callback DataOp EMI: endpoint=2 optype=4 target_task_data=(nil) (0x0) target_data=0x149ffbb277b8 (0x0) host_op_id=0x149ffbb27760 (0x8000000000000003) src=0x149ffaa00000 src_device_num=0 dest=(nil) dest_device_num=-1 bytes=0 code=0x149ffc101782
+host_arr on host = 0x7fff6485fb84
+  Callback DataOp EMI: endpoint=1 optype=1 target_task_data=(nil) (0x0) target_data=0x149ffbb277b8 (0x0) host_op_id=0x149ffbb27760 (0x8000000000000004) src=0x7fff6485fb84 src_device_num=8 dest=(nil) dest_device_num=0 bytes=4 code=0x149ffc0ffbde
+  Callback DataOp EMI: endpoint=2 optype=1 target_task_data=(nil) (0x0) target_data=0x149ffbb277b8 (0x0) host_op_id=0x149ffbb27760 (0x8000000000000004) src=0x7fff6485fb84 src_device_num=8 dest=0x149ffaa00000 dest_device_num=0 bytes=4 code=0x149ffc0ffbde
+  Callback DataOp EMI: endpoint=1 optype=2 target_task_data=(nil) (0x0) target_data=0x149ffbb277b8 (0x0) host_op_id=0x149ffbb27760 (0x8000000000000005) src=0x7fff6485fb84 src_device_num=8 dest=0x149ffaa00000 dest_device_num=0 bytes=4 code=0x149ffc100a67
+  Callback DataOp EMI: endpoint=2 optype=2 target_task_data=(nil) (0x0) target_data=0x149ffbb277b8 (0x0) host_op_id=0x149ffbb27760 (0x8000000000000005) src=0x7fff6485fb84 src_device_num=8 dest=0x149ffaa00000 dest_device_num=0 bytes=4 code=0x149ffc100a67
+Callback Target EMI: kind=1 endpoint=1 device_num=0 task_data=0x2c1b80 (0x0) target_task_data=0x2c2f98 (0x0) target_data=0x149ffbb277b8 (0x8000000000000006) code=0x2095ff
+  Callback Submit EMI: endpoint=1  req_num_teams=0 target_data=0x149ffbb277b8 (0x8000000000000006) host_op_id=0x149ffbb27760 (0x8000000000000005)
+host_arr on device 0 = 0x149ffaa00000
+  Callback Submit EMI: endpoint=2  req_num_teams=0 target_data=0x149ffbb277b8 (0x8000000000000006) host_op_id=0x149ffbb27760 (0x8000000000000005)
+Callback Target EMI: kind=1 endpoint=2 device_num=0 task_data=0x2c1b80 (0x0) target_task_data=0x2c2f98 (0x0) target_data=0x149ffbb277b8 (0x8000000000000006) code=0x2095ff
+Callback Target EMI: kind=2 endpoint=1 device_num=0 task_data=0x2c1b80 (0x0) target_task_data=0x2c2f98 (0x0) target_data=0x149ffbb277b8 (0x8000000000000007) code=0x20967d
+  Callback DataOp EMI: endpoint=1 optype=3 target_task_data=0x2c2f98 (0x0) target_data=0x149ffbb277b8 (0x8000000000000007) host_op_id=0x149ffbb27760 (0x8000000000000008) src=0x149ffaa00000 src_device_num=0 dest=0x7fff6485fb84 dest_device_num=8 bytes=4 code=0x149ffc101bc3
+  Callback DataOp EMI: endpoint=2 optype=3 target_task_data=0x2c2f98 (0x0) target_data=0x149ffbb277b8 (0x8000000000000007) host_op_id=0x149ffbb27760 (0x8000000000000008) src=0x149ffaa00000 src_device_num=0 dest=0x7fff6485fb84 dest_device_num=8 bytes=4 code=0x149ffc101bc3
+  Callback DataOp EMI: endpoint=1 optype=4 target_task_data=0x2c2f98 (0x0) target_data=0x149ffbb277b8 (0x8000000000000007) host_op_id=0x149ffbb27760 (0x8000000000000009) src=0x149ffaa00000 src_device_num=0 dest=(nil) dest_device_num=-1 bytes=0 code=0x149ffc101693
+  Callback DataOp EMI: endpoint=2 optype=4 target_task_data=0x2c2f98 (0x0) target_data=0x149ffbb277b8 (0x8000000000000007) host_op_id=0x149ffbb27760 (0x8000000000000009) src=0x149ffaa00000 src_device_num=0 dest=(nil) dest_device_num=-1 bytes=0 code=0x149ffc101693
+Callback Fini: device_num=0
+```
+
+**aomp 17.0-3:**
+```console
+$ amdclang --version
+AOMP_STANDALONE_17.0-3 clang version 17.0.0 (https://github.com/radeonopencompute/llvm-project f959ea5d8d1e5aef4b6d06727a9698316d3d33cd)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /usr/lib/aomp_17.0-3/bin
+$ amdclang -fopenmp -fopenmp-targets=amdgcn-amd-amdhsa -Xopenmp-target=amdgcn-amd-amdhsa -march=gfx90a reproducer.c
+$ ./a.out
+Callback Init: device_num=0 type=gfx90a device=0x14445b0 lookup=0x1503667d7c90 doc=(nil)
+  Callback DataOp EMI: endpoint=1 optype=1 target_task_data=(nil) (0x0) target_data=0x150368cb47b8 (0x0) host_op_id=0x150368cb4760 (0x8000000000000001) src=(nil) src_device_num=8 dest=(nil) dest_device_num=0 bytes=4 code=0x1503692a7f8e
+  Callback DataOp EMI: endpoint=2 optype=1 target_task_data=(nil) (0x0) target_data=0x150368cb47b8 (0x0) host_op_id=0x150368cb4760 (0x8000000000000001) src=(nil) src_device_num=8 dest=0x150064220000 dest_device_num=0 bytes=4 code=0x1503692a7f8e
+Callback Load: device_num:0 filename:(null) host_adddr:0x200378 device_addr:(nil) bytes:18672
+Callback Target EMI: kind=1 endpoint=1 device_num=0 task_data=0xf44d80 (0x0) target_task_data=0xf46358 (0x0) target_data=0x150368cb47b8 (0x8000000000000002) code=0x2072d0
+  Callback Submit EMI: endpoint=1  req_num_teams=1 target_data=0x150368cb47b8 (0x8000000000000002) host_op_id=0x150368cb4760 (0x8000000000000001)
+dev_ptr on device 0 = 0x150064220000
+  Callback Submit EMI: endpoint=2  req_num_teams=1 target_data=0x150368cb47b8 (0x8000000000000002) host_op_id=0x150368cb4760 (0x8000000000000001)
+Callback Target EMI: kind=1 endpoint=2 device_num=0 task_data=0xf44d80 (0x0) target_task_data=0xf46358 (0x0) target_data=0x150368cb47b8 (0x8000000000000002) code=0x2072d0
+  Callback DataOp EMI: endpoint=1 optype=4 target_task_data=(nil) (0x0) target_data=0x150368cb47b8 (0x0) host_op_id=0x150368cb4760 (0x8000000000000003) src=0x150064220000 src_device_num=0 dest=(nil) dest_device_num=-1 bytes=0 code=0x150369294912
+  Callback DataOp EMI: endpoint=2 optype=4 target_task_data=(nil) (0x0) target_data=0x150368cb47b8 (0x0) host_op_id=0x150368cb4760 (0x8000000000000003) src=0x150064220000 src_device_num=0 dest=(nil) dest_device_num=-1 bytes=0 code=0x150369294912
+host_arr on host = 0x7ffd7ae14fbc
+Callback Target EMI: kind=2 endpoint=1 device_num=0 task_data=0xf44d80 (0x0) target_task_data=0xf46358 (0x0) target_data=0x150368cb47b8 (0x8000000000000004) code=0x207378
+  Callback DataOp EMI: endpoint=1 optype=1 target_task_data=0xf46358 (0x0) target_data=0x150368cb47b8 (0x8000000000000004) host_op_id=0x150368cb4760 (0x8000000000000005) src=0x7ffd7ae14fbc src_device_num=8 dest=(nil) dest_device_num=0 bytes=4 code=0x150369292d1b
+  Callback DataOp EMI: endpoint=2 optype=1 target_task_data=0xf46358 (0x0) target_data=0x150368cb47b8 (0x8000000000000004) host_op_id=0x150368cb4760 (0x8000000000000005) src=0x7ffd7ae14fbc src_device_num=8 dest=0x150064220000 dest_device_num=0 bytes=4 code=0x150369292d1b
+  Callback DataOp EMI: endpoint=1 optype=2 target_task_data=0xf46358 (0x0) target_data=0x150368cb47b8 (0x8000000000000004) host_op_id=0x150368cb4760 (0x8000000000000006) src=0x7ffd7ae14fbc src_device_num=8 dest=0x150064220000 dest_device_num=0 bytes=4 code=0x150369293bbb
+  Callback DataOp EMI: endpoint=2 optype=2 target_task_data=0xf46358 (0x0) target_data=0x150368cb47b8 (0x8000000000000004) host_op_id=0x150368cb4760 (0x8000000000000006) src=0x7ffd7ae14fbc src_device_num=8 dest=0x150064220000 dest_device_num=0 bytes=4 code=0x150369293bbb
+Callback Target EMI: kind=1 endpoint=1 device_num=0 task_data=0xf44d80 (0x0) target_task_data=0xf46358 (0x0) target_data=0x150368cb47b8 (0x8000000000000007) code=0x20747b
+  Callback Submit EMI: endpoint=1  req_num_teams=1 target_data=0x150368cb47b8 (0x8000000000000007) host_op_id=0x150368cb4760 (0x8000000000000006)
+host_arr on device 0 = 0x150064220000
+  Callback Submit EMI: endpoint=2  req_num_teams=1 target_data=0x150368cb47b8 (0x8000000000000007) host_op_id=0x150368cb4760 (0x8000000000000006)
+Callback Target EMI: kind=1 endpoint=2 device_num=0 task_data=0xf44d80 (0x0) target_task_data=0xf46358 (0x0) target_data=0x150368cb47b8 (0x8000000000000007) code=0x20747b
+Callback Target EMI: kind=2 endpoint=1 device_num=0 task_data=0xf44d80 (0x0) target_task_data=0xf46358 (0x0) target_data=0x150368cb47b8 (0x8000000000000008) code=0x20750d
+  Callback DataOp EMI: endpoint=1 optype=3 target_task_data=0xf46358 (0x0) target_data=0x150368cb47b8 (0x8000000000000008) host_op_id=0x150368cb4760 (0x8000000000000009) src=0x150064220000 src_device_num=0 dest=0x7ffd7ae14fbc dest_device_num=8 bytes=4 code=0x150369294fd3
+  Callback DataOp EMI: endpoint=2 optype=3 target_task_data=0xf46358 (0x0) target_data=0x150368cb47b8 (0x8000000000000008) host_op_id=0x150368cb4760 (0x8000000000000009) src=0x150064220000 src_device_num=0 dest=0x7ffd7ae14fbc dest_device_num=8 bytes=4 code=0x150369294fd3
+  Callback DataOp EMI: endpoint=1 optype=4 target_task_data=0xf46358 (0x0) target_data=0x150368cb47b8 (0x8000000000000008) host_op_id=0x150368cb4760 (0x800000000000000a) src=0x150064220000 src_device_num=0 dest=(nil) dest_device_num=-1 bytes=0 code=0x1503692947ee
+  Callback DataOp EMI: endpoint=2 optype=4 target_task_data=0xf46358 (0x0) target_data=0x150368cb47b8 (0x8000000000000008) host_op_id=0x150368cb4760 (0x800000000000000a) src=0x150064220000 src_device_num=0 dest=(nil) dest_device_num=-1 bytes=0 code=0x1503692947ee
+Callback Fini: device_num=0
+```
+
+Both ROCm and aomp are do not dispatch `ompt_callback_target` for `#pragma omp target [enter|exit] data` correctly, but the data operations contain the pointer during allocation.
+
+**NVHPC 23.7:**
+```console
+$ nvc --version
+nvc 23.7-0 64-bit target on x86-64 Linux -tp haswell 
+NVIDIA Compilers and Tools
+Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+$ nvc -mp=gpu,ompt reproducer.c
+$ ./a.out
+Callback Init: device_num=0 type=NVIDIA GeForce MX550 device=0x1e83de0 lookup=(nil) doc=0x7f557e098f20
+  Callback DataOp EMI: endpoint=1 optype=2 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x0) host_op_id=0x7fff3c1a3a50 (0x8000000000000001) src=0x7fff3c1a3bd0 src_device_num=-1 dest=(nil) dest_device_num=0 bytes=4 code=0x401973
+  Callback DataOp EMI: endpoint=1 optype=1 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x0) host_op_id=0x7fff3c1a3a48 (0x8000000000000002) src=0x7fff3c1a3bd0 src_device_num=-1 dest=(nil) dest_device_num=0 bytes=4 code=0x401973
+  Callback DataOp EMI: endpoint=2 optype=1 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x0) host_op_id=0x7fff3c1a3a48 (0x8000000000000002) src=0x7fff3c1a3bd0 src_device_num=-1 dest=0x7f5555afa200 dest_device_num=0 bytes=4 code=0x401973
+  Callback DataOp EMI: endpoint=2 optype=2 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x0) host_op_id=0x7fff3c1a3a50 (0x8000000000000001) src=0x7fff3c1a3bd0 src_device_num=-1 dest=0x7f5555afa200 dest_device_num=0 bytes=4 code=0x401973
+Callback Target EMI: kind=1 endpoint=1 device_num=0 task_data=0x7f557ee001b8 (0x0) target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x8000000000000003) code=0x401aa3
+  Callback Submit EMI: endpoint=1  req_num_teams=-1 target_data=0x26b7820 (0x0) host_op_id=0x7fff3c1a2f28 (0x2)
+Callback Load: device_num:0 filename:(null) host_adddr:0x412140 device_addr:0xffffffffffffffff bytes:0
+  Callback Submit EMI: endpoint=2  req_num_teams=-1 target_data=0x26b7820 (0x0) host_op_id=0x7fff3c1a2f28 (0x2)
+Callback Target EMI: kind=1 endpoint=2 device_num=0 task_data=0x7f557ee001b8 (0x0) target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x8000000000000003) code=0x401aa3
+  Callback DataOp EMI: endpoint=1 optype=4 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x0) host_op_id=0x7fff3c1a3a48 (0x8000000000000004) src=0x7f5555afa200 src_device_num=0 dest=0x7fff3c1a3bd0 dest_device_num=-1 bytes=4 code=0x401b7a
+  Callback DataOp EMI: endpoint=1 optype=3 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x0) host_op_id=0x7fff3c1a3a50 (0x8000000000000005) src=0x7f5555afa200 src_device_num=0 dest=0x7fff3c1a3bd0 dest_device_num=-1 bytes=4 code=0x401b7a
+  Callback DataOp EMI: endpoint=2 optype=3 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x0) host_op_id=0x7fff3c1a3a50 (0x8000000000000005) src=0x7f5555afa200 src_device_num=0 dest=0x7fff3c1a3bd0 dest_device_num=-1 bytes=4 code=0x401b7a
+  Callback DataOp EMI: endpoint=2 optype=4 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x0) host_op_id=0x7fff3c1a3a48 (0x8000000000000004) src=0x7f5555afa200 src_device_num=0 dest=0x7fff3c1a3bd0 dest_device_num=-1 bytes=4 code=0x401b7a
+dev_ptr on device 0 = 0x7f5555afa000
+host_arr on host = 0x7fff3c1a3bd0
+Callback Target EMI: kind=2 endpoint=1 device_num=0 task_data=0x7f557ee001b8 (0x0) target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x8000000000000006) code=0x401c04
+  Callback DataOp EMI: endpoint=1 optype=2 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x8000000000000006) host_op_id=0x7fff3c1a3a50 (0x8000000000000007) src=0x7fff3c1a3bd0 src_device_num=-1 dest=(nil) dest_device_num=0 bytes=4 code=0x401c96
+  Callback DataOp EMI: endpoint=1 optype=1 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x8000000000000006) host_op_id=0x7fff3c1a3a48 (0x8000000000000008) src=0x7fff3c1a3bd0 src_device_num=-1 dest=(nil) dest_device_num=0 bytes=4 code=0x401c96
+  Callback DataOp EMI: endpoint=2 optype=1 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x8000000000000006) host_op_id=0x7fff3c1a3a48 (0x8000000000000008) src=0x7fff3c1a3bd0 src_device_num=-1 dest=0x7f5555afa200 dest_device_num=0 bytes=4 code=0x401c96
+  Callback DataOp EMI: endpoint=2 optype=2 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x8000000000000006) host_op_id=0x7fff3c1a3a50 (0x8000000000000007) src=0x7fff3c1a3bd0 src_device_num=-1 dest=0x7f5555afa200 dest_device_num=0 bytes=4 code=0x401c96
+Callback Target EMI: kind=2 endpoint=2 device_num=-1 task_data=0x7f557ee001b8 (0x0) target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x8000000000000006) code=0x401ca9
+Callback Target EMI: kind=1 endpoint=1 device_num=0 task_data=0x7f557ee001b8 (0x0) target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x8000000000000009) code=0x401ebf
+  Callback Submit EMI: endpoint=1  req_num_teams=-1 target_data=0x26b7820 (0x0) host_op_id=0x7fff3c1a2f28 (0x7)
+  Callback Submit EMI: endpoint=2  req_num_teams=-1 target_data=0x26b7820 (0x0) host_op_id=0x7fff3c1a2f28 (0x7)
+Callback Target EMI: kind=1 endpoint=2 device_num=0 task_data=0x7f557ee001b8 (0x0) target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x8000000000000009) code=0x401ebf
+host_arr on device 0 = 0x7f5555afa200
+Callback Target EMI: kind=3 endpoint=1 device_num=0 task_data=0x7f557ee001b8 (0x0) target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x800000000000000a) code=0x401ffb
+  Callback DataOp EMI: endpoint=1 optype=4 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x800000000000000a) host_op_id=0x7fff3c1a3a48 (0x800000000000000b) src=0x7f5555afa200 src_device_num=0 dest=0x7fff3c1a3bd0 dest_device_num=-1 bytes=4 code=0x402084
+  Callback DataOp EMI: endpoint=1 optype=3 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x800000000000000a) host_op_id=0x7fff3c1a3a50 (0x800000000000000c) src=0x7f5555afa200 src_device_num=0 dest=0x7fff3c1a3bd0 dest_device_num=-1 bytes=4 code=0x402084
+  Callback DataOp EMI: endpoint=2 optype=3 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x800000000000000a) host_op_id=0x7fff3c1a3a50 (0x800000000000000c) src=0x7f5555afa200 src_device_num=0 dest=0x7fff3c1a3bd0 dest_device_num=-1 bytes=4 code=0x402084
+  Callback DataOp EMI: endpoint=2 optype=4 target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x800000000000000a) host_op_id=0x7fff3c1a3a48 (0x800000000000000b) src=0x7f5555afa200 src_device_num=0 dest=0x7fff3c1a3bd0 dest_device_num=-1 bytes=4 code=0x402084
+Callback Target EMI: kind=3 endpoint=2 device_num=0 task_data=0x7f557ee001b8 (0x0) target_task_data=0x7f557ee001b8 (0x0) target_data=0x26a78d0 (0x800000000000000a) code=0x40209c
+Callback Fini: device_num=0
+```
+
+The passed pointers in NVHPC look a bit weird, but in general, pointers are passed to the callbacks.
+
+Comment by llvmbot: @llvm/issue-subscribers-openmp
+Comment by mhalk: Hey and thanks for bringing this to our attention!
+
+So, from my perspective this issue is only affecting the reported target pointer for the DataOp `alloc` EMI callback (i.e.: `optype=1`) -- please confirm.
+
+I don't completely follow where the NVHPC is surpassing the amount of provided information in that case.
+Since for `optype=1 endpoint=1` it will report `dest=(nil)`, like the others.
+Could you please point out the difference?
+
+Other than that I'm able to reproduce and also fix the issue.
+
+```
+Callback DataOp EMI: endpoint=1 optype=1 target_task_data=0x175a658 (0x0) target_data=0x7f0e0ff4c368 (0x8000000000000001) host_op_id=0x7f0e0ff4c380 (0x8000000000000002) src=0x7fffca5c9b90 src_device_num=8 dest=(nil) dest_device_num=0 bytes=400000 code=0x7f0e11418bd1
+Callback DataOp EMI: endpoint=2 optype=1 target_task_data=0x175a658 (0x0) target_data=0x7f0e0ff4c368 (0x8000000000000001) host_op_id=0x7f0e0ff4c380 (0x8000000000000002) src=0x7fffca5c9b90 src_device_num=8 dest=0x7f0e08a00000 dest_device_num=0 bytes=400000 code=0x7f0e11418bd1
+Callback DataOp EMI: endpoint=1 optype=1 target_task_data=0x175a658 (0x0) target_data=0x7f0e0ff4c368 (0x8000000000000001) host_op_id=0x7f0e0ff4c380 (0x8000000000000004) src=0x7fffca568110 src_device_num=8 dest=(nil) dest_device_num=0 bytes=400000 code=0x7f0e11418bd1
+Callback DataOp EMI: endpoint=2 optype=1 target_task_data=0x175a658 (0x0) target_data=0x7f0e0ff4c368 (0x8000000000000001) host_op_id=0x7f0e0ff4c380 (0x8000000000000004) src=0x7fffca568110 src_device_num=8 dest=0x7f0e08a62000 dest_device_num=0 bytes=400000 code=0x7f0e11418bd1
+```
+So, this will only have an effect on DataOp EMI callbacks where `endpoint=2` and `optype=1` (`ompt_target_data_alloc`).
+Is this an acceptable solution / the anticipated output?
+(I'll open a Phabricator review once we're ready here.)
+
+Thanks for taking the time esp. to provide an elaborate issue description -- much appreciated!
+Comment by Thyre: > So, from my perspective this issue is only affecting the reported target pointer for the DataOp alloc EMI callback (i.e.: `optype=1`) -- please confirm.
+
+Yes, you're right. This only affects `optype = 1`. All other cases seem to be fine, as far as I have seen / tested. 
+
+> I don't completely follow where the NVHPC is surpassing the amount of provided information in that case. Since for `optype=1 endpoint=1` it will report `dest=(nil)`, like the others. Could you please point out the difference?
+
+To be honest, I misread the output of NVHPC. There's no difference. Sorry for the confusion. 
+
+> ```
+> Callback DataOp EMI: endpoint=1 optype=1 target_task_data=0x175a658 (0x0) target_data=0x7f0e0ff4c368 (0x8000000000000001) host_op_id=0x7f0e0ff4c380 (0x8000000000000002) src=0x7fffca5c9b90 src_device_num=8 dest=(nil) dest_device_num=0 bytes=400000 code=0x7f0e11418bd1
+> Callback DataOp EMI: endpoint=2 optype=1 target_task_data=0x175a658 (0x0) target_data=0x7f0e0ff4c368 (0x8000000000000001) host_op_id=0x7f0e0ff4c380 (0x8000000000000002) src=0x7fffca5c9b90 src_device_num=8 dest=0x7f0e08a00000 dest_device_num=0 bytes=400000 code=0x7f0e11418bd1
+> Callback DataOp EMI: endpoint=1 optype=1 target_task_data=0x175a658 (0x0) target_data=0x7f0e0ff4c368 (0x8000000000000001) host_op_id=0x7f0e0ff4c380 (0x8000000000000004) src=0x7fffca568110 src_device_num=8 dest=(nil) dest_device_num=0 bytes=400000 code=0x7f0e11418bd1
+> Callback DataOp EMI: endpoint=2 optype=1 target_task_data=0x175a658 (0x0) target_data=0x7f0e0ff4c368 (0x8000000000000001) host_op_id=0x7f0e0ff4c380 (0x8000000000000004) src=0x7fffca568110 src_device_num=8 dest=0x7f0e08a62000 dest_device_num=0 bytes=400000 code=0x7f0e11418bd1
+> ```
+> 
+> So, this will only have an effect on DataOp EMI callbacks where `endpoint=2` and `optype=1` (alloc). Is this an acceptable solution / the anticipated output? 
+
+That looks perfect! With this, we should be able to use the same code in Score-P we've been using until now. 
+
+
+Comment by mhalk: > To be honest, I misread the output of NVHPC. There's no difference. Sorry for the confusion.
+
+No worries, I just wanted to make sure I understood the situation.
+
+> That looks perfect! With this, we should be able to use the same code in Score-P we've been using until now.
+
+That's great to hear!
+
+I have another question, since I'm thinking about adapting the corresponding OMPT (EMI) testcases:
+Should `dest=` **always** report a non-null value when `endpoint=2 optype=1`?
+Comment by Thyre: > I have another question, since I'm thinking about adapting the corresponding OMPT (EMI) testcases:
+Should dest= **always** report a non-null value when `endpoint=2 optype=1`?
+
+Looking at the OpenMP specifications, we _should_ see the data address after the _operation_ has finished. In this case, it would be the allocation of data. The specification allows data aggregation to reduce the number of callbacks though, which means that we may see less `ompt_callback_target_data_op` calls than variables copied to the target device.
+
+The only case where I wouldn't expect a pointer to be returned in the callback is when the allocation fails for some reason (for example insufficient memory). Maybe there's another case I haven't thought of. 
+Comment by mhalk: Thanks for the quick response!
+
+With that info, I guess I'll check that there are no null values:
+```
+/// CHECK: Callback DataOp EMI: endpoint=2 optype=1
+/// CHECK-NOT: dest=(nil)
+```
+Comment by mhalk: Phabricator review is up:
+https://reviews.llvm.org/D157996
+
+@Thyre I took the liberty to directly subscribe you to the review :)

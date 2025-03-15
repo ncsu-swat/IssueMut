@@ -1,0 +1,128 @@
+Bug Summary: [aarch64] ICE Segmentation fault with r14-6178-g8d29b7aca15133
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Michal Jireš | Time: 2024-01-03 17:04:59 UTC
+  Text: Compiling reduced testcase gcc.target/aarch64/sme/zt0_state_5.c results in ICE withr14-6178-g8d29b7aca15133.
+
+$ cat zt0_state_5.c
+#pragma GCC target "+sme2"
+void inout_zt0() __arm_inout("zt0") {
+  int ptr;
+  ptr += 1;
+}
+
+
+$ aarch64-linux-gnu-gcc zt0_state_5.c -ftrapv -fstack-clash-protection
+during RTL pass: mode_sw
+zt0_state_5.c: In function ‘inout_zt0’:
+zt0_state_5.c:5:1: internal compiler error: Segmentation fault
+    5 | }
+      | ^
+0x1787d3a crash_signal
+	/home/mjires/git/GCC/master/gcc/toplev.cc:316
+0x16f07c8 rtx_properties::try_to_add_pattern(rtx_def const*)
+	/home/mjires/git/GCC/master/gcc/rtlanal.cc:2246
+0x16f0d4b rtx_properties::try_to_add_insn(rtx_insn const*, bool)
+	/home/mjires/git/GCC/master/gcc/rtlanal.cc:2356
+0x1c83f7b growing_rtx_properties<vec_rtx_properties_base>::add_insn(rtx_insn const*, bool)::{lambda()#1}::operator()() const
+	/home/mjires/git/GCC/master/gcc/rtlanal.h:288
+0x1c866a2 void growing_rtx_properties<vec_rtx_properties_base>::repeat<growing_rtx_properties<vec_rtx_properties_base>::add_insn(rtx_insn const*, bool)::{lambda()#1}>(growing_rtx_properties<vec_rtx_properties_base>::add_insn(rtx_insn const*, bool)::{lambda()#1})
+	/home/mjires/git/GCC/master/gcc/rtlanal.h:246
+0x1c83fda growing_rtx_properties<vec_rtx_properties_base>::add_insn(rtx_insn const*, bool)
+	/home/mjires/git/GCC/master/gcc/rtlanal.h:288
+0x1c79afe aarch64_mode_emit
+	/home/mjires/git/GCC/master/gcc/config/aarch64/aarch64.cc:29400
+0x2b318d1 optimize_mode_switching
+	/home/mjires/git/GCC/master/gcc/mode-switching.cc:1210
+0x2b31b7a execute
+	/home/mjires/git/GCC/master/gcc/mode-switching.cc:1309
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+
+$ aarch64-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=aarch64-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/home/mjires/built/master/libexec/gcc/aarch64-linux-gnu/14.0.0/lto-wrapper
+Target: aarch64-linux-gnu
+Configured with: /home/mjires/git/GCC/master/configure --prefix=/home/mjires/built/master --target=aarch64-linux-gnu --disable-bootstrap --enable-languages=c,c++,fortran --disable-multilib --disable-libsanitizer --enable-checking : (reconfigured) /home/mjires/git/GCC/master/configure --prefix=/home/mjires/built/master --target=aarch64-linux-gnu --disable-bootstrap --enable-languages=c,c++,fortran --disable-multilib --disable-libsanitizer --enable-checking
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20240103 (experimental) (GCC)
+
+- User: Richard Sandiford | Time: 2024-01-03 17:14:40 UTC
+  Text: Mine
+
+- User: Andrew Pinski | Time: 2024-01-26 05:23:58 UTC
+  Text: Note you can also reproduce the failure with `-fstack-clash-protection` and this simplified testcase:
+```
+#pragma GCC target "+sme2"
+void inout_zt0() __arm_inout("zt0") {
+  __builtin_abort();
+}
+```
+
+Basically any noreturn function and -fstack-clash-protection and SME2 will cause the ICE.
+
+- User: Richard Sandiford | Time: 2024-02-20 14:41:26 UTC
+  Text: ***Bug 113778has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2024-02-21 11:12:55 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:4f7d4a2cd26673887f45e994a2f367a5c8fcc691commitr14-9097-g4f7d4a2cd26673887f45e994a2f367a5c8fcc691Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Wed Feb 21 11:12:26 2024 +0000
+
+    Allow mode-switching to introduce internal loops [PR113220]
+    
+    In this PR, the SME mode-switching code needs to insert a stack-probe
+    loop for an alloca.  This patch allows the target to do that.
+    
+    There are two parts to it: allowing loops for insertions in blocks,
+    and allowing them for insertions on edges.  The former can be handled
+    entirely within mode-switching itself, by recording which blocks have
+    had new branches inserted.  The latter requires an extension to
+    commit_one_edge_insertion.
+    
+    I think the extension to commit_one_edge_insertion makes logical sense,
+    since it already explicitly allows internal loops during RTL expansion.
+    The single-block find_sub_basic_blocks is a relatively recent addition,
+    so wouldn't have been available when the code was originally written.
+    
+    The patch also has a small and obvious fix to make the aarch64 emit
+    hook cope with labels.
+    
+    I've added specific -fstack-clash-protection versions of all
+    aarch64-sme.exp tests that previously failed because of this bug.
+    I've also added -fno-stack-clash-protection to the original versions
+    of these tests if they contain scans that assume no protection.
+    
+    gcc/PR target/113220* cfgrtl.cc (commit_one_edge_insertion): Handle sequences that
+            contain jumps even if called after initial RTL expansion.
+            * mode-switching.cc: Include cfgbuild.h.
+            (optimize_mode_switching): Allow the sequence returned by the
+            emit hook to contain internal jumps.  Record which blocks
+            contain such jumps and split the blocks at the end.
+            * config/aarch64/aarch64.cc (aarch64_mode_emit): Check for
+            non-debug insns when scanning the sequence.
+    
+    gcc/testsuite/PR target/113220* gcc.target/aarch64/sme/call_sm_switch_5.c: Add
+            -fno-stack-clash-protection.
+            * gcc.target/aarch64/sme/call_sm_switch_5_scp.c: New test.
+            * gcc.target/aarch64/sme/sibcall_6_scp.c: New test.
+            * gcc.target/aarch64/sme/za_state_4.c: Add
+            -fno-stack-clash-protection.
+            * gcc.target/aarch64/sme/za_state_4_scp.c: New test.
+            * gcc.target/aarch64/sme/za_state_5.c: Add
+            -fno-stack-clash-protection.
+            * gcc.target/aarch64/sme/za_state_5_scp.c: New test.
+
+- User: Richard Sandiford | Time: 2024-02-21 11:16:56 UTC
+  Text: Fixed
+

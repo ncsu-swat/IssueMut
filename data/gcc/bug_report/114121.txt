@@ -1,0 +1,472 @@
+Bug Summary: wrong code with _BitInt() arithmetics at -O2
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-02-26 18:30:00 UTC
+  Text: Createdattachment 57547[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -O0 testcase.c && ./a.out
+$ x86_64-pc-linux-gnu-gcc -O1 testcase.c && ./a.out
+$ x86_64-pc-linux-gnu-gcc -O2 testcase.c && ./a.out
+Aborted
+$ x86_64-pc-linux-gnu-gcc -O3 testcase.c && ./a.out
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-9167-20240225110837-gd1b241b9506-checking-yes-rtl-df-extra-nobootstrap-pr113988-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-9167-20240225110837-gd1b241b9506-checking-yes-rtl-df-extra-nobootstrap-pr113988-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240225 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-02-26 18:36:52 UTC
+  Text: Confirmed. Though I wonder if this could be an issue even without using _BitInt since bitintlower produces the same IR for -O2 and -O3.
+
+- User: Andrew Pinski | Time: 2024-02-26 18:42:26 UTC
+  Text: As an aside we at -O3 has:
+  _87 = .USUBC (_30, 3, 0);
+  _93 = IMAGPART_EXPR <_87>;
+  _88 = .USUBC (0, 0, _93);
+  _29 = IMAGPART_EXPR <_88>;
+  _187 = .USUBC (0, 0, _29);
+  _217 = IMAGPART_EXPR <_187>;
+  _218 = .USUBC (0, 0, _217);
+  _214 = IMAGPART_EXPR <_218>;
+  _213 = .USUBC (0, 0, _214);
+  _212 = IMAGPART_EXPR <_213>;
+  _200 = .USUBC (0, 0, _212);
+  _34 = IMAGPART_EXPR <_200>;
+  _35 = .USUBC (0, 0, _34);
+  _36 = IMAGPART_EXPR <_35>;
+  _39 = .USUBC (0, 0, _36);
+  _40 = REALPART_EXPR <_39>;
+  _2 = (signed long) _40;
+  _77 = _2 < 0;
+
+isn't `.USUBC (0, 0, _93);` just Complex<-_93, _93!=0> ? Or did I misunderstand USUBC ?
+
+- User: Jakub Jelinek | Time: 2024-02-26 18:50:57 UTC
+  Text: Indeed.  And -O2 -fno-tree-vectorize works.
+
+I've changed it to
+unsigned a, b, c, d, e;
+unsigned _BitInt(256) f;
+
+__attribute__((noipa)) unsigned short
+bswap16 (int t)
+{
+  return __builtin_bswap16 (t);
+}
+
+void
+foo (unsigned z, unsigned _BitInt(512) y, unsigned *r)
+{
+  unsigned t = __builtin_sub_overflow_p (0, y << 509, f);
+  z *= bswap16 (t);
+  d = __builtin_sub_overflow_p (c, 3, (unsigned _BitInt(512)) 0);
+  unsigned q = z + c + b;
+  unsigned short n = q >> (8 + a);
+  *r = b + e + n;
+}
+
+int
+main ()
+{
+  unsigned x;
+  foo (8, 2, &x);
+  if (x != 8)
+    __builtin_abort ();
+}
+and bswap16 is called with 1 with -O2 -fno-tree-vectorize and 0 with -O2, so the problem is either during the computation of y << 509 (but that is fairly simple thing out of bitintlower, set highest limb to the lowest limb << 61 and clear all others),
+or during the sub overflow.
+
+- User: Jakub Jelinek | Time: 2024-02-26 18:58:29 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> As an aside we at -O3 has:
+>   _87 = .USUBC (_30, 3, 0);
+>   _93 = IMAGPART_EXPR <_87>;
+>   _88 = .USUBC (0, 0, _93);
+>   _29 = IMAGPART_EXPR <_88>;
+>   _187 = .USUBC (0, 0, _29);
+>   _217 = IMAGPART_EXPR <_187>;
+>   _218 = .USUBC (0, 0, _217);
+>   _214 = IMAGPART_EXPR <_218>;
+>   _213 = .USUBC (0, 0, _214);
+>   _212 = IMAGPART_EXPR <_213>;
+>   _200 = .USUBC (0, 0, _212);
+>   _34 = IMAGPART_EXPR <_200>;
+>   _35 = .USUBC (0, 0, _34);
+>   _36 = IMAGPART_EXPR <_35>;
+>   _39 = .USUBC (0, 0, _36);
+>   _40 = REALPART_EXPR <_39>;
+>   _2 = (signed long) _40;
+>   _77 = _2 < 0;
+> 
+> isn't `.USUBC (0, 0, _93);` just Complex<-_93, _93!=0> ? Or did I
+> misunderstand USUBC ?It is, but would that result in better generated code in case there is .USUBC (_400, _401, _29); later on?
+It would be nice to optimize such long series of .USUBC (0, 0, prev) into just copying of the result of the first one such call.  For similar long series of .UADDC (0, 0, prev) that would be just the first one and all the rest is 0+0i because it never carries over anymore.
+
+- User: Jakub Jelinek | Time: 2024-02-26 19:10:09 UTC
+  Text: And it works even with -O2 -ftree-loop-vectorize -fno-tree-slp-vectorize and doesn't work with -O2 -fno-tree-loop-vectorize -ftree-slp-vectorize so will need to look at what SLP vectorization does here.
+
+- User: Jakub Jelinek | Time: 2024-02-26 19:43:35 UTC
+  Text: pass_pre_slp_scalar_cleanup invokes another copy of FRE and I think this goes wrong in there.
+The .USUBC calls emitted by bitintlower1 are:
+  _50 = .USUBC (0, _47, _48);
+  _61 = .USUBC (0, _60, _51);
+  _65 = .USUBC (0, 0, _49);
+  _36 = .USUBC (_32, _33, _34);
+  _40 = .USUBC (0, 0, _37);
+where the first two process even and odd limbs of y from the first .SUB_OVERFLOW,
+the two second operands are initialized with
+  _47 = VIEW_CONVERT_EXPR<unsigned long[8]>(y)[_45];
+and
+  _59 = _45 + 1;
+  _60 = VIEW_CONVERT_EXPR<unsigned long[8]>(y)[_59];
+where _45 is an IV going from 0 to 6 in steps of 2 and y has just y[7] non-zero, all lower limbs zero.  The third .USUBC is the final processing of the first .SUB_OVERFLOW
+and the remaining two are from the second .SUB_OVERFLOW, we can ignore that now.
+Now, in cunroll we can see some jump threading from earlier passes:
+  _50 = .USUBC (0, _47, _48);
+  _16 = .USUBC (0, _17, _51);
+  _74 = .USUBC (0, _73, _51);
+  _61 = .USUBC (0, _60, _51);
+  _65 = .USUBC (0, 0, _125);
+but the _48 vs. _51 last operands clearly identify where it is coming from.
+Now the pre-slp fre4 seems to have replaced the second arguments of the 3 calls with 0s:
+  _50 = .USUBC (0, _47, _48);
+  _16 = .USUBC (0, 0, _51);
+  _74 = .USUBC (0, 0, _51);
+  _61 = .USUBC (0, 0, _51);
+  _65 = .USUBC (0, 0, _125);
+While that it would be correct to replace _47 with 0, because _45 iterates over the 0, 2, 4 and 6 indexes into the array and the array is known to be 0 there due to
+  __builtin_memset (&y, 0, 56);
+that is not the case for VIEW_CONVERT_EXPR<unsigned long[8]>(y)[7].
+  _16 = .USUBC (0, _17, _51);
+is guarded on _45 <= 3 (aka 0 or 2) and so _17 -> 0 replacement is ok.
+  _74 = .USUBC (0, _73, _51);
+is guarded on _45 == 4 and VIEW_CONVERT_EXPR<unsigned long[8]>(y)[5] is also known to be 0, so _73 -> 0 is ok as well.
+But in
+  _59 = _45 + 1;
+  _60 = VIEW_CONVERT_EXPR<unsigned long[8]>(y)[_59];
+  _61 = .USUBC (0, _60, _51);
+either we don't know anything, in that case we need to load, or we know that _45 is 6
+and _59 is 7 and VIEW_CONVERT_EXPR<unsigned long[8]>(y)[7] is _84, not 0.
+
+- User: Richard Biener | Time: 2024-02-27 08:26:41 UTC
+  Text: I will have a look.
+
+- User: Richard Biener | Time: 2024-02-27 10:48:03 UTC
+  Text: Createdattachment 57549[details]prototype fix
+
+This is very similar toPR113831.  We again have two refs looking seemingly
+the same:
+
+  _80 = _109 + 1;
+  _79 = VIEW_CONVERT_EXPR<unsigned long[8]>(y)[_80];
+  _77 = .USUBC (0, _79, _103);
+
+and
+
+  _43 = _109 + 1;
+  _42 = VIEW_CONVERT_EXPR<unsigned long[8]>(y)[_43];
+  _39 = .USUBC (0, _42, _103);
+
+so they are structurally entered in the same way into the expression hash
+table.  But since _80 and _43 have different ranges what
+get_ref_base_and_extent will compute differs - in the case of _109 <= 3
+it will make the stmt walking hit the __builtin_memset and record a value
+number of zero for the expresssion.
+
+As we only after that (by bad luck) visit the other reference we successfully
+look up the existing value from the hashtable during the walk.
+
+In thePR113831the accesses degenerated to a single array element which
+allowed the fix to work (adjust the expression we put into the hash).  But
+this shows (and I feared that ...) this doesn't work.  We either have to
+make all ranges part of the expression (even if they make a difference in
+the end) or avoid using ranges alltogether when computing a value for
+an expression during the walk, most definitely when we walk to different
+context (but that's hard to specify).
+
+Maybe a middle-ground would be to make the get_ref_base_and_extent computed
+info part of the expression.  Like the attached.  Lot's of ??? to address
+though ...
+
+- User: Richard Biener | Time: 2024-02-27 12:29:51 UTC
+  Text: Which of course would regress something like
+
+int a[16];
+int foo (int i)
+{
+  if (i > 7)
+    return a[i];
+  else
+    return a[i];
+}
+
+where we'd no longer hoist as we no longer would value-number the refs the
+same (that extends to any ref using SSA names with eventually differing
+ranges).  Revertingr9-398likely isn't the best answer either, it would
+of course also regress the two valid replacements with zero (the prototype
+patch preserves those).
+
+There's thePR100923fix (r12-1295-g7a56d3d3e99cc7) which targeted a similar
+(but even more odd) case with "contextual" PTA info (though there's really no
+such thing).
+But it didn't really fix the contextual thing but added re-valueization
+which in case of vn_reference_lookup_pieces works on value-numbered refs
+where failure mode is keeping the value-number.
+
+The prototype (after fixing it a bit) passes bootstrap but regresses quite
+some number of testcases (maybe due to ???s present).
+
+FAIL: g++.dg/ipa/devirt-20.C  -std=gnu++98  scan-tree-dump-not release_ssa "abor
+t"
+FAIL: g++.dg/ipa/devirt-20.C  -std=gnu++14  scan-tree-dump-not release_ssa "abor
+t"
+FAIL: g++.dg/ipa/devirt-20.C  -std=gnu++17  scan-tree-dump-not release_ssa "abor
+t"
+FAIL: g++.dg/ipa/devirt-20.C  -std=gnu++20  scan-tree-dump-not release_ssa "abort"
+FAIL: g++.dg/opt/pr110879.C  -std=gnu++14  scan-tree-dump-not optimized "=\\\\s*\\\\S*res_(?!\\\\S*_M_end_of_storage;)"
+FAIL: g++.dg/opt/pr110879.C  -std=gnu++17  scan-tree-dump-not optimized "=\\\\s*\\\\S*res_(?!\\\\S*_M_end_of_storage;)"
+FAIL: g++.dg/opt/pr110879.C  -std=gnu++20  scan-tree-dump-not optimized "=\\\\s*\\\\S*res_(?!\\\\S*_M_end_of_storage;)"
+FAIL: g++.dg/pr99966.C  -std=gnu++17  scan-tree-dump-not vrp1 "throw"
+FAIL: g++.dg/pr99966.C  -std=gnu++20  scan-tree-dump-not vrp1 "throw"
+FAIL: g++.dg/vect/pr112961.cc  -std=c++98  scan-tree-dump vect "LOOP VECTORIZED"
+FAIL: g++.dg/vect/pr112961.cc  -std=c++14  scan-tree-dump vect "LOOP VECTORIZED"
+FAIL: g++.dg/vect/pr112961.cc  -std=c++17  scan-tree-dump vect "LOOP VECTORIZED"
+FAIL: g++.dg/vect/pr112961.cc  -std=c++20  scan-tree-dump vect "LOOP VECTORIZED"
+FAIL: g++.dg/vect/pr89653.cc  -std=c++98  scan-tree-dump vect "vectorized 1 loops"
+FAIL: g++.dg/vect/pr89653.cc  -std=c++14  scan-tree-dump vect "vectorized 1 loops"
+FAIL: g++.dg/vect/pr89653.cc  -std=c++17  scan-tree-dump vect "vectorized 1 loops"
+FAIL: g++.dg/vect/pr89653.cc  -std=c++20  scan-tree-dump vect "vectorized 1 loops"
+FAIL: g++.dg/vect/simd-10.cc  -std=c++98  scan-tree-dump-times vect "vectorized [1-3] loops" 2
+FAIL: g++.dg/vect/simd-10.cc  -std=c++14  scan-tree-dump-times vect "vectorized [1-3] loops" 2
+FAIL: g++.dg/vect/simd-10.cc  -std=c++17  scan-tree-dump-times vect "vectorized [1-3] loops" 2
+FAIL: g++.dg/vect/simd-10.cc  -std=c++20  scan-tree-dump-times vect "vectorized [1-3] loops" 2
+
+FAIL: gcc.dg/ira-loop-pressure.c scan-rtl-dump loop2_invariant "Decided to move invariant"
+FAIL: gcc.dg/pr41783.c scan-tree-dump pre "pretmp[^\\\\n]* = a_global_var;"
+FAIL: gcc.dg/pr78138.c  (test for warnings, line 23)
+FAIL: gcc.dg/tree-ssa/ifc-pr69489-1.c scan-tree-dump-times ifcvt "Applying if-conversion" 1
+FAIL: gcc.dg/tree-ssa/ifc-pr69489-1.c scan-tree-dump-times ifcvt "Invalid sum of outgoing probabilities 200.0" 1
+FAIL: gcc.dg/tree-ssa/ifc-pr69489-1.c scan-tree-dump-times ifcvt "Invalid sum of incoming counts" 1
+FAIL: gcc.dg/tree-ssa/ifc-pr69489-2.c scan-tree-dump-times ifcvt "Applying if-conversion" 1
+FAIL: gcc.dg/tree-ssa/ifc-pr69489-2.c scan-tree-dump-times ifcvt "Invalid sum of outgoing probabilities 200.0" 1
+FAIL: gcc.dg/tree-ssa/ifc-pr69489-2.c scan-tree-dump-times ifcvt "Invalid sum of incoming counts" 1
+FAIL: gcc.dg/tree-ssa/loadpre1.c scan-tree-dump-times pre "Eliminated: 1" 1
+FAIL: gcc.dg/tree-ssa/loadpre10.c scan-tree-dump-times pre "Eliminated: 1" 1
+FAIL: gcc.dg/tree-ssa/loadpre11.c scan-tree-dump-times pre "Eliminated: 1" 1
+FAIL: gcc.dg/tree-ssa/loadpre12.c scan-tree-dump-times pre "Eliminated: 1" 1
+FAIL: gcc.dg/tree-ssa/loadpre13.c scan-tree-dump-times pre "Eliminated: 1" 1
+FAIL: gcc.dg/tree-ssa/loadpre14.c scan-tree-dump-times pre "Eliminated: 2" 1
+FAIL: gcc.dg/tree-ssa/loadpre16.c scan-tree-dump-times pre "Eliminated: 1" 1
+FAIL: gcc.dg/tree-ssa/loadpre2.c scan-tree-dump-times pre "Eliminated: 1" 1
+FAIL: gcc.dg/tree-ssa/loadpre21.c scan-tree-dump-times pre "Eliminated: 1" 1
+FAIL: gcc.dg/tree-ssa/loadpre23.c scan-tree-dump-times pre "Eliminated: 1" 1
+FAIL: gcc.dg/tree-ssa/loadpre24.c scan-tree-dump-times pre "Eliminated: 1" 1
+FAIL: gcc.dg/tree-ssa/loadpre25.c scan-tree-dump-times pre "Eliminated: 1" 1
+FAIL: gcc.dg/tree-ssa/loadpre3.c scan-tree-dump-times pre "Eliminated: 2" 1
+FAIL: gcc.dg/tree-ssa/loadpre4.c scan-tree-dump-times pre "Eliminated: 1" 1
+FAIL: gcc.dg/tree-ssa/loadpre6.c scan-tree-dump-times pre "Eliminated: 1" 1
+FAIL: gcc.dg/tree-ssa/loadpre6.c scan-tree-dump-times pre "Insertions: 1" 1
+FAIL: gcc.dg/tree-ssa/pr21417.c scan-tree-dump-times thread2 "jump thread" 1
+FAIL: gcc.dg/tree-ssa/pr23455.c scan-tree-dump-times pre "Eliminated: 3" 1
+FAIL: gcc.dg/tree-ssa/pr35286.c scan-tree-dump-times pre "Eliminated: 2" 1
+FAIL: gcc.dg/tree-ssa/pr35287.c scan-tree-dump-times pre "Eliminated: 3" 1
+FAIL: gcc.dg/tree-ssa/pr43491.c scan-tree-dump-times optimized "= data_0;" 1
+FAIL: gcc.dg/tree-ssa/pr47392.c scan-tree-dump pre "Eliminated: 1"
+FAIL: gcc.dg/tree-ssa/predcom-1.c scan-tree-dump-times pcom "looparound ref" 1
+FAIL: gcc.dg/tree-ssa/ssa-fre-45.c scan-tree-dump fre1 "return y_\\\\d+\\\\(D\\\\);"
+FAIL: gcc.dg/tree-ssa/ssa-hoist-4.c scan-tree-dump-times optimized "= \\\\*" 2
+FAIL: gcc.dg/tree-ssa/ssa-hoist-4.c scan-tree-dump-times optimized "MAX_EXPR" 1
+FAIL: gcc.dg/tree-ssa/ssa-hoist-8.c scan-tree-dump pre "HOIST inserted: 1"
+FAIL: gcc.dg/tree-ssa/ssa-hoist-8.c scan-tree-dump-times pre " = mem;" 1
+FAIL: gcc.dg/tree-ssa/ssa-hoist-9.c scan-tree-dump pre "HOIST inserted: 3"
+FAIL: gcc.dg/tree-ssa/ssa-hoist-9.c scan-tree-dump-times pre " = \\\\*" 2
+FAIL: gcc.dg/tree-ssa/ssa-hoist-9.c scan-tree-dump-times pre " = [^\\r\\n]* \\\\+ [^\\r\\n]*;" 1
+FAIL: gcc.dg/tree-ssa/ssa-pre-16.c scan-tree-dump-times pre "Eliminated: 1" 1
+FAIL: gcc.dg/tree-ssa/ssa-pre-17.c scan-tree-dump pre "Eliminated: 1"
+FAIL: gcc.dg/tree-ssa/ssa-pre-19.c scan-tree-dump pre "Eliminated: 3"
+FAIL: gcc.dg/tree-ssa/ssa-pre-20.c scan-tree-dump pre "New PHIs: 2"
+FAIL: gcc.dg/tree-ssa/ssa-pre-21.c scan-tree-dump-times pre "= \\\\*[^\\n;]*;" 2
+FAIL: gcc.dg/tree-ssa/ssa-pre-23.c scan-tree-dump pre "Eliminated: 3"
+FAIL: gcc.dg/tree-ssa/ssa-pre-25.c scan-tree-dump pre "Eliminated: 1"
+FAIL: gcc.dg/tree-ssa/ssa-pre-29.c scan-tree-dump pre "Replaced hoist"
+FAIL: gcc.dg/tree-ssa/ssa-pre-30.c scan-tree-dump-times pre "Replaced MEM" 3
+FAIL: gcc.dg/tree-ssa/ssa-pre-34.c scan-tree-dump pre "Insertions: 1"
+FAIL: gcc.dg/tree-ssa/ssa-pre-34.c scan-tree-dump pre "HOIST inserted: 1"
+FAIL: gcc.dg/tree-ssa/ssa-pre-34.c scan-tree-dump pre "Eliminated: 3"
+FAIL: gcc.dg/tree-ssa/ssa-pre-34.c scan-tree-dump-not optimized "foo"
+FAIL: gcc.dg/vect/bb-slp-57.c -flto -ffat-lto-objects  scan-tree-dump-times slp1 "transform load" 1
+FAIL: gcc.dg/vect/bb-slp-57.c scan-tree-dump-times slp1 "transform load" 1
+FAIL: gcc.dg/vect/pr56625.c scan-tree-dump-times vect "vectorized 1 loops" 1
+...
+
+- User: Jakub Jelinek | Time: 2024-02-27 12:40:31 UTC
+  Text: Could we for lookups if range isn't a subset of the found range pretend there was not a match, try to see through definitions again and only if it yields an equivalent result value range it the same?  Perhaps even remember the range used in it and in case we find non-subset lookup having the same result union the remembered range?
+
+- User: Jakub Jelinek | Time: 2024-02-27 12:41:08 UTC
+  Text: Shall I try to construct a non-bitint testcase for this?
+
+- User: Richard Biener | Time: 2024-02-27 13:54:12 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #11)> Shall I try to construct a non-bitint testcase for this?That would be nice, more coverage is always good.
+
+- User: Richard Biener | Time: 2024-02-27 14:19:02 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #10)> Could we for lookups if range isn't a subset of the found range pretend
+> there was not a match, try to see through definitions again and only if it
+> yields an equivalent result value range it the same?  Perhaps even remember
+> the range used in it and in case we find non-subset lookup having the same
+> result union the remembered range?So pretend we record the first match with using a range that improves
+the result in the hashtable.  Then, when looking up the second ref we
+hit the hashtable entry, see it has an incompatible range so we can't
+use the recorded value.  We can then easily only ignore the entry (the
+prototype patch does this).  As we can't easily tell whether we used any
+(or even which) range without doing multiple lookups for each ref and
+comparing the result "re-doing" things wouldn't work.
+
+But for determining two refs are equivalent it might be enough to avoid
+recording any kind of range for when the value was "varying".  The value
+of such hashtable entry would be usable even by lookups with narrower
+range (but also not yielding any better "constant" value).
+
+I'm trying to improve things this way.
+
+- User: Jakub Jelinek | Time: 2024-02-27 15:43:44 UTC
+  Text: Tried 
+__attribute__((noipa)) unsigned long
+foo (unsigned long x)
+{
+  unsigned long y[128], z = 0, w = 0;
+  y[127] = x;
+  __builtin_memset (&y, 0, 127 * sizeof (long));
+  for (unsigned long i = 0; i < 128; i += 2)
+    {
+      unsigned long a = y[i], b, c, d;
+      b = __builtin_subcl (0, a, z, &c);
+      z = c;
+      if (i >= 64)
+        {
+          if (i == 64)
+            w = c != 0;
+          else
+            w = (c != 0) | w;
+        }
+      d = i + 1;
+      a = y[d];
+      b = __builtin_subcl (0, a, z, &c);
+      z = c;
+      if (d > 64)
+        w = (c != 0) | w;
+    }
+  return w;
+}
+but that doesn't reproduce it unfortunately.
+
+- User: GCC Commits | Time: 2024-02-28 14:03:45 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:c841144a94363ff26e40ab3f26b14702c32987a8commitr14-9215-gc841144a94363ff26e40ab3f26b14702c32987a8Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Feb 28 12:37:07 2024 +0100
+
+    tree-optimization/114121 - wrong VN with context sensitive range info
+    
+    When VN ends up exploiting range-info specifying the ao_ref offset
+    and max_size we have to make sure to reflect this in the hashtable
+    entry for the recorded expression.  ThePR113831fix handled the
+    case where we can encode this in the operands themselves but this
+    bug shows the issue is more widespread.
+    
+    So instead of altering the operands the following instead records
+    this extra info that's possibly used, only throwing it away when
+    the value-numbering didn't come up with a non-VARYING value which
+    is an important detail to preserve CSE as opposed to constant
+    folding which is where all cases currently known popped up.
+    
+    With this the originalPR113831fix can be reverted.PR tree-optimization/114121* tree-ssa-sccvn.h (vn_reference_s::offset,
+            vn_reference_s::max_size): New fields.
+            (vn_reference_insert_pieces): Adjust prototype.
+            * tree-ssa-pre.cc (phi_translate_1): Preserve offset/max_size.
+            * tree-ssa-sccvn.cc (vn_reference_eq): Compare offset and
+            size, allow using "don't know" state.
+            (vn_walk_cb_data::finish): Pass along offset/max_size.
+            (vn_reference_lookup_or_insert_for_pieces): Take offset and
+            max_size as argument and use it.
+            (vn_reference_lookup_3): Properly adjust offset and max_size
+            according to the adjusted ao_ref.
+            (vn_reference_lookup_pieces): Initialize offset and max_size.
+            (vn_reference_lookup): Likewise.
+            (vn_reference_lookup_call): Likewise.
+            (vn_reference_insert): Likewise.
+            (visit_reference_op_call): Likewise.
+            (vn_reference_insert_pieces): Take offset and max_size
+            as argument and use it.
+    
+            * gcc.dg/torture/pr114121.c: New testcase.
+
+- User: Richard Biener | Time: 2024-02-28 14:04:01 UTC
+  Text: Fixed.
+
+- User: GCC Commits | Time: 2024-03-12 14:16:36 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:73dac51b32575f980289c073969c6d825963d076commitr14-9440-g73dac51b32575f980289c073969c6d825963d076Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Mar 12 14:00:05 2024 +0100
+
+    tree-optimization/114121 - chrec_fold_{plus,multiply} and recursion
+    
+    The following addresses endless recursion in the
+    chrec_fold_{plus,multiply} functions when handling sign-conversions.
+    We only need to apply tricks when we'd fail (there's a chrec in the
+    converted operand) and we need to make sure to not turn the other
+    operand into something worse (for the chrec-vs-chrec case).PR tree-optimization/114121* tree-chrec.cc (chrec_fold_plus_1): Guard recursion with
+            converted operand properly.
+            (chrec_fold_multiply): Likewise.  Handle missed recursion.
+    
+            * gcc.dg/torture/pr114312.c: New testcase.
+
+- User: GCC Commits | Time: 2024-05-07 06:18:53 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:14a16787d99831a28b0c9690e80c420d765ba26fcommitr13-8702-g14a16787d99831a28b0c9690e80c420d765ba26fAuthor: Richard Biener <rguenther@suse.de>
+Date:   Wed Feb 28 12:37:07 2024 +0100
+
+    tree-optimization/114121 - wrong VN with context sensitive range info
+    
+    When VN ends up exploiting range-info specifying the ao_ref offset
+    and max_size we have to make sure to reflect this in the hashtable
+    entry for the recorded expression.  ThePR113831fix handled the
+    case where we can encode this in the operands themselves but this
+    bug shows the issue is more widespread.
+    
+    So instead of altering the operands the following instead records
+    this extra info that's possibly used, only throwing it away when
+    the value-numbering didn't come up with a non-VARYING value which
+    is an important detail to preserve CSE as opposed to constant
+    folding which is where all cases currently known popped up.
+    
+    With this the originalPR113831fix can be reverted.PR tree-optimization/113831PR tree-optimization/114121* tree-ssa-sccvn.h (vn_reference_s::offset,
+            vn_reference_s::max_size): New fields.
+            (vn_reference_insert_pieces): Adjust prototype.
+            * tree-ssa-pre.cc (phi_translate_1): Preserve offset/max_size.
+            * tree-ssa-sccvn.cc (vn_reference_eq): Compare offset and
+            size, allow using "don't know" state.
+            (vn_walk_cb_data::finish): Pass along offset/max_size.
+            (vn_reference_lookup_or_insert_for_pieces): Take offset and
+            max_size as argument and use it.
+            (vn_reference_lookup_3): Properly adjust offset and max_size
+            according to the adjusted ao_ref.
+            (vn_reference_lookup_pieces): Initialize offset and max_size.
+            (vn_reference_lookup): Likewise.
+            (vn_reference_lookup_call): Likewise.
+            (vn_reference_insert): Likewise.
+            (visit_reference_op_call): Likewise.
+            (vn_reference_insert_pieces): Take offset and max_size
+            as argument and use it.
+    
+            * gcc.dg/torture/pr113831.c: New testcase.
+    
+    (cherry picked from commit c841144a94363ff26e40ab3f26b14702c32987a8)
+

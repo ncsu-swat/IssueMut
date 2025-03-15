@@ -1,0 +1,153 @@
+Bug Summary: [15 Regression] Recent phiopt change causing ICE with sqrt and -frounding-math
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jeffrey A. Law | Time: 2024-08-19 02:52:59 UTC
+  Text: riscv64 is failing to build glibc after the recent phiopt changes.
+
+
+
+Using a riscv64-elf cross compiler:
+
+./cc1 -O2 j.c -march=rv64gc -mabi=lp64d -frounding-math -fno-math-errno
+
+j.c:8:1: internal compiler error: in factor_out_conditional_operation, at tree-ssa-phiopt.cc:407
+
+Naturally the recent phiopt change is suspect.
+
+Reduced testcase:
+
+double kernel_ax;
+double sqrt();
+double fma();
+double kernel() {
+  if (kernel_ax)
+    return sqrt(fma());
+  return sqrt(fma());
+}
+
+- User: Andrew Pinski | Time: 2024-08-19 02:58:08 UTC
+  Text: Let me look. Note the testcase itself is undefined due to the undefined use of fma but I suspect using a different function will still cause the issue. The issue is sqrt here.
+
+- User: Andrew Pinski | Time: 2024-08-19 03:02:00 UTC
+  Text: `-O2 -frounding-math -fno-math-errno` is enough to get the ICE even on x86_64.
+
+- User: Andrew Pinski | Time: 2024-08-19 03:11:38 UTC
+  Text: I have a quick fix which just limits to const builtins (rather than pure).
+The expanded change to handle more than const functions will happen later.
+
+- User: Andrew Pinski | Time: 2024-08-19 03:29:27 UTC
+  Text: Better and well defined testcase which ICEs:
+```
+double f(int c, double a, double b) {
+  if (c)
+    return __builtin_sqrt(a);
+  return __builtin_sqrt(b);
+}
+
+```
+
+- User: Andrew Pinski | Time: 2024-08-19 03:51:22 UTC
+  Text: Createdattachment 58952[details]Patch which I am testing
+
+This adds the check so there is no assert. Basically non-const builtins can't be handled currently. This does reduce what can be done but not compared to GCC 14.
+
+- User: Andrew Pinski | Time: 2024-08-19 05:21:48 UTC
+  Text: ***Bug 116411has been marked as a duplicate of this bug. ***
+
+- User: Tamar Christina | Time: 2024-08-19 08:28:49 UTC
+  Text: I see the same error in povray on SPECCPU 2006 and 2017.
+
+- User: Andrew Pinski | Time: 2024-08-19 14:57:31 UTC
+  Text: Cleaned up testcase fromPR116411:
+```
+int f (int t, char *a, char *b) {
+  if (t)
+    return __builtin_strlen (a);
+  return __builtin_strlen (b);
+}
+```
+
+- User: Andrew Pinski | Time: 2024-08-19 18:41:31 UTC
+  Text: Patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2024-August/660807.html
+
+- User: David Binderman | Time: 2024-08-20 18:55:06 UTC
+  Text: This C code seems to fail with -O1:
+
+int RB_Open_SingleDocumentation_document;
+char RB_Open_SingleDocumentation_document_0,
+    RB_Open_SingleDocumentation_default_name;
+char *RB_Open_SingleDocumentation_name;
+void *calloc();
+unsigned long strlen();
+void RB_Open_SingleDocumentation() {
+  long size = 0;
+  if (RB_Open_SingleDocumentation_document)
+    size += strlen(&RB_Open_SingleDocumentation_document_0);
+  else
+    size += strlen(&RB_Open_SingleDocumentation_default_name);
+  RB_Open_SingleDocumentation_name = calloc(size);
+}
+
+cvise $ ~/gcc/results/bin/gcc -c -w -O1bug1045.c
+during GIMPLE pass: phioptbug1045.c: In function ‘RB_Open_SingleDocumentation’:bug1045.c:14:1: internal compiler error: in factor_out_conditional_operation, at tree-ssa-phiopt.cc:407
+   14 | }
+      | ^
+
+Might be useful as an additional test case.
+
+- User: Andrew Pinski | Time: 2024-08-20 18:56:20 UTC
+  Text: (In reply to David Binderman fromcomment #10)> This C code seems to fail with -O1:
+> 
+> int RB_Open_SingleDocumentation_document;
+> char RB_Open_SingleDocumentation_document_0,
+>     RB_Open_SingleDocumentation_default_name;
+> char *RB_Open_SingleDocumentation_name;
+> void *calloc();
+> unsigned long strlen();
+> void RB_Open_SingleDocumentation() {
+>   long size = 0;
+>   if (RB_Open_SingleDocumentation_document)
+>     size += strlen(&RB_Open_SingleDocumentation_document_0);
+>   else
+>     size += strlen(&RB_Open_SingleDocumentation_default_name);
+>   RB_Open_SingleDocumentation_name = calloc(size);
+> }
+>That is the same testcase ascomment #8.
+
+- User: GCC Commits | Time: 2024-08-20 20:27:00 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:404d947d8ddd3c3035dcea115e9bab4c4a6bfa1ccommitr15-3047-g404d947d8ddd3c3035dcea115e9bab4c4a6bfa1cAuthor: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Sun Aug 18 20:45:35 2024 -0700
+
+    phi-opt: Fix for failing maybe_push_res_to_seq in factor_out_conditional_operation [PR 116409]
+    
+    The code was assuming that maybe_push_res_to_seq would not fail if the gimple_extract_op returned true.
+    But for some cases when the function is pure rather than const, then it can fail.
+    This change moves around the code to check the result of maybe_push_res_to_seq instead of assuming it will
+    always work.
+    
+    Changes since v1:
+    * v2: Instead of directly testing non-pure builtin functions change to test if maybe_push_res_to_seq fails.
+    
+    Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/116409gcc/ChangeLog:
+    
+            * tree-ssa-phiopt.cc (factor_out_conditional_operation): Move
+            maybe_push_res_to_seq before creating the phi node and the debug dump.
+            Return false if maybe_push_res_to_seq fails.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/torture/pr116409-1.c: New test.
+            * gcc.dg/torture/pr116409-2.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-08-20 20:27:28 UTC
+  Text: Fixed.
+

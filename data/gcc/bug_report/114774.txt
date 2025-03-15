@@ -1,0 +1,154 @@
+Bug Summary: Missed DSE in simple code due to interleaving stores
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jan Hubicka | Time: 2024-04-18 18:26:46 UTC
+  Text: In the following
+
+#include <stdio.h>
+int a;
+short *p;
+void
+test (int b)
+{
+        a=1;
+        if (b)
+        {
+                (*p)++;
+                a=2;
+                printf ("1\n");
+        }
+        else 
+        {
+                (*p)++;
+                a=3;
+                printf ("2\n");
+        }
+}
+
+We are not able to optimize out "a=1". This is simplified real-world scenario where SRA does not remove definition of SRAed variables.
+
+Note that clang does conditional move here
+test:                                   # @test
+        .cfi_startproc
+# %bb.0:
+        movq    p(%rip), %rax
+        incw    (%rax)
+        xorl    %eax, %eax
+        testl   %edi, %edi
+        leaq    .Lstr(%rip), %rcx
+        leaq    .Lstr.2(%rip), %rdi
+        cmoveq  %rcx, %rdi
+        sete    %al
+        orl     $2, %eax
+        movl    %eax, a(%rip)
+        jmp     puts@PLT                        # TAILCALL
+
+- User: Jan Hubicka | Time: 2024-04-18 20:02:34 UTC
+  Text: the other store being conditional is not the core issue. Here we miss DSE too:
+
+#include <stdio.h>
+int a;
+short p,q;
+void
+test (int b)
+{
+        a=1;
+        if (b)
+          p++;
+        else
+          q++;
+        a=2;
+}
+
+The problem in DSE seems to be that instead of recursively walking the memory-SSA graph it insist the graph to form a chain. Now SRA leaves stores to scalarized variables and even removes the corresponding clobbers, so this is relatively common scenario in non-trivial C++ code.
+
+- User: Richard Biener | Time: 2024-04-19 06:01:18 UTC
+  Text: Yes, DSE walking doesn't "branch" but goes to some length handling some trivial branches only.  Mainly to avoid compile-time issues.  It needs larger
+re-structuring to fix that, but in principle it shouldn't be difficult.  Related to other PRs where the "trivial" cases are not enough (but could be amended).
+
+- User: Jan Hubicka | Time: 2024-04-19 07:36:11 UTC
+  Text: > Yes, DSE walking doesn't "branch" but goes to some length handling some trivial
+> branches only.  Mainly to avoid compile-time issues.  It needs larger
+> re-structuring to fix that, but in principle it shouldn't be difficult.Looking into it, instead of having simple outer loop it needs to
+maintain worklist of defs to proceed each annotated with live bitmap,
+rigt?
+
+With Maritn we noticed it while looking into push_back codegen. In case
+aggregate is passed to a function call but does not escape, we now SRA
+it removing all uses and corresponding clobbers, but we do not remove the
+stores (Martin was expecting DSE to do it). As a result the store stays
+around which causes partial memory stall (storing in pieces, loading as
+a whole). It seems easy to remove this specific store during SRA, but it
+seems improving DSE here would be desirable.
+
+- User: rguenther@suse.de | Time: 2024-04-19 08:20:21 UTC
+  Text: On Fri, 19 Apr 2024, hubicka at ucw dot cz wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=114774> 
+> ---Comment #3from Jan Hubicka <hubicka at ucw dot cz> ---
+> > Yes, DSE walking doesn't "branch" but goes to some length handling some trivial
+> > branches only.  Mainly to avoid compile-time issues.  It needs larger
+> > re-structuring to fix that, but in principle it shouldn't be difficult. 
+> 
+> Looking into it, instead of having simple outer loop it needs to
+> maintain worklist of defs to proceed each annotated with live bitmap,
+> rigt?Yeah, I have some patch on some branch somewhere ... IIRC it was broken
+and miscompiled things and I got distracted ...
+
+I will eventually get back to DSE for stage1 also because of some other
+PRs.> With Maritn we noticed it while looking into push_back codegen. In case
+> aggregate is passed to a function call but does not escape, we now SRA
+> it removing all uses and corresponding clobbers, but we do not remove the
+> stores (Martin was expecting DSE to do it). As a result the store stays
+> around which causes partial memory stall (storing in pieces, loading as
+> a whole). It seems easy to remove this specific store during SRA, but it
+> seems improving DSE here would be desirable.Yes.
+
+- User: Jan Hubicka | Time: 2024-04-19 09:23:22 UTC
+  Text: > > Looking into it, instead of having simple outer loop it needs to
+> > maintain worklist of defs to proceed each annotated with live bitmap,
+> > rigt?
+> 
+> Yeah, I have some patch on some branch somewhere ... IIRC it was broken
+> and miscompiled things and I got distracted ...
+> 
+> I will eventually get back to DSE for stage1 also because of some other
+> PRs.Great, thanks a lot!  I think next stage1 I can try to look more into
+libstdc++ related performance issues - it kind of surprises me how many
+things got noticed on push_back...
+
+- User: GCC Commits | Time: 2024-05-16 09:04:19 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:1e0ae1f52741f7e0133661659ed2d210f939a398commitr15-571-g1e0ae1f52741f7e0133661659ed2d210f939a398Author: Richard Biener <rguenther@suse.de>
+Date:   Wed May 15 18:32:37 2024 +0200
+
+    tree-optimization/79958 - make DSE track multiple paths
+    
+    DSE currently gives up when the path we analyze forks.  This leads
+    to multiple missed dead store elimination PRs.  The following fixes
+    this by recursing for each path and maintaining the visited bitmap
+    to avoid visiting CFG re-merges multiple times.  The overall cost
+    is still limited by the same bound, it's just more likely we'll hit
+    the limit now.  The patch doesn't try to deal with byte tracking
+    once a path forks but drops info on the floor and only handling
+    fully dead stores in that case.PR tree-optimization/79958PR tree-optimization/109087PR tree-optimization/100314PR tree-optimization/114774* tree-ssa-dse.cc (dse_classify_store): New forwarder.
+            (dse_classify_store): Add arguments cnt and visited, recurse
+            to track multiple paths when we end up with multiple defs.
+    
+            * gcc.dg/tree-ssa/ssa-dse-48.c: New testcase.
+            * gcc.dg/tree-ssa/ssa-dse-49.c: Likewise.
+            * gcc.dg/tree-ssa/ssa-dse-50.c: Likewise.
+            * gcc.dg/tree-ssa/ssa-dse-51.c: Likewise.
+            * gcc.dg/graphite/pr80906.c: Avoid DSE of last data reference
+            in loop.
+            * g++.dg/ipa/devirt-24.C: Adjust for extra DSE.
+            * g++.dg/warn/Wuninitialized-pr107919-1.C: Use more important
+            -O2 optimization level, -O1 regresses.
+
+- User: Richard Biener | Time: 2024-05-16 09:06:09 UTC
+  Text: Fixed for GCC 15.
+

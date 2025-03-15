@@ -1,0 +1,189 @@
+Bug Summary: [11 Regression] ICE with __builtin_memcpy with volatile and constants
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code, wrong-code
+Known to Work: 11.4.1, 12.3.1, 13.2.1, 14.0, 4.9.1
+Known to Fail: 10.1.0, 11.4.0, 12.3.0, 13.2.0, 5.1.0, 7.1.0
+
+Comments:
+- User: wierton | Time: 2023-10-15 01:38:38 UTC
+  Text: When compile below program with GCC-14 and option `-O1`, GCC-14 crashes:
+```
+#define DUMMY_VALUE 0x12345678
+static void foo(const volatile unsigned int x, void *p) {
+  __builtin_memcpy(p, &x, sizeof x);
+  __builtin_memcpy(p, &x, sizeof x);
+}
+
+void bar(int type, void *number) {
+  switch (type) {
+  case 1: foo(DUMMY_VALUE, number); break;
+  case 7: foo(0, number); break;
+  case 8: foo(0, number); break;
+  case 9: foo(0, number); break;
+  }
+}
+```
+
+The crash reproducer:https://godbolt.org/z/7sP8zc3KcAnd the full stack dump:
+```
+<source>: In function 'foo':
+<source>:3:23: warning: passing argument 2 of '__builtin_memcpy' discards 'volatile' qualifier from pointer target type [-Wdiscarded-qualifiers]
+    3 |   __builtin_memcpy(p, &x, sizeof x);
+      |                       ^~
+<source>:3:23: note: expected 'const void *' but argument is of type 'const volatile unsigned int *'
+<source>:4:23: warning: passing argument 2 of '__builtin_memcpy' discards 'volatile' qualifier from pointer target type [-Wdiscarded-qualifiers]
+    4 |   __builtin_memcpy(p, &x, sizeof x);
+      |                       ^~
+<source>:4:23: note: expected 'const void *' but argument is of type 'const volatile unsigned int *'
+during RTL pass: expand
+In function 'foo',
+    inlined from 'bar' at <source>:9:11:
+<source>:3:3: internal compiler error: tree check: expected tree that contains 'decl common' structure, have 'integer_cst' in tree_could_trap_p, at tree-eh.cc:2733
+    3 |   __builtin_memcpy(p, &x, sizeof x);
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+0x22ff3ee internal_error(char const*, ...)
+	???:0
+0x8a8243 tree_contains_struct_check_failed(tree_node const*, tree_node_structure_enum, char const*, int, char const*)
+	???:0
+0xc9ab0e set_mem_attributes_minus_bitpos(rtx_def*, tree_node*, int, poly_int<1u, long>)
+	???:0
+0xcc6c35 expand_expr_real_1(tree_node*, rtx_def*, machine_mode, expand_modifier, rtx_def**, bool)
+	???:0
+0xcd3083 store_expr(tree_node*, rtx_def*, int, bool, bool)
+	???:0
+0xcd4d66 expand_assignment(tree_node*, tree_node*, bool)
+	???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+```
+
+- User: Andrew Pinski | Time: 2023-10-15 01:47:21 UTC
+  Text: Confirmed.
+Even though GCC 11.x and 12.x and 13.x don't ICE without checking enabled. The IR is still invalid:
+  _9 ={v} MEM <unsigned int> [(char * {ref-all})&305419896];
+
+That is just wrong.
+
+- User: Richard Biener | Time: 2023-10-16 06:59:45 UTC
+  Text: It's inlining of
+
+void foo (const volatile unsigned int x, void * p)
+{
+  unsigned int _2;
+  unsigned int _5;
+
+  <bb 2> [local count: 1073741824]:
+  _2 ={v} MEM <unsigned int> [(char * {ref-all})&x];
+
+into
+
+  foo (305419896, number_4(D));
+
+Smaller testcase:
+
+static void foo(const volatile unsigned int x, void *p) 
+{ 
+  __builtin_memcpy(p, &x, sizeof x);
+}
+
+void bar(void *number)
+{ 
+  foo(0, number);
+}
+
+- User: GCC Commits | Time: 2023-10-17 06:26:39 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:ce55521bcd149fdc431f1d78e706b66d470210aecommitr14-4678-gce55521bcd149fdc431f1d78e706b66d470210aeAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Oct 16 12:50:46 2023 +0200
+
+    middle-end/111818 - failed DECL_NOT_GIMPLE_REG_P setting of volatile
+    
+    The following addresses a missed DECL_NOT_GIMPLE_REG_P setting of
+    a volatile declared parameter which causes inlining to substitute
+    a constant parameter into a context where its address is required.
+    
+    The main issue is in update_address_taken which clears
+    DECL_NOT_GIMPLE_REG_P from the parameter but fails to rewrite it
+    because is_gimple_reg returns false for volatiles.  The following
+    changes maybe_optimize_var to make the 1:1 correspondence between
+    clearing DECL_NOT_GIMPLE_REG_P of a register typed decl and
+    actually rewriting it to SSA.PR middle-end/111818* tree-ssa.cc (maybe_optimize_var): When clearing
+            DECL_NOT_GIMPLE_REG_P always rewrite into SSA.
+    
+            * gcc.dg/torture/pr111818.c: New testcase.
+
+- User: Richard Biener | Time: 2023-10-17 06:27:28 UTC
+  Text: Fixed on trunk sofar.
+
+- User: GCC Commits | Time: 2023-11-10 14:24:39 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:ffb0615cf1aa628ca8aa10bda31fe1bc554eccf3commitr13-8044-gffb0615cf1aa628ca8aa10bda31fe1bc554eccf3Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Oct 16 12:50:46 2023 +0200
+
+    middle-end/111818 - failed DECL_NOT_GIMPLE_REG_P setting of volatile
+    
+    The following addresses a missed DECL_NOT_GIMPLE_REG_P setting of
+    a volatile declared parameter which causes inlining to substitute
+    a constant parameter into a context where its address is required.
+    
+    The main issue is in update_address_taken which clears
+    DECL_NOT_GIMPLE_REG_P from the parameter but fails to rewrite it
+    because is_gimple_reg returns false for volatiles.  The following
+    changes maybe_optimize_var to make the 1:1 correspondence between
+    clearing DECL_NOT_GIMPLE_REG_P of a register typed decl and
+    actually rewriting it to SSA.PR middle-end/111818* tree-ssa.cc (maybe_optimize_var): When clearing
+            DECL_NOT_GIMPLE_REG_P always rewrite into SSA.
+    
+            * gcc.dg/torture/pr111818.c: New testcase.
+    
+    (cherry picked from commit ce55521bcd149fdc431f1d78e706b66d470210ae)
+
+- User: GCC Commits | Time: 2023-11-27 13:09:59 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:2cc700fec5c72d9c1385ec83621771bb9db58d96commitr12-10014-g2cc700fec5c72d9c1385ec83621771bb9db58d96Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Oct 16 12:50:46 2023 +0200
+
+    middle-end/111818 - failed DECL_NOT_GIMPLE_REG_P setting of volatile
+    
+    The following addresses a missed DECL_NOT_GIMPLE_REG_P setting of
+    a volatile declared parameter which causes inlining to substitute
+    a constant parameter into a context where its address is required.
+    
+    The main issue is in update_address_taken which clears
+    DECL_NOT_GIMPLE_REG_P from the parameter but fails to rewrite it
+    because is_gimple_reg returns false for volatiles.  The following
+    changes maybe_optimize_var to make the 1:1 correspondence between
+    clearing DECL_NOT_GIMPLE_REG_P of a register typed decl and
+    actually rewriting it to SSA.PR middle-end/111818* tree-ssa.cc (maybe_optimize_var): When clearing
+            DECL_NOT_GIMPLE_REG_P always rewrite into SSA.
+    
+            * gcc.dg/torture/pr111818.c: New testcase.
+    
+    (cherry picked from commit ce55521bcd149fdc431f1d78e706b66d470210ae)
+
+- User: GCC Commits | Time: 2023-12-15 12:18:18 UTC
+  Text: The releases/gcc-11 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:45c296f2d81f6259e268e07707b4aa87dffba20acommitr11-11142-g45c296f2d81f6259e268e07707b4aa87dffba20aAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Oct 16 12:50:46 2023 +0200
+
+    middle-end/111818 - failed DECL_NOT_GIMPLE_REG_P setting of volatile
+    
+    The following addresses a missed DECL_NOT_GIMPLE_REG_P setting of
+    a volatile declared parameter which causes inlining to substitute
+    a constant parameter into a context where its address is required.
+    
+    The main issue is in update_address_taken which clears
+    DECL_NOT_GIMPLE_REG_P from the parameter but fails to rewrite it
+    because is_gimple_reg returns false for volatiles.  The following
+    changes maybe_optimize_var to make the 1:1 correspondence between
+    clearing DECL_NOT_GIMPLE_REG_P of a register typed decl and
+    actually rewriting it to SSA.PR middle-end/111818* tree-ssa.c (maybe_optimize_var): When clearing
+            DECL_NOT_GIMPLE_REG_P always rewrite into SSA.
+    
+            * gcc.dg/torture/pr111818.c: New testcase.
+    
+    (cherry picked from commit ce55521bcd149fdc431f1d78e706b66d470210ae)
+
+- User: Richard Biener | Time: 2023-12-15 12:22:24 UTC
+  Text: Fixed.
+

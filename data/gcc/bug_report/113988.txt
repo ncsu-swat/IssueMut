@@ -1,0 +1,692 @@
+Bug Summary: during GIMPLE pass: bitintlower: internal compiler error: in lower_stmt, at gimple-lower-bitint.cc:5470
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jan Schultke | Time: 2024-02-19 09:51:39 UTC
+  Text: https://godbolt.org/z/3ez1erYa3unsigned rem_fast(_BitInt(512) x, unsigned y) {
+    const int size = sizeof(x) / 4;
+    unsigned digits[size];
+    __builtin_memcpy(digits, &x, sizeof(digits));
+    unsigned rem = 0;
+    for (int i = 0; i < size; ++i) {
+        unsigned long long temp = (unsigned long long) rem << 32 | digits[size - i - 1];
+        rem = temp % y;
+    }
+    return rem;
+}
+
+
+during GIMPLE pass: bitintlower
+<source>: In function 'rem_fast':
+<source>:1:10: internal compiler error: in lower_stmt, at gimple-lower-bitint.cc:5470
+    1 | unsigned rem_fast(_BitInt(512) x, unsigned y) {
+      |          ^~~~~~~~
+0x233bebc internal_error(char const*, ...)
+	???:0
+0x96c2ff fancy_abort(char const*, int, char const*)
+	???:0
+
+- User: Andrew Pinski | Time: 2024-02-19 10:00:46 UTC
+  Text: Confirmed, very similar toPR 113783but we get:
+  _11 = (uint512_t) x_10(D);
+  MEM <uint512_t> [(char * {ref-all})&digits] = _11;
+
+And not a VIEW_CONVERT_EXPR here.
+
+- User: Jan Schultke | Time: 2024-02-19 10:01:05 UTC
+  Text: Oh yeah, I should have noted that this only happens for AVX-512 targets.
+
+Changing -march=znver4 to -march=znver3 stops the ICE.
+
+- User: Jakub Jelinek | Time: 2024-02-19 10:05:09 UTC
+  Text: Ugh, types that can't be really supported used like that are toxic :(
+
+- User: Richard Biener | Time: 2024-02-19 14:22:20 UTC
+  Text: I wonder if we should stop claiming those modes are "supported".  Maybe instead of making them integer modes they should be OPAQUE_MODE or vector (integer) modes in the first place?  There's bitwise_mode_for_mode but that will
+I think never do anything unless we have MAX_FIXED_MODE_SIZE < OImode?
+It will also never make vector modes from integer modes ...
+
+- User: Richard Biener | Time: 2024-02-19 14:30:18 UTC
+  Text: Likely "caused" by upping MOVE_MAX and GIMPLE memcpy folding exposing this
+type by means of build_nonstandard_integer_type.
+
+We have from that
+
+      D.5177 = MEM <uint512_t> [(char * {ref-all})&x];
+      MEM <uint512_t> [(char * {ref-all})digits.0] = D.5177;
+
+and then into-SSA rewriting x as
+
+  _22 = VIEW_CONVERT_EXPR<uint512_t>(x_21(D));
+  MEM <uint512_t> [(char * {ref-all})digits.0_20] = _22;
+
+which is eventually folded to a regular conversion by match.pd:4683.  Not
+sure if retaining a V_C_E would have helped here.  Maybe lowering should
+simply special-case a sign-conversion?
+
+- User: Richard Biener | Time: 2024-02-19 14:34:16 UTC
+  Text: -mstore-max=128 -mmove-max=128 avoids it and we inline the memcpy as
+
+      D.5177 = MEM <_BitInt(512)> [(char * {ref-all})&x];
+      MEM <_BitInt(512)> [(char * {ref-all})digits.0] = D.5177;
+
+using a _BitInt(512) temporary instead.
+
+- User: Jakub Jelinek | Time: 2024-02-19 14:34:41 UTC
+  Text: I think I can handle it like the VIEW_CONVERT_EXPR case, bet with _BitInt(511) it would actually be a VCE, but when it is same size BITINT_TYPE to INTEGER_TYPE we choose NOP_EXPR.
+That said, I think it would be better if the memcpy folding used say vector types instead of these extra large integer types.
+
+- User: Richard Biener | Time: 2024-02-19 14:37:15 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #7)> I think I can handle it like the VIEW_CONVERT_EXPR case, bet with
+> _BitInt(511) it would actually be a VCE, but when it is same size
+> BITINT_TYPE to INTEGER_TYPE we choose NOP_EXPR.
+> That said, I think it would be better if the memcpy folding used say vector
+> types instead of these extra large integer types.Hmm.  Maybe we want a target hook to specify the "move mode" for a given
+byte size and then we can use bitwise_type_for_mode to get a type?
+
+Maybe we can even get rid of that large integer mode requirement that way ...
+
+- User: Richard Biener | Time: 2024-02-19 14:39:28 UTC
+  Text: (In reply to Richard Biener fromcomment #8)> (In reply to Jakub Jelinek fromcomment #7)
+> > I think I can handle it like the VIEW_CONVERT_EXPR case, bet with
+> > _BitInt(511) it would actually be a VCE, but when it is same size
+> > BITINT_TYPE to INTEGER_TYPE we choose NOP_EXPR.
+> > That said, I think it would be better if the memcpy folding used say vector
+> > types instead of these extra large integer types.
+> 
+> Hmm.  Maybe we want a target hook to specify the "move mode" for a given
+> byte size and then we can use bitwise_type_for_mode to get a type?
+> 
+> Maybe we can even get rid of that large integer mode requirement that way ...Or we refuse to use integer types for > MAX_FIXED_MODE_SIZE sizes and
+instead always try VNQImode?  For memcpy folding I mean.
+
+- User: Jakub Jelinek | Time: 2024-02-19 14:40:42 UTC
+  Text: (In reply to Richard Biener fromcomment #9)> (In reply to Richard Biener fromcomment #8)
+> > (In reply to Jakub Jelinek fromcomment #7)
+> > > I think I can handle it like the VIEW_CONVERT_EXPR case, bet with
+> > > _BitInt(511) it would actually be a VCE, but when it is same size
+> > > BITINT_TYPE to INTEGER_TYPE we choose NOP_EXPR.
+> > > That said, I think it would be better if the memcpy folding used say vector
+> > > types instead of these extra large integer types.
+> > 
+> > Hmm.  Maybe we want a target hook to specify the "move mode" for a given
+> > byte size and then we can use bitwise_type_for_mode to get a type?
+> > 
+> > Maybe we can even get rid of that large integer mode requirement that way ...
+> 
+> Or we refuse to use integer types for > MAX_FIXED_MODE_SIZE sizes and
+> instead always try VNQImode?  For memcpy folding I mean.Yeah, and punt if that mode isn't supported.
+
+- User: Jakub Jelinek | Time: 2024-02-19 14:42:17 UTC
+  Text: Though, bet that would mean we punt with -mavx -mno-avx2 on 32-byte copies, because there we support just V8SFmode and not V32QImode.
+
+- User: rguenther@suse.de | Time: 2024-02-19 14:44:34 UTC
+  Text: On Mon, 19 Feb 2024, jakub at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113988> 
+> ---Comment #10from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> (In reply to Richard Biener fromcomment #9)
+> > (In reply to Richard Biener fromcomment #8)
+> > > (In reply to Jakub Jelinek fromcomment #7)
+> > > > I think I can handle it like the VIEW_CONVERT_EXPR case, bet with
+> > > > _BitInt(511) it would actually be a VCE, but when it is same size
+> > > > BITINT_TYPE to INTEGER_TYPE we choose NOP_EXPR.
+> > > > That said, I think it would be better if the memcpy folding used say vector
+> > > > types instead of these extra large integer types.
+> > > 
+> > > Hmm.  Maybe we want a target hook to specify the "move mode" for a given
+> > > byte size and then we can use bitwise_type_for_mode to get a type?
+> > > 
+> > > Maybe we can even get rid of that large integer mode requirement that way ...
+> > 
+> > Or we refuse to use integer types for > MAX_FIXED_MODE_SIZE sizes and
+> > instead always try VNQImode?  For memcpy folding I mean.
+> 
+> Yeah, and punt if that mode isn't supported.Or simply use mode_for_size with MODE_VECTOR_INT (though that doesn't
+check targetm.vector_mode_supported_p for vector modes).  Just
+in case a target doesn't have QImode component support.
+
+- User: H.J. Lu | Time: 2024-02-19 15:35:23 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #11)> Though, bet that would mean we punt with -mavx -mno-avx2 on 32-byte copies,
+> because there we support just V8SFmode and not V32QImode.Punt AVX without AVX2 shouldn't have any meaningful impacts on codegen
+for real applications.
+
+- User: Jakub Jelinek | Time: 2024-02-19 18:57:36 UTC
+  Text: --- gcc/gimple-fold.cc.jj	2024-02-06 12:59:58.343050621 +0100
++++ gcc/gimple-fold.cc	2024-02-19 19:48:11.162126759 +0100
+@@ -995,9 +995,27 @@ gimple_fold_builtin_memory_op (gimple_st
+ 		if (warning != OPT_Wrestrict)
+ 		  return false;
+ 
+-	      scalar_int_mode mode;
+-	      if (int_mode_for_size (ilen * 8, 0).exists (&mode)
+-		  && GET_MODE_SIZE (mode) * BITS_PER_UNIT == ilen * 8
++	      machine_mode mode = BLKmode;
++	      scalar_int_mode imode;
++	      if (ilen * BITS_PER_UNIT <= MAX_FIXED_MODE_SIZE)
++		{
++		  if (int_mode_for_size (ilen * BITS_PER_UNIT,
++					 0).exists (&imode)
++		      && GET_MODE_SIZE (imode) == ilen)
++		    mode = imode;
++		}
++	      else if (int_mode_for_size (ilen * BITS_PER_UNIT,
++					  0).exists (&imode))
++		{
++		  /* For > MAX_FIXED_MODE_SIZE, use a vector mode if
++		     it exists rather than a barely supported huge
++		     INTEGER_TYPE.  */
++		  if (!mode_for_vector (QImode, ilen).exists (&mode)
++		      || !VECTOR_MODE_P (mode)
++		      || !targetm.vector_mode_supported_p (mode))
++		    mode = BLKmode;
++		}
++	      if (mode != BLKmode
+ 		  /* If the destination pointer is not aligned we must be able
+ 		     to emit an unaligned store.  */
+ 		  && (dest_align >= GET_MODE_ALIGNMENT (mode)
+@@ -1005,7 +1023,12 @@ gimple_fold_builtin_memory_op (gimple_st
+ 		      || (optab_handler (movmisalign_optab, mode)
+ 			  != CODE_FOR_nothing)))
+ 		{
+-		  tree type = build_nonstandard_integer_type (ilen * 8, 1);
++		  tree type;
++		  if (VECTOR_MODE_P (mode))
++		    type = build_vector_type_for_mode (char_type_node, mode);
++		  else
++		    type = build_nonstandard_integer_type (ilen
++							   * BITS_PER_UNIT, 1);
+ 		  tree srctype = type;
+ 		  tree desttype = type;
+ 		  if (src_align < GET_MODE_ALIGNMENT (mode))
+does something like that (kept the int_mode_for_size (ilen * BITS_PER_UNIT, 0).exists (&imode) in there even for the large modes for now so that it doesn't try to use it for sizes for which it previously did nothing).
+That said, with that now bothPR113783and following ICE.  Guess I should add VCE support to arbitrary types from and to large/huge BITINT_TYPE + more testsuite coverage, and guess even handling the conversions to the barely supported huge INTEGER_TYPEs won't hurt, so perhaps the above patch just for stage1?
+
+/*PR tree-optimization/113988*/
+/* { dg-do compile { target bitint } } */
+/* { dg-options "-O2" } */
+/* { dg-additional-options "-mavx512f" { target i?86-*-* x86_64-*-* } } */
+
+int i;
+
+#if __BITINT_MAXWIDTH__ >= 256
+void
+foo (void *p, _BitInt(256) x)
+{
+  __builtin_memcpy (p, &x, sizeof x);
+}
+
+_BitInt(256)
+bar (void *p, _BitInt(256) x)
+{
+  _BitInt(246) y = x + 1;
+  __builtin_memcpy (p, &y, sizeof y);
+  return x;
+}
+#endif
+
+#if __BITINT_MAXWIDTH__ >= 512
+void
+baz (void *p, _BitInt(512) x)
+{
+  __builtin_memcpy (p, &x, sizeof x);
+}
+
+_BitInt(512)
+qux (void *p, _BitInt(512) x)
+{
+  _BitInt(512) y = x + 1;
+  __builtin_memcpy (p, &y, sizeof y);
+  return x;
+}
+#endif
+
+- User: Richard Biener | Time: 2024-02-20 07:32:14 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #14)> --- gcc/gimple-fold.cc.jj	2024-02-06 12:59:58.343050621 +0100
+> +++ gcc/gimple-fold.cc	2024-02-19 19:48:11.162126759 +0100
+> @@ -995,9 +995,27 @@ gimple_fold_builtin_memory_op (gimple_st
+>  		if (warning != OPT_Wrestrict)
+>  		  return false;
+>  
+> -	      scalar_int_mode mode;
+> -	      if (int_mode_for_size (ilen * 8, 0).exists (&mode)
+> -		  && GET_MODE_SIZE (mode) * BITS_PER_UNIT == ilen * 8
+> +	      machine_mode mode = BLKmode;
+> +	      scalar_int_mode imode;
+> +	      if (ilen * BITS_PER_UNIT <= MAX_FIXED_MODE_SIZE)
+> +		{
+> +		  if (int_mode_for_size (ilen * BITS_PER_UNIT,
+> +					 0).exists (&imode)
+> +		      && GET_MODE_SIZE (imode) == ilen)
+> +		    mode = imode;
+> +		}
+> +	      else if (int_mode_for_size (ilen * BITS_PER_UNIT,
+> +					  0).exists (&imode))
+> +		{
+> +		  /* For > MAX_FIXED_MODE_SIZE, use a vector mode if
+> +		     it exists rather than a barely supported huge
+> +		     INTEGER_TYPE.  */
+> +		  if (!mode_for_vector (QImode, ilen).exists (&mode)
+> +		      || !VECTOR_MODE_P (mode)
+> +		      || !targetm.vector_mode_supported_p (mode))
+> +		    mode = BLKmode;
+> +		}
+> +	      if (mode != BLKmode
+>  		  /* If the destination pointer is not aligned we must be able
+>  		     to emit an unaligned store.  */
+>  		  && (dest_align >= GET_MODE_ALIGNMENT (mode)
+> @@ -1005,7 +1023,12 @@ gimple_fold_builtin_memory_op (gimple_st
+>  		      || (optab_handler (movmisalign_optab, mode)
+>  			  != CODE_FOR_nothing)))
+>  		{
+> -		  tree type = build_nonstandard_integer_type (ilen * 8, 1);
+> +		  tree type;
+> +		  if (VECTOR_MODE_P (mode))
+> +		    type = build_vector_type_for_mode (char_type_node, mode);
+> +		  else
+> +		    type = build_nonstandard_integer_type (ilen
+> +							   * BITS_PER_UNIT, 1);
+>  		  tree srctype = type;
+>  		  tree desttype = type;
+>  		  if (src_align < GET_MODE_ALIGNMENT (mode))
+> does something like that (kept the int_mode_for_size (ilen * BITS_PER_UNIT,
+> 0).exists (&imode) in there even for the large modes for now so that it
+> doesn't try to use it for sizes for which it previously did nothing).
+> That said, with that now bothPR113783and following ICE.  Guess I should
+> add VCE support to arbitrary types from and to large/huge BITINT_TYPE + more
+> testsuite coverage, and guess even handling the conversions to the barely
+> supported huge INTEGER_TYPEs won't hurt, so perhaps the above patch just for
+> stage1?If we can deal with the current situation in lowering I think yes, this looks
+like for stage1 (and then the int_mode_for_size could be skipped).  I do
+wonder if using mode_for_size (..., MODE_VECTOR_INT) would be better though.
+
+Also you could use bitwise_type_for_mode (mode) which should work for both
+vector and integer modes.
+
+That said, I'm sure using vector types might end up uncovering its own
+share of (latent) issues ;)
+
+- User: Richard Sandiford | Time: 2024-02-20 09:12:24 UTC
+  Text: I think it'd be worth splitting the mode selection out
+into a helper called bitwise_mode_for_size, to go alongside
+bitwise_mode_for_mode.
+
+- User: Jakub Jelinek | Time: 2024-02-21 12:40:18 UTC
+  Text: So, I've tried
+--- gcc/gimple-lower-bitint.cc.jj	2024-02-15 09:52:40.999145971 +0100
++++ gcc/gimple-lower-bitint.cc	2024-02-21 12:48:38.704163901 +0100
+@@ -5307,12 +5307,15 @@ bitint_large_huge::lower_stmt (gimple *s
+ 	  final_cast_p = true;
+ 	  if (TREE_CODE (TREE_TYPE (lhs)) == INTEGER_TYPE
+ 	      && TYPE_PRECISION (TREE_TYPE (lhs)) > MAX_FIXED_MODE_SIZE
+-	      && gimple_assign_rhs_code (stmt) == VIEW_CONVERT_EXPR)
++	      && (gimple_assign_rhs_code (stmt) == VIEW_CONVERT_EXPR
++		  || (TYPE_PRECISION (TREE_TYPE (lhs))
++		      == TYPE_PRECISION (TREE_TYPE (rhs1)))))
+ 	    {
+-	      /* Handle VIEW_CONVERT_EXPRs to not generally supported
+-		 huge INTEGER_TYPEs like uint256_t or uint512_t.  These
+-		 are usually emitted from memcpy folding and backends
+-		 support moves with them but that is usually it.  */
++	      /* Handle VIEW_CONVERT_EXPRs or same precision casts to not
++		 generally supported huge INTEGER_TYPEs like uint256_t or
++		 uint512_t.  These are usually emitted from memcpy folding
++		 and backends support moves with them but that is usually
++		 it.  */
+ 	      if (TREE_CODE (rhs1) == INTEGER_CST)
+ 		{
+ 		  rhs1 = fold_unary (VIEW_CONVERT_EXPR, TREE_TYPE (lhs),
+@@ -5339,6 +5342,7 @@ bitint_large_huge::lower_stmt (gimple *s
+ 		  rhs1 = build1 (VIEW_CONVERT_EXPR, TREE_TYPE (lhs),
+ 				 m_vars[part]);
+ 		  gimple_assign_set_rhs1 (stmt, rhs1);
++		  gimple_assign_set_rhs_code (stmt, VIEW_CONVERT_EXPR);
+ 		}
+ 	      update_stmt (stmt);
+ 	      return;
+and while that fixes #c14 bar and qux, foo and baz still ICE, this time during expansion:pr113988.c: In function ‘foo’:pr113988.c:12:3: internal compiler error: in convert_move, at expr.cc:223
+   12 |   __builtin_memcpy (p, &x, sizeof x);
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+0x801435 convert_move(rtx_def*, rtx_def*, int)
+	../../gcc/expr.cc:223
+0x826b99 expand_expr_real_2(separate_ops*, rtx_def*, machine_mode, expand_modifier)
+	../../gcc/expr.cc:9799
+0x82c8f5 expand_expr_real_gassign(gassign*, rtx_def*, machine_mode, expand_modifier, rtx_def**, bool)
+	../../gcc/expr.cc:11096
+0x82d4b2 expand_expr_real_1(tree_node*, rtx_def*, machine_mode, expand_modifier, rtx_def**, bool)
+	../../gcc/expr.cc:11277
+0x825541 expand_expr_real(tree_node*, rtx_def*, machine_mode, expand_modifier, rtx_def**, bool)
+	../../gcc/expr.cc:9440
+0x81a2df store_expr(tree_node*, rtx_def*, int, bool, bool)
+	../../gcc/expr.cc:6740
+0x818717 expand_assignment(tree_node*, tree_node*, bool)
+	../../gcc/expr.cc:6461
+The problem is that for bar/qux it is a VCE from an array, so nothing tries to change it into something else, for e.g. foo bitintlower turns it into
+  uint256_t _2;
+
+  <bb 2> [local count: 1073741824]:
+  _2 = VIEW_CONVERT_EXPR<uint256_t>(x);
+  MEM <uint256_t> [(char * {ref-all})p_4(D)] = _2;
+where x is TREE_ADDRESSABLE _BitInt(256) PARM_DECL, but forwprop3 turns that into
+  _2 = (uint256_t) x_1(D);
+and expansion isn't able to expand that (BLKmode PARM_DECL expanded as a MEM NOP_EXPR converted to OImode.
+
+So, either we could somehow handle that case during expansion (treat it basically as VCE), or tweak the
+/* For integral conversions with the same precision or pointer
+   conversions use a NOP_EXPR instead.  */
+(simplify
+  (view_convert @0)
+  (if ((INTEGRAL_TYPE_P (type) || POINTER_TYPE_P (type))
+       && (INTEGRAL_TYPE_P (TREE_TYPE (@0)) || POINTER_TYPE_P (TREE_TYPE (@0)))
+       && TYPE_PRECISION (type) == TYPE_PRECISION (TREE_TYPE (@0)))
+   (convert @0)))
+match.pd rule not to do that for INTEGER_TYPEs with PRECISION > MAX_FIXED_TYPE_PRECISION (then we don't need the gimple-lower-bitint.cc changes either).
+--- gcc/match.pd.jj	2024-02-19 09:42:16.583617451 +0100
++++ gcc/match.pd	2024-02-21 13:32:06.567816298 +0100
+@@ -4679,7 +4679,13 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+   (view_convert @0)
+   (if ((INTEGRAL_TYPE_P (type) || POINTER_TYPE_P (type))
+        && (INTEGRAL_TYPE_P (TREE_TYPE (@0)) || POINTER_TYPE_P (TREE_TYPE (@0)))
+-       && TYPE_PRECISION (type) == TYPE_PRECISION (TREE_TYPE (@0)))
++       && TYPE_PRECISION (type) == TYPE_PRECISION (TREE_TYPE (@0))
++       /* Punt for conversions from or to barely supported huge
++	  INTEGER_TYPEs.  Those can handle just loads/stores/moves but
++	  nothing else.  */
++       && (TYPE_PRECISION (type) <= MAX_FIXED_MODE_SIZE
++	   || (TREE_CODE (type) != INTEGER_TYPE
++	       && TREE_CODE (TREE_TYPE (@0)) != INTEGER_TYPE)))
+    (convert @0)))
+ 
+ /* Strip inner integral conversions that do not change precision or size, or
+
+- User: Jakub Jelinek | Time: 2024-02-21 12:50:17 UTC
+  Text: Createdattachment 57479[details]gcc14-pr113988.patch
+
+Full untested patch for that variant.
+
+- User: rguenther@suse.de | Time: 2024-02-22 07:47:23 UTC
+  Text: On Wed, 21 Feb 2024, jakub at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113988> 
+> ---Comment #17from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> So, either we could somehow handle that case during expansion (treat it
+> basically as VCE), or tweak the
+> /* For integral conversions with the same precision or pointer
+>    conversions use a NOP_EXPR instead.  */
+> (simplify
+>   (view_convert @0)
+>   (if ((INTEGRAL_TYPE_P (type) || POINTER_TYPE_P (type))
+>        && (INTEGRAL_TYPE_P (TREE_TYPE (@0)) || POINTER_TYPE_P (TREE_TYPE (@0)))
+>        && TYPE_PRECISION (type) == TYPE_PRECISION (TREE_TYPE (@0)))
+>    (convert @0)))
+> match.pd rule not to do that for INTEGER_TYPEs with PRECISION >
+> MAX_FIXED_TYPE_PRECISION (then we don't need the gimple-lower-bitint.cc changes
+> either).
+> --- gcc/match.pd.jj     2024-02-19 09:42:16.583617451 +0100
+> +++ gcc/match.pd        2024-02-21 13:32:06.567816298 +0100
+> @@ -4679,7 +4679,13 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+>    (view_convert @0)
+>    (if ((INTEGRAL_TYPE_P (type) || POINTER_TYPE_P (type))
+>         && (INTEGRAL_TYPE_P (TREE_TYPE (@0)) || POINTER_TYPE_P (TREE_TYPE
+> (@0)))
+> -       && TYPE_PRECISION (type) == TYPE_PRECISION (TREE_TYPE (@0)))
+> +       && TYPE_PRECISION (type) == TYPE_PRECISION (TREE_TYPE (@0))
+> +       /* Punt for conversions from or to barely supported huge
+> +         INTEGER_TYPEs.  Those can handle just loads/stores/moves but
+> +         nothing else.  */
+> +       && (TYPE_PRECISION (type) <= MAX_FIXED_MODE_SIZE
+> +          || (TREE_CODE (type) != INTEGER_TYPE
+> +              && TREE_CODE (TREE_TYPE (@0)) != INTEGER_TYPE)))
+>     (convert @0)))
+> 
+>  /* Strip inner integral conversions that do not change precision or size, orI think the usual BLKmode check would be better here?  Apart from
+that this looks correct, we shouldn't use a regular convert on
+a non-register type.  In fact, it looks like all bitint types are
+register types because we want SSA names for them.  A bit of a
+"bad" design ...
+
+We've used BLKmode checks elsewhere so I think it would be appropriate
+here, too.
+
+- User: Jakub Jelinek | Time: 2024-02-22 08:10:18 UTC
+  Text: (In reply torguenther@suse.defromcomment #19)> I think the usual BLKmode check would be better here?  Apart from
+> that this looks correct, we shouldn't use a regular convert on
+> a non-register type.  In fact, it looks like all bitint types are
+> register types because we want SSA names for them.  A bit of a
+> "bad" design ...
+> 
+> We've used BLKmode checks elsewhere so I think it would be appropriate
+> here, too.But we don't want to disallow turning VIEW_CONVERT_EXPR from one _BitInt to another _BitInt of the same size, even if they both have BLKmode.
+So, if we'd use BLKmode check, it would need to be one of the types is INTEGER_TYPE and the other type is BLKmode BITINT_TYPE (or vice versa).
+Or shall the test be TYPE_MODE (type) == TYPE_MODE (TREE_TYPE (@0)) regardless of precision?
+Or it could be the mode check && at least one of the involved types is BITINT_TYPE,
+that would maintain existing behavior when _BitInt isn't involved.
+
+The #c18 patch passed bootstrap/regtest, the following:
+2024-02-22  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113988* match.pd (view_convert -> convert): Punt for VCEs involving
+        BITINT_TYPEs if there is mode mismatch.
+
+        * gcc.dg/bitint-91.c: New test.
+
+--- gcc/match.pd.jj     2024-02-19 09:42:16.583617451 +0100
++++ gcc/match.pd        2024-02-22 09:00:34.302420089 +0100
+@@ -4679,7 +4679,12 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+   (view_convert @0)
+   (if ((INTEGRAL_TYPE_P (type) || POINTER_TYPE_P (type))
+        && (INTEGRAL_TYPE_P (TREE_TYPE (@0)) || POINTER_TYPE_P (TREE_TYPE (@0)))
+-       && TYPE_PRECISION (type) == TYPE_PRECISION (TREE_TYPE (@0)))
++       && TYPE_PRECISION (type) == TYPE_PRECISION (TREE_TYPE (@0))
++       /* Punt for conversions with mode mismatches if BITINT_TYPEs are
++         involved.  */
++       && (TYPE_MODE (type) == TYPE_MODE (TREE_TYPE (@0))
++          || (TREE_CODE (type) != BITINT_TYPE
++              && TREE_CODE (TREE_TYPE (@0)) != BITINT_TYPE)))
+    (convert @0)))
+
+ /* Strip inner integral conversions that do not change precision or size, or
+--- gcc/testsuite/gcc.dg/bitint-91.c.jj 2024-02-21 13:47:55.244885020 +0100
++++ gcc/testsuite/gcc.dg/bitint-91.c    2024-02-21 12:51:16.900026979 +0100
+@@ -0,0 +1,38 @@
++/*PR tree-optimization/113988*/
++/* { dg-do compile { target bitint } } */
++/* { dg-options "-O2" } */
++/* { dg-additional-options "-mavx512f" { target i?86-*-* x86_64-*-* } } */
++
++int i;
++
++#if __BITINT_MAXWIDTH__ >= 256
++void
++foo (void *p, _BitInt(256) x)
++{
++  __builtin_memcpy (p, &x, sizeof x);
++}
++
++_BitInt(256)
++bar (void *p, _BitInt(256) x)
+
+passed
+make check-gcc check-g++ -j32 -k GCC_TEST_RUN_EXPENSIVE=1 RUNTESTFLAGS="GCC_TEST_RUN_EXPENSIVE=1 dg.exp='*bitint*pr112673.c builtin-stdc-bit-*.cpr112566-2.cpr112511.c' dg-torture.exp=*bitint* dfp.exp=*bitint*"
+
+- User: rguenther@suse.de | Time: 2024-02-22 08:34:22 UTC
+  Text: On Thu, 22 Feb 2024, jakub at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113988> 
+> ---Comment #20from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> (In reply torguenther@suse.defromcomment #19)
+> > I think the usual BLKmode check would be better here?  Apart from
+> > that this looks correct, we shouldn't use a regular convert on
+> > a non-register type.  In fact, it looks like all bitint types are
+> > register types because we want SSA names for them.  A bit of a
+> > "bad" design ...
+> > 
+> > We've used BLKmode checks elsewhere so I think it would be appropriate
+> > here, too.
+> 
+> But we don't want to disallow turning VIEW_CONVERT_EXPR from one _BitInt to
+> another _BitInt of the same size, even if they both have BLKmode.
+> So, if we'd use BLKmode check, it would need to be one of the types is
+> INTEGER_TYPE and the other type is BLKmode BITINT_TYPE (or vice versa).
+> Or shall the test be TYPE_MODE (type) == TYPE_MODE (TREE_TYPE (@0)) regardless
+> of precision?
+> Or it could be the mode check && at least one of the involved types is
+> BITINT_TYPE,
+> that would maintain existing behavior when _BitInt isn't involved.
+> 
+> The #c18 patch passed bootstrap/regtest, the following:
+> 2024-02-22  Jakub Jelinek  <jakub@redhat.com>
+> 
+>PR tree-optimization/113988>         * match.pd (view_convert -> convert): Punt for VCEs involving
+>         BITINT_TYPEs if there is mode mismatch.
+> 
+>         * gcc.dg/bitint-91.c: New test.
+> 
+> --- gcc/match.pd.jj     2024-02-19 09:42:16.583617451 +0100
+> +++ gcc/match.pd        2024-02-22 09:00:34.302420089 +0100
+> @@ -4679,7 +4679,12 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+>    (view_convert @0)
+>    (if ((INTEGRAL_TYPE_P (type) || POINTER_TYPE_P (type))
+>         && (INTEGRAL_TYPE_P (TREE_TYPE (@0)) || POINTER_TYPE_P (TREE_TYPE
+> (@0)))
+> -       && TYPE_PRECISION (type) == TYPE_PRECISION (TREE_TYPE (@0)))
+> +       && TYPE_PRECISION (type) == TYPE_PRECISION (TREE_TYPE (@0))
+> +       /* Punt for conversions with mode mismatches if BITINT_TYPEs are
+> +         involved.  */
+> +       && (TYPE_MODE (type) == TYPE_MODE (TREE_TYPE (@0))I like the mode check and I think we should avoid the transform
+also for non-bit-int in case the mode differs, I can only think
+of odd partial-int vs int mode cases here with pointer vs.
+integer?> +          || (TREE_CODE (type) != BITINT_TYPE
+> +              && TREE_CODE (TREE_TYPE (@0)) != BITINT_TYPE)))
+>     (convert @0)))
+> 
+>  /* Strip inner integral conversions that do not change precision or size, or
+> --- gcc/testsuite/gcc.dg/bitint-91.c.jj 2024-02-21 13:47:55.244885020 +0100
+> +++ gcc/testsuite/gcc.dg/bitint-91.c    2024-02-21 12:51:16.900026979 +0100
+> @@ -0,0 +1,38 @@
+> +/*PR tree-optimization/113988*/
+> +/* { dg-do compile { target bitint } } */
+> +/* { dg-options "-O2" } */
+> +/* { dg-additional-options "-mavx512f" { target i?86-*-* x86_64-*-* } } */
+> +
+> +int i;
+> +
+> +#if __BITINT_MAXWIDTH__ >= 256
+> +void
+> +foo (void *p, _BitInt(256) x)
+> +{
+> +  __builtin_memcpy (p, &x, sizeof x);
+> +}
+> +
+> +_BitInt(256)
+> +bar (void *p, _BitInt(256) x)
+> 
+> passed
+> make check-gcc check-g++ -j32 -k GCC_TEST_RUN_EXPENSIVE=1
+> RUNTESTFLAGS="GCC_TEST_RUN_EXPENSIVE=1 dg.exp='*bitint*pr112673.c
+> builtin-stdc-bit-*.cpr112566-2.cpr112511.c' dg-torture.exp=*bitint*
+> dfp.exp=*bitint*"
+>>
+
+- User: Jakub Jelinek | Time: 2024-02-22 08:37:08 UTC
+  Text: Yeah, I was worried about partial ints.  Or it could be punt if TYPE_MODEs are different and at least one of them is BLKmode.
+
+- User: rguenther@suse.de | Time: 2024-02-22 08:52:14 UTC
+  Text: On Thu, 22 Feb 2024, jakub at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113988> 
+> ---Comment #22from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> Yeah, I was worried about partial ints.  Or it could be punt if TYPE_MODEs are
+> different and at least one of them is BLKmode.Well, then you can also check whether one mode is BLKmode.
+
+Btw, I think forwprop is lucky if it really changes
+
+  _2 = VIEW_CONVERT_EXPR<uint256_t>(x);
+
+to
+
+  _2 = (uint256_t) x_1(D);
+
+because match on its own would create
+
+  _2 = (uint256_t) x;
+
+which would be invalid GIMPLE.  So are you sure it's not
+update-address-taken first rewriting x to a register?
+
+For 'foo' I see x becomes a register already during into-SSA so
+another fix might be to re-consider and make x a non-register
+because of that V_C_E?  (and hopefully the match pattern would
+then not be applied, but I'm not 100% sure on that)
+
+In principle there's nothing wrong about the transform it's
+the use of uint256_t that makes this problematic.
+
+So maybe we should bite the bullet and try the memcpy folding
+fix even at this stage ...
+
+- User: Jakub Jelinek | Time: 2024-02-23 10:06:05 UTC
+  Text: Before going the gimple-fold.cc route, I need to implement VCEs between large/huge BITINT_TYPEs and COMPLEX/VECTOR_TYPEs.
+I've filedPR114073for that.
+
+- User: Zdenek Sojka | Time: 2024-02-25 18:37:17 UTC
+  Text: Createdattachment 57531[details]combined testcase ICEing at different places with -O -mavx512f
+
+This ICEs on,
+$ x86_64-pc-linux-gnu-gcc -O -mavx512f testcase.c
+...
+xxx.c:2:6: internal compiler error: in handle_operand_addr, at gimple-lower-bitint.cc:2108
+
+xxx.c:3:12: internal compiler error: in handle_cast, at gimple-lower-bitint.cc:1559
+
+testcase.c:4:1: internal compiler error: in lower_stmt, at gimple-lower-bitint.cc:5501
+
+depending on which of the functions is compiled
+
+- User: Zdenek Sojka | Time: 2024-02-26 21:41:29 UTC
+  Text: Createdattachment 57548[details]testcase failing with -O -m32
+
+This testcase does not need -mavx512f, but -m32 instead:
+$ x86_64-pc-linux-gnu-gcc -O -m32 testcase32.c
+during GIMPLE pass: bitintlower
+testcase32.c: In function 'foo':
+testcase32.c:6:1: internal compiler error: in handle_cast, at gimple-lower-bitint.cc:1559
+    6 | foo(void)
+      | ^~~
+0xd784d7 handle_cast
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:1559
+0x2697a04 lower_mergeable_stmt
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:2525
+0x269bdec lower_stmt
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:5459
+0x269ed49 gimple_lower_bitint
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:6759
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: Jakub Jelinek | Time: 2024-02-27 11:53:28 UTC
+  Text: Createdattachment 57551[details]gcc14-pr113988.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-02-28 08:55:10 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:cc383e9702897dd783657ea3dce4aecf48318441commitr14-9203-gcc383e9702897dd783657ea3dce4aecf48318441Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Feb 28 09:40:15 2024 +0100
+
+    gimple-fold: Use bitwise vector types rather than barely supported huge integral types in memcpy etc. folding [PR113988]
+    
+    The following patch changes the memcpy etc. folding to use bitwise vector
+    types rather  than huge INTEGER_TYPEs for copying of > MAX_FIXED_MODE_SIZE
+    lengths.  The problem with the huge INTEGER_TYPEs is that they aren't
+    supported very much, usually there are just optabs to handle moves of them,
+    perhaps misaligned moves and that is it, so they pose problems e.g. to
+    BITINT_TYPE lowering.
+    
+    2024-02-28  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113988* stor-layout.h (bitwise_mode_for_size): Declare.
+            * stor-layout.cc (bitwise_mode_for_size): New function.
+            * gimple-fold.cc (gimple_fold_builtin_memory_op): Use it.
+            Use bitwise_type_for_mode instead of build_nonstandard_integer_type.
+            Use BITS_PER_UNIT instead of 8.
+    
+            * gcc.dg/bitint-91.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-28 09:01:14 UTC
+  Text: Fixed.
+

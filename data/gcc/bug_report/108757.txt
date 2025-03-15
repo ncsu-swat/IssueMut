@@ -1,0 +1,463 @@
+Bug Summary: We do not simplify (a - (N*M)) / N + M -> a / N
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Peter Bergner | Time: 2023-02-10 22:26:54 UTC
+  Text: The Eigen project code has a missed optimization that basically simplifies down to the following test case:
+
+linux$ cat bug.c 
+#define N 32
+#define M 2
+
+unsigned long int
+foo (unsigned long int a)
+{
+  return (a - (N*M)) / N + M;
+}
+
+linux$ gcc -O2 -S bug.c 
+
+linux$ cat bug.s 
+foo:
+	addi 3,3,-64
+	srdi 3,3,5
+	addi 3,3,2
+	blr
+
+We should be able to simplify this down to just 'a / N', which for power-of-2 N, results in just the srdi...although, I don't think N is required to be a power-of-2 to fold this down to just 'a / N'.  Can we also simplify this for non-constant N & M?  Maybe under -fast-math or something similar?
+
+- User: Peter Bergner | Time: 2023-02-10 22:28:57 UTC
+  Text: Reported by our Eigen developers and confirmed by me.
+
+- User: Andrew Pinski | Time: 2023-02-10 22:40:57 UTC
+  Text: I am not sure this can be done in the normal case unless you know the range of a to be [64...INF] .
+The wrap around case might be an issue ...
+But I am not 100% sure.
+
+- User: N/A | Time: 2023-02-11 13:14:52 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> I am not sure this can be done in the normal case unless you know the range
+> of a to be [64...INF] .
+> The wrap around case might be an issue ...
+> But I am not 100% sure.It is.  Just print foo(0).
+
+- User: Segher Boessenkool | Time: 2023-02-11 16:38:32 UTC
+  Text: If N is a power of two optimising this to a/N is valid, but for other values
+of N it is not (division is not the inverse of multiplication in C).  It also
+only works for unsigned of course.
+
+- User: Peter Bergner | Time: 2023-02-11 17:32:46 UTC
+  Text: (In reply to Segher Boessenkool fromcomment #4)> If N is a power of two optimising this to a/N is valid, but for other values
+> of N it is not (division is not the inverse of multiplication in C).  It also
+> only works for unsigned of course.Isn't this valid for any N & M, such that M is a factor of N?  Meaning, as long as N / M has no remainder, it seems like this should be ok.  For example, N = 30 & M = 2 should be just as ok as the N = 32 & M = 2 case, correct?
+
+- User: Segher Boessenkool | Time: 2023-02-11 17:55:42 UTC
+  Text: No?  Take a=59 as counterexample:
+
+(a - (N*M)) / N + M = (59 - 2*30)/30 + 2 = ~0UL/30 + 2
+
+but
+
+a / N = 59/30 = 1
+
+Integer division in C is division towards zero, almost no normal algebraic
+simplifications apply there.
+
+- User: Peter Bergner | Time: 2023-02-11 18:05:12 UTC
+  Text: (In reply to Segher Boessenkool fromcomment #6)> No?  Take a=59 as counterexample:
+> 
+> (a - (N*M)) / N + M = (59 - 2*30)/30 + 2 = ~0UL/30 + 2For unsigned integers, isn't having a < N*M UB so we're free to do as we wish for either the optimized and non-optimized sequences?  Meaning, can't we assume here that a >= N*M?
+
+- User: Segher Boessenkool | Time: 2023-02-11 18:15:27 UTC
+  Text: No, addition and subtraction are well defined for all inputs, for unsigned
+integers.
+
+- User: Chip Kerchner | Time: 2023-02-11 19:45:41 UTC
+  Text: Doesn't this work for powers of two (N) and signed values (for A, N and M)?
+
+(59 - (33 * -2)) / -2 + 31 = -62 + 31 = -29
+
+and
+
+59 / -2 = -29
+
+- User: Chip Kerchner | Time: 2023-02-11 21:55:50 UTC
+  Text: Oops that should be 31 * -2, not 33.
+
+- User: Chip Kerchner | Time: 2023-02-11 22:03:30 UTC
+  Text: Nevermind, using a similar example that Segher gave, it would failed too.
+
+- User: Chip Kerchner | Time: 2023-02-13 20:13:04 UTC
+  Text: Here is an example of the original problem
+
+#define EIGEN_ALWAYS_INLINE __attribute__((always_inline)) inline
+
+typedef __vector float Packet4f;
+typedef size_t Index;
+
+EIGEN_ALWAYS_INLINE Packet4f ploadu(const float* from)
+{
+  return vec_xl(0, const_cast<float*>(from));
+}
+
+EIGEN_ALWAYS_INLINE void pstoreu(float* to, const Packet4f &from)
+{
+  vec_xst(from, 0, to);
+}
+
+void convert(Index rows, float*src, float *result)
+{
+  for(Index i = 0; i + 4 <= rows; i+=4) {
+    Packet4f r32_0 = ploadu(src + i +  0);
+    pstoreu(result + i +  0, r32_0);
+  }
+}
+
+And the output (with notation on the lines in question)
+
+    cmpldi 0,3,3
+    blelr 0
+    addi 3,3,-4  <- i = rows - 4
+    li 9,0
+    srdi 3,3,2   <- i >>= 2
+    addi 8,3,1   <- i = i + 1
+    andi. 7,8,0x3
+    mr 10,8
+    beq 0,.L10
+    cmpdi 0,7,1
+    beq 0,.L14
+    cmpdi 0,7,2
+    beq 0,.L15
+    lxv 0,0(4)
+    mr 8,3
+    li 9,16
+    stxv 0,0(5)
+.L15:
+    lxvx 0,4,9
+    addi 8,8,-1
+    stxvx 0,5,9
+    addi 9,9,16
+.L14:
+    lxvx 0,4,9
+    cmpdi 0,8,1
+    stxvx 0,5,9
+    addi 9,9,16
+    beqlr 0
+.L10:
+    srdi 10,10,2
+    mtctr 10
+.L3:
+    lxvx 0,4,9
+    addi 10,9,16
+    addi 7,9,32
+    addi 8,9,48
+    stxvx 0,5,9
+    lxvx 0,4,10
+    addi 9,9,64
+    stxvx 0,5,10
+    lxvx 0,4,7
+    stxvx 0,5,7
+    lxvx 0,4,8
+    stxvx 0,5,8
+    bdnz .L3
+    blr
+
+In this case the 3 lines notated can be replaced a simple `srdi 8,3,2`
+
+- User: Andrew Pinski | Time: 2023-02-13 20:20:19 UTC
+  Text: IIRC this is a doloop issue and has been reported before. Maybe even by myself while I was working at Sony. I think I tried to fix it too.
+
+- User: Andrew Pinski | Time: 2023-02-13 20:27:00 UTC
+  Text: Oh yespr 37451. There are a few other related ones referenced now too. But basically it is doloop which is introducing this.
+The original example does not correspond to the example in given by the eigen folks either..
+
+- User: Chip Kerchner | Time: 2023-02-13 20:36:23 UTC
+  Text: How about this (from Peter's testcase)?  Does it still have issues?  It produces the same assembly.
+
+#define N 32
+#define M 2
+
+unsigned long int
+foo (unsigned long int a)
+{
+  return (a - (N*M)) / N + M;
+}
+
+- User: Chip Kerchner | Time: 2023-02-13 20:37:37 UTC
+  Text: Dang copy and paste issue...  This is what I meant.
+
+unsigned long int
+foo (unsigned long int a)
+{
+  return (a + (N*M)) / N - M;
+}
+
+- User: Andrew Pinski | Time: 2023-02-13 20:58:56 UTC
+  Text: _13 = rows_8(D) + 18446744073709551612;
+  _15 = _13 >> 2;
+  doloop.8_5 = _15 + 1;
+
+
+This is what IV-OPTS produces.
+
+Reduced testcase:
+typedef __SIZE_TYPE__ size_t;
+
+void convert(size_t rows, float*src, float *result)
+{
+  for(size_t i = 0; i + 4 <= rows; i+=4) {
+    float t = src[i];
+    result[i] = t;
+  }
+}
+
+- User: Andrew Pinski | Time: 2023-02-13 20:59:18 UTC
+  Text: Note this shows up on aarch64 too with my reduced testcase.
+
+- User: Andrew Pinski | Time: 2023-02-13 21:01:23 UTC
+  Text: Note in the loop case we know it does not wrap because there is a check already:
+  <bb 2> [local count: 118111600]:
+  if (rows_8(D) > 3)
+    goto <bb 5>; [89.00%]
+  else
+    goto <bb 4>; [11.00%]
+
+  <bb 5> [local count: 105119324]:
+  _13 = rows_8(D) + 18446744073709551612;
+  _15 = _13 / 4;
+  doloop.6_5 = _15 + 1;
+
+- User: Jiu Fu Guo | Time: 2023-05-11 13:15:11 UTC
+  Text: (In reply to Andrew Pinski fromcomment #19)> Note in the loop case we know it does not wrap because there is a check
+> already:
+>   <bb 2> [local count: 118111600]:
+>   if (rows_8(D) > 3)
+>     goto <bb 5>; [89.00%]
+>   else
+>     goto <bb 4>; [11.00%]
+> 
+>   <bb 5> [local count: 105119324]:
+>   _13 = rows_8(D) + 18446744073709551612;
+>   _15 = _13 / 4;
+>   doloop.6_5 = _15 + 1;Checking why below code does not work:
+/* Simplify ((t + -N*M) / N + M) -> t / N: (t + -C) >> N + (C>>N) ==> t >> N */
+(for div (trunc_div round_div)
+ (simplify
+  (plus (rshift (plus @0 INTEGER_CST@1) INTEGER_CST@2) INTEGER_CST@3)
+  (if (ANY_INTEGRAL_TYPE_P (type) &&
+       (wi::to_wide (@3) << wi::to_wide (@2)) == -wi::to_wide (@1))
+   (if (TYPE_OVERFLOW_UNDEFINED (type))
+    (div @0 @2)
+#if GIMPLE
+    (with
+     {
+       bool overflowed = true;
+       value_range vr0;
+       if (INTEGRAL_TYPE_P (type)
+           && get_global_range_query ()->range_of_expr (vr0, @0)
+           && !vr0.varying_p () && !vr0.undefined_p ())
+         {
+           wide_int wmin0 = vr0.lower_bound ();
+           wide_int wmax0 = vr0.upper_bound ();
+           wide_int w1 = -wi::to_wide (@1);
+           wi::overflow_type min_ovf, max_ovf;
+           wi::add (wmin0, w1, TYPE_SIGN (type), &min_ovf);
+           wi::add (wmax0, w1, TYPE_SIGN (type), &max_ovf);
+           if (min_ovf == wi::OVF_NONE && max_ovf == wi::OVF_NONE)
+             overflowed = false;
+         }
+     }
+    (if (!overflowed)
+     (div @0 @2)))
+#endif
+   ))))
+
+
+Interesting thing:
+the VR is always VR_VARYING, even for the below simple case:
+
+typedef unsigned long INT;
+INT __attribute__ ((noinline)) foo (INT x)
+{
+  if (x < 4)
+    return 0;
+  INT a = x + 18446744073709551612ULL;
+  INT b = a >> 2;
+  return b + 1;
+}
+
+- User: Andrew Pinski | Time: 2023-05-11 17:32:29 UTC
+  Text: (In reply to Jiu Fu Guo fromcomment #20)> Interesting thing:
+> the VR is always VR_VARYING, even for the below simple case:
+> 
+> typedef unsigned long INT;
+> INT __attribute__ ((noinline)) foo (INT x)
+> {
+>   if (x < 4)
+>     return 0;
+>   INT a = x + 18446744073709551612ULL;
+>   INT b = a >> 2;
+>   return b + 1;
+> }Yes that is because x does not have a "global" range.
+
+You could try the following testcase:
+```
+typedef unsigned long INT;
+INT __attribute__ ((noinline)) foo (INT x)
+{
+  if (x < 4)
+    __builtin_unreachable();
+  INT a = x + 18446744073709551612ULL;
+  INT b = a >> 2;
+  return b + 1;
+}
+```
+
+Which gets a (global) range for x_1(D) during forwprop3:
+  # RANGE [irange] INT [4, +INF]
+  INTD.2750 x_1(D) = xD.2751;
+
+- User: Jiu Fu Guo | Time: 2023-05-12 01:52:32 UTC
+  Text: (In reply to Andrew Pinski fromcomment #21)> (In reply to Jiu Fu Guo fromcomment #20)
+> > Interesting thing:
+> > the VR is always VR_VARYING, even for the below simple case:
+> > 
+> > typedef unsigned long INT;
+> > INT __attribute__ ((noinline)) foo (INT x)
+> > {
+> >   if (x < 4)
+> >     return 0;
+> >   INT a = x + 18446744073709551612ULL;
+> >   INT b = a >> 2;
+> >   return b + 1;
+> > }
+> 
+> Yes that is because x does not have a "global" range.I also tried "get_range_query (cfun)->range_of_expr (vr0, @0)",> 
+> You could try the following testcase:
+> ```
+> typedef unsigned long INT;
+> INT __attribute__ ((noinline)) foo (INT x)
+> {
+>   if (x < 4)
+>     __builtin_unreachable();
+>   INT a = x + 18446744073709551612ULL;
+>   INT b = a >> 2;
+>   return b + 1;
+> }
+> ```
+> 
+> Which gets a (global) range for x_1(D) during forwprop3:
+>   # RANGE [irange] INT [4, +INF]
+>   INTD.2750 x_1(D) = xD.2751;(In reply to Andrew Pinski fromcomment #21)> (In reply to Jiu Fu Guo fromcomment #20)
+> > Interesting thing:
+> > the VR is always VR_VARYING, even for the below simple case:
+> > 
+> > typedef unsigned long INT;
+> > INT __attribute__ ((noinline)) foo (INT x)
+> > {
+> >   if (x < 4)
+> >     return 0;
+> >   INT a = x + 18446744073709551612ULL;
+> >   INT b = a >> 2;
+> >   return b + 1;
+> > }
+> 
+> Yes that is because x does not have a "global" range.
+> 
+> You could try the following testcase:
+> ```
+> typedef unsigned long INT;
+> INT __attribute__ ((noinline)) foo (INT x)
+> {
+>   if (x < 4)
+>     __builtin_unreachable();
+>   INT a = x + 18446744073709551612ULL;
+>   INT b = a >> 2;
+>   return b + 1;
+> }
+> ```
+> 
+> Which gets a (global) range for x_1(D) during forwprop3:
+>   # RANGE [irange] INT [4, +INF]
+>   INTD.2750 x_1(D) = xD.2751;Thanks so much!
+"get_range_query (cfun)->range_of_expr (vr0, @0)" works for both the case!
+
+- User: Jiu Fu Guo | Time: 2023-05-12 06:25:46 UTC
+  Text: /* Simplify ((t + -N*M) / N + M) -> t / N: (t + -C) >> N + (C>>N) ==> t >> N */
+(for div (trunc_div exact_div)
+ (simplify
+  (plus (rshift (plus @0 INTEGER_CST@1) INTEGER_CST@2) INTEGER_CST@3)
+  (if (INTEGRAL_TYPE_P (type) && TYPE_UNSIGNED (type) &&
+       (wi::to_wide (@3) << wi::to_wide (@2)) == -wi::to_wide (@1))
+   (if (TYPE_OVERFLOW_UNDEFINED (type))
+    (div @0 @2)
+#if GIMPLE
+    (with
+     {
+       bool overflowed = true;
+       value_range vr0;
+       if (get_range_query (cfun)->range_of_expr (vr0, @0)
+           && !vr0.varying_p () && !vr0.undefined_p ())
+         {
+           wide_int wmin0 = vr0.lower_bound ();
+           wide_int wmax0 = vr0.upper_bound ();
+           wide_int w1 = -wi::to_wide (@1);
+           wi::overflow_type min_ovf, max_ovf;
+           wi::sub (wmin0, w1, TYPE_SIGN (type), &min_ovf);
+           wi::sub (wmax0, w1, TYPE_SIGN (type), &max_ovf);
+           if (min_ovf == wi::OVF_NONE && max_ovf == wi::OVF_NONE)
+             overflowed = false;
+         }
+     }
+    (if (!overflowed)
+     (rshift @0 @2)))
+#endif
+   ))))
+
+Got one match for the case.
+Checking if it is safe(condition) or how to support other forms:
+signed type, negative N, non-power2 N, negative M ...
+
+- User: Jiu Fu Guo | Time: 2023-05-12 09:35:05 UTC
+  Text: (In reply to Jiu Fu Guo fromcomment #23)> /* Simplify ((t + -N*M) / N + M) -> t / N: (t + -C) >> N + (C>>N) ==> t >> N
+> */
+> (for div (trunc_div exact_div)div was not used in this matcher, yet.  Here rshift is used:  t/(1<<N) could be optimized to "t>>N".>  (simplify
+>   (plus (rshift (plus @0 INTEGER_CST@1) INTEGER_CST@2) INTEGER_CST@3)
+>   (if (INTEGRAL_TYPE_P (type) && TYPE_UNSIGNED (type) &&
+>        (wi::to_wide (@3) << wi::to_wide (@2)) == -wi::to_wide (@1))
+>    (if (TYPE_OVERFLOW_UNDEFINED (type))
+>     (div @0 @2)This should be "(rshift @0 @2)", otherwise it will be error if relax "TYPE_UNSIGNED (type)"
+
+- User: GCC Commits | Time: 2023-09-04 02:46:46 UTC
+  Text: The master branch has been updated by Jiu Fu Guo <guojiufu@gcc.gnu.org>:https://gcc.gnu.org/g:1aceceb1e2d6e86ce183c8cc448750fa03b6f79ecommitr14-3644-g1aceceb1e2d6e86ce183c8cc448750fa03b6f79eAuthor: Jiufu Guo <guojiufu@linux.ibm.com>
+Date:   Mon Sep 4 10:31:04 2023 +0800
+
+    Optimize '(X - N * M) / N' to 'X / N - M' if valid
+    
+    Integer expression "(X - N * M) / N" can be optimized to "X / N - M" with
+    the below conditions:
+    1. There is no wrap/overflow/underflow.
+       wrap/overflow/underflow breaks the arithmetic operation.
+    2. "X - N * M" and "X" are not of opposite sign.
+       Here, the operation "/" would be "trunc_div", the fractional part is
+       discarded. If "X - N * M" and "X" are in different signs, then trunc_div
+       discards the fractional parts (of /N) in different directions.PR tree-optimization/108757gcc/ChangeLog:
+    
+            * match.pd ((X - N * M) / N): New pattern.
+            ((X + N * M) / N): New pattern.
+            ((X + C) div_rshift N): New pattern.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr108757-1.c: New test.
+            * gcc.dg/pr108757-2.c: New test.
+            * gcc.dg/pr108757.h: New test.
+
+- User: Jiu Fu Guo | Time: 2023-09-04 03:26:18 UTC
+  Text: Patch was committed.
+

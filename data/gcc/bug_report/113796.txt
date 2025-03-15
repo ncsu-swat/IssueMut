@@ -1,0 +1,140 @@
+Bug Summary: [14 Regression] ifcvt does not remove range info before folding: Runtime mismatch at -O2
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-02-07 06:14:55 UTC
+  Text: Testcase:
+signed char a[] = {0x80, 0};
+int b;
+signed char c;
+
+int main() {
+  for (; b < 1; b += 1)
+      c = a[b] < 0 ?: a[b] >> 6;
+
+  if (c == 1)
+    return 0;
+  else
+    return 1;
+}
+
+Commands:> /scratch/tc-testing/tc-feb-6/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv -O2 red.c -o user-config.out
+> QEMU_CPU=rv64,vlen=128,v=true,vext_spec=v1.0,Zve32f=true,Zve64f=true /scratch/tc-testing/tc-feb-6/build-rv64gcv/bin/qemu-riscv64 user-config.out
+> echo $?1> /scratch/tc-testing/tc-feb-6/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv -O1 red.c -o user-config.out
+> QEMU_CPU=rv64,vlen=128,v=true,vext_spec=v1.0,Zve32f=true,Zve64f=true /scratch/tc-testing/tc-feb-6/build-rv64gcv/bin/qemu-riscv64 user-config.out
+> echo $?0
+
+Godbolt:https://godbolt.org/z/c7xrqx7KzTested usingr14-8834-gdb5c3f6d952(not bisected).
+
+Found using fuzzer.
+
+- User: Andrew Pinski | Time: 2024-02-07 06:33:13 UTC
+  Text: Confirmed, the issue is in ifcvt.
+
+Before ifcvt we had:
+```
+  if (_1 >= 0)
+    goto <bb 5>; [59.00%]
+  else
+    goto <bb 6>; [41.00%]
+
+  <bb 5> [local count: 563821836]:
+  iftmp.1_9 = _1 >> 6;
+
+  <bb 6> [local count: 955630226]:
+  # iftmp.1_5 = PHI <iftmp.1_9(5), 1(4)>
+```
+Which is fine.
+
+Note the range for _1 is:
+```
+  # RANGE [irange] signed char [0, 1]
+  iftmp.1_9 = _1 >> 6;
+```
+
+After ifcvt we get:
+```
+  iftmp.1_9 = _1 >> 6;
+  _25 = _1 < 0;
+  _4 = (signed charD.14) _25;
+  # RANGE [irange] signed char [0, 1]
+  iftmp.1_5 = _4 | iftmp.1_9;
+```
+Which is incorrect.
+
+ifcvt needs to something similar to what phiopt did inr14-2650-g8c79b49cd4fa74.
+
+- User: Andrew Pinski | Time: 2024-02-07 06:35:47 UTC
+  Text: It can be reproduce on aarch64 with `-O2 -fno-vect-cost-model -march=armv9-a+sve` too so it is at least a regression there too.
+
+- User: Andrew Pinski | Time: 2024-02-07 06:36:32 UTC
+  Text: Just an FYI :
+
+[apinski@xeond2 upstream-full-cross]$ ./install/bin/aarch64-linux-gnu-gcc -O2 -static t65.c -march=armv9-a+sve2 -fno-vect-cost-model
+[apinski@xeond2 upstream-full-cross]$ ./install-qemu/bin/qemu-aarch64 a.out ;echo $?
+1
+[apinski@xeond2 upstream-full-cross]$ ./install/bin/aarch64-linux-gnu-gcc -O2 -static t65.c -march=armv9-a+sve2
+[apinski@xeond2 upstream-full-cross]$ ./install-qemu/bin/qemu-aarch64 a.out ;echo $?
+0
+
+- User: Andrew Pinski | Time: 2024-02-07 06:48:53 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> ifcvt needs to something similar to what phiopt did in
+>r14-2650-g8c79b49cd4fa74.Or ifcvt needs to remove the range info earlier ...
+I have not looked into the ifcvt code to see which is the right approach.
+
+But it was introduced by the same commit that introducedPR 110252(which was then fixed by the phiopt patch).
+
+- User: Andrew Pinski | Time: 2024-02-07 06:56:02 UTC
+  Text: Here is one that fails on x86_64 too:
+```
+signed char a[] = {0x80, 0x80,0x80,0x80};
+int b;
+signed char c;
+
+int main() {
+  for (; b < sizeof(a); b += 1)
+      c = a[b] < 0 ?: a[b] >> 6;
+
+  if (c == 1)
+    return 0;
+  else
+    return 1;
+}
+```
+
+Compile with `-O2 -fno-vect-cost-model` to see the issue.
+
+- User: Richard Biener | Time: 2024-02-07 08:53:02 UTC
+  Text: Let me take this.
+
+- User: Richard Biener | Time: 2024-02-07 12:06:05 UTC
+  Text: We're removing flow-sensitive info in combine_blocks, but after inserting
+and folding stmts comprising the PHI replacements.  There's possibly
+latent issues when building up the predicates themselves since that uses
+maybe_fold_or_comparisons without the workaround added for if-combine.
+
+I have a patch resetting flow-sensitive info earlier (and also covering
+PHIs).
+
+- User: GCC Commits | Time: 2024-02-07 14:50:16 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:8636c538b68068cd2a4115fece531dc3e3e3a84acommitr14-8869-g8636c538b68068cd2a4115fece531dc3e3e3a84aAuthor: Richard Biener <rguenther@suse.de>
+Date:   Wed Feb 7 13:08:43 2024 +0100
+
+    tree-optimization/113796 - if-conversion and ranges
+    
+    The following makes sure to wipe range info before folding the
+    COND_EXPRs we insert as part of replacing PHI nodes when combining
+    blocks in the if-conversion pass.PR tree-optimization/113796* tree-if-conv.cc (combine_blocks): Wipe range-info before
+            replacing PHIs and inserting predicates.
+    
+            * gcc.dg/torture/pr113796.c: New testcase.
+
+- User: Richard Biener | Time: 2024-02-07 14:50:51 UTC
+  Text: Fixed (but possibly latent on branches of course).
+

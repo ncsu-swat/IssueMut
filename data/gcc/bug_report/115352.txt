@@ -1,0 +1,257 @@
+Bug Summary: wrong code with _BitInt() __builtin_sub_overflow_p() at -O0
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 14.1.0, 15.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-06-05 03:39:57 UTC
+  Text: Createdattachment 58350[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc testcase.c
+$ ./a.out
+Aborted
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r15-1014-20240604161649-g591d30c5c97-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r15-1014-20240604161649-g591d30c5c97-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 15.0.0 20240604 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-06-05 09:30:01 UTC
+  Text: Reducing it down to `128*300` works but `128*400` fails. The gimple level difference between 128*300 vs 128*400 is just the argument that gets passed.
+So I don't think the bug is __builtin_sub_overflow_p  expansion but I could be wrong.
+
+Note clang is very useless at testing this since it unrolls the loop always.
+(that is after changing __builtin_sub_overflow_p to __builtin_sub_overflow:
+
+  _BitInt (65) t;
+  return __builtin_sub_overflow (0, b, &t);
+
+)
+
+
+It also fails on aarch64-linux-gnu.
+
+- User: Jakub Jelinek | Time: 2024-06-06 10:17:46 UTC
+  Text: I've first tried
+--- gcc/gimple-lower-bitint.cc.jj	2024-04-12 10:59:48.233153262 +0200
++++ gcc/gimple-lower-bitint.cc	2024-06-06 11:05:29.845597763 +0200
+@@ -4324,7 +4324,8 @@ bitint_large_huge::lower_addsub_overflow
+ 		  else
+ 		    g = gimple_build_assign (this_ovf, NE_EXPR, l, cmp);
+ 		  insert_before (g);
+-		  if (cmp_code == GT_EXPR)
++		  if (cmp_code == GT_EXPR
++		      || (cmp_code == GE_EXPR && single_comparison))
+ 		    {
+ 		      tree t = make_ssa_name (boolean_type_node);
+ 		      g = gimple_build_assign (t, BIT_IOR_EXPR, ovf, this_ovf);
+which fixes the #c0 testcase.  But on the reduced
+int
+foo (_BitInt (385) b)
+{
+  return __builtin_sub_overflow_p (0, b, (_BitInt (65)) 0);
+}
+
+int
+main ()
+{
+  if (!foo (-(_BitInt (385)) 0x00000000000000000c377e8a3fd1881fff035bb487a51c9ed1f7350befa7ec4450000000000000000a3cf8d1ebb723981wb))
+    __builtin_abort ();
+  if (!foo (-0x1ffffffffffffffffc377e8a3fd1881fff035bb487a51c9ed1f7350befa7ec445ffffffffffffffffa3cf8d1ebb723981uwb))
+    __builtin_abort ();
+  if (!foo (-(_BitInt (385)) 0x00000000000000000ffffffffffffffffffffffffffffffff00000000000000000000000000000000a3cf8d1ebb723981wb))
+    __builtin_abort ();
+  if (!foo (-0x1ffffffffffffffff00000000000000000000000000000000ffffffffffffffffffffffffffffffffa3cf8d1ebb723981uwb))
+    __builtin_abort ();
+}
+testcase it only fixes the first 2 calls but not the last 2.
+So, I'm afraid I just need to kill the optimization instead:
+--- gcc/gimple-lower-bitint.cc.jj	2024-04-12 10:59:48.233153262 +0200
++++ gcc/gimple-lower-bitint.cc	2024-06-06 12:06:57.065717651 +0200
+@@ -4286,11 +4286,7 @@ bitint_large_huge::lower_addsub_overflow
+ 		  bool single_comparison
+ 		    = (startlimb + 2 >= fin || (startlimb & 1) != (i & 1));
+ 		  if (!single_comparison)
+-		    {
+-		      cmp_code = GE_EXPR;
+-		      if (!check_zero && (start % limb_prec) == 0)
+-			single_comparison = true;
+-		    }
++		    cmp_code = GE_EXPR;
+ 		  else if ((startlimb & 1) == (i & 1))
+ 		    cmp_code = EQ_EXPR;
+ 		  else
+The idea behind the optimization was that arith_overflow_extract_bits in those cases is the same, we just extract all bits from the limb, whether it is the limb at the boundary (i.e. EQ_EXPR to the compared limb index) or above (GT_EXPR), so GE_EXPR would do.  Except without the first patch it completely ignored the previously accumulated mismatches (i.e. overflows) from lower limbs, and while that no longer is the case with the first patch, it still ignores whether the upper bits were all 0s or all 1s previously and as long as they are again all 0s or all 1s, it happily makes it non-overflow case and what the next limb should compare against.
+
+- User: Jakub Jelinek | Time: 2024-06-06 11:06:07 UTC
+  Text: Createdattachment 58368[details]gcc15-pr115352.patch
+
+Full so far just lightly tested patch.
+
+- User: GCC Commits | Time: 2024-06-07 08:33:48 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:a47b1aaa7a76201da7e091d9f8d4488105786274commitr15-1093-ga47b1aaa7a76201da7e091d9f8d4488105786274Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Jun 7 10:32:08 2024 +0200
+
+    bitint: Fix up lower_addsub_overflow [PR115352]
+    
+    The following testcase is miscompiled because of a flawed optimization.
+    If one changes the 65 in the testcase to e.g. 66, one gets:
+    ...
+      _25 = .USUBC (0, _24, _14);
+      _12 = IMAGPART_EXPR <_25>;
+      _26 = REALPART_EXPR <_25>;
+      if (_23 >= 1)
+        goto <bb 8>; [80.00%]
+      else
+        goto <bb 11>; [20.00%]
+    
+      <bb 8> :
+      if (_23 != 1)
+        goto <bb 10>; [80.00%]
+      else
+        goto <bb 9>; [20.00%]
+    
+      <bb 9> :
+      _27 = (signed long) _26;
+      _28 = _27 >> 1;
+      _29 = (unsigned long) _28;
+      _31 = _29 + 1;
+      _30 = _31 > 1;
+      goto <bb 11>; [100.00%]
+    
+      <bb 10> :
+      _32 = _26 != _18;
+      _33 = _22 | _32;
+    
+      <bb 11> :
+      # _17 = PHI <_30(9), _22(7), _33(10)>
+      # _19 = PHI <_29(9), _18(7), _18(10)>
+    ...
+    so there is one path for limbs below the boundary (in this case there are
+    actually no limbs there, maybe we could consider optimizing that further,
+    say with simply folding that _23 >= 1 condition to 1 == 1 and letting
+    cfg cleanup handle it), another case where it is exactly the limb on the
+    boundary (that is the bb 9 handling where it extracts the interesting
+    bits (the first 3 statements) and then checks if it is zero or all ones and
+    finally the case of limbs above that where it compares the current result
+    limb against the previously recorded 0 or all ones and ors differences into
+    accumulated result.
+    
+    Now, the optimization which the first hunk removes was based on the idea
+    that for that case the extraction of the interesting bits from the limb
+    don't need anything special, so the _27/_28/_29 statements above aren't
+    needed, the whole limb is interesting bits, so it handled the >= 1
+    case like the bb 9 above without the first 3 statements and bb 10 wasn't
+    there at all.  There are 2 problems with that, for the higher limbs it
+    only checks if the the result limb bits are all zeros or all ones, but
+    doesn't check if they are the same as the other extension bits, and
+    it forgets the previous flag whether there was an overflow.
+    First I wanted to fix it just by adding the _33 = _22 | _30; statement
+    to the end of bb 9 above, which fixed the originally filed huge testcase
+    and the first 2 foo calls in the testcase included in the patch, it no
+    longer forgets about previously checked differences from 0/1.
+    But as the last 2 foo calls show, it still didn't check whether each
+    even (or each odd depending on the exact position) result limb is
+    equal to the first one, so every second limb it could choose some other
+    0 vs. all ones value and as long as it repeated in another limb above it
+    it would be ok.
+    
+    So, the optimization just can't work properly and the following patch
+    removes it.
+    
+    2024-06-07  Jakub Jelinek  <jakub@redhat.com>PR middle-end/115352* gimple-lower-bitint.cc (lower_addsub_overflow): Don't disable
+            single_comparison if cmp_code is GE_EXPR.
+    
+            * gcc.dg/torture/bitint-71.c: New test.
+
+- User: GCC Commits | Time: 2024-06-07 08:35:05 UTC
+  Text: The releases/gcc-14 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:0f616e75f32083e1bc6d08f31e3fbc3dea41fa0ccommitr14-10288-g0f616e75f32083e1bc6d08f31e3fbc3dea41fa0cAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Jun 7 10:32:08 2024 +0200
+
+    bitint: Fix up lower_addsub_overflow [PR115352]
+    
+    The following testcase is miscompiled because of a flawed optimization.
+    If one changes the 65 in the testcase to e.g. 66, one gets:
+    ...
+      _25 = .USUBC (0, _24, _14);
+      _12 = IMAGPART_EXPR <_25>;
+      _26 = REALPART_EXPR <_25>;
+      if (_23 >= 1)
+        goto <bb 8>; [80.00%]
+      else
+        goto <bb 11>; [20.00%]
+    
+      <bb 8> :
+      if (_23 != 1)
+        goto <bb 10>; [80.00%]
+      else
+        goto <bb 9>; [20.00%]
+    
+      <bb 9> :
+      _27 = (signed long) _26;
+      _28 = _27 >> 1;
+      _29 = (unsigned long) _28;
+      _31 = _29 + 1;
+      _30 = _31 > 1;
+      goto <bb 11>; [100.00%]
+    
+      <bb 10> :
+      _32 = _26 != _18;
+      _33 = _22 | _32;
+    
+      <bb 11> :
+      # _17 = PHI <_30(9), _22(7), _33(10)>
+      # _19 = PHI <_29(9), _18(7), _18(10)>
+    ...
+    so there is one path for limbs below the boundary (in this case there are
+    actually no limbs there, maybe we could consider optimizing that further,
+    say with simply folding that _23 >= 1 condition to 1 == 1 and letting
+    cfg cleanup handle it), another case where it is exactly the limb on the
+    boundary (that is the bb 9 handling where it extracts the interesting
+    bits (the first 3 statements) and then checks if it is zero or all ones and
+    finally the case of limbs above that where it compares the current result
+    limb against the previously recorded 0 or all ones and ors differences into
+    accumulated result.
+    
+    Now, the optimization which the first hunk removes was based on the idea
+    that for that case the extraction of the interesting bits from the limb
+    don't need anything special, so the _27/_28/_29 statements above aren't
+    needed, the whole limb is interesting bits, so it handled the >= 1
+    case like the bb 9 above without the first 3 statements and bb 10 wasn't
+    there at all.  There are 2 problems with that, for the higher limbs it
+    only checks if the the result limb bits are all zeros or all ones, but
+    doesn't check if they are the same as the other extension bits, and
+    it forgets the previous flag whether there was an overflow.
+    First I wanted to fix it just by adding the _33 = _22 | _30; statement
+    to the end of bb 9 above, which fixed the originally filed huge testcase
+    and the first 2 foo calls in the testcase included in the patch, it no
+    longer forgets about previously checked differences from 0/1.
+    But as the last 2 foo calls show, it still didn't check whether each
+    even (or each odd depending on the exact position) result limb is
+    equal to the first one, so every second limb it could choose some other
+    0 vs. all ones value and as long as it repeated in another limb above it
+    it would be ok.
+    
+    So, the optimization just can't work properly and the following patch
+    removes it.
+    
+    2024-06-07  Jakub Jelinek  <jakub@redhat.com>PR middle-end/115352* gimple-lower-bitint.cc (lower_addsub_overflow): Don't disable
+            single_comparison if cmp_code is GE_EXPR.
+    
+            * gcc.dg/torture/bitint-71.c: New test.
+    
+    (cherry picked from commit a47b1aaa7a76201da7e091d9f8d4488105786274)
+
+- User: Jakub Jelinek | Time: 2024-06-07 08:42:01 UTC
+  Text: Fixed, thanks for the report.
+

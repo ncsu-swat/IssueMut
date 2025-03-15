@@ -1,0 +1,75 @@
+Bug Summary: RISC-V: Miscompile at -O3 with zvl256b -mrvv-vector-bits=zvl
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 15.0
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-07-30 21:57:48 UTC
+  Text: Testcase:
+long a;
+short b[60000];
+short c[20];
+int main() {
+  for (short d = 0; d < 20; d += 3) {
+    c[d] = 0;
+    for (int e = 0; e < 20; e += 2)
+      for (int f = 1; f < 20; f += 2)
+        a += (unsigned)b[f + e];
+  }
+  __builtin_printf("%lu\n", a);
+}
+
+Commands:> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv_zvl256b -O3 -mrvv-vector-bits=zvl red.c -o red.out
+> QEMU_CPU=rv64,vlen=256,rvv_ta_all_1s=true,v=true,vext_spec=v1.0,zve32f=true,zve64f=true timeout --verbose -k 0.1 4 /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/qemu-riscv64 red.out18446744073709551613> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv_zvl256b -O2 -mrvv-vector-bits=zvl red.c -o red.out
+> QEMU_CPU=rv64,vlen=256,rvv_ta_all_1s=true,v=true,vext_spec=v1.0,zve32f=true,zve64f=true timeout --verbose -k 0.1 4 /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/qemu-riscv64 red.out0
+
+Still present when rvv_ta_all_1s=true is omitted.
+
+Found via fuzzer
+
+- User: Robin Dapp | Time: 2024-07-31 13:39:04 UTC
+  Text: > Still present when rvv_ta_all_1s=true is omitted.My result is '0' when rvv_ta_all_1s=false, is that what you meant?
+
+I didn't have time to check this in detail but it's not the missing else for masked loads.  It looks like we should use the "tu" policy instead of "ta" when doing those intermediate steps.  When I change everything with a vl != 4 (so 3 and 1) to the "tu" policy the result is correct.  Need to check where we go wrong.
+
+- User: Robin Dapp | Time: 2024-07-31 13:40:59 UTC
+  Text: Correction, it's actually just the wx adds with a length of 1 and those should be "tu".  Quite likely this only got exposed recently with the late-combine change in place.
+
+- User: Robin Dapp | Time: 2024-07-31 15:04:26 UTC
+  Text: It looks like the problem is a wrong mode_idx attribute for the wx variants of the adds.  The widening adds's mode is the one of the non-widened input operand but for the wx/scalar variants this is a scalar mode instead of a vector mode.
+That confuses avlprop so that it uses 1 instead of 4 as vector length.
+
+Testing a patch.
+
+- User: GCC Commits | Time: 2024-08-01 19:57:00 UTC
+  Text: The master branch has been updated by Robin Dapp <rdapp@gcc.gnu.org>:https://gcc.gnu.org/g:f15cd1802129454029f7fcc8ee3ddd56a86cdad8commitr15-2649-gf15cd1802129454029f7fcc8ee3ddd56a86cdad8Author: Robin Dapp <rdapp@ventanamicro.com>
+Date:   Wed Jul 31 16:54:03 2024 +0200
+
+    RISC-V: Correct mode_idx attribute for viwalu wx variants [PR116149].
+    
+    InPR116149we choose a wrong vector length which causes wrong values in
+    a reduction.  The problem happens in avlprop where we choose the
+    number of units in the instruction's mode as vector length.  For the
+    non-scalar variants the respective operand has the correct non-widened
+    mode.  For the scalar variants, however, the same operand has a scalar
+    mode which obviously only has one unit.  This makes us choose VL = 1
+    leaving three elements undisturbed (so potentially -1).  Those end up
+    in the reduction causing the wrong result.
+    
+    This patch adjusts the mode_idx just for the scalar variants of the
+    affected instruction patterns.
+    
+    gcc/ChangeLog:PR target/116149* config/riscv/vector.md: Fix mode_idx attribute of scalar
+            widen add/sub variants.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/pr116149.c: New test.
+
+- User: Robin Dapp | Time: 2024-08-01 20:00:51 UTC
+  Text: Fixed on trunk.
+

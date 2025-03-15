@@ -1,0 +1,242 @@
+Bug Summary: rs6000: Miss warning for incompatible no-altivec and vsx in target attribute
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: diagnostic
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Kewen Lin | Time: 2024-06-30 02:56:37 UTC
+  Text: As Peter found in thePR115688, there isn't a warning for:
+
+long __attribute__ ((target ("no-altivec,vsx")))
+foo (void)
+{
+  return 0;
+}
+
+It's expected to see warning like:
+
+warning: ‘-mvsx’ and ‘-mno-altivec’ are incompatible
+
+- User: Kewen Lin | Time: 2024-06-30 03:03:55 UTC
+  Text: There IS a warning for:
+
+long __attribute__ ((target ("vsx,no-altivec")))
+foo1 (void)
+{
+  return 0;
+}
+
+, interesting. :)
+
+It's due to that we enable altivec when parsing vsx in target attribute, but don't consider if it's explicit set, so the fix can be:
+
+diff --git a/gcc/config/rs6000/rs6000.cc b/gcc/config/rs6000/rs6000.cc
+index 76bbb3a28ea..4638c34cc24 100644
+--- a/gcc/config/rs6000/rs6000.cc
++++ b/gcc/config/rs6000/rs6000.cc
+@@ -24638,8 +24638,11 @@ rs6000_inner_target_options (tree args, bool attr_p)
+                           {
+                             if (mask == OPTION_MASK_VSX)
+                               {
+-                                mask |= OPTION_MASK_ALTIVEC;
+-                                TARGET_AVOID_XFORM = 0;
++                                if (!(rs6000_isa_flags_explicit
++                                      & OPTION_MASK_ALTIVEC))
++                                  mask |= OPTION_MASK_ALTIVEC;
++                                if (!OPTION_SET_P (TARGET_AVOID_XFORM))
++                                  TARGET_AVOID_XFORM = 0;
+                               }
+                           }
+
+- User: Peter Bergner | Time: 2024-06-30 03:50:27 UTC
+  Text: (In reply to Kewen Lin fromcomment #0)> As Peter found in thePR115688, there isn't a warning for:
+> 
+> long __attribute__ ((target ("no-altivec,vsx")))
+> foo (void)
+> {
+>   return 0;
+> }
+> 
+> It's expected to see warning like:
+> 
+> warning: ‘-mvsx’ and ‘-mno-altivec’ are incompatibleI think Segher and I mentioned in the other bug, that conflicting options like this should be an error, rather than a warning.
+
+- User: Kewen Lin | Time: 2024-07-01 07:37:14 UTC
+  Text: (In reply to Peter Bergner fromcomment #2)> (In reply to Kewen Lin fromcomment #0)
+> > As Peter found in thePR115688, there isn't a warning for:
+> > 
+> > long __attribute__ ((target ("no-altivec,vsx")))
+> > foo (void)
+> > {
+> >   return 0;
+> > }
+> > 
+> > It's expected to see warning like:
+> > 
+> > warning: ‘-mvsx’ and ‘-mno-altivec’ are incompatible
+> 
+> I think Segher and I mentioned in the other bug, that conflicting options
+> like this should be an error, rather than a warning.ah, thanks for noting this, sorry that I missed that part.  I agree that error sounds better as both are explicitly specified. I thought the reason why it's a warning is that the whole processing hunk is for warning:
+
+  /* Add some warnings for VSX.  */
+  if (TARGET_VSX)
+    {
+      const char *msg = NULL;
+      if (!TARGET_HARD_FLOAT)
+	{
+	  if (rs6000_isa_flags_explicit & OPTION_MASK_VSX)
+	    msg = N_("%<-mvsx%> requires hardware floating point");
+	  else
+	    {
+	      rs6000_isa_flags &= ~ OPTION_MASK_VSX;
+	      rs6000_isa_flags_explicit |= OPTION_MASK_VSX;
+	    }
+	}
+      else if (TARGET_AVOID_XFORM > 0)
+	msg = N_("%<-mvsx%> needs indexed addressing");
+      else if (!TARGET_ALTIVEC && (rs6000_isa_flags_explicit
+				   & OPTION_MASK_ALTIVEC))
+        {
+	  if (rs6000_isa_flags_explicit & OPTION_MASK_VSX)
+	    msg = N_("%<-mvsx%> and %<-mno-altivec%> are incompatible");
+	  else
+	    msg = N_("%<-mno-altivec%> disables vsx");
+        }
+
+      if (msg)
+	{
+	  warning (0, msg);
+	  rs6000_isa_flags &= ~ OPTION_MASK_VSX;
+	  rs6000_isa_flags_explicit |= OPTION_MASK_VSX;
+	}
+    }
+
+I think we still would like to leave the others as warning, then I'll add one flag specific in explicit vsx and altivec arm for error.
+
+- User: Kewen Lin | Time: 2024-07-05 08:48:27 UTC
+  Text: > diff --git a/gcc/config/rs6000/rs6000.cc b/gcc/config/rs6000/rs6000.cc
+> index 76bbb3a28ea..4638c34cc24 100644
+> --- a/gcc/config/rs6000/rs6000.cc
+> +++ b/gcc/config/rs6000/rs6000.cc
+> @@ -24638,8 +24638,11 @@ rs6000_inner_target_options (tree args, bool attr_p)
+>                            {
+>                              if (mask == OPTION_MASK_VSX)
+>                                {
+> -                                mask |= OPTION_MASK_ALTIVEC;
+> -                                TARGET_AVOID_XFORM = 0;
+> +                                if (!(rs6000_isa_flags_explicit
+> +                                      & OPTION_MASK_ALTIVEC))
+> +                                  mask |= OPTION_MASK_ALTIVEC;
+> +                                if (!OPTION_SET_P (TARGET_AVOID_XFORM))
+> +                                  TARGET_AVOID_XFORM = 0;
+>                                }
+>                            }Testing this patch and found one regression failure:
+
+gcc/testsuite/gcc.target/powerpc/ppc-target-4.c
+
+It fails due to that the command line (dg-options) specifies -mno-altivec
+
+/* { dg-options "-O2 -ffast-math -mdejagnu-cpu=power5 -mno-altivec -mabi=altivec -fno-unroll-loops" } */
+
+meanwhile #pragma target just specifies "vsx"
+
+#pragma GCC target("vsx")
+#include <altivec.h>
+
+----
+w/o this patch, "vsx" would enable altivec implicitly no matter that command line option specifying -mno-altivec, while w/ this patch "vsx" won't enable altivec any more.  It's like the case in #c0, the difference is -mno-altivec is from command line or target attribute itself. It can be fixed by explicitly specifying "-maltivec" in target attribute.
+
+But by checking the manual, I noticed the documentation on target attribute says "The original target command-line options are ignored.", I think it contradicts with what we implemented for target attribute parsing now? It seems the other targets don't conform with this very well, target_option_default_node has considered all command line options? I wonder if the documentation is intentional to define like this.
+
+- User: Richard Biener | Time: 2024-07-05 09:20:42 UTC
+  Text: The docs are at least imprecise.  Surely command-line -maltivec with
+target ("no-vsx") shouldn't revert to whatever is default with the target opts.
+
+- User: Kewen Lin | Time: 2024-07-08 06:10:35 UTC
+  Text: (In reply to Richard Biener fromcomment #5)> The docs are at least imprecise.  Surely command-line -maltivec with
+> target ("no-vsx") shouldn't revert to whatever is default with the target
+> opts.Thanks for confirming, I'll update the affected test case.
+
+- User: GCC Commits | Time: 2024-07-23 05:51:27 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:04da747a063850333b062e48d0531debe314dff9commitr15-2214-g04da747a063850333b062e48d0531debe314dff9Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Tue Jul 23 00:47:49 2024 -0500
+
+    rs6000: Escalate warning to error for VSX with explicit no-altivec etc.
+    
+    As the discussion inPR115688, for now when users specify
+    -mvsx and -mno-altivec explicitly, compiler emits warning
+    rather than error, but considering both options are given
+    explicitly, emitting hard error should be better.
+    
+    So this patch is to escalate some related warning to error
+    when both are incompatible.PR target/115713gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.cc (rs6000_option_override_internal): Emit error
+            messages when explicit VSX encounters explicit soft-float, no-altivec
+            or avoid-indexed-addresses.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/warn-1.c: Move to ...
+            * gcc.target/powerpc/error-1.c: ... here.  Adjust dg-warning with
+            dg-error and remove ineffective scan.
+
+- User: GCC Commits | Time: 2024-07-23 05:51:33 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:e6db8848d956f5e712dd621d33630b799ff60a72commitr15-2215-ge6db8848d956f5e712dd621d33630b799ff60a72Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Tue Jul 23 00:48:00 2024 -0500
+
+    rs6000: Consider explicitly set options in target option parsing [PR115713]
+    
+    In rs6000_inner_target_options, when enabling VSX we enable
+    altivec and disable -mavoid-indexed-addresses implicitly,
+    but it doesn't consider the case that the options altivec
+    and avoid-indexed-addresses can be explicitly disabled.  As
+    the test case inPR115713#c1 shows, with target attribute
+    "no-altivec,vsx", it results in that VSX unexpectedly set
+    altivec flag and there isn't an expected error.
+    
+    This patch is to avoid the automatic enablement when they
+    are explicitly specified.  With this change, an existing
+    test case ppc-target-4.c also requires an adjustment by
+    specifying explicit altivec in target attribute (since it
+    requires altivec feature and command line is specifying
+    no-altivec).PR target/115713gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.cc (rs6000_inner_target_options): Avoid to
+            enable altivec or disable avoid-indexed-addresses automatically
+            when they get specified explicitly.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr115713-1.c: New test.
+            * gcc.target/powerpc/ppc-target-4.c: Adjust by specifying altivec
+            in target attribute.
+
+- User: GCC Commits | Time: 2024-07-23 05:51:38 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:f4062e361cccc5a32597afdb6c8066c87f680276commitr15-2216-gf4062e361cccc5a32597afdb6c8066c87f680276Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Tue Jul 23 00:48:14 2024 -0500
+
+    rs6000: Update option set in rs6000_inner_target_options [PR115713]
+    
+    When function rs6000_inner_target_options parsing target
+    options, it updates the explicit option set information for
+    rs6000_opt_masks by rs6000_isa_flags_explicit, but it misses
+    to update that information for rs6000_opt_vars, and it can
+    result in some unexpected consequence as the associated test
+    case shows.  This patch is to fix rs6000_inner_target_options
+    to update the option set for rs6000_opt_vars as well.PR target/115713gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.cc (rs6000_inner_target_options): Update option
+            set information for rs6000_opt_vars.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr115713-2.c: New test.
+
+- User: Kewen Lin | Time: 2024-07-24 07:23:50 UTC
+  Text: Should be fixed on trunk.
+

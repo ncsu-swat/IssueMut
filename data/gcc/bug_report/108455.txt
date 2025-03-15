@@ -1,0 +1,190 @@
+Bug Summary: -Wanalyzer-deref-before-check false positive seen in git pack-revindex.c
+Product: gcc
+Component: analyzer
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Malcolm | Time: 2023-01-18 18:43:14 UTC
+  Text: Createdattachment 54299[details]Reduced reproducer
+
+I'm attaching a reduced reproducerhttps://godbolt.org/z/7oMrno8rdComplains about:
+
+../../src/pack-revindex.c: In function ‘load_revindex_from_disk’:
+../../src/pack-revindex.c:123:8: warning: check of ‘data’ for NULL after already dereferencing it [-Wanalyzer-deref-before-check]
+  123 |     if (data)
+      |        ^
+  ‘load_revindex_from_disk’: events 1-11
+    |
+    |   63 | int load_revindex_from_disk(char *revindex_name, uint32_t num_objects,
+    |      |     ^~~~~~~~~~~~~~~~~~~~~~~
+    |      |     |
+    |      |     (1) entry to ‘load_revindex_from_disk’
+    |......
+    |   73 |   if (fd < 0) {
+    |      |      ~
+    |      |      |
+    |      |      (2) following ‘false’ branch (when ‘fd >= 0’)...
+    |......
+    |   77 |   if (fstat(fd, &st)) {
+    |      |      ~~~~~~~~~~~~~~~
+    |      |      ||
+    |      |      |(3) ...to here
+    |      |      (4) following ‘false’ branch...
+    |......
+    |   82 |   revindex_size = xsize_t(st.st_size);
+    |      |                   ~~~~~~~~~~~~~~~~~~~
+    |      |                   |
+    |      |                   (5) ...to here
+    |   83 | 
+    |   84 |   if (revindex_size < ((12) + (2 * the_repository->hash_algo->rawsz))) {
+    |      |      ~
+    |      |      |
+    |      |      (6) following ‘false’ branch...
+    |......
+    |   90 |   if (revindex_size - ((12) + (2 * the_repository->hash_algo->rawsz)) !=
+    |      |      ~                                           ~~
+    |      |      |                                           |
+    |      |      (8) following ‘false’ branch...             (7) ...to here
+    |......
+    |   97 |   data = xmmap(((void *)0), revindex_size, 0x1, 0x02, fd, 0);
+    |      |          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    |      |          |
+    |      |          (9) ...to here
+    |......
+    |  100 |   if (git_bswap32(hdr->signature) != 0x52494458) {
+    |      |       ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    |      |       |
+    |      |       (10) pointer ‘data’ is dereferenced here
+    |  101 |     ret =
+    |  102 |         (error(_("reverse-index file %s has unknown signature"), revindex_name),
+    |      |          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    |      |          |
+    |      |          (11) calling ‘_’ from ‘load_revindex_from_disk’
+    |
+    +--> ‘_’: events 12-14
+           |
+           |   37 | static inline __attribute__((format_arg(1))) const char *_(const char *msgid) {
+           |      |                                                          ^
+           |      |                                                          |
+           |      |                                                          (12) entry to ‘_’
+           |   38 |   if (!*msgid)
+           |      |      ~                                                    
+           |      |      |
+           |      |      (13) following ‘false’ branch...
+           |   39 |     return "";
+           |   40 |   return gettext(msgid);
+           |      |          ~~~~~~~~~~~~~~                                   
+           |      |          |
+           |      |          (14) ...to here
+           |
+    <------+
+    |
+  ‘load_revindex_from_disk’: events 15-18
+    |
+    |  102 |         (error(_("reverse-index file %s has unknown signature"), revindex_name),
+    |      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    |      |          |
+    |      |          (15) returning to ‘load_revindex_from_disk’ from ‘_’
+    |......
+    |  122 |   if (ret) {
+    |      |      ~    
+    |      |      |
+    |      |      (16) following ‘true’ branch (when ‘ret != 0’)...
+    |  123 |     if (data)
+    |      |        ~  
+    |      |        |
+    |      |        (17) ...to here
+    |      |        (18) pointer ‘data’ is checked for NULL here but it was already dereferenced at (10)
+    |
+
+Yes it does check the pointer for NULL after dereferencing it, but this is in shared cleanup code.  There are other paths to the check for NULL in which the pointer hasn't yet been dereferenced.
+
+- User: David Malcolm | Time: 2023-01-18 18:44:12 UTC
+  Text: Perhaps should only complain if the deref site dominates the check site in the supergraph (and both are in the same function?)
+
+- User: David Malcolm | Time: 2023-01-18 21:50:15 UTC
+  Text: I'm testing a patch for this.
+
+- User: GCC Commits | Time: 2023-01-19 18:52:55 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:0d6f7b1dd62e9c9dccb0b9b673f9cc3238b7ea6dcommitr13-5261-g0d6f7b1dd62e9c9dccb0b9b673f9cc3238b7ea6dAuthor: David Malcolm <dmalcolm@redhat.com>
+Date:   Thu Jan 19 13:51:16 2023 -0500
+
+    analyzer: use dominator info in -Wanalyzer-deref-before-check [PR108455]
+    
+    My integration testing [1] of -fanalyzer in GCC 13 is showing a lot of
+    diagnostics from the new -Wanalyzer-deref-before-check warning on
+    real-world C projects, and most of these seem to be false positives.
+    
+    This patch updates the warning to make it much less likely to fire:
+    - only intraprocedural cases are now reported
+    - reject cases in which there are control flow paths to the check
+      that didn't come through the dereference, by looking at BB dominator
+      information.  This fixes a false positive seen in git-2.39.0's
+      pack-revindex.c: load_revindex_from_disk (PR analyzer/108455), in
+      which a shared "cleanup:" section checks "data" for NULL, and
+      depending on how much of the function is executed "data" might or
+      might not have already been dereferenced.
+    
+    The counts of -Wanalyzer-deref-before-check diagnostics in [1]
+    before/after this patch show this improvement:
+      Known false positives:    6 ->  0  (-6)
+      Known true positives:     1 ->  1
+      Unclassified positives: 123 -> 63 (-60)
+    
+    [1]https://github.com/davidmalcolm/gcc-analyzer-integration-testsgcc/analyzer/ChangeLog:PR analyzer/108455* analyzer.h (class checker_event): New forward decl.
+            (class state_change_event): Indent.
+            (class warning_event): New forward decl.
+            * checker-event.cc (state_change_event::state_change_event): Add
+            "enode" param.
+            (warning_event::get_desc): Update for new param of
+            evdesc::final_event ctor.
+            * checker-event.h (state_change_event::state_change_event): Add
+            "enode" param.
+            (state_change_event::get_exploded_node): New accessor.
+            (state_change_event::m_enode): New field.
+            (warning_event::warning_event): New "enode" param.
+            (warning_event::get_exploded_node): New accessor.
+            (warning_event::m_enode): New field.
+            * diagnostic-manager.cc
+            (state_change_event_creator::on_global_state_change): Pass
+            src_node to state_change_event ctor.
+            (state_change_event_creator::on_state_change): Likewise.
+            (null_assignment_sm_context::set_next_state): Pass NULL for
+            new param of state_change_event ctor.
+            * infinite-recursion.cc
+            (infinite_recursion_diagnostic::add_final_event): Update for new
+            param of warning_event ctor.
+            * pending-diagnostic.cc (pending_diagnostic::add_final_event):
+            Pass enode to warning_event ctor.
+            * pending-diagnostic.h (evdesc::final_event): Add reference to
+            warning_event.
+            * sm-malloc.cc: Include "analyzer/checker-event.h" and
+            "analyzer/exploded-graph.h".
+            (deref_before_check::deref_before_check): Initialize new fields.
+            (deref_before_check::emit): Reject warnings in which we were
+            unable to determine the enodes of the dereference and the check.
+            Reject warnings interprocedural warnings. Reject warnings in which
+            the dereference doesn't dominate the check.
+            (deref_before_check::describe_state_change): Set m_deref_enode.
+            (deref_before_check::describe_final_event): Set m_check_enode.
+            (deref_before_check::m_deref_enode): New field.
+            (deref_before_check::m_check_enode): New field.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/108455* gcc.dg/analyzer/deref-before-check-1.c: Add test coverage
+            involving dominance.
+            * gcc.dg/analyzer/deref-before-check-pr108455-1.c: New test.
+            * gcc.dg/analyzer/deref-before-check-pr108455-git-pack-revindex.c:
+            New test.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2023-01-19 18:58:44 UTC
+  Text: Should be fixed by the above commit.
+
+- User: David Malcolm | Time: 2024-03-23 13:58:50 UTC
+  Text: Note: the above patch caused the ICE inbug 114408.
+

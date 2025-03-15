@@ -1,0 +1,152 @@
+Bug Summary: LoongArch: "unmatched" -mabi and -mfpu setting can break ABI silently
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: patch, wrong-code
+Known to Work: 
+Known to Fail: 12.2.0, 13.0
+
+Comments:
+- User: Xi Ruoyao | Time: 2023-03-03 03:55:29 UTC
+  Text: $ cat t.c
+double t(double x)
+{
+	return 1.0 / x;
+}
+$ ~/gcc-trunk/bin/gcc t.c -O2 -c -mabi=lp64s
+$ readelf -a t.o | grep FLOAT
+  Flags:                             0x41, SOFT-FLOAT, OBJ-v1
+$ objdump -d t.o
+
+t.o:     file format elf64-loongarch
+
+
+Disassembly of section .text:
+
+0000000000000000 <t>:
+   0:	01145800 	frecip.d    	$fa0, $fa0
+   4:	4c000020 	jirl        	$zero, $ra, 0
+
+So we now have a SOFT-FLOAT object using FPR for arguments and return values :(.
+
+- User: Xi Ruoyao | Time: 2023-03-03 03:57:16 UTC
+  Text: I've already made the patch.  Just create a PR to track the issue.
+
+- User: GCC Commits | Time: 2023-03-06 07:56:22 UTC
+  Text: The master branch has been updated by Xi Ruoyao <xry111@gcc.gnu.org>:https://gcc.gnu.org/g:75eccddef5784bc5e262af31f535267a9c4e993ecommitr13-6500-g75eccddef5784bc5e262af31f535267a9c4e993eAuthor: Xi Ruoyao <xry111@xry111.site>
+Date:   Thu Mar 2 18:05:23 2023 +0800
+
+    LoongArch: Stop -mfpu from silently breaking ABI [PR109000]
+    
+    In the toolchain convention, we describe -mfpu= as:
+    
+    "Selects the allowed set of basic floating-point instructions and
+    registers. This option should not change the FP calling convention
+    unless it's necessary."
+    
+    Though not explicitly stated, the rationale of this rule is to allow
+    combinations like "-mabi=lp64s -mfpu=64".  This will be useful for
+    running applications with LP64S/F ABI on a double-float-capable
+    LoongArch hardware and using a math library with LP64S/F ABI but native
+    double float HW instructions, for a better performance.
+    
+    And now a case in Linux kernel has again proven the usefulness of this
+    kind of combination.  The AMDGPU DCN kernel driver needs to perform some
+    floating-point operation, but the entire kernel uses LP64S ABI.  So the
+    translation units of the AMDGPU DCN driver need to be compiled with
+    -mfpu=64 (the kernel lacks soft-FP routines in libgcc), but -mabi=lp64s
+    (or you can't link it with the other part of the kernel).
+    
+    Unfortunately, currently GCC uses TARGET_{HARD,SOFT,DOUBLE}_FLOAT to
+    determine the floating calling convention.  This causes "-mfpu=64"
+    silently allow using $fa* to pass parameters and return values EVEN IF
+    -mabi=lp64s is used.  To make things worse, the generated object file
+    has SOFT-FLOAT set in the eflags field so the linker will happily link
+    it with other LP64S ABI object files, but obviously this will lead to
+    bad results at runtime.  And for now all loongarch64 CPU models (-march
+    settings) implies -mfpu=64 on by default, so the issue makes a single
+    "-mabi=lp64s" option basically broken (fortunately most projects for eg
+    the Linux kernel have used -msoft-float which implies both -mabi=lp64s
+    and -mfpu=none as we've recommended in the toolchain convention doc).
+    
+    The fix is simple: use TARGET_*_FLOAT_ABI instead.
+    
+    I consider this a bug fix: the behavior difference from the toolchain
+    convention doc is a bug, and generating object files with SOFT-FLOAT
+    flag but parameters/return values passed through FPRs is definitely a
+    bug.
+    
+    Bootstrapped and regtested on loongarch64-linux-gnu.  Ok for trunk and
+    release/gcc-12 branch?
+    
+    gcc/ChangeLog:PR target/109000* config/loongarch/loongarch.h (FP_RETURN): Use
+            TARGET_*_FLOAT_ABI instead of TARGET_*_FLOAT.
+            (UNITS_PER_FP_ARG): Likewise.
+    
+    gcc/testsuite/ChangeLog:PR target/109000* gcc.target/loongarch/flt-abi-isa-1.c: New test.
+            * gcc.target/loongarch/flt-abi-isa-2.c: New test.
+            * gcc.target/loongarch/flt-abi-isa-3.c: New test.
+            * gcc.target/loongarch/flt-abi-isa-4.c: New test.
+
+- User: GCC Commits | Time: 2023-03-06 07:57:17 UTC
+  Text: The releases/gcc-12 branch has been updated by Xi Ruoyao <xry111@gcc.gnu.org>:https://gcc.gnu.org/g:eb50091457a789e2f2a15c2e5d08e0d79d3195b1commitr12-9225-geb50091457a789e2f2a15c2e5d08e0d79d3195b1Author: Xi Ruoyao <xry111@xry111.site>
+Date:   Thu Mar 2 18:05:23 2023 +0800
+
+    LoongArch: Stop -mfpu from silently breaking ABI [PR109000]
+    
+    In the toolchain convention, we describe -mfpu= as:
+    
+    "Selects the allowed set of basic floating-point instructions and
+    registers. This option should not change the FP calling convention
+    unless it's necessary."
+    
+    Though not explicitly stated, the rationale of this rule is to allow
+    combinations like "-mabi=lp64s -mfpu=64".  This will be useful for
+    running applications with LP64S/F ABI on a double-float-capable
+    LoongArch hardware and using a math library with LP64S/F ABI but native
+    double float HW instructions, for a better performance.
+    
+    And now a case in Linux kernel has again proven the usefulness of this
+    kind of combination.  The AMDGPU DCN kernel driver needs to perform some
+    floating-point operation, but the entire kernel uses LP64S ABI.  So the
+    translation units of the AMDGPU DCN driver need to be compiled with
+    -mfpu=64 (the kernel lacks soft-FP routines in libgcc), but -mabi=lp64s
+    (or you can't link it with the other part of the kernel).
+    
+    Unfortunately, currently GCC uses TARGET_{HARD,SOFT,DOUBLE}_FLOAT to
+    determine the floating calling convention.  This causes "-mfpu=64"
+    silently allow using $fa* to pass parameters and return values EVEN IF
+    -mabi=lp64s is used.  To make things worse, the generated object file
+    has SOFT-FLOAT set in the eflags field so the linker will happily link
+    it with other LP64S ABI object files, but obviously this will lead to
+    bad results at runtime.  And for now all loongarch64 CPU models (-march
+    settings) implies -mfpu=64 on by default, so the issue makes a single
+    "-mabi=lp64s" option basically broken (fortunately most projects for eg
+    the Linux kernel have used -msoft-float which implies both -mabi=lp64s
+    and -mfpu=none as we've recommended in the toolchain convention doc).
+    
+    The fix is simple: use TARGET_*_FLOAT_ABI instead.
+    
+    I consider this a bug fix: the behavior difference from the toolchain
+    convention doc is a bug, and generating object files with SOFT-FLOAT
+    flag but parameters/return values passed through FPRs is definitely a
+    bug.
+    
+    Bootstrapped and regtested on loongarch64-linux-gnu.  Ok for trunk and
+    release/gcc-12 branch?
+    
+    gcc/ChangeLog:PR target/109000* config/loongarch/loongarch.h (FP_RETURN): Use
+            TARGET_*_FLOAT_ABI instead of TARGET_*_FLOAT.
+            (UNITS_PER_FP_ARG): Likewise.
+    
+    gcc/testsuite/ChangeLog:PR target/109000* gcc.target/loongarch/flt-abi-isa-1.c: New test.
+            * gcc.target/loongarch/flt-abi-isa-2.c: New test.
+            * gcc.target/loongarch/flt-abi-isa-3.c: New test.
+            * gcc.target/loongarch/flt-abi-isa-4.c: New test.
+    
+    (cherry picked from commit 75eccddef5784bc5e262af31f535267a9c4e993e)
+
+- User: Xi Ruoyao | Time: 2023-03-06 07:58:18 UTC
+  Text: Fixed for trunk and gcc-12.
+

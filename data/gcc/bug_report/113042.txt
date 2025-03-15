@@ -1,0 +1,173 @@
+Bug Summary: popcount of 128bits can be improved for !TARGET_CSSC
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2023-12-16 04:04:31 UTC
+  Text: Take:
+```
+unsigned h8 (const unsigned char *restrict a) {
+  return __builtin_popcountg (a[0]);
+}
+
+
+unsigned __int128 h128 (const unsigned __int128 *restrict a) {
+  return __builtin_popcountg (a[0]);
+}
+
+```
+
+Currently h8 produces:
+```
+        ldr     b31, [x0]
+        cnt     v31.8b, v31.8b
+        addv    b31, v31.8b
+        fmov    w0, s31
+        ret
+```
+But the addv is not needed here and we could instead just get:
+```
+        ldr     b31, [x0]
+        cnt     v31.8b, v31.8b
+        smov    w0, v31.b[0]
+        ret
+```
+
+For h128, there are two cnt:
+```
+        ldp     d30, d31, [x0]
+        mov     x1, 0
+        cnt     v30.8b, v30.8b
+        cnt     v31.8b, v31.8b
+        addv    b30, v30.8b
+        addv    b31, v31.8b
+        fmov    x2, d30
+        fmov    x0, d31
+        add     x0, x2, x0
+        ret
+```
+
+But we could do instead:
+```
+        ldr     q30, [x0]
+        mov     x1, 0
+        cnt     v30.16b, v30.16b
+        addv    b30, v31.16b
+        fmov    x0, d30
+        ret
+```
+
+Basically we need to implement popcountqi2 and popcountti2 patterns.
+
+Note for TARGET_CSSC, Using the scalar cnt will still be better I suspect so I won't enable these patterns for that.
+
+- User: Andrew Pinski | Time: 2023-12-16 04:06:43 UTC
+  Text: Will submit the patch early next week.
+
+- User: Andrew Pinski | Time: 2023-12-16 05:42:49 UTC
+  Text: Blah, adding popcountti2 does not work as the middle-end (in fold_builtin_bit_query) splits it into 2 __builtin_popcountll already ...
+
+- User: Andrew Pinski | Time: 2024-06-10 04:06:19 UTC
+  Text: https://gcc.gnu.org/pipermail/gcc-patches/2024-June/654011.htmlI will implement the TI change later as it requires some middle-end changes still.
+
+- User: Andrew Pinski | Time: 2024-06-11 17:11:43 UTC
+  Text: New patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2024-June/654115.html
+
+- User: Andrew Pinski | Time: 2024-06-26 15:05:55 UTC
+  Text: ***Bug 115667has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2024-08-16 06:56:15 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:fcc3af9949880476c4ed01a98bd7f5d7f29b7b16commitr15-2946-gfcc3af9949880476c4ed01a98bd7f5d7f29b7b16Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Mon Jun 10 00:39:54 2024 +0000
+
+    aarch64: Improve popcount for bytes [PR113042]
+    
+    For popcount for bytes, we don't need the reduction addition
+    after the vector cnt instruction as we are only counting one
+    byte's popcount.
+    This changes the popcount extend to cover all ALLI rather than GPI.
+    
+    Changes since v1:
+    * v2 - Use ALLI iterator and combine all into one pattern.
+           Add new testcases popcnt[6-8].c.
+    * v3 - Simplify TARGET_CSSC path.
+           Use convert_to_mode instead of gen_zero_extend* directly.
+           Some other small cleanups.
+    
+    Bootstrapped and tested on aarch64-linux-gnu with no regressions.PR target/113042gcc/ChangeLog:
+    
+            * config/aarch64/aarch64.md (popcount<mode>2): Update pattern
+            to support ALLI modes.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/popcnt5.c: New test.
+            * gcc.target/aarch64/popcnt6.c: New test.
+            * gcc.target/aarch64/popcnt7.c: New test.
+            * gcc.target/aarch64/popcnt8.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-08-16 06:58:09 UTC
+  Text: I will fix popcountti2 next.
+
+- User: Andrew Pinski | Time: 2024-08-16 07:50:30 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> Blah, adding popcountti2 does not work as the middle-end (in
+> fold_builtin_bit_query) splits it into 2 __builtin_popcountll already ...I have a patch for that:
+```
+diff --git a/gcc/builtins.cc b/gcc/builtins.cc
+index 0b902896ddd..b4d51eaeba5 100644
+--- a/gcc/builtins.cc
++++ b/gcc/builtins.cc
+@@ -10185,7 +10185,9 @@ fold_builtin_bit_query (location_t loc, enum built_in_function fcode,
+   tree call = NULL_TREE, tem;
+   if (TYPE_PRECISION (arg0_type) == MAX_FIXED_MODE_SIZE
+       && (TYPE_PRECISION (arg0_type)
+-         == 2 * TYPE_PRECISION (long_long_unsigned_type_node)))
++         == 2 * TYPE_PRECISION (long_long_unsigned_type_node))
++      /* If the target supports the optab, then don't do the expansion. */
++      && !direct_internal_fn_supported_p (ifn, arg0_type, OPTIMIZE_FOR_BOTH))
+     {
+       /* __int128 expansions using up to 2 long long builtins.  */
+       arg0 = save_expr (arg0);
+
+```
+
+I didn't realize it was that simple :).
+
+- User: Andrew Pinski | Time: 2024-08-16 21:37:36 UTC
+  Text: The two patches submitted for this:https://gcc.gnu.org/pipermail/gcc-patches/2024-August/660664.htmlhttps://gcc.gnu.org/pipermail/gcc-patches/2024-August/660665.html
+
+- User: GCC Commits | Time: 2024-08-21 15:12:05 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:4a5d6118c10dfa4f1ed28ab4875bb80f2b2dca9dcommitr15-3072-g4a5d6118c10dfa4f1ed28ab4875bb80f2b2dca9dAuthor: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Fri Aug 16 11:18:31 2024 -0700
+
+    aarch64: Implement popcountti2 pattern [PR113042]
+    
+    When CSSC is not enabled, 128bit popcount can be implemented
+    just via the vector (v16qi) cnt instruction followed by a reduction,
+    like how the 64bit one is currently implemented instead of
+    splitting into 2 64bit popcount.
+    
+    Changes since v1:
+    * v2: Make operand 0 be DImode instead of TImode and simplify.
+    
+    Build and tested for aarch64-linux-gnu.PR target/113042gcc/ChangeLog:
+    
+            * config/aarch64/aarch64.md (popcountti2): New define_expand.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/popcnt10.c: New test.
+            * gcc.target/aarch64/popcnt9.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-08-21 15:12:40 UTC
+  Text: Fixed.
+

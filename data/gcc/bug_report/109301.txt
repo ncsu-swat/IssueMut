@@ -1,0 +1,200 @@
+Bug Summary: [13 Regression] ICE in format_helper, at real.h:233 since r13-1763
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: G. Steinmetz | Time: 2023-03-27 18:38:37 UTC
+  Text: Started between 20220717 and 20220724, at -Ofast :
+
+
+$ cat z1.c
+double x[256];
+void f (void)
+{
+  int i, j;
+  for (i=0; i<256; ++i)
+    for (j=0; j<8; ++j)
+      x[i] = __builtin_pow (x[i], 0.5);
+}
+
+
+$ gcc-13-20230326 -c z1.c -Ofast
+during GIMPLE pass: cunroll
+z1.c: In function 'f':
+z1.c:2:6: internal compiler error: in format_helper, at real.h:233
+    2 | void f (void)
+      |      ^
+0x94a671 format_helper::format_helper<machine_mode>(machine_mode const&)
+        ../../gcc/real.h:233
+0x94a671 const_binop
+        ../../gcc/fold-const.cc:1340
+0x94b027 const_binop(tree_code, tree_node*, tree_node*, tree_node*)
+        ../../gcc/fold-const.cc:1761
+0x10e23d8 gimple_resimplify2
+        ../../gcc/gimple-match-head.cc:280
+0x10e258a gimple_match_op::resimplify(gimple**, tree_node* (*)(tree_node*))
+        ../../gcc/gimple-match-head.cc:516
+0x1206eb8 gimple_simplify_CFN_POW
+        .../gcc-13-20230326/zzz_rel/gcc/gimple-match.cc:188875
+0x10e1112 gimple_simplify
+        .../gcc-13-20230326/zzz_rel/gcc/gimple-match.cc:211319
+0x10e22ca gimple_resimplify2
+        ../../gcc/gimple-match-head.cc:323
+0x10e258a gimple_match_op::resimplify(gimple**, tree_node* (*)(tree_node*))
+        ../../gcc/gimple-match-head.cc:516
+0x10fd1c0 gimple_simplify_CFN_SQRT
+        .../gcc-13-20230326/zzz_rel/gcc/gimple-match.cc:87171
+0x12a7aa7 gimple_simplify
+        .../gcc-13-20230326/zzz_rel/gcc/gimple-match.cc:95836
+0x12a8dc9 gimple_resimplify1
+        ../../gcc/gimple-match-head.cc:246
+0x10e259a gimple_match_op::resimplify(gimple**, tree_node* (*)(tree_node*))
+        ../../gcc/gimple-match-head.cc:514
+0x12a8f86 gimple_simplify(gimple*, gimple_match_op*, gimple**, tree_node* (*)(tree_node*), tree_node* (*)(tree_node*))
+        ../../gcc/gimple-match-head.cc:1115
+0x99029d fold_stmt_1
+        ../../gcc/gimple-fold.cc:6251
+0xe234f8 eliminate_dom_walker::eliminate_stmt(basic_block_def*, gimple_stmt_iterator*)
+        ../../gcc/tree-ssa-sccvn.cc:7062
+0xe298b7 process_bb
+        ../../gcc/tree-ssa-sccvn.cc:8050
+0xe2ad95 do_rpo_vn_1
+        ../../gcc/tree-ssa-sccvn.cc:8501
+0xe2bdc9 do_rpo_vn(function*, edge_def*, bitmap_head*, bool, bool, vn_lookup_kind)
+        ../../gcc/tree-ssa-sccvn.cc:8603
+0xd9b03d tree_unroll_loops_completely
+        ../../gcc/tree-ssa-loop-ivcanon.cc:1485
+
+- User: Jakub Jelinek | Time: 2023-03-27 19:00:53 UTC
+  Text: Started withr13-1763-g78d5e125c008d87cb2e1.
+
+ (for sqrts (SQRT)
+      cbrts (CBRT)
+      pows (POW)
+  /* sqrt(sqrt(x)) -> pow(x,1/4).  */
+  (simplify
+   (sqrts (sqrts @0))
+   (pows @0 { build_real (type, dconst_quarter ()); }))
+and various other simplifications after it aren't really suitable for floating point vector types.
+Well, we could do them as long as we'd verify that vector POW is actually implemented and used build_uniform_cst (type, VECTOR_TYPE_P (type) ? TREE_TYPE (type) : type, dconst_quarter ())); and similar stuff.
+But given that no target currently implements pow_optab, I think that would be a wasted effort.
+
+- User: Jakub Jelinek | Time: 2023-03-27 19:14:09 UTC
+  Text: Createdattachment 54774[details]gcc13-pr109301.patch
+
+Actually, I think just that single case might be enough, all the others involve cbrt or pow in the IL before.
+
+- User: Jakub Jelinek | Time: 2023-03-27 19:23:30 UTC
+  Text: Tried -Ofast -mavx512f
+#include <math.h>
+
+void
+foo (double *a, double *b)
+{
+  for (int i = 0; i < 1024; i++)
+    a[i] = pow (a[i], b[i]);
+}
+
+void
+bar (double *a)
+{
+  for (int i = 0; i < 1024; i++)
+    a[i] = cbrt (sqrt (a[i]));
+}
+
+void
+baz (double *a)
+{
+  for (int i = 0; i < 1024; i++)
+    a[i] = cbrt (cbrt (a[i]));
+}
+but that doesn't trigger, it uses simd clones rather than internal functions.
+Strangely, bar isn't vectorized while foo and baz are.
+
+- User: Richard Biener | Time: 2023-03-28 07:20:50 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #3)> Tried -Ofast -mavx512f
+> #include <math.h>
+> 
+> void
+> foo (double *a, double *b)
+> {
+>   for (int i = 0; i < 1024; i++)
+>     a[i] = pow (a[i], b[i]);
+> }
+> 
+> void
+> bar (double *a)
+> {
+>   for (int i = 0; i < 1024; i++)
+>     a[i] = cbrt (sqrt (a[i]));
+> }
+> 
+> void
+> baz (double *a)
+> {
+>   for (int i = 0; i < 1024; i++)
+>     a[i] = cbrt (cbrt (a[i]));
+> }
+> but that doesn't trigger, it uses simd clones rather than internal functions.
+> Strangely, bar isn't vectorized while foo and baz are.I only see foo vectorized (with simdclones), neither bar nor baz are - probably
+because cbrt isn't available in vector form and we don't resort to pow()
+here for baz because
+
+  /* cbrt(cbrt(x)) -> pow(x,1/9), iff x is nonnegative.  */
+  (simplify
+   (cbrts (cbrts tree_expr_nonnegative_p@0))
+   (pows @0 { build_real_truncate (type, dconst_ninth ()); }))
+
+doesn't trigger.  Later the 'powcabs' pass synthesizes cbrt(sqrt()) again
+but at least for me no cbrt vectorized variant is available.
+
+- User: GCC Commits | Time: 2023-03-29 06:37:56 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:8dd57939c20b5e218404a838f514429f8e414deacommitr13-6924-g8dd57939c20b5e218404a838f514429f8e414deaAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Mar 29 08:33:30 2023 +0200
+
+    tree-ssa-math-opts: Move PROP_gimple_opt_math from sincos pass to powcabs [PR109301]
+    
+    The following testcase ICEs since the sincos and vect pass order has
+    been swapped.  It is not valid to replace vector sqrt (sqrt (x)) with
+    pow (x, 0.25) because build_real on vector type is invalid (could be
+    handled by using build_uniform_cst and adjusting type passed to
+    build_real) but more importantly because nothing checks if we can
+    actually do vector pow.
+    While we have pow_optab, apparently no target defines it, so it doesn't
+    seem to be worth bothering with for now and the patch just punts on
+    non-scalar sqrts.
+    I think the other simplifications next to it are fine, as they mostly
+    use CBRT which doesn't even have internal function (so is a builtin
+    only and therefore always scalar), or have already pow in the IL (which
+    doesn't have optab and shouldn't be thus vector either).
+    It is true that with <bits/math-vector.h> we do vectorize some calls to
+    pow or cbrt (but don't handle others strangely), but those aren't using
+    internal functions but simd clones and so match.pd doesn't know anything
+    about those (at least for now).
+    
+    The following patch fixes it by mostly restoring the state beforer13-1763where canonicalize_math_p () was true only until the end of the
+    pass which transformed pow or pow-like calls before vectorization (formerly
+    sincos pass, now it is powcabs pass).
+    powcabs is a pass in the spot sincos was happening before, so the
+    only change was defer the sin+cos simplification into cexpi to a later
+    new pass (except for the name moving with it) and none of the
+    canonicalize_math_p () guarded simplification in match.pd seem to rely
+    on those sin+cos -> cexpi simplifications and canonicalize_math_p is
+    the only user of this property.
+    
+    2023-03-29  Jakub Jelinek  <jakub@redhat.com>
+                Richard Biener  <rguenther@suse.de>PR tree-optimization/109301* tree-ssa-math-opts.cc (pass_data_cse_sincos): Change
+            properties_provided from PROP_gimple_opt_math to 0.
+            (pass_data_expand_powcabs): Change properties_provided from 0 to
+            PROP_gimple_opt_math.
+    
+            * gcc.dg/pr109301.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-03-29 06:39:20 UTC
+  Text: Fixed.
+

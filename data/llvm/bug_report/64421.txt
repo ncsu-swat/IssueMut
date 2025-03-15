@@ -1,0 +1,84 @@
+Issue Title: [OpenMP][libomptarget][DeviceRTL] Removing ASSERT macro leads to test failures
+Original Post: When replacing the ASSERT macro in Debug.h i.e.:
+```
+#define ASSERT(expr, msg)                                                      \
+  {                                                                            \
+    if (config::isDebugMode(config::DebugKind::Assertion) && !(expr))          \
+      __assert_fail(#expr, msg, __FILE__, __LINE__, __PRETTY_FUNCTION__);      \
+    else                                                                       \
+      __assert_assume(expr);                                                   \
+  }
+```
+with an empty assert:
+```
+#define ASSERT(expr, msg)
+```
+
+There are 4 OpenMP tests which fail:
+```
+  libomptarget :: amdgcn-amd-amdhsa :: jit/empty_kernel_lvl2.c
+  libomptarget :: amdgcn-amd-amdhsa :: offloading/cuda_no_devices.c
+  libomptarget :: amdgcn-amd-amdhsa :: offloading/std_complex_arithmetic.cpp
+  libomptarget :: amdgcn-amd-amdhsa :: offloading/test_libc.cpp
+```
+
+Further investigation has revealed that:
+
+Removing the ASSERT in `omp_get_level()` makes the `jit/empty_kernel_lvl2.c` test fail.
+
+Removing the ASSERT in `void *SharedMemorySmartStackTy::push(uint64_t Bytes) {` leads to 3 tests failing:
+```
+  libomptarget :: amdgcn-amd-amdhsa :: offloading/cuda_no_devices.c
+  libomptarget :: amdgcn-amd-amdhsa :: offloading/std_complex_arithmetic.cpp
+  libomptarget :: amdgcn-amd-amdhsa :: offloading/test_libc.cpp
+```
+
+In addition to the tests above the OpenMP opt pass produces different results based on whether the ASSERTs are present in the DeviceRTL or not.
+
+```
+#include <omp.h>
+#include <stdio.h>
+
+int main(void) {
+  int threads = 0;
+
+#pragma omp target map(from:threads)
+  {
+    threads = omp_get_num_threads();
+  }
+
+  if (threads <= 0) {
+    printf("Runtime error, threads=%d\n", threads);
+  }
+  printf("Success!\n");
+
+  // INFO: 1 blocks and 256 threads in Generic-SPMD mode
+  return 0;
+}
+```
+
+If run with `LIBOMPTARGET_INFO=16` enabled, the launch details will change as follows based on whether the ASSERTs are present in the code or not:
+If the ASSERTs are present then the launch info is:
+```
+"PluginInterface" device 0 info: Launching kernel __omp_offloading_fd00_2448d7a_main_l6 with 1 blocks and 256 threads in Generic mode
+AMDGPU device 0 info: #Args: 1 Teams x Thrds:    1x 256 (MaxFlatWorkGroupSize: 1024) LDS Usage: 0B #SGPRs/VGPRs: 4/0 #SGPR/VGPR Spills: 0/0 Tripcount: 0
+```
+
+If the ASSERTs are NOT present then the launch info is:
+```
+"PluginInterface" device 0 info: Launching kernel __omp_offloading_fd00_2448d7a_main_l6 with 1 blocks and 256 threads in Generic-SPMD mode
+AMDGPU device 0 info: #Args: 1 Teams x Thrds:    1x 256 (MaxFlatWorkGroupSize: 1024) LDS Usage: 0B #SGPRs/VGPRs: 4/0 #SGPR/VGPR Spills: 0/0 Tripcount: 0
+```
+
+Note the Generic VS. Generic-SPMD mode.
+
+The presence of the ASSERTs should not influence the outcome of the optimizer and the OpenMP lit tests should not fail when the ASSERTs are removed.
+
+Comment by llvmbot: @llvm/issue-subscribers-openmp
+Comment by doru1004: Note: the failures above are segmentation faults.
+Comment by jdoerfert: > Note: the failures above are segmentation faults.
+
+We segfault because the shared stack is "too small" and the fallback, which is malloc, is not implemented on AMD. So the reason this crashes is the missing malloc, not the optimizer going bad or assume/assert being wrong. The reason it works otherwise is coincidental and not backed up by anything. We effectively ignore the fact that we are not having enough shared stack for the main thread to allocate 16 bytes, and still just do it.
+
+get level is failing because we optimize better for that case. This is the actual (performance) bug we should address; optimize better if the ASSERT is present.
+Comment by doru1004: Thanks for looking into this Johannes! The explanation is very helpful in understanding what's happening.

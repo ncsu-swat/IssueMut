@@ -1,0 +1,193 @@
+Issue Title: Weird Clang's branch coverage with macros from system headers
+Original Post: Clang eliminates whole MACRO expr in branch coverage.
+
+(https://godbolt.org/z/3o9MTf4eW)
+```
+/* header.h */
+#define ISN(c) ('0' <= (c) && (c) <= '9')
+```
+
+```
+#include <header.h>
+int isx(int c) {
+  return (ISN(c) || ('A' <= c && c <= 'F'));
+}
+```
+```
+clang -fprofile-instr-generate -fcoverage-mapping -Xclang -dump-coverage-mapping -isystem .
+```
+The emission of the record is as below; `ISN(c)` cannot be seen nor evaluated.
+Could I see the condition of `ISN(c)`?
+```
+isx:
+  File 0, 9:16 -> 11:2 = #0
+  File 0, 10:23 -> 10:45 = #1
+  File 0, 10:24 -> 10:32 = #1
+  Branch,File 0, 10:24 -> 10:32 = #4, (#1 - #4)
+  File 0, 10:36 -> 10:44 = #4
+  Branch,File 0, 10:36 -> 10:44 = #5, (#4 - #5)
+```
+
+WIth `-fcoverage-mcdc`, `llvm-cov` crashes. (cc: @evodius96)
+A workaround is adding `-mllvm -system-headers-coverage` to `clang`.
+
+Comment by ManuelvOK: Coverage mappings should not be generated for system headers, as introduced in 93205af066341a53733046894bd75c72c99566db.
+The hidden option `-mllvm -system-headers-coverage` introduced in 2155195131a57f2f01e7cfabb85bb027518c2dc6 changes that. But since that option was not checked on all places where coverage regions are generated, I created 1762695354c172bb35b97017b2706d8d476121e1 to do so.
+
+Adding `-mllvm -system-headers-coverage` is not a workaround, but the way to include coverage for code in system headers, which your header code is because of `-isystem .`.
+
+That does not explain the `llvm-cov` crash, though. Maybe there are more places the hidden option has to be checked.
+Comment by chapuni: @ManuelvOK Thank you to explain the background. Seems your change doesn't affect the testcase above.
+
+> Adding -mllvm -system-headers-coverage is not a workaround
+
+I think it'd be ideal, in this case, to handle `ISN` as if it were a function. I suppose users don't expect satisfying inner branch coverage in `ISN`. Rather, the final decision of `ISN` would be taken in account. This is the reason why I suppose `-system-headers-coverage` is a workaround.
+
+At the moment, ~~`-fcoverage-mcdc` crashes `llvm-cov` regardless of `-system-headers-coverage` in certain cases.~~
+`-fcoverage-mcdc` crashes `llvm-cov` (w/o the option) or `clang` (with the hidden option).
+Comment by chapuni: The crash can be reproducible w/o `-fcoverage-mcdc`.
+
+(https://godbolt.org/z/3qfva7rWa)
+```
+// -fprofile-instr-generate -fcoverage-mapping -mllvm -system-headers-coverage
+
+#include <set>
+
+void pruneCache() {
+  std::set<int> FileInfos;
+  FileInfos.insert(0);
+}
+```
+
+In this case, it dies in `CoverageMappingGen.cpp:coverIfConstexpr()`, to meet `ExprWithCleanups` on `cast<ConstantExpr>(S->getCond())`.
+Hope this helps.
+Comment by gkotheim: The assumption made in `coverIfConstexpr` that the condition of an `if contexpr` must be castable to  `ConstantExpr` seems to be incorrect (see the example below).
+This code was introduced very recently (Jan 22 2024) in commit e2e0ecab6693547938274ffa0a7f517cedf52205 as part of #78033, which explains why the error has never been noticed before.
+
+@chapuni Thank for the reproducible example.
+When I build your example on my machine, clang crashes during the coverage instrumentation of the following `if constexpr` in `/usr/include/c++/13.2.1/bits/stl_tree.h`:
+```cpp
+      static const _Key&
+      _S_key(_Const_Link_type __x)
+      {
+  ...
+
+      //            | Assumed to be castable to `ConstantExpr` but is of type
+      //            | `CXXUnresolvedConstructExpr`, which is not.
+      //            v
+      if constexpr (__is_invocable<
+                        _Compare &, const _Key &,
+                        const _Key
+                            &>{}) static_assert(is_invocable_v<const _Compare &,
+                                                               const _Key &,
+                                                               const _Key &>,
+                                                "comparison object must be "
+                                                "invocable as const");
+
+  ...
+      }
+```
+
+As can be seen from the corresponding part of the AST (dumped with `-Xclang -ast-dump=json test.cpp`), the `IfStmt` has `"isConstexpr": true`, but its condition (the first entry in `"inner"`) is of type `CXXUnresolvedConstructExpr`, which does not derive from `ConstantExpr`:
+```json
+{
+  "id" : "0x59f1f4f79b40",
+         "kind" : "IfStmt",
+                  "range"
+      : {
+        "begin" : {
+          "line" : 770,
+
+          "includedFrom" : {"file" : "/usr/include/c++/13.2.0/set"}
+        },
+        "end" : {
+          "line" : 773,
+          "col" : 55,
+          "tokLen" : 1,
+          "includedFrom" : {"file" : "/usr/include/c++/13.2.0/set"}
+        }
+      },
+        "isConstexpr" : true,
+                        "inner"
+      : [
+        {
+          "id" : "0x59f1f4f79930",
+          "kind" : "CXXUnresolvedConstructExpr",
+          "range" : {
+            "begin" : {
+              "offset" : 20556,
+              "line" : 770,
+              "col" : 16,
+              "tokLen" : 14,
+              "includedFrom" : {"file" : "/usr/include/c++/13.2.0/set"}
+            },
+            "end" : {
+              "offset" : 20608,
+              "col" : 68,
+              "tokLen" : 1,
+              "includedFrom" : {"file" : "/usr/include/c++/13.2.0/set"}
+            }
+          },
+          "type" : {
+            "qualType" :
+                "__is_invocable<_Compare &, const _Key &, const _Key &>"
+          },
+          "valueCategory" : "prvalue",
+          "list" : true,
+          "inner" : [ {
+            "id" : "0x59f1f4f798f0",
+            "kind" : "InitListExpr",
+            "range" : {
+              "begin" : {
+                "offset" : 20607,
+                "col" : 67,
+                "tokLen" : 1,
+                "includedFrom" : {"file" : "/usr/include/c++/13.2.0/set"}
+              },
+              "end" : {
+                "offset" : 20608,
+                "col" : 68,
+                "tokLen" : 1,
+                "includedFrom" : {"file" : "/usr/include/c++/13.2.0/set"}
+              }
+            },
+            "type" : {"qualType" : "void"},
+            "valueCategory" : "prvalue"
+          } ]
+        },
+        {"id" : "0x59f1f4f79b28", "kind" : "DeclStmt", "..." : "..."}
+      ]
+}
+```
+
+Unfortunately I don't have enough insight in Clang to provide a fix / correct implementation of `coverIfConstexpr` myself, but I hope the additional information proves useful nevertheless.
+
+Comment by cor3ntin: `CXXUnresolvedConstructExpr` should only appear in dependent code and I'm not quite sure why we would try to cover dependent code, something is weird. Afaict. the assumption that if constexpr expression is a ConstantExpr holds in a non-dependent context
+Comment by hanickadot: > The crash can be reproducible w/o `-fcoverage-mcdc`.
+> 
+> (https://godbolt.org/z/3qfva7rWa)
+
+It's no longer crashing, what changed? I see my patch is still there. I'm confused.
+Comment by gkotheim: > > The crash can be reproducible w/o `-fcoverage-mcdc`.
+> > (https://godbolt.org/z/3qfva7rWa)
+> 
+> It's no longer crashing, what changed? I see my patch is still there. I'm confused.
+
+A recent change #76950 fixed the `-system-headers-coverage` option, which enables collecting coverage for system headers, so that it is correctly applied in all necessary places.
+
+The crash was uncovered as a result.
+However, as the actual cause for the crash was still unknown at the time, the `-system-headers-coverage` change was [reverted](https://github.com/llvm/llvm-project/pull/76950#issuecomment-1913027127) (see commit faef68bca852d08511ea0311d8a0d221cb202e73), i.e. system headers such as `/usr/include/c++/13.2.1/bits/stl_tree.h` are now excluded from coverage again, and the example crashes no longer.
+
+I did my tests with 5585ddd90b08ecc287e1fb7f765056dc13ccbfe1, the commit immediately before the revert.
+Comment by chapuni: I've added assertions in #89572. This detects the issue in clang side.
+Comment by chapuni: I've created #91446 . @ManuelvOK Could you take a look?
+Comment by chapuni: @tstellar I'd like to backport this to 18.x. Could we add this to the waitlist?
+
+702a2b627ff4b2a5d330a7bd0d3f7cadaff0b4ed cannot be pulled cleanly. I can arrange it for release/18.x.
+Comment by tstellar: @chapuni There are no more 18.1.x releases planned.
+Comment by chapuni: @tstellar Thanks for tagging. Can I add a tag by myself for another issues #87000 ?
+Comment by tstellar: @chapuni Sure, you can tag it.
+Comment by chapuni: Patches for release/18.x are available.
+https://github.com/llvm/llvm-project/compare/release/18.x...chapuni:llvm-project:release/18.x
+6a7700a2ed095e3d4e153dcedbbe1f14e0565501
+24bda495bb387e66e85b2faa91ba4220d0d716d6

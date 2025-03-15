@@ -1,0 +1,170 @@
+Bug Summary: [15 regression] ICE on valid code at -Os with "-fschedule-insns -fno-thread-jumps -fno-dce" on x86_64-linux-gnu: in extract_insn, at recog.cc:2869
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2024-08-12 10:15:15 UTC
+  Text: It appears to be a recent regression as it doesn't reproduce with 14.2 and earlier. 
+
+Compiler Explorer:https://godbolt.org/z/e4jjW5rvM[531] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240807 (experimental) (GCC) 
+[532] % 
+[532] % gcctk -Os -fschedule-insns -fno-thread-jumps -fno-dce small.c
+small.c: In function ‘main’:
+small.c:16:1: error: unrecognizable insn:
+   16 | }
+      | ^
+(insn 42 38 89 9 (parallel [
+            (set (reg:SI 103 [ a_lsm.11 ])
+                (reg:SI 103 [ a_lsm.11 ]))
+            (clobber (reg:CC 17 flags))
+        ]) "small.c":3:40 discrim 1 -1
+     (expr_list:REG_UNUSED (reg:CC 17 flags)
+        (expr_list:REG_EQUAL (const_int 1 [0x1])
+            (nil))))
+during RTL pass: sched1
+small.c:16:1: internal compiler error: in extract_insn, at recog.cc:2869
+0x24fe5c5 internal_error(char const*, ...)
+	../../gcc-trunk/gcc/diagnostic-global-context.cc:491
+0xa50e04 fancy_abort(char const*, int, char const*)
+	../../gcc-trunk/gcc/diagnostic.cc:1772
+0x85641a _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+	../../gcc-trunk/gcc/rtl-error.cc:108
+0x85643c _fatal_insn_not_found(rtx_def const*, char const*, int, char const*)
+	../../gcc-trunk/gcc/rtl-error.cc:116
+0x854533 extract_insn(rtx_insn*)
+	../../gcc-trunk/gcc/recog.cc:2869
+0x2401d87 get_implicit_reg_pending_clobbers(HARD_REG_SET*, rtx_insn*)
+	../../gcc-trunk/gcc/sched-deps.cc:2886
+0x24032cc sched_analyze_insn
+	../../gcc-trunk/gcc/sched-deps.cc:2905
+0x240422e deps_analyze_insn(deps_desc*, rtx_insn*)
+	../../gcc-trunk/gcc/sched-deps.cc:3707
+0x2404757 sched_analyze(deps_desc*, rtx_insn*, rtx_insn*)
+	../../gcc-trunk/gcc/sched-deps.cc:3860
+0x1132b15 compute_block_dependences
+	../../gcc-trunk/gcc/sched-rgn.cc:2738
+0x1132b15 sched_rgn_compute_dependencies(int)
+	../../gcc-trunk/gcc/sched-rgn.cc:3367
+0x1135608 schedule_region
+	../../gcc-trunk/gcc/sched-rgn.cc:3139
+0x1135608 schedule_insns()
+	../../gcc-trunk/gcc/sched-rgn.cc:3525
+0x1135b87 schedule_insns()
+	../../gcc-trunk/gcc/sched-rgn.cc:3511
+0x1135b87 rest_of_handle_sched
+	../../gcc-trunk/gcc/sched-rgn.cc:3729
+0x1135b87 execute
+	../../gcc-trunk/gcc/sched-rgn.cc:3839
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+[533] % 
+[533] % cat small.c
+int a, b, c;
+volatile int d;
+int e(int f, int g) { return g > 1 ? 1 : f >> g; }
+int main() {
+  int *i = &a;
+  long j[1];
+  if (a)
+    while (1) {
+      a ^= 1;
+      if (*i)
+        while (1)
+          ;
+      b = c && e((d, 1) >= 1, j[0]);
+    }
+  return 0;
+}
+
+- User: Sam James | Time: 2024-08-12 10:23:12 UTC
+  Text: -fno-late-combine-instructions works
+
+- User: Andrew Pinski | Time: 2024-08-12 19:28:02 UTC
+  Text: ```
+trying to combine definition of r101 in:
+   20: r101:SI=0
+into:
+   57: {r103:SI=r103:SI>>r101:SI#0;clobber flags:CC;}
+      REG_DEAD r101:SI
+      REG_UNUSED flags:CC
+      REG_EQUAL 0x1>>r101:SI#0
+instruction becomes a no-op:
+(parallel [
+        (set (reg:SI 103 [ a_lsm.11D.2845 ])
+            (reg:SI 103 [ a_lsm.11D.2845 ]))
+        (clobber (reg:CC 17 flags))
+    ])
+original cost = 4 + 4, replacement cost = 2147483647; keeping replacement
+rescanning insn with uid = 57.
+updating insn 57 in-place
+verify found no changes in insn with uid = 57.
+deleting insn 20
+deleting insn with uid = 20.
+````
+
+So if noop_move_p is true (which in this case it is), we don't remove the clobbers unlike in ths case of !noop_move_p .
+
+- User: Andrew Pinski | Time: 2024-08-12 19:36:13 UTC
+  Text: Note I think late_combine 1 depends on DCE later on to delete the noop_move_p instructions but since -fno-dce was passed on the command line, it is not deleted and that causes the ICE.
+
+Note also I think this only happens with -fno-dce it can't happen otherwise.
+
+- User: Richard Sandiford | Time: 2024-08-12 20:05:12 UTC
+  Text: (In reply to Andrew Pinski fromcomment #3)> Note I think late_combine 1 depends on DCE later on to delete the
+> noop_move_p instructions but since -fno-dce was passed on the command line,
+> it is not deleted and that causes the ICE.I can look tomorrow, but: if the insn code is set to NOOP_MOVE_INSN_CODE,
+possibly_queue_changes is supposed to ensure that perform_pending_updates
+deletes it later.
+
+- User: Richard Sandiford | Time: 2024-08-13 10:26:14 UTC
+  Text: Argh, substituting into the REG_EQUAL note is causing INSN_CODE to be reset.  Testing a patch…
+
+- User: GCC Commits | Time: 2024-08-15 15:54:15 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:70ae0daeb76f28a3135f4a74d6e440fb1d9821facommitr15-2936-g70ae0daeb76f28a3135f4a74d6e440fb1d9821faAuthor: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Thu Aug 15 16:54:02 2024 +0100
+
+    late-combine: Preserve INSN_CODE when modifying notes [PR116343]
+    
+    When it removes a definition, late-combine tries to update all
+    uses in notes.  It does this using the same insn_propagation class
+    that it uses for patterns.
+    
+    However, insn_propagation uses validate_change, which in turn
+    resets the INSN_CODE.  This is inefficient in the best case,
+    since it forces the pattern to be rerecognised even though
+    changing a note can't affect the INSN_CODE.  But in the PR
+    it's a correctness problem: resetting INSN_CODE means we lose
+    the NOOP_INSN_MOVE_CODE, which in turn means that rtl-ssa doesn't
+    queue it for deletion.
+    
+    This patch adds a routine specifically for propagating into notes.
+    A belt-and-braces fix would be to rerecognise noop moves in
+    function_info::change_insns, but I can't think of a good reason
+    why that would be necessary, and it could paper over latent bugs.
+    
+    gcc/PR testsuite/116343* recog.h (insn_propagation::apply_to_note): Declare.
+            * recog.cc (insn_propagation::apply_to_note): New function.
+            * late-combine.cc (insn_combination::substitute_note): Use
+            apply_to_note instead of apply_to_rvalue.
+            * rtl-ssa/changes.cc (rtl_ssa::changes_are_worthwhile): Improve
+            dumping of costs for noop moves.
+    
+    gcc/testsuite/PR testsuite/116343* gcc.dg/torture/pr116343.c: New test.
+
+- User: Richard Sandiford | Time: 2024-08-15 15:56:08 UTC
+  Text: Fixed.  Thanks for the report.
+

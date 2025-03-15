@@ -1,0 +1,89 @@
+Bug Summary: Code generation for vectorized -(a[i] != 0) with number of elements change could be improved
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2023-08-12 09:37:21 UTC
+  Text: Testcase:
+```
+void __attribute__ ((noipa))
+f (int *__restrict r,
+   int *__restrict a,
+   short *__restrict pred)
+{
+  for (int i = 0; i < 1024; ++i)
+    r[i] = pred[i] != 0 ? -1 : 0;
+}
+```
+
+Kinda of patch:
+```
+/* Sink unary operations to branches, but only if we do fold both.  */
+(for op (negate bit_not abs absu)
+ (simplify
+  (op (view_convert? (vec_cond:s @0 @1 @2)))
+  (if (element_precision (type) == element_precision (@1))
+   (vec_cond @0 (op! (view_convert @1)) (op! (view_convert @2))))))
+```
+
+That is `Sink unary operations` one needs to add support for view_convert there ...
+
+I Noticed this while working onPR 110986(but is not needed for that issue).
+
+- User: Andrew Pinski | Time: 2023-08-12 09:42:35 UTC
+  Text: Note it looks like 4.7 used to produce the code without the secondary negate there ...
+
+- User: Andrew Pinski | Time: 2023-08-21 00:06:11 UTC
+  Text: here is the corrected patch:
+diff --git a/gcc/match.pd b/gcc/match.pd
+index 851f1af6eac..81666f28465 100644
+--- a/gcc/match.pd
++++ b/gcc/match.pd
+@@ -4718,6 +4718,15 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+       && types_match (TREE_TYPE (@0), truth_type_for (type)))
+   (vec_cond @0 (convert! @1) (convert! @2))))
+
++/* Likewise for view_convert of nop_conversions. */
++(simplify
++ (view_convert (vec_cond:s @0 @1 @2))
++ (if (VECTOR_TYPE_P (type) && VECTOR_TYPE_P (TREE_TYPE (@1))
++      && known_eq (TYPE_VECTOR_SUBPARTS (type),
++                  TYPE_VECTOR_SUBPARTS (TREE_TYPE (@1)))
++      && tree_nop_conversion_p (TREE_TYPE (type), TREE_TYPE (TREE_TYPE (@1))))
++  (vec_cond @0 (view_convert! @1) (view_convert! @2))))
++
+ /* Sink binary operation to branches, but only if we can fold it.  */
+ (for op (tcc_comparison plus minus mult bit_and bit_ior bit_xor
+         lshift rshift rdiv trunc_div ceil_div floor_div round_div
+
+- User: Andrew Pinski | Time: 2023-08-21 03:22:24 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2023-August/627955.html
+
+- User: GCC Commits | Time: 2023-08-21 07:45:57 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:47b833a9abe19d862a773d20dd6f961dcf811a11commitr14-3350-g47b833a9abe19d862a773d20dd6f961dcf811a11Author: Andrew Pinski <apinski@marvell.com>
+Date:   Sun Aug 20 17:22:27 2023 -0700
+
+    MATCH: [PR111002] Sink view_convert for vec_cond
+    
+    Like convert we can sink view_convert into vec_cond but
+    we can only do it if the element types are nop_conversions.
+    This is to allow conversion between signed and unsigned types only.
+    Rather than between integer and float types which mess up the vec_cond
+    so that isel does not understand `a?-1:0` is still that.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu and aarch64-linux-gnu.PR tree-optimization/111002gcc/ChangeLog:
+    
+            * match.pd (view_convert(vec_cond(a,b,c))): New pattern.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/sve/cond_convert_8.c: New test.
+
+- User: Andrew Pinski | Time: 2023-08-21 07:47:12 UTC
+  Text: Fixed.
+

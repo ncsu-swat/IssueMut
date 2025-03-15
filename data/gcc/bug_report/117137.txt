@@ -1,0 +1,134 @@
+Bug Summary: [15 Regression] ICE: in extract_insn, at recog.cc:2882 unrecognizable insn: (compare:CCZ reg:V2DI reg:V2DI) with -O2 -msse4 since r15-4194-g5977b746db3925
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 14.2.1
+Known to Fail: 15.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-10-14 18:44:56 UTC
+  Text: Createdattachment 59345[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O2 -msse4 testcase.c 
+testcase.c: In function 'foo':
+testcase.c:8:1: error: unrecognizable insn:
+    8 | }
+      | ^
+(insn 8 10 11 2 (set (reg:CCZ 17 flags)
+        (compare:CCZ (reg:V2DI 106)
+            (reg:V2DI 107))) "testcase.c":7:5 -1
+     (nil))
+during RTL pass: vregs
+testcase.c:8:1: internal compiler error: in extract_insn, at recog.cc:2882
+0x2c7f74e internal_error(char const*, ...)
+        /repo/gcc-trunk/gcc/diagnostic-global-context.cc:517
+0xe801f3 fancy_abort(char const*, int, char const*)
+        /repo/gcc-trunk/gcc/diagnostic.cc:1533
+0x835a77 _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+        /repo/gcc-trunk/gcc/rtl-error.cc:108
+0x835af4 _fatal_insn_not_found(rtx_def const*, char const*, int, char const*)
+        /repo/gcc-trunk/gcc/rtl-error.cc:116
+0x824877 extract_insn(rtx_insn*)
+        /repo/gcc-trunk/gcc/recog.cc:2882
+0x11d7fad instantiate_virtual_regs_in_insn
+        /repo/gcc-trunk/gcc/function.cc:1612
+0x11d7fad instantiate_virtual_regs
+        /repo/gcc-trunk/gcc/function.cc:1995
+0x11d7fad execute
+        /repo/gcc-trunk/gcc/function.cc:2042
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r15-4339-20241014183748-gde0320712d0-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r15-4339-20241014183748-gde0320712d0-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 15.0.0 20241014 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-10-14 18:56:18 UTC
+  Text: Confirmed. Here is a testcase without `_Complex long`:
+```
+long x[2];
+
+int
+foo (int c)
+{
+  long x0 = x[0], x1 = x[1];
+  int t = x0 != 0 | x1 != 0;
+  c *= t;
+  return c;
+}
+```
+
+There seems like an interaction between the `vector!=0` comparison vs COND_EXPR expansion.
+
+```
+  _2 = vect_x0_4.5_9 != { 0, 0 };
+  c_8 = _2 ? c_7(D) : 0;
+```
+
+- User: Richard Biener | Time: 2024-10-15 07:46:49 UTC
+  Text: I have a patch.
+
+- User: Haochen Jiang | Time: 2024-10-15 08:38:41 UTC
+  Text: From my bisect:
+
+5977b746db3925aaba37722f5312419d5f2968a5 is the first bad commit
+commit 5977b746db3925aaba37722f5312419d5f2968a5
+Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Oct 8 09:01:01 2024 +0200
+
+    tree-optimization/117000 - elide .REDUC_IOR with compare against zero
+
+    The following adds a pattern to elide a .REDUC_IOR operation when
+    the result is compared against zero with a cbranch.  I've resorted
+    to using can_compare_p since that's what RTL expansion eventually
+    checks - while GIMPLE allowed whole vector equality compares for long
+    I'll notice vector lowering won't lower unsupported ones and RTL
+    expansion doesn't seem to try using [u]cmp<vector-mode> optabs
+    (and neither x86 nor aarch64 implements those).  There's cstore
+    but no target implements that for vector modes either.PR tree-optimization/117000* match.pd (.REDUC_IOR !=/== 0): New pattern.
+            * gimple-match-head.cc: Include memmodel.h and optabs.h.
+            * generic-match-head.cc: Likewise.
+
+            * gcc.target/i386/pr117000.c: New testcase.
+
+ gcc/generic-match-head.cc                |  2 ++
+ gcc/gimple-match-head.cc                 |  2 ++
+ gcc/match.pd                             |  9 +++++++++
+ gcc/testsuite/gcc.target/i386/pr117000.c | 13 +++++++++++++
+ 4 files changed, 26 insertions(+)
+ create mode 100644 gcc/testsuite/gcc.target/i386/pr117000.c
+
+- User: Sam James | Time: 2024-10-15 08:51:45 UTC
+  Text: r15-4194-g5977b746db3925
+
+- User: GCC Commits | Time: 2024-10-15 09:07:03 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:79b881df72c946f2ba61879c36ae93b0cb974617commitr15-4350-g79b881df72c946f2ba61879c36ae93b0cb974617Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Oct 15 09:48:10 2024 +0200
+
+    middle-end/117137 - expansion issue with vector equality compares
+    
+    When expanding a COND_EXPR with a vector equality compare as condition
+    expand_cond_expr_using_cmove fails to properly go the cbranch path.
+    I failed to massage it's twisted logic so the simple fix is to make
+    sure to expand a vector condition separately which also generates
+    the expected code for the testcase:
+    
+            ptest   %xmm0, %xmm0
+            cmovne  %edi, %eaxPR middle-end/117137* expr.cc (expand_cond_expr_using_cmove): Make sure to
+            expand vector comparisons separately.
+    
+            * gcc.dg/torture/pr117137.c: New testcase.
+
+- User: Richard Biener | Time: 2024-10-15 09:08:28 UTC
+  Text: Fixed.
+

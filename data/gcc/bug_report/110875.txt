@@ -1,0 +1,294 @@
+Bug Summary: [14 Regression] Dead Code Elimination Regression since r14-2501-g285c9d042e9
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Theodoros Theodoridis | Time: 2023-08-02 13:56:34 UTC
+  Text: https://godbolt.org/z/rjxT5PfzYGiven the following code:
+
+void foo(void);
+static int a, b;
+static int *c = &a, *d;
+static unsigned e;
+static short f;
+static unsigned g(unsigned char h, char i) { return h + i; }
+int main() {
+    d = &a;
+    int *j = d;
+    e = -27;
+    for (; e > 18; e = g(e, 6)) {
+        a = 0;
+        for (; a != -3; a--) {
+            if (0 != a ^ *j)
+                for (; b; b++) f = -f;
+            else if (*c) {
+                foo();
+                break;
+            }
+            if (!(((e) >= 235) && ((e) <= 4294967269))) {
+                __builtin_unreachable();
+            }
+            b = 0;
+        }
+    }
+}
+
+gcc-trunk -O2 does not eliminate the call to foo:
+
+main:
+	subq	$8, %rsp
+	movl	$-27, e(%rip)
+	.p2align 4,,10
+	.p2align 3
+.L5:
+	xorl	%eax, %eax
+.L3:
+	subl	$1, %eax
+	cmpl	$-3, %eax
+	je	.L2
+	cmpl	$1, %eax
+	jne	.L3
+	movl	$1, a(%rip)
+	movl	$0, b(%rip)
+	call	foo
+.L6:
+	movzbl	e(%rip), %eax
+	addl	$6, %eax
+	movl	%eax, e(%rip)
+	cmpl	$18, %eax
+	jg	.L5
+	xorl	%eax, %eax
+	addq	$8, %rsp
+	ret
+	.p2align 4,,10
+	.p2align 3
+.L2:
+	movl	$-3, a(%rip)
+	movl	$0, b(%rip)
+	jmp	.L6
+
+gcc-13.2.0 -O2 eliminates the call to foo:
+
+main:
+	movl	$-27, e(%rip)
+	movl	$-27, %esi
+	.p2align 4,,10
+	.p2align 3
+.L9:
+	movzwl	f(%rip), %r11d
+	xorl	%ecx, %ecx
+	xorl	%r10d, %r10d
+	xorl	%edx, %edx
+	movl	$0, a(%rip)
+	movl	b(%rip), %eax
+	leal	-235(%rsi), %r8d
+	jmp	.L7
+	.p2align 4,,10
+	.p2align 3
+.L2:
+	cmpl	$-262, %r8d
+	ja	.L28
+	subl	$1, %edx
+	xorl	%eax, %eax
+	movl	$1, %ecx
+	cmpl	$-3, %edx
+	je	.L32
+	movl	%edx, %r9d
+.L7:
+	xorl	%esi, %esi
+	testl	%edx, %edx
+	movl	%ecx, %edi
+	setne	%sil
+	cmpl	%edx, %esi
+	je	.L2
+	testl	%eax, %eax
+	je	.L2
+	testb	$1, %al
+	je	.L3
+	negl	%r11d
+	addl	$1, %eax
+	je	.L30
+	.p2align 4,,10
+	.p2align 3
+.L3:
+	addl	$2, %eax
+	jne	.L3
+.L30:
+	movl	$1, %edi
+	movl	$1, %r10d
+	jmp	.L2
+	.p2align 4,,10
+	.p2align 3
+.L32:
+	movl	$-3, a(%rip)
+	movl	$0, b(%rip)
+	testb	%r10b, %r10b
+	je	.L8
+	movw	%r11w, f(%rip)
+.L8:
+	movzbl	e(%rip), %esi
+	addl	$6, %esi
+	movl	%esi, e(%rip)
+	cmpl	$18, %esi
+	jg	.L9
+	xorl	%eax, %eax
+	ret
+	.section	.text.unlikely
+	.type	main.cold, @function
+main.cold:
+.L28:
+	testb	%cl, %cl
+	je	.L5
+	movl	%r9d, a(%rip)
+.L5:
+	testb	%dil, %dil
+	je	.L6
+	movl	%eax, b(%rip)
+.L6:
+	movw	%r11w, f(%rip)
+	.section	.text.startup
+
+Bisects tor14-2501-g285c9d042e9
+
+- User: Andrew Pinski | Time: 2023-08-03 03:19:35 UTC
+  Text: Confirmed. Though I have no idea how to fix this really.
+The first major change to the IR happens in thread2 where we decide to do a jump thread with the change that we didn't do before.
+
+In GCC 13 we had:
+```
+  <bb 4> [local count: 282631250]:
+  # a.8_39 = PHI <_12(23), 0(3)>
+  # f_lsm.17_20 = PHI <f_lsm.17_16(23), f_lsm.17_51(3)>
+  # f_lsm_flag.18_22 = PHI <f_lsm_flag.18_10(23), 0(3)>
+  # b_lsm.19_45 = PHI <0(23), b_lsm.19_53(3)>
+  # b_lsm_flag.20_47 = PHI <1(23), 0(3)>
+  # a_lsm.21_49 = PHI <_12(23), _55(D)(3)>
+  _1 = a.8_39 != 0;
+  _2 = (int) _1;
+  if (_2 != a.8_39)
+    goto <bb 5>; [41.79%]
+```
+
+On the trunk we get:
+```
+  <bb 4> [local count: 339987332]:
+  # a.8_38 = PHI <_10(24), 0(3)>
+  # f_lsm.17_18 = PHI <f_lsm.17_14(24), f_lsm.17_50(3)>
+  # f_lsm_flag.18_20 = PHI <f_lsm_flag.18_8(24), 0(3)>
+  # b_lsm.19_44 = PHI <0(24), b_lsm.19_52(3)>
+  # b_lsm_flag.20_46 = PHI <1(24), 0(3)>
+  # a_lsm.21_48 = PHI <_10(24), _54(D)(3)>
+  _13 = (unsigned int) a.8_38;
+  if (_13 > 1)
+    goto <bb 5>; [34.74%]
+  else
+    goto <bb 7>; [65.26%]
+```
+We duplicate bb4 for bb3 as we can figure that _13>1 will be false. This was not done for the IR in GCC 13.
+
+I am super confused about VRP's ranges:
+We have the following that ranges that get exported and their relationships:
+Global Exported: a.8_105 = [irange] int [-2, 0]
+  _10 = a.8_105 + -1;
+Global Exported: _10 = [irange] int [-INF, -6][-3, -1][1, 2147483645]
+  _103 = (unsigned int) _10;
+Global Exported: _103 = [irange] unsigned int [1, 2147483645][2147483648, 4294967290][4294967294, +INF]
+Simplified relational if (_103 > 1)
+ into if (_103 != 1)
+
+
+Shouldn't the range of _10 just be [-3,-1] ????
+If so _103 can't get 0 or 1 ? And then if that gets it right then the call to foo will go away.
+
+- User: Aldy Hernandez | Time: 2023-08-21 10:55:02 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> I am super confused about VRP's ranges:
+> We have the following that ranges that get exported and their relationships:
+> Global Exported: a.8_105 = [irange] int [-2, 0]
+>   _10 = a.8_105 + -1;
+> Global Exported: _10 = [irange] int [-INF, -6][-3, -1][1, 2147483645]
+>   _103 = (unsigned int) _10;
+> Global Exported: _103 = [irange] unsigned int [1, 2147483645][2147483648,
+> 4294967290][4294967294, +INF]
+> Simplified relational if (_103 > 1)
+>  into if (_103 != 1)
+> 
+> 
+> Shouldn't the range of _10 just be [-3,-1] ????
+> If so _103 can't get 0 or 1 ? And then if that gets it right then the call
+> to foo will go away.[It looks like a caching issue of some kind.  Looping Andrew.]
+
+Yes, that is indeed confusing.  _10 should have a more refined range.
+
+Note that there's a dependency between a.8_105 and _10:
+
+    <bb 4> [local count: 327784168]:
+    # f_lsm.17_26 = PHI <f_lsm.17_50(3), f_lsm.17_26(13)>
+    # a.8_105 = PHI <0(3), _10(13)>
+    # b_lsm.19_33 = PHI <b_lsm.19_52(3), 0(13)>
+    # b_lsm_flag.20_53 = PHI <0(3), 1(13)>
+    # a_lsm.21_49 = PHI <_54(D)(3), _10(13)>
+    _9 = e.10_39 + 4294967061;
+    _10 = a.8_105 + -1;
+    if (_10 != -3(OVF))
+      goto <bb 7>; [94.50%]
+    else
+      goto <bb 8>; [5.50%]
+
+This is what I see with --param=ranger-debug=tracegori in VRP2...
+
+We first calculate a.8_105 to [-INF, -5][-2, 0][2, 2147483646]:
+
+1140     range_of_stmt (a.8_105) at stmt a.8_105 = PHI <0(3), _10(13)>
+1141       ROS dependence fill
+             ROS dep fill (a.8_105) at stmt a.8_105 = PHI <0(3), _10(13)>
+             ROS dep fill (_10) at stmt _10 = a.8_105 + -1;
+1142         range_of_expr(a.8_105) at stmt _10 = a.8_105 + -1;
+             TRUE : (1142) range_of_expr (a.8_105) [irange] int [-INF, -5][-2, 0][2, 2147483646]
+
+Which we later refine with SCEV:
+
+Statement _10 = a.8_105 + -1;
+ is executed at most 2147483647 (bounded by 2147483647) + 1 times in loop 4.
+   Loops range found for a.8_105: [irange] int [-2, 0] and calculated range :[irange] int [-INF, -6][-2, 0][2, 2147483645]
+         TRUE : (1140) range_of_stmt (a.8_105) [irange] int [-2, 0]
+Global Exported: a.8_105 = [irange] int [-2, 0]
+
+I have verified that range_of_expr after this point returns [-2, 0], so we know both globally and locally this refined range.
+
+However, when we try to fold _10 later on, we use the cached value instead of recalculating with the new range for a.8_105:
+
+Folding statement: _10 = a.8_105 + -1;
+872      range_of_stmt (_10) at stmt _10 = a.8_105 + -1;
+         TRUE : (872)  cached (_10) [irange] int [-INF, -6][-3, -1][1, 2147483645]
+
+- User: GCC Commits | Time: 2023-09-07 19:21:14 UTC
+  Text: The master branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:cf2ae3fff4ee9bf884b122ee6cd83bffd791a16fcommitr14-3792-gcf2ae3fff4ee9bf884b122ee6cd83bffd791a16fAuthor: Andrew MacLeod <amacleod@redhat.com>
+Date:   Thu Sep 7 11:15:50 2023 -0400
+
+    Some ssa-names get incorrectly marked as always_current.
+    
+    When range_of_stmt invokes prefill_name to evaluate unvisited dependencies
+    it should not mark already visited names as always_current.PR tree-optimization/110875gcc/
+            * gimple-range.cc (gimple_ranger::prefill_name): Only invoke
+            cache-prefilling routine when the ssa-name has no global value.
+    
+            gcc/testsuite/
+            * gcc.dg/pr110875.c: New.
+
+- User: Andrew Macleod | Time: 2023-09-07 19:26:09 UTC
+  Text: When range_of_stmt invokes prefill_name to evaluate unvisited dependencies it should not mark visited names as always_current.
+
+when ranger_cache::get_globaL_range() is invoked with the optional  "current_p" flag, it triggers additional functionality. This call is meant to be from within ranger and it is understood that if the current value is not current,  set_global_range will always be called later with a value.  Thus it sets the always_current flag in the temporal cache to avoid computation cycles.
+
+the prefill_stmt_dependencies () mechanism within ranger is intended to emulate the bahaviour of range_of_stmt on an arbitrarily long series of unresolved dependencies without triggering the overhead of huge call chains from the range_of_expr/range_on_entry/range_on_exit routines.  Rather, it creates a stack of unvisited names, and invokes range_of_stmt on them directly in order to get initial cache values for each ssa-name.
+
+The issue in this PR was that routine was incorrectly invoking the get_global_cache to determine whether there was a global value.  If there was, it would move on to the next dependency without invoking set_global_range to clear the always_current flag.
+
+What it should have been doing was simply checking if there as a global value, and if there was not, add the name for processing and THEN invoke get_global_value to do all the special processing.
+fixed.
+

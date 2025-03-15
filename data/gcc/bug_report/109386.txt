@@ -1,0 +1,134 @@
+Bug Summary: [13 Regression] Frange value relation related miscompilation
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jakub Jelinek | Time: 2023-04-03 08:00:19 UTC
+  Text: I've totally missed a regression caused by my recent frange improvements (most likelyr13-6967-g5fe05ffefd21c4fa):
++FAIL: libphobos.phobos/std/math/algebraic.d execution test
++FAIL: libphobos.phobos_shared/std/math/algebraic.d execution test
+
+Reduced testcase in C:
+static inline float
+foo (float x, float y)
+{
+  float u = __builtin_fabsf (x);
+  float v = __builtin_fabsf (y);
+  if (!(u >= v))
+    {
+      v = u;
+      u = __builtin_fabsf (y);
+      if (__builtin_isinf (u)) return u;
+      if (__builtin_isinf (v)) return v;
+    }
+  return 42.0f;
+}
+
+int
+main ()
+{
+  if (!__builtin_isinf (foo (__builtin_inff (), __builtin_nanf (""))))
+    __builtin_abort ();
+}
+for -O2.
+I believe the bug is that (as discussed earlier) we don't implement the full set of VREL_* relations for the case where NAN may be seen and in this case register VREL_LT for the if block, which is wrong, the inverse of VREL_GE is VREL_UNLT which we don't currently have.
+
+- User: Jakub Jelinek | Time: 2023-04-03 08:48:49 UTC
+  Text: Createdattachment 54802[details]gcc13-pr109386.patch
+
+Untested patch.  I've tried to fix the incorrect registraction of value relation (in the scope of the current set of VREL_*), but unfortunately it didn't fix it.
+
+- User: Jakub Jelinek | Time: 2023-04-03 10:21:52 UTC
+  Text: The swapping isn't really needed, the testcase can be simplified to:
+static inline float
+foo (float x, float y)
+{
+  float u = __builtin_fabsf (x);
+  float v = __builtin_fabsf (y);
+  if (!(u >= v))
+    {
+      if (__builtin_isinf (v)) return v;
+      if (__builtin_isinf (u)) return u;
+    }
+  return 42.0f;
+}
+
+int
+main ()
+{
+  if (!__builtin_isinf (foo (__builtin_inff (), __builtin_nanf (""))))
+    __builtin_abort ();
+}
+
+- User: Jakub Jelinek | Time: 2023-04-03 12:16:50 UTC
+  Text: Createdattachment 54803[details]gcc13-pr109386.patch
+
+Untested fix.  When LT/LE/GT/GE have lhs [0, 0] or UNLT/UNLE/UNGT/UNGE have lhs [1, 1], we don't know anything (VARYING) about one operand if the other operand may be a NAN, not just is known to be a NAN, because if it happens to be NAN at runtime, the comparison is false (resp. true) regardless of the finite/infinite comparison results.
+
+- User: GCC Commits | Time: 2023-04-04 14:20:23 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:ce243c9eefc2728cb8743ebbcb84c3e08236f06acommitr13-7002-gce243c9eefc2728cb8743ebbcb84c3e08236f06aAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Apr 4 16:13:06 2023 +0200
+
+    range-op-float: Fix reverse ops of comparisons [PR109386]
+    
+    I've missed one of my recent range-op-float.cc changes (likely ther13-6967one) caused
+    FAIL: libphobos.phobos/std/math/algebraic.d execution test
+    FAIL: libphobos.phobos_shared/std/math/algebraic.d execution test
+    regressions, distilled into a C testcase below.
+    
+    In the testcase, we have
+    !(u >= v)
+    condition where both u and v are results of fabs*, which guards
+    t1 = u u<= __FLT_MAX__;
+    and
+    t2 = v u<= __FLT_MAX__;
+    comparisons.  From false u >= v where u and v have [0.0, +Inf] NAN
+    ranges we (incorrectly deduce that one of them is [nextafterf (0.0, 1.0), +Inf] NAN
+    and the other is [0.0, nextafterf (+Inf, 0.0)] NAN and from that deduce that
+    one of the comparisons is always true, because UNLE_EXPR with the maximum
+    representable number are false only if the value is +Inf and our ranges tell
+    that is not possible.
+    
+    The bug is that the u >= v comparison determines a sensible range only when
+    it is true - we then know neither operand can be NAN and it behaves
+    correctly.  But when the comparison is false, our current code gives
+    sensible answers only if the other op can't be NAN.  If it can be NAN,
+    whenever it is NAN, the comparison is always false regardless of the other
+    value, so the other value needs to be VARYING.
+    Now, foperator_unordered_lt::op1_range etc. had code to deal with that
+    for op?.known_nan (), but as the testcase shows, it is enough if it may be a
+    NAN at runtime to make it VARYING.
+    
+    So, the following patch replaces for all those BRS_FALSE cases of the normal
+    non-equality comparisons if (opOTHER.known_isnan ()) r.set_varying (type);
+    to do it also if maybe_isnan ().
+    
+    For the unordered or ... comparisons, it is similar for BRS_TRUE.  Those
+    comparisons are true whenever either operand is NAN, or if neither is NAN,
+    the corresponding normal comparison.  So, if those comparisons are true
+    and other operand might be a NAN, we can't tell (VARYING), if it is false,
+    currently handling is correct.
+    
+    2023-04-04  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109386* range-op-float.cc (foperator_lt::op1_range, foperator_lt::op2_range,
+            foperator_le::op1_range, foperator_le::op2_range,
+            foperator_gt::op1_range, foperator_gt::op2_range,
+            foperator_ge::op1_range, foperator_ge::op2_range): Make r varying for
+            BRS_FALSE case even if the other op is maybe_isnan, not just
+            known_isnan.
+            (foperator_unordered_lt::op1_range, foperator_unordered_lt::op2_range,
+            foperator_unordered_le::op1_range, foperator_unordered_le::op2_range,
+            foperator_unordered_gt::op1_range, foperator_unordered_gt::op2_range,
+            foperator_unordered_ge::op1_range, foperator_unordered_ge::op2_range):
+            Make r varying for BRS_TRUE case even if the other op is maybe_isnan,
+            not just known_isnan.
+    
+            * gcc.c-torture/execute/ieee/pr109386.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-04-04 14:22:43 UTC
+  Text: Fixed.
+

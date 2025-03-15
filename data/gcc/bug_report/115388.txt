@@ -1,0 +1,145 @@
+Bug Summary: [15 Regression] wrong code at -O3 on x86_64-linux-gnu since r15-571-g1e0ae1f52741f7
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2024-06-07 19:16:51 UTC
+  Text: This appears to be a recent regression as it doesn't reproduce with 14.1 and earlier.
+
+Compiler Explorer:https://godbolt.org/z/dzbaj98PM[515] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240607 (experimental) (GCC) 
+[516] % 
+[516] % gcctk -O2 small.c; ./a.out
+[517] % gcctk -O3 small.c
+[518] % ./a.out
+Aborted
+[519] % cat small.c
+int printf(const char *, ...);
+int a[10], b, c, d[0], h, i, j, k, l;
+char e = -1, g;
+volatile int f;
+static void n() {
+  while (e >= 0)
+    while (1)
+      ;
+  for (b = 2; b >= 0; b--) {
+    for (k = 0; k < 4; k++) {
+      if (e || i)
+        continue;
+      for (h = 0; h < 2; h++)
+        f;
+    }
+    for (l = 2; l >= 0; l--)
+      g = 0;
+    for (; g < 1; g++)
+      if (c)
+        d[l] = 1;
+    a[9] = 0;
+    a[b] = 1;
+    while (j)
+      printf("\n");
+  }
+}
+int main() {
+  n();
+  if (a[1] != 1)
+    __builtin_abort();
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2024-06-07 23:50:20 UTC
+  Text: Confirmed.
+
+- User: Sam James | Time: 2024-06-09 12:37:21 UTC
+  Text: r15-571-g1e0ae1f52741f7
+
+- User: Richard Biener | Time: 2024-06-10 06:35:52 UTC
+  Text: Ah, finally a small testcase.  I'll have a look.
+
+- User: Richard Biener | Time: 2024-06-10 09:26:03 UTC
+  Text: It's DSE5 deleting
+
+  Deleted dead store: a[b.19_216] = 1;
+
+there's a big irreducible region following the loop with this store, but
+I fail to see how we can reach the load without going through the other
+redundant store.
+
+Ah, wait - it's the same as with loops in irreducible regions and triggering
+a latent issue.  We do
+
+                      /* If we visit this PHI by following a backedge then we
+                         have to make sure ref->ref only refers to SSA names
+                         that are invariant with respect to the loop
+                         represented by this PHI node.  */
+                      if (dominated_by_p (CDI_DOMINATORS, gimple_bb (stmt),
+                                          gimple_bb (use_stmt))
+                          && !for_each_index (ref->ref ? &ref->ref : &ref->base,
+                                              check_name, gimple_bb (use_stmt)))
+                        return DSE_STORE_LIVE;
+
+but we identify backedges by using dominators which only works for natural
+loops and not irreducible regions.  We have to either disregard all refs in
+irreducible regions or check for invariantness in the irreducible (sub-)region
+spanned by the PHI and the backedge source.
+
+I'm going to check the latter.
+
+- User: GCC Commits | Time: 2024-06-10 11:36:55 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:818e760528d436ea8f6c28ef620e2bb82d456ea1commitr15-1163-g818e760528d436ea8f6c28ef620e2bb82d456ea1Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Jun 10 11:29:43 2024 +0200
+
+    tree-optimization/115388 - wrong DSE in irreductible regions
+    
+    The following fixes a latent bug in DSE with regarding to variant
+    array accesses where the code avoiding bogus DSE in loops fails to
+    handle irreducible regions.  For those we need to make sure backedges
+    are marked and discover a header for the irreducible region to check
+    invariantness.PR tree-optimization/115388* tree-ssa-dse.cc (dse_classify_store): Handle irreducible
+            regions.
+            (pass_dse::execute): Make sure to mark backedges.
+    
+            * gcc.dg/torture/pr115388.c: New testcase.
+
+- User: Richard Biener | Time: 2024-06-10 11:37:50 UTC
+  Text: Fixed.  Unfortunately this didn't fixPR115256if I checked correctly.  Keep searching!
+
+- User: Wilco | Time: 2024-06-10 14:31:44 UTC
+  Text: (In reply to Richard Biener fromcomment #6)> Fixed.  Unfortunately this didn't fixPR115256if I checked correctly.  Keep
+> searching!The testcase hangs on AArch64, so this commit didn't fix it...
+
+- User: Andrew Pinski | Time: 2024-06-10 14:38:51 UTC
+  Text: (In reply to Wilco fromcomment #7)> (In reply to Richard Biener fromcomment #6)
+> > Fixed.  Unfortunately this didn't fixPR115256if I checked correctly.  Keep
+> > searching!
+> 
+> The testcase hangs on AArch64, so this commit didn't fix it...I suspect the issue is char being unsigned on a few targets. I will fix it in a few hours.
+
+- User: GCC Commits | Time: 2024-06-10 15:27:04 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:c3d1153bc0a2b820e3c373ecf19a5a127703f854commitr15-1165-gc3d1153bc0a2b820e3c373ecf19a5a127703f854Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Mon Jun 10 08:23:00 2024 -0700
+
+    Fixpr115388.c: plain char could be unsigned by default [PR115415]
+    
+    This is a simple fix to the testcase as plain `char` could be
+    unsigned by default on some targets (e.g. aarch64 and powerpc).
+    
+    Committed as obvious after quick test of the testcase on both aarch64 and x86_64.
+    
+    gcc/testsuite/ChangeLog:PR testsuite/115415PR tree-optimization/115388* gcc.dg/torture/pr115388.c: Use `signed char` directly instead
+            of plain `char`.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+

@@ -1,0 +1,133 @@
+Bug Summary: [14 Regression] vector by lane operation costing broken since g:21416caf221fae4351319ef8ca8d41c0234bdfa7
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Tamar Christina | Time: 2023-10-27 10:31:38 UTC
+  Text: After this commitg:21416caf221fae4351319ef8ca8d41c0234bdfa7commit 21416caf221fae4351319ef8ca8d41c0234bdfa7
+Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Tue Oct 24 11:01:52 2023 +0100
+
+    aarch64: Define TARGET_INSN_COST
+
+    This patch adds a bare-bones TARGET_INSN_COST.  See the comment
+    in the patch for the rationale.
+
+we now fail to form by lane instructions when they're not single use:> cat test.c#include <arm_neon.h>
+typedef struct {
+  float re;
+  float im;
+} cmplx_f32_t;
+
+void test2x2_f32(const cmplx_f32_t *p_src_a,
+             const cmplx_f32_t *p_src_b,
+             cmplx_f32_t *p_dst) {
+  const float32_t *a_ptr = (const float32_t *)p_src_a;
+  const float32_t *b_ptr = (const float32_t *)p_src_b;
+  float32_t *out_ptr = (float32_t *)p_dst;
+
+  float32x2x2_t a_col[2];
+  float32x2x2_t b[2];
+  float32x2x2_t result[2];
+
+  a_col[0] = vld2_f32(a_ptr);
+  b[0] = vld2_f32(b_ptr);
+
+  result[0].val[0] = vmul_lane_f32(a_col[0].val[0], b[0].val[0], 0);
+  result[0].val[1] = vmul_lane_f32(a_col[0].val[1], b[0].val[0], 0);
+
+  vst2_f32(out_ptr, result[0]);
+  out_ptr = out_ptr + 4;
+}
+
+---> ./bin/gcc test.c -O1 -S -o -...
+	test2x2_f32:
+	ld2     {v27.2s - v28.2s}, [x0]
+	ld2     {v30.2s - v31.2s}, [x1]
+	dup     v31.2s, v30.s[0]
+	fmul    v29.2s, v31.2s, v27.2s
+	fmul    v30.2s, v31.2s, v28.2s
+	st2     {v29.2s - v30.2s}, [x2]
+	ret
+
+which has an unneeded dup.  Before this we generated:
+
+test2x2_f32:
+        ld2     {v0.2s - v1.2s}, [x1]
+        ld2     {v4.2s - v5.2s}, [x0]
+        fmul    v2.2s, v4.2s, v0.s[0]
+        fmul    v3.2s, v5.2s, v0.s[0]
+        st2     {v2.2s - v3.2s}, [x2]
+        ret
+
+- User: Richard Sandiford | Time: 2023-10-27 10:38:40 UTC
+  Text: Gah.  Thanks for the report, will have a look.
+
+- User: Richard Sandiford | Time: 2023-10-27 11:25:28 UTC
+  Text: Seems to be due to aarch64_modes_tieable_p saying that
+SF can't be tied to V2x2SF, so that a subreg of that
+form is given a cost of 2 instructions.
+
+Using:
+
+  if (aarch64_vector_data_mode_p (mode1)
+      || aarch64_vector_data_mode_p (mode2))
+    return true;
+
+makes the test work, but who knows what the knock-on
+effects will be…
+
+- User: GCC Commits | Time: 2023-11-05 12:08:14 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:0e6f3e9175bddb5cada6571744f33af574232c76commitr14-5129-g0e6f3e9175bddb5cada6571744f33af574232c76Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Sun Nov 5 12:08:02 2023 +0000
+
+    aarch64: Rework aarch64_modes_tieable_p [PR112105]
+    
+    On AArch64, can_change_mode_class and modes_tieable_p are
+    mostly answering the same questions:
+    
+    (a) Do two modes have the same layout for the bytes that are
+        common to both modes?
+    
+    (b) Do all valid subregs involving the two modes behave as
+        GCC would expect?
+    
+    (c) Is there at least one register that can hold both modes?
+    
+    These questions involve no class-dependent tests, and the relationship
+    is symmetrical.  This means we can do most of the checks in a common
+    subroutine.
+    
+    can_change_mode_class is the hook that matters for correctness,
+    while modes_tieable_p is more for optimisation.  It was therefore
+    can_change_mode_class that had the more accurate tests.
+    modes_tieable_p was looser in some ways (e.g. it missed some
+    big-endian tests) and overly strict in others (it didn't allow
+    ties between a vector structure mode and the mode of a single lane).
+    The overly strict part caused a missed combination in the testcase.
+    
+    I think the can_change_mode_class logic also needed some tweaks,
+    as described in the changelog.
+    
+    gcc/PR target/112105* config/aarch64/aarch64.cc (aarch64_modes_compatible_p): New
+            function, with the core logic extracted from...
+            (aarch64_can_change_mode_class): ...here.  Extend the previous rules
+            to allow changes between partial SVE modes and other modes if
+            the other mode is no bigger than an element, and if no other rule
+            prevents it.  Use the aarch64_modes_tieable_p handling of
+            partial Advanced SIMD structure modes.
+            (aarch64_modes_tieable_p): Use aarch64_modes_compatible_p.
+            Allow all vector mode ties that it allows.
+    
+    gcc/testsuite/PR target/112105* gcc.target/aarch64/pr112105.c: New test.
+            * gcc.target/aarch64/sve/pcs/struct_3_128.c: Expect a 32-bit spill
+            rather than a 16-bit spill.
+
+- User: Richard Sandiford | Time: 2023-11-05 12:08:41 UTC
+  Text: Fixed.  Thanks for the catch.
+

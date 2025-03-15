@@ -1,0 +1,208 @@
+Bug Summary: [14 Regression] Wrong code on pixman-0.42.2
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: needs-bisection, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2023-05-31 22:42:56 UTC
+  Text: This week's gccr14-1423-gfefa7db2c31feestarted failing pixman-0.42.2 test suite:
+
+pixman> FAIL: scaling-crash-test
+pixman> FAIL: cover-test
+pixman> FAIL: affine-test
+pixman> FAIL: filter-reduction-test
+pixman> FAIL: scaling-test
+
+I think it's a gcc bug.
+
+Extracted example from scaling-test:
+
+// $ cat bug.c
+#include <stdint.h>
+#include <stdio.h>
+
+#define BILINEAR_INTERPOLATION_BITS 7
+
+#define force_inline __inline__ __attribute__ ((__always_inline__))
+
+__attribute__((noipa))
+static void
+fetch_pixel_no_alpha_32_bug (void *out)
+{
+    uint32_t *ret = out;
+
+    *ret = 0xff499baf;
+}
+
+
+static force_inline uint32_t
+bilinear_interpolation_local (uint32_t tl, uint32_t tr,
+                        uint32_t bl, uint32_t br,
+                        int distx, int disty)
+{
+    uint64_t distxy, distxiy, distixy, distixiy;
+    uint64_t tl64, tr64, bl64, br64;
+    uint64_t f, r;
+
+    distx <<= (8 - BILINEAR_INTERPOLATION_BITS);
+    disty <<= (8 - BILINEAR_INTERPOLATION_BITS);
+
+    distxy = distx * disty;
+    distxiy = distx * (256 - disty);
+    distixy = (256 - distx) * disty;
+    distixiy = (256 - distx) * (256 - disty);
+
+    /* Alpha and Blue */
+    tl64 = tl & 0xff0000ff;
+    tr64 = tr & 0xff0000ff;
+    bl64 = bl & 0xff0000ff;
+    br64 = br & 0xff0000ff;
+
+    f = tl64 * distixiy + tr64 * distxiy + bl64 * distixy + br64 * distxy;
+    r = f & 0x0000ff0000ff0000ull;
+
+    /* Red and Green */
+    tl64 = tl;
+    tl64 = ((tl64 << 16) & 0x000000ff00000000ull) | (tl64 & 0x0000ff00ull);
+
+    tr64 = tr;
+    tr64 = ((tr64 << 16) & 0x000000ff00000000ull) | (tr64 & 0x0000ff00ull);
+
+    bl64 = bl;
+    bl64 = ((bl64 << 16) & 0x000000ff00000000ull) | (bl64 & 0x0000ff00ull);
+
+    br64 = br;
+    br64 = ((br64 << 16) & 0x000000ff00000000ull) | (br64 & 0x0000ff00ull);
+
+    f = tl64 * distixiy + tr64 * distxiy + bl64 * distixy + br64 * distxy;
+    r |= ((f >> 16) & 0x000000ff00000000ull) | (f & 0xff000000ull);
+
+    return (uint32_t)(r >> 16);
+}
+
+__attribute__((noipa))
+static void
+bits_image_fetch_pixel_bilinear_32_bug (void *out)
+{
+    uint32_t br;
+    uint32_t *ret = out;
+
+    fetch_pixel_no_alpha_32_bug (&br);
+
+    *ret = bilinear_interpolation_local (0, 0, 0, br, 0x41, 0x42);
+}
+
+int main() {
+    uint32_t r;
+    bits_image_fetch_pixel_bilinear_32_bug (&r);
+    printf("r=%08x\n", r);
+}
+
+Triggering:
+
+  $ gcc-14 -O2 -fno-strict-aliasing bug.c -obug14&& ./bug14r=4200282d
+
+  $ gcc-13 -O2 -fno-strict-aliasing bug.c -obug13&& ./bug13r=4213282d
+
+Note that returned values are not identical.
+
+$ gcc-14 -v |& unnix
+Using built-in specs.
+COLLECT_GCC=/<<NIX>>/gcc-14.0.0/bin/gcc
+COLLECT_LTO_WRAPPER=/<<NIX>>/gcc-14.0.0/libexec/gcc/x86_64-unknown-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-unknown-linux-gnu
+Configured with:
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 99999999 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2023-05-31 22:46:12 UTC
+  Text: I am suspecting it was caused byr14-1402-gd8545fb2c71683f407bfd9670.
+
+- User: Sergei Trofimovich | Time: 2023-05-31 23:28:14 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> I am suspecting it was caused byr14-1402-gd8545fb2c71683f407bfd9670.I did not bisect and tested only a revert on top ofr14-1423-gfefa7db2c31fee. The revert does indeed restore pixman-0.42.2 test suite passing!
+
+- User: Hongtao.liu | Time: 2023-06-01 01:42:32 UTC
+  Text: (In reply to Sergei Trofimovich fromcomment #2)> (In reply to Andrew Pinski fromcomment #1)
+> > I am suspecting it was caused byr14-1402-gd8545fb2c71683f407bfd9670.
+> 
+> I did not bisect and tested only a revert on top of
+>r14-1423-gfefa7db2c31fee. The revert does indeed restore pixman-0.42.2 test
+> suite passing!I'll take a look.
+
+- User: Hongtao.liu | Time: 2023-06-01 01:55:26 UTC
+  Text: For 
+    br64 = br;
+    br64 = ((br64 << 16) & 0x000000ff00000000ull) | (br64 & 0x0000ff00ull);
+
+n->n is  0x3000000200.
+n->range is 32.
+n->type is uint64.
+
+Currently the code assumes n->range is same as TYPE PRECISION(n->type), and tries to rotate the mask with below code and get new mask as 0x20300 which is incorrect. 
+tmp_n = tmp_n >> count | tmp_n << (range - count)
+
+- User: Hongtao.liu | Time: 2023-06-01 01:55:26 UTC
+  Text: For 
+    br64 = br;
+    br64 = ((br64 << 16) & 0x000000ff00000000ull) | (br64 & 0x0000ff00ull);
+
+n->n is  0x3000000200.
+n->range is 32.
+n->type is uint64.
+
+Currently the code assumes n->range is same as TYPE PRECISION(n->type), and tries to rotate the mask with below code and get new mask as 0x20300 which is incorrect. 
+tmp_n = tmp_n >> count | tmp_n << (range - count)
+
+- User: Sergei Trofimovich | Time: 2023-06-01 09:46:10 UTC
+  Text: Adding configure flags for completeness (nothing special):> Configured with:configure flags: --prefix=/<<NIX>>/gcc-14.0.0 --with-gmp-include=/<<NIX>>/gmp-6.2.1-dev/include --with-gmp-lib=/<<NIX>>/gmp-6.2.1/lib --with-mpfr-include=/<<NIX>>/mpfr-4.2.0-dev/include --with-mpfr-lib=/<<NIX>>/mpfr-4.2.0/lib --with-mpc=/<<NIX>>/libmpc-1.3.1 --with-native-system-header-dir=/<<NIX>>/glibc-2.37-8-dev/include --with-build-sysroot=/ --program-prefix= --enable-lto --disable-libstdcxx-pch --without-included-gettext --with-system-zlib --enable-checking=release --enable-static --enable-languages=c,c++ --disable-multilib --enable-plugin --disable-libcc1 --with-isl=/<<NIX>>/isl-0.20 --disable-bootstrap --build=x86_64-unknown-linux-gnu --host=x86_64-unknown-linux-gnu --target=x86_64-unknown-linux-gnu
+
+- User: Hongtao.liu | Time: 2023-06-02 07:55:45 UTC
+  Text: A patch is posted athttps://gcc.gnu.org/pipermail/gcc-patches/2023-June/620324.html
+
+- User: GCC Commits | Time: 2023-06-03 00:09:48 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:57b30f0134d9b49f7707b0c2ded6fd7686a312c8commitr14-1510-g57b30f0134d9b49f7707b0c2ded6fd7686a312c8Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Jun 1 12:11:24 2023 +0800
+
+    Don't try bswap + rotate when TYPE_PRECISION(n->type) > n->range.
+    
+    For the testcase in the PR, we have
+    
+      br64 = br;
+      br64 = ((br64 << 16) & 0x000000ff00000000ull) | (br64 & 0x0000ff00ull);
+    
+      n->n: 0x3000000200.
+      n->range: 32.
+      n->type: uint64.
+    
+    The original code assumes n->range is same as TYPE PRECISION(n->type),
+    and tries to rotate the mask from 0x300000200 -> 0x20300 which is
+    incorrect. The patch fixed this bug by not trying bswap + rotate when
+    TYPE_PRECISION(n->type) is not equal to n->range.
+    
+    gcc/ChangeLog:PR tree-optimization/110067* gimple-ssa-store-merging.cc (find_bswap_or_nop): Don't try
+            bswap + rotate when TYPE_PRECISION(n->type) > n->range.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110067.c: New test.
+
+- User: Hongtao.liu | Time: 2023-06-03 00:10:34 UTC
+  Text: Fixed.
+
+- User: Sergei Trofimovich | Time: 2023-06-03 07:33:13 UTC
+  Text: Thank you! I confirm the fix also fixed complete pixman-0.42.2 test suite.
+
+- User: Sam James | Time: 2023-06-04 05:08:05 UTC
+  Text: (In reply to Hongtao.liu fromcomment #9)> Fixed.OK to close?
+
+- User: Hongtao.liu | Time: 2023-06-05 01:01:06 UTC
+  Text: (In reply to Sam James fromcomment #11)> (In reply to Hongtao.liu fromcomment #9)
+> > Fixed.
+> 
+> OK to close?Yes.
+

@@ -1,0 +1,268 @@
+Bug Summary: [14 Regression] ICE with -fanalyzer on -Wanalyzer-out-of-bounds checker
+Product: gcc
+Component: analyzer
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Geoffrey | Time: 2023-08-07 03:24:13 UTC
+  Text: ICE bug when analyzing the folowing program. And there also is a FP report of out-of-bounds. 
+
+cmd: gcc -O0 -fanalyzer
+gcc version: x86-64 gcc (trunk)
+compiler explore:https://godbolt.org/z/Gsx5WTqKj```c
+#include "stdio.h"
+#include "stdint.h"
+
+
+uint64_t d(int32_t h) {
+  uint64_t j[2][6];
+  int32_t k;
+  for (k = 1;;) {
+    printf("FLAG\n");
+    if (h < 106 || j[k][h])
+      return 0;
+  }
+}
+int16_t e() {
+  int32_t f[5];
+  for (f[2] = 3; f[2]; --f[2])
+    d(0);
+}
+
+int main() { e(); }
+
+```
+
+output:
+```
+<source>: In function 'd':
+<source>:10:24: warning: stack-based buffer over-read [CWE-121] [-Wanalyzer-out-of-bounds]
+   10 |     if (h < 106 || j[k][h])
+      |                    ~~~~^~~
+  'd': events 1-4
+    |
+    |    6 |   uint64_t j[2][6];
+    |      |            ^
+    |      |            |
+    |      |            (1) capacity: 96 bytes
+    |......
+    |   10 |     if (h < 106 || j[k][h])
+    |      |        ~           ~~~~~~~
+    |      |        |               |
+    |      |        |               (3) ...to here
+    |      |        |               (4) read of 8 bytes at offset 'h * 8 + 48' exceeds 'j'
+    |      |        (2) following 'false' branch (when 'h > 105')...
+    |
+<source>:10:24: note: valid subscripts for 'j' are '[0]' to '[1]'
+   10 |     if (h < 106 || j[k][h])
+      |                    ~~~~^~~
+during IPA pass: analyzer
+<source>:10:8: internal compiler error: in fold_binary_loc, at fold-const.cc:11320
+   10 |     if (h < 106 || j[k][h])
+      |        ^
+0x216b2ae internal_error(char const*, ...)
+	???:0
+0x9d1202 fancy_abort(char const*, int, char const*)
+	???:0
+0xcdba8d fold_build2_loc(unsigned int, tree_code, tree_node*, tree_node*, tree_node*)
+	???:0
+0x172fc13 generic_simplify_MULT_EXPR(unsigned int, tree_code, tree_node*, tree_node*, tree_node*)
+	???:0
+0xcd40c5 fold_binary_loc(unsigned int, tree_code, tree_node*, tree_node*, tree_node*)
+	???:0
+0xcdba8d fold_build2_loc(unsigned int, tree_code, tree_node*, tree_node*, tree_node*)
+	???:0
+0x14beb7f ana::region_offset::calc_symbolic_bit_offset(ana::region_model const&) const
+	???:0
+0x213be3b ana::access_range::get_size(ana::region_model const&, ana::bit_size_expr*) const
+	???:0
+0x2148663 ana::access_diagram_impl::access_diagram_impl(ana::access_operation const&, diagnostic_event_id_t, text_art::style_manager&, text_art::theme const&, ana::logger*)
+	???:0
+0x213ce0b ana::access_diagram::access_diagram(ana::access_operation const&, diagnostic_event_id_t, text_art::style_manager&, text_art::theme const&, ana::logger*)
+	???:0
+0x1fbf5d3 ana::symbolic_buffer_over_read::emit(rich_location*, ana::logger*)
+	???:0
+0x1fe653e ana::diagnostic_manager::emit_saved_diagnostic(ana::exploded_graph const&, ana::saved_diagnostic const&)
+	???:0
+0x1fe6d40 ana::diagnostic_manager::emit_saved_diagnostics(ana::exploded_graph const&)
+	???:0
+0x149e891 ana::impl_run_checkers(ana::logger*)
+	???:0
+0x149f83f ana::run_checkers()
+	???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+Compiler returned: 1
+```
+
+- User: GCC Commits | Time: 2024-03-18 22:47:02 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:1579394c9ecf3d1f678daa54b835c7fc3b76fb6dcommitr14-9527-g1579394c9ecf3d1f678daa54b835c7fc3b76fb6dAuthor: David Malcolm <dmalcolm@redhat.com>
+Date:   Mon Mar 18 18:44:34 2024 -0400
+
+    analyzer: fix ICEs due to sloppy types in bounds-checking [PR110902,PR110928,PR111305,PR111441]
+    
+    Various analyzer ICEs in our bugzilla relate to sloppy use of types
+    within bounds-checking.
+    
+    The bounds-checking code works by comparing symbolic *bit* offsets, and
+    we don't have a good user-facing type that can represent such an offset
+    (ptrdiff_type_node is for *byte* offsets).
+    
+    ana::svalue doesn't enforce valid combinations of types for things like
+    binary operations.  When I added the access diagrams for GCC 14, this
+    could lead to attempts to generate trees for such svalues, leading to
+    trees with invalid combinations of types (e.g. PLUS_EXPR or MULT_EXPR of
+    incompatible types), leading to ICEs inside the tree folding logic.
+    
+    I tried two approaches to fixing this.
+    
+    My first approach was to fix the type-handling throughout the
+    bounds-checking code to use correct types, using size_type_node for
+    sizes, ptrdiff_type_node for byte offsets, and trying ptrdiff_type_node
+    for bit offsets.  I implemented this, and it fixed the crashes, but
+    unfortunately it led to:
+    (a) numerous false negatives from the bounds-checking code, due to it
+    becoming unable to be sure that the accessed offset was beyond the valid
+    bounds, due to the expressions involved gaining complicated sets of
+    nested casts.
+    (b) ugly access diagrams full of nested casts (for capacities, gap
+    measurements, etc)
+    
+    So my second approach, implemented in this patch, is to accept that we
+    don't have a tree type for representing bit offsets.  The patch
+    represents bit offsets using "typeless" symbolic values i.e. ones for
+    which get_type () is NULL_TREE, and implements enough support for basic
+    arithemetic as if these are mathematical integers (albeit ones for which
+    concrete values within an expression must fit within a signed wide int).
+    Such values can't be converted to tree, so the patch avoids such
+    conversions, instead implementing a new svalue::maybe_print_for_user for
+    printing them to a pretty_printer.  The patch uses ptrdiff_type_node for
+    byte offsets.
+    
+    Doing so fixes the crashes, whilst appearing to preserve the behavior of
+    -Wanalyzer-out-of-bounds in my testing.
+    
+    gcc/analyzer/ChangeLog:PR analyzer/110902PR analyzer/110928PR analyzer/111305PR analyzer/111441* access-diagram.cc: Include "analyzer/analyzer-selftests.h".
+            (get_access_size_str): Reimplement for conversion of
+            implmementation of bit_size_expr from tree to const svalue &.  Use
+            svalue::maybe_print_for_user rather than tree printing routines.
+            (remove_ssa_names): Make non-static.
+            (bit_size_expr::get_formatted_str): Rename to...
+            (bit_size_expr::maybe_get_formatted_str): ...this, adding "model"
+            param and converting return type to a unique_ptr.  Update for
+            conversion of implementation of bit_size_expr from tree to
+            const svalue &.  Use svalue::maybe_print_for_user rather than tree
+            printing routines.
+            (bit_size_expr::print): Rename to...
+            (bit_size_expr::maybe_print_for_user): ...this, adding "model"
+            param and converting return type to bool.  Update for
+            conversion of implementation of bit_size_expr from tree to
+            const svalue &.  Use svalue::maybe_print_for_user rather than tree
+            printing routines.
+            (bit_size_expr::maybe_get_as_bytes): Add "mgr" param and convert
+            return type from tree to const svalue *; reimplement.
+            (access_range::access_range): Call strip_types when on region_offset
+            intializations.
+            (access_range::get_size): Update for conversion of implementation
+            of bit_size_expr from tree to const svalue &.
+            (access_operation::get_valid_bits): Pass manager to access_range
+            ctor.
+            (access_operation::maybe_get_invalid_before_bits): Likewise.
+            (access_operation::maybe_get_invalid_after_bits): Likewise.
+            (boundaries::add): Likewise.
+            (bit_to_table_map::populate): Add "mgr" param and pass it to
+            access_range ctor.
+            (access_diagram_impl::access_diagram_impl): Pass manager to
+            bit_to_table_map::populate.
+            (access_diagram_impl::maybe_add_gap): Use svalue rather than tree
+            for symbolic bit offsets.  Port to new bit_size_expr
+            representation.
+            (access_diagram_impl::add_valid_vs_invalid_ruler): Port to new
+            bit_size_expr representation.
+            (selftest::assert_eq_typeless_integer): New.
+            (ASSERT_EQ_TYPELESS_INTEGER): New.
+            (selftest::test_bit_size_expr_to_bytes): New.
+            (selftest::analyzer_access_diagram_cc_tests): New.
+            * access-diagram.h (class bit_size_expr): Reimplement, converting
+            implementation from tree to const svalue &.
+            (access_range::access_range): Add "mgr" param.  Call strip_types
+            on region_offset initializations.
+            (access_range::get_size): Update decl for reimplementation.
+            * analyzer-selftests.cc (selftest::run_analyzer_selftests): Call
+            selftest::analyzer_access_diagram_cc_tests.
+            * analyzer-selftests.h
+            (selftest::analyzer_checker_script_cc_tests): Delete this stray
+            typo.
+            (selftest::analyzer_access_diagram_cc_tests): New decl.
+            * analyzer.h (print_expr_for_user): New decl.
+            (calc_symbolic_bit_offset): Update decl for reimplementation.
+            (strip_types): New decls.
+            (remove_ssa_names): New decl.
+            * bounds-checking.cc (strip_types): New.
+            (region_model::check_symbolic_bounds): Use typeless svalues.
+            * region-model-manager.cc
+            (region_model_manager::get_or_create_constant_svalue): Add "type"
+            param.  Add overload with old signature.
+            (region_model_manager::get_or_create_int_cst): Support type being
+            NULL_TREE.
+            (region_model_manager::maybe_fold_unaryop): Gracefully reject folding
+            of casts to NULL_TREE type.
+            (get_code_for_cast): Use NOP_EXPR for "casting" svalues to
+            NULL_TREE type.
+            (region_model_manager::get_or_create_cast): Support "casting"
+            svalues to NULL_TREE type.
+            (region_model_manager::maybe_fold_binop): Don't crash on inputs
+            with NULL_TREE type.  Handle folding of binops on constants with
+            NULL_TREE type.  Add missing cast fromPR analyzer/110902.
+            Support enough folding of other ops on NULL_TREE type to support
+            bounds checking.
+            (region_model_manager::get_or_create_const_fn_result_svalue):
+            Remove assertion that type is nonnull.
+            * region-model-manager.h
+            (region_model_manager::get_or_create_constant_svalue): Add
+            overloaded decl taking a type.
+            (region_model_manager::maybe_fold_binop): Make public.
+            (region_model_manager::constants_map_t): Use
+            constant_svalue::key_t for the key, rather than just tree.
+            * region-model.cc (print_expr_for_user): New.
+            (selftest::test_array_2): Handle casts.
+            * region.cc (region_offset::calc_symbolic_bit_offset): Return
+            const svalue & rather than tree, and reimplement accordingly.
+            (region::calc_offset): Use ptrdiff_type_node for types of byte
+            offsets.
+            (region::maybe_print_for_user): New.
+            (element_region::get_relative_symbolic_offset): Use NULL_TREE for
+            types of bit offsets.
+            (offset_region::get_bit_offset): Likewise.
+            (sized_region::get_bit_size_sval): Likewise for bit sizes.
+            * region.h (region::maybe_print_for_user): New decl.
+            * svalue.cc (class auto_add_parens): New.
+            (svalue::maybe_print_for_user): New.
+            (svalue::cmp_ptr): Support typeless constant svalues.
+            (tristate_from_boolean_tree_node): New, taken from...
+            (constant_svalue::eval_condition): ...here.  Handle comparison of
+            typeless integer svalue constants.
+            * svalue.h (svalue::maybe_print_for_user): New decl.
+            (class constant_svalue): Support the type of the svalue being
+            NULL_TREE.
+            (struct default_hash_traits<constant_svalue::key_t>): New.
+    
+    gcc/ChangeLog:PR analyzer/110902PR analyzer/110928PR analyzer/111305PR analyzer/111441* selftest.h (ASSERT_NE_AT): New macro.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/110902PR analyzer/110928PR analyzer/111305PR analyzer/111441* c-c++-common/analyzer/out-of-bounds-const-fn.c: New test.
+            * c-c++-common/analyzer/out-of-bounds-diagram-11.c: Update
+            expected diagram output.
+            * c-c++-common/analyzer/out-of-bounds-diagram-pr110928.c: New test.
+            * c-c++-common/analyzer/out-of-bounds-diagram-pr111305.c: New test.
+            * c-c++-common/analyzer/out-of-bounds-diagram-pr111441.c: New test.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2024-03-18 22:54:38 UTC
+  Text: Should be fixed by the above patch.
+

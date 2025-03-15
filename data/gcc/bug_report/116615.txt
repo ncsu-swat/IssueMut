@@ -1,0 +1,229 @@
+Bug Summary: Investigate LOGICAL_OP_NON_SHORT_CIRCUIT for RISC-V
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: internal-improvement, missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jeffrey A. Law | Time: 2024-09-05 14:29:47 UTC
+  Text: The RISC-V port defines LOGICAL_OP_NON_SHORT_CIRCUIT as 0, which seems odd.  On the assumption that the value was chosen for a reason, probably the right thing to do is move it to the uarch tuning structure with 0 as the value for all tunings.
+
+Then it can be benchmarked on relevant designs and the uarch tuning updated.
+
+- User: Sam James | Time: 2024-09-05 14:37:29 UTC
+  Text: First came up athttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=116166#c15.
+
+- User: Palmer Dabbelt | Time: 2024-09-05 14:59:55 UTC
+  Text: I didn't remember what this means, which probably means I'd never looked at it before, which probably means it just predates me working on this stuff.  Andrew might remember, but looks like MIPS has it defined as 0 and IIRC a lot of the early port is MIPS-ish (though I think we pulled in a bunch of arm64 at some point, so not 100% sure there).
+
+So I'd bet this is just an oversight.  That said, from reading the docs I can't quite figure out what's going on -- I'd expect 
+
+long foo(long a, long b, long c, long d)
+{
+    return a || b || c || d;
+}
+
+to generate something branchy, but it looks fine under -O1.  I do get very branchy code under -O0:
+
+foo:
+.LFB0:
+	.cfi_startproc
+	addi	sp,sp,-48
+	.cfi_def_cfa_offset 48
+	sd	ra,40(sp)
+	sd	s0,32(sp)
+	.cfi_offset 1, -8
+	.cfi_offset 8, -16
+	addi	s0,sp,48
+	.cfi_def_cfa 8, 0
+	sd	a0,-24(s0)
+	sd	a1,-32(s0)
+	sd	a2,-40(s0)
+	sd	a3,-48(s0)
+	ld	a5,-24(s0)
+	bne	a5,zero,.L2
+	ld	a5,-32(s0)
+	bne	a5,zero,.L2
+	ld	a5,-40(s0)
+	bne	a5,zero,.L2
+	ld	a5,-48(s0)
+	beq	a5,zero,.L3
+.L2:
+	li	a5,1
+	j	.L4
+.L3:
+	li	a5,0
+.L4:
+	mv	a0,a5
+	ld	ra,40(sp)
+	.cfi_restore 1
+	ld	s0,32(sp)
+	.cfi_restore 8
+	.cfi_def_cfa 2, 48
+	addi	sp,sp,48
+	.cfi_def_cfa_offset 0
+	jr	ra
+	.cfi_endproc
+
+so is some other optimization just eating the branches and re-optimizing for us here?  I'm getting basically the same thing with LOGICAL_OP_NON_SHORT_CIRCUIT=1, so I'm kind of worried I'm just misunderstanding the docs here.
+
+- User: Xi Ruoyao | Time: 2024-09-05 16:13:42 UTC
+  Text: FYI on LoongArch it's claimed LOGICAL_OP_NON_SHORT_CIRCUIT=0 mostly helps FP benchmarks, something like
+
+/* { dg-options "-O2 -ffast-math -fdump-tree-gimple" } */
+
+int
+short_circuit (float *a)
+{
+  float t1x = a[0];
+  float t2x = a[1];
+  float t1y = a[2];
+  float t2y = a[3];
+  float t1z = a[4];
+  float t2z = a[5];
+
+  if (t1x > t2y  || t2x < t1y  || t1x > t2z || t2x < t1z || t1y > t2z || t2y < t1z)
+    return 0;
+
+  return 1;
+}
+
+Seer14-8446.  Maybe because FP comparison is more expensive.
+
+I'm really not a fan of the change because without -ffast-math (which should really not be used for 99.9% real-life code) the FP comparision isn't allowed to be short-circuited anyway.  Generally I'm much frustrated when all the people seem using -ffast-math to bench things and justify changes.
+
+- User: Xi Ruoyao | Time: 2024-09-05 16:14:29 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #3)> FYI on LoongArch ... ...Note that I don't know if things are same or not on RISC-V.
+
+- User: Xi Ruoyao | Time: 2024-09-05 16:18:20 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #3)> I'm really not a fan of the change because without -ffast-math (which should
+> really not be used for 99.9% real-life code) the FP comparision isn't
+> allowed to be short-circuited anyway.Oops, I mean "it must be short-circuited without -ffast-math anyway."  I cannot type :(.
+
+- User: Andrew Pinski | Time: 2024-09-05 16:59:06 UTC
+  Text: Mips have it defined to 0 too, I also I think incorrectly and I changed it when I was maintaining a downstream mips compiler 
+
+It has been on my radar to improve the situation with this macro for a while now.
+
+- User: Andrew Pinski | Time: 2024-09-05 17:20:14 UTC
+  Text: History on LOGICAL_OP_NON_SHORT_CIRCUIT being able to defined differently from BRANCH_COST. It was originally added for powerpc (2002/2003ish) which had expensive cset at the time; and there was no possibility to use the crand/cror (etc.) instructions. Though now with ccmp is this is no longer true but powerpc has not implemented that yet.
+
+Anyways back to RISCV since defining it to 0 might seem wrong since cset (at least for integers) is cheap.
+
+- User: Palmer Dabbelt | Time: 2024-09-05 18:54:39 UTC
+  Text: (In reply to Andrew Pinski fromcomment #7)> History on LOGICAL_OP_NON_SHORT_CIRCUIT being able to defined differently
+> from BRANCH_COST. It was originally added for powerpc (2002/2003ish) which
+> had expensive cset at the time; and there was no possibility to use the
+> crand/cror (etc.) instructions. Though now with ccmp is this is no longer
+> true but powerpc has not implemented that yet.
+> 
+> Anyways back to RISCV since defining it to 0 might seem wrong since cset (at
+> least for integers) is cheap.OK, sounds like this is just the wrong way to go on RISC-V then?  I just sent a patch, maybe someone will remember why things are this way.  Thanks for the help here, I didn't know any of this ;)
+
+- User: Palmer Dabbelt | Time: 2024-09-05 18:55:30 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #3)> FYI on LoongArch it's claimed LOGICAL_OP_NON_SHORT_CIRCUIT=0 mostly helps FP
+> benchmarks, something like
+> 
+> /* { dg-options "-O2 -ffast-math -fdump-tree-gimple" } */
+> 
+> int
+> short_circuit (float *a)
+> {
+>   float t1x = a[0];
+>   float t2x = a[1];
+>   float t1y = a[2];
+>   float t2y = a[3];
+>   float t1z = a[4];
+>   float t2z = a[5];
+> 
+>   if (t1x > t2y  || t2x < t1y  || t1x > t2z || t2x < t1z || t1y > t2z || t2y
+> < t1z)
+>     return 0;
+> 
+>   return 1;
+> }
+> 
+> Seer14-8446.  Maybe because FP comparison is more expensive.
+> 
+> I'm really not a fan of the change because without -ffast-math (which should
+> really not be used for 99.9% real-life code) the FP comparision isn't
+> allowed to be short-circuited anyway.  Generally I'm much frustrated when
+> all the people seem using -ffast-math to bench things and justify changes.Ya, I also kind of just ignore the -ffast-math stuff...
+
+- User: Andrew Waterman | Time: 2024-09-05 21:36:26 UTC
+  Text: > Andrew might remember, but looks like MIPS has it defined as 0 and IIRC a lot of the early port is MIPS-ishRight, I just cribbed this from the MIPS port and didn't perform any RISC-V-specific analysis.
+
+I do worry about changing this unconditionally, though, especially with respect to static code size.  We should justify any changes here with benchmarking results, and we should consider the possibility that the best answer depends on whether we are optimizing for speed or size.
+
+- User: Richard Biener | Time: 2024-09-06 06:29:27 UTC
+  Text: Note this now mostly controls early and gimple-time optimization, the expansion
+to RTL will use BRANCH_COST and friends to decide whether if (a | b) is
+expanded into one or two branches.
+
+LOGICAL_OP_NON_SHORT_CIRCUIT is one source of early IL differences and thus
+target dependent divergence of behavior during GIMPLE optimizations.
+
+In the end I'd like to have us short-circuit always during gimplification
+and GENERIC folding (but late re-gimplification has to non-short-circuit)
+and keep the current behavior for passes like ifcombine (I'll note it's
+currently not looked at by phiopt ...).
+
+Iff FP and INT cset has different costs we should see to expose that
+to the middle-end in a way, like instead of just looking at BRANCH_COST
+we should compare it with a new CSET_COST (mode).  OTOH even a conditional
+branch on FP compare can be more expensive if the FP compare doesn't set CC?
+
+- User: Andrew Pinski | Time: 2024-09-24 18:08:34 UTC
+  Text: ***Bug 106724has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2024-09-24 18:09:07 UTC
+  Text: (In reply to Andrew Pinski fromcomment #12)> ***Bug 106724has been marked as a duplicate of this bug. ***I forgot I had filedPR 106724until I was looking for a different issue :).
+
+- User: GCC Commits | Time: 2024-10-08 13:31:04 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:34ae3a992a0cc3240d07d69ff12a664cbb5c8be0commitr15-4173-g34ae3a992a0cc3240d07d69ff12a664cbb5c8be0Author: Palmer Dabbelt <palmer@rivosinc.com>
+Date:   Tue Oct 8 07:28:32 2024 -0600
+
+    [RISC-V][PR target/116615] RISC-V: Use default LOGICAL_OP_NON_SHORT_CIRCUIT
+    
+    > We have cheap logical ops, so let's just move this back to the default
+    > to take advantage of the standard branch/op hueristics.
+    >
+    > gcc/ChangeLog:
+    >
+    >PR target/116615>     * config/riscv/riscv.h (LOGICAL_OP_NON_SHORT_CIRCUIT): Remove.
+    > ---
+    > There's a bunch more discussion in the bug, but it's starting to smell
+    > like this was just a holdover from MIPS (where maybe it also shouldn't
+    > be set).  I haven't tested this, but I figured I'd send the patch to get
+    > a little more visibility.
+    >
+    > I guess we should also kick off something like a SPEC run to make sure
+    > there's no regressions?
+    So as I noted earlier, this appears to be a nice win on the BPI. Testsuite
+    fallout is minimal -- just the one SFB related test tripping at -Os that was
+    also hit by Andrew P's work.
+    
+    After looking at it more closely, the SFB codegen and the codegen after
+    Andrew's work should be equivalent assuming two independent ops can dispatch
+    together.
+    
+    The test actually generates sensible code at -Os.  It's the -Os in combination
+    with the -fno-ssa-phiopt that causes problems.   I think the best thing to do
+    here is just skip at -Os.  That still keeps a degree of testing the SFB path.
+    
+    Tested successfully in my tester.  But will wait for the pre-commit tester to
+    render a verdict before moving forward.PR target/116615gcc/
+            * config/riscv/riscv.h (LOGICAL_OP_NON_SHORT_CIRCUIT): Remove.
+    
+    gcc/testsuite/
+    
+            * gcc.target/riscv/cset-sext-sfb.c: Skip for -Os.
+    
+                Co-authored-by: Jeff Law  <jlaw@ventanamicro.com>
+
+- User: Jeffrey A. Law | Time: 2024-10-08 15:30:04 UTC
+  Text: Fixed on the trunk by removing the macro and adjusting one affected test.
+

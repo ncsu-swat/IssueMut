@@ -1,0 +1,216 @@
+Bug Summary: [14 Regression] ice with -O2 with recent gcc
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2023-08-02 13:46:37 UTC
+  Text: Createdattachment 55675[details]C source code
+
+The attached C code, when compiled by recent gcc trunk and -O2, does this:
+
+foundBugs $ ~/gcc/results/bin/gcc -c -w -O2bug945.c
+buildData/keep/in.18686.c: In function ‘func_56’:
+buildData/keep/in.18686.c:1184:17: note: the ABI for passing parameters with 32-byte alignment has changed in GCC 4.6
+gcc: internal compiler error: Segmentation fault signal terminated program cc1
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+See <https://gcc.gnu.org/bugs/> for instructions.
+foundBugs $ 
+
+-O1 is fine:
+
+foundBugs $ ~/gcc/results/bin/gcc -c -w -O1bug945.c
+buildData/keep/in.18686.c: In function ‘func_56’:
+buildData/keep/in.18686.c:1184:17: note: the ABI for passing parameters with 32-byte alignment has changed in GCC 4.6
+foundBugs $ 
+
+Yesterday's compiler (g:01b0c36ba0c3bbe6) seems fine, but today's (g:0460c1221627938b),
+some 36 commits later, does not.
+
+I have a reduction running.
+
+It seems a side issue that -w was given to the compiler, but it still prints
+out notes about things that happened a long time ago (gcc 4.6).
+
+- User: David Binderman | Time: 2023-08-02 15:23:38 UTC
+  Text: Stack backtrace seems to be:
+
+#0  0x0000000000a0b511 in operand_compare::verify_hash_value (flags=0, 
+    this=<optimized out>, arg0=<optimized out>, arg1=<optimized out>, 
+    ret=<optimized out>) at ../../trunk.year/gcc/fold-const.cc:4074
+#1  operand_compare::operand_equal_p (
+    this=0x2efbbd8 <default_compare_instance>, arg0=0x7fffe9c9fc60, 
+    arg1=0x7fffe9cc8e10, flags=0) at ../../trunk.year/gcc/fold-const.cc:3090
+#2  0x0000000000a04162 in operand_equal_p (arg0=0x7fffe9c9fc60, 
+    arg1=0x7fffe9cc8e10, flags=16) at ../../trunk.year/gcc/fold-const.cc:4105
+#3  0x0000000001dde083 in gimple_bitwise_inverted_equal_p (
+    expr1=0x7fffe9c9fc60, expr2=expr2@entry=0x7fffe9cc8e10, 
+    valueize=valueize@entry=0x106ee10 <rpo_vn_valueize(tree_node*)>)
+    at ../../trunk.year/gcc/gimple-match-head.cc:284
+
+Looking for the word "invert" in the range of git hashes gives:
+
+$ grep invert /tmp/0
+    Slightly improve bitwise_inverted_equal_p comparisons
+    This slighly improves bitwise_inverted_equal_p
+            * gimple-match-head.cc (gimple_bitwise_inverted_equal_p): Valueize
+    Move `~X & X` and `~X | X` over to use bitwise_inverted_equal_p
+    bitwise_inverted_equal_p. It also allows us to remove 2 other patterns
+            use bitwise_inverted_equal_p, removing :c as bitwise_inverted_equal_p
+$ 
+
+This is commit:
+
+commit ee20be8325f7f257ba91a0201cfb3bd6bfbceba9
+Author: Andrew Pinski <apinski@marvell.com>
+Date:   Sat Jul 29 16:29:09 2023 -0700
+
+    Slightly improve bitwise_inverted_equal_p comparisons
+
+I can't be sure yet, but that commit is a likely candidate.
+Perhaps Andrew would be willing to offer their opinion ?
+
+- User: Andrew Pinski | Time: 2023-08-02 15:58:12 UTC
+  Text: Let me look into it ...
+
+- User: Andrew Pinski | Time: 2023-08-02 16:12:09 UTC
+  Text: I think this might be the common attribute on an local variable decl that is causing the issue ....
+
+- User: Andrew Pinski | Time: 2023-08-02 16:59:30 UTC
+  Text: Reduced testcase:
+```
+struct S1 {
+  unsigned f0;
+};
+static int g_161;
+void func_109(unsigned g_227, unsigned t) {
+  struct S1 l_178;
+  int l_160 = 0x1FAE99D5L;
+  int *l_230[] = {&l_160};
+  if (l_160) {
+    for (l_178.f0 = -7; l_178.f0;) {
+      ++g_227;
+      break;
+    }
+    (g_161) = g_227;
+  }
+  (g_161) &= t;
+}
+```
+There is a stack overflow while executing the FRE pass.
+
+- User: David Binderman | Time: 2023-08-02 20:11:49 UTC
+  Text: Createdattachment 55679[details]C source code
+
+Another test case.
+
+- User: David Binderman | Time: 2023-08-02 20:14:23 UTC
+  Text: (In reply to Andrew Pinski fromcomment #4)> There is a stack overflow while executing the FRE pass.I can confirm over 100,000 stack frames.
+
+Which -f flag causes the FRE pass to be executed ?
+I assume it is in -O2, but not in -O1.
+
+- User: Andrew Pinski | Time: 2023-08-02 20:17:08 UTC
+  Text: (In reply to David Binderman fromcomment #6)> (In reply to Andrew Pinski fromcomment #4)
+> > There is a stack overflow while executing the FRE pass.
+> 
+> I can confirm over 100,000 stack frames.
+> 
+> Which -f flag causes the FRE pass to be executed ?
+> I assume it is in -O2, but not in -O1.Fre is enabled at -O1 but the IR changes before fre. I have not looked into what changes to the IR on why there is a difference between -O1 and -O2 yet.
+
+- User: Andrew Pinski | Time: 2023-08-02 20:32:24 UTC
+  Text: Oh the difference between -O1 and -O2 is due to in fre:
+  /* At -O[1g] use the cheap non-iterating mode.  */
+  bool iterate_p = may_iterate && (optimize > 1);
+
+- User: Andrew Pinski | Time: 2023-08-02 21:01:21 UTC
+  Text: (gdb) p debug_tree(expr1)
+ <ssa_name 0x7ffff780df78
+    type <integer_type 0x7ffff78215e8 int sizes-gimplified public SI
+        size <integer_cst 0x7ffff7802fd8 constant 32>
+        unit-size <integer_cst 0x7ffff7825000 constant 4>
+        align:32 warn_if_not_align:0 symtab:0 alias-set 1 canonical-type 0x7ffff78215e8 precision:32 min <integer_cst 0x7ffff7802f90 -2147483648> max <integer_cst 0x7ffff7802fa8 2147483647>
+        pointer_to_this <pointer_type 0x7ffff7829b28>>
+    visited
+    def_stmt g_227.1_3 = (int) g_227_8;
+    version:3>
+$3 = void
+(gdb) up -1
+#0  gimple_bitwise_inverted_equal_p (expr1=0x7ffff79db048, expr2=0x7ffff79db3a8, valueize=0x11ba180 <rpo_vn_valueize(tree_node*)>) at /home/apinski/src/upstream-gcc-git/gcc/gcc/gimple-match-head.cc:278
+278       if (expr1 == expr2)
+(gdb) p debug_tree(expr1)
+ <ssa_name 0x7ffff79db048
+    type <integer_type 0x7ffff7821690 unsigned int sizes-gimplified public unsigned SI
+        size <integer_cst 0x7ffff7802fd8 constant 32>
+        unit-size <integer_cst 0x7ffff7825000 constant 4>
+        align:32 warn_if_not_align:0 symtab:0 alias-set -1 canonical-type 0x7ffff7821690 precision:32 min <integer_cst 0x7ffff7825018 0> max <integer_cst 0x7ffff7802fc0 4294967295>
+        pointer_to_this <pointer_type 0x7ffff7831690>>
+    visited
+    def_stmt g_161.3_5 = (unsigned int) g_161.2_4;
+    version:5>
+$4 = void
+
+
+
+Value numbering stmt = g_161.2_4 = g_161;
+Setting value number of g_161.2_4 to g_227.1_3 (changed)
+g_227.1_3 is available for g_227.1_3
+Value numbering stmt = g_161.3_5 = (unsigned int) g_161.2_4;
+g_227.1_3 is available for g_227.1_3
+Applying pattern match.pd:4207, gimple-match-4.cc:4064
+Applying pattern match.pd:4299, gimple-match-4.cc:4122
+Match-and-simplified (unsigned int) g_161.2_4 to g_227_8
+RHS (unsigned int) g_161.2_4 simplified to g_227_8
+Setting value number of g_161.3_5 to g_227_15 (changed)
+Making available beyond BB6 g_161.3_5 for value g_227_15
+Value numbering stmt = _6 = g_161.3_5 & t_17(D);
+
+
+
+So when we go and handle gimple_nop_convert here and we loop between the two.
+So we just need to limit gimple_bitwise_inverted_equal_p to only one look through I think ...
+
+- User: Andrew Pinski | Time: 2023-08-02 21:09:15 UTC
+  Text: I am not happy with the patch I came up with but it does reduce the amount of iterating and 100% makes sure it is bound so it will work.
+
+- User: Andrew Pinski | Time: 2023-08-03 02:44:35 UTC
+  Text: Patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2023-August/626131.html
+
+- User: Andrew Pinski | Time: 2023-08-03 06:59:33 UTC
+  Text: ***Bug 110886has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-08-03 07:18:41 UTC
+  Text: ***Bug 110887has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-08-03 22:49:29 UTC
+  Text: ***Bug 110895has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2023-08-04 07:27:01 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:91c963ea6f845a0c59b7523a5330b8d3ed1beb6acommitr14-2978-g91c963ea6f845a0c59b7523a5330b8d3ed1beb6aAuthor: Andrew Pinski <apinski@marvell.com>
+Date:   Wed Aug 2 14:49:00 2023 -0700
+
+    FixPR 110874: infinite loop in gimple_bitwise_inverted_equal_p with fre
+    
+    This changes gimple_bitwise_inverted_equal_p to use a 2 different match patterns
+    to try to match bit_not wrapped with a possible nop_convert and a comparison
+    also wrapped with a possible nop_convert. This is to avoid being recursive.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu with no regressions.
+    
+    gcc/ChangeLog:PR tree-optimization/110874* gimple-match-head.cc (gimple_bit_not_with_nop): New declaration.
+            (gimple_maybe_cmp): Likewise.
+            (gimple_bitwise_inverted_equal_p): Rewrite to use gimple_bit_not_with_nop
+            and gimple_maybe_cmp instead of being recursive.
+            * match.pd (bit_not_with_nop): New match pattern.
+            (maybe_cmp): Likewise.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/110874* gcc.c-torture/compile/pr110874-a.c: New test.
+
+- User: Andrew Pinski | Time: 2023-08-04 07:27:22 UTC
+  Text: Fixed.
+

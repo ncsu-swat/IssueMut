@@ -1,0 +1,181 @@
+Bug Summary: [14 regression] pointless movs when passing by value on x86-64
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization, needs-bisection
+Known to Work: 15.0
+Known to Fail: 14.1.0
+
+Comments:
+- User: Michael Kenzel | Time: 2024-06-05 03:14:54 UTC
+  Text: When passing structs of certain shape by value on x86-64 (seems to be specific to this target), gcc 14 emits (fails to optimize away?) a number of redundant moves:
+
+	struct complex
+	{
+		double real;
+		double imag;
+	};
+
+	complex blub(complex z)
+	{
+		return {
+			z.real * z.real - z.imag * z.imag,
+			2 * z.real * z.imag
+		};
+	}
+
+on gcc 13 with -O3 results in
+
+	blub(complex):
+		movapd  xmm3, xmm1
+		movapd  xmm2, xmm0
+		mulsd   xmm3, xmm1
+		addsd   xmm2, xmm2
+		mulsd   xmm0, xmm0
+		mulsd   xmm1, xmm2
+		subsd   xmm0, xmm3
+		ret
+
+gcc 14 and later with -O3 emit
+
+	blub(complex):
+			movq    rax, xmm1
+			movq    rdx, xmm0
+			xchg    rdx, rax
+			movq    xmm2, rax
+			movq    xmm1, rdx
+			movapd  xmm0, xmm2
+			movapd  xmm3, xmm1
+			mulsd   xmm3, xmm1
+			mulsd   xmm0, xmm2
+			addsd   xmm2, xmm2
+			mulsd   xmm1, xmm2
+			subsd   xmm0, xmm3
+			ret
+
+godbolt:https://godbolt.org/z/hzEfs3ob4
+
+- User: Richard Biener | Time: 2024-06-05 07:10:36 UTC
+  Text: Confirmed.  The IL we expand from is the same.
+
+- User: Hongtao Liu | Time: 2024-06-05 07:21:05 UTC
+  Text: There're 
+
+(insn 5 4 6 2 (set (reg:TI 110)
+        (ior:TI (and:TI (reg:TI 110)
+                (const_wide_int 0xffffffffffffffff0000000000000000))
+            (zero_extend:TI (subreg:DI (reg:DF 111) 0)))) "/app/example.cpp":8:1 136 {*insvti_lowpart_1}
+     (nil))
+(insn 6 5 7 2 (set (reg:TI 110)
+        (ior:TI (and:TI (reg:TI 110)
+                (const_wide_int 0x0ffffffffffffffff))
+            (ashift:TI (zero_extend:TI (subreg:DI (reg:DF 112) 0))
+                (const_int 64 [0x40])))) "/app/example.cpp":8:1 133 {*insvti_highpart_1}
+     (nil))
+(insn 7 6 8 2 (set (reg/v:TI 109 [ z ])
+
+in GCC14's rtl dump, guess related tor14-589-g1e3054d27c83ee?
+
+- User: Roger Sayle | Time: 2024-06-05 23:33:16 UTC
+  Text: I have a fix (to ix86_rtx_costs) that I'm bootstrapping and regression testing.
+By making concatditi3 slightly cheaper than *insvti_highpart (COSTS_N_INSN(2) vs. COSTS_N_INSNS(2)+1), fwprop is able to do the right.
+
+- User: GCC Commits | Time: 2024-06-07 13:04:29 UTC
+  Text: The master branch has been updated by Roger Sayle <sayle@gcc.gnu.org>:https://gcc.gnu.org/g:fb3e4c549d16d5050e10114439ad77149f33c597commitr15-1101-gfb3e4c549d16d5050e10114439ad77149f33c597Author: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Fri Jun 7 14:03:20 2024 +0100
+
+    i386:PR target/115351: RTX costs for *concatditi3 and *insvti_highpart.
+    
+    This patch addressesPR target/115351, which is a code quality regression
+    on x86 when passing floating point complex numbers.  The ABI considers
+    these arguments to have TImode, requiring interunit moves to place the
+    FP values (which are actually passed in SSE registers) into the upper
+    and lower parts of a TImode pseudo, and then similar moves back again
+    before they can be used.
+    
+    The cause of the regression is that changes in how TImode initialization
+    is represented in RTL now prevents the RTL optimizers from eliminating
+    these redundant moves.  The specific cause is that the *concatditi3
+    pattern, (zext(hi)<<64)|zext(lo), has an inappropriately high (default)
+    rtx_cost, preventing fwprop1 from propagating it.  This pattern just
+    sets the hipart and lopart of a double-word register, typically two
+    instructions (less if reload can allocate things appropriately) but
+    the current ix86_rtx_costs actually returns INSN_COSTS(13), i.e. 52.
+    
+    propagating insn 5 into insn 6, replacing:
+    (set (reg:TI 110)
+        (ior:TI (and:TI (reg:TI 110)
+                (const_wide_int 0x0ffffffffffffffff))
+            (ashift:TI (zero_extend:TI (subreg:DI (reg:DF 112 [ zD.2796+8 ]) 0))
+                (const_int 64 [0x40]))))
+    successfully matched this instruction to *concatditi3_3:
+    (set (reg:TI 110)
+        (ior:TI (ashift:TI (zero_extend:TI (subreg:DI (reg:DF 112 [ zD.2796+8 ]) 0))
+                (const_int 64 [0x40]))
+            (zero_extend:TI (subreg:DI (reg:DF 111 [ zD.2796 ]) 0))))
+    change not profitable (cost 50 -> cost 52)
+    
+    This issue is resolved by having ix86_rtx_costs return more reasonable
+    values for these (place-holder) patterns.
+    
+    2024-06-07  Roger Sayle  <roger@nextmovesoftware.com>
+    
+    gcc/ChangeLogPR target/115351* config/i386/i386.cc (ix86_rtx_costs): Provide estimates for
+            the *concatditi3 and *insvti_highpart patterns, about two insns.
+    
+    gcc/testsuite/ChangeLogPR target/115351* g++.target/i386/pr115351.C: New test case.
+
+- User: Roger Sayle | Time: 2024-06-08 14:51:48 UTC
+  Text: This has been fixed on mainline (for GCC 15).
+
+- User: GCC Commits | Time: 2024-07-18 11:51:19 UTC
+  Text: The releases/gcc-14 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:a4c9ade72885f9cf72c873d110545e4e3c2c7805commitr14-10458-ga4c9ade72885f9cf72c873d110545e4e3c2c7805Author: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Fri Jun 7 14:03:20 2024 +0100
+
+    i386:PR target/115351: RTX costs for *concatditi3 and *insvti_highpart.
+    
+    This patch addressesPR target/115351, which is a code quality regression
+    on x86 when passing floating point complex numbers.  The ABI considers
+    these arguments to have TImode, requiring interunit moves to place the
+    FP values (which are actually passed in SSE registers) into the upper
+    and lower parts of a TImode pseudo, and then similar moves back again
+    before they can be used.
+    
+    The cause of the regression is that changes in how TImode initialization
+    is represented in RTL now prevents the RTL optimizers from eliminating
+    these redundant moves.  The specific cause is that the *concatditi3
+    pattern, (zext(hi)<<64)|zext(lo), has an inappropriately high (default)
+    rtx_cost, preventing fwprop1 from propagating it.  This pattern just
+    sets the hipart and lopart of a double-word register, typically two
+    instructions (less if reload can allocate things appropriately) but
+    the current ix86_rtx_costs actually returns INSN_COSTS(13), i.e. 52.
+    
+    propagating insn 5 into insn 6, replacing:
+    (set (reg:TI 110)
+        (ior:TI (and:TI (reg:TI 110)
+                (const_wide_int 0x0ffffffffffffffff))
+            (ashift:TI (zero_extend:TI (subreg:DI (reg:DF 112 [ zD.2796+8 ]) 0))
+                (const_int 64 [0x40]))))
+    successfully matched this instruction to *concatditi3_3:
+    (set (reg:TI 110)
+        (ior:TI (ashift:TI (zero_extend:TI (subreg:DI (reg:DF 112 [ zD.2796+8 ]) 0))
+                (const_int 64 [0x40]))
+            (zero_extend:TI (subreg:DI (reg:DF 111 [ zD.2796 ]) 0))))
+    change not profitable (cost 50 -> cost 52)
+    
+    This issue is resolved by having ix86_rtx_costs return more reasonable
+    values for these (place-holder) patterns.
+    
+    2024-06-07  Roger Sayle  <roger@nextmovesoftware.com>
+    
+    gcc/ChangeLogPR target/115351* config/i386/i386.cc (ix86_rtx_costs): Provide estimates for
+            the *concatditi3 and *insvti_highpart patterns, about two insns.
+    
+    gcc/testsuite/ChangeLogPR target/115351* g++.target/i386/pr115351.C: New test case.
+    
+    (cherry picked from commit fb3e4c549d16d5050e10114439ad77149f33c597)
+
+- User: Richard Biener | Time: 2024-07-18 11:52:35 UTC
+  Text: Fixed.
+

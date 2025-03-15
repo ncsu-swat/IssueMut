@@ -1,0 +1,590 @@
+Bug Summary: Sub-optimal conditional jumps in conditional-swap with floating point
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Antony Polukhin | Time: 2023-06-08 11:31:05 UTC
+  Text: Some of the C++ algorithms are written in attempt to avoid conditional jumps in tight loops. For example, code close the following could be seen in libc++:
+
+void __cond_swap(double* __x, double* __y) {
+  bool __r = (*__x < *__y);
+  auto __tmp = __r ? *__x : *__y;
+  *__y = __r ? *__y : *__x;
+  *__x = __tmp;
+}
+
+
+GCC-14 with -O2 and -march=x86-64 options generates the following code:
+
+__cond_swap(double*, double*):
+        movsd   xmm1, QWORD PTR [rdi]
+        movsd   xmm0, QWORD PTR [rsi]
+        comisd  xmm0, xmm1
+        jbe     .L2
+        movq    rax, xmm1
+        movapd  xmm1, xmm0
+        movq    xmm0, rax
+.L2:
+        movsd   QWORD PTR [rsi], xmm1
+        movsd   QWORD PTR [rdi], xmm0
+        ret
+
+
+A conditional jump could be probably avoided in the following way:
+
+__cond_swap(double*, double*):
+        movsd   xmm0, qword ptr [rdi]
+        movsd   xmm1, qword ptr [rsi]
+        movapd  xmm2, xmm0
+        minsd   xmm2, xmm1
+        maxsd   xmm1, xmm0
+        movsd   qword ptr [rsi], xmm1
+        movsd   qword ptr [rdi], xmm2
+        ret
+
+
+Playground:https://godbolt.org/z/v3jW67x91
+
+- User: Andrew Pinski | Time: 2023-06-08 11:34:17 UTC
+  Text: Is that only valid if not trapping math?
+Gcc defaults to -ftrapping-math . Try disabling it and see if you get that result.
+
+Also is that correct for nans?
+
+- User: Antony Polukhin | Time: 2023-06-08 11:57:41 UTC
+  Text: -fno-trapping-math had no effect
+
+Some tests with nans seem to produce the same results for both code snippets:https://godbolt.org/z/GaKM3EhMq
+
+- User: Andrew Pinski | Time: 2023-06-08 13:32:53 UTC
+  Text: So for arm, GCC does produce the code you want:
+```
+        vcmpe.f64       d17, d16
+        vmrs    APSR_nzcv, FPSCR
+        ite     pl
+        vmovpl.f64      d18, d17
+        vmovmi.f64      d18, d16
+        it      mi
+        vmovmi.f64      d16, d17
+```
+
+RTL CE1 (ifcvt) detects it:
+if-conversion succeeded through noce_convert_multiple_sets
+
+
+So maybe there is some cost issue. Because arm64 does not do it either.
+
+- User: Andrew Pinski | Time: 2023-06-08 19:40:10 UTC
+  Text: Note for aarch64, we do produce conditional moves but only when there is a loop.
+
+That is:
+```
+__attribute__((noinline))
+void __cond_swap(double* __x, double* __y) {
+  for(int i = 0; i < 100; i++, __x++, __y++) {
+  double __r = (*__x < *__y);
+  double __tmp = __r ? *__x : *__y;
+  *__y = __r ? *__y : *__x;
+  *__x = __tmp;
+  }
+}
+```
+Produces:
+```
+.L3:
+        ldr     d31, [x0, x2]
+        ldr     d30, [x1, x2]
+        fcmpe   d31, d30
+        fcsel   d29, d30, d31, mi
+        fcsel   d31, d31, d30, mi
+        str     d29, [x1, x2]
+        str     d31, [x0, x2]
+        add     x2, x2, 8
+        cmp     x2, 800
+        bne     .L3
+```
+
+Otherwise it will duplicate the return basic block (which is expected).
+
+So this is a x86_64 specific issue.
+
+- User: Hongtao.liu | Time: 2023-06-09 05:38:53 UTC
+  Text: (In reply to Antony Polukhin fromcomment #2)> -fno-trapping-math had no effect
+> 
+> Some tests with nans seem to produce the same results for both code
+> snippets:https://godbolt.org/z/GaKM3EhMqWhat about infinity, I notice
+With -ffinite-math-only -funsafe-math-optimizations, gcc now can generate 
+
+__cond_swap(double*, double*):
+        movsd   (%rdi), %xmm0
+        movsd   (%rsi), %xmm1
+        movapd  %xmm0, %xmm2
+        minsd   %xmm1, %xmm0
+        maxsd   %xmm1, %xmm2
+        movsd   %xmm2, (%rsi)
+        movsd   %xmm0, (%rdi)
+        ret
+
+- User: Hongtao.liu | Time: 2023-06-09 06:40:55 UTC
+  Text: (In reply to Hongtao.liu fromcomment #5)> (In reply to Antony Polukhin fromcomment #2)
+> > -fno-trapping-math had no effect
+> > 
+> > Some tests with nans seem to produce the same results for both code
+> > snippets:https://godbolt.org/z/GaKM3EhMq> 
+> What about infinity, I notice
+> With -ffinite-math-only -funsafe-math-optimizations, gcc now can generate 
+> 
+> __cond_swap(double*, double*):
+>         movsd   (%rdi), %xmm0
+>         movsd   (%rsi), %xmm1
+>         movapd  %xmm0, %xmm2
+>         minsd   %xmm1, %xmm0
+>         maxsd   %xmm1, %xmm2
+>         movsd   %xmm2, (%rsi)
+>         movsd   %xmm0, (%rdi)
+>         retAssume -funsafe-math-optimizations is not needed?
+
+- User: Hongtao.liu | Time: 2023-06-09 07:01:11 UTC
+  Text: void __cond_swap(double* __x, double* __y) {
+  bool __r = (*__x < *__y);
+  *__x = __r ? *__y : *__x ;
+}
+
+void __cond_swap1(double* __x, double* __y) {
+  bool __r = (*__x < *__y);
+  *__y = __r ? *__x : *__y;
+}
+
+Separately, GCC can generate both max/min.
+
+- User: Hongtao.liu | Time: 2023-06-12 02:17:19 UTC
+  Text: ix86_expand_sse_fp_minmax failed since rtx_equal_p (cmp_op0, if_true) is false, 
+
+249(reg:DF 86 [ _1 ])  (if_true)
+250(reg:DF 83 [ _2 ])  (if_false)
+251(reg:DF 82 [ _1 ])  (cmp0_op0)
+252(reg:DF 83 [ _2 ])  (cmp1_op1)
+
+but here if_true is just a copy from cmp_op0 but with different REGNO, rtx_equal_p seems too conservative here.
+
+ 85(code_label 26 13 17 3 4 (nil) [1 uses])
+ 86(note 17 26 5 3 [bb 3] NOTE_INSN_BASIC_BLOCK)
+ 87(insn 5 17 6 3 (set (reg:DF 86 [ _1 ])
+ 88        (reg:DF 82 [ _1 ])) "test.C":3:20 153 {*movdf_internal}
+ 89     (expr_list:REG_DEAD (reg:DF 82 [ _1 ])
+ 90        (nil)))
+ 91(insn 6 5 7 3 (set (reg:DF 82 [ _1 ])
+ 92        (reg:DF 83 [ _2 ])) "test.C":4:14 discrim 1 153 {*movdf_internal}
+ 93     (expr_list:REG_DEAD (reg:DF 83 [ _2 ])
+ 94        (nil)))
+ 95(insn 7 6 18 3 (set (reg:DF 83 [ _2 ])
+ 96        (reg:DF 86 [ _1 ])) "test.C":3:20 discrim 1 153 {*movdf_internal}
+ 97     (expr_list:REG_DEAD (reg:DF 86 [ _1 ])
+ 98        (nil)))
+
+
+3812  if (rtx_equal_p (cmp_op0, if_true) && rtx_equal_p (cmp_op1, if_false))
+ 3813    is_min = true;
+ 3814  else if (rtx_equal_p (cmp_op1, if_true) && rtx_equal_p (cmp_op0, if_false))
+ 3815    is_min = false;
+ 3816  else
+ 3817=>  return false;
+
+- User: Hongtao.liu | Time: 2023-06-12 09:09:31 UTC
+  Text: (In reply to Hongtao.liu fromcomment #8)> ix86_expand_sse_fp_minmax failed since rtx_equal_p (cmp_op0, if_true) is
+> false, 
+> 
+> 249(reg:DF 86 [ _1 ])  (if_true)
+> 250(reg:DF 83 [ _2 ])  (if_false)
+> 251(reg:DF 82 [ _1 ])  (cmp0_op0)
+> 252(reg:DF 83 [ _2 ])  (cmp1_op1)
+> 
+> but here if_true is just a copy from cmp_op0 but with different REGNO,
+> rtx_equal_p seems too conservative here.
+>But if_convert didn't maintain DF_CHAIN info, and and backend can't get DF_REG_DEF_* info to figure out if_true is just a single_set of cmp_op0.
+
+
+With -march=x86-64-v2, gcc generates 
+
+        movsd   (%rdi), %xmm2
+        movsd   (%rsi), %xmm1
+        movapd  %xmm2, %xmm0
+        movapd  %xmm1, %xmm3
+        cmpltsd %xmm1, %xmm0
+        maxsd   %xmm2, %xmm3
+        blendvpd        %xmm0, %xmm2, %xmm1
+        movsd   %xmm3, (%rsi)
+        movsd   %xmm1, (%rdi)
+        ret
+
+Which can be further optimized: cmpltsd + blendvpd -> minsd
+
+- User: Hongtao.liu | Time: 2023-07-04 05:46:48 UTC
+  Text: There're couple of other issues.
+1. rtx_cost for and/ior/xor:SF/DF is not right, it actually generate vector instructions.
+2. branch_cost is COSTS_N_INSN(1) instead of BRANCH_COST ().
+which make noce more conservative to eliminate condition.
+w/ sse2, backend tries
+
+(insn 34 0 36 (set (reg:DF 86 [ _1 ])
+        (reg:DF 82 [ _1 ])) 151 {*movdf_internal}
+     (nil))
+
+(insn 36 34 37 (set (reg:DF 92)
+        (unspec:DF [
+                (reg:DF 83 [ _2 ])
+                (reg:DF 82 [ _1 ])
+            ] UNSPEC_IEEE_MAX)) -1
+     (nil))
+
+(insn 37 36 38 (set (reg:DF 93)
+        (lt:DF (reg:DF 82 [ _1 ])
+            (reg:DF 83 [ _2 ]))) -1
+     (nil))
+
+(insn 38 37 39 (set (reg:DF 94)
+        (and:DF (reg:DF 86 [ _1 ])
+            (reg:DF 93))) -1
+     (nil))
+
+(insn 39 38 40 (set (reg:DF 95)
+        (and:DF (not:DF (reg:DF 93))
+            (reg:DF 83 [ _2 ]))) -1
+     (nil))
+
+(insn 40 39 41 (set (reg:DF 83 [ _2 ])
+        (ior:DF (reg:DF 95)
+            (reg:DF 94))) -1
+     (nil))
+
+(insn 41 40 0 (set (reg:DF 82 [ _1 ])
+        (reg:DF 92)) 151 {*movdf_internal}
+     (nil))
+
+which is cost is 28, and original cost is 12 (3 moves + 1 branch).(needs also conside comparison? since it's counted in cmov seq), if use ix86_branch_cost + count comparison cost in the orginal seq, then the cost should be 28 vs 28.)
+
+
+(insn 5 17 6 3 (set (reg:DF 86 [ _1 ])
+        (reg:DF 82 [ _1 ])) "/export/users/liuhongt/tools-build/build_intel-innersource_pr110170_debug/test.c":5:23 151 {*movdf_internal}
+     (expr_list:REG_DEAD (reg:DF 82 [ _1 ])
+        (nil)))
+(insn 6 5 7 3 (set (reg:DF 82 [ _1 ])
+        (reg:DF 83 [ _2 ])) "/export/users/liuhongt/tools-build/build_intel-innersource_pr110170_debug/test.c":6:15 discrim 1 151 {*movdf_internal}
+     (expr_list:REG_DEAD (reg:DF 83 [ _2 ])
+        (nil)))
+(insn 7 6 18 3 (set (reg:DF 83 [ _2 ])
+        (reg:DF 86 [ _1 ])) "/export/users/liuhongt/tools-build/build_intel-innersource_pr110170_debug/test.c":5:23 discrim 1 151 {*movdf_internal}
+     (expr_list:REG_DEAD (reg:DF 86 [ _1 ])
+        (nil)))
+
+- User: GCC Commits | Time: 2023-07-06 05:54:38 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:37a231cc7594d12ba0822077018aad751a6fb94ecommitr14-2337-g37a231cc7594d12ba0822077018aad751a6fb94eAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Jul 5 13:45:11 2023 +0800
+
+    Disparage slightly for the alternative which move DFmode between SSE_REGS and GENERAL_REGS.
+    
+    For testcase
+    
+    void __cond_swap(double* __x, double* __y) {
+      bool __r = (*__x < *__y);
+      auto __tmp = __r ? *__x : *__y;
+      *__y = __r ? *__y : *__x;
+      *__x = __tmp;
+    }
+    
+    GCC-14 with -O2 and -march=x86-64 options generates the following code:
+    
+    __cond_swap(double*, double*):
+            movsd   xmm1, QWORD PTR [rdi]
+            movsd   xmm0, QWORD PTR [rsi]
+            comisd  xmm0, xmm1
+            jbe     .L2
+            movq    rax, xmm1
+            movapd  xmm1, xmm0
+            movq    xmm0, rax
+    .L2:
+            movsd   QWORD PTR [rsi], xmm1
+            movsd   QWORD PTR [rdi], xmm0
+            ret
+    
+    rax is used to save and restore DFmode value. In RA both GENERAL_REGS
+    and SSE_REGS cost zero since we didn't disparage the
+    alternative in movdf_internal pattern, according to register
+    allocation order, GENERAL_REGS is allocated. The patch add ? for
+    alternative (r,v) and (v,r) just like we did for movsf/hf/bf_internal
+    pattern, after that we get optimal RA.
+    
+    __cond_swap:
+    .LFB0:
+            .cfi_startproc
+            movsd   (%rdi), %xmm1
+            movsd   (%rsi), %xmm0
+            comisd  %xmm1, %xmm0
+            jbe     .L2
+            movapd  %xmm1, %xmm2
+            movapd  %xmm0, %xmm1
+            movapd  %xmm2, %xmm0
+    .L2:
+            movsd   %xmm1, (%rsi)
+            movsd   %xmm0, (%rdi)
+            ret
+    
+    gcc/ChangeLog:PR target/110170* config/i386/i386.md (movdf_internal): Disparage slightly for
+            2 alternatives (r,v) and (v,r) by adding constraint modifier
+            '?'.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110170-3.c: New test.
+
+- User: GCC Commits | Time: 2023-07-10 01:06:39 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:d41a57c46df6f8f7dae0c0a8b349e734806a837bcommitr14-2403-gd41a57c46df6f8f7dae0c0a8b349e734806a837bAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Mon Jul 3 18:19:19 2023 +0800
+
+    Add pre_reload splitter to detect fp min/max pattern.
+    
+    We have ix86_expand_sse_fp_minmax to detect min/max sematics, but
+    it requires rtx_equal_p for cmp_op0/cmp_op1 and if_true/if_false, for
+    the testcase in the PR, there's an extra move from cmp_op0 to if_true,
+    and it failed ix86_expand_sse_fp_minmax.
+    
+    This patch adds pre_reload splitter to detect the min/max pattern.
+    
+    Operands order in MINSS matters for signed zero and NANs, since the
+    instruction always returns second operand when any operand is NAN or
+    both operands are zero.
+    
+    gcc/ChangeLog:PR target/110170* config/i386/i386.md (*ieee_max<mode>3_1): New pre_reload
+            splitter to detect fp max pattern.
+            (*ieee_min<mode>3_1): Ditto, but for fp min pattern.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/i386/pr110170.C: New test.
+            * gcc.target/i386/pr110170.c: New test.
+
+- User: Antony Polukhin | Time: 2023-07-11 09:51:58 UTC
+  Text: There's a typo athttps://gcc.gnu.org/git/?p=gcc.git;a=blob;f=gcc/testsuite/g%2B%2B.target/i386/pr110170.C;h=e638b12a5ee2264ecef77acca86432a9f24b103b;hb=d41a57c46df6f8f7dae0c0a8b349e734806a837b#l87It should be `|| !test3() || !test3r()` rather than `|| !test3() || !test4r()`
+
+- User: Hongtao.liu | Time: 2023-07-11 13:23:38 UTC
+  Text: (In reply to Antony Polukhin fromcomment #13)> There's a typo at
+>https://gcc.gnu.org/git/?p=gcc.git;a=blob;f=gcc/testsuite/g%2B%2B.target/> i386/pr110170.C;h=e638b12a5ee2264ecef77acca86432a9f24b103b;
+> hb=d41a57c46df6f8f7dae0c0a8b349e734806a837b#l87
+> 
+> It should be `|| !test3() || !test3r()` rather than `|| !test3() ||
+> !test4r()`Yes, thanks for the reminder.
+
+- User: GCC Commits | Time: 2023-07-11 13:57:26 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:e5c64efb1367459dbc2d2e29856f23908cb503c1commitr14-2432-ge5c64efb1367459dbc2d2e29856f23908cb503c1Author: liuhongt <hongtao.liu@intel.com>
+Date:   Tue Jul 11 21:21:03 2023 +0800
+
+    Fix typo in the testcase.
+    
+    Antony Polukhin 2023-07-11 09:51:58 UTC
+    There's a typo athttps://gcc.gnu.org/git/?p=gcc.git;a=blob;f=gcc/testsuite/g%2B%2B.target/i386/pr110170.C;h=e638b12a5ee2264ecef77acca86432a9f24b103b;hb=d41a57c46df6f8f7dae0c0a8b349e734806a837b#l87It should be `|| !test3() || !test3r()` rather than `|| !test3() || !test4r()`
+    
+    gcc/testsuite/ChangeLog:PR target/110170* g++.target/i386/pr110170.C: Fix typo.
+
+- User: Richard Biener | Time: 2023-07-18 10:28:40 UTC
+  Text: This is fixed now.
+
+- User: Hongtao.liu | Time: 2023-07-18 10:33:41 UTC
+  Text: (In reply to Richard Biener fromcomment #16)> This is fixed now.The original issue is for sse2, my patch only fixed misoptimization for sse4.1.
+
+- User: Richard Biener | Time: 2023-07-18 13:48:35 UTC
+  Text: Huh, right.  Somehow I thought minss/maxss is SSE 4.1.  I do have a patch series that fixes this, thePR88540is missing for this but it has some fallout still.
+
+- User: Richard Biener | Time: 2023-07-21 08:18:57 UTC
+  Text: Fixed now.
+
+- User: GCC Commits | Time: 2023-10-17 06:31:54 UTC
+  Text: The releases/gcc-13 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:27165633859bdf92589428213edfeccdb49b7d83commitr13-7956-g27165633859bdf92589428213edfeccdb49b7d83Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Jul 5 13:45:11 2023 +0800
+
+    Disparage slightly for the alternative which move DFmode between SSE_REGS and GENERAL_REGS.
+    
+    For testcase
+    
+    void __cond_swap(double* __x, double* __y) {
+      bool __r = (*__x < *__y);
+      auto __tmp = __r ? *__x : *__y;
+      *__y = __r ? *__y : *__x;
+      *__x = __tmp;
+    }
+    
+    GCC-14 with -O2 and -march=x86-64 options generates the following code:
+    
+    __cond_swap(double*, double*):
+            movsd   xmm1, QWORD PTR [rdi]
+            movsd   xmm0, QWORD PTR [rsi]
+            comisd  xmm0, xmm1
+            jbe     .L2
+            movq    rax, xmm1
+            movapd  xmm1, xmm0
+            movq    xmm0, rax
+    .L2:
+            movsd   QWORD PTR [rsi], xmm1
+            movsd   QWORD PTR [rdi], xmm0
+            ret
+    
+    rax is used to save and restore DFmode value. In RA both GENERAL_REGS
+    and SSE_REGS cost zero since we didn't disparage the
+    alternative in movdf_internal pattern, according to register
+    allocation order, GENERAL_REGS is allocated. The patch add ? for
+    alternative (r,v) and (v,r) just like we did for movsf/hf/bf_internal
+    pattern, after that we get optimal RA.
+    
+    __cond_swap:
+    .LFB0:
+            .cfi_startproc
+            movsd   (%rdi), %xmm1
+            movsd   (%rsi), %xmm0
+            comisd  %xmm1, %xmm0
+            jbe     .L2
+            movapd  %xmm1, %xmm2
+            movapd  %xmm0, %xmm1
+            movapd  %xmm2, %xmm0
+    .L2:
+            movsd   %xmm1, (%rsi)
+            movsd   %xmm0, (%rdi)
+            ret
+    
+    gcc/ChangeLog:PR target/110170* config/i386/i386.md (movdf_internal): Disparage slightly for
+            2 alternatives (r,v) and (v,r) by adding constraint modifier
+            '?'.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110170-3.c: New test.
+    
+    (cherry picked from commit 37a231cc7594d12ba0822077018aad751a6fb94e)
+
+- User: GCC Commits | Time: 2023-10-17 11:14:05 UTC
+  Text: The releases/gcc-11 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:0d005deb6c8a956b4f7ccb6e70e8e7830a40fed9commitr11-11065-g0d005deb6c8a956b4f7ccb6e70e8e7830a40fed9Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Jul 5 13:45:11 2023 +0800
+
+    Disparage slightly for the alternative which move DFmode between SSE_REGS and GENERAL_REGS.
+    
+    For testcase
+    
+    void __cond_swap(double* __x, double* __y) {
+      bool __r = (*__x < *__y);
+      auto __tmp = __r ? *__x : *__y;
+      *__y = __r ? *__y : *__x;
+      *__x = __tmp;
+    }
+    
+    GCC-14 with -O2 and -march=x86-64 options generates the following code:
+    
+    __cond_swap(double*, double*):
+            movsd   xmm1, QWORD PTR [rdi]
+            movsd   xmm0, QWORD PTR [rsi]
+            comisd  xmm0, xmm1
+            jbe     .L2
+            movq    rax, xmm1
+            movapd  xmm1, xmm0
+            movq    xmm0, rax
+    .L2:
+            movsd   QWORD PTR [rsi], xmm1
+            movsd   QWORD PTR [rdi], xmm0
+            ret
+    
+    rax is used to save and restore DFmode value. In RA both GENERAL_REGS
+    and SSE_REGS cost zero since we didn't disparage the
+    alternative in movdf_internal pattern, according to register
+    allocation order, GENERAL_REGS is allocated. The patch add ? for
+    alternative (r,v) and (v,r) just like we did for movsf/hf/bf_internal
+    pattern, after that we get optimal RA.
+    
+    __cond_swap:
+    .LFB0:
+            .cfi_startproc
+            movsd   (%rdi), %xmm1
+            movsd   (%rsi), %xmm0
+            comisd  %xmm1, %xmm0
+            jbe     .L2
+            movapd  %xmm1, %xmm2
+            movapd  %xmm0, %xmm1
+            movapd  %xmm2, %xmm0
+    .L2:
+            movsd   %xmm1, (%rsi)
+            movsd   %xmm0, (%rdi)
+            ret
+    
+    gcc/ChangeLog:PR target/110170* config/i386/i386.md (movdf_internal): Disparage slightly for
+            2 alternatives (r,v) and (v,r) by adding constraint modifier
+            '?'.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110170-3.c: New test.
+    
+    (cherry picked from commit 37a231cc7594d12ba0822077018aad751a6fb94e)
+
+- User: GCC Commits | Time: 2023-10-26 05:30:38 UTC
+  Text: The releases/gcc-12 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:1e36498710f9ca84fefa578863cf505f484601b1commitr12-9944-g1e36498710f9ca84fefa578863cf505f484601b1Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Jul 5 13:45:11 2023 +0800
+
+    Disparage slightly for the alternative which move DFmode between SSE_REGS and GENERAL_REGS.
+    
+    For testcase
+    
+    void __cond_swap(double* __x, double* __y) {
+      bool __r = (*__x < *__y);
+      auto __tmp = __r ? *__x : *__y;
+      *__y = __r ? *__y : *__x;
+      *__x = __tmp;
+    }
+    
+    GCC-14 with -O2 and -march=x86-64 options generates the following code:
+    
+    __cond_swap(double*, double*):
+            movsd   xmm1, QWORD PTR [rdi]
+            movsd   xmm0, QWORD PTR [rsi]
+            comisd  xmm0, xmm1
+            jbe     .L2
+            movq    rax, xmm1
+            movapd  xmm1, xmm0
+            movq    xmm0, rax
+    .L2:
+            movsd   QWORD PTR [rsi], xmm1
+            movsd   QWORD PTR [rdi], xmm0
+            ret
+    
+    rax is used to save and restore DFmode value. In RA both GENERAL_REGS
+    and SSE_REGS cost zero since we didn't disparage the
+    alternative in movdf_internal pattern, according to register
+    allocation order, GENERAL_REGS is allocated. The patch add ? for
+    alternative (r,v) and (v,r) just like we did for movsf/hf/bf_internal
+    pattern, after that we get optimal RA.
+    
+    __cond_swap:
+    .LFB0:
+            .cfi_startproc
+            movsd   (%rdi), %xmm1
+            movsd   (%rsi), %xmm0
+            comisd  %xmm1, %xmm0
+            jbe     .L2
+            movapd  %xmm1, %xmm2
+            movapd  %xmm0, %xmm1
+            movapd  %xmm2, %xmm0
+    .L2:
+            movsd   %xmm1, (%rsi)
+            movsd   %xmm0, (%rdi)
+            ret
+    
+    gcc/ChangeLog:PR target/110170* config/i386/i386.md (movdf_internal): Disparage slightly for
+            2 alternatives (r,v) and (v,r) by adding constraint modifier
+            '?'.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110170-3.c: New test.
+    
+    (cherry picked from commit 37a231cc7594d12ba0822077018aad751a6fb94e)
+

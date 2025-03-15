@@ -1,0 +1,296 @@
+Bug Summary: [11/12/13 Regression] vectorizer generates calls to vector math routines with 1 simd lane.
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: link-failure
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Tamar Christina | Time: 2024-01-23 07:53:00 UTC
+  Text: In GCC 7 the Arm vector PCS was implemented to support libmvec but the libmvec component never made it into glibc until now.
+
+GLIBC 2.39 which will be paired with GCC 14 now implements the vector math routines.
+
+However consider this function:> cat cosmo.fppized3.fSUBROUTINE a(b)
+      DIMENSION b(3,0)
+      COMMON c
+      DO 4 m=1,c
+         DO 4 d=1,3
+             b(d,m)=b(d,m)+COS(5.0D00*m)
+   4  CONTINUE
+      END
+      DIMENSION e(53)
+      DIMENSION f(6,91),g(6,91),h(6,91),
+     *          i(6,91),j(6,91),k(6,86)
+      DIMENSION l(107)
+      END
+
+and compiled with headers from a glibc 2.39:> aarch64-unknown-linux-gnu-gfortran -S -o - -Ofast -L/data/repro/glibc/usr/lib64 -I/data/repro/glibc/include --sysroot=/data/repro/glibc -w cosmo.fppized3.fproduces:
+
+        fmul    v13.2d, v13.2d, v19.2d
+        fmov    d0, d13
+        bl      _ZGVnN1v_cos
+        fmov    d12, d0
+        dup     d0, v13.d[1]
+        bl      _ZGVnN1v_cos
+        fmov    d31, d0
+        stp     d12, d31, [sp, 96]
+
+which has deconstructed the vector to scalar and performs a vector call with 1 element.
+This is not just inefficient but _ZGVnN1v_cos does not exist in glibc as such code is produced that we cannot link.
+
+It looks like the vectorizer starts with 4 floats and widens to 2x 2 double.  But then during vectorizable simd this is again split into multiple vectors, even though the operation already fits in a vector:
+
+cosmo.fppized3.f:4:13: note:   ------>vectorizing SLP node starting from: _49 = __builtin_cos (_48);
+cosmo.fppized3.f:4:13: note:   vect_is_simple_use: operand _47 * 5.0e+0, type of def: internal
+cosmo.fppized3.f:4:13: note:   transform call.
+cosmo.fppized3.f:4:13: note:   add new stmt: _132 = BIT_FIELD_REF <vect__48.26_126, 64, 0>;
+cosmo.fppized3.f:4:13: note:   add new stmt: _133 = cos.simdclone.0 (_132);
+cosmo.fppized3.f:4:13: note:   add new stmt: _134 = BIT_FIELD_REF <vect__48.26_126, 64, 64>;
+cosmo.fppized3.f:4:13: note:   add new stmt: _135 = cos.simdclone.0 (_134);
+cosmo.fppized3.f:4:13: note:   add new stmt: vect__49.27_136 = {_133, _135};
+cosmo.fppized3.f:4:13: note:   add new stmt: _137 = BIT_FIELD_REF <vect__48.26_127, 64, 0>;
+cosmo.fppized3.f:4:13: note:   add new stmt: _138 = cos.simdclone.0 (_137);
+cosmo.fppized3.f:4:13: note:   add new stmt: _139 = BIT_FIELD_REF <vect__48.26_127, 64, 64>;
+cosmo.fppized3.f:4:13: note:   add new stmt: _140 = cos.simdclone.0 (_139);
+...
+
+Because we happen to have a V1DF mode that is meant to only be used by some intrinsics the operation succeeds.
+
+So several issues here:
+
+1. We should remove the new libmvec headers from glibc from applying to GCC 10,9,8,7 since we can't fix those anymore.  So we need a GCC version check on them, however glibc is now frozen for release.
+2. The vectorizer should not decompose a simd call if the input and result don't require it.
+3. We shouldn't generate a call with simdlen 1.  That said in theory this could still be beneficial because it would allow the rest of the code to vectorize and the vector pcs is cheaper to call.
+
+- User: Richard Biener | Time: 2024-01-23 08:13:19 UTC
+  Text: Hum, the vectorizer looks at the simd specs and if it says 1-lane variants (simdlen == 1) are available it will happily create them.
+
+Can you provide the testcase amended with the used SIMD "declarations"
+(as with the fortran syntax or with a C testcase)?
+
+- User: N/A | Time: 2024-01-23 08:51:13 UTC
+  Text: is this fortran only?
+
+glibc release is in a week, we can still do something (or backport a fix).
+
+the vector abi does not allow 1 lane in this casehttps://github.com/ARM-software/abi-aa/blob/main/vfabia64/vfabia64.rst#L867c annotation:https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/aarch64/fpu/bits/math-vector.h;h=04837bdcd7c0d0ce91192e09fc2d6614cae289c2;hb=HEADfortran annotation:https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/aarch64/fpu/finclude/math-vector-fortran.h;h=92e15f0d6a758258f5728e628bbb2422b176fa95;hb=HEADi think the bug can be reproduced with older glibc by adding
+
+!GCC$ builtin (cos) attributes simd (notinbranch)
+
+- User: Tamar Christina | Time: 2024-01-23 08:51:48 UTC
+  Text: (In reply to Richard Biener fromcomment #1)> Hum, the vectorizer looks at the simd specs and if it says 1-lane variants
+> (simdlen == 1) are available it will happily create them.>
+
+My understanding is that the spec just says "All SIMD variants are available" but technically V1DF is FP not SIMD.> Can you provide the testcase amended with the used SIMD "declarations"
+> (as with the fortran syntax or with a C testcase)?fair point:
+
+!GCC$ builtin (cos) attributes simd (notinbranch)
+
+      SUBROUTINE a(b)
+      DIMENSION b(3,0)
+      COMMON c
+      DO 4 m=1,c
+         DO 4 d=1,3
+             b(d,m)=b(d,m)+COS(5.0D00*m)
+   4  CONTINUE
+      END
+      DIMENSION e(53)
+      DIMENSION f(6,91),g(6,91),h(6,91),
+     *          i(6,91),j(6,91),k(6,86)
+      DIMENSION l(107)
+      END
+
+where just
+
+aarch64-unknown-linux-gnu-gfortran -S -o - -Ofast -w cosmo.fppized3.f
+
+is enough.
+
+- User: Tamar Christina | Time: 2024-01-23 08:54:14 UTC
+  Text: (In reply to nsz fromcomment #2)> is this fortran only?
+>No it should be C as well, I was just reducing from a Fortran workload that failed so I can see what the vectorizer was doing.
+
+- User: Tamar Christina | Time: 2024-01-23 10:12:27 UTC
+  Text: __attribute__ ((__simd__ ("notinbranch"), const))
+double cos (double);
+
+void foo (float *a, double *b)
+{
+    for (int i = 0; i < 12; i+=3)
+      {
+        b[i] = cos (5.0 * a[i]);
+        b[i+1] = cos (5.0 * a[i+1]);
+        b[i+2] = cos (5.0 * a[i+2]);
+      }
+}
+
+Simple C example that shows the problem.
+
+This seems to happen when SLP succeeds and the group size is a non power of two.
+The vectorizer then unrolls to make it a power of two and during vectorization
+it seems to destroy the vector, make the call and reconstruct it.
+
+So this seems like an SLP vectorization bug.  I can't seem to trigger it however on GCC < 14 since SLP consistently fails for all my examples because it tries a mode that's larger than the vector size.
+
+So It may be a GCC 14 only regression, but I think it's latent in the vectorizer.
+
+- User: Richard Biener | Time: 2024-01-23 10:39:49 UTC
+  Text: (In reply to Tamar Christina fromcomment #5)> __attribute__ ((__simd__ ("notinbranch"), const))
+> double cos (double);So here the backend is then probably responsible to parse this into a valid
+list of simdlen cases.> void foo (float *a, double *b)
+> {
+>     for (int i = 0; i < 12; i+=3)
+>       {
+>         b[i] = cos (5.0 * a[i]);
+>         b[i+1] = cos (5.0 * a[i+1]);
+>         b[i+2] = cos (5.0 * a[i+2]);
+>       }
+> }
+> 
+> Simple C example that shows the problem.
+> 
+> This seems to happen when SLP succeeds and the group size is a non power of
+> two.
+> The vectorizer then unrolls to make it a power of two and during
+> vectorization
+> it seems to destroy the vector, make the call and reconstruct it.
+> 
+> So this seems like an SLP vectorization bug.  I can't seem to trigger it
+> however on GCC < 14 since SLP consistently fails for all my examples because
+> it tries a mode that's larger than the vector size.On the 13 branch and x86_64 the above results in a large VF and using
+_ZGVbN2v_cos, same on trunk.> So It may be a GCC 14 only regression, but I think it's latent in the
+> vectorizer.I think there's sth odd with the backend here, but I can confirm the
+behavior.  Note it analyzes and costs VF == 4 and V2DF resulting in
+6 calls but then code generation comes along doing sth different!?
+
+- User: Richard Biener | Time: 2024-01-23 10:56:38 UTC
+  Text: OK, maybe the costing is simply not taking into account that we chose the simdlen == 1 variant which _does_ exist!  It's the chosen one:
+
+4052        bestn = cgraph_node::get (simd_clone_info[0]);
+(gdb) p bestn
+$5 = <cgraph_node * 0x7ffff695e440 "cos.simdclone.0"/2>
+(gdb) p bestn->simdclone->simdlen 
+$6 = {coeffs = {1, 0}}
+
+and it's usable
+
+4077            int target_badness = targetm.simd_clone.usable (n);
+4078            if (target_badness < 0)
+
+(returns 0)
+
+But note we do
+
+4073            if (num_calls != 1)
+4074              this_badness += exact_log2 (num_calls) * 4096;
+
+which of course is quite bogus since we have 12 calls and exact_log2 will
+return -1 here.  Maybe we want ceil_log2 here.
+
+when we try the simdlen == 2 variant that also turns out usable but
+the calculates badness is the same so we stick to the simdlen == 1 one.
+
+So - the target should reject this clone or not generate it in the first
+place.  And of course the cost thing should be fixed which will likely mask
+the issue in the target.
+
+- User: Richard Biener | Time: 2024-01-23 10:59:10 UTC
+  Text: diff --git a/gcc/tree-vect-stmts.cc b/gcc/tree-vect-stmts.cc
+index 09749ae3817..1ddbe7a2f6b 100644
+--- a/gcc/tree-vect-stmts.cc
++++ b/gcc/tree-vect-stmts.cc
+@@ -4071,7 +4071,7 @@ vectorizable_simd_clone_call (vec_info *vinfo, stmt_vec_info stmt_info,
+            || (nargs != simd_nargs))
+          continue;
+        if (num_calls != 1)
+-         this_badness += exact_log2 (num_calls) * 4096;
++         this_badness += floor_log2 (num_calls) * 4096 + num_calls;
+        if (n->simdclone->inbranch)
+          this_badness += 8192;
+        int target_badness = targetm.simd_clone.usable (n);
+
+
+"fixes" it
+
+- User: Tamar Christina | Time: 2024-01-23 11:19:25 UTC
+  Text: (In reply to Richard Biener fromcomment #7)> So - the target should reject this clone or not generate it in the first
+> place.  And of course the cost thing should be fixed which will likely mask
+> the issue in the target.Yeah, looks like there's a bug in aarch64_simd_clone_compute_vecsize_and_simdlen that's also present on the branches.  I'll submit a patch.
+
+- User: Richard Biener | Time: 2024-01-23 11:57:09 UTC
+  Text: I'll fix the exact_log2 issue.
+
+- User: GCC Commits | Time: 2024-01-23 13:10:03 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:d5d43dc399bb0f15084827c59a025189c630afddcommitr14-8357-gd5d43dc399bb0f15084827c59a025189c630afddAuthor: Richard Biener <rguenther@suse.de>
+Date:   Tue Jan 23 12:53:04 2024 +0100
+
+    tree-optimization/113552 - fix num_call accounting in simd clone vectorization
+    
+    The following avoids using exact_log2 on the number of SIMD clone calls
+    to be emitted when vectorizing calls since that can easily be not
+    a power of two in which case it will return -1.  For different simd
+    clones the number of calls will differ by a multiply with a power of two
+    only so using floor_log2 is good enough here.PR tree-optimization/113552* tree-vect-stmts.cc (vectorizable_simd_clone_call): Use
+            floor_log2 instead of exact_log2 on the number of calls.
+
+- User: GCC Commits | Time: 2024-01-24 15:58:45 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:306713c953d509720dc394c43c0890548bb0ae07commitr14-8393-g306713c953d509720dc394c43c0890548bb0ae07Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Wed Jan 24 15:56:50 2024 +0000
+
+    AArch64: Do not allow SIMD clones with simdlen 1 [PR113552]
+    
+    The AArch64 vector PCS does not allow simd calls with simdlen 1,
+    however due to a bug we currently do allow it for num == 0.
+    
+    This causes us to emit a symbol that doesn't exist and we fail to link.
+    
+    gcc/ChangeLog:PR tree-optimization/113552* config/aarch64/aarch64.cc
+            (aarch64_simd_clone_compute_vecsize_and_simdlen): Block simdlen 1.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/113552* gcc.target/aarch64/pr113552.c: New test.
+            * gcc.target/aarch64/simd_pcs_attribute-3.c: Remove bogus check.
+
+- User: GCC Commits | Time: 2024-04-15 11:14:49 UTC
+  Text: The releases/gcc-13 branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:1e08e39c743692afdd5d3546b2223474beac1dbccommitr13-8604-g1e08e39c743692afdd5d3546b2223474beac1dbcAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Mon Apr 15 12:11:48 2024 +0100
+
+    AArch64: Do not allow SIMD clones with simdlen 1 [PR113552]
+    
+    This is a backport ofg:306713c953d509720dc394c43c0890548bb0ae07.
+    
+    The AArch64 vector PCS does not allow simd calls with simdlen 1,
+    however due to a bug we currently do allow it for num == 0.
+    
+    This causes us to emit a symbol that doesn't exist and we fail to link.
+    
+    gcc/ChangeLog:PR tree-optimization/113552* config/aarch64/aarch64.cc
+            (aarch64_simd_clone_compute_vecsize_and_simdlen): Block simdlen 1.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/113552* gcc.target/aarch64/pr113552.c: New test.
+            * gcc.target/aarch64/simd_pcs_attribute-3.c: Remove bogus check.
+
+- User: GCC Commits | Time: 2024-04-15 11:38:35 UTC
+  Text: The releases/gcc-11 branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:0c2fcf3ddfe93d1f403962c4bacbb5d55ab7d19dcommitr11-11323-g0c2fcf3ddfe93d1f403962c4bacbb5d55ab7d19dAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Mon Apr 15 12:32:24 2024 +0100
+
+    [AArch64]: Do not allow SIMD clones with simdlen 1 [PR113552]
+    
+    This is a backport ofg:306713c953d509720dc394c43c0890548bb0ae07.
+    
+    The AArch64 vector PCS does not allow simd calls with simdlen 1,
+    however due to a bug we currently do allow it for num == 0.
+    
+    This causes us to emit a symbol that doesn't exist and we fail to link.
+    
+    gcc/ChangeLog:PR tree-optimization/113552* config/aarch64/aarch64.c
+            (aarch64_simd_clone_compute_vecsize_and_simdlen): Block simdlen 1.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/113552* gcc.target/aarch64/pr113552.c: New test.
+            * gcc.target/aarch64/simd_pcs_attribute-3.c: Remove bogus check.
+
+- User: Tamar Christina | Time: 2024-04-15 11:40:45 UTC
+  Text: Fixed on trunk and all open branches
+

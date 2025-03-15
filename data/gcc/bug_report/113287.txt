@@ -1,0 +1,163 @@
+Bug Summary: wrong code with __builtin_mul_overflow_p() and _BitInt() with -O3 -msse4
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-01-09 05:30:50 UTC
+  Text: Createdattachment 57013[details]reduced testcase
+
+I don't know if this is a _BitInt() issue, or if it's related toPR113144(or is a standalone issue), since it appears only when vectorisation is enabled.
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -O3 -msse4 testcase.c
+$ ./a.out 
+Aborted
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-7009-20240108175617-ga17299c17af-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-7009-20240108175617-ga17299c17af-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20240108 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2024-01-09 14:12:29 UTC
+  Text: Comparing the arguments of the __mulbitint3 call between -O3 -msse4 and -O3 -msse4 -fno-tree-vectorize shows that the arguments to that call are computed right even when vectorizing, (_BitInt(9020)) 5 << 1128, 5 and seems there is some bug in the vectorization of the loop trying to check if the result of the __mulbitint3 fits into signed int (which it doesn't).
+That is done by checking if the least significant limb
+(unsigned long) ((signed long) res[0] >> 31) > 1UL (that is not the case, the least significant limb is actually 0), then comparing the next 140 array elements against
+(unsigned long) ((signed long) res[0] >> 31) (one of them is different) and finally
+if none is different, compare (long) (res[141] << 60) >> 60 against it too.
+So, I believe this is a bug in the vectorizer part Tamar is changing right now.
+
+- User: Jakub Jelinek | Time: 2024-01-09 14:23:08 UTC
+  Text: Functionally what it does is
+__attribute__((noipa)) void
+bar (unsigned long *p)
+{
+  __builtin_memset (p, 0, 142 * sizeof (unsigned long));
+  p[17] = 0x50000000000UL;
+}
+
+__attribute__((noipa)) int
+foo (void)
+{
+  unsigned long r[142];
+  bar (r);
+  unsigned long v = ((long) r[0] >> 31);
+  if (v + 1 > 1)
+    return 1;
+  for (unsigned long i = 1; i <= 140; ++i)
+    if (r[i] != v)
+      return 1;
+  unsigned long w = r[141];
+  if ((unsigned long) (((long) (w << 60)) >> 60) != v)
+    return 1;
+  return 0;
+}
+
+int
+main ()
+{
+  if (foo () != 1)
+    __builtin_abort ();
+}
+but this doesn't abort.
+
+- User: Tamar Christina | Time: 2024-01-09 14:29:52 UTC
+  Text: I'll take it. Thanks :)
+
+The key difference between the loop that aborts and the one that doesn't is this:
+
+The one that doesn't abort generates:
+
+  mask_patt_21.17_45 = vect__5.16_43 != vect_cst__44;
+  if (mask_patt_21.17_45 != { 0, 0, 0, 0 })
+    goto <bb 19>; [5.50%]
+
+and the one that does genertaes:
+
+  mask_patt_72.30_100 = vect_cst__101 != vect__48.29_102;
+  if (mask_patt_72.30_100 == { -1, -1, -1, -1 })
+    goto <bb 23>; [20.00%]
+
+This happens when the CFG in the loop is flipped, so the vectorizer is instead asking for the target to check that all values are true instead of any.
+
+Looking at ix86_expand_branch only one part of the branch does a XOR to account for the difference.
+
+So I'll first start looking whether the generated assembly is as expected.
+
+- User: Tamar Christina | Time: 2024-01-09 16:07:32 UTC
+  Text: Ok, definitely mine :)
+
+I've miss identified that the exit doesn't leave the loop.
+Quick hack fixes the issue. I'll work on a proper one tomorrow morning.
+
+- User: Tamar Christina | Time: 2024-01-10 12:36:47 UTC
+  Text: Createdattachment 57023[details]branch_check.patch
+
+Patch undergoing testing
+
+- User: GCC Commits | Time: 2024-01-10 14:32:39 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:91fd5c94965b4077490c6bfcc9aa4b0e4146b38acommitr14-7109-g91fd5c94965b4077490c6bfcc9aa4b0e4146b38aAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Wed Jan 10 14:31:02 2024 +0000
+
+    middle-end: correctly identify the edge taken when condition is true. [PR113287]
+    
+    The vectorizer needs to know during early break vectorization whether the edge
+    that will be taken if the condition is true stays or leaves the loop.
+    
+    This is because the code assumes that if you take the true branch you exit the
+    loop.  If you don't exit the loop it has to generate a different condition.
+    
+    Basically it uses this information to decide whether it's generating a
+    "any element" or an "all element" check.
+    
+    Bootstrapped Regtested on aarch64-none-linux-gnu, x86_64-pc-linux-gnu
+    and no issues with --enable-lto --with-build-config=bootstrap-O3
+    --enable-checking=release,yes,rtl,extra.
+    
+    gcc/ChangeLog:PR tree-optimization/113287* tree-vect-stmts.cc (vectorizable_early_exit): Check the flags on edge
+            instead of using BRANCH_EDGE to determine true edge.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/113287* gcc.dg/vect/vect-early-break_100-pr113287.c: New test.
+            * gcc.dg/vect/vect-early-break_99-pr113287.c: New test.
+
+- User: Tamar Christina | Time: 2024-01-10 14:33:22 UTC
+  Text: Fixed, thanks for the report!
+
+- User: GCC Commits | Time: 2024-01-12 15:33:02 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:d14ef0987de2f6f2dac64f4f0f068b929078a01dcommitr14-7199-gd14ef0987de2f6f2dac64f4f0f068b929078a01dAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Fri Jan 12 15:27:45 2024 +0000
+
+    testsuite: Make bitint early vect test more accurate
+    
+    This changes the tests I committed forPR113287to also
+    run on targets that don't support bitint.
+    
+    gcc/ChangeLog:PR tree-optimization/113287* doc/sourcebuild.texi (check_effective_target_bitint65535): New.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/113287* gcc.dg/vect/vect-early-break_100-pr113287.c: Support non-bitint.
+            * gcc.dg/vect/vect-early-break_99-pr113287.c: Likewise.
+            * lib/target-supports.exp (bitint, bitint128, bitint575, bitint65535):
+            Document them.
+
+- User: GCC Commits | Time: 2024-01-13 09:48:21 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:7012a252528233ca3ced5b9230013c50b604da9bcommitr14-7223-g7012a252528233ca3ced5b9230013c50b604da9bAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Sat Jan 13 10:46:51 2024 +0100
+
+    testsuite: Fix up vect-early-break_100-pr113287.c testcase [PR113287]
+    
+    When the testcase was being adjusted for unsigned long -> unsigned long long,
+    two spots using long weren't changed to long long, so the testcase still warns
+    about UB in shifts.
+    
+    2024-01-13  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113287* gcc.dg/vect/vect-early-break_100-pr113287.c: Use long long instead
+            of long.
+

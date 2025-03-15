@@ -1,0 +1,370 @@
+Bug Summary: [15 Regression] ice in decompose, at wide-int.h:1049
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2024-08-28 07:39:47 UTC
+  Text: This C code:
+
+char excmap_def_0;
+int gg_strescape_i;
+void gg_strescape() {
+  for (; gg_strescape_i; gg_strescape_i++)
+    switch ((unsigned char)gg_strescape_i)
+    case '\\':
+    case '"':
+      excmap_def_0 = 0;
+}
+
+does this
+
+cvise $ ~/gcc/results/bin/gcc -c -w -O2bug1047.c
+during GIMPLE pass: ifcvtbug1047.c: In function ‘gg_strescape’:bug1047.c:5:5: internal compiler error: in decompose, at wide-int.h:1049
+    5 |     switch ((unsigned char)gg_strescape_i)
+      |     ^~~~~~
+0x2240c4d internal_error(char const*, ...)
+	/home/dcb40b/gcc/working/gcc/../../trunk/gcc/diagnostic-global-context.cc:492
+0x222e6fb fancy_abort(char const*, int, char const*)
+	/home/dcb40b/gcc/working/gcc/../../trunk/gcc/diagnostic.cc:1658
+0x1708c47 wi::binary_traits<generic_wide_int<wide_int_ref_storage<false, false> >, generic_wide_int<wide_int_storage>, int_traits<generic_wide_int<wide_int_ref_storage<false, false> > >::precision_type, int_traits<generic_wide_int<wide_int_storage> >::precision_type>::result_type wi::bit_and_not<generic_wide_int<wide_int_ref_storage<false, false> >, generic_wide_int<wide_int_storage> >(generic_wide_int<wide_int_ref_storage<false, false> > const&, generic_wide_int<wide_int_storage> const&)
+
+with recent gcc. The bug first seems to occur sometime between
+date 20240823 and 20240826. Git hashesg:cb51e0b236c7d492andg:b4ac2c23d8745d98. That's a distance of 51 commits.
+
+- User: Andrew Pinski | Time: 2024-08-28 07:46:42 UTC
+  Text: I am 99% sure it was introduced byr15-3167-gc9ccc3961f5b8d.
+
+- User: Andrew Pinski | Time: 2024-08-28 07:51:29 UTC
+  Text: There is a type mismatch going on ...
+
+- User: Richard Biener | Time: 2024-08-28 07:53:26 UTC
+  Text: Confirmed.  This is likely from a new match.pd pattern.
+
+* X == C (or X & Z == Y | C) is impossible if ~nonzero(X) & C != 0.  */
+(for cmp (eq ne)
+ (simplify
+  (cmp:c (with_possible_nonzero_bits2 @0) (with_certain_nonzero_bits2 @1))
+  (if (wi::bit_and_not (wi::to_wide (@1), get_nonzero_bits (@0)) != 0)
+   { constant_boolean_node (cmp == NE_EXPR, type); })))
+
+the issue is that with_possible_nonzero_bits2 also supports SSA_NAMEs, so
+@1 cannot be used like this.
+
+Caused byr8-910-g10bc8017a3028c- the pattern is quite old (and was
+broken).  I would suggest
+
+  (cmp (with_possible_nonzero_bits2 @0) INTEGER_CST@1)
+
+as "trivial" fix.
+
+The testcase exposes this only now.
+
+- User: Richard Biener | Time: 2024-08-28 07:58:25 UTC
+  Text: And yes, there's a type mismatch in ifcvt:
+
+(gdb) p captures[1]
+$1 = <integer_cst 0x7ffff6fbde10>
+(gdb) p captures[0]
+$2 = <ssa_name 0x7ffff6fde1f8 8>
+(gdb) p debug_tree ($1)
+ <integer_cst 0x7ffff6fbde10 type <integer_type 0x7ffff6e22348 unsigned char> constant 92>
+$3 = void
+(gdb) p debug_tree ($2)
+ <ssa_name 0x7ffff6fde1f8
+    type <integer_type 0x7ffff6e225e8 int public SI
+
+the built 'cond' is
+
+!(_8 == 92 | _8 == 34)
+
+where _8 is 'int' but the case label constants are 'unsigned char'.  You
+have to convert the case label constants to the type of the switch variable.
+
+- User: Richard Biener | Time: 2024-08-28 07:59:53 UTC
+  Text: (In reply to Richard Biener fromcomment #3)> Confirmed.  This is likely from a new match.pd pattern.
+> 
+> * X == C (or X & Z == Y | C) is impossible if ~nonzero(X) & C != 0.  */
+> (for cmp (eq ne)
+>  (simplify
+>   (cmp:c (with_possible_nonzero_bits2 @0) (with_certain_nonzero_bits2 @1))
+>   (if (wi::bit_and_not (wi::to_wide (@1), get_nonzero_bits (@0)) != 0)
+>    { constant_boolean_node (cmp == NE_EXPR, type); })))
+> 
+> the issue is that with_possible_nonzero_bits2 also supports SSA_NAMEs, so
+> @1 cannot be used like this.OK, I misparsed with_certain_nonzero_bits2 as with_possible_nonzero_bits2,
+the pattern looks correct.
+
+- User: Andrew Pinski | Time: 2024-08-28 08:01:50 UTC
+  Text: #6  0x000000000187822c in gimple_simplify_226 (res_op=0x7fffffffcd00, seq=0x7fffffffced0, valueize=0xd13880 <no_follow_ssa_edges(tree_node*)>, type=0x7ffff741cb28, captures=0x7fffffffa160, cmp=EQ_EXPR) at gimple-match-9.cc:1994
+1994      if (wi::bit_and_not (wi::to_wide (captures[1]), get_nonzero_bits (captures[0])) != 0
+(gdb) p debug_tree(captures[1])
+ <integer_cst 0x7ffff730fb40 type <integer_type 0x7ffff741c348 unsigned char> constant 92>
+$1 = void
+(gdb) p debug_tree(captures[0])
+ <ssa_name 0x7ffff73086c0
+    type <integer_type 0x7ffff741c5e8 int public SI
+        size <integer_cst 0x7ffff741f168 constant 32>
+        unit-size <integer_cst 0x7ffff741f180 constant 4>
+        align:32 warn_if_not_align:0 symtab:0 alias-set 1 canonical-type 0x7ffff741c5e8 precision:32 min <integer_cst 0x7ffff741f120 -2147483648> max <integer_cst 0x7ffff741f138 2147483647>
+        pointer_to_this <pointer_type 0x7ffff7424b28>>
+    visited
+    def_stmt _8 = gg_strescape_i.2_11 & 255;
+    version:8
+    ptr-info 0x7ffff733ddb0>
+
+...
+(gdb) p debug_tree(switch_cond)
+ <truth_not_expr 0x7ffff73513a0
+    type <boolean_type 0x7ffff741cb28 _Bool public unsigned QI
+        size <integer_cst 0x7ffff741f018 constant 8>
+        unit-size <integer_cst 0x7ffff741f030 constant 1>
+        align:8 warn_if_not_align:0 symtab:0 alias-set -1 canonical-type 0x7ffff741cb28 precision:1 min <integer_cst 0x7ffff741f270 0> max <integer_cst 0x7ffff741f2a0 1>>
+
+    arg:0 <bit_ior_expr 0x7ffff7354320 type <boolean_type 0x7ffff741cb28 _Bool>
+
+        arg:0 <eq_expr 0x7ffff7354348 type <boolean_type 0x7ffff741cb28 _Bool>
+
+            arg:0 <ssa_name 0x7ffff73086c0 type <integer_type 0x7ffff741c5e8 int>
+                visited
+                def_stmt _8 = gg_strescape_i.2_11 & 255;
+                version:8
+                ptr-info 0x7ffff733ddb0>
+            arg:1 <integer_cst 0x7ffff730fb40 constant 92>
+            t5.c:6:5 start: t5.c:6:5 finish: t5.c:6:10>
+        arg:1 <eq_expr 0x7ffff7354370 type <boolean_type 0x7ffff741cb28 _Bool>
+            arg:0 <ssa_name 0x7ffff73086c0>
+            arg:1 <integer_cst 0x7ffff730fb58 constant 34>
+            t5.c:6:5 start: t5.c:6:5 finish: t5.c:6:10>
+        t5.c:6:5 start: t5.c:6:5 finish: t5.c:6:10>
+    t5.c:6:5 start: t5.c:6:5 finish: t5.c:6:10>
+
+(gdb) p debug_tree((tree)0x7ffff730fb40)
+ <integer_cst 0x7ffff730fb40 type <integer_type 0x7ffff741c348 unsigned char> constant 92>
+
+
+CASE_HIGH/CASE_LOW have a type of `unsigned char` but index is type of `int`.
+
+
+There is a missing fold_convert in the predicate_bbs on CASE_HIGH/CASE_LOW.
+
+Note one more thing:
++                 tree low = build2_loc (loc, GE_EXPR,
++                                        boolean_type_node,
++                                        index, CASE_LOW (label));
++                 tree high = build2_loc (loc, LE_EXPR,
++                                         boolean_type_node,
++                                         index, CASE_HIGH (label));
++                 case_cond = build2_loc (loc, TRUTH_AND_EXPR,
++                                         boolean_type_node,
++                                         low, high);
+
+Why use TRUTH_AND_EXPR here, just use AND_EXPR .
+
+Likewise, use TRUTH_NOT_EXPR.
+
++         switch_cond = build1_loc (loc, TRUTH_NOT_EXPR, boolean_type_node,
++                                   unshare_expr (switch_cond));
+
+Also why not do something like what is done in convert_single_case_switch ?
+
+- User: Marc Glisse | Time: 2024-08-28 08:02:04 UTC
+  Text: (In reply to Richard Biener fromcomment #3)> the issue is that with_possible_nonzero_bits2 also supports SSA_NAMEs, so
+> @1 cannot be used like this.It has only 2 cases, and both imply INTEGER_CST, if I interpret the match syntax correctly (it's been a while)
+
+(match (with_certain_nonzero_bits2 @0)
+ INTEGER_CST@0)
+(match (with_certain_nonzero_bits2 @0)
+ (bit_ior @1 INTEGER_CST@0))
+
+- User: rguenther@suse.de | Time: 2024-08-28 08:07:40 UTC
+  Text: On Wed, 28 Aug 2024, pinskia at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=116510> 
+> ---Comment #6from Andrew Pinski <pinskia at gcc dot gnu.org> ---
+> #6  0x000000000187822c in gimple_simplify_226 (res_op=0x7fffffffcd00,
+> seq=0x7fffffffced0, valueize=0xd13880 <no_follow_ssa_edges(tree_node*)>,
+> type=0x7ffff741cb28, captures=0x7fffffffa160, cmp=EQ_EXPR) at
+> gimple-match-9.cc:1994
+> 1994      if (wi::bit_and_not (wi::to_wide (captures[1]), get_nonzero_bits
+> (captures[0])) != 0
+> (gdb) p debug_tree(captures[1])
+>  <integer_cst 0x7ffff730fb40 type <integer_type 0x7ffff741c348 unsigned char>
+> constant 92>
+> $1 = void
+> (gdb) p debug_tree(captures[0])
+>  <ssa_name 0x7ffff73086c0
+>     type <integer_type 0x7ffff741c5e8 int public SI
+>         size <integer_cst 0x7ffff741f168 constant 32>
+>         unit-size <integer_cst 0x7ffff741f180 constant 4>
+>         align:32 warn_if_not_align:0 symtab:0 alias-set 1 canonical-type
+> 0x7ffff741c5e8 precision:32 min <integer_cst 0x7ffff741f120 -2147483648> max
+> <integer_cst 0x7ffff741f138 2147483647>
+>         pointer_to_this <pointer_type 0x7ffff7424b28>>
+>     visited
+>     def_stmt _8 = gg_strescape_i.2_11 & 255;
+>     version:8
+>     ptr-info 0x7ffff733ddb0>
+> 
+> ...
+> (gdb) p debug_tree(switch_cond)
+>  <truth_not_expr 0x7ffff73513a0
+>     type <boolean_type 0x7ffff741cb28 _Bool public unsigned QI
+>         size <integer_cst 0x7ffff741f018 constant 8>
+>         unit-size <integer_cst 0x7ffff741f030 constant 1>
+>         align:8 warn_if_not_align:0 symtab:0 alias-set -1 canonical-type
+> 0x7ffff741cb28 precision:1 min <integer_cst 0x7ffff741f270 0> max <integer_cst
+> 0x7ffff741f2a0 1>>
+> 
+>     arg:0 <bit_ior_expr 0x7ffff7354320 type <boolean_type 0x7ffff741cb28 _Bool>
+> 
+>         arg:0 <eq_expr 0x7ffff7354348 type <boolean_type 0x7ffff741cb28 _Bool>
+> 
+>             arg:0 <ssa_name 0x7ffff73086c0 type <integer_type 0x7ffff741c5e8
+> int>
+>                 visited
+>                 def_stmt _8 = gg_strescape_i.2_11 & 255;
+>                 version:8
+>                 ptr-info 0x7ffff733ddb0>
+>             arg:1 <integer_cst 0x7ffff730fb40 constant 92>
+>             t5.c:6:5 start: t5.c:6:5 finish: t5.c:6:10>
+>         arg:1 <eq_expr 0x7ffff7354370 type <boolean_type 0x7ffff741cb28 _Bool>
+>             arg:0 <ssa_name 0x7ffff73086c0>
+>             arg:1 <integer_cst 0x7ffff730fb58 constant 34>
+>             t5.c:6:5 start: t5.c:6:5 finish: t5.c:6:10>
+>         t5.c:6:5 start: t5.c:6:5 finish: t5.c:6:10>
+>     t5.c:6:5 start: t5.c:6:5 finish: t5.c:6:10>
+> 
+> (gdb) p debug_tree((tree)0x7ffff730fb40)
+>  <integer_cst 0x7ffff730fb40 type <integer_type 0x7ffff741c348 unsigned char>
+> constant 92>
+> 
+> 
+> CASE_HIGH/CASE_LOW have a type of `unsigned char` but index is type of `int`.
+> 
+> 
+> There is a missing fold_convert in the predicate_bbs on CASE_HIGH/CASE_LOW.
+> 
+> Note one more thing:
+> +                 tree low = build2_loc (loc, GE_EXPR,
+> +                                        boolean_type_node,
+> +                                        index, CASE_LOW (label));
+> +                 tree high = build2_loc (loc, LE_EXPR,
+> +                                         boolean_type_node,
+> +                                         index, CASE_HIGH (label));
+> +                 case_cond = build2_loc (loc, TRUTH_AND_EXPR,
+> +                                         boolean_type_node,
+> +                                         low, high);
+> 
+> Why use TRUTH_AND_EXPR here, just use AND_EXPR .
+> 
+> Likewise, use TRUTH_NOT_EXPR.
+> 
+> +         switch_cond = build1_loc (loc, TRUTH_NOT_EXPR, boolean_type_node,
+> +                                   unshare_expr (switch_cond));
+> 
+> Also why not do something like what is done in convert_single_case_switch ?Note this is what ifcvt requires internally, so I'd rather not change
+this just in this isolated place.
+
+- User: Andrew Pinski | Time: 2024-08-28 21:35:35 UTC
+  Text: ***Bug 116523has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2024-09-01 07:59:15 UTC
+  Text: ***Bug 116555has been marked as a duplicate of this bug. ***
+
+- User: Richard Biener | Time: 2024-10-13 12:05:38 UTC
+  Text: Andi, can you fix this please?
+
+- User: N/A | Time: 2024-10-15 16:55:20 UTC
+  Text: Like this?  It fixes the test case.
+
+I'm not sure why you want AND_EXPR, this is a truth formula. Maybe it should be TRUTH_ANDIF_EXPR though to short circuit.
+
+diff --git a/gcc/tree-if-conv.cc b/gcc/tree-if-conv.cc
+index 90c754a48147..376a4642954d 100644
+--- a/gcc/tree-if-conv.cc
++++ b/gcc/tree-if-conv.cc
+@@ -1477,10 +1477,12 @@ predicate_bbs (loop_p loop)
+                {
+                  tree low = build2_loc (loc, GE_EXPR,
+                                         boolean_type_node,
+-                                        index, CASE_LOW (label));
++                                        index, fold_convert_loc (loc, TREE_TYPE (index),
++                                                CASE_LOW (label)));
+                  tree high = build2_loc (loc, LE_EXPR,
+                                          boolean_type_node,
+-                                         index, CASE_HIGH (label));
++                                         index, fold_convert_loc (loc, TREE_TYPE (index),
++                                                 CASE_HIGH (label)));
+                  case_cond = build2_loc (loc, TRUTH_AND_EXPR,
+                                          boolean_type_node,
+                                          low, high);
+@@ -1489,7 +1491,8 @@ predicate_bbs (loop_p loop)
+                case_cond = build2_loc (loc, EQ_EXPR,
+                                        boolean_type_node,
+                                        index,
+-                                       CASE_LOW (gimple_switch_label (sw, i)));
++                                       fold_convert_loc (loc, TREE_TYPE (index),
++                                                         CASE_LOW (label)));
+              if (i > 1)
+                switch_cond = build2_loc (loc, TRUTH_OR_EXPR,
+                                          boolean_type_node,
+
+- User: rguenther@suse.de | Time: 2024-10-16 06:59:36 UTC
+  Text: On Tue, 15 Oct 2024, ak at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=116510> 
+> ---Comment #12from ak at gcc dot gnu.org ---
+> Like this?  It fixes the test case.Yes, this looks good (maybe split the expressions to avoid long lines).> I'm not sure why you want AND_EXPR, this is a truth formula. Maybe it should be
+> TRUTH_ANDIF_EXPR though to short circuit.On gimple it will be BIT_AND in the end, and TRUTH_ANDIF is simplified
+to TRUTH_AND if there's no side-effects.  It doesn't matter in the end,
+but if-conversion somewhat relies on unfolded concat of conditions
+for its internal predicate handling so don't change any of that.> diff --git a/gcc/tree-if-conv.cc b/gcc/tree-if-conv.cc
+> index 90c754a48147..376a4642954d 100644
+> --- a/gcc/tree-if-conv.cc
+> +++ b/gcc/tree-if-conv.cc
+> @@ -1477,10 +1477,12 @@ predicate_bbs (loop_p loop)
+>                 {
+>                   tree low = build2_loc (loc, GE_EXPR,
+>                                          boolean_type_node,
+> -                                        index, CASE_LOW (label));
+> +                                        index, fold_convert_loc (loc,
+> TREE_TYPE (index),
+> +                                                CASE_LOW (label)));
+>                   tree high = build2_loc (loc, LE_EXPR,
+>                                           boolean_type_node,
+> -                                         index, CASE_HIGH (label));
+> +                                         index, fold_convert_loc (loc,
+> TREE_TYPE (index),
+> +                                                 CASE_HIGH (label)));
+>                   case_cond = build2_loc (loc, TRUTH_AND_EXPR,
+>                                           boolean_type_node,
+>                                           low, high);
+> @@ -1489,7 +1491,8 @@ predicate_bbs (loop_p loop)
+>                 case_cond = build2_loc (loc, EQ_EXPR,
+>                                         boolean_type_node,
+>                                         index,
+> -                                       CASE_LOW (gimple_switch_label (sw,
+> i)));
+> +                                       fold_convert_loc (loc, TREE_TYPE
+> (index),
+> +                                                         CASE_LOW (label)));
+>               if (i > 1)
+>                 switch_cond = build2_loc (loc, TRUTH_OR_EXPR,
+>                                           boolean_type_node,
+
+- User: GCC Commits | Time: 2024-10-16 13:49:22 UTC
+  Text: The trunk branch has been updated by Andi Kleen <ak@gcc.gnu.org>:https://gcc.gnu.org/g:d5a05db80fa95dcae1ebc177f7790e1d34fa73edcommitr15-4387-gd5a05db80fa95dcae1ebc177f7790e1d34fa73edAuthor: Andi Kleen <ak@gcc.gnu.org>
+Date:   Tue Oct 15 13:16:02 2024 -0700PR116510: Add missing fold_converts into tree switch if conversion
+    
+    Passes test suite. Ok to commit?
+    
+    gcc/ChangeLog:PR middle-end/116510* tree-if-conv.cc (predicate_bbs): Add missing fold_converts.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/vect/vect-switch-ifcvt-3.c: New test.
+
+- User: Richard Biener | Time: 2024-10-17 07:34:07 UTC
+  Text: Fixed.
+

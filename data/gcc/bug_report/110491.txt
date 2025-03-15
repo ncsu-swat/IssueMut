@@ -1,0 +1,171 @@
+Bug Summary: Wrong code at -O2 on x86_64-linux-gnu (a recent regression)
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Shaohua Li | Time: 2023-06-30 01:38:10 UTC
+  Text: gcc at -O2 produced wrong code.
+
+Compiler explorer:https://godbolt.org/z/cbM1q13G7$ cat a.c
+int printf(const char *, ...);
+int a, c, d, e;
+short b;
+void f(int *g) { c &= *g; }
+void h(void);
+void i() {
+  a = 1;
+  h();
+  f(&a);
+}
+void h() {
+  int *j = &c;
+  *j = 5;
+k:
+  for (; 4 + b <= 0;)
+    ;
+  for (; d;) {
+    c = e == 0;
+    goto k;
+  }
+}
+int main() {
+  i();
+  printf("%d\n", c);
+}
+$
+$ gcc-tk -O0 a.c &&./a.out
+1
+$ gcc-tk -O2 a.c && ./a.out
+-2003318871
+$
+$ gcc-tk -v
+Using built-in specs.
+COLLECT_GCC=gcc-tk
+COLLECT_LTO_WRAPPER=/zdata/shaoli/compilers/ccbuilder-compilers/gcc-5f590ee3174cf6058ac882c3a84a96ae639349c8/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../configure --disable-multilib --disable-bootstrap --enable-languages=c,c++ --prefix=/zdata/shaoli/compilers/ccbuilder-compilers/gcc-5f590ee3174cf6058ac882c3a84a96ae639349c8
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20230629 (experimental) (GCC)
+$
+
+- User: Andrew Pinski | Time: 2023-06-30 02:19:41 UTC
+  Text: Dup ofbug 110228.
+
+
+
+  # RANGE [irange] int [0, 1] NONZERO 0x1
+  # c_lsm.10_3 = PHI <_17(D)(2), _11(5)>
+...
+  if (c_lsm_flag.11_16 != 0)
+    goto <bb 8>; [66.67%]
+  else
+    goto <bb 7>; [33.33%]
+;;    succ:       7 [33.3% (adjusted)]  count:357913944 (estimated locally) (FALSE_VALUE,EXECUTABLE)
+;;                8 [66.7% (adjusted)]  count:715827880 (estimated locally) (TRUE_VALUE,EXECUTABLE)
+
+;;   basic block 7, loop depth 0, count 357913944 (estimated locally), maybe hot
+;;    prev block 6, next block 8, flags: (NEW)
+;;    pred:       6 [33.3% (adjusted)]  count:357913944 (estimated locally) (FALSE_VALUE,EXECUTABLE)
+;;    succ:       8 [always]  count:357913944 (estimated locally) (FALLTHRU)
+
+;;   basic block 8, loop depth 0, count 1073741824 (estimated locally), maybe hot
+;;    prev block 7, next block 1, flags: (NEW, REACHABLE, VISITED)
+;;    pred:       7 [always]  count:357913944 (estimated locally) (FALLTHRU)
+;;                6 [66.7% (adjusted)]  count:715827880 (estimated locally) (TRUE_VALUE,EXECUTABLE)
+  # RANGE [irange] int [0, 1] NONZERO 0x1
+  # prephitmp_27 = PHI <1(7), c_lsm.10_3(6)>
+
+*** This bug has been marked as a duplicate ofbug 110228***
+
+- User: Richard Biener | Time: 2023-07-04 10:55:46 UTC
+  Text: So the issue here is phiopt4 doing
+
+   <bb 6> [local count: 1073741824]:
+-  if (c_lsm_flag.14_16 != 0)
+-    goto <bb 8>; [66.67%]
+-  else
+-    goto <bb 7>; [33.33%]
+-
+-  <bb 7> [local count: 357913944]:
+-
+-  <bb 8> [local count: 1073741824]:
++  _26 = ~c_lsm_flag.14_16;
++  _14 = (int) _26;
+   # RANGE [irange] int [0, 1] NONZERO 0x1
+-  # prephitmp_27 = PHI <1(7), c_lsm.13_3(6)>
+-  c = prephitmp_27;
++  _4 = c_lsm.13_3 | _14;
++  c = _4;
+   return;
+
+via
+
+phiopt match-simplify trying:
+       c_lsm_flag.14_16 != 0 ? c_lsm.13_3 : 1
+Matching expression match.pd:1991, gimple-match-5.cc:23
+Matching expression match.pd:1991, gimple-match-5.cc:23
+Matching expression match.pd:1991, gimple-match-5.cc:23
+Matching expression match.pd:1948, gimple-match-7.cc:20
+Matching expression match.pd:2480, gimple-match-4.cc:35
+Matching expression match.pd:2483, gimple-match-3.cc:66
+Matching expression match.pd:2490, gimple-match-2.cc:58
+Applying pattern match.pd:6459, gimple-match-10.cc:12767
+Applying pattern match.pd:1378, gimple-match-5.cc:7352
+Applying pattern match.pd:1886, gimple-match-1.cc:1232
+Applying pattern match.pd:4748, gimple-match-4.cc:15651
+Folded into the sequence:
+_13 = (int) c_lsm_flag.14_16;
+_26 = ~c_lsm_flag.14_16;
+_14 = (int) _26;
+_4 = c_lsm.13_3 | _14;
+Removing basic block 7
+
+but
+
+  <bb 3> [local count: 9761289309]:
+  # RANGE [irange] int [0, 1] NONZERO 0x1
+  # c_lsm.13_3 = PHI <_17(D)(2), _11(5)>
+
+so we have an uninitialized use here.  The following fixes this.
+
+diff --git a/gcc/tree-ssa-phiopt.cc b/gcc/tree-ssa-phiopt.cc
+index 31a7c39e405..467c9fd108a 100644
+--- a/gcc/tree-ssa-phiopt.cc
++++ b/gcc/tree-ssa-phiopt.cc
+@@ -785,6 +785,13 @@ match_simplify_replacement (basic_block cond_bb, basic_block middle_bb,
+       arg_false = arg0;
+     }
+ 
++  /* Do not make conditional undefs unconditional.  */
++  if ((TREE_CODE (arg_true) == SSA_NAME
++       && ssa_name_maybe_undef_p (arg_true))
++      || (TREE_CODE (arg_false) == SSA_NAME
++         && ssa_name_maybe_undef_p (arg_false)))
++    return false;
++
+   tree type = TREE_TYPE (gimple_phi_result (phi));
+   result = gimple_simplify_phiopt (early_p, type, stmt,
+                                   arg_true, arg_false,
+
+- User: GCC Commits | Time: 2023-07-04 12:16:51 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:819285ef10a87d663f8c181c06aa88d1d9f75aedcommitr14-2296-g819285ef10a87d663f8c181c06aa88d1d9f75aedAuthor: Richard Biener <rguenther@suse.de>
+Date:   Tue Jul 4 12:52:27 2023 +0200
+
+    tree-optimization/110491 - PHI-OPT and undefs
+    
+    The following makes sure to not make conditional undefs in PHI arguments
+    unconditional by folding cond ? arg1 : arg2.PR tree-optimization/110491* tree-ssa-phiopt.cc (match_simplify_replacement): Check
+            whether the PHI args are possibly undefined before folding
+            the COND_EXPR.
+    
+            * gcc.dg/torture/pr110491.c: New testcase.
+
+- User: Richard Biener | Time: 2023-07-04 12:17:10 UTC
+  Text: Fixed.
+

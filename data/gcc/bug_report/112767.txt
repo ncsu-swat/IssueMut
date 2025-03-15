@@ -1,0 +1,92 @@
+Bug Summary: [14 regression] spurious -Waggressive-loop-optimizations since r14-2944-g3d48c11ad082de
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: diagnostic
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: scott snyder | Time: 2023-11-29 18:24:49 UTC
+  Text: With a recent checkout of gcc14 (20231129), on a x86_64-pc-linux-gnu host,
+the following source gives a seemingly bogus -Waggressive-loop-optimizations
+warning with -O3:
+
+--------------------------------------------------------------
+double reg_dict[32];
+
+void foo(int);
+
+void initialize()
+{
+  int i=8;
+  for (int phi=0; phi<8; ++phi) {
+    reg_dict[i]=0;
+    int sn = 0;
+    if (i < 16) sn = 20;
+    foo(sn);
+    ++i;
+  }
+}
+--------------------------------------------------------------
+
+$ g++ -c -O3 x.cc
+x.cc: In function ‘void initialize()’:
+x.cc:9:16: warning: iteration 16 invokes undefined behavior [-Waggressive-loop-optimizations]
+    9 |     reg_dict[i]=0;
+      |     ~~~~~~~~~~~^~
+x.cc:8:22: note: within this loop
+    8 |   for (int phi=0; phi<8; ++phi) {
+      |                   ~~~^~
+
+
+This is a confusing warning, as the containing loop is executed only 8 times.
+Exactly which undefined behavior is meant is also not spelled out.
+From the context, i'd guess it to be an out-of-bounds array write,
+but that's a false positive.
+
+The warning happens with -O3 but not with lower optimization levels.
+It also does not occur with gcc 13.2.1 20230728.
+
+- User: Andrew Pinski | Time: 2023-11-29 18:34:42 UTC
+  Text: Confirmed. Looks like loop split is messing up ...
+
+- User: Patrick Palka | Time: 2023-11-29 22:08:08 UTC
+  Text: Started withr14-2944-g3d48c11ad082de
+
+- User: Richard Biener | Time: 2023-11-30 11:42:25 UTC
+  Text: Confirmed.  Now with SCCP after loop splitting that's the pass
+exposing enough info but not eliding the loop before IVCANON comes and
+diagnoses this.
+
+SCCP does
+
+   <bb 17> [local count: 119292719]:
+-  # i_23 = PHI <i_8(3)>
+-  # phi_24 = PHI <phi_9(3)>
++  i_23 = 16;
++  phi_24 = 8;
+   if (phi_24 != 8)
+
+and only copyprop3 removes the condition.
+
+- User: GCC Commits | Time: 2023-11-30 12:35:25 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:2dde9f326ded84814a78c3044294b535c1f97b41commitr14-6010-g2dde9f326ded84814a78c3044294b535c1f97b41Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Nov 30 12:38:53 2023 +0100
+
+    tree-optimization/112767 - spurious diagnostic after sccp/loop-split swap
+    
+    We are diagnosing an unreachable loop which we only manage to elide
+    after the copyprop pass after sccp which leaves the code open for
+    diagnosing by the intermittent ivcanon pass.  The following makes sure
+    to clean things up a bit earlier, propagating constant final values
+    to uses immediately.PR tree-optimization/112767* tree-scalar-evolution.cc (final_value_replacement_loop):
+            Propagate constants to immediate uses immediately.
+    
+            * gcc.dg/tree-ssa/pr112767.c: New testcase.
+            * gcc.dg/graphite/pr83255.c: Disable SCCP.
+
+- User: Richard Biener | Time: 2023-11-30 12:36:05 UTC
+  Text: Fixed.
+

@@ -1,0 +1,300 @@
+Bug Summary: [14 Regression] ICE in combine after 7cdd0860949c6c3232e6cff1d7ca37bb5234074c
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: build, ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: N/A | Time: 2023-08-01 08:18:04 UTC
+  Text: For the following test-case adapted from libgcc/fixed-bit.c:
+
+typedef int DItype __attribute__ ((mode (DI)));
+
+void
+__gnu_saturate1sq (DItype *a)
+{
+  DItype max, min;
+  max = (DItype)1 << (31 + 0);
+  max = max - 1;
+
+  min = (DItype)1 << (2 * (4 * 8) - 1);
+  min = min >> (2 * (4 * 8) - 1 - (31 + 0));
+
+
+
+  if (*a > max)
+    *a = max;
+  else if (*a < min)
+    *a = min;
+}
+
+Compiling with -O2 on armv8l-unknown-linux-gnueabihf results in following ICE:
+typedef int DItype __attribute__ ((mode (DI)));
+
+during RTL pass: combine
+foo.c: In function '__gnu_saturate1sq':
+foo.c:19:1: internal compiler error: in decompose, at rtl.h:2297
+   19 | }
+      | ^
+0xaa23e3 wi::int_traits<std::pair<rtx_def*, machine_mode> >::decompose(long long*, unsigned int, std::pair<rtx_def*, machine_mode> const&)
+        ../../gcc/gcc/rtl.h:2297
+0xaf5ab3 wide_int_ref_storage<false, true>::wide_int_ref_storage<std::pair<rtx_def*, machine_mode> >(std::pair<rtx_def*, machine_mode> const&)
+        ../../gcc/gcc/wide-int.h:1030
+0xaf5023 generic_wide_int<wide_int_ref_storage<false, true> >::generic_wide_int<std::pair<rtx_def*, machine_mode> >(std::pair<rtx_def*, machine_mode> const&)
+        ../../gcc/gcc/wide-int.h:788
+0xf916f9 simplify_const_unary_operation(rtx_code, machine_mode, rtx_def*, machine_mode)
+        ../../gcc/gcc/simplify-rtx.cc:2131
+0xf8bad5 simplify_context::simplify_unary_operation(rtx_code, machine_mode, rtx_def*, machine_mode)
+        ../../gcc/gcc/simplify-rtx.cc:889
+0xf8a591 simplify_context::simplify_gen_unary(rtx_code, machine_mode, rtx_def*, machine_mode)
+        ../../gcc/gcc/simplify-rtx.cc:360
+0x9bd1b7 simplify_gen_unary(rtx_code, machine_mode, rtx_def*, machine_mode)
+        ../../gcc/gcc/rtl.h:3520
+0x1bd5677 simplify_comparison
+        ../../gcc/gcc/combine.cc:13125
+0x1bc2b2b simplify_set
+        ../../gcc/gcc/combine.cc:6848
+0x1bc1647 combine_simplify_rtx
+        ../../gcc/gcc/combine.cc:6353
+0x1bbf97f subst
+        ../../gcc/gcc/combine.cc:5609
+0x1bb864b try_combine
+        ../../gcc/gcc/combine.cc:3302
+0x1bb30fb combine_instructions
+        ../../gcc/gcc/combine.cc:1264
+0x1bd8d25 rest_of_handle_combine
+        ../../gcc/gcc/combine.cc:15059
+0x1bd8dd5 execute
+        ../../gcc/gcc/combine.cc:15103
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+
+Thanks,
+Prathamesh
+
+- User: Stefan Schulze Frielinghaus | Time: 2023-08-01 12:12:06 UTC
+  Text: The optimization introduced byr14-2879-g7cdd0860949c6chits during combination of insn
+
+(insn 31 3 32 2 (set (reg:SI 118 [ _1 ])
+        (mem:SI (reg/v/f:SI 115 [ a ]) [1 *a_4(D)+0 S4 A64])) "t.c":15:7 758 {*arm_movsi_vfp}
+     (nil))
+
+and
+
+(insn 9 32 10 2 (set (reg:CC 100 cc)
+        (compare:CC (reg:SI 118 [ _1 ])
+            (const_int -2147483648 [0xffffffff80000000]))) "t.c":15:6 272 {*arm_cmpsi_insn}
+     (nil))
+
+The idea ofr14-2879-g7cdd0860949c6cis to get rid of large constants while performing an unsigned comparison.  In this case it looks like a 32-bit constant is sign-extended into a 64-bit constant and then a 32-bit comparison is done.  While writing the optimization I always assumed that the constant does fit into int_mode which is apparently not the case here.  Thus one possible solution would be to simply bail out in those cases:
+
+diff --git a/gcc/combine.cc b/gcc/combine.cc
+index 0d99fa541c5..e46d202d0a7 100644
+--- a/gcc/combine.cc
++++ b/gcc/combine.cc
+@@ -11998,11 +11998,15 @@ simplify_compare_const (enum rtx_code code, machine_mode mode,
+      x0 >= 0x40.  */
+   if ((code == LEU || code == LTU || code == GEU || code == GTU)
+       && is_a <scalar_int_mode> (GET_MODE (op0), &int_mode)
++      && HWI_COMPUTABLE_MODE_P (int_mode)
+       && MEM_P (op0)
+       && !MEM_VOLATILE_P (op0)
+       /* The optimization makes only sense for constants which are big enough
+         so that we have a chance to chop off something at all.  */
+       && (unsigned HOST_WIDE_INT) const_op > 0xff
++      /* Bail out, if the constant does not fit into INT_MODE.  */
++      && (unsigned HOST_WIDE_INT) const_op
++        < ((HOST_WIDE_INT_1U << (GET_MODE_PRECISION (int_mode) - 1) << 1) - 1)
+       /* Ensure that we do not overflow during normalization.  */
+       && (code != GTU || (unsigned HOST_WIDE_INT) const_op < HOST_WIDE_INT_M1U))
+     {
+
+Does this resolve the problem for you?
+
+- User: N/A | Time: 2023-08-01 15:04:23 UTC
+  Text: (In reply to Stefan Schulze Frielinghaus fromcomment #1)> The optimization introduced byr14-2879-g7cdd0860949c6chits during
+> combination of insn
+> 
+> (insn 31 3 32 2 (set (reg:SI 118 [ _1 ])
+>         (mem:SI (reg/v/f:SI 115 [ a ]) [1 *a_4(D)+0 S4 A64])) "t.c":15:7 758
+> {*arm_movsi_vfp}
+>      (nil))
+> 
+> and
+> 
+> (insn 9 32 10 2 (set (reg:CC 100 cc)
+>         (compare:CC (reg:SI 118 [ _1 ])
+>             (const_int -2147483648 [0xffffffff80000000]))) "t.c":15:6 272
+> {*arm_cmpsi_insn}
+>      (nil))
+> 
+> The idea ofr14-2879-g7cdd0860949c6cis to get rid of large constants while
+> performing an unsigned comparison.  In this case it looks like a 32-bit
+> constant is sign-extended into a 64-bit constant and then a 32-bit
+> comparison is done.  While writing the optimization I always assumed that
+> the constant does fit into int_mode which is apparently not the case here. 
+> Thus one possible solution would be to simply bail out in those cases:
+> 
+> diff --git a/gcc/combine.cc b/gcc/combine.cc
+> index 0d99fa541c5..e46d202d0a7 100644
+> --- a/gcc/combine.cc
+> +++ b/gcc/combine.cc
+> @@ -11998,11 +11998,15 @@ simplify_compare_const (enum rtx_code code,
+> machine_mode mode,
+>       x0 >= 0x40.  */
+>    if ((code == LEU || code == LTU || code == GEU || code == GTU)
+>        && is_a <scalar_int_mode> (GET_MODE (op0), &int_mode)
+> +      && HWI_COMPUTABLE_MODE_P (int_mode)
+>        && MEM_P (op0)
+>        && !MEM_VOLATILE_P (op0)
+>        /* The optimization makes only sense for constants which are big
+> enough
+>          so that we have a chance to chop off something at all.  */
+>        && (unsigned HOST_WIDE_INT) const_op > 0xff
+> +      /* Bail out, if the constant does not fit into INT_MODE.  */
+> +      && (unsigned HOST_WIDE_INT) const_op
+> +        < ((HOST_WIDE_INT_1U << (GET_MODE_PRECISION (int_mode) - 1) << 1) -
+> 1)
+>        /* Ensure that we do not overflow during normalization.  */
+>        && (code != GTU || (unsigned HOST_WIDE_INT) const_op <
+> HOST_WIDE_INT_M1U))
+>      {
+> 
+> Does this resolve the problem for you?Yes, it worked thanks! I will do a full bootstrap+test with your fix and let you know the results.
+
+Thanks,
+Prathamesh
+
+- User: N/A | Time: 2023-08-02 02:00:24 UTC
+  Text: (In reply to prathamesh3492 fromcomment #2)> (In reply to Stefan Schulze Frielinghaus fromcomment #1)
+> > The optimization introduced byr14-2879-g7cdd0860949c6chits during
+> > combination of insn
+> > 
+> > (insn 31 3 32 2 (set (reg:SI 118 [ _1 ])
+> >         (mem:SI (reg/v/f:SI 115 [ a ]) [1 *a_4(D)+0 S4 A64])) "t.c":15:7 758
+> > {*arm_movsi_vfp}
+> >      (nil))
+> > 
+> > and
+> > 
+> > (insn 9 32 10 2 (set (reg:CC 100 cc)
+> >         (compare:CC (reg:SI 118 [ _1 ])
+> >             (const_int -2147483648 [0xffffffff80000000]))) "t.c":15:6 272
+> > {*arm_cmpsi_insn}
+> >      (nil))
+> > 
+> > The idea ofr14-2879-g7cdd0860949c6cis to get rid of large constants while
+> > performing an unsigned comparison.  In this case it looks like a 32-bit
+> > constant is sign-extended into a 64-bit constant and then a 32-bit
+> > comparison is done.  While writing the optimization I always assumed that
+> > the constant does fit into int_mode which is apparently not the case here. 
+> > Thus one possible solution would be to simply bail out in those cases:
+> > 
+> > diff --git a/gcc/combine.cc b/gcc/combine.cc
+> > index 0d99fa541c5..e46d202d0a7 100644
+> > --- a/gcc/combine.cc
+> > +++ b/gcc/combine.cc
+> > @@ -11998,11 +11998,15 @@ simplify_compare_const (enum rtx_code code,
+> > machine_mode mode,
+> >       x0 >= 0x40.  */
+> >    if ((code == LEU || code == LTU || code == GEU || code == GTU)
+> >        && is_a <scalar_int_mode> (GET_MODE (op0), &int_mode)
+> > +      && HWI_COMPUTABLE_MODE_P (int_mode)
+> >        && MEM_P (op0)
+> >        && !MEM_VOLATILE_P (op0)
+> >        /* The optimization makes only sense for constants which are big
+> > enough
+> >          so that we have a chance to chop off something at all.  */
+> >        && (unsigned HOST_WIDE_INT) const_op > 0xff
+> > +      /* Bail out, if the constant does not fit into INT_MODE.  */
+> > +      && (unsigned HOST_WIDE_INT) const_op
+> > +        < ((HOST_WIDE_INT_1U << (GET_MODE_PRECISION (int_mode) - 1) << 1) -
+> > 1)
+> >        /* Ensure that we do not overflow during normalization.  */
+> >        && (code != GTU || (unsigned HOST_WIDE_INT) const_op <
+> > HOST_WIDE_INT_M1U))
+> >      {
+> > 
+> > Does this resolve the problem for you?
+> 
+> Yes, it worked thanks! I will do a full bootstrap+test with your fix and let
+> you know the results.Bootstrap+testing works fine with your fix. Thanks!> 
+> Thanks,
+> Prathamesh
+
+- User: Stefan Schulze Frielinghaus | Time: 2023-08-02 14:03:33 UTC
+  Text: Thanks for testing so quickly :)
+
+I've send a patch for review:https://gcc.gnu.org/pipermail/gcc-patches/2023-August/626075.html
+
+- User: GCC Commits | Time: 2023-08-02 19:44:36 UTC
+  Text: The master branch has been updated by Stefan Schulze Frielinghaus <stefansf@gcc.gnu.org>:https://gcc.gnu.org/g:41ef5a34161356817807be3a2e51fbdbe575ae85commitr14-2932-g41ef5a34161356817807be3a2e51fbdbe575ae85Author: Stefan Schulze Frielinghaus <stefansf@linux.ibm.com>
+Date:   Wed Aug 2 21:43:22 2023 +0200
+
+    rtl-optimization/110867 Fix narrow comparison of memory and constant
+    
+    In certain cases a constant may not fit into the mode used to perform a
+    comparison.  This may be the case for sign-extended constants which are
+    used during an unsigned comparison as e.g. in
+    
+    (set (reg:CC 100 cc)
+        (compare:CC (mem:SI (reg/v/f:SI 115 [ a ]) [1 *a_4(D)+0 S4 A64])
+            (const_int -2147483648 [0xffffffff80000000])))
+    
+    Fixed by ensuring that the constant fits into comparison mode.
+    
+    Furthermore, on some targets as e.g. sparc the constant used in a
+    comparison is chopped off before combine which leads to failing test
+    cases (seePR 110869).  Fixed by not requiring that the source mode has
+    to be DImode, and excluding sparc from the last two test cases entirely
+    since there the constant cannot be further reduced.
+    
+    gcc/ChangeLog:PR rtl-optimization/110867* combine.cc (simplify_compare_const): Try the optimization only
+            in case the constant fits into the comparison mode.
+    
+    gcc/testsuite/ChangeLog:PR rtl-optimization/110869* gcc.dg/cmp-mem-const-1.c: Relax mode for constant.
+            * gcc.dg/cmp-mem-const-2.c: Relax mode for constant.
+            * gcc.dg/cmp-mem-const-3.c: Relax mode for constant.
+            * gcc.dg/cmp-mem-const-4.c: Relax mode for constant.
+            * gcc.dg/cmp-mem-const-5.c: Exclude sparc since here the
+            constant is already reduced.
+            * gcc.dg/cmp-mem-const-6.c: Exclude sparc since here the
+            constant is already reduced.
+
+- User: Xi Ruoyao | Time: 2023-08-08 09:41:48 UTC
+  Text: ***Bug 110939has been marked as a duplicate of this bug. ***
+
+- User: Xi Ruoyao | Time: 2023-08-08 09:42:53 UTC
+  Text: Can we close it as fixed now?
+
+- User: Stefan Schulze Frielinghaus | Time: 2023-08-10 08:36:51 UTC
+  Text: Createdattachment 55716[details]Really fix narrow comparison
+
+- User: Stefan Schulze Frielinghaus | Time: 2023-08-10 08:37:47 UTC
+  Text: It looks like as if the first fix didn't entirely solve the problem.  It turns out that the normal form of const_int is not always met.  Before releasing a new patch, could you test it first in order to make sure that I do not break bootstrapping again.  I already gave it a try against the reproducer but would like to make sure that the whole bootstrap is successful.
+
+- User: N/A | Time: 2023-08-13 16:45:59 UTC
+  Text: (In reply to Stefan Schulze Frielinghaus fromcomment #9)> It looks like as if the first fix didn't entirely solve the problem.  It
+> turns out that the normal form of const_int is not always met.  Before
+> releasing a new patch, could you test it first in order to make sure that I
+> do not break bootstrapping again.  I already gave it a try against the
+> reproducer but would like to make sure that the whole bootstrap is
+> successful.Hi Stefan,
+I bootstrapped+tested your patch fromComment 8on arm, and it seems OK.
+
+Thanks,
+Prathamesh
+
+- User: Xi Ruoyao | Time: 2023-10-02 05:22:59 UTC
+  Text: The patch is pushed atr14-4355.
+
+*** This bug has been marked as a duplicate ofbug 110939***
+
+- User: Xi Ruoyao | Time: 2023-10-02 05:25:42 UTC
+  Text: Mistakenly marked it as dup.
+

@@ -1,0 +1,274 @@
+Bug Summary: _tile_loadconfig doesn't work
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: H.J. Lu | Time: 2024-02-25 15:03:08 UTC
+  Text: [hjl@gnu-cfl-3 amx-1]$ cat foo.c
+#include <stdint.h>
+#include <x86intrin.h>
+
+#define MAX_ROWS 16
+#define MAX_COLS 64
+#define MAX 1024
+#define STRIDE 64
+
+typedef struct __tile_config
+{
+  uint8_t palette_id;
+  uint8_t start_row;
+  uint8_t reserved_0[14];
+  uint16_t colsb[16];
+  uint8_t rows[16];
+} __tilecfg;
+
+
+extern void bar (__tilecfg *tileinfo);
+
+/* Initialize tile config */
+static void
+init_tile_config (__tilecfg *tileinfo)
+{
+  int i;
+  tileinfo->palette_id = 1;
+  tileinfo->start_row = 0;
+
+  for (i = 0; i < 1; ++i)
+  {
+    tileinfo->colsb[i] = MAX_ROWS;
+    tileinfo->rows[i] =  MAX_ROWS;
+  }
+
+  for (i = 1; i < 4; ++i)
+  {
+    tileinfo->colsb[i] = MAX_COLS;
+    tileinfo->rows[i] =  MAX_ROWS;
+  }
+
+  _tile_loadconfig (tileinfo);
+}
+
+void
+enable_amx (void)
+{
+  __tilecfg tile_data = {0};
+  init_tile_config (&tile_data);
+}
+[hjl@gnu-cfl-3 amx-1]$ gcc -S -O2 -mamx-tile foo.c
+[hjl@gnu-cfl-3 amx-1]$ cat foo.s
+	.file	"foo.c"
+	.text
+	.p2align 4
+	.globl	enable_amx
+	.type	enable_amx, @function
+enable_amx:
+.LFB6615:
+	.cfi_startproc
+	movl	$1, %eax <<<<<<<<<<<<< tile_data isn't properly initialized.
+	movw	%ax, -72(%rsp)
+#APP
+# 42 "/usr/lib/gcc/x86_64-redhat-linux/13/include/amxtileintrin.h" 1
+	ldtilecfg	-72(%rsp)
+# 0 "" 2
+#NO_APP
+	ret
+	.cfi_endproc
+.LFE6615:
+	.size	enable_amx, .-enable_amx
+	.ident	"GCC: (GNU) 13.2.1 20231205 (Red Hat 13.2.1-6)"
+	.section	.note.GNU-stack,"",@progbits
+[hjl@gnu-cfl-3 amx-1]$
+
+- User: H.J. Lu | Time: 2024-02-25 15:11:27 UTC
+  Text: The problem is that in
+
+extern __inline void
+__attribute__((__gnu_inline__, __always_inline__, __artificial__))
+_tile_loadconfig (const void *__config)
+{
+  __asm__ volatile ("ldtilecfg\t%X0" :: "m" (*((const void **)__config)));
+}
+
+only 8 bytes are used.
+
+- User: H.J. Lu | Time: 2024-02-25 15:57:34 UTC
+  Text: We should tell GCC that 64 bytes will be accessed by ldtilecfg and sttilecfg.
+
+- User: GCC Commits | Time: 2024-02-26 04:26:54 UTC
+  Text: The master branch has been updated by H.J. Lu <hjl@gcc.gnu.org>:https://gcc.gnu.org/g:4972f97a265c574d51e20373ddefd66576051e5ccommitr14-9171-g4972f97a265c574d51e20373ddefd66576051e5cAuthor: H.J. Lu <hjl.tools@gmail.com>
+Date:   Sun Feb 25 10:21:04 2024 -0800
+
+    x86: Properly implement AMX-TILE load/store intrinsics
+    
+    ldtilecfg and sttilecfg take a 512-byte memory block.  With
+    _tile_loadconfig implemented as
+    
+    extern __inline void
+    __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+    _tile_loadconfig (const void *__config)
+    {
+      __asm__ volatile ("ldtilecfg\t%X0" :: "m" (*((const void **)__config)));
+    }
+    
+    GCC sees:
+    
+    (parallel [
+      (asm_operands/v ("ldtilecfg   %X0") ("") 0
+       [(mem/f/c:DI (plus:DI (reg/f:DI 77 virtual-stack-vars)
+                             (const_int -64 [0xffffffffffffffc0])) [1 MEM[(const void * *)&tile_data]+0 S8 A128])]
+       [(asm_input:DI ("m"))]
+       (clobber (reg:CC 17 flags))])
+    
+    and the memory operand size is 1 byte.  As the result, the rest of 511
+    bytes is ignored by GCC.  Implement ldtilecfg and sttilecfg intrinsics
+    with a pointer to XImode to honor the 512-byte memory block.
+    
+    gcc/ChangeLog:PR target/114098* config/i386/amxtileintrin.h (_tile_loadconfig): Use
+            __builtin_ia32_ldtilecfg.
+            (_tile_storeconfig): Use __builtin_ia32_sttilecfg.
+            * config/i386/i386-builtin.def (BDESC): Add
+            __builtin_ia32_ldtilecfg and __builtin_ia32_sttilecfg.
+            * config/i386/i386-expand.cc (ix86_expand_builtin): Handle
+            IX86_BUILTIN_LDTILECFG and IX86_BUILTIN_STTILECFG.
+            * config/i386/i386.md (ldtilecfg): New pattern.
+            (sttilecfg): Likewise.
+    
+    gcc/testsuite/ChangeLog:PR target/114098* gcc.target/i386/amxtile-4.c: New test.
+
+- User: GCC Commits | Time: 2024-02-27 03:47:15 UTC
+  Text: The releases/gcc-13 branch has been updated by H.J. Lu <hjl@gcc.gnu.org>:https://gcc.gnu.org/g:2b3ecdf4fb13471b69d80583e10c5baedfe84d7ccommitr13-8365-g2b3ecdf4fb13471b69d80583e10c5baedfe84d7cAuthor: H.J. Lu <hjl.tools@gmail.com>
+Date:   Sun Feb 25 10:21:04 2024 -0800
+
+    x86: Properly implement AMX-TILE load/store intrinsics
+    
+    ldtilecfg and sttilecfg take a 512-byte memory block.  With
+    _tile_loadconfig implemented as
+    
+    extern __inline void
+    __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+    _tile_loadconfig (const void *__config)
+    {
+      __asm__ volatile ("ldtilecfg\t%X0" :: "m" (*((const void **)__config)));
+    }
+    
+    GCC sees:
+    
+    (parallel [
+      (asm_operands/v ("ldtilecfg   %X0") ("") 0
+       [(mem/f/c:DI (plus:DI (reg/f:DI 77 virtual-stack-vars)
+                             (const_int -64 [0xffffffffffffffc0])) [1 MEM[(const void * *)&tile_data]+0 S8 A128])]
+       [(asm_input:DI ("m"))]
+       (clobber (reg:CC 17 flags))])
+    
+    and the memory operand size is 1 byte.  As the result, the rest of 511
+    bytes is ignored by GCC.  Implement ldtilecfg and sttilecfg intrinsics
+    with a pointer to XImode to honor the 512-byte memory block.
+    
+    gcc/ChangeLog:PR target/114098* config/i386/amxtileintrin.h (_tile_loadconfig): Use
+            __builtin_ia32_ldtilecfg.
+            (_tile_storeconfig): Use __builtin_ia32_sttilecfg.
+            * config/i386/i386-builtin.def (BDESC): Add
+            __builtin_ia32_ldtilecfg and __builtin_ia32_sttilecfg.
+            * config/i386/i386-expand.cc (ix86_expand_builtin): Handle
+            IX86_BUILTIN_LDTILECFG and IX86_BUILTIN_STTILECFG.
+            * config/i386/i386.md (ldtilecfg): New pattern.
+            (sttilecfg): Likewise.
+    
+    gcc/testsuite/ChangeLog:PR target/114098* gcc.target/i386/amxtile-4.c: New test.
+    
+    (cherry picked from commit 4972f97a265c574d51e20373ddefd66576051e5c)
+
+- User: GCC Commits | Time: 2024-02-27 03:49:16 UTC
+  Text: The releases/gcc-12 branch has been updated by H.J. Lu <hjl@gcc.gnu.org>:https://gcc.gnu.org/g:23f4aa6c68e24a76d3784bcfdad5a53e46cd8f95commitr12-10180-g23f4aa6c68e24a76d3784bcfdad5a53e46cd8f95Author: H.J. Lu <hjl.tools@gmail.com>
+Date:   Sun Feb 25 10:21:04 2024 -0800
+
+    x86: Properly implement AMX-TILE load/store intrinsics
+    
+    ldtilecfg and sttilecfg take a 512-byte memory block.  With
+    _tile_loadconfig implemented as
+    
+    extern __inline void
+    __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+    _tile_loadconfig (const void *__config)
+    {
+      __asm__ volatile ("ldtilecfg\t%X0" :: "m" (*((const void **)__config)));
+    }
+    
+    GCC sees:
+    
+    (parallel [
+      (asm_operands/v ("ldtilecfg   %X0") ("") 0
+       [(mem/f/c:DI (plus:DI (reg/f:DI 77 virtual-stack-vars)
+                             (const_int -64 [0xffffffffffffffc0])) [1 MEM[(const void * *)&tile_data]+0 S8 A128])]
+       [(asm_input:DI ("m"))]
+       (clobber (reg:CC 17 flags))])
+    
+    and the memory operand size is 1 byte.  As the result, the rest of 511
+    bytes is ignored by GCC.  Implement ldtilecfg and sttilecfg intrinsics
+    with a pointer to XImode to honor the 512-byte memory block.
+    
+    gcc/ChangeLog:PR target/114098* config/i386/amxtileintrin.h (_tile_loadconfig): Use
+            __builtin_ia32_ldtilecfg.
+            (_tile_storeconfig): Use __builtin_ia32_sttilecfg.
+            * config/i386/i386-builtin.def (BDESC): Add
+            __builtin_ia32_ldtilecfg and __builtin_ia32_sttilecfg.
+            * config/i386/i386-expand.cc (ix86_expand_builtin): Handle
+            IX86_BUILTIN_LDTILECFG and IX86_BUILTIN_STTILECFG.
+            * config/i386/i386.md (ldtilecfg): New pattern.
+            (sttilecfg): Likewise.
+    
+    gcc/testsuite/ChangeLog:PR target/114098* gcc.target/i386/amxtile-4.c: New test.
+    
+    (cherry picked from commit 4972f97a265c574d51e20373ddefd66576051e5c)
+
+- User: GCC Commits | Time: 2024-02-27 10:33:42 UTC
+  Text: The releases/gcc-11 branch has been updated by H.J. Lu <hjl@gcc.gnu.org>:https://gcc.gnu.org/g:26b1012c26c4b4de0b4561e74b856a7f7d259a48commitr11-11258-g26b1012c26c4b4de0b4561e74b856a7f7d259a48Author: H.J. Lu <hjl.tools@gmail.com>
+Date:   Sun Feb 25 10:21:04 2024 -0800
+
+    x86: Properly implement AMX-TILE load/store intrinsics
+    
+    ldtilecfg and sttilecfg take a 512-byte memory block.  With
+    _tile_loadconfig implemented as
+    
+    extern __inline void
+    __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+    _tile_loadconfig (const void *__config)
+    {
+      __asm__ volatile ("ldtilecfg\t%X0" :: "m" (*((const void **)__config)));
+    }
+    
+    GCC sees:
+    
+    (parallel [
+      (asm_operands/v ("ldtilecfg   %X0") ("") 0
+       [(mem/f/c:DI (plus:DI (reg/f:DI 77 virtual-stack-vars)
+                             (const_int -64 [0xffffffffffffffc0])) [1 MEM[(const void * *)&tile_data]+0 S8 A128])]
+       [(asm_input:DI ("m"))]
+       (clobber (reg:CC 17 flags))])
+    
+    and the memory operand size is 1 byte.  As the result, the rest of 511
+    bytes is ignored by GCC.  Implement ldtilecfg and sttilecfg intrinsics
+    with a pointer to XImode to honor the 512-byte memory block.
+    
+    gcc/ChangeLog:PR target/114098* config/i386/amxtileintrin.h (_tile_loadconfig): Use
+            __builtin_ia32_ldtilecfg.
+            (_tile_storeconfig): Use __builtin_ia32_sttilecfg.
+            * config/i386/i386-builtin.def (BDESC): Add
+            __builtin_ia32_ldtilecfg and __builtin_ia32_sttilecfg.
+            * config/i386/i386-expand.c (ix86_expand_builtin): Handle
+            IX86_BUILTIN_LDTILECFG and IX86_BUILTIN_STTILECFG.
+            * config/i386/i386.md (ldtilecfg): New pattern.
+            (sttilecfg): Likewise.
+    
+    gcc/testsuite/ChangeLog:PR target/114098* gcc.target/i386/amxtile-4.c: New test.
+    
+    (cherry picked from commit 4972f97a265c574d51e20373ddefd66576051e5c)
+
+- User: H.J. Lu | Time: 2024-02-27 10:37:34 UTC
+  Text: Fixed for 11.5, 12.4, 13.3 and 14.
+

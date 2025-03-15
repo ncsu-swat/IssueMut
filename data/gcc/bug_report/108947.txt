@@ -1,0 +1,107 @@
+Bug Summary: [13 Regression] wrong code with -O2 -fno-forward-propagate and vector compare on riscv64
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 12.2.1
+Known to Fail: 13.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-02-27 11:50:53 UTC
+  Text: Createdattachment 54543[details]reduced testcase
+
+Output:
+$ riscv64-unknown-linux-gnu-gcc -O2 -fno-forward-propagate testcase.c -static
+$ qemu-riscv64 -- ./a.out 
+Aborted
+
+w == { 0, 0 } instead of { 0xffff, 0 }
+
+$ riscv64-unknown-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-riscv64/bin/riscv64-unknown-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r13-6353-20230227090511-g529e03b9882-checking-yes-rtl-df-extra-riscv64/bin/../libexec/gcc/riscv64-unknown-linux-gnu/13.0.1/lto-wrapper
+Target: riscv64-unknown-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --with-cloog --with-ppl --with-isl --with-isa-spec=2.2 --with-sysroot=/usr/riscv64-unknown-linux-gnu --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=riscv64-unknown-linux-gnu --with-ld=/usr/bin/riscv64-unknown-linux-gnu-ld --with-as=/usr/bin/riscv64-unknown-linux-gnu-as --disable-multilib --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r13-6353-20230227090511-g529e03b9882-checking-yes-rtl-df-extra-riscv64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 13.0.1 20230227 (experimental) (GCC)
+
+- User: Martin Liška | Time: 2023-03-27 11:51:27 UTC
+  Text: Started withr13-4907-g2e886eef7f2b5asame asPR109040.
+
+- User: Jeffrey A. Law | Time: 2023-04-05 14:17:00 UTC
+  Text: ***Bug 109040has been marked as a duplicate of this bug. ***
+
+- User: Sam James | Time: 2023-04-05 18:41:30 UTC
+  Text: Note that's substantial discussion (including a patch) in dupePR109040.
+
+- User: Jeffrey A. Law | Time: 2023-04-08 14:36:19 UTC
+  Text: P1 as this look like a latent issue in combine or simplification routines.
+
+- User: GCC Commits | Time: 2023-04-14 07:32:40 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:9d1a6119590ef828f9782a7083d03e535bc2f2cfcommitr13-7178-g9d1a6119590ef828f9782a7083d03e535bc2f2cfAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Apr 14 09:20:49 2023 +0200
+
+    combine: Fix AND handling for WORD_REGISTER_OPERATIONS targets [PR109040]
+    
+    The following testcase is miscompiled on riscv since the addition
+    of *mvconst_internal define_insn_and_split.
+    We have:
+    (insn 36 35 39 2 (set (mem/c:SI (plus:SI (reg/f:SI 65 frame)
+                    (const_int -64 [0xffffffffffffffc0])) [2  S4 A128])
+            (reg:SI 166)) "pr109040.c":9:11 178 {*movsi_internal}
+         (expr_list:REG_DEAD (reg:SI 166)
+            (nil)))
+    (insn 39 36 40 2 (set (reg:SI 171)
+            (zero_extend:SI (mem/c:HI (plus:SI (reg/f:SI 65 frame)
+                        (const_int -64 [0xffffffffffffffc0])) [0  S2 A128]))) "pr109040.c":9:11 111 {*zero_extendhisi2}
+         (nil))
+    and RTL DSE's replace_read sincer0-86337-g18b526e806ab6455handles
+    even different modes like in the above case, and so it optimizes it into:
+    (insn 47 35 39 2 (set (reg:HI 175)
+            (subreg:HI (reg:SI 166) 0)) "pr109040.c":9:11 179 {*movhi_internal}
+         (expr_list:REG_DEAD (reg:SI 166)
+            (nil)))
+    (insn 39 47 40 2 (set (reg:SI 171)
+            (zero_extend:SI (reg:HI 175))) "pr109040.c":9:11 111 {*zero_extendhisi2}
+         (expr_list:REG_DEAD (reg:HI 175)
+            (nil)))
+    Pseudo 166 is result of AND with 0x8084c constant (forced into a register).
+    Combine attempts to combine the AND with the insn 47 above created by DSE,
+    and turns it because of WORD_REGISTER_OPERATIONS and its assumption that all
+    the subword operations are actually done on word mode into:
+    (set (subreg:SI (reg:HI 175) 0)
+        (and:SI (reg:SI 167 [ m ])
+            (reg:SI 168)))
+    and later on the ZERO_EXTEND is thrown away.
+    
+    We then see
+    (and:SI (subreg:SI (reg:HI 175) 0) (const_int 0x84c))
+    and optimize that into
+    (subreg:SI (and:HI (reg:HI 175) (const_int 0x84c)) 0)
+    which is still fine, in WORD_REGISTER_OPERATIONS the AND in HImode
+    will set all upper bits up to BITS_PER_WORD to zeros.
+    
+    But later on simplify_binary_operation_1 or simplify_and_const_int_1
+    sees that because nonzero_bits ((reg:HI 175), HImode) == 0x84c, we can
+    optimize the AND into (reg:HI 175).  That isn't correct, because while
+    the low 16 bits of that REG are known to have all bits but 0x84c cleared,
+    we don't know that all the upper 16 bits are all clear as well.
+    So, for WORD_REGISTER_OPERATIONS for integral modes smaller than word mode,
+    we need to check all bits from word_mode in nonzero_bits for the optimizations.
+    
+    2023-04-14  Jeff Law  <jlaw@ventanamicro.com>
+                Jakub Jelinek  <jakub@redhat.com>PR target/108947PR target/109040* combine.cc (simplify_and_const_int_1): Compute nonzero_bits in
+            word_mode rather than mode if WORD_REGISTER_OPERATIONS and mode is
+            smaller than word_mode.
+            * simplify-rtx.cc (simplify_context::simplify_binary_operation_1)
+            <case AND>: Likewise.
+    
+            * gcc.dg/pr108947.c: New test.
+            * gcc.c-torture/execute/pr109040.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-04-14 07:36:05 UTC
+  Text: Fixed.
+

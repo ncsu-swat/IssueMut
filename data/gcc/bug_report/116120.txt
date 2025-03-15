@@ -1,0 +1,134 @@
+Bug Summary: [15 regression] Wrong code for (a ? x : y) != (b ? x : y) since r15-2106-g44fcc1ca11e7ea35dc9fb25a5317346bc1eaf7b2
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Krister Walfridsson | Time: 2024-07-27 23:05:58 UTC
+  Text: GCC is miscompiling the functions in g++.dg/tree-ssa/pr111150.C, such as:
+
+typedef int v4si __attribute((__vector_size__(4 * sizeof(int))));
+v4si f1_(v4si a, v4si b, v4si c, v4si d, v4si e, v4si f) {
+  v4si X = a == b ? e : f;
+  v4si Y = c == d ? e : f;
+  return (X != Y);
+}
+
+The reason is thatPR111150implemented match patterns of the form:
+
+  (a ? x : y) != (b ? x : y) --> (a^b) ? TRUE  : FALSE
+
+But this optimization is not correct -- the optimized code gives us a different result for:
+  a = TRUE
+  b = FALSE
+  x = 0
+  y = 0
+
+- User: Andrew Pinski | Time: 2024-07-28 00:12:47 UTC
+  Text: testcase that shows the issue:
+```
+typedef int v4si __attribute((__vector_size__(1 * sizeof(int))));
+v4si f1(v4si a, v4si b, v4si c, v4si d, v4si e, v4si f) {
+  v4si X = a == b ? e : f;
+  v4si Y = c == d ? e : f;
+  return (X != Y); // ~(X == Y ? -1 : 0) (x ^ Y)
+}
+
+int f2(int a, int b, int c, int d, int e, int f) {
+  int X = a == b ? e : f;
+  int Y = c == d ? e : f;
+  return (X != Y) ? -1 : 0; // ~(X == Y ? -1 : 0) (x ^ Y)
+}
+
+int main()
+{
+  v4si a = {0};
+  v4si b = {0}; // a == b, true
+  v4si c = {2};
+  v4si d = {3}; // c == b, false
+  v4si e = {0};
+  v4si f = e;
+  v4si r = f1(a,b,c,d,e, f);
+  int r1 = f2(a[0], b[0], c[0], d[0], e[0], f[0]);
+  if (r[0] != r1)
+    __builtin_abort();
+  __builtin_printf ("%d == %d.\n", r[0], r1);
+}
+```
+So the test needs to add `(x == y)`/`(a != b)`
+
+So it should be:
+/* (a ? x : y) != (b ? x : y) --> (a^b & (x != y)) ? TRUE  : FALSE */
+/* (a ? x : y) == (b ? x : y) --> (a^b & (x != y)) ? FALSE : TRUE  */
+
+/* (a ? x : y) != (b ? y : x) --> (a^b | (x == y)) ? FALSE : TRUE  */
+/* (a ? x : y) == (b ? y : x) --> (a^b | (x == y)) ? TRUE  : FALSE */
+
+This was introduced when Eikansh tried to make this generic more than just -1/0 and it was missed that handled the case where `x == y`. Anyways I will fix this.
+
+- User: Andrew Pinski | Time: 2024-07-28 00:57:59 UTC
+  Text: That is:
+```
+v4si f3(v4si a, v4si b, v4si c, v4si d, v4si e, v4si f) {
+  v4si X = a == b;
+  v4si Y = c == d;
+  return ((X^Y) & (e != f)) ? {-1,...} : {0};
+}
+```
+is what we should produce. Note this is still better code generation than the original with `?:`. And for the constant case `e != f` will be reduced to 0/-1 just fine.
+
+- User: Andrew Pinski | Time: 2024-07-29 21:12:44 UTC
+  Text: Testing a fix, should be submitted later today.
+
+- User: GCC Commits | Time: 2024-08-01 15:22:54 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:c5ccdfdcab0b24afba2a661af861bec1d63f0595commitr15-2637-gc5ccdfdcab0b24afba2a661af861bec1d63f0595Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Mon Jul 29 14:00:13 2024 -0700
+
+    match: Fix wrong code due to `(a ? e : f) !=/== (b ? e : f)` patterns [PR116120]
+    
+    When this pattern was converted from being only dealing with 0/-1, we missed that if `e == f` is true
+    then the optimization is wrong and needs an extra check for that.
+    
+    This changes the patterns to be:
+    /* (a ? x : y) != (b ? x : y) --> (a^b & (x != y)) ? TRUE  : FALSE */
+    /* (a ? x : y) == (b ? x : y) --> (a^b & (x != y)) ? FALSE : TRUE  */
+    /* (a ? x : y) != (b ? y : x) --> (a^b | (x == y)) ? FALSE : TRUE  */
+    /* (a ? x : y) == (b ? y : x) --> (a^b | (x == y)) ? TRUE  : FALSE */
+    
+    Also this can't be done if the X can be a NaNs either. Since that changes the value there too.
+    
+    This still produces better code than the original case and in many cases (x != y) will
+    still reduce to either false or true.
+    
+    With this change we also need to make sure `a`, `b` and the resulting types are all
+    the same for the same reason as the previous patch.
+    
+    I updated (well added) to the testcases to make sure there are the right amount of
+    comparisons left.
+    
+    Changes since v1:
+    * v2: Fixed the testcase names and fixed dg-run to be `dg-do run`. Added a check for HONORS_NANS too.
+    
+    Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/116120gcc/ChangeLog:
+    
+            * match.pd (`(a ? x : y) eq/ne (b ? x : y)`): Add test for `x != y`
+            in result.
+            (`(a ? x : y) eq/ne (b ? y : x)`): Add test for `x == y` in result.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.dg/tree-ssa/pr111150.C: Add extra checks on the test.
+            * gcc.dg/tree-ssa/pr111150-1.c: Likewise.
+            * gcc.dg/tree-ssa/pr111150.c: Likewise.
+            * g++.dg/torture/pr116120-1.C: New test.
+            * g++.dg/torture/pr116120-2.C: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-08-01 15:26:28 UTC
+  Text: Fixed.
+

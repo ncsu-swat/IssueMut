@@ -1,0 +1,212 @@
+Bug Summary: [11/12/13/14 Regression] __int128 bitfields optimized incorrectly to  the 64 bit operations
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 7.5.0
+Known to Fail: 11.4.0, 13.2.0
+
+Comments:
+- User: Pavel Shevchuk | Time: 2023-08-14 13:53:49 UTC
+  Text: godbolt:https://godbolt.org/z/r5d6ToY1zBasically, a store of one half of a 70-bit bitfield gets completely optimized away.
+i.e. for 
+
+struct Entry {
+    unsigned left : 4;
+    unsigned right : 4;
+    uint128 key : KEY_BITS;
+} data;
+
+the code:
+
+data.left = left;
+data.right = right;
+data.key = key & KEY_BITS_MASK;
+
+produces the following (amd64):
+        andl    $15, %ecx
+        salq    $4, %rcx
+        andl    $15, %edx
+        orq     %rdx, %rcx
+        movq    %rdi, %rax
+        salq    $8, %rax
+        orq     %rax, %rcx
+        movq    %rcx, data(%rip)
+        andw    $-16384, data+8(%rip)
+
+critically, at no point is there any attempt to actually initialize data+8
+
+The problem does not disappear if the bitfields gets moved around; it is, however, very finicky with respect to the size of the bitfields.
+
+-O1 -fstore-merging appears to be close to the smallest set of compilation options at which it fails.
+
+If you replace -O1 with the list of -O1 optimization from here:https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html, it will start working correctly, so probably we have a documentation issue
+
+- User: Richard Biener | Time: 2023-08-14 14:01:40 UTC
+  Text: Createdattachment 55735[details]testcase from godbolt
+
+- User: Richard Biener | Time: 2023-08-14 14:04:13 UTC
+  Text: Confirmed.
+
+- User: Mikael Pettersson | Time: 2023-08-15 23:06:32 UTC
+  Text: 10.5.0 is good, 11.4.0 and above are affected, started with (or was exposed by):
+
+commit ed01d707f8594827de95304371d5b62752410842
+Author: Eric Botcazou <ebotcazou@gcc.gnu.org>
+Date:   Mon May 25 22:13:11 2020 +0200
+
+    Fix internal error on store to FP component at -O2
+    
+    This is about a GIMPLE verification failure at -O2 or above because
+    the GIMPLE store merging pass generates a NOP_EXPR between a FP type
+    and an integral type.  This happens when the bit-field insertion path
+    is taken for a FP field, which can happen in Ada for bit-packed record
+    types.
+    
+    It is fixed by generating an intermediate VIEW_CONVERT_EXPR.  The patch
+    also tames a little the bit-field insertion path because, for bit-packed
+    record  types in Ada, you can end up with large bit-field regions, which
+    results in a lot of mask-and-shifts instructions.
+    
+    gcc/ChangeLog
+            * gimple-ssa-store-merging.c (merged_store_group::can_be_merged_into):
+            Only turn MEM_REFs into bit-field stores for small bit-field regions
+            (imm_store_chain_info::output_merged_store): Be prepared for sources
+            with non-integral type in the bit-field insertion case.
+            (pass_store_merging::process_store): Use MAX_BITSIZE_MODE_ANY_INT as
+            the largest size for the bit-field case.
+    
+    gcc/testsuite/ChangeLog
+            * gnat.dg/opt84.adb: New test.
+
+ gcc/ChangeLog                   |  9 +++++
+ gcc/gimple-ssa-store-merging.c  | 20 ++++++++---
+ gcc/testsuite/ChangeLog         |  4 +++
+ gcc/testsuite/gnat.dg/opt84.adb | 74 +++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 103 insertions(+), 4 deletions(-)
+ create mode 100644 gcc/testsuite/gnat.dg/opt84.adb
+
+- User: Mikael Pettersson | Time: 2023-08-16 15:14:44 UTC
+  Text: Reverting the pass_store_merging::process_store hunk makes this test case work again:
+
+diff --git a/gcc/gimple-ssa-store-merging.cc b/gcc/gimple-ssa-store-merging.cc
+index 0d19b98ed73..c4bf8eec64e 100644
+--- a/gcc/gimple-ssa-store-merging.cc
++++ b/gcc/gimple-ssa-store-merging.cc
+@@ -5299,7 +5299,7 @@ pass_store_merging::process_store (gimple *stmt)
+          && bitsize.is_constant (&const_bitsize)
+          && ((const_bitsize % BITS_PER_UNIT) != 0
+              || !multiple_p (bitpos, BITS_PER_UNIT))
+-         && const_bitsize <= MAX_FIXED_MODE_SIZE)
++         && const_bitsize <= 64)
+        {
+          /* Bypass a conversion to the bit-field type.  */
+          if (!bit_not_p
+
+- User: Jakub Jelinek | Time: 2023-08-29 14:24:32 UTC
+  Text: Createdattachment 55811[details]gcc14-pr111015.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2023-08-30 08:47:58 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:49a3b35c4068091900b657cd36e5cffd41ef0c47commitr14-3563-g49a3b35c4068091900b657cd36e5cffd41ef0c47Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Aug 30 10:47:21 2023 +0200
+
+    store-merging: Fix up >= 64 bit insertion [PR111015]
+    
+    The following testcase shows that we mishandle bit insertion for
+    info->bitsize >= 64.  The problem is in using unsigned HOST_WIDE_INT
+    shift + subtraction + build_int_cst to compute mask, the shift invokes
+    UB at compile time for info->bitsize 64 and larger and e.g. on the testcase
+    with info->bitsize happens to compute mask of 0x3f rather than
+    0x3f'ffffffff'ffffffff.
+    
+    The patch fixes that by using wide_int wi::mask + wide_int_to_tree, so it
+    handles masks in any precision (up to WIDE_INT_MAX_PRECISION ;) ).
+    
+    2023-08-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/111015* gimple-ssa-store-merging.cc
+            (imm_store_chain_info::output_merged_store): Use wi::mask and
+            wide_int_to_tree instead of unsigned HOST_WIDE_INT shift and
+            build_int_cst to build BIT_AND_EXPR mask.
+    
+            * gcc.dg/pr111015.c: New test.
+
+- User: GCC Commits | Time: 2023-08-30 09:33:11 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:f8ea576111a499595b0fe9d879830ae03afbaf17commitr13-7767-gf8ea576111a499595b0fe9d879830ae03afbaf17Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Aug 30 10:47:21 2023 +0200
+
+    store-merging: Fix up >= 64 bit insertion [PR111015]
+    
+    The following testcase shows that we mishandle bit insertion for
+    info->bitsize >= 64.  The problem is in using unsigned HOST_WIDE_INT
+    shift + subtraction + build_int_cst to compute mask, the shift invokes
+    UB at compile time for info->bitsize 64 and larger and e.g. on the testcase
+    with info->bitsize happens to compute mask of 0x3f rather than
+    0x3f'ffffffff'ffffffff.
+    
+    The patch fixes that by using wide_int wi::mask + wide_int_to_tree, so it
+    handles masks in any precision (up to WIDE_INT_MAX_PRECISION ;) ).
+    
+    2023-08-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/111015* gimple-ssa-store-merging.cc
+            (imm_store_chain_info::output_merged_store): Use wi::mask and
+            wide_int_to_tree instead of unsigned HOST_WIDE_INT shift and
+            build_int_cst to build BIT_AND_EXPR mask.
+    
+            * gcc.dg/pr111015.c: New test.
+    
+    (cherry picked from commit 49a3b35c4068091900b657cd36e5cffd41ef0c47)
+
+- User: GCC Commits | Time: 2023-08-30 09:49:38 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d04993b217f42b8e60b7a6d66647966b1e41302dcommitr12-9836-gd04993b217f42b8e60b7a6d66647966b1e41302dAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Aug 30 10:47:21 2023 +0200
+
+    store-merging: Fix up >= 64 bit insertion [PR111015]
+    
+    The following testcase shows that we mishandle bit insertion for
+    info->bitsize >= 64.  The problem is in using unsigned HOST_WIDE_INT
+    shift + subtraction + build_int_cst to compute mask, the shift invokes
+    UB at compile time for info->bitsize 64 and larger and e.g. on the testcase
+    with info->bitsize happens to compute mask of 0x3f rather than
+    0x3f'ffffffff'ffffffff.
+    
+    The patch fixes that by using wide_int wi::mask + wide_int_to_tree, so it
+    handles masks in any precision (up to WIDE_INT_MAX_PRECISION ;) ).
+    
+    2023-08-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/111015* gimple-ssa-store-merging.cc
+            (imm_store_chain_info::output_merged_store): Use wi::mask and
+            wide_int_to_tree instead of unsigned HOST_WIDE_INT shift and
+            build_int_cst to build BIT_AND_EXPR mask.
+    
+            * gcc.dg/pr111015.c: New test.
+    
+    (cherry picked from commit 49a3b35c4068091900b657cd36e5cffd41ef0c47)
+
+- User: GCC Commits | Time: 2023-08-30 09:57:53 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:beabb96786e4b3e1a820e400c09b1c1c9ab06287commitr11-10968-gbeabb96786e4b3e1a820e400c09b1c1c9ab06287Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Aug 30 10:47:21 2023 +0200
+
+    store-merging: Fix up >= 64 bit insertion [PR111015]
+    
+    The following testcase shows that we mishandle bit insertion for
+    info->bitsize >= 64.  The problem is in using unsigned HOST_WIDE_INT
+    shift + subtraction + build_int_cst to compute mask, the shift invokes
+    UB at compile time for info->bitsize 64 and larger and e.g. on the testcase
+    with info->bitsize happens to compute mask of 0x3f rather than
+    0x3f'ffffffff'ffffffff.
+    
+    The patch fixes that by using wide_int wi::mask + wide_int_to_tree, so it
+    handles masks in any precision (up to WIDE_INT_MAX_PRECISION ;) ).
+    
+    2023-08-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/111015* gimple-ssa-store-merging.c
+            (imm_store_chain_info::output_merged_store): Use wi::mask and
+            wide_int_to_tree instead of unsigned HOST_WIDE_INT shift and
+            build_int_cst to build BIT_AND_EXPR mask.
+    
+            * gcc.dg/pr111015.c: New test.
+    
+    (cherry picked from commit 49a3b35c4068091900b657cd36e5cffd41ef0c47)
+
+- User: Jakub Jelinek | Time: 2023-08-30 10:00:32 UTC
+  Text: Fixed.
+

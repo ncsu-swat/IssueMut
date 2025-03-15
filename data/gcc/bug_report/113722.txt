@@ -1,0 +1,107 @@
+Bug Summary: [14 Regression] Constant folding of __builtin_bswap128 is broken since r14-1455
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Antoni | Time: 2024-02-02 15:24:23 UTC
+  Text: With the following code:
+
+#include <stdio.h>
+
+int main(int argc, char* argv[]) {
+    __uint128_t res = __builtin_bswap128 (2);
+    printf("Value: %ld\n", res >> 64);
+    res = __builtin_bswap128 (argc + 1);
+    printf("Value: %ld\n", res >> 64);
+}
+
+it gives the following output in gcc 13.2.1:
+
+Value: 144115188075855872
+Value: 144115188075855872
+
+while it gives the following output in the master branch, commit 2c27aa8d75113f404bf9cd39364611af386d9719:
+
+Value: 0
+Value: 144115188075855872
+
+So it seems to be a regression in the folding of wide_int::bswap.
+
+- User: Andrew Pinski | Time: 2024-02-02 16:12:35 UTC
+  Text: Simplified testcase:
+```
+#define constant 2
+int main() {
+    __uint128_t res = __builtin_bswap128 ((__uint128_t)constant);
+    __uint128_t t = constant;
+    __uint128_t res1 = __builtin_bswap128 (t);
+    if (res != res1)
+      __builtin_abort();
+}
+```
+
+- User: Jakub Jelinek | Time: 2024-02-02 16:50:58 UTC
+  Text: The #c0 testcase is broken, res >> 64 has still __uint128_t type, so you shouldn't pass it to %ld format specifier.
+
+- User: Jakub Jelinek | Time: 2024-02-02 16:57:47 UTC
+  Text: Anyway, at -O0
+int
+main ()
+{
+  unsigned __int128 a = __builtin_bswap128 ((unsigned __int128) 2);
+  unsigned __int128 b = 2;
+  unsigned __int128 c = __builtin_bswap128 (b);
+  if (a != c)
+    __builtin_abort ();
+}
+regressed withr14-1455-g0ede6b5ad77c4791a513ab312b9e278dafc2bff9I'll have a look.
+
+- User: Jakub Jelinek | Time: 2024-02-02 17:30:20 UTC
+  Text: Createdattachment 57296[details]gcc14-pr113722.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-02-03 13:39:10 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:09df058a09f888daad26fa80634068b38b4ad04dcommitr14-8776-g09df058a09f888daad26fa80634068b38b4ad04dAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Sat Feb 3 14:38:27 2024 +0100
+
+    wide-int: Fix up wi::bswap_large [PR113722]
+    
+    Since bswap has been converted from a method to a function we miscompile
+    the following testcase.  The problem is the assumption that the passed in
+    len argument (number of limbs in the xval array) is the upper bound for the
+    bswap result, which is true only if precision is <= 64.  If precision is
+    larger than that, e.g. 128 as in the testcase, if the argument has only
+    one limb (i.e. 0 to ~(unsigned HOST_WIDE_INT) 0), the result can still
+    need 2 limbs for that precision, or generally BLOCKS_NEEDED (precision)
+    limbs, it all depends on how many least significant limbs of the operand
+    are zero.  bswap_large as implemented only cleared len limbs of result,
+    then swapped the bytes (invoking UB when oring something in all the limbs
+    above it) and finally passed len to canonize, saying that more limbs
+    aren't needed.
+    
+    The following patch fixes it by renaming len to xlen (so that it is clear
+    it is X's length), using it solely for safe_uhwi argument when we attempt
+    to read from X, and using new len = BLOCKS_NEEDED (precision) instead in
+    the other two spots (i.e. when clearing the val array, turned it also
+    into memset, and in canonize argument).  wi::bswap asserts it isn't invoked
+    on widest_int, so we are always invoked on wide_int or similar and those
+    have preallocated result sized for the corresponding precision (i.e.
+    BLOCKS_NEEDED (precision)).
+    
+    2024-02-03  Jakub Jelinek  <jakub@redhat.com>PR middle-end/113722* wide-int.cc (wi::bswap_large): Rename third argument from
+            len to xlen and adjust use in safe_uhwi.  Add len variable, set
+            it to BLOCKS_NEEDED (precision) and use it for clearing of val
+            and as canonize argument.  Clear val using memset instead of
+            a loop.
+    
+            * gcc.dg/pr113722.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-03 19:45:27 UTC
+  Text: Fixed.
+

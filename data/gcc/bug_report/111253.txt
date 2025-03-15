@@ -1,0 +1,178 @@
+Bug Summary: [11 Regression] Dodgy pointer name (*_42 = PHI ...) in -Wfree-nonheap-object diagnostic
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: diagnostic
+Known to Work: 12.3.1, 13.2.1, 14.0
+Known to Fail: 11.5.0, 12.3.0, 13.2.0
+
+Comments:
+- User: Sam James | Time: 2023-08-31 06:33:34 UTC
+  Text: Createdattachment 55823[details]object_cache.i
+
+With gcc-13 (Gentoo Hardened 13.2.1_p20230826 p7) 13.2.1 20230826:
+```
+/bin/sh ../libtool  --tag=CC   --mode=compile x86_64-pc-linux-gnu-gcc -DHAVE_CONFIG_H -I. -I..    -fvisibility=hidden -pthread -std=gnu99 -O2 -pipe -march=native -fdiagnostics-color=always -frecord-gcc-switch
+es -Wreturn-type      -ggdb3 -Wall -Wmissing-prototypes -Wextra -DLT_BUILDING_DLL=1 -c -o data-struct/object_cache.lo data-struct/object_cache.c
+libtool: compile:  x86_64-pc-linux-gnu-gcc -DHAVE_CONFIG_H -I. -I.. -fvisibility=hidden -pthread -std=gnu99 -O2 -pipe -march=native -fdiagnostics-color=always -frecord-gcc-switches -Wreturn-type -ggdb3 -Wall
+-Wmissing-prototypes -Wextra -DLT_BUILDING_DLL=1 -c data-struct/object_cache.c  -fPIC -DPIC -o data-struct/.libs/object_cache.o
+In function 'resize_memory_caches',
+    inlined from 'find_cache' at data-struct/object_cache.c:211:4:
+data-struct/object_cache.c:150:29: warning: 'realloc' called on pointer '*_42 = PHI <lcs.14_40(29), lcs.19_48(30)>.t_mem_caches' with nonzero offset 640 [-Wfree-nonheap-object]
+  150 |         lcs->t_mem_caches = realloc(lcs->t_mem_caches,
+      |                             ^~~~~~~~~~~~~~~~~~~~~~~~~~
+  151 |                                     lcs->t_mem_caches_total * sizeof(struct local_cache));
+      |                                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+```
+
+gcc -O2 -c object_cache.i is enough to reproduce.
+
+- User: Sam James | Time: 2023-08-31 07:05:57 UTC
+  Text: Createdattachment 55825[details]reduced.i
+
+- User: Richard Biener | Time: 2023-08-31 11:13:29 UTC
+  Text: We use
+
+2034      if (!warning_at (loc, OPT_Wfree_nonheap_object,
+2035                       "%qD called on pointer %qE with nonzero offset%s",
+2036                       dealloc_decl, aref.ref, offstr))
+
+so this is %qE handling where in c_pretty_printer::primary_expression for
+an SSA name we do
+
+      if (SSA_NAME_VAR (e))
+        ...
+      else
+        {
+          /* Print only the right side of the GIMPLE assignment.  */
+          gimple *def_stmt = SSA_NAME_DEF_STMT (e);
+          pp_gimple_stmt_1 (this, def_stmt, 0, TDF_RHS_ONLY);
+        }
+
+this regressed withr11-6508-gabb1b6058c09a7which of course was supposed
+to be an improvement.  But I'm not sure in which cases it actually is?
+Possibly when the definition is a memory read (but then this can also
+appear to falsely re-order loads across stores).
+
+Fixing this gets us again
+
+t.i:21:5: warning: 'realloc' called on pointer '*<unknown>.t_mem_caches' with nonzero offset 40 [-Wfree-nonheap-object]
+   21 |     realloc(__trans_tmp_1.t_mem_caches, sizeof(int));
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+the idea of expanding GIMPLE stmts until we hit a named one might be
+appealing but then we need to do so recursively and for example
+expand PHIs as <condition> ? A : B (or even more complex for PHIs with
+more than one argument).
+
+The following still passes the three testcases adjusted/added with the
+original change.
+
+diff --git a/gcc/c-family/c-pretty-print.cc b/gcc/c-family/c-pretty-print.cc
+index 7536a7c471f..679aa766fe0 100644
+--- a/gcc/c-family/c-pretty-print.cc
++++ b/gcc/c-family/c-pretty-print.cc
+@@ -33,6 +33,9 @@ along with GCC; see the file COPYING3.  If not see
+ #include "langhooks.h"
+ #include "options.h"
+ #include "internal-fn.h"
++#include "function.h"
++#include "basic-block.h"
++#include "gimple.h"
+ 
+ /* The pretty-printer code is primarily designed to closely follow
+    (GNU) C and C++ grammars.  That is to be contrasted with spaghetti
+@@ -1380,12 +1383,14 @@ c_pretty_printer::primary_expression (tree e)
+          else
+            primary_expression (var);
+        }
+-      else
++      else if (gimple_assign_single_p (SSA_NAME_DEF_STMT (e)))
+        {
+          /* Print only the right side of the GIMPLE assignment.  */
+          gimple *def_stmt = SSA_NAME_DEF_STMT (e);
+          pp_gimple_stmt_1 (this, def_stmt, 0, TDF_RHS_ONLY);
+        }
++      else
++       expression (e);
+       break;
+ 
+     default:
+
+- User: Richard Biener | Time: 2023-08-31 11:14:28 UTC
+  Text: ***Bug 111254has been marked as a duplicate of this bug. ***
+
+- User: Richard Biener | Time: 2023-08-31 12:37:14 UTC
+  Text: Successfully tested.
+
+- User: GCC Commits | Time: 2023-08-31 13:07:46 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:e3ece7684b02c47d2b259899cf8009d6bdcccaf3commitr14-3595-ge3ece7684b02c47d2b259899cf8009d6bdcccaf3Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Aug 31 13:53:21 2023 +0200
+
+    middle-end/111253 - partly revertr11-6508-gabb1b6058c09a7The following keeps dumping SSA def stmt RHS during diagnostic
+    reporting only for gimple_assign_single_p defs which means
+    memory loads.  This avoids diagnostics containing PHI nodes
+    like
+    
+      warning: 'realloc' called on pointer '*_42 = PHI <lcs.14_40(29), lcs.19_48(30)>.t_mem_caches' with nonzero offset 40
+    
+    instead getting back the previous behavior:
+    
+      warning: 'realloc' called on pointer '*<unknown>.t_mem_caches' with nonzero offset 40PR middle-end/111253gcc/c-family/
+            * c-pretty-print.cc (c_pretty_printer::primary_expression):
+            Only dump gimple_assign_single_p SSA def RHS.
+    
+    gcc/testsuite/
+            * gcc.dg/Wfree-nonheap-object-7.c: New testcase.
+
+- User: Richard Biener | Time: 2023-08-31 13:08:12 UTC
+  Text: Fixed on trunk sofar.
+
+- User: GCC Commits | Time: 2023-11-10 14:23:58 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:f1e717bd8b043e07e74accff3235d04e6eb719cccommitr13-8036-gf1e717bd8b043e07e74accff3235d04e6eb719ccAuthor: Richard Biener <rguenther@suse.de>
+Date:   Thu Aug 31 13:53:21 2023 +0200
+
+    middle-end/111253 - partly revertr11-6508-gabb1b6058c09a7The following keeps dumping SSA def stmt RHS during diagnostic
+    reporting only for gimple_assign_single_p defs which means
+    memory loads.  This avoids diagnostics containing PHI nodes
+    like
+    
+      warning: 'realloc' called on pointer '*_42 = PHI <lcs.14_40(29), lcs.19_48(30)>.t_mem_caches' with nonzero offset 40
+    
+    instead getting back the previous behavior:
+    
+      warning: 'realloc' called on pointer '*<unknown>.t_mem_caches' with nonzero offset 40PR middle-end/111253gcc/c-family/
+            * c-pretty-print.cc (c_pretty_printer::primary_expression):
+            Only dump gimple_assign_single_p SSA def RHS.
+    
+    gcc/testsuite/
+            * gcc.dg/Wfree-nonheap-object-7.c: New testcase.
+    
+    (cherry picked from commit e3ece7684b02c47d2b259899cf8009d6bdcccaf3)
+
+- User: GCC Commits | Time: 2023-12-15 13:17:29 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:e26608db3c2b2644decca5f49dab1e6846a9d1b0commitr12-10041-ge26608db3c2b2644decca5f49dab1e6846a9d1b0Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Aug 31 13:53:21 2023 +0200
+
+    middle-end/111253 - partly revertr11-6508-gabb1b6058c09a7The following keeps dumping SSA def stmt RHS during diagnostic
+    reporting only for gimple_assign_single_p defs which means
+    memory loads.  This avoids diagnostics containing PHI nodes
+    like
+    
+      warning: 'realloc' called on pointer '*_42 = PHI <lcs.14_40(29), lcs.19_48(30)>.t_mem_caches' with nonzero offset 40
+    
+    instead getting back the previous behavior:
+    
+      warning: 'realloc' called on pointer '*<unknown>.t_mem_caches' with nonzero offset 40PR middle-end/111253gcc/c-family/
+            * c-pretty-print.cc (c_pretty_printer::primary_expression):
+            Only dump gimple_assign_single_p SSA def RHS.
+    
+    gcc/testsuite/
+            * gcc.dg/Wfree-nonheap-object-7.c: New testcase.
+    
+    (cherry picked from commit e3ece7684b02c47d2b259899cf8009d6bdcccaf3)
+
+- User: Richard Biener | Time: 2024-07-19 12:19:17 UTC
+  Text: Fixed in GCC 12.4.
+

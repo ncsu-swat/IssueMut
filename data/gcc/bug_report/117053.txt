@@ -1,0 +1,150 @@
+Bug Summary: [15 Regression] ICE in extract_insn building glibc testsuite tst-svc2.c
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Joseph S. Myers | Time: 2024-10-09 21:07:26 UTC
+  Text: Createdattachment 59303[details]preprocessed source
+
+The recent commit
+
+commit 37554bacfd38b1466278b529d9e70a44d7b1b909
+Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Oct 7 10:50:39 2024 +0200
+
+    ssa-math-opts, i386: Improve spaceship expansion [PR116896]
+
+introduced an ICE building the glibc testsuite for i486-linux-gnu (there's also an ICE for i586-linux-gnu, probably the same though I didn't investigate / bisect it separately). Build the attached test with -m32 -march=i486 -O2 (I was testing with an x86_64-linux-gnu compiler with those options including -m32).
+
+tst-svc2.c: In function 'compare':
+tst-svc2.c:26:1: error: unrecognizable insn:
+   26 | }
+      | ^
+(insn 20 19 21 2 (set (reg:SI 107)
+        (zero_extend:SI (reg:QI 106))) -1
+     (nil))
+during RTL pass: vregs
+tst-svc2.c:26:1: internal compiler error: in extract_insn, at recog.cc:2882
+0x24b6a50 internal_error(char const*, ...)
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/diagnostic-global-context.cc:517
+0x956b91 fancy_abort(char const*, int, char const*)
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/diagnostic.cc:1617
+0x7ec8e6 _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/rtl-error.cc:108
+0x7ec902 _fatal_insn_not_found(rtx_def const*, char const*, int, char const*)
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/rtl-error.cc:116
+0x7eadf6 extract_insn(rtx_insn*)
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/recog.cc:2882
+0xca9015 instantiate_virtual_regs_in_insn
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/function.cc:1612
+0xca9015 instantiate_virtual_regs
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/function.cc:1995
+0xca9015 execute
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/function.cc:2042
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: Andrew Pinski | Time: 2024-10-09 21:24:38 UTC
+  Text: Reduced testcase:
+```
+int f(void);
+int g(void)
+{
+  int c = f();
+  if (c != 0)
+    c /= __builtin_abs (c);
+  return c;
+}
+```
+
+Fails with `-m32 -march=i486 -O2`.
+
+- User: Jakub Jelinek | Time: 2024-10-09 21:26:40 UTC
+  Text: Reduced testcase:
+int
+foo (int x, int y)
+{
+  int v;
+  if (x == 0)
+    v = 0;
+  else if (x > 0)
+    v = 1;
+  else
+    v = -1;
+  return v == y;
+}
+
+Seems -march=i486 and -march=i586 are TARGET_ZERO_EXTEND_WITH_AND targets and the movzbl emitted doesn't work there.
+Guess either I can use the UNSPEC setcc that is used for the jp float comparison case, or simply make the spaceship int patterns use !TARGET_ZERO_EXTEND_WITH_AND condition and for floating point always emits the branches.  Who cares about i486 or i586 code performance these days...
+
+- User: Andrew Pinski | Time: 2024-10-09 21:31:17 UTC
+  Text: The problem is in ix86_expand_int_spaceship 
+
+here:
++      emit_insn (gen_rtx_SET (tmp, gen_rtx_ZERO_EXTEND (GET_MODE (dest),
++                                                       lt_tmp)));
+
+Most likely should have used:
+emit_insn (gen_zero_extend<mode>si2 (tmp, lt_tmp))
+
+But that requires some magic.
+
+This is due to TARGET_ZERO_EXTEND_WITH_AND which is only set for 486 and pentium:
+
+/* X86_TUNE_ZERO_EXTEND_WITH_AND: Use AND instruction instead
+   of mozbl/movwl.  */
+DEF_TUNE (X86_TUNE_ZERO_EXTEND_WITH_AND, "zero_extend_with_and",
+          m_486 | m_PENT)
+
+- User: Jakub Jelinek | Time: 2024-10-09 21:39:52 UTC
+  Text: (In reply to Andrew Pinski fromcomment #3)> The problem is in ix86_expand_int_spaceship 
+> 
+> here:
+> +      emit_insn (gen_rtx_SET (tmp, gen_rtx_ZERO_EXTEND (GET_MODE (dest),
+> +                                                       lt_tmp)));
+> 
+> Most likely should have used:
+> emit_insn (gen_zero_extend<mode>si2 (tmp, lt_tmp))No, it can't.  We can't clobber flags that need to be still used.
+
+- User: Jakub Jelinek | Time: 2024-10-10 18:18:13 UTC
+  Text: Createdattachment 59314[details]gcc15-pr117053.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-10-11 09:43:02 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:b0d624726cccdb855f9e1ba68edbd5c30913457bcommitr15-4249-gb0d624726cccdb855f9e1ba68edbd5c30913457bAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Oct 11 11:41:53 2024 +0200
+
+    i386: Fix up spaceship expanders for -mtune=i[45]86 [PR117053]
+    
+    The adjusted and new spaceship expanders ICE with -mtune=i486 or
+    -mtune=i586.
+    The problem is that in that case TARGET_ZERO_EXTEND_WITH_AND is true
+    and zero_extendqisi2 isn't allowed in that case, and we can't use
+    the replacement AND, because that clobbers flags and we want to use them
+    again.
+    
+    The following patch fixes that by using in those cases roughly what
+    we want to expand it to after peephole2 optimizations, i.e. xor
+    before the comparison, *setcc_qi_slp and sbbl $0 (or for signed
+    int case xoring of 2 regs, two *setcc_qi_slp, subl).
+    For *setcc_qi_slp, it uses the setcc_si_slp hacks with UNSPEC that
+    were in use for the floating point jp case (so such code is IMHO
+    undesirable for the !TARGET_ZERO_EXTEND_WITH_AND case as we want to
+    give combiner more liberty in that case).
+    
+    2024-10-11  Jakub Jelinek  <jakub@redhat.com>PR target/117053* config/i386/i386-expand.cc (ix86_expand_fp_spaceship): Handle
+            TARGET_ZERO_EXTEND_WITH_AND differently.
+            (ix86_expand_int_spaceship): Likewise.
+    
+            * g++.target/i386/pr116896-3.C: New test.
+
+- User: Jakub Jelinek | Time: 2024-10-11 10:16:58 UTC
+  Text: Should be fixed now.  Sorry for missing this case.
+

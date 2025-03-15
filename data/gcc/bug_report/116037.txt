@@ -1,0 +1,104 @@
+Bug Summary: [15 Regression] wrong code at -O2 with vector masking and add
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-07-22 19:30:46 UTC
+  Text: Createdattachment 58722[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O2 testcase.c -Wno-psabi
+$ ./a.out 
+Aborted
+
+The values are missing the bit 32 set.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r15-2206-20240722194717-g6f81b7fa799-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r15-2206-20240722194717-g6f81b7fa799-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 15.0.0 20240722 (experimental) (GCC)
+
+- User: Sam James | Time: 2024-07-22 19:43:09 UTC
+  Text: It's -fext-dce.
+
+- User: Andrew Pinski | Time: 2024-07-23 01:38:36 UTC
+  Text: .
+
+- User: Jeffrey A. Law | Time: 2024-07-24 01:28:59 UTC
+  Text: So this is fixed by a patch I'm still working on.  Essentially I want to stop relying on an empty LIVE_TMP to denote that we skipped a destination's set.  That's not quite ready yet, but I think it's damn close.
+
+- User: GCC Commits | Time: 2024-07-24 17:17:30 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:679086172b84be18c55fdbb9cda7e97806e7c083commitr15-2275-g679086172b84be18c55fdbb9cda7e97806e7c083Author: Jeff Law <jlaw@ventanamicro.com>
+Date:   Wed Jul 24 11:16:26 2024 -0600
+
+    [rtl-optimization/116037] Explicitly track if a destination was skipped in ext-dce
+    
+    So this has been in the hopper since the first bugs were reported against
+    ext-dce.  It'd been holding off committing as I was finding other issues in
+    terms of correctness of live computations.  There's still problems in that
+    space, but I think it's time to push this chunk forward.  I'm marking it as
+    116037, but it may impact other bugs.
+    
+    This patch starts explicitly tracking if set processing skipped a destination,
+    which can happen for wide modes (TI+), vectors, certain subregs, etc.  This is
+    computed during ext_dce_set_processing.
+    
+    During use processing we use that flag to determine reliably if we need to make
+    the inputs fully live and to avoid even trying to eliminate an extension if we
+    skipped output processing.
+    
+    While testing this I found that a recent change to fix cases where we had two
+    subreg input operands mucked up the code to make things like a shift/rotate
+    count fully live.  So that goof has been fixed.
+    
+    Bootstrapped and regression tested on x86.  Most, but not all, of these changes
+    have also been tested on the crosses.  Pushing to the trunk.
+    
+    I'm not including it in this patch but I'm poking at converting this code to
+    use note_uses/note_stores to make it more maintainable.  The SUBREG and
+    STRICT_LOW_PART handling of note_stores is problematical, but I think it's
+    solvable.  I haven't tried a conversion to note_uses yet.PR rtl-optimization/116037gcc/
+            * ext-dce.cc (ext_dce_process_sets): Note if we ever skip a dest
+            and return that info explicitly.
+            (ext_dce_process_uses): If a set was skipped, then consider all bits
+            in every input as live.  Do not try to optimize away an extension if
+            we skipped processing a destination in the same insn.  Restore code
+            to make shift/rotate count fully live.
+            (ext_dce_process_bb): Handle API changes for ext_dce_process_sets.
+    
+    gcc/testsuite/
+            * gcc.dg/torture/pr116037.c: New test
+
+- User: Jeffrey A. Law | Time: 2024-07-24 17:18:51 UTC
+  Text: Fixed on the trunk.
+
+- User: Jeffrey A. Law | Time: 2024-07-24 17:39:50 UTC
+  Text: ***Bug 116067has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2024-08-06 09:53:13 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:df4062c54b0b3c5f5c6a1f1a2454abf965100e3acommitr15-2753-gdf4062c54b0b3c5f5c6a1f1a2454abf965100e3aAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Aug 6 11:52:35 2024 +0200
+
+    testsuite: Fix uppr116037.c test [PR116245]
+    
+    The test FAILs on big endian targets, because VV is a vector of unsigned __int128
+    and VC vector of unsigned char and so ((VC) vv)[0] is 0x01 on little endian
+    but 0xff on big endian and PDP endian.
+    As I believe it is intentional to test it as it is written on little endian,
+    the following patch just adds another case for big endian and for other
+    endians instead of figuring out what exactly to fetch it fetches the whole
+    unsigned __int128 and casts it to unsigned char.  Not that pdp11 has
+    __int128 support...
+    
+    2024-08-06  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/116037PR testsuite/116245* gcc.dg/torture/pr116037.c (foo): Fix up for big end middle endian.
+

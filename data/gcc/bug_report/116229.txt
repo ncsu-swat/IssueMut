@@ -1,0 +1,155 @@
+Bug Summary: [15 Regression] wrong code at -Ofast aarch64 due to missing fneg to generate 0x8000000000000000
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 14.2.1
+Known to Fail: 15.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-08-04 18:09:01 UTC
+  Text: Createdattachment 58828[details]reduced testcase
+
+Output:
+$ aarch64-unknown-linux-gnu-gcc -Ofast testcase.c -static
+$ qemu-aarch64 -- ./a.out 
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted
+
+Diff from -O3 to -Ofast shows the 0x8000000000000000 constant is not generated (as -0.0):
+
+$ diff -u a-testcase.s-O3 a-testcase.s-Ofast 
+--- a-testcase.s-O3     2024-08-04 20:07:06.417271286 +0200
++++ a-testcase.s-Ofast  2024-08-04 20:07:11.877241325 +0200
+@@ -24,7 +24,7 @@
+ main:
+ .LFB1:
+        .cfi_startproc
+-       movi    v0.4s, 0
++       movi    v0.2d, 0
+        stp     x29, x30, [sp, -48]!
+        .cfi_def_cfa_offset 48
+        .cfi_offset 29, -48
+@@ -35,7 +35,6 @@
+        .cfi_offset 20, -24
+        adrp    x20, .LC0
+        add     x19, sp, 40
+-       fneg    v0.2d, v0.2d
+        add     x20, x20, :lo12:.LC0
+        bl      foo
+        str     d0, [sp, 40]
+
+$ aarch64-unknown-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-aarch64/bin/aarch64-unknown-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r15-2709-20240804001730-g7cd71c88637-checking-yes-rtl-df-extra-nobootstrap-aarch64/bin/../libexec/gcc/aarch64-unknown-linux-gnu/15.0.0/lto-wrapper
+Target: aarch64-unknown-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --with-sysroot=/usr/aarch64-unknown-linux-gnu --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=aarch64-unknown-linux-gnu --with-ld=/usr/bin/aarch64-unknown-linux-gnu-ld --with-as=/usr/bin/aarch64-unknown-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r15-2709-20240804001730-g7cd71c88637-checking-yes-rtl-df-extra-nobootstrap-aarch64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 15.0.0 20240804 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-08-04 22:27:26 UTC
+  Text: Reduced a little further:
+```
+typedef __attribute__((__vector_size__ (8))) unsigned long V;
+
+V __attribute__((__noipa__))
+foo (void)
+{
+  return (V){ 0x8000000000000000 };
+}
+
+V ref = (V){ 0x8000000000000000 };
+
+int
+main ()
+{
+  V v = foo ();
+  if (v[0] != ref[0])
+    __builtin_abort();
+}
+```
+
+
+Late_combine2 does:
+```
+trying to combine definition of r32 in:
+   13: v0:V4SI=const_vector
+into:
+   14: v0:V2DF=-v0:V2DF
+successfully matched this instruction to *aarch64_simd_movv2df:
+(set (reg:V2DF 32 v0)
+    (const_vector:V2DF [
+            (const_double:DF -0.0 [-0x0.0p+0]) repeated x2
+        ]))
+```
+
+Which is correct if it was V2DF but the issue is how split of:
+```
+(insn 10 5 11 2 (set (reg:DI 32 v0)
+        (const_int -9223372036854775808 [0x8000000000000000])) "/app/example.cpp":7:1 -1
+     (expr_list:REG_EQUAL (const_int -9223372036854775808 [0x8000000000000000])
+        (nil)))
+```
+
+into:
+```
+(insn 13 5 14 2 (set (reg:V4SI 32 v0)
+        (const_vector:V4SI [
+                (const_int 0 [0]) repeated x4
+            ])) "/app/example.cpp":7:1 -1
+     (nil))
+(insn 14 13 11 2 (set (reg:V2DF 32 v0)
+        (neg:V2DF (reg:V2DF 32 v0))) "/app/example.cpp":7:1 -1
+     (nil))
+```
+
+Via `Splitting with gen_split_10 (aarch64.md:1488)` .
+
+- User: Andrew Pinski | Time: 2024-08-04 22:38:39 UTC
+  Text: /* For Advanced SIMD we can create an integer with only the top bit set
+     using fneg (0.0f).  */
+
+is wrong in aarch64_maybe_generate_simd_constant.
+
+it should use either an unspec here or an XOR instead of fneg here I think especially for -ffast-math reasons.
+
+- User: Tamar Christina | Time: 2024-08-06 06:23:35 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)>   /* For Advanced SIMD we can create an integer with only the top bit set
+>      using fneg (0.0f).  */
+> 
+> is wrong in aarch64_maybe_generate_simd_constant.
+> 
+> it should use either an unspec here or an XOR instead of fneg here I think
+> especially for -ffast-math reasons.XOR would defeat the point of the optimization. The original expression is fine but relied on nothing in the late pipeline being able to fold the zero constant back in.
+
+It was for this reason that we explicitly forced it to a separate register. Late combine is just doing something not possible before. I'll fix it.
+
+- User: GCC Commits | Time: 2024-08-08 17:52:00 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:2c24e0568392e51a77ebdaab629d631969ce8966commitr15-2839-g2c24e0568392e51a77ebdaab629d631969ce8966Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Thu Aug 8 18:51:30 2024 +0100
+
+    AArch64: Fix signbit mask creation after late combine [PR116229]
+    
+    The optimization to generate a Di signbit constant by using fneg was relying
+    on nothing being able to push the constant into the negate.  It's run quite
+    late for this reason.
+    
+    However late combine now runs after it and triggers RTL simplification based on
+    the neg.  When -fno-signed-zeros this ends up dropping the - from the -0.0 and
+    thus producing incorrect code.
+    
+    This change adds a new unspec FNEG on DI mode which prevents this simplication.
+    
+    gcc/ChangeLog:PR target/116229* config/aarch64/aarch64-simd.md (aarch64_fnegv2di2<vczle><vczbe>): New.
+            * config/aarch64/aarch64.cc (aarch64_maybe_generate_simd_constant):
+            Update call to gen_aarch64_fnegv2di2.
+            * config/aarch64/iterators.md: New UNSPEC_FNEG.
+    
+    gcc/testsuite/ChangeLog:PR target/116229* gcc.target/aarch64/pr116229.c: New test.
+
+- User: Tamar Christina | Time: 2024-08-08 17:55:11 UTC
+  Text: Fixed, thanks for the report!
+

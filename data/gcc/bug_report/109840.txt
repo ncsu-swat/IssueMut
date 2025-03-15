@@ -1,0 +1,122 @@
+Bug Summary: [14 Regression] internal compiler error: in expand_fn_using_insn, at internal-fn.cc:153 when building graphite2
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sam James | Time: 2023-05-13 06:34:22 UTC
+  Text: Createdattachment 55074[details]GlyphCache.cpp.ii.orig
+
+Split out fromPR109834(https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109834#c8).
+
+```
+$ aarch64-unknown-linux-gnu-g++ -O2 -c GlyphCache.cpp.ii
+during RTL pass: expand
+/var/tmp/portage/media-gfx/graphite2-1.3.14_p20210810-r3/work/graphite-80c52493ef42e6fe605a69dcddd2a691cd8a1380/src/GlyphCache.cpp: In member function ‘const graphite2::GlyphFace* graphite2::GlyphCache::Loader::read_glyph(short unsigned int, graphite2::GlyphFace&, int*) const’:
+/var/tmp/portage/media-gfx/graphite2-1.3.14_p20210810-r3/work/graphite-80c52493ef42e6fe605a69dcddd2a691cd8a1380/src/GlyphCache.cpp:348:19: internal compiler error: in expand_fn_using_insn, at internal-fn.cc:153
+  348 | const GlyphFace * GlyphCache::Loader::read_glyph(unsigned short glyphid, GlyphFace & glyph, int *numsubs) const throw()
+      |                   ^~~~~~~~~~
+0xe8cadf expand_fn_using_insn
+        /usr/src/debug/sys-devel/gcc-14.0.0.9999/gcc-14.0.0.9999/gcc/internal-fn.cc:153
+0xbd5407 expand_call_stmt
+        /usr/src/debug/sys-devel/gcc-14.0.0.9999/gcc-14.0.0.9999/gcc/cfgexpand.cc:2737
+0xbd5407 expand_gimple_stmt_1
+        /usr/src/debug/sys-devel/gcc-14.0.0.9999/gcc-14.0.0.9999/gcc/cfgexpand.cc:3880
+0xbd5407 expand_gimple_stmt
+        /usr/src/debug/sys-devel/gcc-14.0.0.9999/gcc-14.0.0.9999/gcc/cfgexpand.cc:4044
+0xbdc793 expand_gimple_basic_block
+        /usr/src/debug/sys-devel/gcc-14.0.0.9999/gcc-14.0.0.9999/gcc/cfgexpand.cc:6106
+0xbde4cf execute
+        /usr/src/debug/sys-devel/gcc-14.0.0.9999/gcc-14.0.0.9999/gcc/cfgexpand.cc:6841
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://bugs.gentoo.org/> for instructions.
+```
+
+```
+gcc (Gentoo 14.0.0.9999 p, commit 29d805847dc870c92f705ed9c5e7eac955c7e7d4) 14.0.0 20230513 (experimental) 99488a6048745a7b999c22f46e5814d02ebf88d9
+Copyright (C) 2023 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+```
+
+- User: Sam James | Time: 2023-05-13 06:35:17 UTC
+  Text: Createdattachment 55075[details]GlyphCache.cpp.ii (reduced)
+
+- User: Andrew Pinski | Time: 2023-05-13 06:53:44 UTC
+  Text: (gdb) p debug_gimple_stmt(stmt)
+_5 = .POPCOUNT (load_dst_15);
+
+
+  short unsigned int load_dst_15;
+
+  <bb 2> [local count: 1073741824]:
+  load_dst_15 = MEM <short unsigned int> [(unsigned char *)&Loaderthrow_p];
+  _5 = .POPCOUNT (load_dst_15);
+
+In forwprop4:
+gimple_simplified to _5 = .POPCOUNT (load_dst_15);
+
+
+Before:
+  load_dst_15 = MEM <short unsigned int> [(unsigned char *)&Loaderthrow_p];
+  bswapdst_16 = load_dst_15 r>> 8;
+  r_14 = (unsigned int) bswapdst_16;
+  _5 = .POPCOUNT (r_14);
+
+
+aarch64 has a popcountsi2 pattern but does not have a popcounthi2 pattern.
+
+Using the internal function here is definitely an issue without checking which patterns the backend has.
+
+Confirmed.
+
+- User: Andrew Pinski | Time: 2023-05-13 07:01:50 UTC
+  Text: Now the aarch64 backend could add hi and qi patterns for popcount.
+
+For the TARGET_CSSC case, it would need to zero extend to SImode.
+For the !TARGET_CSSC case, it would also zero extend but instead to DImode (just like SImode case).
+
+
+But I am not 100% sure there might be other backends that would need this.
+
+Now the expansion of the popcount Internal function could do the zero extend but that is not what the internal function is for ...
+
+- User: Roger Sayle | Time: 2023-05-14 18:08:24 UTC
+  Text: Doh!  The recent popcount(bswap(x)) optimizations shouldn't be changing the width of the popcount, i.e. the convert? extension needs to be re-inserted, it's only the bswap that gets eliminated.  I'll investigate a fix.
+
+- User: GCC Commits | Time: 2023-05-24 16:36:53 UTC
+  Text: The master branch has been updated by Roger Sayle <sayle@gcc.gnu.org>:https://gcc.gnu.org/g:2738955004256c2e9753364d78a7be340323b74bcommitr14-1171-g2738955004256c2e9753364d78a7be340323b74bAuthor: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Wed May 24 17:32:20 2023 +0100PR middle-end/109840: Preserve popcount/parity type in match.pd.PR middle-end/109840is a regression introduced by my recent patch to
+    fold popcount(bswap(x)) as popcount(x).  When the bswap and the popcount
+    have the same precision, everything works fine, but this optimization also
+    allowed a zero-extension between the two.  The oversight is that we need
+    to be strict with type conversions, both to avoid accidentally changing
+    the argument type to popcount, and also to reflect the effects of
+    argument/return-value promotion in the call to bswap, so this zero extension
+    needs to be preserved/explicit in the optimized form.
+    
+    Interestingly, match.pd should (in theory) be able to narrow calls to
+    popcount and parity, removing a zero-extension from its argument, but
+    that is an independent optimization, that needs to check IFN_ support.
+    Many thanks to Andrew Pinski for his help/fixes with these transformations.
+    
+    2023-05-24  Roger Sayle  <roger@nextmovesoftware.com>
+    
+    gcc/ChangeLogPR middle-end/109840* match.pd <popcount optimizations>: Preserve zero-extension when
+            optimizing popcount((T)bswap(x)) and popcount((T)rotate(x,y)) as
+            popcount((T)x), so the popcount's argument keeps the same type.
+            <parity optimizations>:  Likewise preserve extensions when
+            simplifying parity((T)bswap(x)) and parity((T)rotate(x,y)) as
+            parity((T)x), so that the parity's argument type is the same.
+    
+    gcc/testsuite/ChangeLogPR middle-end/109840* gcc.dg/fold-parity-8.c: New test.
+            * gcc.dg/fold-popcount-11.c: Likewise.
+
+- User: Roger Sayle | Time: 2023-05-26 13:20:49 UTC
+  Text: Many thanks to Sam for confirming this is now fixed on aarch64.
+

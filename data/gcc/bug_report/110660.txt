@@ -1,0 +1,320 @@
+Bug Summary: conditional length reduction optimization
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2023-07-14 01:51:25 UTC
+  Text: Consider this following test:
+
+#include <stdint.h>
+int __attribute__((noipa))
+add_loop (int32_t * __restrict x, int32_t n, int res, int * __restrict cond)
+{
+  for (int i = 0; i < n; ++i)
+    if (cond[i])
+      res += x[i];
+  return res;
+}
+
+
+Current GCC can do vectorize reduction for RVV:
+
+  <bb 4> [local count: 630715945]:
+  ...
+
+  _59 = .SELECT_VL (ivtmp_57, POLY_INT_CST [4, 4]);
+  ivtmp_40 = _59 * 4;
+  vect__4.10_43 = .LEN_MASK_LOAD (vectp_cond.8_41, 32B, _59, 0, { -1, ... });
+  mask__18.11_45 = vect__4.10_43 != { 0, ... };
+  vect__7.14_49 = .LEN_MASK_LOAD (vectp_x.12_47, 32B, _59, 0, mask__18.11_45);
+
+  vect__ifc__33.15_51 = .VCOND_MASK (mask__18.11_45, vect__7.14_49, { 0, ... });
+
+  vect__34.16_52 = .COND_LEN_ADD ({ -1, ... }, vect_res_19.7_38, 
+  vect__ifc__33.15_51, vect_res_19.7_38, _59, 0);
+
+  ...
+
+  <bb 5> [local count: 105119324]:
+  _54 = .REDUC_PLUS (vect__34.16_52);
+  _55 = res_11(D) + _54;
+
+
+Actually, we can optmize "VCOND_MASK + COND_LEN_ADD" into single "COND_LEN_ADD"
+with replacing the argument of "COND_LEN_ADD". 
+
+Consider this following pattern:
+
+dummy_mask = { -1, ... }
+dummy_else_value = { 0, ... } ;; This is dummy for PLUS, since a + 0 = a
+
+op1_2 = .VCOND_MASK (control_mask, op1_1, dummy_else_value);
+result = .COND_LEN_ADD (dummy_mask, op0, op1_2, op2, loop_len, bias)
+
+Since it is using dummy_mask and dummy_else_value, we can simplify this
+operation into:
+
+result = .COND_LEN_ADD (control_mask, op0, op1_1, op2, loop_len, bias)
+
+To do this optimization, we can either do this optimization either in middle-end
+"match.pd" or in backend "combine pass" to handle this.
+
+Which approach is better?
+
+Thanks.
+
+- User: Richard Biener | Time: 2023-07-14 05:56:51 UTC
+  Text: The vectorizer itself could do the merging which means it could also more accurately cost things.
+
+Otherwise think about whether/how such a situation might arise from people
+using RVV intrinsics - how are those exposed to GIMPLE / RTL and at which
+level could that be optimized?  Is it possible to write an intrinsic
+testcase with such opportunity?
+
+- User: JuzheZhong | Time: 2023-07-14 06:17:58 UTC
+  Text: (In reply to Richard Biener fromcomment #1)> The vectorizer itself could do the merging which means it could also more
+> accurately cost things.
+>It's similar with ARM SVE:https://godbolt.org/z/8cn5j1zTrvect.dump:
+
+vect__ifc__33.15_53 = VEC_COND_EXPR <vec_mask_and_49, vect__7.14_50, { 0, ... }>;
+  vect__34.16_54 = .COND_ADD (loop_mask_43, vect_res_19.7_40, vect__ifc__33.15_53, vect_res_19.7_40);
+
+
+optimized.dump:
+
+vect__34.16_54 = .COND_ADD (vec_mask_and_49, vect_res_19.7_40, vect__7.14_50, vect_res_19.7_40);
+
+No vcond_mask
+
+GCC can fuse vec_cond_expr with COND_ADD, I think this pattern in match.pd helps:
+
+/* Detect cases in which a VEC_COND_EXPR effectively replaces the
+   "else" value of an IFN_COND_*.  */
+(for cond_op (COND_BINARY)
+ (simplify
+  (vec_cond @0 (view_convert? (cond_op @0 @1 @2 @3)) @4)
+  (with { tree op_type = TREE_TYPE (@3); }
+   (if (element_precision (type) == element_precision (op_type))
+    (view_convert (cond_op @0 @1 @2 (view_convert:op_type @4))))))
+ (simplify
+  (vec_cond @0 @1 (view_convert? (cond_op @2 @3 @4 @5)))
+  (with { tree op_type = TREE_TYPE (@5); }
+   (if (inverse_conditions_p (@0, @2)
+        && element_precision (type) == element_precision (op_type))
+    (view_convert (cond_op @2 @3 @4 (view_convert:op_type @1)))))))> Otherwise think about whether/how such a situation might arise from people
+> using RVV intrinsics - how are those exposed to GIMPLE / RTL and at which
+> level could that be optimized?  Is it possible to write an intrinsic
+> testcase with such opportunity?This piece code, users can easily write intrinsics to produce that but I 
+don't think compiler should help users to optimize that:
+
+user can write this code:
+
+size_t vl = vsetvl;
+vbool32_t mask = comparison;
+vbool32_t dummy_mask = vmset;
+vint32m1_t dummy_else_value = {0};
+vint32m1_t op1_1 = vload;
+vint32m1_t op1_2 = vmerge (op1_1,dummy_else_value,mask)
+vint32m1_t result = vadd (dummy_mask,op0,op1_2,op0,vl);
+
+Writing the intrinsics as above will generate the same codegen as the 
+this example auto-vectorization codegen.
+
+However, I don't think compiler should optimize this intrinsic codes since
+this intentional codes written by uers. If user want to optimize this codegen,
+user can easily modify these intrinsic as follows:
+
+size_t vl = vsetvl;
+vbool32_t mask = comparison;
+vint32m1_t op1_1 = vload;
+vint32m1_t result = vadd (mask,op0,op1_1,op0,vl);
+
+Then user can get optimal codegen.
+
+So, I am not sure whether such optimization for auto-vectorization should be done in middle-end (match.pd) or backend (combine pass).
+
+Are you suggesting me doing this in the backend?
+
+Thanks.
+
+- User: rguenther@suse.de | Time: 2023-07-14 08:29:32 UTC
+  Text: On Fri, 14 Jul 2023, juzhe.zhong at rivai dot ai wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=110660> 
+> ---Comment #2from JuzheZhong <juzhe.zhong at rivai dot ai> ---
+> (In reply to Richard Biener fromcomment #1)
+> > The vectorizer itself could do the merging which means it could also more
+> > accurately cost things.
+> > 
+> 
+> It's similar with ARM SVE:
+> 
+>https://godbolt.org/z/8cn5j1zTr> 
+> vect.dump:
+> 
+> vect__ifc__33.15_53 = VEC_COND_EXPR <vec_mask_and_49, vect__7.14_50, { 0, ...
+> }>;
+>   vect__34.16_54 = .COND_ADD (loop_mask_43, vect_res_19.7_40,
+> vect__ifc__33.15_53, vect_res_19.7_40);
+> 
+> 
+> optimized.dump:
+> 
+> vect__34.16_54 = .COND_ADD (vec_mask_and_49, vect_res_19.7_40, vect__7.14_50,
+> vect_res_19.7_40);
+> 
+> No vcond_mask
+> 
+> GCC can fuse vec_cond_expr with COND_ADD, I think this pattern in match.pd
+> helps:
+> 
+> /* Detect cases in which a VEC_COND_EXPR effectively replaces the
+>    "else" value of an IFN_COND_*.  */
+> (for cond_op (COND_BINARY)
+>  (simplify
+>   (vec_cond @0 (view_convert? (cond_op @0 @1 @2 @3)) @4)
+>   (with { tree op_type = TREE_TYPE (@3); }
+>    (if (element_precision (type) == element_precision (op_type))
+>     (view_convert (cond_op @0 @1 @2 (view_convert:op_type @4))))))
+>  (simplify
+>   (vec_cond @0 @1 (view_convert? (cond_op @2 @3 @4 @5)))
+>   (with { tree op_type = TREE_TYPE (@5); }
+>    (if (inverse_conditions_p (@0, @2)
+>         && element_precision (type) == element_precision (op_type))
+>     (view_convert (cond_op @2 @3 @4 (view_convert:op_type @1)))))))
+> 
+> 
+> 
+> > Otherwise think about whether/how such a situation might arise from people
+> > using RVV intrinsics - how are those exposed to GIMPLE / RTL and at which
+> > level could that be optimized?  Is it possible to write an intrinsic
+> > testcase with such opportunity?
+> 
+> This piece code, users can easily write intrinsics to produce that but I 
+> don't think compiler should help users to optimize that:
+> 
+> user can write this code:
+> 
+> size_t vl = vsetvl;
+> vbool32_t mask = comparison;
+> vbool32_t dummy_mask = vmset;
+> vint32m1_t dummy_else_value = {0};
+> vint32m1_t op1_1 = vload;
+> vint32m1_t op1_2 = vmerge (op1_1,dummy_else_value,mask)
+> vint32m1_t result = vadd (dummy_mask,op0,op1_2,op0,vl);
+> 
+> Writing the intrinsics as above will generate the same codegen as the 
+> this example auto-vectorization codegen.
+> 
+> However, I don't think compiler should optimize this intrinsic codes since
+> this intentional codes written by uers. If user want to optimize this codegen,
+> user can easily modify these intrinsic as follows:
+> 
+> size_t vl = vsetvl;
+> vbool32_t mask = comparison;
+> vint32m1_t op1_1 = vload;
+> vint32m1_t result = vadd (mask,op0,op1_1,op0,vl);
+> 
+> Then user can get optimal codegen.Sure.  For that to reliably work the intrinsics need to stay target
+builtins and UNSPECS, but I'm not entirely convinced this is always
+what users want.> So, I am not sure whether such optimization for auto-vectorization should be
+> done in middle-end (match.pd) or backend (combine pass).
+> 
+> Are you suggesting me doing this in the backend?If there's a match.pd pattern doing this for SVE try to extend that.
+
+- User: GCC Commits | Time: 2023-09-26 12:20:52 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:dd0197fb4cdee8cd5f78fea9a965c96d7ca47229commitr14-4277-gdd0197fb4cdee8cd5f78fea9a965c96d7ca47229Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Tue Sep 26 17:50:37 2023 +0800
+
+    MATCH: Optimize COND_ADD_LEN reduction pattern
+    
+    This patch leverage this commit:https://gcc.gnu.org/git/gitweb.cgi?p=gcc.git;h=62b505a4d5fc89to optimize COND_LEN_ADD reduction pattern.
+    
+    We are doing optimization of VEC_COND_EXPR + COND_LEN_ADD -> COND_LEN_ADD.
+    
+    Consider thsi following case:
+    
+    voidpr11594(uint64_t *restrict a, uint64_t *restrict b, int loop_size)
+    {
+      uint64_t result = 0;
+    
+      for (int i = 0; i < loop_size; i++)
+        {
+          if (b[i] <= a[i])
+            {
+              result += a[i];
+            }
+        }
+    
+      a[0] = result;
+    }
+    
+    Before this patch:
+            vsetvli a7,zero,e64,m1,ta,ma
+            vmv.v.i v2,0
+            vmv1r.v v3,v2                    --- redundant
+    .L3:
+            vsetvli a5,a2,e64,m1,ta,ma
+            vle64.v v1,0(a3)
+            vle64.v v0,0(a1)
+            slli    a6,a5,3
+            vsetvli a7,zero,e64,m1,ta,ma
+            sub     a2,a2,a5
+            vmsleu.vv       v0,v0,v1
+            add     a1,a1,a6
+            vmerge.vvm      v1,v3,v1,v0     ---- redundant.
+            add     a3,a3,a6
+            vsetvli zero,a5,e64,m1,tu,ma
+            vadd.vv v2,v2,v1
+            bne     a2,zero,.L3
+            li      a5,0
+            vsetvli a4,zero,e64,m1,ta,ma
+            vmv.s.x v1,a5
+            vredsum.vs      v2,v2,v1
+            vmv.x.s a5,v2
+            sd      a5,0(a0)
+            ret
+    
+    After this patch:
+    
+            vsetvli a6,zero,e64,m1,ta,ma
+            vmv.v.i v1,0
+    .L3:
+            vsetvli a5,a2,e64,m1,ta,ma
+            vle64.v v2,0(a4)
+            vle64.v v0,0(a1)
+            slli    a3,a5,3
+            vsetvli a6,zero,e64,m1,ta,ma
+            sub     a2,a2,a5
+            vmsleu.vv       v0,v0,v2
+            add     a1,a1,a3
+            vsetvli zero,a5,e64,m1,tu,mu
+            add     a4,a4,a3
+            vadd.vv v1,v1,v2,v0.t
+            bne     a2,zero,.L3
+            li      a5,0
+            vsetivli        zero,1,e64,m1,ta,ma
+            vmv.s.x v2,a5
+            vsetvli a5,zero,e64,m1,ta,ma
+            vredsum.vs      v1,v1,v2
+            vmv.x.s a5,v1
+            sd      a5,0(a0)
+            ret
+    
+    Bootstrap && Regression is running.
+    
+    Ok for trunk when testing passes ?PR tree-optimization/111594PR tree-optimization/110660gcc/ChangeLog:
+    
+            * match.pd: Optimize COND_LEN_ADD reduction.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/cond/cond_reduc-1.c: New test.
+            * gcc.target/riscv/rvv/autovec/cond/pr111594.c: New test.
+
+- User: JuzheZhong | Time: 2023-09-26 12:29:21 UTC
+  Text: Fixed
+

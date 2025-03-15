@@ -1,0 +1,1002 @@
+Bug Summary: [14 Regression] weird and inefficient codegen and addressing modes since r14-9193
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Tamar Christina | Time: 2024-02-28 13:57:25 UTC
+  Text: Createdattachment 57559[details]testcase
+
+The attached C++ testcase compiled with: -O3 -mcpu=neoverse-n2
+
+used to compile a nice and simple loop.  But afterg:a0b1798042d033fd2cc2c806afbb77875dd2909bThe codegen is weird and it uses horrible addressing modes.
+
+The first odd part is that it's decided to split the loop, the "main" loop has a guard after it to branch to the exit is the iteration count is 1.
+
+If not instead of just loop again it falls through the a copy of the main loop, but has destroyed addressing modes.
+
+The copy of the loop seems to have unshared the address calculations. Before we had:
+
+  _128 = (void *) ivtmp.11_20;
+  _54 = MEM <__SVFloat16_t> [(__fp16 *)_128];
+  _10 = MEM <__SVFloat16_t> [(__fp16 *)_128 + POLY_INT_CST [16B, 16B]];
+  _75 = MEM <__SVFloat16_t> [(__fp16 *)_128 + POLY_INT_CST [32B, 32B]];
+
+etc, so all as an offset from _128.  Now we have:
+
+  col_i_61 = (int) ivtmp.11_100;
+  _60 = (long unsigned int) col_i_61;
+  _59 = _60 * 2;
+  _58 = a_j_69 + _59;
+  _54 = MEM <__SVFloat16_t> [(__fp16 *)_58];
+  _53 = _59 + POLY_INT_CST [16, 16];
+  _13 = a_j_69 + _53;
+  _10 = MEM <__SVFloat16_t> [(__fp16 *)_13];
+  _74 = _59 + POLY_INT_CST [32, 32];
+  _19 = a_j_69 + _74;
+  _75 = MEM <__SVFloat16_t> [(__fp16 *)_19];
+
+and similarly for the stores as well.
+
+it also weirdly creates some very complicated addressing computations. Before we had:
+
+  _144 = p_mat_16(D) + 6; 
+  _64 = MEM <__SVFloat16_t> [(__fp16 *)_144 + ivtmp.10_100 * 2];
+  _143 = p_mat_16(D) + 4;
+  _84 = MEM <__SVFloat16_t> [(__fp16 *)_143 + ivtmp.10_100 * 2];
+
+and after:
+
+  ivtmp.23_130 = (unsigned long) p_mat_16(D);
+  _123 = 2 - ivtmp.23_130;
+  _124 = &MEM <__SVFloat16_t> [(__fp16 *)0B + _123 + ivtmp.12_109 * 2];
+  _64 = MEM <__SVFloat16_t> [(__fp16 *)_124];
+
+  _122 = -ivtmp.23_130;
+  _120 = &MEM <__SVFloat16_t> [(__fp16 *)0B + _122 + ivtmp.12_109 * 2];
+  _84 = MEM <__SVFloat16_t> [(__fp16 *)_120];
+
+This results in quite the codesize increase, and a 7-10% performance loss.
+
+- User: Richard Biener | Time: 2024-02-28 14:33:20 UTC
+  Text: Do we have POLY_INT_CSTs in CHRECs?  Huh, yeah - we do.  So in IVOPTs the
+differences are like
+
+ (get_scalar_evolution 
+   (scalar = col_i_61)
+-  (scalar_evolution = {iftmp.0_11 * _105, +, iftmp.0_11}_2))
++  (scalar_evolution = (int) {(unsigned int) col_stride_10 * (unsigned int) _105, +, (unsigned int) col_stride_10}_2))
+
+but also
+
+ (set_scalar_evolution 
+   instantiated_below = 22 
+   (scalar = _58)
+-  (scalar_evolution = {(__fp16 *) p_mat_16(D) + ((long unsigned int) _105 + (long unsigned int) (iftmp.0_11 * _105)) * 2, +, ((long unsigned int) iftmp.0_11 + 1) * 2}_2))
++  (scalar_evolution = _58))
+
+(that's completely missed)
+
+Likewise, with POLY_INT_CST:
+
+-  (scalar_evolution = {(__fp16 *) p_mat_16(D) + (((long unsigned int) (iftmp.0_11 * _105) + (long unsigned int) _105) * 2 + POLY_INT_CST [16, 16]), +, ((long unsigned int) iftmp.0_11 + 1) * 2}_2))
++  (scalar_evolution = _13))
+
+The special-casing of CHREC * x we allow to be expressed works by looking
+at value-ranges and signs of INTEGER_CSTs:
+
++         if (!ANY_INTEGRAL_TYPE_P (type)
++             || TYPE_OVERFLOW_WRAPS (type)
++             || integer_zerop (CHREC_LEFT (op0))
++             || (TREE_CODE (CHREC_LEFT (op0)) == INTEGER_CST
++                 && TREE_CODE (CHREC_RIGHT (op0)) == INTEGER_CST
++                 && (tree_int_cst_sgn (CHREC_LEFT (op0))
++                     == tree_int_cst_sgn (CHREC_RIGHT (op0))))
++             || (get_range_query (cfun)->range_of_expr (rl, CHREC_LEFT (op0
+...
+
+possibly there might be a way to adapt the "same sign" check to also work
+for POLY_INT_CSTs which I think have known signs?  Possibly rewriting
+that by using poly_int_tree_p () isntead of checking for INTEGER_CST
+and then using known_lt (wi::to_poly_wide (), 0) && known_lt (..., 0)
+|| known_gt (..., 0) && known_gt (..., 0) helps?
+
+Nope, the following doesn't make a difference here.
+
+diff --git a/gcc/tree-chrec.cc b/gcc/tree-chrec.cc
+index 2e6c7356d3b..366ab914c8f 100644
+--- a/gcc/tree-chrec.cc
++++ b/gcc/tree-chrec.cc
+@@ -442,10 +442,12 @@ chrec_fold_multiply (tree type,
+          if (!ANY_INTEGRAL_TYPE_P (type)
+              || TYPE_OVERFLOW_WRAPS (type)
+              || integer_zerop (CHREC_LEFT (op0))
+-             || (TREE_CODE (CHREC_LEFT (op0)) == INTEGER_CST
+-                 && TREE_CODE (CHREC_RIGHT (op0)) == INTEGER_CST
+-                 && (tree_int_cst_sgn (CHREC_LEFT (op0))
+-                     == tree_int_cst_sgn (CHREC_RIGHT (op0))))
++             || (poly_int_tree_p (CHREC_LEFT (op0))
++                 && poly_int_tree_p (CHREC_RIGHT (op0))
++                 && ((known_lt (wi::to_poly_widest (CHREC_LEFT (op0)), 0)
++                      && known_lt (wi::to_poly_widest (CHREC_RIGHT (op0)), 0))
++                     || (known_ge (wi::to_poly_widest (CHREC_LEFT (op0)), 0)
++                         && known_ge (wi::to_poly_widest (CHREC_RIGHT (op0)), 0))))
+              || (get_range_query (cfun)->range_of_expr (rl, CHREC_LEFT (op0))
+                  && !rl.undefined_p ()
+                  && (rl.nonpositive_p () || rl.nonnegative_p ())
+
+
+This was a correctness fix btw, so I'm not sure we can easily recover - we
+could try using niter information for CHREC_VARIABLE but then there's
+variable niter here so I don't see a chance.
+
+This is mainly IVs like
+
+  col_i_61 = col_stride_10 * j_73;
+  _60 = (long unsigned int) col_i_61;
+  _59 = _60 * 2;
+  _58 = a_j_69 + _59;
+  _54 = MEM <__SVFloat16_t> [(__fp16 *)_58];
+
+where we compose for example the scalar evolution of col_i_61 by
+multiplyinig that of j_73 which is {_105, +, 1}_2 with col_stride_10.
+
+Possibly adding a ranger instance to IVOPTs could help, for this instance
+since
+
+  <bb 4> [local count: 118111600]:
+  # col_stride_10 = PHI <size_15(D)(11), 1(2)>
+  if (size_15(D) > 0)
+    goto <bb 21>; [89.00%]
+  else
+    goto <bb 5>; [11.00%]
+
+  <bb 5> [local count: 118111600]:
+  return;
+
+so col_stride_10 should be positive, and _105 as well:
+
+  _12 = MAX_EXPR <_103, 0>;
+  _3 = (unsigned int) _12;
+  _4 = _3 + 1;
+  _105 = (int) _4;
+
+OTOH the +1 could make it overflow for large size.
+
+Can you test the above?  It should be an incremental improvement.
+
+Adding enable_ranger (cfun); / disable_ranger (cfun);  around the IVOPTs
+pass doesn't seem to help (but see above - there might not be enough
+info, also the code added doesn't pass in a context stmt so ranger
+might not do much/anything here).
+
+Confirmed.
+
+- User: Richard Biener | Time: 2024-02-28 14:36:21 UTC
+  Text: Yep, it seems to only pick up global ranges that way.
+
+diff --git a/gcc/tree-ssa-loop-ivopts.cc b/gcc/tree-ssa-loop-ivopts.cc
+index 7cae5bdefea..626fc5bf5d7 100644
+--- a/gcc/tree-ssa-loop-ivopts.cc
++++ b/gcc/tree-ssa-loop-ivopts.cc
+@@ -132,6 +132,7 @@ along with GCC; see the file COPYING3.  If not see
+ #include "tree-vectorizer.h"
+ #include "dbgcnt.h"
+ #include "cfganal.h"
++#include "gimple-range.h"
+ 
+ /* For lang_hooks.types.type_for_mode.  */
+ #include "langhooks.h"
+@@ -8280,6 +8281,8 @@ tree_ssa_iv_optimize (void)
+   tree_ssa_iv_optimize_init (&data);
+   mark_ssa_maybe_undefs ();
+ 
++  enable_ranger (cfun);
++
+   /* Optimize the loops starting with the innermost ones.  */
+   for (auto loop : loops_list (cfun, LI_FROM_INNERMOST))
+     {
+@@ -8292,6 +8295,8 @@ tree_ssa_iv_optimize (void)
+       tree_ssa_iv_optimize_loop (&data, loop, toremove);
+     }
+ 
++  disable_ranger (cfun);
++
+   /* Remove eliminated IV defs.  */
+   release_defs_bitset (toremove);
+
+- User: Tamar Christina | Time: 2024-02-28 16:51:53 UTC
+  Text: > 
+> This was a correctness fix btw, so I'm not sure we can easily recover - we
+> could try using niter information for CHREC_VARIABLE but then there's
+> variable niter here so I don't see a chance.
+>It looks like it's mostly SVE suffering here. Adv. SIMD an scalar codegen seems to have vastly improved with it. we see ~10% improvements due to better addressing for scalar.
+
+It also only happens at -O3 but -O2 is fine, which is weird as I was expected IVopts to be enabled at -O2 too.> 
+> OTOH the +1 could make it overflow for large size.
+> 
+> Can you test the above?  It should be an incremental improvement.
+>Applying the changes does not seem to make a difference for the final codegen :(
+
+- User: rguenther@suse.de | Time: 2024-02-29 07:19:35 UTC
+  Text: On Wed, 28 Feb 2024, tnfchris at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=114151> 
+> ---Comment #3from Tamar Christina <tnfchris at gcc dot gnu.org> ---
+> > 
+> > This was a correctness fix btw, so I'm not sure we can easily recover - we
+> > could try using niter information for CHREC_VARIABLE but then there's
+> > variable niter here so I don't see a chance.
+> > 
+> 
+> It looks like it's mostly SVE suffering here. Adv. SIMD an scalar codegen seems
+> to have vastly improved with it. we see ~10% improvements due to better
+> addressing for scalar.
+> 
+> It also only happens at -O3 but -O2 is fine, which is weird as I was expected
+> IVopts to be enabled at -O2 too.Note the underlying issue, analyzing { a, +, b } * c differently and
+thus eventually dependent CHRECs failing to analyze should be independent
+on the architecture.
+
+What was definitely missing is consideration of POLY_INT_CSTs (and
+variable polys, as I think there's no range info for those).
+
+We do eventually want to improve how ranger behaves here.  I'm not sure
+why when we do not provide a context 'stmt' it can't see to compute
+a range valid at the SSA names point of definition?  (so basically
+compute the global range)
+
+Maybe there's another API to do that.  But I thought it was convenient
+to use range_of_expr as that also handles GENERIC expression trees
+to some extent and those are common within SCEV.
+
+- User: Andrew Macleod | Time: 2024-02-29 18:15:08 UTC
+  Text: (In reply torguenther@suse.defromcomment #4)> 
+> What was definitely missing is consideration of POLY_INT_CSTs (and
+> variable polys, as I think there's no range info for those).
+>Ranger doesn't do anything with POLY_INTs, mostly because I didn't understand them.> We do eventually want to improve how ranger behaves here.  I'm not sure
+> why when we do not provide a context 'stmt' it can't see to compute
+> a range valid at the SSA names point of definition?  (so basically
+> compute the global range)The call looks like it doesn't provide the stmt.  Without the stmt, all ranger will ever provide is global ranges.
+
+I think you are asking why, If there is no global range, it doesn't try to compute one from the ssa_name_def_stmt?  Ranger does when it is active.   Otherwise it simply picks up the global information from SSA_NAME_RANGE_INFO()    Of course, if its a poly int, we don't actually support those... so all you will ever see is VARYING.  Again, because I don't understand them.> Maybe there's another API to do that.  But I thought it was convenient
+> to use range_of_expr as that also handles GENERIC expression trees
+> to some extent and those are common within SCEV.A range can always be calculated by simply calling fold_range from gimple-range-fold.h:
+
+// Fold stmt S into range R using range query Q.
+bool fold_range (vrange &r, gimple *s, range_query *q = NULL);
+
+if range_query is not provided, it'll simply use the current one.   If you want to ensure its only global ranges, you call it with
+
+fold_range (r, SSA_NAME_DEF_STMT (name), get_global_range_query ());
+
+- User: Richard Biener | Time: 2024-03-01 09:37:05 UTC
+  Text: (In reply to Andrew Macleod fromcomment #5)> (In reply torguenther@suse.defromcomment #4)
+> 
+> > 
+> > What was definitely missing is consideration of POLY_INT_CSTs (and
+> > variable polys, as I think there's no range info for those).
+> > 
+> Ranger doesn't do anything with POLY_INTs, mostly because I didn't
+> understand them.  
+> 
+> > We do eventually want to improve how ranger behaves here.  I'm not sure
+> > why when we do not provide a context 'stmt' it can't see to compute
+> > a range valid at the SSA names point of definition?  (so basically
+> > compute the global range)
+> 
+> The call looks like it doesn't provide the stmt.  Without the stmt, all
+> ranger will ever provide is global ranges.
+> 
+> I think you are asking why, If there is no global range, it doesn't try to
+> compute one from the ssa_name_def_stmt?  Ranger does when it is active.I tried with an active ranger but that doesn't make a difference.  Basically
+I added enable_ranger () / disable_ranger () around the pass and thought
+that would "activate" it.  But looking at range_for_expr I don't see how
+that would make a difference without a provided stmt.
+
+But maybe I'm doing it wrong?
+
+- User: Andrew Macleod | Time: 2024-03-01 15:02:31 UTC
+  Text: (In reply to Richard Biener fromcomment #6)> (In reply to Andrew Macleod fromcomment #5)
+> > (In reply torguenther@suse.defromcomment #4)
+> > 
+> > > 
+> > > What was definitely missing is consideration of POLY_INT_CSTs (and
+> > > variable polys, as I think there's no range info for those).
+> > > 
+> > Ranger doesn't do anything with POLY_INTs, mostly because I didn't
+> > understand them.  
+> > 
+> > > We do eventually want to improve how ranger behaves here.  I'm not sure
+> > > why when we do not provide a context 'stmt' it can't see to compute
+> > > a range valid at the SSA names point of definition?  (so basically
+> > > compute the global range)
+> > 
+> > The call looks like it doesn't provide the stmt.  Without the stmt, all
+> > ranger will ever provide is global ranges.
+> > 
+> > I think you are asking why, If there is no global range, it doesn't try to
+> > compute one from the ssa_name_def_stmt?  Ranger does when it is active.  
+> 
+> I tried with an active ranger but that doesn't make a difference.  Basically
+> I added enable_ranger () / disable_ranger () around the pass and thought
+> that would "activate" it.  But looking at range_for_expr I don't see how
+> that would make a difference without a provided stmt.
+>It wouldn't. why isn't a context stmt being provided?
+
+range_of_expr with no context stmt makes no attempt to calculate anything. This is because one can get into a lot of trouble as it doesn't know whether the expression you are calculating is even in the IL or just some detached tree expression.
+
+If you have an SSA NAME and want to actually calculate the value, you can use range_of_stmt (range, SSA_NAME_DEF_STMT (name))  instead of range_of_expr ().
+
+If you pass in a stmt as context, and the SSA_NAME you are asking about is the LHS of the stmt, then range_of_expr will call range_of_stmt itself... but again, it needs a context stmt in order to know its safe to do so.
+
+In general, range_of_expr with no context will not calculate anything... When a stmt for location context is provided, then its free to go an do whatever calculations are required.
+
+- User: Richard Biener | Time: 2024-03-04 07:47:15 UTC
+  Text: (In reply to Andrew Macleod fromcomment #7)> (In reply to Richard Biener fromcomment #6)
+> > (In reply to Andrew Macleod fromcomment #5)
+> > > (In reply torguenther@suse.defromcomment #4)
+> > > 
+> > > > 
+> > > > What was definitely missing is consideration of POLY_INT_CSTs (and
+> > > > variable polys, as I think there's no range info for those).
+> > > > 
+> > > Ranger doesn't do anything with POLY_INTs, mostly because I didn't
+> > > understand them.  
+> > > 
+> > > > We do eventually want to improve how ranger behaves here.  I'm not sure
+> > > > why when we do not provide a context 'stmt' it can't see to compute
+> > > > a range valid at the SSA names point of definition?  (so basically
+> > > > compute the global range)
+> > > 
+> > > The call looks like it doesn't provide the stmt.  Without the stmt, all
+> > > ranger will ever provide is global ranges.
+> > > 
+> > > I think you are asking why, If there is no global range, it doesn't try to
+> > > compute one from the ssa_name_def_stmt?  Ranger does when it is active.  
+> > 
+> > I tried with an active ranger but that doesn't make a difference.  Basically
+> > I added enable_ranger () / disable_ranger () around the pass and thought
+> > that would "activate" it.  But looking at range_for_expr I don't see how
+> > that would make a difference without a provided stmt.
+> > 
+> 
+> It wouldn't. why isn't a context stmt being provided?I don't have one in this context.  There supposedly is one, but it's not
+passed down, I'm also not sure we can use that since it would taint SCEV
+info with possibly context sensitive info that's re-used (by cache) in
+other context.> range_of_expr with no context stmt makes no attempt to calculate anything.
+> This is because one can get into a lot of trouble as it doesn't know whether
+> the expression you are calculating is even in the IL or just some detached
+> tree expression.
+> 
+> If you have an SSA NAME and want to actually calculate the value, you can
+> use range_of_stmt (range, SSA_NAME_DEF_STMT (name))  instead of
+> range_of_expr ().Yes, the issue is that I might have a GENERIC expression like _1 + 2, or
+even _1 + _2.> If you pass in a stmt as context, and the SSA_NAME you are asking about is
+> the LHS of the stmt, then range_of_expr will call range_of_stmt itself...
+> but again, it needs a context stmt in order to know its safe to do so.But for an SSA name it should be always safe to assume its definition as
+context because that's effectively what it's global range is computed from.
+If it's not in the IL then gimple_bb should be NULL, so this could be
+guarded against ...> In general, range_of_expr with no context will not calculate anything...
+> When a stmt for location context is provided, then its free to go an do
+> whatever calculations are required.So I'd like to see global ranges computed on-demand here since I can't
+easily pass in the definition stmt for a GENERIC expression.  Sth like
+(untested)
+
+diff --git a/gcc/gimple-range.cc b/gcc/gimple-range.cc
+index c16b776c1e3..2f481695c22 100644
+--- a/gcc/gimple-range.cc
++++ b/gcc/gimple-range.cc
+@@ -98,33 +98,35 @@ gimple_ranger::range_of_expr (vrange &r, tree expr, gimple *stmt)
+        fputs ("\n", dump_file);
+     }
+ 
+-  // If there is no statement, just get the global value.
+-  if (!stmt)
+-    {
+-      Value_Range tmp (TREE_TYPE (expr));
+-      m_cache.get_global_range (r, expr);
+-      // Pick up implied context information from the on-entry cache
+-      // if current_bb is set.  Do not attempt any new calculations.
+-      if (current_bb && m_cache.block_range (tmp, current_bb, expr, false))
+-       {
+-         r.intersect (tmp);
+-         char str[80];
+-         sprintf (str, "picked up range from bb %d\n",current_bb->index);
+-         if (idx)
+-           tracer.print (idx, str);
+-       }
+-    }
+   // For a debug stmt, pick the best value currently available, do not
+   // trigger new value calculations.PR 100781.
+-  else if (is_gimple_debug (stmt))
++  if (stmt && is_gimple_debug (stmt))
+     m_cache.range_of_expr (r, expr, stmt);
+   else
+     {
+-      basic_block bb = gimple_bb (stmt);
++      basic_block bb = stmt ? gimple_bb (stmt) : NULL;
+       gimple *def_stmt = SSA_NAME_DEF_STMT (expr);
+ 
++      // If the definition is not in the IL or this is a default def and
++      // there's no context, just get the global value.
++      if ((!stmt && SSA_NAME_IS_DEFAULT_DEF (expr))
++         || (!SSA_NAME_IS_DEFAULT_DEF (expr) && !gimple_bb (def_stmt)))
++       {
++         Value_Range tmp (TREE_TYPE (expr));
++         m_cache.get_global_range (r, expr);
++         // Pick up implied context information from the on-entry cache
++         // if current_bb is set.  Do not attempt any new calculations.
++         if (current_bb && m_cache.block_range (tmp, current_bb, expr, false))
++           {
++             r.intersect (tmp);
++             char str[80];
++             sprintf (str, "picked up range from bb %d\n",current_bb->index);
++             if (idx)
++               tracer.print (idx, str);
++           }
++       }
+       // If name is defined in this block, try to get an range from S.
+-      if (def_stmt && gimple_bb (def_stmt) == bb)
++      else if (gimple_bb (def_stmt) == bb)
+        {
+          // Declared in this block, if it has a global set, check for an
+          // override from a block walk, otherwise calculate it.
+
+I thought about adding a flag or using a magic (gimple *)-1 stmt argument
+but I can't see where computing new global ranges could go wrong
+(well, OK, I guess I can - but I wonder whether affected passes wouldn't
+only have the global_range_query anyway).
+So passing NULL should be similar behavior
+as when passing in a debug stmt - we only query the cache, I wonder
+whether calling that 'cached_range_of_expr' might be easier?  Or
+calling what I like range_of_def (but make it work on GENERIC as well)?
+At least the defaulted NULL stmt in range_of_expr makes it difficult to
+extent that API.
+
+- User: Andrew Macleod | Time: 2024-03-06 03:37:43 UTC
+  Text: Createdattachment 57620[details]proposed patch
+
+Does this solve your problem if there is an active ranger?  it bootstraps with no regressions
+
+ITs pretty minimal, and basically we invokes the cache's version of range_of_expr if there is no context.   I tweaked it such that if there is no context, and the def has not been calculated yet, it calls range_of_def, and combines it with any SSA_NAME_RANGE_INFO that may have pre-existed.  All without invoking any new lookups.
+
+This seems relatively harmless and does not spawn new dynamic lookups.   As long as it resolves your issue...   If it still does not work, and we require the def to actually be evaluated, I will look into that. we prpbably should do that anyway.  There appears to be a cycle when this is invoked from the loop analysis, probably because folding of PHIs uses loop info... and back and forth we go.    I'd probably need to add a flag to the ranger instantiation to tell it to avoid using loop info.
+
+Are we looking to fix this in this release?
+
+- User: Richard Biener | Time: 2024-03-06 07:14:31 UTC
+  Text: (In reply to Andrew Macleod fromcomment #9)> Createdattachment 57620[details]> proposed patch
+> 
+> Does this solve your problem if there is an active ranger?  it bootstraps
+> with no regressionsI'll check what it does.> ITs pretty minimal, and basically we invokes the cache's version of
+> range_of_expr if there is no context.   I tweaked it such that if there is
+> no context, and the def has not been calculated yet, it calls range_of_def,
+> and combines it with any SSA_NAME_RANGE_INFO that may have pre-existed.  All
+> without invoking any new lookups.
+> 
+> This seems relatively harmless and does not spawn new dynamic lookups.   As
+> long as it resolves your issue...   If it still does not work, and we
+> require the def to actually be evaluated, I will look into that. we prpbably
+> should do that anyway.  There appears to be a cycle when this is invoked
+> from the loop analysis, probably because folding of PHIs uses loop info...
+> and back and forth we go.Yeah, I ran into this as well.> I'd probably need to add a flag to the ranger
+> instantiation to tell it to avoid using loop info.I've quickly tried to detect active discovery in SCEV but it wasn't as easy
+as I thought.> Are we looking to fix this in this release?I think the full evaluation has to wait for stage1 because of that recursion
+issue.  I'm also sure we're going to need ways to _not_ do this, so maybe
+a clearer separation in the API is warranted.  As I see it when you call
+range_of_expr without context you get the same result as if using the
+global range query so maybe it should be a different API from the start
+(the one that is now without context) and range_of_expr without context
+using a conservative default (the definition point).
+
+- User: Richard Biener | Time: 2024-03-06 07:31:58 UTC
+  Text: (In reply to Richard Biener fromcomment #10)> (In reply to Andrew Macleod fromcomment #9)
+> > Createdattachment 57620[details]> > proposed patch
+> > 
+> > Does this solve your problem if there is an active ranger?  it bootstraps
+> > with no regressions
+> 
+> I'll check what it does.So it does seem to help, not on the testcases ultimate outcome, but for the
+important bits of the analysis.  With adding an active ranger around IVOPTs
+with
+
+diff --git a/gcc/tree-ssa-loop-ivopts.cc b/gcc/tree-ssa-loop-ivopts.cc
+index 7cae5bdefea..626fc5bf5d7 100644
+--- a/gcc/tree-ssa-loop-ivopts.cc
++++ b/gcc/tree-ssa-loop-ivopts.cc
+@@ -132,6 +132,7 @@ along with GCC; see the file COPYING3.  If not see
+ #include "tree-vectorizer.h"
+ #include "dbgcnt.h"
+ #include "cfganal.h"
++#include "gimple-range.h"
+ 
+ /* For lang_hooks.types.type_for_mode.  */
+ #include "langhooks.h"
+@@ -8280,6 +8281,8 @@ tree_ssa_iv_optimize (void)
+   tree_ssa_iv_optimize_init (&data);
+   mark_ssa_maybe_undefs ();
+ 
++  enable_ranger (cfun);
++
+   /* Optimize the loops starting with the innermost ones.  */
+   for (auto loop : loops_list (cfun, LI_FROM_INNERMOST))
+     {
+@@ -8292,6 +8295,8 @@ tree_ssa_iv_optimize (void)
+       tree_ssa_iv_optimize_loop (&data, loop, toremove);
+     }
+ 
++  disable_ranger (cfun);
++
+   /* Remove eliminated IV defs.  */
+   release_defs_bitset (toremove);
+ 
+
+I then see the following difference with a ranger-debug dump during IVOPTs:
+
+ 11       range_of_expr(_12)
+-         TRUE : (11) range_of_expr (_12) [irange] int VARYING
++         TRUE : (11) range_of_expr (_12) [irange] int [0, +INF]
+...
+   Base:        (long unsigned int) (int) ((unsigned int) _12 + 1) * 2
+   Step:        2
+   Biv: N
+-  Overflowness wrto loop niter:        Overflow
++  Overflowness wrto loop niter:        No-overflow
+...
+-74       range_of_expr(_103)
+-         TRUE : (74) range_of_expr (_103) [irange] int VARYING
++64       range_of_expr(_103)
++         TRUE : (64) range_of_expr (_103) [irange] int [-INF, 0]
+ Analyzing # of iterations of loop 1
+   exit condition [1, + , 1](no_overflow) <= _103
+-  bounds on difference of bases: -2147483649 ... 2147483646
++  bounds on difference of bases: -2147483649 ... -1
+   result:
+     zero if _103 < 0
+-    # of iterations (unsigned int) _103, bounded by 2147483647
++    # of iterations (unsigned int) _103, bounded by 0
+
+So the important part is that it got the fact that _12 is positive.  As
+analyzed in earlier comments I think that's all we can do, we don't know
+anything about the other variable involved and thus can't avoid the
+unsigned punning during SCEV analysis.
+
+I think it's a good change, let's keep it queued for stage1 at this point
+unless we really know a case it helps to avoid a regression withr14-9193-ga0b1798042d033For testing, what's the "easiest" pass/thing to do to recompute global
+ranges now?  In the past I'd schedule EVRP but is there now a ranger
+API to do this?  Just to see if full global range compute before IVOPTs
+would help.
+
+- User: Andrew Macleod | Time: 2024-03-06 14:57:58 UTC
+  Text: (In reply to Richard Biener fromcomment #11)> (In reply to Richard Biener fromcomment #10)
+> > (In reply to Andrew Macleod fromcomment #9)
+> > > Createdattachment 57620[details]> > > proposed patch
+> > > 
+> > > Does this solve your problem if there is an active ranger?  it bootstraps
+> > > with no regressions
+> > 
+> > I'll check what it does.
+>> 
+> So the important part is that it got the fact that _12 is positive.  As
+> analyzed in earlier comments I think that's all we can do, we don't know
+> anything about the other variable involved and thus can't avoid the
+> unsigned punning during SCEV analysis.Yeah, I wouldn't want to invoke any dynamic lookup changes at this point. that would be too hard to predict or contain.    I will continue poking at what is triggering the loop issues because I think its a good longer term solution to have range_of_expr with no context to invoke range_of_stmt if the DEF is in the IL and has not been processed.> 
+> I think it's a good change, let's keep it queued for stage1 at this point
+> unless we really know a case it helps to avoid a regression with
+>r14-9193-ga0b1798042d033> 
+> For testing, what's the "easiest" pass/thing to do to recompute global
+> ranges now?  In the past I'd schedule EVRP but is there now a ranger
+> API to do this?  Just to see if full global range compute before IVOPTs
+> would help.all VRP passes are the same now. so just schedule EVRP.   in theory, you could schedule the fast vrp pass I added, but its not heavily tested... but you could try it.  It doesnt do any back edges or switches (iirc), but does basic calculations in DOM order and exports/updates globals.
+
+NEXT_PASS (pass_fast_vrp)
+
+- User: Andrew Macleod | Time: 2024-03-06 20:05:50 UTC
+  Text: Createdattachment 57638[details]patch
+
+Ok, there were 2 issues with simply invoking range_of_stmt, which this new patch resolves.  IF we aren't looking to fix this in GCC 14 right now anyway, this is the way to go.
+
+1) The cache has always tried to provide a global range by pre-folding a stmt for an estimate using global values.  This is a bad idea for PHIs when SCEV is invoked AND SCEV is calling ranger. This changes it to not pre-evaluate PHIs, which also saves time when functions have a lot of edges. Its mostly pointless for PHIs anyway since we're about to do a real evaluation.
+
+2) The cache's entry range propagator was not re-entrant.  We didn't previously need this, but with SCEV (and possible other place) invoking range_of_expr without context and having range_of_stmt being called, we can occasionally get layered calls for cache filling (of different ssa-names) 
+
+With those 2 changes, we can now safely invoke range_of_stmt from a contextless range_of_expr call.
+
+We would have tripped over this earlier if SCEV or one of those other places using range_of_expr without context had instead invoked range_of_stmt.  That would have been perfectly reasonable, and would have resulting in these same issues.  We never tripped over it because range_of_stmt is not used much outside of ranger.  That is the primary reason I wanted to track this down.  There were alternative paths to the same end result that would have triggered these issues.
+
+Give this patch a try. it also bootstraps with no regressions.  I will queue it up for stage 1 instead assuming all is good.
+
+- User: Richard Biener | Time: 2024-03-07 08:04:55 UTC
+  Text: (In reply to Andrew Macleod fromcomment #13)> Createdattachment 57638[details]> patch
+> 
+> Ok, there were 2 issues with simply invoking range_of_stmt, which this new
+> patch resolves.  IF we aren't looking to fix this in GCC 14 right now
+> anyway, this is the way to go.
+> 
+> 1) The cache has always tried to provide a global range by pre-folding a
+> stmt for an estimate using global values.  This is a bad idea for PHIs when
+> SCEV is invoked AND SCEV is calling ranger. This changes it to not
+> pre-evaluate PHIs, which also saves time when functions have a lot of edges.
+> Its mostly pointless for PHIs anyway since we're about to do a real
+> evaluation.
+> 
+> 2) The cache's entry range propagator was not re-entrant.  We didn't
+> previously need this, but with SCEV (and possible other place) invoking
+> range_of_expr without context and having range_of_stmt being called, we can
+> occasionally get layered calls for cache filling (of different ssa-names) 
+> 
+> With those 2 changes, we can now safely invoke range_of_stmt from a
+> contextless range_of_expr call.
+> 
+> We would have tripped over this earlier if SCEV or one of those other places
+> using range_of_expr without context had instead invoked range_of_stmt.  That
+> would have been perfectly reasonable, and would have resulting in these same
+> issues.  We never tripped over it because range_of_stmt is not used much
+> outside of ranger.  That is the primary reason I wanted to track this down. 
+> There were alternative paths to the same end result that would have
+> triggered these issues.It sounds like this part is a bugfix?> Give this patch a try. it also bootstraps with no regressions.  I will queue
+> it up for stage 1 instead assuming all is good.It seems to work well, it now computes a lot of additional ranges and
+causes a minor code generation change on the testcase (it doesn't fix the
+observed regression though).
+
+Thanks for working on this.
+
+As of things unexplored is whether we can with better range-info lift the constraint on the folding some more.  We're turning (A + i * B) * C into
+(A * C + i * (B * C)) and need to avoid any additional intermediate undefined
+overflow with this association for i in [0, n] (with n being the number of
+iterations of the loop where i varies).
+
+As said, if the regression is too important to ignore we could choose to
+leave the bug unfixed for all but the case with A, B and C constant which
+was the case for the testcase in the original PR.
+
+- User: Andrew Macleod | Time: 2024-03-07 15:53:41 UTC
+  Text: (In reply to Richard Biener fromcomment #14)> (In reply to Andrew Macleod fromcomment #13)> > 
+> > We would have tripped over this earlier if SCEV or one of those other places
+> > using range_of_expr without context had instead invoked range_of_stmt.  That
+> > would have been perfectly reasonable, and would have resulting in these same
+> > issues.  We never tripped over it because range_of_stmt is not used much
+> > outside of ranger.  That is the primary reason I wanted to track this down. 
+> > There were alternative paths to the same end result that would have
+> > triggered these issues.
+> 
+> It sounds like this part is a bugfix?Technically yes.  When I commit it to trunk, I would split this into 3 patches. 
+
+1 - The change to get_global_range to not process PHIS.
+This is only a bug that shows up if range_of_stmt is called from within SCEV.
+
+2 - Make cache propagation re-entrant
+This is also only currently needed if SCEV invokes range_of_stmt
+
+3 - call range_of_stmt from range_of_expr when context-less.
+This patch causes SCEV to call range_of_stmt indirectly through range_of_expr.
+
+
+I don't think the buglet would show up in the current release simply because SCEV never calls ranger with a context, and thus range_of_stmt never gets invoked by it.
+
+It might be worthwhile to put the patchset (or at least the first 2?) in the first point release after they've been committed to trunk in case something else wants to be backported which trips over it.
+
+- User: Richard Biener | Time: 2024-03-08 10:13:49 UTC
+  Text: (In reply to Andrew Macleod fromcomment #12)> 
+> all VRP passes are the same now. so just schedule EVRP.   in theory, you
+> could schedule the fast vrp pass I added, but its not heavily tested... but
+> you could try it.  It doesnt do any back edges or switches (iirc), but does
+> basic calculations in DOM order and exports/updates globals.
+> 
+> NEXT_PASS (pass_fast_vrp)When I just want to update global ranges what do I do?  It looks like
+VRP first and foremost calls range_of_stmt on each PHI and stmt in the
+pre-fold hook.  Does that update global ranges?  It should at least
+fill the cache so SCEV would pick up ranges, right?
+
+So doing in the vectorizer sth like the following should get us the best
+possible ranges?  Ah, probably only global ranges since the SCEV query
+itself would still lack context sensitive info (but as said we don't have
+a good context we can easily use).
+
+Would doing sth like below gain anything in addition to your proposed
+patch (for context-less queries like those done in SCEV)?
+
+@@ -1240,6 +1241,37 @@ pass_vectorize::execute (function *fun)
+   if (vect_loops_num <= 1)
+     return 0;
+ 
++      scev_reset ();
++  auto ranger = enable_ranger (fun);
++
++    {
++      basic_block bb;
++      FOR_EACH_BB_FN (bb, fun)
++       {
++         for (auto gsi = gsi_start_phis (bb); !gsi_end_p (gsi); gsi_next (&gsi))
++           {
++             tree name = gimple_range_ssa_p (PHI_RESULT (*gsi));
++             if (name)
++               {
++                 Value_Range vr(TREE_TYPE (name));
++                 ranger->range_of_stmt (vr, *gsi, name);
++               }
++           }
++         for (auto gsi = gsi_start_bb (bb); !gsi_end_p (gsi); gsi_next (&gsi))
++           {
++             gimple *s = *gsi;
++             if (is_gimple_debug (s))
++               continue;
++             tree type = gimple_range_type (s);
++             if (type)
++               {
++                 Value_Range vr(type);
++                 ranger->range_of_stmt (vr, s);
++               }
++           }
++       }
++    }
++
+
+- User: Tamar Christina | Time: 2024-03-08 10:22:25 UTC
+  Text: > So doing in the vectorizer sth like the following should get us the best
+> possible ranges?  Ah, probably only global ranges since the SCEV query
+> itself would still lack context sensitive info (but as said we don't have
+> a good context we can easily use).
+>which reminds me.. I have been playing around with using ranger directly in the vectorizer.
+
+It looks like we get better ranges for the overwidening detection.
+
+It feels like using ranger.range_of_expr or similar would solve the problem that we don't currently get ranged for structural widening, i.e.https://gcc.gnu.org/bugzilla/show_bug.cgi?id=102188
+
+- User: Richard Biener | Time: 2024-03-08 14:10:52 UTC
+  Text: r14-9391-g018ddc86b92851doesn't seem to make a difference for this aarch64 IVOPTs case.  It might be that tree-affine.cc needs similar handling.  I'm going to dig into that on Monday.
+
+- User: Richard Biener | Time: 2024-03-12 09:59:33 UTC
+  Text: So what remains here is differences like
+
+-  (chrec = {(long unsigned int) (col_stride_10 * _105), +, (long unsigned int) col_stride_10}_2)
++  (chrec = (long unsigned int) (int) {(unsigned int) col_stride_10 * (unsigned int) _105, +, (unsigned int) col_stride_10}_2)
+
+where we can't pull the sign-extension inside the CHREC because it might
+overflow.
+
+And
+
+ (set_scalar_evolution 
+   instantiated_below = 22 
+   (scalar = _59)
+-  (scalar_evolution = {(long unsigned int) (col_stride_10 * _105) * 2, +, (long unsigned int) col_stride_10 * 2}_2))
++  (scalar_evolution = _59))
++)
+
+which is failure to analyze at all.  This one looks like
+
+  <bb 4> [local count: 118111600]:
+  # col_stride_10 = PHI <size_15(D)(11), 1(2)>
+  if (size_15(D) > 0)
+    goto <bb 21>; [89.00%]
+  else
+    goto <bb 5>; [11.00%]
+
+  <bb 5> [local count: 118111600]:
+  return;
+...
+  <bb 15> [local count: 343854870]:
+  # RANGE [irange] int [0, 2147483646]
+  # j_73 = PHI <_105(22), _68(19)>
+...
+  col_i_61 = col_stride_10 * j_73;
+  # RANGE [irange] long unsigned int [0, 2147483647][18446744071562067968, +INF]
+  _60 = (long unsigned int) col_i_61;
+  # RANGE [irange] long unsigned int [0, 4294967294][18446744069414584320, 18446744073709551614] MASK 0xfffffffffffffffe VALUE 0x0
+  _59 = _60 * 2;
+
+j_73 is {_105, +, 1}_2
+col_i_61 is (int) {(unsigned int) col_stride_10 * (unsigned int) _105, +, (unsigned int) col_stride_10}_2
+_60 is (long unsigned int) (int) {(unsigned int) col_stride_10 * (unsigned int) _105, +, (unsigned int) col_stride_10}_2
+
+and on the _60 * 2 multiply we fail.  When applying Andrews proposed patch
+this doesn't help since the range of col_stride_10 can only conditionally
+be adjusted to positive.
+
+SCEV caches a scalar evolution based on SSA_NAME and 'instantiated below'
+block which is "block_before_loop" which is a loops preheader or the
+function ENTRY block for analyses of scalars in the loop tree root.
+A conservative context for analysis of the SCEV might be
+ 1) the definition stmt of the SSA name
+ 2) the instantiated-below block (on-exit ranges of it)
+
+With doing 2) by feeding the last stmt of the block as context (when the
+block is empty that won't work :/) the testcase is optimized again when
+I discard the SCEV cache at the start of IVOPTs and wrap IVOPTs in a
+ranger instance.
+
+While ranger has a range_on_exit API this doesn't work on GENERIC expressions
+as far as I can see but only SSA names but I guess that could be "fixed"
+given range_on_exit also looks at the last stmt and eventually defers to
+range_of_expr (or range_on_entry), but possibly get_tree_range needs
+variants for on_entry/on_exit (it doesn't seem to use it's 'stmt' context
+very consistently, notably not for SSA_NAMEs ...).
+
+Interestingly enough we somehow still need the
+
+diff --git a/gcc/gimple-range.cc b/gcc/gimple-range.cc
+index c16b776c1e3..c0eda5fc51d 100644
+--- a/gcc/gimple-range.cc
++++ b/gcc/gimple-range.cc
+@@ -102,7 +102,15 @@ gimple_ranger::range_of_expr (vrange &r, tree expr, gimple *stmt)
+   if (!stmt)
+     {
+       Value_Range tmp (TREE_TYPE (expr));
+-      m_cache.get_global_range (r, expr);
++      // If there is no global range for EXPR yet, try to evaluate it.
++      // THis call does set R to a global range regardless.
++      if (!m_cache.get_global_range (r, expr))
++       {
++         gimple *s = SSA_NAME_DEF_STMT (expr);
++         // Calculate a range for S if it is safe to do so.
++         if (s && gimple_bb (s) && gimple_get_lhs (s) == expr)
++           return range_of_stmt (r, s);
++       }
+       // Pick up implied context information from the on-entry cache
+       // if current_bb is set.  Do not attempt any new calculations.
+       if (current_bb && m_cache.block_range (tmp, current_bb, expr, false))
+
+hunk of Andrews patch to do it :/
+
+There's one other detail - the problematical multiply folding is
+col_stride_10 * {_105, +, 1}_2
+I'm thinking that similar to CHREC_LEFT == 0 we can handle CHREC_RIGHT == 1
+without unsigned promotion.  In the second iteration we are replacing
+(_105 + 1) * col_stride_10 with _105 * col_stride_10 + col_stride_10
+but we know already that _105 * col_stride_10 doesn't overflow as we
+computed that in the first iteration.  And 1 * X never overflows.
+The third iteration is problematic - we don't know whether 2 * col_stride_10
+overflows if _105 was zero, if it was not it might have been -1 which
+means the second iteration computed 0 * col_stride_10 originally.  Hmm,
+so _105 == -1 is problematic, so no - I don't think we can handle
+CHREC_RIGHT == 1 specially.
+
+- User: Richard Biener | Time: 2024-03-12 10:00:28 UTC
+  Text: Createdattachment 57681[details]patch for context sensitive range during SCEV
+
+This is the patch I was playing with.
+
+- User: Andrew Macleod | Time: 2024-03-12 20:41:10 UTC
+  Text: (In reply to Richard Biener fromcomment #19)> 
+> While ranger has a range_on_exit API this doesn't work on GENERIC expressions
+> as far as I can see but only SSA names but I guess that could be "fixed"
+> given range_on_exit also looks at the last stmt and eventually defers to
+> range_of_expr (or range_on_entry), but possibly get_tree_range needs
+> variants for on_entry/on_exit (it doesn't seem to use it's 'stmt' context
+> very consistently, notably not for SSA_NAMEs ...).That would appear to be an oversight. That API has not been used very much for arbitrary generic trees.  I think the original reason support for tree expressions was added was a "try this" for some other PR. It was simple to do so we lef tit in, but it never got any real traction.  At least as far as I can recall :-)
+
+Currently, I think mosrt, if not all, uses of get_tree_range() are either !gimple_ssa_range_p() (commonly constants or unsupported types) or ssa_names on abnormal edges. 
+
+For abnormal edges, we ought to be getting the global range directly these days instad of calling that routine.   Then in get_tree_range (), we ought to be calling range_of_expr for SSA_NAMES with the provided context.  I'll poke at that too. The support for general tree expressions changed the original intent of the function, and it should be adjusted. 
+
+As for the on-exit/on-entry bits... we haven't had a need for entry/exit outside of ranger in the past.  I had toyed with exporting those routines and making them a part of the official API for value-query, but hadn't run across the need as yet.
+
+Let me think about that for a minute. It can certainly be done. I guess we really only need an on-entry and on-exit version of range_of_expr to do everything.  So if we end up with something like:  
+  range_of_expr (r, expr, stmt)
+  range_of_expr_on_entry  (r, expr, bb)
+  range_of_expr_on_exit (r, expr, bb)
+
+And have that all work with general trees expressions.. That would solve much of this for you?> 
+> Interestingly enough we somehow still need the
+>> 
+> hunk of Andrews patch to do it :/
+>That probably means there is another call somewhere in the chain with no context. However, I will say that functionality is more important than it seems. Should have been there from the start :-P.
+
+- User: Richard Biener | Time: 2024-03-13 07:38:18 UTC
+  Text: (In reply to Andrew Macleod fromcomment #21)> (In reply to Richard Biener fromcomment #19)
+> 
+> > 
+> > While ranger has a range_on_exit API this doesn't work on GENERIC expressions
+> > as far as I can see but only SSA names but I guess that could be "fixed"
+> > given range_on_exit also looks at the last stmt and eventually defers to
+> > range_of_expr (or range_on_entry), but possibly get_tree_range needs
+> > variants for on_entry/on_exit (it doesn't seem to use it's 'stmt' context
+> > very consistently, notably not for SSA_NAMEs ...).
+> 
+> That would appear to be an oversight. That API has not been used very much
+> for arbitrary generic trees.  I think the original reason support for tree
+> expressions was added was a "try this" for some other PR. It was simple to
+> do so we lef tit in, but it never got any real traction.  At least as far as
+> I can recall :-)
+> 
+> Currently, I think mosrt, if not all, uses of get_tree_range() are either
+> !gimple_ssa_range_p() (commonly constants or unsupported types) or ssa_names
+> on abnormal edges. 
+> 
+> For abnormal edges, we ought to be getting the global range directly these
+> days instad of calling that routine.   Then in get_tree_range (), we ought
+> to be calling range_of_expr for SSA_NAMES with the provided context.  I'll
+> poke at that too. The support for general tree expressions changed the
+> original intent of the function, and it should be adjusted. 
+> 
+> As for the on-exit/on-entry bits... we haven't had a need for entry/exit
+> outside of ranger in the past.  I had toyed with exporting those routines
+> and making them a part of the official API for value-query, but hadn't run
+> across the need as yet.
+> 
+> Let me think about that for a minute. It can certainly be done. I guess we
+> really only need an on-entry and on-exit version of range_of_expr to do
+> everything.  So if we end up with something like:  
+>   range_of_expr (r, expr, stmt)
+>   range_of_expr_on_entry  (r, expr, bb)
+>   range_of_expr_on_exit (r, expr, bb)
+> 
+> And have that all work with general trees expressions.. That would solve
+> much of this for you?Yes, I wouldn't mind if range_on_{entry,exit} handle general tree expressions,
+there's enough APIs to be confused with already ;)> 
+> 
+> 
+> > 
+> > Interestingly enough we somehow still need the
+> > 
+> 
+> > 
+> > hunk of Andrews patch to do it :/
+> > 
+> 
+> That probably means there is another call somewhere in the chain with no
+> context. However, I will say that functionality is more important than it
+> seems. Should have been there from the start :-P.Possibly yes.  It might be we fill rangers cache with VARYING and when
+we re-do the query as a dependent one but with context we don't recompute
+it?  I also only patched up a single place in SCEV with the context so
+I possibly missed some others that end up with a range query, for example
+through niter analysis that might be triggered.
+
+- User: Andrew Macleod | Time: 2024-03-13 17:37:57 UTC
+  Text: Createdattachment 57686[details]another patch
+
+
+
+(In reply to Richard Biener fromcomment #22)> (In reply to Andrew Macleod fromcomment #21)> > 
+> > And have that all work with general trees expressions.. That would solve
+> > much of this for you?
+> 
+> Yes, I wouldn't mind if range_on_{entry,exit} handle general tree
+> expressions,
+> there's enough APIs to be confused with already ;)
+> 
+> >I promoted range_on_exit and range_on_entry to be part of the API in this patch. This brings valeu_query in line with rangers basic 5 routine API.   It also tweaks rangers versions to handle tree expressions.  It bootstraps and shows no regressions, with the caveat that I haven't actually tested the usage of range_on_entry and exit with arbitrary trees.   As you can see, I didnt change much... so it should work OK.> > 
+> > 
+> > > 
+> > > Interestingly enough we somehow still need the
+> > > 
+> > 
+> > > 
+> > > hunk of Andrews patch to do it :/
+> > > 
+> > 
+> > That probably means there is another call somewhere in the chain with no
+> > context. However, I will say that functionality is more important than it
+> > seems. Should have been there from the start :-P.
+> 
+> Possibly yes.  It might be we fill rangers cache with VARYING and when
+> we re-do the query as a dependent one but with context we don't recompute
+> it?  I also only patched up a single place in SCEV with the context so
+> I possibly missed some others that end up with a range query, for example
+> through niter analysis that might be triggered.My guess is the latter.     Without a context and with that change, ranger evaluates the definition with the context at the location of the def, then simply uses that value.  If anything it is dependent on later changes, the temporal cache should indicate it's out of date and trigger a new fold using current values.
+
+- User: GCC Commits | Time: 2024-03-19 12:12:05 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:e0e9499aeffdaca88f0f29334384aa5f710a81a4commitr14-9540-ge0e9499aeffdaca88f0f29334384aa5f710a81a4Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Mar 19 12:24:08 2024 +0100
+
+    tree-optimization/114151 - revertPR114074fix
+    
+    The following reverts the chrec_fold_multiply fix and only keeps
+    handling of constant overflow which keeps the original testcase
+    fixed.  A better solution might involve ranger improvements or
+    tracking of assumptions during SCEV analysis similar to what niter
+    analysis does.PR tree-optimization/114151PR tree-optimization/114269PR tree-optimization/114322PR tree-optimization/114074* tree-chrec.cc (chrec_fold_multiply): Restrict the use of
+            unsigned arithmetic when actual overflow on constant operands
+            is observed.
+    
+            * gcc.dg/pr68317.c: Revert last change.
+
+- User: Richard Biener | Time: 2024-03-19 12:16:46 UTC
+  Text: The causing change has been reverted.  I still hope we can improve ranger and some loop analysis with (context sensitive) ranges for GCC 15.
+
+Fixed.
+

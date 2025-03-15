@@ -1,0 +1,206 @@
+Bug Summary: [13 Regression] unable to generate reloads for at -Og on riscv64 since r13-4907
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 12.2.1
+Known to Fail: 13.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-02-22 19:52:54 UTC
+  Text: Createdattachment 54507[details]reduced testcase
+
+Compiler output:
+$ riscv64-unknown-linux-gnu-gcc -Og testcase.c
+testcase.c: In function 'foo':
+testcase.c:23:1: error: unable to generate reloads for:
+   23 | }
+      | ^
+(insn 122 117 127 2 (set (reg:DI 157 [ _46 ])
+        (ior:DI (reg:DI 200)
+            (reg:DI 251))) "testcase.c":14:5 177 {*mvconst_internal}
+     (expr_list:REG_EQUIV (const_int 25769803782 [0x600000006])
+        (nil)))
+during RTL pass: reload
+testcase.c:23:1: internal compiler error: in curr_insn_transform, at lra-constraints.cc:4168
+0x79094f _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+        /repo/gcc-trunk/gcc/rtl-error.cc:108
+0x75103a curr_insn_transform
+        /repo/gcc-trunk/gcc/lra-constraints.cc:4168
+0xeca15b lra_constraints(bool)
+        /repo/gcc-trunk/gcc/lra-constraints.cc:5215
+0xeb18e4 lra(_IO_FILE*)
+        /repo/gcc-trunk/gcc/lra.cc:2375
+0xe62d09 do_reload
+        /repo/gcc-trunk/gcc/ira.cc:5963
+0xe62d09 execute
+        /repo/gcc-trunk/gcc/ira.cc:6149
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ riscv64-unknown-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-riscv64/bin/riscv64-unknown-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r13-6278-20230222135711-g3da77f217c8-checking-yes-rtl-df-extra-riscv64/bin/../libexec/gcc/riscv64-unknown-linux-gnu/13.0.1/lto-wrapper
+Target: riscv64-unknown-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --with-cloog --with-ppl --with-isl --with-isa-spec=2.2 --with-sysroot=/usr/riscv64-unknown-linux-gnu --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=riscv64-unknown-linux-gnu --with-ld=/usr/bin/riscv64-unknown-linux-gnu-ld --with-as=/usr/bin/riscv64-unknown-linux-gnu-as --disable-multilib --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r13-6278-20230222135711-g3da77f217c8-checking-yes-rtl-df-extra-riscv64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 13.0.1 20230222 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2023-02-23 21:20:09 UTC
+  Text: The backend is really broken:
+(define_insn_and_split "*mvconst_internal"
+  [(set (match_operand:GPR 0 "register_operand" "=r")
+        (match_operand:GPR 1 "splittable_const_int_operand" "i"))]
+  "!(p2m1_shift_operand (operands[1], <MODE>mode)
+     || high_mask_shift_operand (operands[1], <MODE>mode))"
+  "#"
+  "&& 1"
+  [(const_int 0)]
+{
+  riscv_move_integer (operands[0], operands[0], INTVAL (operands[1]),
+                      <MODE>mode, TRUE);
+  DONE;
+})
+
+
+There are multiple insn patterns which match and guess what it is just broken.
+
+- User: Andrew Pinski | Time: 2023-02-23 21:21:34 UTC
+  Text: r13-4907-g2e886eef7f2b5abroke this.
+
+- User: Jeffrey A. Law | Time: 2023-03-10 12:29:28 UTC
+  Text: This looks like a long-standing latent bug in combine.
+
+About 20 years ago support was added to combine to allow it to utilize a REG_EQUAL note to help simplifications.  The code looks like this:
+                  /* Temporarily replace the set's source with the
+                     contents of the REG_EQUAL note.  The insn will
+                     be deleted or recognized by try_combine.  */
+                  rtx orig_src = SET_SRC (set); 
+                  rtx orig_dest = SET_DEST (set); 
+                  if (GET_CODE (SET_DEST (set)) == ZERO_EXTRACT)
+                    SET_DEST (set) = XEXP (SET_DEST (set), 0);
+                  SET_SRC (set) = note;
+                  i2mod = temp;
+                  i2mod_old_rhs = copy_rtx (orig_src);
+                  i2mod_new_rhs = copy_rtx (note);
+                  next = try_combine (insn, i2mod, NULL, NULL,
+                                      &new_direct_jump_p, 
+                                      last_combined_insn);
+                  i2mod = NULL;
+                  if (next)
+                    {
+                      statistics_counter_event (cfun, "insn-with-note combine", 1);
+                      goto retry;
+                    } 
+                  SET_SRC (set) = orig_src;
+                  SET_DEST (set) = orig_dest;
+
+So assume that temp (from which SET in the above code was extracted) looks like this:
+
+(insn 122 117 127 2 (set (reg:DI 157 [ _46 ])
+        (ior:DI (reg:DI 200)
+            (reg:DI 251))) "j.c":14:5 -1
+     (expr_list:REG_EQUAL (const_int 25769803782 [0x600000006])
+        (nil)))
+
+Basically the constant isn't one we can load with a single insn, so we construct the constant using several insns and attach a REG_EQUAL note for the final result.  Totally normal.
+
+We replace the SET_SRC with the contents of the note.  This results in the following insn that gets passed down to try_combine as I2MOD:
+
+
+(insn 122 117 127 2 (set (reg:DI 157 [ _46 ])
+        (const_int 25769803782 [0x600000006])) "j.c":14:5 -1
+     (expr_list:REG_EQUAL (const_int 25769803782 [0x600000006])
+        (nil)))
+
+Exactly what I would expect.  try_combine will actually try to recognize that insn and gets a match on the mvconst_internal.  So when try_combine returns the insn looks like this:
+
+(insn 122 117 127 2 (set (reg:DI 157 [ _46 ])
+        (const_int 25769803782 [0x600000006])) "j.c":14:5 177 {*mvconst_internal}
+     (expr_list:REG_EQUAL (const_int 25769803782 [0x600000006])
+        (nil)))
+
+Again, totally normal.  Nothing wrong at this point.  But note how we restore the SET_SRC/SET_DEST objects after returning from try_combine.  After restoration we have:
+
+(insn 122 117 127 2 (set (reg:DI 157 [ _46 ])
+        (ior:DI (reg:DI 200)
+            (reg:DI 251))) "j.c":14:5 177 {*mvconst_internal}
+     (expr_list:REG_EQUAL (const_int 25769803782 [0x600000006])
+        (nil)))
+
+And that's where things have gone off the rails.  When we restore the SET_SRC/SET_DEST we need to either re-recognize or at least clear the INSN_CODE.
+
+This has *absolutely nothing* to do with multiple matching patterns.  It's just a latent bug in the combiner.
+
+- User: Richard Biener | Time: 2023-03-27 10:59:20 UTC
+  Text: middle-end though, exposed for Risc-V, the regression is long present so P2 (and riscv wouldn't be primary/secondary).
+
+- User: Jeffrey A. Law | Time: 2023-03-27 13:16:02 UTC
+  Text: Right.  The fix is a 1-liner.  I had it going through a test on x86 and riscv and lost power.  Finally got it re-spun and just need to look at the results.
+
+- User: GCC Commits | Time: 2023-04-05 15:19:52 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:4a45f5d6a9b53f7f5446dee47e25b07d413bb7ebcommitr13-7013-g4a45f5d6a9b53f7f5446dee47e25b07d413bb7ebAuthor: Jeff Law <jlaw@ventanamicro>
+Date:   Wed Apr 5 09:16:29 2023 -0600
+
+    [RFA][Bug target/108892 ][13 regression] Force re-recognition after changing RTL structure of an insn
+    
+    So as mentioned in the PR the underlying issue here is combine changes the form of an existing insn, but fails to force re-recognition.  As a result other parts of the compiler blow up.
+    
+    >                   /* Temporarily replace the set's source with the
+    >                      contents of the REG_EQUAL note.  The insn will
+    >                      be deleted or recognized by try_combine.  */
+    >                   rtx orig_src = SET_SRC (set);                   rtx orig_dest = SET_DEST (set);                   if (GET_CODE (SET_DEST (set)) == ZERO_EXTRACT)
+    >                     SET_DEST (set) = XEXP (SET_DEST (set), 0);
+    >                   SET_SRC (set) = note;
+    >                   i2mod = temp;
+    >                   i2mod_old_rhs = copy_rtx (orig_src);
+    >                   i2mod_new_rhs = copy_rtx (note);
+    >                   next = try_combine (insn, i2mod, NULL, NULL,
+    >                                       &new_direct_jump_p,                                       last_combined_insn);
+    >                   i2mod = NULL;
+    >                   if (next)
+    >                     {
+    >                       statistics_counter_event (cfun, "insn-with-note combine", 1);
+    >                       goto retry;
+    >                     }                   SET_SRC (set) = orig_src;
+    >                   SET_DEST (set) = orig_dest;
+    
+    This code replaces the SET_SRC of an insn in the RTL stream with the contents of a REG_EQUAL note.  So given an insn like this:
+    
+    > (insn 122 117 127 2 (set (reg:DI 157 [ _46 ])
+    >         (ior:DI (reg:DI 200)
+    >             (reg:DI 251))) "j.c":14:5 -1
+    >      (expr_list:REG_EQUAL (const_int 25769803782 [0x600000006])
+    >         (nil)))
+    
+    It replaces the (ior ...) with a (const_int ...).  The resulting insn is passed to try_combine which will try to recognize it, then use it in a combination attempt.  Recognition succeeds with the special define_insn_and_split pattern in the risc-v backend resulting in:
+    
+    > (insn 122 117 127 2 (set (reg:DI 157 [ _46 ])
+    >         (const_int 25769803782 [0x600000006])) "j.c":14:5 177 {*mvconst_internal}
+    >      (expr_list:REG_EQUAL (const_int 25769803782 [0x600000006])
+    >         (nil)))
+    
+    This is as-expected.  Now assume we were unable to combine anything, so try_combine returns NULL_RTX.  The quoted code above restores SET_SRC (and SET_DEST) resulting in:
+    
+    > (insn 122 117 127 2 (set (reg:DI 157 [ _46 ])
+    >         (ior:DI (reg:DI 200)
+    >             (reg:DI 251))) "j.c":14:5 177 {*mvconst_internal}
+    >      (expr_list:REG_EQUAL (const_int 25769803782 [0x600000006])
+    >         (nil)))
+    
+    But this doesn't get re-recognized and we ICE later in LRA.
+    
+    The fix is trivial, reset the INSN_CODE to force re-recognition in the case where try_combine fails.PR target/108892gcc/
+            * combine.cc (combine_instructions): Force re-recognition when
+            after restoring the body of an insn to its original form.
+    
+    gcc/testsuite/
+            * gcc.c-torture/compile/pr108892.c: New test.
+
+- User: Jeffrey A. Law | Time: 2023-04-05 15:20:38 UTC
+  Text: Fixed on the trunk.  Currently no plans to backport as this hasn't been seen on any release branches.
+

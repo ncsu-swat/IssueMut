@@ -1,0 +1,174 @@
+Bug Summary: [15 Regression] wrong code on highway-1.2.0 since r15-2011-ga6f551d079de1d
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2024-07-14 12:25:16 UTC
+  Text: Seemingly a recent regression.
+
+On gcc-masterr15-2026-g44c9403ed1833ahighway-1.2.0 testsuite fails as:
+
+The following tests FAILED:
+        1190 - HwyShuffle4TestGroup/HwyShuffle4Test.TestAllPer4LaneBlockShuffle/EMU128  # GetParam() = 2305843009213693952 (Subprocess aborted)
+
+Here is the minimized version extracted out of original example:
+
+// $ cat shuffle4_test.cc
+#include <stddef.h>
+#include <stdint.h>
+
+struct ve {
+    ve() = default;
+    ve(const ve&) = default;
+    ve& operator=(const ve&) = default;
+
+    // note that the code usually uses the first half of this array
+    uint8_t raw[16] = {};
+};
+
+static ve First8_(void) {
+    ve m;
+    __builtin_memset(m.raw, 0xff, 8);
+    return m;
+}
+
+static ve And_(ve a, ve b) {
+    ve au;
+    __builtin_memcpy(au.raw, a.raw, 16);
+    for (size_t i = 0; i < 8; ++i) {
+        au.raw[i] &= b.raw[i];
+    }
+    return au;
+}
+
+__attribute__((noipa, optimize(0)))
+static void vec_assert(ve a) {
+    if (a.raw[6] != 0x06 && a.raw[6] != 0x07)
+        __builtin_trap();
+}
+
+static ve Reverse4_(ve v) {
+    ve ret;
+    for (size_t i = 0; i < 8; i += 4) {
+        ret.raw[i + 0] = v.raw[i + 3];
+        ret.raw[i + 1] = v.raw[i + 2];
+        ret.raw[i + 2] = v.raw[i + 1];
+        ret.raw[i + 3] = v.raw[i + 0];
+    }
+    return ret;
+}
+
+static ve DupEven_(ve v) {
+    for (size_t i = 0; i < 8; i += 2) {
+        v.raw[i + 1] = v.raw[i];
+    }
+    return v;
+}
+
+template <bool b>
+ve Per4LaneBlockShuffle_(ve v) {
+    if (b) {
+        return Reverse4_(v);
+    } else {
+        return DupEven_(v);
+    }
+}
+
+template <bool b>
+static inline __attribute__((always_inline)) void DoTestPer4LaneBlkShuffle(const ve v) {
+    ve actual = Per4LaneBlockShuffle_<b>(v);
+    const auto valid_lanes_mask = First8_();
+    ve actual_masked = And_(valid_lanes_mask, actual);
+    vec_assert(actual_masked);
+}
+
+static void DoTestPer4LaneBlkShuffles(const ve v) {
+    alignas(128) uint8_t src_lanes[8];
+    __builtin_memcpy(src_lanes, v.raw, 8);
+    // need both, hm
+    DoTestPer4LaneBlkShuffle<true >(v);
+    DoTestPer4LaneBlkShuffle<false>(v);
+}
+
+__attribute__((noipa, optimize(0)))
+static void bug(void) {
+   uint8_t iv[8] = {1,2,3,4,5,6,7,8};
+   ve v;
+   __builtin_memcpy(v.raw, iv, 8);
+   DoTestPer4LaneBlkShuffles(v);
+}
+
+int main(void) {
+    bug();
+}
+
+Bad:
+
+$ gcc/xg++ -Bgcc shuffle4_test.cc -O3 -o bug && ./bug
+Illegal instruction (core dumped)
+
+Ok:
+
+$ gcc/xg++ -Bgcc shuffle4_test.cc -O2 -o bug && ./bug
+
+$ gcc/xg++ -Bgcc -v
+Reading specs from gcc/specs
+COLLECT_GCC=gcc/xg++
+COLLECT_LTO_WRAPPER=gcc/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /home/slyfox/dev/git/gcc/configure --disable-multilib --disable-bootstrap --disable-lto --disable-libsanitizer --disable-libstdcxx-pch --enable-languages=c,c++ --disable-libgomp --disable-libquadmath --disable-libvtv CFLAGS='-O1 -g0' CXXFLAGS='-O1 -g0' LDFLAGS='-O1 -g0'
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240714 (experimental) (GCC)
+
+- User: Sergei Trofimovich | Time: 2024-07-14 12:55:53 UTC
+  Text: Bisect saysr15-2011-ga6f551d079de1dintroduced it:
+
+commit a6f551d079de1d151b272bcdd3d42316857c9d4e
+Author: Jeff Law <jlaw@ventanamicro.com>
+Date:   Fri Jul 12 13:11:33 2024 -0600
+
+    [PR rtl-optimization/115876] Fix one of two ubsan reported issues in new ext-dce.cc code
+
+- User: Andreas Schwab | Time: 2024-07-14 12:58:42 UTC
+  Text: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=115876#c7It broke the ASHIFT case.
+
+-        return mask &gt;&gt; INTVAL (XEXP (x, 1));
++        return (HOST_WIDE_INT)mask &gt;&gt; INTVAL (XEXP (x, 1));</pre>
+
+- User: Andreas Schwab | Time: 2024-07-14 19:01:54 UTC
+  Text: ***Bug 115877has been marked as a duplicate of this bug. ***
+
+- User: Andreas Schwab | Time: 2024-07-14 19:03:09 UTC
+  Text: ***Bug 115912has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2024-07-15 23:05:43 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:94b21f13763638f64e83e7f9959c7f1523b9eaedcommitr15-2048-g94b21f13763638f64e83e7f9959c7f1523b9eaedAuthor: Jeff Law <jlaw@ventanamicro.com>
+Date:   Mon Jul 15 16:57:44 2024 -0600
+
+    Fix sign/carry bit handling in ext-dce.
+    
+    My change to fix a ubsan issue broke handling propagation of the carry/sign bit
+    down through a right shift.  Thanks to Andreas for the analysis and proposed
+    fix and Sergei for the testcase.PR rtl-optimization/115876PR rtl-optimization/115916gcc/
+            * ext-dce.cc (carry_backpropagate): Make return type unsigned as well.
+            Cast to signed for right shift to preserve sign bit.
+    
+    gcc/testsuite/
+    
+            * g++.dg/torture/pr115916.C: New test.
+    
+            Co-author: Andreas Schwab <schwab@linux-m68k.org>
+            Co-author: Sergei Trofimovich <slyfox at gentoo dot org>
+
+- User: Jeffrey A. Law | Time: 2024-07-15 23:07:15 UTC
+  Text: Fixed on the trunk.
+
+- User: Sergei Trofimovich | Time: 2024-07-17 23:06:46 UTC
+  Text: The change also fixed highway-1.2.0 testsuite for me. Thank you!
+

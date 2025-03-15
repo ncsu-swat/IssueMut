@@ -1,0 +1,569 @@
+Issue Title: [BOLT] Optimizing immediate relocation with addends produces incorrect assembly
+Original Post: I ran into an issue running BOLT on a program that accesses a global struct field provided by the linker. When accessing a field of that struct, the optimized binary wipes the addend and instead replaces reads of that field with reads of the struct+0.
+
+## Versions of things
+
+I tested with both x86 and aarch64 and managed to reproduce.
+
+```sh
+$ llvm-bolt --version
+LLVM (http://llvm.org/):
+  LLVM version 19.0.0git
+  Optimized build with assertions.
+BOLT revision bb6a4850553dd4140a5bd63187ec1b14d0b731f9
+```
+
+```sh
+$ gcc --version                                                                                                
+gcc (GCC) 7.3.1 20180712 (Red Hat 7.3.1-17)
+```
+
+## Repro
+This is a minimal repro on x86.
+
+The following is the C, `print_global.c`
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+struct build_id_note {
+  char pad[16];
+  uint8_t hash[20];
+};
+
+extern const struct build_id_note build_id_note;
+
+void print_build_id()
+{
+	int x;
+
+	for (x = 0; x < 20; x++) {
+		printf("%02hhx", build_id_note.hash[x]);
+	}
+        printf("\n");
+}
+
+int main() {
+        print_build_id();
+        return 0;
+}
+```
+
+I used the default linker script outputted by the `-Wl,-verbose` gcc flag, then inserted the `build_id_note` at an absolute location right under that first `PROVIDE` in `build_id.ld`, like so:
+
+```ld
+/* first bit of default linker script removed */
+SECTIONS
+{
+  /* Read-only sections, merged into text segment: */
+  PROVIDE (__executable_start = SEGMENT_START("text-segment", 0x400000)); . = SEGMENT_START("text-segment", 0x400000) + SIZEOF_HEADERS;
+  .note.gnu.build-id (0x400200):
+   {
+    build_id_note = ABSOLUTE(.);
+    *(.note.gnu.build-id)
+   }
+  /* rest of default linker script removed */
+}
+```
+
+This is compiled with
+```sh
+gcc -o print_global print_global.c -Wl,-T,build_id.ld -Wl,--emit-relocs -Wl,--build-id=sha1
+```
+
+Then bolting:
+```sh
+$ llvm-bolt ./print_global -o print_global.bolted --funcs print_build_id         
+BOLT-INFO: Target architecture: x86_64
+BOLT-INFO: BOLT version: bb6a4850553dd4140a5bd63187ec1b14d0b731f9
+BOLT-INFO: first alloc address is 0x200000
+BOLT-INFO: creating new program header table at address 0x800000, offset 0x600000
+BOLT-INFO: enabling relocation mode
+BOLT-INFO: enabling -align-macro-fusion=all since no profile was specified
+BOLT-INFO: enabling lite mode
+BOLT-INFO: 0 out of 12 functions in the binary (0.0%) have non-empty execution profile
+BOLT-INFO: setting _end to 0xa001cc
+BOLT-INFO: patched build-id (flipped last bit)
+```
+
+The output of the non-bolted binary is:
+```sh
+$ ./print_global
+74007820799e8dc7eb6ff742fe419c5866842b5b
+```
+
+Yet, the bolted binary produces the wrong result
+```
+$ ./print_global.bolted                                                                      
+040000001400000003000000474e550074007820
+```
+
+Of course, the build id is still as expected for the bolted binary:
+```sh
+$ readelf -n print_global.bolted 
+Displaying notes found in: .note.gnu.build-id
+  Owner                 Data size       Description
+  GNU                  0x00000014       NT_GNU_BUILD_ID (unique build ID bitstring)
+    Build ID: 74007820799e8dc7eb6ff742fe419c5866842b5a
+```
+
+So this is a case where BOLT leads to incorrect runtime behavior. Inspecting the assembly, we see the root of the problem is that the immediate address for `build_id_note.hash` is missing the addend and thus we print starting from the `pad` field:
+
+Non-bolted asm:
+```sh
+$ gdb -batch -ex "disassemble print_build_id" print_global                
+Dump of assembler code for function print_build_id:
+   0x00000000004004e7 <+0>:     push   %rbp
+   0x00000000004004e8 <+1>:     mov    %rsp,%rbp
+   0x00000000004004eb <+4>:     sub    $0x10,%rsp
+   0x00000000004004ef <+8>:     movl   $0x0,-0x4(%rbp)
+   0x00000000004004f6 <+15>:    jmp    0x40051c <print_build_id+53>
+   0x00000000004004f8 <+17>:    mov    -0x4(%rbp),%eax
+   0x00000000004004fb <+20>:    cltq   
+   0x00000000004004fd <+22>:    movzbl 0x400210(%rax),%eax <---------- Access of build_id_note.hash
+   0x0000000000400504 <+29>:    movzbl %al,%eax
+   0x0000000000400507 <+32>:    mov    %eax,%esi
+   0x0000000000400509 <+34>:    mov    $0x4005d0,%edi
+   0x000000000040050e <+39>:    mov    $0x0,%eax
+   0x0000000000400513 <+44>:    callq  0x400410 <printf@plt>
+   0x0000000000400518 <+49>:    addl   $0x1,-0x4(%rbp)
+   0x000000000040051c <+53>:    cmpl   $0x13,-0x4(%rbp)
+   0x0000000000400520 <+57>:    jle    0x4004f8 <print_build_id+17>
+   0x0000000000400522 <+59>:    mov    $0xa,%edi
+   0x0000000000400527 <+64>:    callq  0x400400 <putchar@plt>
+   0x000000000040052c <+69>:    nop
+   0x000000000040052d <+70>:    leaveq 
+   0x000000000040052e <+71>:    retq   
+End of assembler dump.
+
+```
+
+Bolted asm:
+```sh
+$ gdb -batch -ex "disassemble print_build_id" print_global.bolted                             
+Dump of assembler code for function print_build_id:
+   0x0000000000a00000 <+0>:     push   %rbp
+   0x0000000000a00001 <+1>:     mov    %rsp,%rbp
+   0x0000000000a00004 <+4>:     sub    $0x10,%rsp
+   0x0000000000a00008 <+8>:     movl   $0x0,-0x4(%rbp)
+   0x0000000000a0000f <+15>:    jmp    0xa00035 <print_build_id+53>
+   0x0000000000a00011 <+17>:    mov    -0x4(%rbp),%eax
+   0x0000000000a00014 <+20>:    cltq   
+   0x0000000000a00016 <+22>:    movzbl 0x400200(%rax),%eax <---------- Uh oh, should be 0x400210
+   0x0000000000a0001d <+29>:    movzbl %al,%eax
+   0x0000000000a00020 <+32>:    mov    %eax,%esi
+   0x0000000000a00022 <+34>:    mov    $0x4005d0,%edi
+   0x0000000000a00027 <+39>:    mov    $0x0,%eax
+   0x0000000000a0002c <+44>:    callq  0x400410 <printf@plt>
+   0x0000000000a00031 <+49>:    addl   $0x1,-0x4(%rbp)
+   0x0000000000a00035 <+53>:    cmpl   $0x13,-0x4(%rbp)
+   0x0000000000a00039 <+57>:    jle    0xa00011 <print_build_id+17>
+   0x0000000000a0003b <+59>:    mov    $0xa,%edi
+   0x0000000000a00040 <+64>:    callq  0x400400 <putchar@plt>
+   0x0000000000a00045 <+69>:    leaveq 
+   0x0000000000a00046 <+70>:    retq   
+End of assembler dump.
+
+```
+
+Comment by yota9: Hello! Thanks for raise an issue, should be fixed by #100890  
+Comment by s-dag: Hi @yota9, thanks for taking a look. We have found that at least on AAarch64 our linker's behavior was not correct and it should not have generated a relocation for an absolute symbol. When tested on a toolchain with the fix [here](https://sourceware.org/git/?p=binutils-gdb.git;a=commit;h=0c1ded8dc0be9c61975e04a0b416b064223f7bda), the relocation was not generated so BOLT and pre-BOLT assembly were both correct. We still think this should be fixed in BOLT as well so it works correctly with older toolchains and had come up with a similar patch to yours. This may explain why you were not able to reproduce it locally if you were using a newer toolchain. 
+Comment by yota9: @s-dag Hi! I agree that in this case using GOT table is excess on the first place. With different options clang/gcc would output different assembly that would have different impact on BOLT. But BOLT patch fixes other "legal" problems too, we still need to apply it, so I think I would be able to push it ASAP when someone from meta team would review it :)
+Comment by johndoe2012: Hello @yota9,
+not sure i understand. why do we need bolt to process it to use GOT table, is it a difference between clang and gcc behavior? because according to the [ld toolchain fix](https://sourceware.org/git/?p=binutils-gdb.git;a=commit;h=0c1ded8dc0be9c61975e04a0b416b064223f7bda), on aarch64 the relocation for ABS symbols should not be emitted at all thus no need to be handled by bolt relocation pass. so here the expected behavior would be simply to ignore any seen relocation for ABS symbols right? then for example we would have the following on aarch64
+
+```
++       // This might be a relocation for an ABS symbols like __global_pointer$ on
++       // RISC-V
++-      ContainingBF->addRelocation(Rel.getOffset(), ReferencedSymbol,
++-                                  Rel.getType(), 0,
++-                                  cantFail(Symbol.getValue()));
+++      // on aarch64 with ld version prior to 2.40 relocation is also mistakenly
+++      // generated for an ABS symbol. in this case we ignore such relocation without
+++      // rewriting
+++      if (!IsAArch64) {
+++        ContainingBF->addRelocation(Rel.getOffset(), ReferencedSymbol,
+++                                    Rel.getType(), 0,
+++                                    cantFail(Symbol.getValue()));
+++      }
++       return;
+```
+Comment by yota9: @johndoe2012 Hello! 
+Sorry, I might not understand your question properly, but we need to process it with the GOT table because originally the binary has a GOT relocation and a GOT access to get the symbol. We are not creating any GOT access by this code or near it, we only preserve it if it was originally built this way.  If original binary was built with the ld fix above it won't have GOT access and thus won't have it in bolted binary too. 
+Comment by johndoe2012: Hello @yota9, 
+while testing the patch another issue surfaces regarding the handling of R_AARCH64_ADR_PREL_PG_HI21 relocs of ABS symbols in our environment. we dont have much detail yet but is working on a reproducer and more digging into the root cause.
+
+regarding my previous comment, i was talking about two approaches on the fix:
+- ignore relocs handling for abs symbol, do nothing if not risc-v and return immediate. (my example)
+- do not add relocs if not risc-v at the fixed line, but fall through into the rest of relocs handling. (your patch)
+
+considering the right behavior is not to generate relocs for abs symbol on aarch64, wouldn't ignoring it be the correct action here?
+
+Thanks, 
+Comment by yota9: Hello @johndoe2012! Sorry, at this point I could not tell much without looking at your binary and the problem you observe :( Currently I don't see any problems with my patch but observe some fixed test cases for both aarch64 and x86. So please provide the binary and exact place in it where you observe incorrect behaviour.
+Comment by s-dag: Hi @yota9, we had to prioritize the dynamic linking issue first but we will try to come up with a simple enough reproducer here again for the relocation of absolute symbols. We're seeing with https://github.com/llvm/llvm-project/pull/100890 (and yes it does fix build id reproducer above), relocation of absolute symbols are still handled incorrectly on Aarch64.
+Comment by yota9: @s-dag Hi. I need more information of what kind of problems do you see. Better with test, but at least diff of old and new binaries in a place that has a problem
+Comment by johndoe2012: hello @yota9, terribly sorry we haven't been able to produce a minimal reproducer, but here are some descriptions of the problem we see: 
+```
+# in linker script we define __metadata_start to a fixed address, 0x5000000 in this example
+
+SECTIONS
+{
+...
+__metadata_start = METADATA_BASE_ADDR;
+}
+
+# disassembly in original binary
+0000000004322150 <foo_function>:
+ 4322150:       d00066e0        adrp    x0, 5000000 <METADATA_BASE_ADDR>           <<<<< intended
+	                    4322150: R_AARCH64_ADR_PREL_PG_HI21     __metadata_start
+ 4322154:       91000000        add     x0, x0, #0x0
+                        4322154: R_AARCH64_ADD_ABS_LO12_NC      __metadata_start
+ 4322158:       b9400400        ldr     w0, [x0, #4]
+ 432215c:       7100001f        cmp     w0, #0x0
+ 4322160:       1a9f07e0        cset    w0, ne  // ne = any
+ 4322164:       d65f03c0        ret
+
+# bolt, internally parsed relocation. the information is correct
+Relocation: offset = 0x4322150; type = R_AARCH64_ADR_PREL_PG_HI21; value = 0x5000000; symbol = __metadata_start (); symbol address = 0x5000000; addend = 0x0; address = 0x5000000; in = foo_function
+Relocation: offset = 0x4322154; type = R_AARCH64_ADD_ABS_LO12_NC; value = 0x0; symbol = __metadata_start (); symbol address = 0x5000000; addend = 0x0; address = 0x5000000; in = foo_function
+BOLT-INFO: pre-processing profile using branch profile reader
+
+# disassembly in bolted binary, with this patch
+000000000432e7c8 <foo_function>:
+ 432e7c8:       d00066e0        adrp    x0, 500c000 <METADATA_BASE_ADDR+0xc000>.   <<<<< wrong
+ 432e7cc:       91000000        add     x0, x0, #0x0
+ 432e7d0:       b9400400        ldr     w0, [x0, #4]
+ 432e7d4:       7100001f        cmp     w0, #0x0
+ 432e7d8:       1a9f07e0        cset    w0, ne  // ne = any
+ 432e7dc:       d65f03c0        ret
+
+# before [this patch](https://github.com/llvm/llvm-project/pull/100890), bolt applies the relocs and fixes adrp target to symbol addresss 0x5000000, likely by accident. after this patch, wrong address target is used.
+# we know the address is already wrong when bolt enters `handleRelocation()`, but still trying to trace where exactly it is altered
+``` 
+Comment by yota9: Thanks @johndoe2012 ! Looks strange, I think we've got plenty of tests with adr/adrp , not sure why it is happening. If you willing to share the binary I would try to check what is going on there. 
+Comment by johndoe2012: hello @yota9, thanks for the quick response. but sharing the full binary is unlikely. we are attempting a simple reproducer but currently have some difficulty achieving the intended `adrp    x0, 5000000 <METADATA_BASE_ADDR>` as in the original binary case. nonetheless we will continue to work on the reproducer while dig into where bolt alters the value. 
+Comment by yota9: @johndoe2012 Please check BOLT with --print-all --print-only= foo_function, and write here e.g. after disassembly, cfg and somewhere in the last pass what would it print out for this ADRP instruction
+Comment by johndoe2012: hi @yota9, please find following the bolt logs. there are several more passes but the `00000000:   adrp    x0, #13492224 # debug line foo_file.c:393` value is unchanged
+(edited to add last pass "after clean-mc-state")
+```
+Binary Function "foo_function" after disassembly {
+  Number      : 4909
+  State       : disassembled
+  Address     : 0x4322150
+  Size        : 0x18
+  MaxSize     : 0x20
+  Offset      : 0x332150
+  Section     : .text
+  Orc Section : .local.text.foo_function
+  LSDA        : 0x0
+  IsSimple    : 1
+  IsMultiEntry: 0
+  IsSplit     : 0
+  BB Count    : 0
+}
+.LBB04908:
+    00000000:   adrp    x0, #13492224 # debug line foo_file.c:393
+    00000004:   add     x0, x0, #0x0 # debug line foo_file.c:393
+    00000008:   ldr     w0, [x0, #0x4] # debug line foo_file.c:393
+    0000000c:   cmp     w0, #0x0 # debug line foo_file.c:393
+    00000010:   cset    w0, ne # debug line foo_file.c:394
+    00000014:   ret     x30 # Offset: 20 # debug line foo_file.c:394
+DWARF CFI Instructions:
+    <empty>
+End of Function "foo_function"
+
+Binary Function "foo_function" while building cfg {
+  Number      : 4909
+  State       : CFG constructed
+  Address     : 0x4322150
+  Size        : 0x18
+  MaxSize     : 0x20
+  Offset      : 0x332150
+  Section     : .text
+  Orc Section : .local.text.foo_function
+  LSDA        : 0x0
+  IsSimple    : 1
+  IsMultiEntry: 0
+  IsSplit     : 0
+  BB Count    : 1
+  Hash        : 232f37ac2717279a
+  BB Layout   : .LBB04908
+                   0 : executed forward branches
+                   0 : taken forward branches
+                   0 : executed backward branches
+                   0 : taken backward branches
+                   0 : executed unconditional branches
+                   0 : all function calls
+                   0 : indirect calls
+                   0 : PLT calls
+                   0 : executed instructions
+                   0 : executed load instructions
+                   0 : executed store instructions
+                   0 : taken jump table branches
+                   0 : taken unknown indirect branches
+                   0 : total branches
+                   0 : taken branches
+                   0 : non-taken conditional branches
+                   0 : taken conditional branches
+                   0 : all conditional branches
+                   0 : linker-inserted veneer calls
+
+}
+.LBB04908 (6 instructions, align : 1)
+  Entry Point
+  CFI State : 0
+    00000000:   adrp    x0, #13492224 # debug line foo_file.c:393
+    00000004:   add     x0, x0, #0x0 # debug line foo_file.c:393
+    00000008:   ldr     w0, [x0, #0x4] # debug line foo_file.c:393
+    0000000c:   cmp     w0, #0x0 # debug line foo_file.c:393
+    00000010:   cset    w0, ne # debug line foo_file.c:394
+    00000014:   ret     x30 # Offset: 20 # debug line foo_file.c:394
+  CFI State: 0
+
+DWARF CFI Instructions:
+    <empty>
+End of Function "foo_function"
+
+
+Binary Function "foo_function" after attaching profile {
+  Number      : 4909
+  State       : CFG constructed
+  Address     : 0x4322150
+  Size        : 0x18
+  MaxSize     : 0x20
+  Offset      : 0x332150
+  Section     : .text
+  Orc Section : .local.text.foo_function
+  LSDA        : 0x0
+  IsSimple    : 1
+  IsMultiEntry: 0
+  IsSplit     : 0
+  BB Count    : 1
+  Hash        : 232f37ac2717279a
+  BB Layout   : .LBB04908
+                   0 : executed forward branches
+                   0 : taken forward branches
+                   0 : executed backward branches
+                   0 : taken backward branches
+                   0 : executed unconditional branches
+                   0 : all function calls
+                   0 : indirect calls
+                   0 : PLT calls
+                   0 : executed instructions
+                   0 : executed load instructions
+                   0 : executed store instructions
+                   0 : taken jump table branches
+                   0 : taken unknown indirect branches
+                   0 : total branches
+                   0 : taken branches
+                   0 : non-taken conditional branches
+                   0 : taken conditional branches
+                   0 : all conditional branches
+                   0 : linker-inserted veneer calls
+
+}
+.LBB04908 (6 instructions, align : 1)
+  Entry Point
+  CFI State : 0
+    00000000:   adrp    x0, #13492224 # debug line foo_file.c:393
+    00000004:   add     x0, x0, #0x0 # debug line foo_file.c:393
+    00000008:   ldr     w0, [x0, #0x4] # debug line foo_file.c:393
+    0000000c:   cmp     w0, #0x0 # debug line foo_file.c:393
+    00000010:   cset    w0, ne # debug line foo_file.c:394
+    00000014:   ret     x30 # Offset: 20 # debug line foo_file.c:394
+  CFI State: 0
+
+DWARF CFI Instructions:
+    <empty>
+End of Function "foo_function"
+
+Binary Function "foo_function" after building cfg {
+  Number      : 4909
+  State       : CFG constructed
+  Address     : 0x4322150
+  Size        : 0x18
+  MaxSize     : 0x20
+  Offset      : 0x332150
+  Section     : .text
+  Orc Section : .local.text.foo_function
+  LSDA        : 0x0
+  IsSimple    : 1
+  IsMultiEntry: 0
+  IsSplit     : 0
+  BB Count    : 1
+  Hash        : 232f37ac2717279a
+  BB Layout   : .LBB04908
+                   0 : executed forward branches
+                   0 : taken forward branches
+                   0 : executed backward branches
+                   0 : taken backward branches
+                   0 : executed unconditional branches
+                   0 : all function calls
+                   0 : indirect calls
+                   0 : PLT calls
+                   0 : executed instructions
+                   0 : executed load instructions
+                   0 : executed store instructions
+                   0 : taken jump table branches
+                   0 : taken unknown indirect branches
+                   0 : total branches
+                   0 : taken branches
+                   0 : non-taken conditional branches
+                   0 : taken conditional branches
+                   0 : all conditional branches
+                   0 : linker-inserted veneer calls
+
+}
+.LBB04908 (6 instructions, align : 1)
+  Entry Point
+  CFI State : 0
+    00000000:   adrp    x0, #13492224 # debug line foo_file.c:393
+    00000004:   add     x0, x0, #0x0 # debug line foo_file.c:393
+    00000008:   ldr     w0, [x0, #0x4] # debug line foo_file.c:393
+    0000000c:   cmp     w0, #0x0 # debug line foo_file.c:393
+    00000010:   cset    w0, ne # debug line foo_file.c:394
+    00000014:   ret     x30 # debug line foo_file.c:394
+  CFI State: 0
+
+DWARF CFI Instructions:
+    <empty>
+End of Function "foo_function"
+
+Binary Function "foo_function" after clean-mc-state {
+  Number      : 4909
+  State       : CFG finalized
+  Address     : 0x4322150
+  Size        : 0x18
+  MaxSize     : 0x20
+  Offset      : 0x332150
+  Section     : .text
+  Orc Section : .text.cold
+  LSDA        : 0x0
+  IsSimple    : 1
+  IsMultiEntry: 0
+  IsSplit     : 0
+  BB Count    : 1
+  Hash        : 232f37ac2717279a
+  BB Layout   : .LBB04908
+                   0 : executed forward branches
+                   0 : taken forward branches
+                   0 : executed backward branches
+                   0 : taken backward branches
+                   0 : executed unconditional branches
+                   0 : all function calls
+                   0 : indirect calls
+                   0 : PLT calls
+                   0 : executed instructions
+                   0 : executed load instructions
+                   0 : executed store instructions
+                   0 : taken jump table branches
+                   0 : taken unknown indirect branches
+                   0 : total branches
+                   0 : taken branches
+                   0 : non-taken conditional branches
+                   0 : taken conditional branches
+                   0 : all conditional branches
+                   0 : linker-inserted veneer calls
+
+}
+.LBB04908 (6 instructions, align : 1)
+  Entry Point
+  CFI State : 0
+    00000000:   adrp    x0, #13492224 # debug line foo_file.c:393
+    00000004:   add     x0, x0, #0x0 # debug line foo_file.c:393
+    00000008:   ldr     w0, [x0, #0x4] # debug line foo_file.c:393
+    0000000c:   cmp     w0, #0x0 # debug line foo_file.c:393
+    00000010:   cset    w0, ne # debug line foo_file.c:394
+    00000014:   ret     x30 # debug line foo_file.c:394
+
+DWARF CFI Instructions:
+    <empty>
+End of Function "foo_function"
+```
+Comment by yota9: It seems that the adrp relocation was skipped for some strange reason, it should be adrp x0, __metadata_start not 13492224 imm value.  It would be interested to know the reason behind it. I suggest you to run with --debug-only=bolt and check the messages after the 
+`Relocation: offset = 0x4322150; type = R_AARCH64_ADR_PREL_PG_HI21; value = 0x5000000; symbol = __metadata_start (); symbol address = 0x5000000; addend = 0x0; address = 0x5000000; in = foo_function
+` line. Maybe it was skipped, e.g. the section was not determine. Could you show the section entry for __metadata_start using readelf?
+Comment by johndoe2012: Thanks @yota9, this is really helpful, enabled debug log give us this:
+
+```
+BOLT-DEBUG: Relocation: offset = 0x4322150; type = R_AARCH64_ADR_PREL_PG_HI21; value = 0x5000000; symbol = __metadata_start (); symbol address = 0x5000000; addend = 0x0; address = 0x5000000; in = foo_function
+Relocation: offset = 0x4322150; type = R_AARCH64_ADR_PREL_PG_HI21; value = 0x5000000; symbol = __metadata_start (); symbol address = 0x5000000; addend = 0x0; address = 0x5000000; in = foo_function
+BOLT-DEBUG: cannot determine referenced section.
+BOLT-DEBUG: Relocation: offset = 0x4322154; type = R_AARCH64_ADD_ABS_LO12_NC; value = 0x0; symbol = __metadata_start (); symbol address = 0x5000000; addend = 0x0; address = 0x5000000; in = foo_function
+Relocation: offset = 0x4322154; type = R_AARCH64_ADD_ABS_LO12_NC; value = 0x0; symbol = __metadata_start (); symbol address = 0x5000000; addend = 0x0; address = 0x5000000; in = foo_function
+BOLT-DEBUG: cannot determine referenced section.
+```
+
+so we know relocs is skipped at https://github.com/llvm/llvm-project/blob/main/bolt/lib/Rewrite/RewriteInstance.cpp#L2670
+
+also `__metadata_start` is not a section, but a symbol (example from original binary)
+```
+28230: 0000000005000000     0 NOTYPE  GLOBAL DEFAULT  ABS __metadata_start
+```
+
+are you suggesting it is expected for bolt to change its value after bolt parsed the original elf, then fixes it by the relocation (suppose it is not skipped in handleRelocation)?
+Comment by yota9: @johndoe2012 I mean the section where this symbol __metadata_start located, is there a section for this 0x5000000 or it is in the middle of nowhere? Or it might be something really strange like non-allocatable section, basically show me the output of readelf for section and segments :) 
+Normally such relocations are not skipped, for some strange reason it could not identify the section for this symbol and I want to understand why. Maybe in your script you located this symbol in out-of-section manner, I'm not sure.
+Comment by johndoe2012: hello @yota9, yes 0x5000000 is indeed out of section. we have the line in linker file, and have `-Wl,--defsym=METADATA_BASE_ADDR=0x5000000` to supply its value
+
+linker file line
+```
+SECTIONS
+{
+...
+__metadata_start = METADATA_BASE_ADDR;
+}
+```
+
+```
+Elf file type is EXEC (Executable file)
+Entry point 0x4101058
+There are 4 program headers, starting at offset 64
+
+Program Headers:
+  Type           Offset             VirtAddr           PhysAddr
+                 FileSiz            MemSiz              Flags  Align
+  LOAD           0x0000000000010000 0x0000000004000000 0x0000000004000000
+                 0x0000000000467e20 0x0000000000467e20  RWE    0x10000
+  LOAD           0x0000000000480000 0x0000000004600000 0x0000000004600000
+                 0x0000000000000000 0x000000000024b4a0  RW     0x10000
+  NOTE           0x0000000000010000 0x0000000004000000 0x0000000004000000
+                 0x0000000000000024 0x0000000000000024  R      0x4
+  GNU_STACK      0x0000000000000000 0x0000000000000000 0x0000000000000000
+                 0x0000000000000000 0x0000000000000000  RW     0x10
+
+ Section to Segment mapping:
+  Segment Sections...
+   00     .note.gnu.build-id .data .tm_clone_table .percpu .init .text .fini .rodata .config.mak.lz4 .eh_frame .init_array .fini_array .foo_info
+   01     .bss
+   02     .note.gnu.build-id
+   03
+```
+Comment by yota9: It is segments, you forgot about sections (readelf -S). Anyway it seems to me that it is the binary fault, not BOLTs. Previously indeed the relocation was used before this skip but it was done by accident. The binary expected to be well-formed so all sections, segments must be in-place in order BOLT would be able to work properly.  
+Comment by johndoe2012: it is not in any part of the sections, so we cannot see it from `readelf -S`
+
+we see your point. we are not aware of such restrictions on out of section use case for absolute symbols. in [man page for elf](https://man7.org/linux/man-pages/man5/elf.5.html) here it mentioned specifically "...An object file does not have sections for these special indices: ... 
+SHN_ABS
+              This value specifies the absolute value for the corresponding reference...
+"
+
+`__metadata_start` is an ABS symbol. and the original binary before bolt does have the right value for this adrp instruction. 
+
+if bolt is confused by such legitimate use case, we think bolt should be fixed to handle it. 
+
+```
+# disassembly in original binary
+0000000004322150 <foo_function>:
+ 4322150:       d00066e0        adrp    x0, 5000000 <METADATA_BASE_ADDR>           <<<<< intended
+	                    4322150: R_AARCH64_ADR_PREL_PG_HI21     __metadata_start
+ 4322154:       91000000        add     x0, x0, #0x0
+                        4322154: R_AARCH64_ADD_ABS_LO12_NC      __metadata_start
+ 4322158:       b9400400        ldr     w0, [x0, #4]
+ 432215c:       7100001f        cmp     w0, #0x0
+ 4322160:       1a9f07e0        cset    w0, ne  // ne = any
+ 4322164:       d65f03c0        ret
+```
+Comment by yota9: Well, AFAICT probably it should be fixed, yes :) Your contribution would be appreciated.
+Anyway, as initial problem is fixed I'm closing this issue. Fill free to open new one related to your problem. 
+Comment by s-dag: Thank you very much for the help so far @yota9! It is indeed just by luck that out of section relocations were working previously before https://github.com/llvm/llvm-project/pull/100890. That commit fixes this other legitimate issue, relocation addends. We will deal with the out of section relocation issue separately.

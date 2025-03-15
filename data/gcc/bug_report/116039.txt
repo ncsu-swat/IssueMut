@@ -1,0 +1,101 @@
+Bug Summary: [15 Regression] rv64gc miscompile at -O3 with -fno-strict-aliasing since r15-1901-g98914f9eba5
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-07-22 20:40:39 UTC
+  Text: Testcase:
+int c[12];
+char d[12];
+int *f = c;
+int *z = (int *)1;
+long long y;
+int main() {
+  c[9] = 0xff;
+  for (int i = 0; i < 12; i += 3)
+    d[9] = z ? f[i] : 0;
+  for (long i = 0; i < 12; ++i)
+    y ^= d[i];
+  __builtin_printf("%llu\n", y);
+}
+
+Commands:> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -O3 red.c -o user-config.out -fsigned-char -fno-strict-aliasing -fwrapv
+> QEMU_CPU=rv64,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true,v=true,vext_spec=v1.0,zve32f=true,zve64f=true timeout --verbose -k 0.1 4 /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/qemu-riscv64 user-config.out255> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -O2 red.c -o user-config.out -fsigned-char -fno-strict-aliasing -fwrapv
+> QEMU_CPU=rv64,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true,v=true,vext_spec=v1.0,zve32f=true,zve64f=true timeout --verbose -k 0.1 4 /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/qemu-riscv64 user-config.out18446744073709551615
+
+First bad commit:r15-1901-g98914f9eba5Found via fuzzer.
+
+- User: Andrew Pinski | Time: 2024-07-23 01:38:04 UTC
+  Text: .
+
+- User: Jeffrey A. Law | Time: 2024-07-24 19:22:21 UTC
+  Text: Very interesting little testcase.  This may be the loongarch bug that was recently reported.
+
+It appears the root cause is this insn (from a hacked up version, so the insn #s may not match up perfectly):
+
+(insn 82 79 83 4 (set (reg:DI 246 [ _123 ])
+        (sign_extend:DI (subreg/s/u:QI (reg:DI 260) 0))) "j.c":11:11 128 {*extendqidi2}
+     (expr_list:REG_DEAD (reg:DI 260)
+        (expr_list:REG_EQUAL (sign_extend:DI (mem/c:QI (const:DI (plus:DI (symbol_ref:DI ("*.LANCHOR0") [flags 0x182])
+                            (const_int 57 [0x39]))) [0 d[9]+0 S1 A8]))
+
+
+Note the /s/u flags on the SUBREG.  Those tell the optimizers that the value is actually a sign extended object already and the optimizers can drop the extraneous extension.   In a subtle way those flags essentially mean that bits outside the subreg's mode are live.  So we really should have marked additional groups in (reg 260) as live.  That in turn would have kept key bit groups live in a different register and inhibited extension removal.
+
+There's a nonzero chance this is also the loongarch bug that just got reported.
+
+- User: GCC Commits | Time: 2024-07-25 18:36:23 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:34fb0feca71f763b2fbe832548749666d34a4a76commitr15-2321-g34fb0feca71f763b2fbe832548749666d34a4a76Author: Jeff Law <jlaw@ventanamicro.com>
+Date:   Thu Jul 25 12:32:28 2024 -0600
+
+    [PR rtl-optimization/116039] Fix life computation for promoted subregs
+    
+    So this turned out to be a neat little test and while the fuzzer found it on
+    RISC-V, I wouldn't be surprised if the underlying issue is also the root cause
+    of the loongarch issue with ext-dce.
+    
+    The key issue is that if we have something like
+    
+    (set (dest) (any_extend (subreg (source))))
+    
+    If the subreg object is marked with SUBREG_PROMOTED and the sign/unsigned state
+    matches the any_extend opcode, then combine (and I guess anything using
+    simplify-rtx) may simplify that to
+    
+    (set (dest) (source))
+    
+    That implies that bits outside the mode of the subreg are actually live and
+    valid.  This needs to be accounted for during liveness computation.
+    
+    We have to be careful here though. If we're too conservative about setting
+    additional bits live, then we'll inhibit the desired optimization in the
+    coremark examples.  To do a good job we need to know the extension opcode.
+    
+    I'm extremely unhappy with how the use handling works in ext-dce.  It mixes
+    different conceptual steps and has horribly complex control flow.  It only
+    handles a subset of the unary/binary opcodes, etc etc.  It's just damn mess.
+    It's going to need some more noodling around.
+    
+    In the mean time this is a bit hacky in that it depends on non-obvious behavior
+    to know it can get the extension opcode, but I don't want to leave the trunk in
+    a broken state while I figure out the refactoring problem.
+    
+    Bootstrapped and regression tested on x86 and tested on the crosses.  Pushing to the trunk.PR rtl-optimization/116039gcc/
+            * ext-dce.cc (ext_dce_process_uses): Add some comments about concerns
+            with current code.  Mark additional bit groups as live when we have
+            an extension of a suitably promoted subreg.
+    
+    gcc/testsuite
+            * gcc.dg/torture/pr116039.c: New test.
+
+- User: Jeffrey A. Law | Time: 2024-07-25 18:37:49 UTC
+  Text: Fixed on the trunk.
+
+- User: Xi Ruoyao | Time: 2024-07-26 07:20:10 UTC
+  Text: ***Bug 116066has been marked as a duplicate of this bug. ***
+

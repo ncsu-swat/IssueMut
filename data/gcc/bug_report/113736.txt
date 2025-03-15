@@ -1,0 +1,154 @@
+Bug Summary: ICE: verify_gimple failed: incompatible types in 'PHI' argument 0 with _BitInt() struct copy to __seg_fs/gs
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: addr-space, ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-02-03 09:31:01 UTC
+  Text: Createdattachment 57303[details]reduced testcase (from gcc.target/i386/pr90856.c)
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O2 testcase.c 
+testcase.c: In function 'clearS2_n':
+testcase.c:12:1: error: incompatible types in 'PHI' argument 0
+   12 | clearS2_n (__seg_gs S2 *p)
+      | ^~~~~~~~~
+vector(2) unsigned long * {ref-all}
+
+<address-space-2> struct S2 *
+
+vectp_p.4_14 = PHI <p_2(D)(2), vectp_p.4_15(5)>
+during GIMPLE pass: vect
+testcase.c:12:1: internal compiler error: verify_gimple failed
+0x1567165 verify_gimple_in_cfg(function*, bool, bool)
+        /repo/gcc-trunk/gcc/tree-cfg.cc:5666
+0x13cf7e4 execute_function_todo
+        /repo/gcc-trunk/gcc/passes.cc:2088
+0x13cfd3e execute_todo
+        /repo/gcc-trunk/gcc/passes.cc:2142
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-8771-20240203001826-g4b7d4d8a4af-checking-yes-rtl-df-extra-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-8771-20240203001826-g4b7d4d8a4af-checking-yes-rtl-df-extra-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240203 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2024-02-03 10:25:17 UTC
+  Text: struct S { _BitInt(710) a; };
+struct T { struct S b[2]; };
+
+void
+foo (__seg_gs struct T *p)
+{
+  struct S s;
+  p->b[0] = s;
+}
+
+Bitint lowering changes here
+  MEM <<address-space-2> _BitInt(768)> [(<address-space-2> struct T *)p_2(D)] = s_4(D);
+to
+  VIEW_CONVERT_EXPR<unsigned long[12]>(MEM <<address-space-2> _BitInt(768)> [(<address-space-2> struct T *)p_2(D)])[_5] = s_7(D);
+accesses in a loop.  Is that invalid and should have <address-space-2> also in the VCE type?  Or is this just a vectorizer bug?
+
+- User: Jakub Jelinek | Time: 2024-02-03 12:24:14 UTC
+  Text: struct S { int a[4]; };
+struct T { struct S b[16]; };
+
+void
+foo (__seg_gs struct T *p, int q)
+{
+  for (int i = 0; i < 16; ++i)
+    {
+      p->b[i].a[0] = q;
+      p->b[i].a[1] = q;
+      p->b[i].a[2] = q;
+      p->b[i].a[3] = q;
+    }
+}
+
+is vectorized right though (uses <address-space-2> vector(4) int * vectp_p.4).
+
+- User: rguenther@suse.de | Time: 2024-02-05 08:22:33 UTC
+  Text: On Sat, 3 Feb 2024, jakub at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113736> 
+> Jakub Jelinek <jakub at gcc dot gnu.org> changed:
+> 
+>            What    |Removed                     |Added
+> ----------------------------------------------------------------------------
+>    Last reconfirmed|                            |2024-02-03
+>                  CC|                            |rguenth at gcc dot gnu.org
+>      Ever confirmed|0                           |1
+>              Status|UNCONFIRMED                 |NEW
+> 
+> ---Comment #1from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> struct S { _BitInt(710) a; };
+> struct T { struct S b[2]; };
+> 
+> void
+> foo (__seg_gs struct T *p)
+> {
+>   struct S s;
+>   p->b[0] = s;
+> }
+> 
+> Bitint lowering changes here
+>   MEM <<address-space-2> _BitInt(768)> [(<address-space-2> struct T *)p_2(D)] =
+> s_4(D);
+> to
+>   VIEW_CONVERT_EXPR<unsigned long[12]>(MEM <<address-space-2> _BitInt(768)>
+> [(<address-space-2> struct T *)p_2(D)])[_5] = s_7(D);
+> accesses in a loop.  Is that invalid and should have <address-space-2> also in
+> the VCE type?  Or is this just a vectorizer bug?I think that's OK, I will have a look.
+
+- User: Richard Biener | Time: 2024-02-05 09:20:43 UTC
+  Text: (In reply torguenther@suse.defromcomment #3)> On Sat, 3 Feb 2024, jakub at gcc dot gnu.org wrote:
+> > Bitint lowering changes here
+> >   MEM <<address-space-2> _BitInt(768)> [(<address-space-2> struct T *)p_2(D)] =
+> > s_4(D);
+> > to
+> >   VIEW_CONVERT_EXPR<unsigned long[12]>(MEM <<address-space-2> _BitInt(768)>
+> > [(<address-space-2> struct T *)p_2(D)])[_5] = s_7(D);
+> > accesses in a loop.  Is that invalid and should have <address-space-2> also in
+> > the VCE type?  Or is this just a vectorizer bug?
+> 
+> I think that's OK, I will have a look.I stand corrected - it isn't correct.  The address-space needs to be on
+all types involved in a memory reference (RTL expansion is later quite
+forgiving though).
+
+This needs better documentation and maybe even IL checking I guess.
+
+- User: Jakub Jelinek | Time: 2024-02-05 11:25:58 UTC
+  Text: Createdattachment 57322[details]gcc14-pr113736.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-02-06 12:00:47 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:483c061d699309d58a1b28ce5c00ee9b55a7365ccommitr14-8824-g483c061d699309d58a1b28ce5c00ee9b55a7365cAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Feb 6 12:58:55 2024 +0100
+
+    lower-bitint: Encode address space qualifiers in VIEW_CONVERT_EXPRs [PR113736]
+    
+    As discussed in the PR, e.g. build_fold_addr_expr needs TYPE_ADDR_SPACE
+    on the outermost reference rather than just on the base, so the
+    following patch makes sure to propagate the address space from
+    the accessed var to the MEM_REFs and/or VIEW_CONVERT_EXPRs used to
+    access those.
+    
+    2024-02-06  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113736* gimple-lower-bitint.cc (bitint_large_huge::limb_access): Use
+            var's address space for MEM_REF or VIEW_CONVERT_EXPRs.
+    
+            * gcc.dg/bitint-86.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-06 12:02:09 UTC
+  Text: Fixed.
+

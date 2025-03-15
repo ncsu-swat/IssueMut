@@ -1,0 +1,158 @@
+Bug Summary: [12 Regression] ICE in tree-object-size when struct has VLA
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Siddhesh Poyarekar | Time: 2023-01-24 16:52:33 UTC
+  Text: Reproducer:
+
+__SIZE_TYPE__ foo (unsigned int n)
+{
+ struct {
+  unsigned char a[n];
+  unsigned char b;
+ } s;
+
+ return __builtin_dynamic_object_size (&s.b, 1);
+}
+
+$ gcc/cc1 -quiet ../repro.cc -O2 -Wall -o -
+	.file	"repro.cc"
+	.text
+during GIMPLE pass: objsz
+../repro.cc: In function ‘foo’:
+../repro.cc:1:15: internal compiler error: in execute_todo, at passes.cc:2140
+    1 | __SIZE_TYPE__ foo (unsigned int n)
+      |               ^~~
+0x72216f execute_todo
+	../../gcc/passes.cc:2140
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+Looks like getting the size of object for a pointer right after a VLA in a struct results in an ICE.  I'm on it.
+
+- User: Jakub Jelinek | Time: 2023-01-24 18:27:04 UTC
+  Text: At least for backports one option can be punt (give the constant maximum or minimum) when variable length structures are involved, almost nobody uses them (with the exception of Ada but then _FORTIFY_SOURCE=3 isn't on) and they are quite a mess to support.
+Otherwise, one needs to make sure to use TREE_OPERAND (t, 2) of COMPONENT_REF if non-NULL.
+On the above testcase one can see:
+  _3 = &s.1_9->b{off: _1};
+  _12 = __builtin_dynamic_object_size (_3, 1);
+That {off: _1} in there means COMPONENT_REF's last operand isn't NULL, but is SSA_NAME _1.  That contains something that should be used instead of DECL_FIELD_OFFSET if specified, because in DECL_FIELD_OFFSET you'll see a VAR_DECL that contained that value during gimplification, but isn't maintained later on.
+tree-object-size.cc currently uses byte_position, which is ok if last COMPONENT_REF's operand is NULL, otherwise it should be
+byte_from_pos (TREE_OPERAND (component_ref, 2), DECL_FIELD_BIT_OFFSET (field));
+where field is TREE_OPERAND (component_ref, 1).
+
+- User: Jakub Jelinek | Time: 2023-01-24 18:28:44 UTC
+  Text: Ah, actually
+      off = size_binop (PLUS_EXPR, DECL_FIELD_OFFSET (t),
+                        size_int (tree_to_uhwi (DECL_FIELD_BIT_OFFSET (t))
+                                  / BITS_PER_UNIT));
+So:
+-      off = size_binop (PLUS_EXPR, DECL_FIELD_OFFSET (t),
++      off = size_binop (PLUS_EXPR, TREE_OPERAND (expr, 2)
++                                   ? TREE_OPERAND (expr, 2) : DECL_FIELD_OFFSET (t),
+                         size_int (tree_to_uhwi (DECL_FIELD_BIT_OFFSET (t))
+                                   / BITS_PER_UNIT));
+or so.
+
+- User: GCC Commits | Time: 2023-01-25 00:47:40 UTC
+  Text: The master branch has been updated by Siddhesh Poyarekar <siddhesh@gcc.gnu.org>:https://gcc.gnu.org/g:b851ee9fdf0f3023635f0cb1f7c607b2d6801053commitr13-5341-gb851ee9fdf0f3023635f0cb1f7c607b2d6801053Author: Siddhesh Poyarekar <siddhesh@gotplt.org>
+Date:   Tue Jan 24 19:47:05 2023 -0500
+
+    tree-optimization/108522 Use COMPONENT_REF offset when available
+    
+    Use the offset in TREE_OPERAND(component_ref, 2) when available instead
+    of DECL_FIELD_OFFSET when trying to compute offset for a COMPONENT_REF.
+    
+    Co-authored-by: Jakub Jelinek <jakub@redhat.com>
+    
+    gcc/ChangeLog:PR tree-optimization/108522* tree-object-size.cc (compute_object_offset): Use
+            TREE_OPERAND(ref, 2) for COMPONENT_REF when available.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/108522* gcc.dg/builtin-dynamic-object-size-0.c
+            (test_dynarray_struct_member): New test.
+            (main): Call it.
+    
+    Signed-off-by: Siddhesh Poyarekar <siddhesh@gotplt.org>
+
+- User: GCC Commits | Time: 2023-01-26 12:21:11 UTC
+  Text: The master branch has been updated by Siddhesh Poyarekar <siddhesh@gcc.gnu.org>:https://gcc.gnu.org/g:0573a0778af88e805f7630ac8640ecd67d692665commitr13-5382-g0573a0778af88e805f7630ac8640ecd67d692665Author: Siddhesh Poyarekar <siddhesh@gotplt.org>
+Date:   Thu Jan 26 07:07:03 2023 -0500
+
+    tree-optimization/108522 Use component_ref_field_offset
+    
+    Instead of using TREE_OPERAND (expr, 2) directly, use
+    component_ref_field_offset instead, which does scaling for us.  The
+    function also substitutes PLACEHOLDER_EXPRs but it is not relevant for
+    tree-object-size.
+    
+    gcc/ChangeLog:PR tree-optimization/108522* tree-object-size.cc (compute_object_offset): Make EXPR
+            argument non-const.  Call component_ref_field_offset.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/108522* gcc.dg/builtin-dynamic-object-size-0.c (DEFSTRUCT): New
+            macro.
+            (test_dynarray_struct_member_b, test_dynarray_struct_member_c,
+            test_dynarray_struct_member_d,
+            test_dynarray_struct_member_subobj_b,
+            test_dynarray_struct_member_subobj_c,
+            test_dynarray_struct_member_subobj_d): New tests.
+            (main): Call them.
+    
+    Signed-off-by: Siddhesh Poyarekar <siddhesh@gotplt.org>
+
+- User: GCC Commits | Time: 2023-02-07 20:03:40 UTC
+  Text: The releases/gcc-12 branch has been updated by Siddhesh Poyarekar <siddhesh@gcc.gnu.org>:https://gcc.gnu.org/g:4526562a305b3bfc18485a2aa017500aa22aa14bcommitr12-9112-g4526562a305b3bfc18485a2aa017500aa22aa14bAuthor: Siddhesh Poyarekar <siddhesh@gotplt.org>
+Date:   Tue Jan 24 19:47:05 2023 -0500
+
+    tree-optimization/108522 Use COMPONENT_REF offset when available
+    
+    Use the offset in TREE_OPERAND(component_ref, 2) when available instead
+    of DECL_FIELD_OFFSET when trying to compute offset for a COMPONENT_REF.
+    
+    Co-authored-by: Jakub Jelinek <jakub@redhat.com>
+    
+    gcc/ChangeLog:PR tree-optimization/108522* tree-object-size.cc (compute_object_offset): Use
+            TREE_OPERAND(ref, 2) for COMPONENT_REF when available.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/108522* gcc.dg/builtin-dynamic-object-size-0.c
+            (test_dynarray_struct_member): New test.
+            (main): Call it.
+    
+    Signed-off-by: Siddhesh Poyarekar <siddhesh@gotplt.org>
+    (cherry picked from commit b851ee9fdf0f3023635f0cb1f7c607b2d6801053)
+
+- User: GCC Commits | Time: 2023-02-07 20:03:45 UTC
+  Text: The releases/gcc-12 branch has been updated by Siddhesh Poyarekar <siddhesh@gcc.gnu.org>:https://gcc.gnu.org/g:45b346664c0af57053e77276cd030015eb21f851commitr12-9113-g45b346664c0af57053e77276cd030015eb21f851Author: Siddhesh Poyarekar <siddhesh@gotplt.org>
+Date:   Thu Jan 26 07:07:03 2023 -0500
+
+    tree-optimization/108522 Use component_ref_field_offset
+    
+    Instead of using TREE_OPERAND (expr, 2) directly, use
+    component_ref_field_offset instead, which does scaling for us.  The
+    function also substitutes PLACEHOLDER_EXPRs but it is not relevant for
+    tree-object-size.
+    
+    gcc/ChangeLog:PR tree-optimization/108522* tree-object-size.cc (compute_object_offset): Make EXPR
+            argument non-const.  Call component_ref_field_offset.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/108522* gcc.dg/builtin-dynamic-object-size-0.c (DEFSTRUCT): New
+            macro.
+            (test_dynarray_struct_member_b, test_dynarray_struct_member_c,
+            test_dynarray_struct_member_d,
+            test_dynarray_struct_member_subobj_b,
+            test_dynarray_struct_member_subobj_c,
+            test_dynarray_struct_member_subobj_d): New tests.
+            (main): Call them.
+    
+    Signed-off-by: Siddhesh Poyarekar <siddhesh@gotplt.org>
+    (cherry picked from commit 0573a0778af88e805f7630ac8640ecd67d692665)
+
+- User: Siddhesh Poyarekar | Time: 2023-02-07 20:05:06 UTC
+  Text: Fixed on master as well as gcc-12 now.
+

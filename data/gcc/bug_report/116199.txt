@@ -1,0 +1,209 @@
+Bug Summary: [15 Regression] reload ICE building glibc for m68k
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, ra
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Joseph S. Myers | Time: 2024-08-02 17:37:40 UTC
+  Text: Createdattachment 58807[details]preprocessed source
+
+The following ICE building glibc for m68k-linux-gnu was introduced by:
+
+commit 88d16194d0c8a6bdc2896c8944bfbf3e6038c9d2
+Author: Jeff Law <jlaw@ventanamicro.com>
+Date:   Mon Jul 22 08:45:10 2024 -0600
+
+    [NFC][PR rtl-optimization/115877] Avoid setting irrelevant bit groups as live in ext-dce
+
+and is still present as of 7ecd6610528a301e349df273b624513ef3827321. Build the attached testcase with -O2 (not reduced, but pretty short anyway).
+
+during RTL pass: reload
+makedev.c: In function '__gnu_dev_makedev':
+makedev.c:34:316: internal compiler error: Segmentation fault
+0x1b413ce internal_error(char const*, ...)
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/diagnostic-global-context.cc:491
+0xf02c3f crash_signal
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/toplev.cc:321
+0xe7990a operands_match_p(rtx_def*, rtx_def*)
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/reload.cc:2252
+0xe809b0 find_reloads(rtx_insn*, int, int, int, short*)
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/reload.cc:2782
+0xe9162d calculate_needs_all_insns
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/reload1.cc:1469
+0xe9162d reload(rtx_insn*, int)
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/reload1.cc:983
+0xcd577f do_reload
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/ira.cc:5985
+0xcd577f execute
+        /notnfs/josmyers/glibc-manual/src/gcc/gcc/ira.cc:6161
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: Andrew Pinski | Time: 2024-08-02 17:55:16 UTC
+  Text: Hmm, I thought at least we were going to deprecate all non LRA based targets which in this case includes m68k.
+
+- User: Jeffrey A. Law | Time: 2024-08-02 18:57:57 UTC
+  Text: Even if we're going to drop m68k due to lack of LRA support, if ext-dce is doing something wrong, it's still worth debugging & fixing as it likely affects other ports.  And note this is the second issue bisect to what was supposed to be a NFC change :(  Ugh.
+
+And you never know, maybe someone will come along and enable LRA on the m68k.  I think one of the bugbounty folks that worked on the cc0 transition also had bits to enable LRA.  So it may not be a huge lift if we can find those old bits...
+
+- User: Jeffrey A. Law | Time: 2024-08-02 21:21:03 UTC
+  Text: So the code coming out of ext-dce looks quite sensible.   The key insns:
+
+(insn 7 4 8 2 (set (reg:DI 31 [ _1 ])
+        (subreg:DI (reg/v:SI 37 [ __major ]) 0)) "j.c":7:32 75 {*m68k.md:1568}
+     (nil))
+(insn 8 7 10 2 (set (reg:DI 39 [ _2 ])
+        (ashift:DI (reg:DI 31 [ _1 ])
+            (const_int 8 [0x8]))) "j.c":7:48 322 {*ashldi3}
+     (expr_list:REG_DEAD (reg:DI 31 [ _1 ])
+        (nil)))
+
+Insn 7 had previously been a extension, but the upper bits aren't used and we could safely turn it into a paradoxical subreg.
+
+Combine's actions are sensible, combining insns 7 and 8 into:
+
+(insn 8 7 10 2 (set (reg:DI 39 [ _2 ])
+        (ashift:DI (subreg:DI (reg/v:SI 37 [ __major ]) 0)
+            (const_int 8 [0x8]))) "j.c":7:48 322 {*ashldi3}
+     (nil))
+
+Still quite sensible.  IRA allocates (reg:SI 37) to d0.  Still quite sensible.  We ultimately have this inside reload:
+
+(insn 8 7 10 2 (set (reg:DI 8 %a0 [orig:39 _2 ] [39])
+        (ashift:DI (subreg:DI (reg/v:SI 0 %d0 [orig:37 __major ] [37]) 0)
+            (const_int 8 [0x8]))) "j.c":7:48 322 {*ashldi3}
+     (nil))
+
+Then reload blows up trying to ensure that op0/op1 match.  Looks like a reload issue to me.
+
+- User: Jeffrey A. Law | Time: 2024-08-02 22:35:32 UTC
+  Text: Definitely a latent bug in reload.  Looks like it's been around since the conversion to SUBREG_BYTE back in 2001!  We're blindly using subreg_regno_offset on a case that can't be simplified.  We should be checking simplify_subreg_regno first.
+
+- User: Andreas Schwab | Time: 2024-08-04 08:16:11 UTC
+  Text: Also seen while compiling libgfortran.
+
+$ ./cc1 -quiet -fpreprocessed transfer.i -mcpu=68020 -O2 -std=gnu11 -fcx-fortran-rules -o transfer.s
+during RTL pass: reload
+../../../libgfortran/io/transfer.c: In function ‘formatted_transfer_scalar_writ ’:
+../../../libgfortran/io/transfer.c:2523:1: internal compiler error: Segmentation fault
+0x1bf09ce internal_error(char const*, ...)
+        ../../gcc/diagnostic-global-context.cc:491
+0xe1f87f crash_signal
+        ../../gcc/toplev.cc:321
+0x7ff54124297f ???
+        /usr/src/debug/glibc-2.38-150600.14.5.1.x86_64/signal/../sysdeps/unix/sysv/linux/x86_64/libc_sigaction.c:0
+0xd86488 operands_match_p(rtx_def*, rtx_def*)
+        ../../gcc/reload.cc:2252
+0xd8de9d find_reloads(rtx_insn*, int, int, int, short*)
+        ../../gcc/reload.cc:2803
+0xd9f211 calculate_needs_all_insns
+        ../../gcc/reload1.cc:1469
+0xd9f211 reload(rtx_insn*, int)
+        ../../gcc/reload1.cc:983
+0xbad13f do_reload
+        ../../gcc/ira.cc:5985
+0xbad13f execute
+        ../../gcc/ira.cc:6161
+
+- User: Andreas Schwab | Time: 2024-08-04 08:19:43 UTC
+  Text: The last crash only started withr15-2690-g4b9ba9cee95119.
+
+- User: GCC Commits | Time: 2024-08-04 19:12:10 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:cfeb994d64743691d4a787f8eef7ce52d8711756commitr15-2710-gcfeb994d64743691d4a787f8eef7ce52d8711756Author: Jeff Law <jlaw@ventanamicro.com>
+Date:   Sun Aug 4 13:09:02 2024 -0600
+
+    [committed][PR rtl-optimization/116199] Fix latent bug in reload's SUBREG handling
+    
+    Building glibc on the m68k has exposed a long standing latent bug in reload.
+    
+    Basically ext-dce replaced an extension with a subreg expression (good)
+    resulting in this pair of insns:
+    
+    > (insn 7 4 8 2 (set (reg:DI 31 [ _1 ])
+    >         (subreg:DI (reg/v:SI 37 [ __major ]) 0)) "j.c":7:32 75 {*m68k.md:1568}
+    >      (nil))
+    > (insn 8 7 10 2 (set (reg:DI 39 [ _2 ])
+    >         (ashift:DI (reg:DI 31 [ _1 ])
+    >             (const_int 8 [0x8]))) "j.c":7:48 322 {*ashldi3}
+    >      (expr_list:REG_DEAD (reg:DI 31 [ _1 ])
+    >         (nil)))
+    
+    insn 7 was optimized to the simple copy by ext-dce.  That looks fine.  Combine
+    comes along and squashes them together resulting in:
+    
+    > (insn 8 7 10 2 (set (reg:DI 39 [ _2 ])
+    >         (ashift:DI (subreg:DI (reg/v:SI 37 [ __major ]) 0)
+    >             (const_int 8 [0x8]))) "j.c":7:48 322 {*ashldi3}
+    >      (nil))
+    
+    Which also looks good.
+    
+    After IRA's allocation, in the middle of reload we have:
+    
+    > (insn 8 7 10 2 (set (reg:DI 8 %a0 [orig:39 _2 ] [39])
+    >         (ashift:DI (subreg:DI (reg/v:SI 0 %d0 [orig:37 __major ] [37]) 0)
+    >             (const_int 8 [0x8]))) "j.c":7:48 322 {*ashldi3}
+    >      (nil))
+    
+    Again, sensible.  The pattern requires op0 and op1 to match, so we try to
+    figure out if d0 & a0 are the same underlying register.  So we get into this
+    code in operands_match_p:
+    
+    >       if (code == SUBREG)
+    >         {
+    >           i = REGNO (SUBREG_REG (x));
+    >           if (i >= FIRST_PSEUDO_REGISTER)
+    >             goto slow;
+    >           i += subreg_regno_offset (REGNO (SUBREG_REG (x)),
+    >                                     GET_MODE (SUBREG_REG (x)),
+    >                                     SUBREG_BYTE (x),
+    >                                     GET_MODE (x));
+    >         }
+    >       else
+    >         i = REGNO (x);
+    There's a similar fragment for the other operand.  The key is that
+    subreg_regno_offset call.  That call assumes the subreg is representable.  But
+    in the case of (subreg:DI (reg:SI d0)) we're going to get -1 (remember, m68k is
+    a big endian target).  That -1 gets passed to hard_regno_regs via this code
+    (again, just showing one of the two copies of this fragment):
+    
+    >      if (REG_WORDS_BIG_ENDIAN
+    >           && is_a <scalar_int_mode> (GET_MODE (x), &xmode)
+    >           && GET_MODE_SIZE (xmode) > UNITS_PER_WORD
+    >           && i < FIRST_PSEUDO_REGISTER)
+    >         i += hard_regno_nregs (i, xmode) - 1;
+    
+    That triggers the reported ICE.  It appears this has been broken since the
+    conversion to SUBREG_BYTE way back in 2001, though possibly it could have been
+    some minor changes around this code circa 2005 as well, it didn't seem worth
+    putting under the debugger to be sure.  Certainly the code from 2001 looks
+    suspicious to me.
+    
+    Anyway, the fix here is pretty simple.  The routine "simplify_subreg_regno" is
+    meant to be used to determine if we can simplify the subreg expression and will
+    explicitly return -1 if it can't be represented for one reason or another.  It
+    checks a variety of conditions that aren't worth listing here.
+    
+    Bootstrapped and regression tested on x86 (after reverting an unrelated patch
+    from Richard S that's causing multiple unrelated failures), which of course
+    doesn't really test the code as x86 is an LRA target.  Also built & tested the
+    crosses, none of which show issues (and some of which are reload targets).
+    m68k will bootstrap & regression test tomorrow, but I don't think there's any
+    point in waiting for that.
+    
+    Pushing to the trunk.PR rtl-optimization/116199gcc/
+            * reload.cc (operands_match_p): Verify subreg is expressable before
+            trying to simplify and match it to another operand.
+    
+    gcc/testsuite/
+            * gcc.dg/torture/pr116199.c: New test.
+
+- User: Jeffrey A. Law | Time: 2024-08-04 19:13:08 UTC
+  Text: Fixed on the trunk.
+

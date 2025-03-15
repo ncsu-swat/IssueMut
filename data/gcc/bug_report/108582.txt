@@ -1,0 +1,183 @@
+Bug Summary: [12 Regression] ICE on valid code at -Os and above with "-fno-tree-ccp -fno-tree-dce": tree check: expected class ‘type’, have ‘exceptional’ (error_mark) in useless_type_conversion_p, at gimple-expr.cc:87
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, wrong-code
+Known to Work: 11.1.0, 13.0
+Known to Fail: 12.2.0
+
+Comments:
+- User: Zhendong Su | Time: 2023-01-28 13:48:17 UTC
+  Text: It appears to be a recent regression from 12.2. 
+
+Compiler Explorer:https://godbolt.org/z/91oGh1W8K[617] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/13.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --disable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 13.0.1 20230128 (experimental) [masterr12-4647-g3f861a5c8fd] (GCC)
+[618] %
+[618] % gcctk -O3 small.c; ./a.out
+[619] %
+[619] % gcctk -O3 -fno-tree-ccp -fno-tree-dce small.c
+during GIMPLE pass: phiopt
+small.c: In function ‘main’:
+small.c:3:5: internal compiler error: tree check: expected class ‘type’, have ‘exceptional’ (error_mark) in useless_type_conversion_p, at gimple-expr.cc:87
+    3 | int main() {
+      |     ^~~~
+0x6e9981 tree_class_check_failed(tree_node const*, tree_code_class, char const*, int, char const*)
+        ../../gcc-trunk/gcc/tree.cc:8959
+0xbad6e3 tree_class_check(tree_node*, tree_code_class, char const*, int, char const*)
+        ../../gcc-trunk/gcc/tree.h:3653
+0xbad6e3 useless_type_conversion_p(tree_node*, tree_node*)
+        ../../gcc-trunk/gcc/gimple-expr.cc:87
+0xfb106c verify_gimple_assign_binary
+        ../../gcc-trunk/gcc/tree-cfg.cc:4292
+0xfc1897 verify_gimple_assign
+        ../../gcc-trunk/gcc/tree-cfg.cc:4829
+0xfc1897 verify_gimple_stmt
+        ../../gcc-trunk/gcc/tree-cfg.cc:5088
+0xfc9448 verify_gimple_in_cfg(function*, bool, bool)
+        ../../gcc-trunk/gcc/tree-cfg.cc:5583
+0xe5a333 execute_function_todo
+        ../../gcc-trunk/gcc/passes.cc:2091
+0xe5adb2 execute_todo
+        ../../gcc-trunk/gcc/passes.cc:2145
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+[620] %
+[620] % cat small.c
+int a, c, d, e, f;
+char b;
+int main() {
+  int g = 1;
+  char h[1] = {0};
+  while (a) {
+    if (f) {
+      b = 0;
+      if (d)
+        continue;
+    }
+    if (a < 1) {
+      g = 0;
+      goto L;
+    }
+  }
+  while (c) {
+    char *j = h;
+    int k;
+  L:
+    if (e && !g)
+      k |= 2 | (*j < 0);
+  }
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2023-01-28 18:10:08 UTC
+  Text: #5  0x000000000162e9cc in verify_gimple_assign (stmt=0x7ffff741c2c0) at /home/apinski/src/upstream-gcc/gcc/gcc/tree-cfg.cc:4829
+4829          return verify_gimple_assign_binary (stmt);
+(gdb) p debug_gimple_stmt(stmt)
+_4 = _13 & _28;
+
+#4  0x000000000162c6b7 in verify_gimple_assign_binary (stmt=0x7ffff741c2c0) at /home/apinski/src/upstream-gcc/gcc/gcc/tree-cfg.cc:4292
+4292      if (!useless_type_conversion_p (lhs_type, rhs1_type)
+(gdb) p debug_generic_expr(lhs_type)
+int
+$2 = void
+(gdb) p debug_generic_expr(rhs1_type)
+<<< error >>>
+$3 = void
+
+- User: Andrew Pinski | Time: 2023-01-28 18:12:04 UTC
+  Text: Mine I think ...
+
+- User: Andrew Pinski | Time: 2023-01-28 18:12:55 UTC
+  Text: PHI g_9 reduced for COND_EXPR in block 7 to g_8.
+statement un-sinked:
+k_22 = k_11 | iftmp.5_13;
+Removing basic block 8
+;; basic block 8, loop depth 0
+;;  pred:       7
+# iftmp.5_13 = PHI <2(7)>
+;;  succ:       9
+
+Looks like match-and-simplify phiopt does not take into account PHInodes ...
+
+- User: Andrew Pinski | Time: 2023-01-28 18:17:28 UTC
+  Text: This should fix the issue:
+apinski@xeond:~/src/upstream-gcc/gcc/gcc$ git diff tree-ssa-phiopt.cc
+diff --git a/gcc/tree-ssa-phiopt.cc b/gcc/tree-ssa-phiopt.cc
+index c3a889dc593..a7ab6ce4ad9 100644
+--- a/gcc/tree-ssa-phiopt.cc
++++ b/gcc/tree-ssa-phiopt.cc
+@@ -1002,6 +1002,11 @@ match_simplify_replacement (basic_block cond_bb, basic_block middle_bb,
+       if (!single_pred_p (middle_bb))
+        return false;
+
++      /* The middle bb cannot have phi nodes as we don't
++        move those assignments yet. */
++      if (!gimple_seq_empty_p (phi_nodes (middle_bb)))
++       return false;
++
+       stmt_to_move = last_and_only_stmt (middle_bb);
+       if (!stmt_to_move)
+        return false;
+
+- User: Andrew Pinski | Time: 2023-01-28 18:50:47 UTC
+  Text: Note this is a latent bug since it was introduced byr12-1309-gc4574d23cb0734.
+I don't know what changed that cause the IR to be different on the trunk but I just know it is a latent bug.
+
+- User: Andrew Pinski | Time: 2023-01-28 22:25:14 UTC
+  Text: Patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2023-January/610817.html
+
+- User: GCC Commits | Time: 2023-01-30 12:46:08 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:876b3e0514bc8cb2256c44db56255403bedfa52dcommitr13-5493-g876b3e0514bc8cb2256c44db56255403bedfa52dAuthor: Andrew Pinski <apinski@marvell.com>
+Date:   Sat Jan 28 18:27:08 2023 +0000
+
+    FixPR 108582: ICE due to PHI-OPT removing a still in use ssa_name.
+    
+    This patch adds a check in match_simplify_replacement to make sure the middlebb
+    does not have any phi-nodes as we don't currently move those.
+    This was just a thinko from before.
+    
+    Ok? Bootstrapped and tested on x86_64-linux-gnu with no regressions?PR tree-optimization/108582gcc/ChangeLog:
+    
+            * tree-ssa-phiopt.cc (match_simplify_replacement): Add check
+            for middlebb to have no phi nodes.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr108582-1.c: New test.
+
+- User: Andrew Pinski | Time: 2023-01-30 12:47:12 UTC
+  Text: Fixed on the trunk, still latent in GCC 12, will be backporting the patch next week.
+
+- User: GCC Commits | Time: 2023-02-07 20:21:53 UTC
+  Text: The releases/gcc-12 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:6f23c9077feebb29c2a28ffe89b287286df27d6dcommitr12-9114-g6f23c9077feebb29c2a28ffe89b287286df27d6dAuthor: Andrew Pinski <apinski@marvell.com>
+Date:   Sat Jan 28 18:27:08 2023 +0000
+
+    FixPR 108582: ICE due to PHI-OPT removing a still in use ssa_name.
+    
+    This patch adds a check in match_simplify_replacement to make sure the middlebb
+    does not have any phi-nodes as we don't currently move those.
+    This was just a thinko from before.
+    
+    Committed on the GCC 12 branch after a bootstrap/test on x86_64-linux-gnu.PR tree-optimization/108582gcc/ChangeLog:
+    
+            * tree-ssa-phiopt.cc (match_simplify_replacement): Add check
+            for middlebb to have no phi nodes.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr108582-1.c: New test.
+    
+    (cherry picked from commit 876b3e0514bc8cb2256c44db56255403bedfa52d)
+
+- User: Andrew Pinski | Time: 2023-02-07 20:22:28 UTC
+  Text: Fixed.
+

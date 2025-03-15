@@ -1,0 +1,119 @@
+Bug Summary: [14 Regression] ice in vn_walk_cb_data
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2023-09-08 08:52:01 UTC
+  Text: From the gcc testsuite:
+
+$ ~/gcc/results/bin/gcc -c -w ./gcc.dg/bitint-18.c
+$
+$ ~/gcc/results/bin/gcc -c -w -O1 ./gcc.dg/bitint-18.c
+during GIMPLE pass: fre
+./gcc.dg/bitint-18.c: In function ‘main’:
+./gcc.dg/bitint-18.c:44:1: internal compiler error: in vn_walk_cb_data, at tree-ssa-sccvn.cc:1866
+   44 | }
+      | ^
+0x10897ff vn_walk_cb_data::vn_walk_cb_data(vn_reference_s*, tree_node*, tree_node**, vn_lookup_kind, bool, tree_node*, bool)
+	../../trunk.year/gcc/tree-ssa-sccvn.cc:1866
+0x10784e7 vn_reference_lookup(tree_node*, tree_node*, vn_lookup_kind, vn_reference_s**, bool, tree_node**, tree_node*, bool)
+	../../trunk.year/gcc/tree-ssa-sccvn.cc:4017
+0x10860ec visit_nary_op(tree_node*, gassign*)
+	../../trunk.year/gcc/tree-ssa-sccvn.cc:5427
+
+$ ~/gcc/results/bin/gcc -v
+Using built-in specs.
+COLLECT_GCC=/home/dcb38/gcc/results/bin/gcc
+COLLECT_LTO_WRAPPER=/home/dcb38/gcc/results.20230908.asan.ubsan/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../trunk.year/configure --prefix=/home/dcb38/gcc/results.20230908.asan.ubsan --disable-multilib --disable-bootstrap --with-build-config=bootstrap-asan --with-build-config=bootstrap-ubsan --with-pkgversion=daaed758517c81fc --enable-checking=df,extra,fold,rtl,yes --enable-languages=c,c++,fortran
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20230907 (experimental) (daaed758517c81fc)
+
+- User: David Binderman | Time: 2023-09-08 10:11:30 UTC
+  Text: Reduced code is:
+
+_BitInt(575) e;
+main() {
+  __atomic_fetch_and(
+      &e,
+      40418462630594385361724744395454079240140931656245750192534103967695265126850678980088699287669565365078793986191778469857714756111026776864987769580622009237241167211461,
+      __ATOMIC_RELAXED);
+}
+
+- User: David Binderman | Time: 2023-09-08 10:17:44 UTC
+  Text: The code first seems to go wrong sometime betweeng:c1597e7fb9f9ecb9andg:10d59b802a7db9ae, which is 36 commits.
+
+- User: David Binderman | Time: 2023-09-08 10:20:45 UTC
+  Text: Jakub seems to have implemented a lot of the _BitInt support.
+
+- User: Jakub Jelinek | Time: 2023-09-08 11:26:25 UTC
+  Text: Slightly cleaned up, still -O1:
+
+_BitInt(575) e;
+
+int
+main ()
+{
+  __atomic_fetch_and (&e, 1, __ATOMIC_RELAXED);
+}
+
+(otherwise you'd want the wb suffix on the large constant to avoid warning).
+
+Or even
+_BitInt(575) e;
+
+_BitInt(575)
+foo (void)
+{
+  return e & 1;
+}
+
+The problem is that push_partial_def uses a fixed size 512-bit buffer, for larger stuff it fails and myPR93582patch assumed it doesn't fail.
+
+- User: Jakub Jelinek | Time: 2023-09-08 11:38:05 UTC
+  Text: Createdattachment 55855[details]gcc14-pr111338.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2023-09-12 10:24:51 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:6067dbdcf77df995129214248f062d9ce18b48d8commitr14-3875-g6067dbdcf77df995129214248f062d9ce18b48d8Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Sep 12 12:23:13 2023 +0200
+
+    sccvn: Avoid ICEs on _BitInt load BIT_AND_EXPR mask [PR111338]
+    
+    The following testcase ICEs, because vn_walk_cb_data::push_partial_def
+    uses a fixed size buffer (64 target bytes) for its
+    construction/deconstruction of partial stores and fails if larger precision
+    than that is needed, and thePR93582changes assert push_partial_def
+    succeeds (and check the various other conditions much earlier when seeing
+    the BIT_AND_EXPR statement, like CHAR_BIT == 8, BITS_PER_UNIT == 8,
+    BYTES_BIG_ENDIAN == WORDS_BIG_ENDIAN, etc.).  So, just removing the assert
+    and allowing it fail there doesn't really work and ICEs later on.
+    
+    The following patch moves the bufsize out of the method and tests it
+    together with the other checks.
+    
+    BTW, perhaps we could increase the bufsize as well or in addition to
+    increasing it make the buffer allocated using XALLOCAVEC, but still I think
+    it is useful to have some upper bound and so I think this patch is useful
+    even in that case.
+    
+    2023-09-12  Jakub Jelinek  <jakub@redhat.com>PR middle-end/111338* tree-ssa-sccvn.cc (struct vn_walk_cb_data): Add bufsize non-static
+            data member.
+            (vn_walk_cb_data::push_partial_def): Remove bufsize variable.
+            (visit_nary_op): Avoid the BIT_AND_EXPR with constant rhs2
+            optimization if type's precision is too large for
+            vn_walk_cb_data::bufsize.
+    
+            * gcc.dg/bitint-37.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-09-12 10:38:30 UTC
+  Text: Should be fixed now.
+

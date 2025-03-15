@@ -1,0 +1,236 @@
+Bug Summary: [13/14 Regression] Missed Dead Code Elimination at -Os when using __builtin_unreachable since r13-6945-g429a7a88438
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Theodoros Theodoridis | Time: 2023-06-01 13:54:43 UTC
+  Text: Given: 
+
+void foo(void);
+static unsigned char a = 131;
+static int *b;
+static int **c = &b;
+static void d(int e, unsigned f) {
+    int *g;
+    if (e){
+        for (; a; ++a)
+            for (e = 0; 0;)
+                ;
+        g = &e;
+        int **h = &g;
+        if (**h) {
+            foo();
+        }
+    }
+    *c = &e;
+}
+int main() { d(4 & a, a); }
+
+
+gcc trunk/13.1/12.3 at -Os generate:
+
+main:
+        testb   $4, a(%rip)
+        je      .L3
+        movb    $0, a(%rip)
+.L3:
+        leaq    -4(%rsp), %rax
+        movq    %rax, b(%rip)
+        xorl    %eax, %eax
+        ret
+a:
+        .byte   -125
+
+If I include a __builtin_unreachable() to help the compiler:
+
+void foo(void);
+static unsigned char a = 131;
+static int *b;
+static int **c = &b;
+static void d(int e, unsigned f) {
+    int *g;
+    if (f != 131) {
+        __builtin_unreachable(); // <- THIS
+    }
+    if (!e){
+        for (; a; ++a)
+            for (e = 0; 0;)
+                ;
+        g = &e;
+        int **h = &g;
+        if (**h) {
+            foo();
+        }
+    }
+    *c = &e;
+}
+int main() { d(4 & a, a); }
+
+gcc-12.3 at -Os generates better code:
+
+main:
+        leaq    -4(%rsp), %rax
+        movb    $0, a(%rip)
+        movq    %rax, b(%rip)
+        xorl    %eax, %eax
+        ret
+a:
+        .byte   -125
+
+But gcc-13.1/trunk at -Os generate worse code:
+
+main:
+        subq    $24, %rsp
+        movb    a(%rip), %al
+        movl    %eax, %edx
+        andl    $4, %edx
+        movl    %edx, 12(%rsp)
+        xorl    %edx, %edx
+.L2:
+        testb   %al, %al
+        je      .L8
+        incl    %eax
+        movb    $1, %dl
+        jmp     .L2
+.L8:
+        testb   %dl, %dl
+        je      .L4
+        movb    $0, a(%rip)
+        jmp     .L5
+.L4:
+        cmpl    $0, 12(%rsp)
+        je      .L5
+        call    foo
+.L5:
+        leaq    12(%rsp), %rax
+        movq    %rax, b(%rip)
+        xorl    %eax, %eax
+        addq    $24, %rsp
+        ret
+a:
+        .byte   -125https://godbolt.org/z/zvqshjEj3Started withr13-6945-g429a7a88438
+
+- User: Theodoros Theodoridis | Time: 2023-06-01 14:02:32 UTC
+  Text: Oops, the first code snippet is wrong in the original post: 
+
+void foo(void);
+static unsigned char a = 131;
+static int *b;
+static int **c = &b;
+static void d(int e, unsigned f) {
+    int *g;
+    if (!e){ // <------------------------ if (!e) is correct
+        for (; a; ++a)
+            for (e = 0; 0;)
+                ;
+        g = &e;
+        int **h = &g;
+        if (**h) {
+            foo();
+        }
+    }
+    *c = &e;
+}
+int main() { d(4 & a, a); }
+
+this is also the correct assembly for gcc trunk/13.1/12.3 at -Os:
+
+main:
+        movb    a(%rip), %al
+        testb   $4, %al
+        jne     .L5
+        xorl    %edx, %edx
+.L2:
+        testb   %al, %al
+        je      .L12
+        incl    %eax
+        movb    $1, %dl
+        jmp     .L2
+.L12:
+        testb   %dl, %dl
+        je      .L5
+        movb    $0, a(%rip)
+.L5:
+        leaq    -4(%rsp), %rax
+        movq    %rax, b(%rip)
+        xorl    %eax, %eax
+        ret
+a:
+        .byte   -125
+
+
+the code with the _builtin_unreachable and the rest are correct
+
+- User: Richard Biener | Time: 2023-07-27 09:26:33 UTC
+  Text: GCC 13.2 is being released, retargeting bugs to GCC 13.3.
+
+- User: Andrew Pinski | Time: 2023-08-21 23:20:55 UTC
+  Text: a.0_1 = aD.2830;
+  # RANGE [irange] unsigned int [0, 255] MASK 0xff VALUE 0x0
+  _2 = (unsigned intD.9) a.0_1;
+  # RANGE [irange] unsigned char [0, 0][4, 4] MASK 0x4 VALUE 0x0
+  _6 = a.0_1 & 4;
+  # RANGE [irange] int [0, 0][4, 4] MASK 0x4 VALUE 0x0
+  _3 = (intD.6) _6;
+
+Those ranges should have been:
+a.0_1 [131,131]
+_2 [131,131]
+_6 [0,0]
+_3 [0,0]
+
+Like we got from the (not) unreachable branch:
+=========== BB 4 ============
+Imports: a.0_1  _3  
+Exports: a.0_1  _3  _6  
+a.0_1	[irange] unsigned char [131, 131]
+_3	[irange] int [0, 0] MASK 0x4 VALUE 0x0
+
+
+The store to e was not 131 because it was before the unreachable though:
+  e = _3;
+  if (a.0_1 != 131)
+    goto <bb 3>; [0.00%]
+  else
+    goto <bb 4>; [100.00%]
+
+  <bb 3> [count: 0]:
+  __builtin_unreachable ();
+
+- User: Andrew Pinski | Time: 2023-08-21 23:21:41 UTC
+  Text: Confirmed.
+
+- User: GCC Commits | Time: 2023-09-19 14:30:58 UTC
+  Text: The master branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:bf6b107e2a342319b3787ec960fc8014ef3aff91commitr14-4141-gbf6b107e2a342319b3787ec960fc8014ef3aff91Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Wed Sep 13 11:52:15 2023 -0400
+
+    New early __builtin_unreachable processing.
+    
+    in VRP passes before __builtin_unreachable MUST be removed, only remove it
+    if all exports affected by the unreachable can have global values updated, and
+    do not involve loads from memory.PR tree-optimization/110080PR tree-optimization/110249gcc/
+            * tree-vrp.cc (remove_unreachable::final_p): New.
+            (remove_unreachable::maybe_register): Rename from
+            maybe_register_block and call early or final routine.
+            (fully_replaceable): New.
+            (remove_unreachable::handle_early): New.
+            (remove_unreachable::remove_and_update_globals): Remove
+            non-final processing.
+            (rvrp_folder::rvrp_folder): Add final flag to constructor.
+            (rvrp_folder::post_fold_bb): Remove unreachable registration.
+            (rvrp_folder::pre_fold_stmt): Move unreachable processing to here.
+            (execute_ranger_vrp): Adjust some call parameters.
+    
+            gcc/testsuite/
+            * g++.dg/pr110249.C: New.
+            * gcc.dg/pr110080.c: New.
+            * gcc.dg/pr93917.c: Adjust.
+
+- User: Andrew Macleod | Time: 2023-09-19 15:03:07 UTC
+  Text: fixed.
+

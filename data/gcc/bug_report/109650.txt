@@ -1,0 +1,448 @@
+Bug Summary: avr-gcc incorrect code with -Os
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: patch, wrong-code
+Known to Work: 11.1.0
+Known to Fail: 
+
+Comments:
+- User: Martin Thierer | Time: 2023-04-27 17:13:23 UTC
+  Text: Createdattachment 54942[details]preprocessed input file
+
+The attached file imho creates invalid code with avr-gcc 12.2.0 when compiling with "-Os". The same code works with either different optimization settings or avr-gcc 11.3.0 (haven't tried any other versions).
+
+The misbehaving code is this function:
+
+static bool test_func(uint8_t p1, uint8_t p2) {
+  if (p1 == 0 || p1 > 7)
+    return false;
+
+  if      (p1 < 3) return p2 <= 8;
+  else if (p1 < 5) return p2 <= 6;
+  else if (p1 < 7) return p2 <= 4;
+  else             return p2 <= 2;
+}
+
+It should return false for all values of p2 if p1 is 0 or > 7 and the result should depend on p2 for inbetween values of p1.
+
+The code contains a lot of boilerplate for sending a showcase output over USART0. This is the result for values of 0 <= p2 < 10 (columns) for 0 < p1 < 9 (rows):
+
+  0123456789
+0 ??????????
+1 XXXXXXXXX?
+2 XXXXXXXXX?
+3 XXXXXX????
+4 XXXXXX????
+5 XXXX??????
+6 XXXX??????
+7 XX????????
+8 ??????????
+
+"X" means test_func() returned true, "?" false. The result for p1 in [0,1,2,8] is correct, all the other results are off (too low) by 1. For example, for p1 == 3 the function should return true for all p2 <= 6, but it only does for <= 5.
+
+I'm not too familiar with AVR assembly, but the problem seems to be that the comparisons that calculate the result value all use the same brlo (branch if lower) instruction at .L34, but the compiler fails to compensate for the "lower" instead of "lower or equal" for all but the first (<= 8) condition:
+
+.L21:
+	cpi r17,lo8(7)
+	brsh .L25
+	cpi r28,lo8(3)
+	brsh .L12
+	cpi r29,lo8(9)		; this correctly compares to 9 == 8+1
+.L34:
+	brlo .L27
+.L25:
+	ldi r24,lo8(63)
+.L11:
+
+[...]
+
+.L12:
+	cpi r28,lo8(5)
+	brsh .L15
+	cpi r29,lo8(6)		; but this does not (should be 6+1 == 7)
+	rjmp .L34
+.L15:
+	cpi r28,lo8(7)
+	breq .L17
+	cpi r29,lo8(4)		; neither does this (should be 4+1 == 5)
+	rjmp .L34
+.L17:
+	cpi r29,lo8(2)		; nor this (should be 2+1 == 3)
+	rjmp .L34
+.L27:
+
+
+Tested with the respective Arch Linux x86_64 avr-gcc packages.
+
+Output of "avr-gcc -v":> avr-gcc -v -save-temps -Wall -Wextra -mmcu=atmega1284p -Os --param=min-pagesize=0 avr-bug.cUsing built-in specs.
+Reading specs from /usr/lib/gcc/avr/12.2.0/device-specs/specs-atmega1284p
+COLLECT_GCC=avr-gcc
+COLLECT_LTO_WRAPPER=/usr/lib/gcc/avr/12.2.0/lto-wrapper
+Target: avr
+Configured with: /build/avr-gcc/src/gcc-12.2.0/configure --disable-install-libiberty --disable-libssp --disable-libstdcxx-pch --disable-libunwind-exceptions --disable-linker-build-id --disable-nls --disable-werror --disable-__cxa_atexit --enable-checking=release --enable-clocale=gnu --enable-gnu-unique-object --enable-gold --enable-languages=c,c++ --enable-ld=default --enable-lto --enable-plugin --enable-shared --infodir=/usr/share/info --libdir=/usr/lib --libexecdir=/usr/lib --mandir=/usr/share/man --prefix=/usr --target=avr --with-as=/usr/bin/avr-as --with-gnu-as --with-gnu-ld --with-ld=/usr/bin/avr-ld --with-plugin-ld=ld.gold --with-system-zlib --with-isl --enable-gnu-indirect-function
+Thread model: single
+Supported LTO compression algorithms: zlib zstd
+gcc version 12.2.0 (GCC)
+COLLECT_GCC_OPTIONS='-v' '-save-temps' '-Wall' '-Wextra'  '-Os' '--param=min-pagesize=0' '-mdouble=32' '-mlong-double=64' '-specs=device-specs/specs-atmega1284p' '-mmcu=avr51' '-dumpdir' 'a-'
+ /usr/lib/gcc/avr/12.2.0/cc1 -E -quiet -v -imultilib avr51 -D__AVR_ATmega1284P__ -D__AVR_DEVICE_NAME__=atmega1284p avr-bug.c -mn-flash=2 -mno-skip-bug -mdouble=32 -mlong-double=64 -mmcu=avr51 -Wall -Wextra -Os -fpch-preprocess -o a-avr-bug.i
+ignoring nonexistent directory "/usr/lib/gcc/avr/12.2.0/../../../../avr/sys-include"
+#include "..." search starts here:
+#include <...> search starts here:
+ /usr/lib/gcc/avr/12.2.0/include
+ /usr/lib/gcc/avr/12.2.0/include-fixed
+ /usr/lib/gcc/avr/12.2.0/../../../../avr/include
+End of search list.
+COLLECT_GCC_OPTIONS='-v' '-save-temps' '-Wall' '-Wextra'  '-Os' '--param=min-pagesize=0' '-mdouble=32' '-mlong-double=64' '-specs=device-specs/specs-atmega1284p' '-mmcu=avr51' '-dumpdir' 'a-'
+ /usr/lib/gcc/avr/12.2.0/cc1 -fpreprocessed a-avr-bug.i -mn-flash=2 -mno-skip-bug -quiet -dumpdir a- -dumpbase avr-bug.c -dumpbase-ext .c -mdouble=32 -mlong-double=64 -mmcu=avr51 -Os -Wall -Wextra -version --param=min-pagesize=0 -o a-avr-bug.s
+GNU C17 (GCC) version 12.2.0 (avr)
+        compiled by GNU C version 12.1.1 20220730, GMP version 6.2.1, MPFR version 4.1.0-p13, MPC version 1.2.1, isl version isl-0.26-GMP
+
+warning: MPFR header version 4.1.0-p13 differs from library version 4.2.0.
+warning: MPC header version 1.2.1 differs from library version 1.3.1.
+GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072
+GNU C17 (GCC) version 12.2.0 (avr)
+        compiled by GNU C version 12.1.1 20220730, GMP version 6.2.1, MPFR version 4.1.0-p13, MPC version 1.2.1, isl version isl-0.26-GMP
+
+warning: MPFR header version 4.1.0-p13 differs from library version 4.2.0.
+warning: MPC header version 1.2.1 differs from library version 1.3.1.
+GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072
+Compiler executable checksum: 00c69299beaa7f88846ded0b751d0e18
+COLLECT_GCC_OPTIONS='-v' '-save-temps' '-Wall' '-Wextra'  '-Os' '--param=min-pagesize=0' '-mdouble=32' '-mlong-double=64' '-specs=device-specs/specs-atmega1284p' '-mmcu=avr51' '-dumpdir' 'a-'
+ /usr/bin/avr-as -v -mmcu=avr51 -mgcc-isr -mno-skip-bug -o a-avr-bug.o a-avr-bug.s
+GNU assembler version 2.40 (avr) using BFD version (GNU Binutils) 2.40
+COMPILER_PATH=/usr/lib/gcc/avr/12.2.0/:/usr/lib/gcc/avr/12.2.0/:/usr/lib/gcc/avr/:/usr/lib/gcc/avr/12.2.0/:/usr/lib/gcc/avr/
+LIBRARY_PATH=/usr/lib/gcc/avr/12.2.0/avr51/:/usr/lib/gcc/avr/12.2.0/../../../../avr/lib/avr51/:/usr/lib/gcc/avr/12.2.0/:/usr/lib/gcc/avr/12.2.0/../../../../avr/lib/
+COLLECT_GCC_OPTIONS='-v' '-save-temps' '-Wall' '-Wextra'  '-Os' '--param=min-pagesize=0' '-mdouble=32' '-mlong-double=64' '-specs=device-specs/specs-atmega1284p' '-mmcu=avr51' '-dumpdir' 'a.'
+ /usr/lib/gcc/avr/12.2.0/collect2 -plugin /usr/lib/gcc/avr/12.2.0/liblto_plugin.so -plugin-opt=/usr/lib/gcc/avr/12.2.0/lto-wrapper -plugin-opt=-fresolution=a.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lm -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-latmega1284p -mavr51 -Tdata 0x800100 /usr/lib/gcc/avr/12.2.0/../../../../avr/lib/avr51/crtatmega1284p.o -L/usr/lib/gcc/avr/12.2.0/avr51 -L/usr/lib/gcc/avr/12.2.0/../../../../avr/lib/avr51 -L/usr/lib/gcc/avr/12.2.0 -L/usr/lib/gcc/avr/12.2.0/../../../../avr/lib a-avr-bug.o --start-group -lgcc -lm -lc -latmega1284p --end-group
+COLLECT_GCC_OPTIONS='-v' '-save-temps' '-Wall' '-Wextra'  '-Os' '--param=min-pagesize=0' '-mdouble=32' '-mlong-double=64' '-specs=device-specs/specs-atmega1284p' '-mmcu=avr51' '-dumpdir' 'a.'
+
+- User: Andrew Pinski | Time: 2023-04-27 17:26:49 UTC
+  Text: x86_64 prints (with a simple: `#define uart_putc __builtin_putchar`):
+```
+  0123456789
+0 ??????????
+1 XXXXXXXXX?
+2 XXXXXXXXX?
+3 XXXXXXX???
+4 XXXXXXX???
+5 XXXXX?????
+6 XXXXX?????
+7 XXX???????
+8 ??????????
+```
+Which I think is the correct output
+
+- User: Georg-Johann Lay | Time: 2023-04-28 15:09:42 UTC
+  Text: Createdattachment 54953[details]Full C test case that doesn't require hardware like UART.
+
+This testcase tests against the code as generated by avr-gcc-8.5 -Os. It should work for all AVR devices including reduced tiny like ATtiny40, thus eligible for
+
+testsuite/gcc.target/avr/torture
+
+Pairs that produce different results with avr-gcc v14 (current master). are:
+
+p1,p2 = 3,6;  4,6;  5,4;  6,4  and  7,2.
+
+- User: Georg-Johann Lay | Time: 2023-04-28 15:13:09 UTC
+  Text: Confirmed with "gcc version 14.0.0 20230420 (experimental) (GCC)"
+
+- User: Georg-Johann Lay | Time: 2023-04-28 15:14:41 UTC
+  Text: Set component to "other" until we know what component actually causes this bug.
+
+- User: Georg-Johann Lay | Time: 2023-04-29 09:05:01 UTC
+  Text: Createdattachment 54956[details]pr109650-2.c: A simpler C test case without assembly.
+
+Again, this testcase triggers with avr-gcc -Os:
+
+typedef _Bool bool;
+typedef __UINT8_TYPE__ uint8_t;
+
+static inline __attribute__((__always_inline__))
+bool func1 (uint8_t p1, uint8_t p2)
+{
+    if (p1)
+        return p2 <= 8;
+    return p2 <= 2;
+}
+
+__attribute__((__noinline__, __noclone__))
+bool func2 (uint8_t p1, uint8_t p2)
+{
+    return func1 (p1, p2);
+}
+
+int main (void)
+{
+    if (func1 (0, 1) != func2 (0, 1)) __builtin_abort();
+    if (func1 (0, 2) != func2 (0, 2)) __builtin_abort();
+    if (func1 (0, 3) != func2 (0, 3)) __builtin_abort();
+
+    if (func1 (1, 7) != func2 (1, 7)) __builtin_abort();
+    if (func1 (1, 8) != func2 (1, 8)) __builtin_abort();
+    if (func1 (1, 9) != func2 (1, 9)) __builtin_abort();
+
+    __builtin_exit (0);
+}
+
+- User: Georg-Johann Lay | Time: 2023-05-02 16:46:59 UTC
+  Text: As it appears, disabling avr.cc's machine dependent reorg by means of -fdisable-rtl-mach can stop this PR.  Maybe avr.cc::avr_reorg() is no more correct afterPR92729because contrary to cc0, now a branch instruction may have more than one CCmode setter.  A part of this optimization could be run prior to .split2 when cbranch insns are still intact.  In particular transformations like from "if (x <= 2)" to "if (x < 3)" must be performed on cbranch, or otherwise avr_reorg() must check that there is only one CCmode setter, or otherwise adjust *all* CCmode setters.
+
+This optimization should not run too early so that avr_reorg_remove_redundant_compare can still do its job on switch-case if-else trees.
+
+I am allowing me to add Senthil to CC, maybe he has some ideas.
+
+- User: Georg-Johann Lay | Time: 2023-05-03 16:57:47 UTC
+  Text: Target issue: Implicitly introduced byPR92729as avr's machine dependent reorg in avr.cc::avr_reorg() still assumes there is nothing between a comparison and the following conditional branch, like it was with cc0. However, pass "jump2" introduces a label between a comarison and a branch insn.
+
+Affected are all versions from v12 onwards.
+
+- User: Georg-Johann Lay | Time: 2023-05-19 08:31:52 UTC
+  Text: Createdattachment 55115[details]Proposed patch.
+
+This is a proposed patch to fix this PR.  Under review athttps://gcc.gnu.org/pipermail/gcc-patches/2023-May/618973.html
+
+- User: Georg-Johann Lay | Time: 2023-05-19 08:52:14 UTC
+  Text: (In reply to Georg-Johann Lay fromcomment #8)> Createdattachment 55115[details]> Proposed patch.
+> 
+> This is a proposed patch to fix this PR.  Under review atHere actually:https://gcc.gnu.org/pipermail/gcc-patches/2023-May/618976.html
+
+- User: GCC Commits | Time: 2023-06-10 19:59:48 UTC
+  Text: The master branch has been updated by Georg-Johann Lay <gjl@gcc.gnu.org>:https://gcc.gnu.org/g:30a8771c0f5ddcbc329408c3bbf4f100b01acca9commitr14-1688-g30a8771c0f5ddcbc329408c3bbf4f100b01acca9Author: Georg-Johann Lay <avr@gjlay.de>
+Date:   Sat Jun 10 21:47:53 2023 +0200
+
+    target/109650: Fix wrong code after cc0 -> CCmode transition.
+    
+    This patch fixes a wrong-code bug in the wake ofPR92729, the transition that
+    turned the AVR backend from cc0 to CCmode.  In cc0, the insn that uses cc0 like
+    a conditional branch always follows the cc0 setter, which is no more the case
+    with CCmode where set and use of REG_CC might be in different basic blocks.
+    
+    This patch removes the machine-dependent reorg pass in avr_reorg entirely.
+    
+    It is replaced by a new, AVR specific mini-pass that runs prior to split2.
+    Canonicalization of comparisons away from the "difficult" codes GT[U] and LE[U]
+    is now mostly performed by implementing TARGET_CANONICALIZE_COMPARISON.
+    
+    Moreover:
+    
+    * Text peephole conditions get "dead_or_set_regno_p (*, REG_CC)" as needed.
+    
+    * RTL peephole conditions get "peep2_regno_dead_p (*, REG_CC)" as needed.
+    
+    * Conditional branches no more clobber REG_CC.
+    
+    * insn output for compares looks ahead to determine the branch mode in use.
+      This needs also "dead_or_set_regno_p (*, REG_CC)".
+    
+    * Add RTL peepholes for decrement-and-branch detection.
+    
+    * Some of the patterns like "*cmphi.zero-extend.0" lost their
+      combine-ational part witPR92729.  Restore them.
+    
+    Finally, it fixes some of the many indentation glitches left over fromPR92729.
+    
+    gcc/PR target/109650PR target/92729* config/avr/avr-passes.def (avr_pass_ifelse): Insert new pass.
+            * config/avr/avr.cc (avr_pass_ifelse): New RTL pass.
+            (avr_pass_data_ifelse): New pass_data for it.
+            (make_avr_pass_ifelse, avr_redundant_compare, avr_cbranch_cost)
+            (avr_canonicalize_comparison, avr_out_plus_set_ZN)
+            (avr_out_cmp_ext): New functions.
+            (compare_condtition): Make sure REG_CC dies in the branch insn.
+            (avr_rtx_costs_1): Add computation of cbranch costs.
+            (avr_adjust_insn_length) [ADJUST_LEN_ADD_SET_ZN, ADJUST_LEN_CMP_ZEXT]:
+            [ADJUST_LEN_CMP_SEXT]Handle them.
+            (TARGET_CANONICALIZE_COMPARISON): New define.
+            (avr_simplify_comparison_p, compare_diff_p, avr_compare_pattern)
+            (avr_reorg_remove_redundant_compare, avr_reorg): Remove functions.
+            (TARGET_MACHINE_DEPENDENT_REORG): Remove define.
+            * config/avr/avr-protos.h (avr_simplify_comparison_p): Remove proto.
+            (make_avr_pass_ifelse, avr_out_plus_set_ZN, cc_reg_rtx)
+            (avr_out_cmp_zext): New Protos
+            * config/avr/avr.md (branch, difficult_branch): Don't split insns.
+            (*cbranchhi.zero-extend.0", *cbranchhi.zero-extend.1")
+            (*swapped_tst<mode>, *add.for.eqne.<mode>): New insns.
+            (*cbranch<mode>4): Rename to cbranch<mode>4_insn.
+            (define_peephole): Add dead_or_set_regno_p(insn,REG_CC) as needed.
+            (define_deephole2): Add peep2_regno_dead_p(*,REG_CC) as needed.
+            Add new RTL peepholes for decrement-and-branch and *swapped_tst<mode>.
+            Rework signtest-and-branch peepholes for *sbrx_branch<mode>.
+            (adjust_len) [add_set_ZN, cmp_zext]: New.
+            (QIPSI): New mode iterator.
+            (ALLs1, ALLs2, ALLs4, ALLs234): New mode iterators.
+            (gelt): New code iterator.
+            (gelt_eqne): New code attribute.
+            (rvbranch, *rvbranch, difficult_rvbranch, *difficult_rvbranch)
+            (branch_unspec, *negated_tst<mode>, *reversed_tst<mode>)
+            (*cmpqi_sign_extend): Remove insns.
+            (define_c_enum "unspec") [UNSPEC_IDENTITY]: Remove.
+            * config/avr/avr-dimode.md (cbranch<mode>4): Canonicalize comparisons.
+            * config/avr/predicates.md (scratch_or_d_register_operand): New.
+            * config/avr/constraints.md (Yxx): New constraint.
+    
+    gcc/testsuite/PR target/109650* gcc.target/avr/torture/pr109650-1.c: New test.
+            * gcc.target/avr/torture/pr109650-2.c: New test.
+
+- User: GCC Commits | Time: 2023-06-10 20:25:18 UTC
+  Text: The releases/gcc-13 branch has been updated by Georg-Johann Lay <gjl@gcc.gnu.org>:https://gcc.gnu.org/g:6165b233ecc637efb5edcad8a34aae74b165a711commitr13-7436-g6165b233ecc637efb5edcad8a34aae74b165a711Author: Georg-Johann Lay <avr@gjlay.de>
+Date:   Sat Jun 10 21:47:53 2023 +0200
+
+    target/109650: Fix wrong code after cc0 -> CCmode transition.
+    
+    This patch fixes a wrong-code bug in the wake ofPR92729, the transition that
+    turned the AVR backend from cc0 to CCmode.  In cc0, the insn that uses cc0 like
+    a conditional branch always follows the cc0 setter, which is no more the case
+    with CCmode where set and use of REG_CC might be in different basic blocks.
+    
+    This patch removes the machine-dependent reorg pass in avr_reorg entirely.
+    
+    It is replaced by a new, AVR specific mini-pass that runs prior to split2.
+    Canonicalization of comparisons away from the "difficult" codes GT[U] and LE[U]
+    is now mostly performed by implementing TARGET_CANONICALIZE_COMPARISON.
+    
+    Moreover:
+    
+    * Text peephole conditions get "dead_or_set_regno_p (*, REG_CC)" as needed.
+    
+    * RTL peephole conditions get "peep2_regno_dead_p (*, REG_CC)" as needed.
+    
+    * Conditional branches no more clobber REG_CC.
+    
+    * insn output for compares looks ahead to determine the branch mode in use.
+      This needs also "dead_or_set_regno_p (*, REG_CC)".
+    
+    * Add RTL peepholes for decrement-and-branch detection.
+    
+    * Some of the patterns like "*cmphi.zero-extend.0" lost their
+      combine-ational part witPR92729.  Restore them.
+    
+    Finally, it fixes some of the many indentation glitches left over fromPR92729.
+    
+    gcc/PR target/109650PR target/92729Backport from 2023-05-10 masterr14-1688.
+            * config/avr/avr-passes.def (avr_pass_ifelse): Insert new pass.
+            * config/avr/avr.cc (avr_pass_ifelse): New RTL pass.
+            (avr_pass_data_ifelse): New pass_data for it.
+            (make_avr_pass_ifelse, avr_redundant_compare, avr_cbranch_cost)
+            (avr_canonicalize_comparison, avr_out_plus_set_ZN)
+            (avr_out_cmp_ext): New functions.
+            (compare_condtition): Make sure REG_CC dies in the branch insn.
+            (avr_rtx_costs_1): Add computation of cbranch costs.
+            (avr_adjust_insn_length) [ADJUST_LEN_ADD_SET_ZN, ADJUST_LEN_CMP_ZEXT]:
+            [ADJUST_LEN_CMP_SEXT]Handle them.
+            (TARGET_CANONICALIZE_COMPARISON): New define.
+            (avr_simplify_comparison_p, compare_diff_p, avr_compare_pattern)
+            (avr_reorg_remove_redundant_compare, avr_reorg): Remove functions.
+            (TARGET_MACHINE_DEPENDENT_REORG): Remove define.
+            * config/avr/avr-protos.h (avr_simplify_comparison_p): Remove proto.
+            (make_avr_pass_ifelse, avr_out_plus_set_ZN, cc_reg_rtx)
+            (avr_out_cmp_zext): New Protos
+            * config/avr/avr.md (branch, difficult_branch): Don't split insns.
+            (*cbranchhi.zero-extend.0", *cbranchhi.zero-extend.1")
+            (*swapped_tst<mode>, *add.for.eqne.<mode>): New insns.
+            (*cbranch<mode>4): Rename to cbranch<mode>4_insn.
+            (define_peephole): Add dead_or_set_regno_p(insn,REG_CC) as needed.
+            (define_deephole2): Add peep2_regno_dead_p(*,REG_CC) as needed.
+            Add new RTL peepholes for decrement-and-branch and *swapped_tst<mode>.
+            Rework signtest-and-branch peepholes for *sbrx_branch<mode>.
+            (adjust_len) [add_set_ZN, cmp_zext]: New.
+            (QIPSI): New mode iterator.
+            (ALLs1, ALLs2, ALLs4, ALLs234): New mode iterators.
+            (gelt): New code iterator.
+            (gelt_eqne): New code attribute.
+            (rvbranch, *rvbranch, difficult_rvbranch, *difficult_rvbranch)
+            (branch_unspec, *negated_tst<mode>, *reversed_tst<mode>)
+            (*cmpqi_sign_extend): Remove insns.
+            (define_c_enum "unspec") [UNSPEC_IDENTITY]: Remove.
+            * config/avr/avr-dimode.md (cbranch<mode>4): Canonicalize comparisons.
+            * config/avr/predicates.md (scratch_or_d_register_operand): New.
+            * config/avr/constraints.md (Yxx): New constraint.
+    
+    gcc/testsuite/PR target/109650Backport from 2023-05-10 masterr14-1688.
+            * gcc.target/avr/torture/pr109650-1.c: New test.
+            * gcc.target/avr/torture/pr109650-2.c: New test.
+
+- User: GCC Commits | Time: 2023-06-10 20:46:22 UTC
+  Text: The releases/gcc-12 branch has been updated by Georg-Johann Lay <gjl@gcc.gnu.org>:https://gcc.gnu.org/g:ee92dc2dae45acc79d4dc08ea31adf894831840acommitr12-9691-gee92dc2dae45acc79d4dc08ea31adf894831840aAuthor: Georg-Johann Lay <avr@gjlay.de>
+Date:   Sat Jun 10 21:47:53 2023 +0200
+
+    target/109650: Fix wrong code after cc0 -> CCmode transition.
+    
+    This patch fixes a wrong-code bug in the wake ofPR92729, the transition that
+    turned the AVR backend from cc0 to CCmode.  In cc0, the insn that uses cc0 like
+    a conditional branch always follows the cc0 setter, which is no more the case
+    with CCmode where set and use of REG_CC might be in different basic blocks.
+    
+    This patch removes the machine-dependent reorg pass in avr_reorg entirely.
+    
+    It is replaced by a new, AVR specific mini-pass that runs prior to split2.
+    Canonicalization of comparisons away from the "difficult" codes GT[U] and LE[U]
+    is now mostly performed by implementing TARGET_CANONICALIZE_COMPARISON.
+    
+    Moreover:
+    
+    * Text peephole conditions get "dead_or_set_regno_p (*, REG_CC)" as needed.
+    
+    * RTL peephole conditions get "peep2_regno_dead_p (*, REG_CC)" as needed.
+    
+    * Conditional branches no more clobber REG_CC.
+    
+    * insn output for compares looks ahead to determine the branch mode in use.
+      This needs also "dead_or_set_regno_p (*, REG_CC)".
+    
+    * Add RTL peepholes for decrement-and-branch detection.
+    
+    * Some of the patterns like "*cmphi.zero-extend.0" lost their
+      combine-ational part witPR92729.  Restore them.
+    
+    Finally, it fixes some of the many indentation glitches left over fromPR92729.
+    
+    gcc/PR target/109650PR target/92729Backport from 2023-05-10 masterr14-1688.
+            * config/avr/avr-passes.def (avr_pass_ifelse): Insert new pass.
+            * config/avr/avr.cc (avr_pass_ifelse): New RTL pass.
+            (avr_pass_data_ifelse): New pass_data for it.
+            (make_avr_pass_ifelse, avr_redundant_compare, avr_cbranch_cost)
+            (avr_canonicalize_comparison, avr_out_plus_set_ZN)
+            (avr_out_cmp_ext): New functions.
+            (compare_condtition): Make sure REG_CC dies in the branch insn.
+            (avr_rtx_costs_1): Add computation of cbranch costs.
+            (avr_adjust_insn_length) [ADJUST_LEN_ADD_SET_ZN, ADJUST_LEN_CMP_ZEXT]:
+            [ADJUST_LEN_CMP_SEXT]Handle them.
+            (TARGET_CANONICALIZE_COMPARISON): New define.
+            (avr_simplify_comparison_p, compare_diff_p, avr_compare_pattern)
+            (avr_reorg_remove_redundant_compare, avr_reorg): Remove functions.
+            (TARGET_MACHINE_DEPENDENT_REORG): Remove define.
+            * config/avr/avr-protos.h (avr_simplify_comparison_p): Remove proto.
+            (make_avr_pass_ifelse, avr_out_plus_set_ZN, cc_reg_rtx)
+            (avr_out_cmp_zext): New Protos
+            * config/avr/avr.md (branch, difficult_branch): Don't split insns.
+            (*cbranchhi.zero-extend.0", *cbranchhi.zero-extend.1")
+            (*swapped_tst<mode>, *add.for.eqne.<mode>): New insns.
+            (*cbranch<mode>4): Rename to cbranch<mode>4_insn.
+            (define_peephole): Add dead_or_set_regno_p(insn,REG_CC) as needed.
+            (define_deephole2): Add peep2_regno_dead_p(*,REG_CC) as needed.
+            Add new RTL peepholes for decrement-and-branch and *swapped_tst<mode>.
+            Rework signtest-and-branch peepholes for *sbrx_branch<mode>.
+            (adjust_len) [add_set_ZN, cmp_zext]: New.
+            (QIPSI): New mode iterator.
+            (ALLs1, ALLs2, ALLs4, ALLs234): New mode iterators.
+            (gelt): New code iterator.
+            (gelt_eqne): New code attribute.
+            (rvbranch, *rvbranch, difficult_rvbranch, *difficult_rvbranch)
+            (branch_unspec, *negated_tst<mode>, *reversed_tst<mode>)
+            (*cmpqi_sign_extend): Remove insns.
+            (define_c_enum "unspec") [UNSPEC_IDENTITY]: Remove.
+            * config/avr/avr-dimode.md (cbranch<mode>4): Canonicalize comparisons.
+            * config/avr/predicates.md (scratch_or_d_register_operand): New.
+            * config/avr/constraints.md (Yxx): New constraint.
+    
+    gcc/testsuite/PR target/109650Backport from 2023-05-10 masterr14-1688.
+            * gcc.target/avr/torture/pr109650-1.c: New test.
+            * gcc.target/avr/torture/pr109650-2.c: New test.
+
+- User: Georg-Johann Lay | Time: 2023-06-10 21:08:23 UTC
+  Text: r14-1688
+
+- User: Georg-Johann Lay | Time: 2023-06-10 21:13:02 UTC
+  Text: Fixed in v12.4+ and v13.2+.
+

@@ -1,0 +1,191 @@
+Bug Summary: [15 regression] Missed optimization with with std::vector resize in loop since r15-575-gda73261ce7731b
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sam James | Time: 2024-10-19 06:12:41 UTC
+  Text: Createdattachment 59391[details]test.cxx
+
+Noticed this when looking atPR80641.
+
+At -O3, we do so much better in GCC 14.2 than we do on trunk (https://godbolt.org/z/6jeoxKxTq).
+
+With 14, we have which is optimal:
+```
+;; Function main (main, funcdef_no=1275, decl_uid=24945, cgraph_uid=152, symbol_order=168) (executed once)
+
+int main ()
+{
+  int * _53;
+
+  <bb 2> [local count: 114863531]:
+  _53 = operator new (16);
+  MEM <uint128_t> [(char * {ref-all})_53] = 0x30000000200000001;
+  operator delete (_53, 16);
+  return 0;
+
+}
+```
+
+With trunk, we have:
+```
+
+;; Function main (main, funcdef_no=1267, decl_uid=24700, cgraph_uid=153, symbol_order=169) (executed once)
+
+int main ()
+{
+  void * D.28023;
+  int * _1;
+  long int _10;
+  int pretmp_17;
+  void * _26;
+  int * _48;
+  int * _53;
+  int * _61;
+  long unsigned int _149;
+  long unsigned int _156;
+
+  <bb 2> [local count: 114863530]:
+  _53 = operator new (16);
+  MEM <uint128_t> [(char * {ref-all})_53] = 0x30000000200000001;
+  _48 = _53 + 16;
+  goto <bb 4>; [100.00%]
+
+  <bb 3> [local count: 906139990]:
+  pretmp_17 = MEM[(value_type &)_61 + 18446744073709551612];
+  if (pretmp_17 == 0)
+    goto <bb 4>; [93.80%]
+  else
+    goto <bb 7>; [6.20%]
+
+  <bb 4> [local count: 958878295]:
+  # _1 = PHI <_61(3), _48(2)>
+  _10 = _1 - _53;
+  if (_10 == 0)
+    goto <bb 5>; [33.00%]
+  else
+    goto <bb 6>; [67.00%]
+
+  <bb 5> [local count: 316429836]:
+  std::__throw_length_error ("vector::_M_default_append");
+
+  <bb 6> [local count: 958878296]:
+  _156 = (long unsigned int) _10;
+  _149 = _156 + 18446744073709551612;
+  _61 = _53 + _149;
+  if (_53 != _61)
+    goto <bb 3>; [94.50%]
+  else
+    goto <bb 7>; [5.50%]
+
+  <bb 7> [local count: 114863531]:
+  operator delete (_53, 16);
+  return 0;
+
+  <bb 8> [count: 0]:
+<L12>:
+  operator delete (_53, 16);
+  _26 = __builtin_eh_pointer (6);
+  __builtin_unwind_resume (_26);
+
+}
+```
+
+- User: Sam James | Time: 2024-10-19 07:06:08 UTC
+  Text: Bisecting.
+
+- User: Sam James | Time: 2024-10-19 07:51:35 UTC
+  Text: r15-575-gda73261ce7731bConfirmed with a revert too (as in just before that commit, as it doesn't revert cleanly on trunk and I didn't try massage it).
+
+I'm very surprised by this as I was under the impression the prange stuff was an initial stub (new class of range) rather than with anything especially wired with it yet -- I must have misread something.
+
+andrew?
+
+- User: Sam James | Time: 2024-10-19 07:56:46 UTC
+  Text: (In reply to Sam James fromcomment #2)> [...]
+> I'm very surprised by this as I was under the impression the prange stuff
+> was an initial stub (new class of range) rather than with anything
+> especially wired with it yet -- I must have misread something.
+>(I should say: I thought it was a clone of irange to start with, with adaptations planned, rather than - as it really is - already a set of some initial diff. impls.)
+
+- User: Sam James | Time: 2024-10-19 08:15:35 UTC
+  Text: With prange, evrp has:
+```
+[-Global Exported: _17 = [irange] long int [-INF, -1][1, +INF]-]
+```
+and then vrp1 has:
+```
+[...]
+{+Global Exported: _69 = [prange] int * [1, +INF]+}
+Global Exported: _68 = [irange] long unsigned int [0, 0]
+{+Global Exported: _67 = [irange] long int [0, 0]+}
+Global Exported: _82 = [irange] long unsigned int [0, 9223372036854775804] MASK 0x7fffffffffffffff VALUE 0x0
+int main ()
+{
+@@ -91,7 +93,6 @@ int main ()
+  int * _44;
+  int * _53;
+  int * _61;
+[-  long int _67;-]
+  int * _69;
+  long unsigned int _82;
+  long unsigned int _95;
+@@ -101,7 +102,6 @@ int main ()
+  int * _130;
+  long unsigned int _149;
+  long unsigned int _156;
+[-  long unsigned int _161;-]
+[...]
+````
+
+Then forwprop3 ends up keeping bbs 9/10/11/15/12 and it all goes wrong from there.
+
+- User: Sam James | Time: 2024-10-19 08:18:14 UTC
+  Text: so with irange, evrp discovers _17's range earlier, but with prange, it doesn't (only does so in vrp1?
+
+- User: Andrew Macleod | Time: 2024-10-19 14:12:28 UTC
+  Text: (In reply to Sam James fromcomment #3)> (In reply to Sam James fromcomment #2)
+> > [...]
+> > I'm very surprised by this as I was under the impression the prange stuff
+> > was an initial stub (new class of range) rather than with anything
+> > especially wired with it yet -- I must have misread something.
+> > 
+> 
+> (I should say: I thought it was a clone of irange to start with, with
+> adaptations planned, rather than - as it really is - already a set of some
+> initial diff. impls.)It is suppose to just be an irange clone ATM, as far as I know. With all range-op operations now going thru dispatch to prange implementations, its possible there is a missing operation or slightly different interaction somewhere. I'll have a look
+
+- User: Sam James | Time: 2024-10-20 04:51:42 UTC
+  Text: Thanks Andrew
+
+- User: Andrew Macleod | Time: 2024-10-23 14:24:58 UTC
+  Text: pointer_diff depends on range_operator::fold_range to do the generic fold, which invokes wi_fold on subranges.  It also in turn invokes op1_op2_relation_effect.
+
+This worked fine when pointers were implemented with irange, but when the transition to prange was made, a new version of fold_range is invoked by dispatch which uses prange operators. The default fold_range for prange does nothing, expecting the few operators which need it to implement their own fold_range.  As a result all calls to fold_range for pointer_diff were returning false, which translates to VARYING.
+
+This PR demonstrates a dependency on knowing the relation between the operands is VREL_NE, in which case pointer_diff should return a non-zero result instead of varying.  The upcoming patch implements the pointer_diff version of fold_range which then invokes the appropriate op1_op2_relation_effect () routine.  This will in turn will cause the result to be non-zero as expected.
+
+- User: GCC Commits | Time: 2024-10-23 16:22:35 UTC
+  Text: The master branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:774ad67fba458dd1beaa0f2d3e389aac46ca18b5commitr15-4578-g774ad67fba458dd1beaa0f2d3e389aac46ca18b5Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Mon Oct 21 16:32:00 2024 -0400
+
+    Implement operator_pointer_diff::fold_range
+    
+    prange has no default fold_range processing like irange does, so each
+    pointer specific operator needs to implement its own fold routine.PR tree-optimization/117222gcc/
+            * range-op-ptr.cc (operator_pointer_diff::fold_range): New.
+            (operator_pointer_diff::op1_op2_relation_effect): Remove irange
+            variant.
+            (operator_pointer_diff::update_bitmask): Likewise.
+    
+            gcc/testsuite
+            * g++.dg/pr117222.C: New.
+
+- User: Sam James | Time: 2024-10-26 11:58:33 UTC
+  Text: Fixed, thank you!
+

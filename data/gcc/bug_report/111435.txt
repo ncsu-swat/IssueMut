@@ -1,0 +1,170 @@
+Bug Summary: [14 Regression] gimple_zero_one_valued_p() infinite recursion
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: build, ice-on-valid-code, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2023-09-16 19:54:02 UTC
+  Text: Createdattachment 55911[details]tree-ssa-loop-niter.cc.cc.gz
+
+Noticed on i686-linux gcc bootstrap when buildingr14-4077-g86451305d8b2a2.
+
+Reproduced on x86_64-linux -m32 as well.r14-4038-gb975c0dc3be285looks suspicious. The reduction is a bit slow. Attaching partially reduced.
+
+How to crash:
+
+$ gcc/xg++ -Bgcc ~/dev/bugs/gcc-14-i686-ICE/tree-ssa-loop-niter.cc.cc -O2 -m32 --verbose
+
+Or:
+
+$ gcc/cc1plus -quiet -imultilib . -iprefix /tmp/gb/gcc/../lib/gcc/x86_64-pc-linux-gnu/14.0.0/ -isystem gcc/include -isystem gcc/include-fixed -D_GNU_SOURCE /home/slyfox/dev/bugs/gcc-14-i686-ICE/tree-ssa-loop-niter.cc.cc -quiet -dumpdir a- -dumpbase tree-ssa-loop-niter.cc.cc -dumpbase-ext .cc -m32 -mtune=generic -march=x86-64 -O2 -version -o /run/user/1000/ccgZ63HD.s
+GNU C++17 (GCC) version 14.0.0 20230916 (experimental) (x86_64-pc-linux-gnu)
+        compiled by GNU C version 14.0.0 20230916 (experimental), GMP version 6.3.0, MPFR version 4.2.1, MPC version 1.3.1, isl version isl-0.20-GMP
+
+GGC heuristics: --param ggc-min-expand=30 --param ggc-min-heapsize=4096
+Compiler executable checksum: 7c2c55b6bcbe18476b6d2c66d34ac4cc
+Segmentation fault (core dumped)
+
+Backtrace:
+
+Program received signal SIGSEGV, Segmentation fault.
+0x000000000150a239 in get_nonzero_bits (name=0x7fffe8c02240) at /home/slyfox/dev/git/gcc/gcc/tree-ssanames.cc:494
+494       unsigned int precision = element_precision (TREE_TYPE (name));
+(gdb) bt
+#0  0x000000000150a239 in get_nonzero_bits (name=0x7fffe8c02240) at /home/slyfox/dev/git/gcc/gcc/tree-ssanames.cc:494
+#1  0x000000000150ad4c in get_nonzero_bits (name=<optimized out>) at /home/slyfox/dev/git/gcc/gcc/tree-ssanames.cc:489
+#2  0x0000000000f04105 in tree_nonzero_bits (t=t@entry=0x7fffe8c02240) at /home/slyfox/dev/git/gcc/gcc/fold-const.cc:16792
+#3  0x00000000021de3ce in gimple_zero_one_valued_p (t=0x7fffe8c02240, valueize=valueize@entry=0x14a18c0 <rpo_vn_valueize(tree_node*)>) at gimple-match-3.cc:19
+#4  0x00000000021de537 in gimple_zero_one_valued_p (t=0x7fffe8c02090, valueize=valueize@entry=0x14a18c0 <rpo_vn_valueize(tree_node*)>) at gimple-match-3.cc:70
+#5  0x00000000021de537 in gimple_zero_one_valued_p (t=0x7fffe8c02240, valueize=valueize@entry=0x14a18c0 <rpo_vn_valueize(tree_node*)>) at gimple-match-3.cc:70
+#6  0x00000000021de537 in gimple_zero_one_valued_p (t=0x7fffe8c02090, valueize=valueize@entry=0x14a18c0 <rpo_vn_valueize(tree_node*)>) at gimple-match-3.cc:70
+...
+
+- User: Andrew Pinski | Time: 2023-09-16 19:55:25 UTC
+  Text: Must be something 32bit related ...
+
+- User: Andrew Pinski | Time: 2023-09-16 19:59:18 UTC
+  Text: So Basically you can't have a recusive match because of the way VN works ...
+I should have figured that out when I was adding bitwise_inverted_equal_p .
+
+- User: Andrew Pinski | Time: 2023-09-16 20:08:07 UTC
+  Text: Changing the match pattern for conversions to non-recusive fixes the issue.
+
+That is:
+/* A conversion from an zero_one_valued_p is still a [0,1].
+   This is useful when the range of a variable is not known */
+/* Note this matches can't be recusive because of the way VN handles
+   nop conversions being equivalent and then recusive between them. */
+(match zero_one_valued_p
+ (convert@0 @1)
+ (if (INTEGRAL_TYPE_P (TREE_TYPE (@1))
+      && (TYPE_UNSIGNED (TREE_TYPE (@1))
+	  || TYPE_PRECISION (TREE_TYPE (@1)) > 1)
+      && wi::leu_p (tree_nonzero_bits (@1), 1))))
+
+- User: Sergei Trofimovich | Time: 2023-09-16 21:37:48 UTC
+  Text: Meanwhile cvise extracted this test:
+
+// $ cat tree-ssa-loop-niter.cc.cc
+int discover_iteration_bound_by_body_walk_queue_index, m_vec;
+int *address();
+unsigned length();
+int deref(unsigned ix) {
+  int __trans_tmp_1 = address()[ix];
+  return __trans_tmp_1;
+}
+unsigned discover_iteration_bound_by_body_walk___trans_tmp_4;
+void discover_iteration_bound_by_body_walk() {
+  bool __trans_tmp_3 = m_vec;
+  if (!__trans_tmp_3)
+    return;
+  discover_iteration_bound_by_body_walk___trans_tmp_4 = m_vec ? length() : 0;
+  discover_iteration_bound_by_body_walk_queue_index =
+      discover_iteration_bound_by_body_walk___trans_tmp_4;
+  for (;;)
+    deref(discover_iteration_bound_by_body_walk_queue_index);
+}
+
+- User: Andrew Pinski | Time: 2023-09-16 21:47:24 UTC
+  Text: Here is a better testcase:
+```
+void find_slot_with_hash(const int &,int, int);
+void put(const int &k, const int &v) {
+    find_slot_with_hash(k, 0, 1);
+    __builtin_unreachable();
+}
+unsigned len();
+int *address();
+void h(int header, int **bounds) {
+  if (!*bounds)
+    return;
+  unsigned t = *bounds ? len() : 0;
+  int queue_index = t;
+  address()[(unsigned)queue_index] = 0;
+  put(header, queue_index);
+}
+```
+
+- User: Andrew Pinski | Time: 2023-09-16 21:54:00 UTC
+  Text: Note my testcase needs exceptions turned on ...
+
+- User: Andrew Pinski | Time: 2023-09-16 22:28:33 UTC
+  Text: Createdattachment 55912[details]Patch which I am testing
+
+- User: Andrew Pinski | Time: 2023-09-17 01:45:10 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2023-September/630668.html
+
+- User: Andrew Pinski | Time: 2023-09-17 09:02:41 UTC
+  Text: ***Bug 111442has been marked as a duplicate of this bug. ***
+
+- User: Sergei Trofimovich | Time: 2023-09-17 10:50:33 UTC
+  Text: The proposed patch fixes my modified i686-linux gcc bootstrap as well. Thank you!
+
+- User: Andrew Pinski | Time: 2023-09-17 16:06:09 UTC
+  Text: ***Bug 111443has been marked as a duplicate of this bug. ***
+
+- User: Jakub Jelinek | Time: 2023-09-18 08:33:57 UTC
+  Text: s/recusive/recursive/
+
+- User: GCC Commits | Time: 2023-09-18 20:45:56 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:951d3c191d01440ad54415f683437770b0c957e4commitr14-4113-g951d3c191d01440ad54415f683437770b0c957e4Author: Andrew Pinski <apinski@marvell.com>
+Date:   Sat Sep 16 15:19:58 2023 -0700
+
+    MATCH: Avoid recursive zero_one_valued_p for conversions
+    
+    So when VN finds a name which has a nop conversion, it says
+    both names are equivalent to each other and the valuaization
+    function for one will return the other. This normally does not
+    cause any issues as there is no recursive matches. But afterr14-4038-gb975c0dc3be285, there was one added. So we would
+    do an infinite recursion on the match and never finish.
+    This fixes the issue (and adds a comment in match.pd) by
+    for converts just handle one level instead of being recursive
+    always.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu with no regressions.
+    
+    Note the testcase was reduced from tree-ssa-loop-niter.cc and then
+    changed slightly into C rather than C++ but it still needs exceptions
+    turned on get the IR that VN would produce this equivalence relationship
+    going on. Also had to turn off early inline to force put to be inlined later.PR tree-optimization/111435gcc/ChangeLog:
+    
+            * match.pd (zero_one_valued_p): Don't do recursion
+            on converts.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/compile/pr111435-1.c: New test.
+
+- User: Andrew Pinski | Time: 2023-09-18 20:47:12 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #12)> s/recusive/recursive/Thanks I committed it with the spelling fix applied.
+
+- User: Andrew Pinski | Time: 2023-09-19 00:15:35 UTC
+  Text: ***Bug 111454has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-09-20 02:12:22 UTC
+  Text: ***Bug 111491has been marked as a duplicate of this bug. ***
+

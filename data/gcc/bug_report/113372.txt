@@ -1,0 +1,735 @@
+Bug Summary: wrong code with _BitInt() arithmetics at -O1
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-01-13 08:53:41 UTC
+  Text: Createdattachment 57068[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -O testcase.c
+$ ./a.out 
+Aborted
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-7215-20240112190107-g8b447fa89d5-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-7215-20240112190107-g8b447fa89d5-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240112 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-01-13 09:03:32 UTC
+  Text: Confirmed.
+
+A slightly different testcase which made it easier to test with clang (clang does not have the _p variants):
+```
+_BitInt(8) a, b, c;
+
+_BitInt(8)
+foo(_BitInt(6384) y)
+{
+  _BitInt(4745) x = -(b % y) * b;
+  int t;
+  _BitInt(8) tt;
+  int i = __builtin_sub_overflow(-y, 0, &t);
+  c |= __builtin_add_overflow(i, 0, &tt);
+  return x;
+}
+
+int
+main(void)
+{
+  _BitInt(8) x = foo(4);
+  if (x != 0)
+    __builtin_abort();
+  return 0;
+}
+```
+
+- User: Jakub Jelinek | Time: 2024-01-15 10:28:57 UTC
+  Text: Seems this is invalid variable sharing during RTL, I'm afraid we have tons of open bugs against that, and I'm afraid I don't know anything what to do on the bitint lowering side.
+Bitint lowering creates 3 large variables:
+  unsigned long bitint.8[75];
+  unsigned long bitint.7[75];
+  unsigned long bitint.6[100];
+where bitint.6 corresponds to
+  _3 = _2 % y_14(D);
+and later when _3 isn't needed anymore to
+  _8 = -y_14(D);
+bitint.7 corresponds to
+  _4 = -_3;
+  _5 = (unsigned _BitInt(4745)) _4;
+and bitint.8 corresponds to
+  _7 = _5 * _6;
+Reusing the same variable bitint.6 for 2 different _BitInt(6384) SSA_NAMEs ought to be fine, they aren't live at the same time.
+After lowering, we end up with:
+  .DIVMODBITINT (0B, 0, &bitint.6, 6384, &D.2796, -8, &y, -6384);
+  // Above fills in bitint.6 array
+...
+  loop which uses bitint.6 to compute bitint.7
+  bitint.6 ={v} {CLOBBER(eos)};
+...
+  .MULBITINT (&bitint.8, 4745, &bitint.7, 4745, &D.2795, -8);
+  // Above fills in bitint.8 array
+...
+  loop to compute bitint.6
+...
+  loop which uses bitint.6
+...
+  _21 = MEM[(unsigned long *)&bitint.8];
+  _22 = (_BitInt(8)) _21;
+  _18 = _22;
+  return _18;
+  // I.e. use bitint.8 for the return value
+
+But unfortunately RTL expansion decides to use the same underlying memory for bitint.6 and bitint.8 arrays, even when the second uses of bitint.6 happens when bitint.8 is live.
+
+Or am I using incorrect CLOBBER kind when an underlying variable is used for more than one SSA_NAME?  Like should that be just eob rather than eos?
+
+- User: Jakub Jelinek | Time: 2024-01-15 10:33:54 UTC
+  Text: Though, sed -i -e 's/CLOBBER_STORAGE_END/CLOBBER_OBJECT_END/' gimple-lower-bitint.cc
+doesn't help and the bogus variable sharing still happens.
+
+- User: Jakub Jelinek | Time: 2024-01-15 11:25:44 UTC
+  Text: Ah, so it really is the classical stack conflicts vs. ADDR_EXPR problem.
+Before dom3 we have
+  _2 = &bitint.6 + 8;
+  ivtmp.40_3 = (unsigned long) _2;
+from ivopts above the loop using bitint.6 and
+  _44 = &bitint.6 + 8;
+  ivtmp.28_43 = (unsigned long) _44;
+above the second loop computing bitint.6, with
+  bitint.6 ={v} {CLOBBER(eos)};
+in between (or eob).
+dom3 optimizes the latter to
+  _44 = &MEM <unsigned long[100]> [(void *)&bitint.6 + 8B];
+  ivtmp.28_43 = ivtmp.40_3;
+and later on all the visible uses of bitint.6 in the second part of the function
+after
+  bitint.6 ={v} {CLOBBER(eos)};
+disappear.
+
+- User: rguenther@suse.de | Time: 2024-01-15 11:31:11 UTC
+  Text: On Mon, 15 Jan 2024, jakub at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113372> 
+> Jakub Jelinek <jakub at gcc dot gnu.org> changed:
+> 
+>            What    |Removed                     |Added
+> ----------------------------------------------------------------------------
+>                  CC|                            |rguenth at gcc dot gnu.org
+> 
+> ---Comment #2from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> Seems this is invalid variable sharing during RTL, I'm afraid we have tons of
+> open bugs against that, and I'm afraid I don't know anything what to do on the
+> bitint lowering side.
+> Bitint lowering creates 3 large variables:
+>   unsigned long bitint.8[75];
+>   unsigned long bitint.7[75];
+>   unsigned long bitint.6[100];
+> where bitint.6 corresponds to
+>   _3 = _2 % y_14(D);
+> and later when _3 isn't needed anymore to
+>   _8 = -y_14(D);
+> bitint.7 corresponds to
+>   _4 = -_3;
+>   _5 = (unsigned _BitInt(4745)) _4;
+> and bitint.8 corresponds to
+>   _7 = _5 * _6;
+> Reusing the same variable bitint.6 for 2 different _BitInt(6384) SSA_NAMEs
+> ought to be fine, they aren't live at the same time.
+> After lowering, we end up with:
+>   .DIVMODBITINT (0B, 0, &bitint.6, 6384, &D.2796, -8, &y, -6384);
+>   // Above fills in bitint.6 array
+> ...
+>   loop which uses bitint.6 to compute bitint.7
+>   bitint.6 ={v} {CLOBBER(eos)};
+> ...
+>   .MULBITINT (&bitint.8, 4745, &bitint.7, 4745, &D.2795, -8);
+>   // Above fills in bitint.8 array
+> ...
+>   loop to compute bitint.6
+> ...
+>   loop which uses bitint.6
+> ...
+>   _21 = MEM[(unsigned long *)&bitint.8];
+>   _22 = (_BitInt(8)) _21;
+>   _18 = _22;
+>   return _18;
+>   // I.e. use bitint.8 for the return value
+> 
+> But unfortunately RTL expansion decides to use the same underlying memory for
+> bitint.6 and bitint.8 arrays, even when the second uses of bitint.6 happens
+> when bitint.8 is live.
+> 
+> Or am I using incorrect CLOBBER kind when an underlying variable is used for
+> more than one SSA_NAME?  Like should that be just eob rather than eos?I think it's OK, but likely the address-taken of bitint.8 somehow breaks
+things.  Does RTL expansion properly handle internal-functions here?
+
+- User: Jakub Jelinek | Time: 2024-01-15 11:51:13 UTC
+  Text: So, couldn't we attempt at least a partial workaround at add_scope_conflicts time?
+I mean, for SSA_NAME uses in statements with some caching try to check if those SSA_NAMEs may contain addresses (or because of ivopts also in pointer-sized integers) of particular DECL_RTL_IF_SET (op) == pc_rtx vars or set of them and treat those as if they were the addresses too?
+I mean where we call walk_stmt_load_store_addr_ops also check uses of SSA_NAMEs which are based on those ADDR_EXPRs and treat those similarly.
+It wouldn't handle say const or pure functions taking address of some var and say returning something based on it, but perhaps could workaround the most common issues in the wild with stack sharing.
+
+- User: Jakub Jelinek | Time: 2024-01-15 12:07:20 UTC
+  Text: I believe such a change could workaround this PR,PR110115,PR111422,PR90348among others just from quick search.
+
+- User: Richard Biener | Time: 2024-01-15 12:19:18 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #6)> So, couldn't we attempt at least a partial workaround at add_scope_conflicts
+> time?
+> I mean, for SSA_NAME uses in statements with some caching try to check if
+> those SSA_NAMEs may contain addresses (or because of ivopts also in
+> pointer-sized integers) of particular DECL_RTL_IF_SET (op) == pc_rtx vars or
+> set of them and treat those as if they were the addresses too?
+> I mean where we call walk_stmt_load_store_addr_ops also check uses of
+> SSA_NAMEs which are based on those ADDR_EXPRs and treat those similarly.
+> It wouldn't handle say const or pure functions taking address of some var
+> and say returning something based on it, but perhaps could workaround the
+> most common issues in the wild with stack sharing.I belive we investigated such workarounds but they didn't seem to work?  Other
+cases are concerned with address uses before loops (I think they start
+lifetime "correctly" now) but CLOBBERs ending lifetime inside the loop.  The
+dataflow problem then is confused with the backedge having the object not
+live IIRC.
+
+So what would your workaround do?  Not handle address mentions as starting
+live but only its (possible) memory uses?
+
+- User: Jakub Jelinek | Time: 2024-01-15 12:43:48 UTC
+  Text: (In reply to Richard Biener fromcomment #8)> I belive we investigated such workarounds but they didn't seem to work? 
+> Other
+> cases are concerned with address uses before loops (I think they start
+> lifetime "correctly" now) but CLOBBERs ending lifetime inside the loop.  The
+> dataflow problem then is confused with the backedge having the object not
+> live IIRC.
+> 
+> So what would your workaround do?  Not handle address mentions as starting
+> live but only its (possible) memory uses?I meant in addition to the current cases which start uses (ADDR_EXPRs in the IL, loads and stores) also handle like that uses of SSA_NAMEs which can contain those ADDR_EXPRs.
+So, say add a mapping from SSA_NAME_VERSION to a bitmap (or vector?) of DECLs and propagate through uses which addresses of decl they (may) refer to and then when
+add_scope_conflicts_1 sees uses of those SSA_NAMEs, visit_conflict those too.
+So, say on the testcase from this PR, when seeing
+  ivtmp.40_3 = (unsigned long) &MEM <unsigned long[100]> [(void *)&bitint.6 + 8B];
+mark 3 -> bitint.6
+  # ivtmp.40_39 = PHI <ivtmp.40_3(2), ivtmp.40_38(3)>
+mark 39 -> bitint.6
+  # ivtmp.28_40 = PHI <ivtmp.40_3(4), ivtmp.28_41(5)>
+mark 40 -> bitint.6
+  _147 = (void *) ivtmp.40_39;
+mark 147 -> bitint.6
+  ivtmp.40_38 = ivtmp.40_39 + 16;
+mark 38 -> bitint.6
+  _27 = (void *) ivtmp.28_40;
+mark 27 -> bitint.6
+  ivtmp.28_41 = ivtmp.28_40 + 16;
+mark 48 -> bitint.6
+  _98 = MEM[(unsigned long *)_147 + -8B];
+don't do anything, this is a load from it, etc.
+  if (ivtmp.40_38 != _57)
+again, nothing, etc.
+  _7 = (unsigned long) &bitint.6;
+mark 7 -> bitint.6
+  _57 = _7 + 600;
+mark _57 -> bitint.6
+  if (ivtmp.40_38 != _57)
+nothing
+  ivtmp.41_139 = (unsigned long) &MEM <unsigned long[75]> [(void *)&bitint.7 + 8B];
+mark 139 -> bitint.7
+  # ivtmp.41_137 = PHI <ivtmp.41_139(2), ivtmp.41_138(3)>
+mark 137 -> bitint.7
+  _146 = (void *) ivtmp.41_137;
+mark 146 -> bitint.7
+  ivtmp.41_138 = ivtmp.41_137 + 16;
+mark 138 -> bitint.7
+  .DIVMODBITINT (0B, 0, &bitint.6, 6384, &D.2796, -8, &y, -6384);
+nothing
+  _108 = MEM[(unsigned long *)&bitint.6 + 592B];
+nothing, etc.
+Basically, only handle statements which can propagate address (or pointer-sized integer based on it) of a tracked variable or pointer arithmetics based on that to other SSA_NAMEs.
+Of course, big question is what kind of propagation to use for that.
+
+- User: Jakub Jelinek | Time: 2024-01-15 12:55:17 UTC
+  Text: Example statements which should be handled during the propagation from the other PRs:
+  ivtmp.32_28 = (unsigned long) &in;
+  _44 = &g + _43;
+guess a plain
+  _1234 = &whatever;
+too.
+
+- User: Richard Biener | Time: 2024-01-15 13:04:18 UTC
+  Text: So the key would be to make the object live again after a CLOBBER when such
+address SSA name is used (but before any other explicit mention appears)?
+
+The current algorithm relies on explitic mentions appearing, one original
+idea was to turn those explicit mentions (or BLOCK starts) into
+start-of-live CLOBBERs, but even that was shown to be not enough.
+
+But yes, if we want to try to mitigate the problems somewhat without
+doing a full solution then possibly even just looking at SSA defs
+when POINTER_TYPE and the def is an ADDR_EXPR might work (in the
+visit_* callbacks of the walk_stmt_load_store_addr_ops), no propagation
+needed at all (basically just undo CSE virtually here for the simple
+cases).
+
+- User: Jakub Jelinek | Time: 2024-01-15 13:35:15 UTC
+  Text: (In reply to Richard Biener fromcomment #11)> So the key would be to make the object live again after a CLOBBER when such
+> address SSA name is used (but before any other explicit mention appears)?
+> 
+> The current algorithm relies on explitic mentions appearing, one original
+> idea was to turn those explicit mentions (or BLOCK starts) into
+> start-of-live CLOBBERs, but even that was shown to be not enough.
+> 
+> But yes, if we want to try to mitigate the problems somewhat without
+> doing a full solution then possibly even just looking at SSA defs
+> when POINTER_TYPE and the def is an ADDR_EXPR might work (in the
+> visit_* callbacks of the walk_stmt_load_store_addr_ops), no propagation
+> needed at all (basically just undo CSE virtually here for the simple
+> cases).It couldn't be limited to just POINTER_TYPE, because it mostly is actually pointer-sized unsigned integer from IVOPTs, but yes, even without full propagation I think all the testcases I've mentioned could be solved by just doing the short walks in PHI arguments or other SSA_NAME uses (onlyPR111422needs the latter).
+For this PR, we'd need to visit for ivtmp.40_3 uses in PHI args the def-stmt:
+  ivtmp.40_3 = (unsigned long) &MEM <unsigned long[100]> [(void *)&bitint.6 + 8B];
+forPR90348ivtmp.32_28's def-stmt:
+  ivtmp.32_28 = (unsigned long) &in;
+forPR110115ivtmp.27_2's def-stmt:
+  ivtmp.27_2 = (unsigned long) &h;
+fprPR111422_44's def-stmt:
+  _44 = &g + _43;
+So, if you think it is ok to use just a small hack rather than full propagation (which could even handle const/pure calls perhaps if they return pointer or pointer-sized integer), I can implement that too.  Even the full propagation wouldn't handle everything of course, but could handle more than the small hack (which would need to be limited to just say 4 def-stmts and wouldn't try to look through PHIs).
+
+- User: rguenther@suse.de | Time: 2024-01-15 13:47:16 UTC
+  Text: On Mon, 15 Jan 2024, jakub at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113372> 
+> ---Comment #12from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> (In reply to Richard Biener fromcomment #11)
+> > So the key would be to make the object live again after a CLOBBER when such
+> > address SSA name is used (but before any other explicit mention appears)?
+> > 
+> > The current algorithm relies on explitic mentions appearing, one original
+> > idea was to turn those explicit mentions (or BLOCK starts) into
+> > start-of-live CLOBBERs, but even that was shown to be not enough.
+> > 
+> > But yes, if we want to try to mitigate the problems somewhat without
+> > doing a full solution then possibly even just looking at SSA defs
+> > when POINTER_TYPE and the def is an ADDR_EXPR might work (in the
+> > visit_* callbacks of the walk_stmt_load_store_addr_ops), no propagation
+> > needed at all (basically just undo CSE virtually here for the simple
+> > cases).
+> 
+> It couldn't be limited to just POINTER_TYPE, because it mostly is actually
+> pointer-sized unsigned integer from IVOPTs, but yes, even without full
+> propagation I think all the testcases I've mentioned could be solved by just
+> doing the short walks in PHI arguments or other SSA_NAME uses (onlyPR111422> needs the latter).
+> For this PR, we'd need to visit for ivtmp.40_3 uses in PHI args the def-stmt:
+>   ivtmp.40_3 = (unsigned long) &MEM <unsigned long[100]> [(void *)&bitint.6 +
+> 8B];
+> forPR90348ivtmp.32_28's def-stmt:
+>   ivtmp.32_28 = (unsigned long) &in;
+> forPR110115ivtmp.27_2's def-stmt:
+>   ivtmp.27_2 = (unsigned long) &h;
+> fprPR111422_44's def-stmt:
+>   _44 = &g + _43;
+> So, if you think it is ok to use just a small hack rather than full propagation
+> (which could even handle const/pure calls perhaps if they return pointer or
+> pointer-sized integer), I can implement that too.  Even the full propagation
+> wouldn't handle everything of course, but could handle more than the small hack
+> (which would need to be limited to just say 4 def-stmts and wouldn't try to
+> look through PHIs).I think we don't expect arbitrary complex obfuscation.  We do have
+RPO order computed so propagation cost would be mostly a bunch of
+bitmaps (possibly one per SSA name), but with PHIs we'd need to
+iterate.  I wonder if this could be done along the propagation
+add_scope_conflicts does itself - can we do this within
+add_scope_conflicts_1 when for_conflict == false?  I'd think so
+(though whether a change occured is more difficult to track?).
+
+What would you then consider a mention that's not explicit?
+Any that we couldn't further propagate to its uses?  Thus also
+
+  mem = _1;
+
+with _1 having the address of some local?
+
+- User: Jakub Jelinek | Time: 2024-01-15 14:35:51 UTC
+  Text: Createdattachment 57085[details]gcc14-pr113372.patch
+
+The non-propagation workaround which seems to fix^H^H^Hworkaround all those 4 issues (PR90348testcase actually doesn't FAIL anymore, but I've verified the patch results in in and buf no longer being shared) can look like this.
+
+- User: Richard Biener | Time: 2024-01-15 14:42:40 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #14)> Createdattachment 57085[details]> gcc14-pr113372.patch
+> 
+> The non-propagation workaround which seems to fix^H^H^Hworkaround all those
+> 4 issues (PR90348testcase actually doesn't FAIL anymore, but I've verified
+> the patch results in in and buf no longer being shared) can look like this.+	  || (INTEGRAL_TYPE_P (TREE_TYPE (use))
++	      && TYPE_PRECISION (TREE_TYPE (use)) == POINTER_SIZE)))
+
+ptrofftype_p (TREE_TYPE (use))
+
++    {
++      gimple *g = SSA_NAME_DEF_STMT (use);
++      if (is_gimple_assign (g))
++	for (unsigned i = 1; i < gimple_num_ops (g); ++i)
++	  {
++	    tree op = gimple_op (g, i);
++	    if (op && TREE_CODE (op) == ADDR_EXPR)
+
+I think it should be enough to look at gimple_assing_rhs1, that works
+for single non-invariant &a[i], for conversions and for offsetting of
+an invariant address (pointer-plus).
+
+I'd say OK with those changes.
+
+- User: Michael Matz | Time: 2024-01-15 14:43:24 UTC
+  Text: A general remark: in principle I don't see problems with undoing a little CSE,
+as proposed.  I.e. for each SSA name use, see if it (trivially, or conservatively
+or optimistically) refers to an address of a tracked DECL, and include those
+in the dont-share set.
+
+But I will remark that this then handles code that was invalid to start with
+as if it were valid, and I'm not sure if this will change diagnostics outcome
+in any way (it certainly will prevent the slot sharing and hence any diagnostics
+that are based on such sharing to happen, e.g. when dirtying memory at lifetime-end).
+
+What I mean is the classic anti-pattern in C:
+
+   char * ptr;
+   {
+     char localarray[n];
+     dosomething (localarray);
+     ptr = localarray;
+   }
+   domore (ptr);
+
+The proposed solution will make the reference to the SSA name of 'ptr',
+even though it was invalid in the source, keep localarray[] to be conflicting
+and hence unshared with any other surrounding storage.
+
+Depending on how PHI nodes are handled this will also mean that an SSA name
+can't ever be un-associated with a DECL anymore:
+
+  char * ptr = someotherarray;
+  if (cond1)
+  {
+    char localarray[n];
+    ptr = localarray;
+    foo (ptr);
+  }
+  if (cond2) { char localarray[n]; ptr = localarray; foo(ptr); }
+  if (!cond1 && !cond2)
+    foo (ptr);
+
+Here we will have a PHI for ptr: 'ptr_3 = PHI<ptr_1, ptr_2>'.  The question
+is how the reference(s) to 'localarray' will be handled: does it lead to ptr_3
+also referring to them or not.  I.e. usual question in PHI merging: optimistic
+or pessimistic.
+
+Note that the answer to the latter question might influence the whole effectiveness of stack slot sharing.  IIRC the latter type of code was one
+of the examples that explodes in stack usage without sharing (localarray[]
+being instead local C++ objects; but I don't remember if references to them
+could bleed out of scopes in the same way as above).
+
+- User: Jakub Jelinek | Time: 2024-01-15 14:58:58 UTC
+  Text: (In reply to Richard Biener fromcomment #15)> (In reply to Jakub Jelinek fromcomment #14)
+> > Createdattachment 57085[details]> > gcc14-pr113372.patch
+> > 
+> > The non-propagation workaround which seems to fix^H^H^Hworkaround all those
+> > 4 issues (PR90348testcase actually doesn't FAIL anymore, but I've verified
+> > the patch results in in and buf no longer being shared) can look like this.
+> 
+> +	  || (INTEGRAL_TYPE_P (TREE_TYPE (use))
+> +	      && TYPE_PRECISION (TREE_TYPE (use)) == POINTER_SIZE)))
+> 
+> ptrofftype_p (TREE_TYPE (use))Aren't there targets where pointers are larger than sizetype?
+I thought msp430, but that one uses __int20.> I think it should be enough to look at gimple_assing_rhs1, that works
+> for single non-invariant &a[i], for conversions and for offsetting of
+> an invariant address (pointer-plus).Is the invariant operand guaranteed to go first?  If it is pointer, guess POINTER_PLUS_EXPR enforces that, and for sizetype addition guess an operand can't be ADDR_EXPR, there would need to be a cast in a separate stmt.  So perhaps ok.
+
+As for Micha's fears, I can certainly try to dump statistics during bootstrap/regtest on how many variables were shared and/or their cumulative size without/with the patch and see if it has significant effects on real-world code.
+
+- User: rguenther@suse.de | Time: 2024-01-16 07:21:26 UTC
+  Text: On Mon, 15 Jan 2024, jakub at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113372> 
+> ---Comment #17from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> (In reply to Richard Biener fromcomment #15)
+> > (In reply to Jakub Jelinek fromcomment #14)
+> > > Createdattachment 57085[details]> > > gcc14-pr113372.patch
+> > > 
+> > > The non-propagation workaround which seems to fix^H^H^Hworkaround all those
+> > > 4 issues (PR90348testcase actually doesn't FAIL anymore, but I've verified
+> > > the patch results in in and buf no longer being shared) can look like this.
+> > 
+> > +	  || (INTEGRAL_TYPE_P (TREE_TYPE (use))
+> > +	      && TYPE_PRECISION (TREE_TYPE (use)) == POINTER_SIZE)))
+> > 
+> > ptrofftype_p (TREE_TYPE (use))
+> 
+> Aren't there targets where pointers are larger than sizetype?
+> I thought msp430, but that one uses __int20.There are also address-spaces with pointer sizes different from
+POINTER_SIZE.  I suppose tracking all INTEGRAL_TYPE_P uses and
+instead relying on the def to identify a pointer source would work
+as well.> > I think it should be enough to look at gimple_assing_rhs1, that works
+> > for single non-invariant &a[i], for conversions and for offsetting of
+> > an invariant address (pointer-plus).
+> 
+> Is the invariant operand guaranteed to go first?  If it is pointer, guess
+> POINTER_PLUS_EXPR enforces that, and for sizetype addition guess an operand
+> can't be ADDR_EXPR, there would need to be a cast in a separate stmt.  So
+> perhaps ok.Yes, I think that works.> As for Micha's fears, I can certainly try to dump statistics during
+> bootstrap/regtest on how many variables were shared and/or their cumulative
+> size without/with the patch and see if it has significant effects on real-world
+> code.Might be interesting to dump the stack size saved due to sharing instead?
+
+Do we really need to handle the PHI nodes btw?  With doing propagation
+we could avoid marking certain use sites as mentions, like compares
+of the address value.  But of course we'd have to give up for uses
+in calls or other things we can't analyze.
+
+- User: GCC Commits | Time: 2024-01-16 10:51:20 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:1251d3957de04dc9b023a23c09400217e13deadbcommitr14-7274-g1251d3957de04dc9b023a23c09400217e13deadbAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jan 16 11:49:34 2024 +0100
+
+    cfgexpand: Workaround CSE of ADDR_EXPRs in VAR_DECL partitioning [PR113372]
+    
+    The following patch adds a quick workaround to bugs in VAR_DECL
+    partitioning.
+    The problem is that there is no dependency between ADDR_EXPRs of local
+    decls and CLOBBERs of those vars, so VN can CSE uses of ADDR_EXPRs
+    (including ivopts integral variants thereof), which can break
+    add_scope_conflicts discovery of what variables are actually used
+    in certain region.
+    E.g. we can have
+      ivtmp.40_3 = (unsigned long) &MEM <unsigned long[100]> [(void *)&bitint.6 + 8B];
+    ...
+      uses of ivtmp.40_3
+    ...
+      bitint.6 ={v} {CLOBBER(eos)};
+    ...
+      ivtmp.28_43 = (unsigned long) &MEM <unsigned long[100]> [(void *)&bitint.6 + 8B];
+    ...
+      uses of ivtmp.28_43
+    before VN (such as dom3), which the add_scope_conflicts code identifies as 2
+    independent uses of bitint.6 variable (which is correct), but then VN
+    determines ivtmp.28_43 is the same as ivtmp.40_3 and just uses ivtmp.40_3
+    even in the second region; at that point add_scope_conflict thinks the
+    bitint.6 variable is not used in that region anymore.
+    
+    The following patch does a simple single def-stmt check for such ADDR_EXPRs
+    (rather than say trying to do a full propagation of what SSA_NAMEs can
+    contain ADDR_EXPRs of local variables), which seems to workaround all 4 PRs.
+    
+    In addition to this patch I've used the attached one to gather statistics
+    on the total size of all variable partitions in a function and seems besides
+    the new testcases nothing is really affected compared to no patch (I've
+    actually just modified the patch to == OMP_SCAN instead of == ADDR_EXPR, so
+    it looks the same except that it never triggers).  The comparison wasn't
+    perfect because I've only gathered BITS_PER_WORD, main_input_filename (did
+    some replacement of build directories and /tmp/ccXXXXXX names of LTO to make
+    it more similar between the two bootstraps/regtests), current_function_name
+    and the total size of all variable partitions if any, because I didn't
+    record e.g. the optimization options and so e.g. torture tests which iterate
+    over options could have different partition sizes even in one compiler when
+    BITS_PER_WORD, main_input_filename and current_function_name are all equal.
+    So had to write an awk script to check if the first triple in the second
+    build appeared in the first one and the quadruple in the second build
+    appeared in the first one too, otherwise print result and that only
+    triggered in the new tests.
+    Also, the cc1plus binary according to objdump -dr is identical between the
+    two builds except for the ADDR_EXPR vs. OMP_SCAN constant in the two spots.
+    
+    2024-01-16  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113372PR middle-end/90348PR middle-end/110115PR middle-end/111422* cfgexpand.cc (add_scope_conflicts_2): New function.
+            (add_scope_conflicts_1): Use it.
+    
+            * gcc.dg/torture/bitint-49.c: New test.
+            * gcc.c-torture/execute/pr90348.c: New test.
+            * gcc.c-torture/execute/pr110115.c: New test.
+            * gcc.c-torture/execute/pr111422.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-01-16 10:56:32 UTC
+  Text: Worked around for now.
+
+- User: GCC Commits | Time: 2024-03-02 00:38:16 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:432708c306838fe1444da0df7d629a60468c0c73commitr13-8383-g432708c306838fe1444da0df7d629a60468c0c73Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jan 16 11:49:34 2024 +0100
+
+    cfgexpand: Workaround CSE of ADDR_EXPRs in VAR_DECL partitioning [PR113372]
+    
+    The following patch adds a quick workaround to bugs in VAR_DECL
+    partitioning.
+    The problem is that there is no dependency between ADDR_EXPRs of local
+    decls and CLOBBERs of those vars, so VN can CSE uses of ADDR_EXPRs
+    (including ivopts integral variants thereof), which can break
+    add_scope_conflicts discovery of what variables are actually used
+    in certain region.
+    E.g. we can have
+      ivtmp.40_3 = (unsigned long) &MEM <unsigned long[100]> [(void *)&bitint.6 + 8B];
+    ...
+      uses of ivtmp.40_3
+    ...
+      bitint.6 ={v} {CLOBBER(eos)};
+    ...
+      ivtmp.28_43 = (unsigned long) &MEM <unsigned long[100]> [(void *)&bitint.6 + 8B];
+    ...
+      uses of ivtmp.28_43
+    before VN (such as dom3), which the add_scope_conflicts code identifies as 2
+    independent uses of bitint.6 variable (which is correct), but then VN
+    determines ivtmp.28_43 is the same as ivtmp.40_3 and just uses ivtmp.40_3
+    even in the second region; at that point add_scope_conflict thinks the
+    bitint.6 variable is not used in that region anymore.
+    
+    The following patch does a simple single def-stmt check for such ADDR_EXPRs
+    (rather than say trying to do a full propagation of what SSA_NAMEs can
+    contain ADDR_EXPRs of local variables), which seems to workaround all 4 PRs.
+    
+    In addition to this patch I've used the attached one to gather statistics
+    on the total size of all variable partitions in a function and seems besides
+    the new testcases nothing is really affected compared to no patch (I've
+    actually just modified the patch to == OMP_SCAN instead of == ADDR_EXPR, so
+    it looks the same except that it never triggers).  The comparison wasn't
+    perfect because I've only gathered BITS_PER_WORD, main_input_filename (did
+    some replacement of build directories and /tmp/ccXXXXXX names of LTO to make
+    it more similar between the two bootstraps/regtests), current_function_name
+    and the total size of all variable partitions if any, because I didn't
+    record e.g. the optimization options and so e.g. torture tests which iterate
+    over options could have different partition sizes even in one compiler when
+    BITS_PER_WORD, main_input_filename and current_function_name are all equal.
+    So had to write an awk script to check if the first triple in the second
+    build appeared in the first one and the quadruple in the second build
+    appeared in the first one too, otherwise print result and that only
+    triggered in the new tests.
+    Also, the cc1plus binary according to objdump -dr is identical between the
+    two builds except for the ADDR_EXPR vs. OMP_SCAN constant in the two spots.
+    
+    2024-01-16  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113372PR middle-end/90348PR middle-end/110115PR middle-end/111422* cfgexpand.cc (add_scope_conflicts_2): New function.
+            (add_scope_conflicts_1): Use it.
+    
+            * gcc.c-torture/execute/pr90348.c: New test.
+            * gcc.c-torture/execute/pr110115.c: New test.
+            * gcc.c-torture/execute/pr111422.c: New test.
+    
+    (cherry picked from commit 1251d3957de04dc9b023a23c09400217e13deadb)
+
+- User: Jakub Jelinek | Time: 2024-03-28 11:01:58 UTC
+  Text: ***Bug 109925has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2024-06-11 10:36:39 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:170c2bba7cb85b3ac9380a7d5a1c6d82b3c6aa63commitr12-10506-g170c2bba7cb85b3ac9380a7d5a1c6d82b3c6aa63Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jan 16 11:49:34 2024 +0100
+
+    cfgexpand: Workaround CSE of ADDR_EXPRs in VAR_DECL partitioning [PR113372]
+    
+    The following patch adds a quick workaround to bugs in VAR_DECL
+    partitioning.
+    The problem is that there is no dependency between ADDR_EXPRs of local
+    decls and CLOBBERs of those vars, so VN can CSE uses of ADDR_EXPRs
+    (including ivopts integral variants thereof), which can break
+    add_scope_conflicts discovery of what variables are actually used
+    in certain region.
+    E.g. we can have
+      ivtmp.40_3 = (unsigned long) &MEM <unsigned long[100]> [(void *)&bitint.6 + 8B];
+    ...
+      uses of ivtmp.40_3
+    ...
+      bitint.6 ={v} {CLOBBER(eos)};
+    ...
+      ivtmp.28_43 = (unsigned long) &MEM <unsigned long[100]> [(void *)&bitint.6 + 8B];
+    ...
+      uses of ivtmp.28_43
+    before VN (such as dom3), which the add_scope_conflicts code identifies as 2
+    independent uses of bitint.6 variable (which is correct), but then VN
+    determines ivtmp.28_43 is the same as ivtmp.40_3 and just uses ivtmp.40_3
+    even in the second region; at that point add_scope_conflict thinks the
+    bitint.6 variable is not used in that region anymore.
+    
+    The following patch does a simple single def-stmt check for such ADDR_EXPRs
+    (rather than say trying to do a full propagation of what SSA_NAMEs can
+    contain ADDR_EXPRs of local variables), which seems to workaround all 4 PRs.
+    
+    In addition to this patch I've used the attached one to gather statistics
+    on the total size of all variable partitions in a function and seems besides
+    the new testcases nothing is really affected compared to no patch (I've
+    actually just modified the patch to == OMP_SCAN instead of == ADDR_EXPR, so
+    it looks the same except that it never triggers).  The comparison wasn't
+    perfect because I've only gathered BITS_PER_WORD, main_input_filename (did
+    some replacement of build directories and /tmp/ccXXXXXX names of LTO to make
+    it more similar between the two bootstraps/regtests), current_function_name
+    and the total size of all variable partitions if any, because I didn't
+    record e.g. the optimization options and so e.g. torture tests which iterate
+    over options could have different partition sizes even in one compiler when
+    BITS_PER_WORD, main_input_filename and current_function_name are all equal.
+    So had to write an awk script to check if the first triple in the second
+    build appeared in the first one and the quadruple in the second build
+    appeared in the first one too, otherwise print result and that only
+    triggered in the new tests.
+    Also, the cc1plus binary according to objdump -dr is identical between the
+    two builds except for the ADDR_EXPR vs. OMP_SCAN constant in the two spots.
+    
+    2024-01-16  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113372PR middle-end/90348PR middle-end/110115PR middle-end/111422* cfgexpand.cc (add_scope_conflicts_2): New function.
+            (add_scope_conflicts_1): Use it.
+    
+            * gcc.c-torture/execute/pr90348.c: New test.
+            * gcc.c-torture/execute/pr110115.c: New test.
+            * gcc.c-torture/execute/pr111422.c: New test.
+    
+    (cherry picked from commit 1251d3957de04dc9b023a23c09400217e13deadb)
+
+- User: GCC Commits | Time: 2024-06-20 13:21:52 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:c845244dd7afae95689b8dd02a62c18932441583commitr11-11490-gc845244dd7afae95689b8dd02a62c18932441583Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jan 16 11:49:34 2024 +0100
+
+    cfgexpand: Workaround CSE of ADDR_EXPRs in VAR_DECL partitioning [PR113372]
+    
+    The following patch adds a quick workaround to bugs in VAR_DECL
+    partitioning.
+    The problem is that there is no dependency between ADDR_EXPRs of local
+    decls and CLOBBERs of those vars, so VN can CSE uses of ADDR_EXPRs
+    (including ivopts integral variants thereof), which can break
+    add_scope_conflicts discovery of what variables are actually used
+    in certain region.
+    E.g. we can have
+      ivtmp.40_3 = (unsigned long) &MEM <unsigned long[100]> [(void *)&bitint.6 + 8B];
+    ...
+      uses of ivtmp.40_3
+    ...
+      bitint.6 ={v} {CLOBBER(eos)};
+    ...
+      ivtmp.28_43 = (unsigned long) &MEM <unsigned long[100]> [(void *)&bitint.6 + 8B];
+    ...
+      uses of ivtmp.28_43
+    before VN (such as dom3), which the add_scope_conflicts code identifies as 2
+    independent uses of bitint.6 variable (which is correct), but then VN
+    determines ivtmp.28_43 is the same as ivtmp.40_3 and just uses ivtmp.40_3
+    even in the second region; at that point add_scope_conflict thinks the
+    bitint.6 variable is not used in that region anymore.
+    
+    The following patch does a simple single def-stmt check for such ADDR_EXPRs
+    (rather than say trying to do a full propagation of what SSA_NAMEs can
+    contain ADDR_EXPRs of local variables), which seems to workaround all 4 PRs.
+    
+    In addition to this patch I've used the attached one to gather statistics
+    on the total size of all variable partitions in a function and seems besides
+    the new testcases nothing is really affected compared to no patch (I've
+    actually just modified the patch to == OMP_SCAN instead of == ADDR_EXPR, so
+    it looks the same except that it never triggers).  The comparison wasn't
+    perfect because I've only gathered BITS_PER_WORD, main_input_filename (did
+    some replacement of build directories and /tmp/ccXXXXXX names of LTO to make
+    it more similar between the two bootstraps/regtests), current_function_name
+    and the total size of all variable partitions if any, because I didn't
+    record e.g. the optimization options and so e.g. torture tests which iterate
+    over options could have different partition sizes even in one compiler when
+    BITS_PER_WORD, main_input_filename and current_function_name are all equal.
+    So had to write an awk script to check if the first triple in the second
+    build appeared in the first one and the quadruple in the second build
+    appeared in the first one too, otherwise print result and that only
+    triggered in the new tests.
+    Also, the cc1plus binary according to objdump -dr is identical between the
+    two builds except for the ADDR_EXPR vs. OMP_SCAN constant in the two spots.
+    
+    2024-01-16  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113372PR middle-end/90348PR middle-end/110115PR middle-end/111422* cfgexpand.c (add_scope_conflicts_2): New function.
+            (add_scope_conflicts_1): Use it.
+    
+            * gcc.c-torture/execute/pr90348.c: New test.
+            * gcc.c-torture/execute/pr110115.c: New test.
+            * gcc.c-torture/execute/pr111422.c: New test.
+    
+    (cherry picked from commit 1251d3957de04dc9b023a23c09400217e13deadb)
+

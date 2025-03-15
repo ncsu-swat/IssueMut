@@ -1,0 +1,175 @@
+Bug Summary: [14 regression] gcc.target/powerpc/vsx-extract-6.c fails after r14-3381-g27de9aa152141e
+Product: gcc
+Component: testsuite
+
+  (show other bugs)
+Keywords: testsuite-fail
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: N/A | Time: 2023-08-29 19:00:00 UTC
+  Text: g:27de9aa152141e7f3ee66372647d0f2cd94c4b90,r14-3381-g27de9aa152141emake  -k check-gcc RUNTESTFLAGS="powerpc.exp=gcc.target/powerpc/vsx-extract-6.c"
+FAIL: gcc.target/powerpc/vsx-extract-6.c scan-assembler-times \\mxxpermdi\\M 1
+FAIL: gcc.target/powerpc/vsx-extract-6.c scan-assembler-not \\mxxspltib\\M
+# of expected passes		10
+# of unexpected failures	2
+
+Also
+
+FAIL: gcc.target/powerpc/vsx-extract-7.c scan-assembler-times \\mxxpermdi\\M 1
+FAIL: gcc.target/powerpc/vsx-extract-7.c scan-assembler-not \\mxxspltib\\M
+
+
+commit 27de9aa152141e7f3ee66372647d0f2cd94c4b90 (HEAD, refs/bisect/bad)
+Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Jul 12 15:01:47 2023 +0200
+
+    tree-optimization/94864 - vector insert of vector extract simplification
+
+- User: Peter Bergner | Time: 2023-08-30 03:26:49 UTC
+  Text: Confirmed.  The testsuite log shows for vsx-extract-6.c and vsx-extract-7.c:
+
+gcc.target/powerpc/vsx-extract-6.c: \\mxxpermdi\\M found 2 times
+FAIL: gcc.target/powerpc/vsx-extract-6.c scan-assembler-times \\mxxpermdi\\M 1
+FAIL: gcc.target/powerpc/vsx-extract-6.c scan-assembler-not \\mvspltisw\\M
+
+So we have an extra xxpermdi than we expected and we also have a vspltisw when we expected none.  I haven't looked at whether the code is better or worse though, to know whether we should just update the expected counts or whether this is really a code quality regression.
+
+- User: Kewen Lin | Time: 2023-08-30 05:12:23 UTC
+  Text: (In reply to Peter Bergner fromcomment #1)> Confirmed.  The testsuite log shows for vsx-extract-6.c and vsx-extract-7.c:
+> 
+> gcc.target/powerpc/vsx-extract-6.c: \\mxxpermdi\\M found 2 times
+> FAIL: gcc.target/powerpc/vsx-extract-6.c scan-assembler-times \\mxxpermdi\\M
+> 1
+> FAIL: gcc.target/powerpc/vsx-extract-6.c scan-assembler-not \\mvspltisw\\M
+> 
+> So we have an extra xxpermdi than we expected and we also have a vspltisw
+> when we expected none.  I haven't looked at whether the code is better or
+> worse though, to know whether we should just update the expected counts or
+> whether this is really a code quality regression.The commit makes the vsx-extract-6.c end up with:
+
+test_vpasted:
+.LFB0:
+        .cfi_startproc
+        xxspltib 0,0
+        xxpermdi 34,34,0,1
+        xxpermdi 34,34,35,1
+        blr
+
+instead of (the original expected):
+
+test_vpasted:
+.LFB0:
+        .cfi_startproc
+        xxpermdi 34,34,35,1
+        blr
+
+I think it's a code quality regression. The optimized gimple IR is changed to:
+
+__vector unsigned long long test_vpasted (__vector unsigned long long high, __vector unsigned long long low)
+{
+  __vector unsigned long long res;
+
+  <bb 2> [local count: 1073741824]:
+  res_3 = VEC_PERM_EXPR <res_2(D), high_1(D), { 0, 3 }>;
+  res_5 = VEC_PERM_EXPR <low_4(D), res_3, { 0, 3 }>;
+  return res_5;
+
+}
+
+from:
+
+__vector unsigned long long test_vpasted (__vector unsigned long long high, __vector unsigned long long low)
+{
+  __vector unsigned long long res;
+  long long unsigned int _1;
+  long long unsigned int _2;
+
+  <bb 2> [local count: 1073741824]:
+  _1 = BIT_FIELD_REF <high_3(D), 64, 64>;
+  res_5 = BIT_INSERT_EXPR <res_4(D), _1, 64 (64 bits)>;
+  _2 = BIT_FIELD_REF <low_6(D), 64, 0>;
+  res_7 = BIT_INSERT_EXPR <res_5, _2, 0 (64 bits)>;
+  return res_7;
+
+}
+
+For gimple IRs:
+
+  res_3 = VEC_PERM_EXPR <res_2(D), high_1(D), { 0, 3 }>;
+  res_5 = VEC_PERM_EXPR <low_4(D), res_3, { 0, 3 }>;
+
+I'd expect it can be further optimized into
+
+  res_5 = VEC_PERM_EXPR <low_4(D), high_1(D), { 0, 3 }>;
+
+- User: Richard Biener | Time: 2023-08-30 07:17:19 UTC
+  Text: Mine.  We have
+
+/* Merge
+   c = VEC_PERM_EXPR <a, b, VCST0>;
+   d = VEC_PERM_EXPR <c, c, VCST1>;
+   to
+   d = VEC_PERM_EXPR <a, b, NEW_VCST>;  */
+         
+and tree-ssa-forwprop.cc has some other special-cases.  What we lack is
+simplification of two consecutive permutes.> For gimple IRs:
+> 
+>  res_3 = VEC_PERM_EXPR <res_2(D), high_1(D), { 0, 3 }>;
+>  res_5 = VEC_PERM_EXPR <low_4(D), res_3, { 0, 3 }>;>> I'd expect it can be further optimized into>>  res_5 = VEC_PERM_EXPR <low_4(D), high_1(D), { 0, 3 }>;where I think the vectors are all vector(2) unsigned long this works
+because the later permute replaces all elements the first permute
+uses from the first or second element.  Thus the key is to identify
+whether the inherited elements are all from a single operand of the
+first source (and which ones).
+
+- User: GCC Commits | Time: 2023-08-30 11:55:21 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:caa7a99a052929d5970677c5b639e1fa5166e334commitr14-3571-gcaa7a99a052929d5970677c5b639e1fa5166e334Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Aug 30 11:57:47 2023 +0200
+
+    tree-optimization/111228 - combine two VEC_PERM_EXPRs
+    
+    The following adds simplification of two VEC_PERM_EXPRs where
+    the later one replaces all elements from either the first or the
+    second input of the earlier permute.  This allows a three input
+    permute to be simplified to a two input one.
+    
+    I'm following the existing two input simplification case and only
+    allow non-VLA permutes.  The now existing three cases and the
+    single case in tree-ssa-forwprop.cc somehow ask for merging,
+    I'm not doing this as part of this change though.PR tree-optimization/111228* match.pd ((vec_perm (vec_perm ..) @5 ..) -> (vec_perm @x @5 ..)):
+            New simplifications.
+    
+            * gcc.dg/tree-ssa/forwprop-42.c: New testcase.
+
+- User: Richard Biener | Time: 2023-08-30 11:55:38 UTC
+  Text: Should be fixed.
+
+- User: Peter Bergner | Time: 2023-08-30 14:41:36 UTC
+  Text: (In reply to Richard Biener fromcomment #5)> Should be fixed.Confirmed fixed.  Thanks!
+
+- User: GCC Commits | Time: 2023-08-31 13:57:30 UTC
+  Text: The master branch has been updated by Peter Bergner <bergner@gcc.gnu.org>:https://gcc.gnu.org/g:80277e18e1a77b68f938b605c3ecd2750194ed75commitr14-3598-g80277e18e1a77b68f938b605c3ecd2750194ed75Author: Peter Bergner <bergner@linux.ibm.com>
+Date:   Thu Aug 31 08:56:47 2023 -0500
+
+    rs6000: Update instruction counts to match vec_* calls [PR111228]
+    
+    Commitr14-3258-ge7a36e4715c716increased the amount of folding we perform,
+    leading to better code.  Update the expected instruction counts to match the
+    changes.
+    
+    2023-08-31  Peter Bergner  <bergner@linux.ibm.com>
+    
+    gcc/testsuite/PR testsuite/111228* gcc.target/powerpc/fold-vec-logical-ors-char.c: Update instruction
+            counts to match the number of associated vec_* built-in calls.
+            * gcc.target/powerpc/fold-vec-logical-ors-int.c: Likewise.
+            * gcc.target/powerpc/fold-vec-logical-ors-longlong.c: Likewise.
+            * gcc.target/powerpc/fold-vec-logical-ors-short.c: Likewise.
+            * gcc.target/powerpc/fold-vec-logical-other-char.c: Likewise.
+            * gcc.target/powerpc/fold-vec-logical-other-int.c: Likewise.
+            * gcc.target/powerpc/fold-vec-logical-other-longlong.c: Likewise.
+            * gcc.target/powerpc/fold-vec-logical-other-short.c: Likewise.
+
+- User: Peter Bergner | Time: 2023-08-31 13:58:41 UTC
+  Text: (In reply to CVS Commits fromcomment #7)> The master branch has been updated by Peter Bergner <bergner@gcc.gnu.org>:Bah, wrong PR#, Sorry! :-(
+

@@ -1,0 +1,145 @@
+Bug Summary: [14] RISC-V vector: failure to mask top bits during type conversion
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Patrick O'Neill | Time: 2023-12-01 02:41:53 UTC
+  Text: This testcase is correctly handled on rv64gc but fails on rv64gcv -O2> ./bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv -mabi=lp64d -O2 red.c -o rv64gcv.outCreduced testcase:
+int printf(char *, ...);
+int a;
+void c(int b) { a = b; }
+char d;
+char *const e = &d;
+long f = 66483309998;
+unsigned long g[2];
+short h;
+int k;
+void l() {
+  int i = 0;
+  for (; i < 2; i++) {
+    {
+      unsigned long *m = &g[0];
+      *m &= 2;
+      if (f && *e)
+        for (;;)
+          ;
+    }
+    k = f;
+    g[1] = k;
+    for (; h;)
+      ;
+  }
+}
+int main() {
+  l();
+  c(g[1] >> 32);
+  printf("%X\n", a);
+}
+
+Here's my analysis:
+Focusing on the stack of operations that lead to a:
+long f = 66483309998; // hex: F7AB6CDAE
+int k = f; // Should mask off the top bits: 7AB6CDAE
+unsigned long g[1] = k; // 7AB6CDAE
+int arg to c() = g[1]; >> 32 // 0
+int a = arg; // 0
+print(a); // 0
+
+0 is expected but rv64gcv fails to mask the top bits and ends up printing F
+
+Tested using qemu with these commands:> ./bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv -mabi=lp64d -O2 red.c -o rv64gcv.out> ./bin/riscv64-unknown-linux-gnu-gcc -march=rv64gc -mabi=lp64d -O2 red.c -o rv64gc.out> QEMU_CPU="rv64,vlen=128,v=true,vext_spec=v1.0,Zve32f=true,Zve64f=true" ./bin/qemu-riscv64 rv64gc.out0> QEMU_CPU="rv64,vlen=128,v=true,vext_spec=v1.0,Zve32f=true,Zve64f=true" ./bin/qemu-riscv64 rv64gcv.outF
+
+- User: JuzheZhong | Time: 2023-12-01 02:49:38 UTC
+  Text: Known issue for a long time.
+
+I realized that 2 years ago:https://github.com/riscv-collab/riscv-gnu-toolchain/issues/1075when I developed the first version of RVV GCC (rvv-next).
+
+I don't think it is serious issue since I chose to ignore this issue and
+correctly work fine in all my downstream application.
+
+This issue is also exposed in our regression:
+
+FAIL: gcc.dg/signbit-5.c execution test
+
+I ignore this FAIL for a long time.
+
+Low priority for me and I won't work on fixing it.
+
+- User: Richard Biener | Time: 2023-12-01 07:57:30 UTC
+  Text: I think wrong-code should be high-priority ;)
+
+- User: JuzheZhong | Time: 2023-12-01 08:26:24 UTC
+  Text: (In reply to Richard Biener fromcomment #2)> I think wrong-code should be high-priority ;)Oh. I see. Sorry. I thought it was the previous RVV shift ISA issue.
+since I saw c(g[1] >> 32);
+
+Confirm it is wrong code. Will take a look at it.
+
+Thanks for remind.
+
+- User: GCC Commits | Time: 2023-12-02 03:38:10 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:1461b431da51f80c90c3bea03d587d76e3e50843commitr14-6069-g1461b431da51f80c90c3bea03d587d76e3e50843Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Fri Dec 1 20:31:50 2023 +0800
+
+    RISC-V: Fix incorrect combine of extended scalar pattern
+    
+    Background:
+    RVV ISA vx instructions for example vadd.vx,
+    When EEW = 64 and RV32. We can't directly use vadd.vx.
+    Instead, we need to use:
+    
+    sw
+    sw
+    vlse
+    vadd.vv
+    
+    However, we have some special situation that we still can directly use
+    vadd.vx directly for EEW=64 && RV32.
+    
+    that is, when scalar is a known CONST_INT value that doesn't overflow 32-bit value.
+    So, we have a dedicated pattern for such situation:
+    
+    ...
+    (sign_extend:<VEL> (match_operand:<VSUBEL> 3 "register_operand"          " r,  r,  r,  r")).
+    ...
+    
+    We first force_reg such CONST_INT (within 32bit value) into a SImode reg.
+    Then use such special patterns.
+    Those pattern with this operand match should only value on! TARGET_64BIT.
+    
+    ThePR112801combine into such patterns on RV64 incorrectly (Those patterns should be only value on RV32).
+    
+    This is the bug:
+    
+            andi    a2,a2,2
+            vsetivli        zero,2,e64,m1,ta,ma
+            sext.w  a3,a4
+            vmv.v.x v1,a2
+            vslide1down.vx  v1,v1,a4    -> it should be a3 instead of a4.
+    
+    Such incorrect codegen is caused by
+    ...
+                    (sign_extend:DI (subreg:SI (reg:DI 135 [ f.0_3 ]) 0))
+                ] UNSPEC_VSLIDE1DOWN)) 16935 {*pred_slide1downv2di_extended}
+    ...
+    
+    Incorretly combine into the patterns should not be valid on RV64 system.
+    
+    So add !TARGET_64BIT to all same type patterns which can fix such issue as well as robostify the vector.md.PR target/112801gcc/ChangeLog:
+    
+            * config/riscv/vector.md: Add !TARGET_64BIT.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/pr112801.c: New test.
+
+- User: JuzheZhong | Time: 2023-12-02 03:38:54 UTC
+  Text: Should be fixed on the trunk. Plz verify it and close it.
+
+- User: Patrick O'Neill | Time: 2023-12-04 17:25:33 UTC
+  Text: Fixed, thanks!
+

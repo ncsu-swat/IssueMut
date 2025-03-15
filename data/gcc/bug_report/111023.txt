@@ -1,0 +1,185 @@
+Bug Summary: missing extendv4siv4hi (and friends)
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Richard Biener | Time: 2023-08-15 07:33:52 UTC
+  Text: We could vectorize gcc.dg/vect/pr65947-7.c if we implement the
+extendv4siv4hi pattern (sign-extend V4HI to V4SI).  We can already do
+vec_unpacks_lo via
+
+        pcmpgtw %xmm0, %xmm1
+        movdqa  %xmm0, %xmm2
+        punpcklwd       %xmm1, %xmm2
+
+and that would trivially extend to the required pattern - just the
+input is v4hi instead of v8hi.
+
+Other related patterns are probably missing as well, where we can do
+vec_unpack[s]_lo we should be able to implement [zero_]extend.
+
+- User: Uroš Bizjak | Time: 2023-08-15 15:23:21 UTC
+  Text: (In reply to Richard Biener fromcomment #0)> We could vectorize gcc.dg/vect/pr65947-7.c if we implement the
+> extendv4siv4hi pattern (sign-extend V4HI to V4SI).  We can already do
+> vec_unpacks_lo via
+> 
+>         pcmpgtw %xmm0, %xmm1
+>         movdqa  %xmm0, %xmm2
+>         punpcklwd       %xmm1, %xmm2
+> 
+> and that would trivially extend to the required pattern - just the
+> input is v4hi instead of v8hi.
+> 
+> Other related patterns are probably missing as well, where we can do
+> vec_unpack[s]_lo we should be able to implement [zero_]extend.We have:
+
+(define_expand "<insn>v4hiv4si2"
+  [(set (match_operand:V4SI 0 "register_operand")
+	(any_extend:V4SI
+	  (match_operand:V4HI 1 "nonimmediate_operand")))]
+  "TARGET_SSE4_1"
+
+in sse.md, so the testcase should be vectorized using -msse4.1. Is there any other pattern missing for efficient vectorization?
+
+- User: Richard Biener | Time: 2023-08-17 06:46:42 UTC
+  Text: Huh, that escaped me.  I'll have to go back and compare where it derails compared to aarch64 with neon.
+
+- User: Uroš Bizjak | Time: 2023-08-18 09:58:10 UTC
+  Text: The idea of implementing some sign/zero extensions using PUNPCKL?? is quite interesting. We can implement extensions for all <= 64byte vector modes that extend to wider vector mode also for SSE2.
+
+I have a patch.
+
+- User: Uroš Bizjak | Time: 2023-08-18 09:59:36 UTC
+  Text: Createdattachment 55753[details]Proposed patch
+
+Patch that implements zero/sign extend of <= 64byte vector modes to a wider vector mode also for SSE2.
+
+- User: Richard Biener | Time: 2023-08-18 11:37:00 UTC
+  Text: So for gcc.dg/vect/pr65947-7.c the main difference is that aarch64 succeeds with
+
+t.c:12:21: note:  ***** Re-trying analysis with vector mode V4HI
+t.c:12:21: note:   === vect_analyze_data_refs ===
+t.c:12:21: note:   got vectype for stmt: aval_13 = *_3;
+vector(4) short int
+t.c:12:21: note:   got vectype for stmt: _7 = *_6;
+vector(4) int
+
+while x86_64 fails with both the default (V8HI) and V8QI
+
+t.c:12:21: note:   === vect_analyze_data_refs ===
+t.c:12:21: note:   got vectype for stmt: aval_13 = *_3;
+vector(8) short int
+t.c:12:21: note:   got vectype for stmt: _7 = *_6;
+vector(4) int
+...
+t.c:12:21: note:  ***** Re-trying analysis with vector mode V8QI
+t.c:12:21: note:   === vect_analyze_data_refs ===
+t.c:12:21: note:   got vectype for stmt: aval_13 = *_3;
+vector(4) short int
+t.c:12:21: note:   got vectype for stmt: _7 = *_6;
+vector(2) int
+
+that is, aarch64 is special here in that it somehow tries V4HI which ends
+up behaving differently than V8QI.  aarch64 also tries V2SI for the
+epilogue which yields
+
+t.c:12:21: note:   === vect_analyze_data_refs ===
+t.c:12:21: note:   got vectype for stmt: aval_13 = *_3;
+vector(4) short int 
+t.c:12:21: note:   got vectype for stmt: _7 = *_6;
+vector(2) int
+
+aarch64 also fails for V8HI (same default).
+
+The order for aarch64 is V8HI, V4HI ..., x86_64 tries V8HI, V8QI, V4QI.
+
+That V4HI yields V4SI as related mode is a "fluke"(?) of aarch64_vectorize_related_mode which has
+
+  /* Prefer to use 1 128-bit vector instead of 2 64-bit vectors.  */
+  if (TARGET_SIMD
+      && (vec_flags & VEC_ADVSIMD)
+      && known_eq (nunits, 0U)
+      && known_eq (GET_MODE_BITSIZE (vector_mode), 64U)
+      && maybe_ge (GET_MODE_BITSIZE (element_mode)
+                   * GET_MODE_NUNITS (vector_mode), 128U))
+    {
+      machine_mode res = aarch64_simd_container_mode (element_mode, 128);
+      if (VECTOR_MODE_P (res))
+        return res;
+    }
+
+which essentially "violates" the one-vector-size design of the loop
+vectorizer in these kind of special cases.
+
+So indeed x86 isn't going to vectorize this because of the inherent
+limitation of the vectorizer which chooses vector types too early.
+
+- User: GCC Commits | Time: 2023-08-18 17:08:36 UTC
+  Text: The master branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:4123b5609da53c8f8ac01c90aef127ad6375e9dfcommitr14-3327-g4123b5609da53c8f8ac01c90aef127ad6375e9dfAuthor: Uros Bizjak <ubizjak@gmail.com>
+Date:   Fri Aug 18 19:06:38 2023 +0200
+
+    i386: Use PUNPCKL?? to implement vector extend and zero_extend for TARGET_SSE2.
+    
+    Implement vector extend and zero_extend functionality for TARGET_SSE2 using
+    PUNPCKL?? family of instructions. The code for e.g. zero-extend from V2SI to
+    V2DImode improves from:
+    
+            movd    %xmm0, %edx
+            pshufd  $85, %xmm0, %xmm0
+            movd    %xmm0, %eax
+            movq    %rdx, (%rdi)
+            movq    %rax, 8(%rdi)
+    
+    to:
+            pxor    %xmm1, %xmm1
+            punpckldq       %xmm1, %xmm0
+            movaps  %xmm0, (%rdi)
+    
+    And the code for sign-extend from V2SI to V2DImode from:
+    
+            movd    %xmm0, %edx
+            pshufd  $85, %xmm0, %xmm0
+            movd    %xmm0, %eax
+            movslq  %edx, %rdx
+            cltq
+            movq    %rdx, (%rdi)
+            movq    %rax, 8(%rdi)
+    
+    to:
+            pxor    %xmm1, %xmm1
+            pcmpgtd %xmm0, %xmm1
+            punpckldq       %xmm1, %xmm0
+            movaps  %xmm0, (%rdi)PR target/111023gcc/ChangeLog:
+    
+            * config/i386/i386-expand.cc (ix86_split_mmx_punpck):
+            Also handle V2QImode.
+            (ix86_expand_sse_extend): New function.
+            * config/i386/i386-protos.h (ix86_expand_sse_extend): New prototype.
+            * config/i386/mmx.md (<any_extend:insn>v4qiv4hi2): Enable for
+            TARGET_SSE2.  Expand through ix86_expand_sse_extend for !TARGET_SSE4_1.
+            (<any_extend:insn>v2hiv2si2): Ditto.
+            (<any_extend:insn>v2qiv2hi2): Ditto.
+            * config/i386/sse.md (<any_extend:insn>v8qiv8hi2): Ditto.
+            (<any_extend:insn>v4hiv4si2): Ditto.
+            (<any_extend:insn>v2siv2di2): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr111023-2.c: New test.
+            * gcc.target/i386/pr111023-4b.c: New test.
+            * gcc.target/i386/pr111023-8b.c: New test.
+            * gcc.target/i386/pr111023.c: New test.
+
+- User: Uroš Bizjak | Time: 2023-08-21 07:26:41 UTC
+  Text: The target part is now implemented (even for SSE2).
+
+Should we keep this PR open as a tree-vectorizer enhancement?
+
+- User: Richard Biener | Time: 2023-08-21 09:25:27 UTC
+  Text: Let's close it, we very likely have a duplicate.
+

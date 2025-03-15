@@ -1,0 +1,373 @@
+Bug Summary: [13/14 Regression] Wrong code at -O3 on x86_64-linux-gnu since r13-455-g1fe04c497d
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Shaohua Li | Time: 2023-09-21 13:20:27 UTC
+  Text: gcc at -O3 produced the wrong code.
+
+Bisected tor13-455-g1fe04c497dCompiler explorer:https://godbolt.org/z/ozEaKa1rY$ cat a.c
+int printf(const char *, ...);
+int a, o;
+char b, f, i;
+long c;
+static signed char d;
+static char g;
+unsigned *h;
+signed char *e = &f;
+static signed char **j = &e;
+static long k[2];
+unsigned **l = &h;
+short m;
+int main(int q, char *r[]) {
+  int p = 0;
+  if (q == 0)
+    p = 1;
+  signed char *n = &d;
+  *n = 0;
+  for (; c;)
+    for (; i; i--)
+      ;
+  g = 0;
+  for (; g <= 1; g++) {
+    *n = **j;
+    k[g] = 0 != &m;
+    *e = l && k[0];
+  }
+  if (p)
+    printf(&b);
+  for (; o < 4; o++) {
+    a = d;
+    if (p)
+      printf(&b);
+  }
+  printf("%d\n", a);
+}
+$
+$ gcc -O2 a.c && ./a.out
+1
+$ gcc -O3 a.c && ./a.out
+0
+$
+
+- User: Andrew Pinski | Time: 2023-09-21 15:47:26 UTC
+  Text: Confirmed.
+
+- User: Roger Sayle | Time: 2023-10-09 22:05:50 UTC
+  Text: Complicated.  Things have gone wrong before the strlen pass which is given:
+
+  _73 = e;
+  _72 = *_73;
+...
+  *_73 = prephitmp_23;
+  d = _72;
+
+Here the assignment to *_73 overwrites the value of f (at *e) which then invalidates the use of _72 resulting in the wrong value for d.  But figuring out which pass is at fault (perhaps complete loop unrolling?) is tricky.
+
+- User: Richard Biener | Time: 2023-10-10 07:56:15 UTC
+  Text: g = 0;
+  for (; g <= 1; g++) {
+    *n = **j;
+    k[g] = 0 != &m;
+    *e = l && k[0];
+  }
+
+this is
+
+  g = 0;
+  d = f; // 0
+  k[0] = 1;
+  f = 1;
+  g = 1;
+  d = f; // 1
+  k[1] = 1;
+  f = 1;
+  g = 2;
+
+that looks still equivalent to what we have after unrolling this loop in cunroll
+and also after DOM3 which really points to strlen wrongly considering 'd' zero.
+Before strlen we have
+
+  <bb 7> [local count: 1605787]:
+  _2 = e;
+  _3 = *_2;
+  k[0] = 1;
+  l.8_91 = l;
+  if (l.8_91 != 0B)
+    goto <bb 8>; [70.00%]
+  else
+    goto <bb 9>; [30.00%]
+
+  <bb 8> [local count: 1124051]:
+
+  <bb 9> [local count: 1605787]:
+  # prephitmp_82 = PHI <0(7), 1(8)>
+  *_2 = prephitmp_82;
+  _7 = e;
+  _8 = *_7;
+  k[1] = 1;
+  l.8_10 = l;
+  if (l.8_10 != 0B)
+    goto <bb 10>; [70.00%]
+  else
+    goto <bb 11>; [30.00%]
+
+  <bb 10> [local count: 1124051]:
+
+  <bb 11> [local count: 14598063]:
+  # prephitmp_89 = PHI <1(10), 0(9)>
+  *_7 = prephitmp_89;
+  d = _8;
+  g = 2;
+  if (q_32(D) == 0)
+    goto <bb 12>; [33.00%]
+  else
+    goto <bb 18>; [67.00%]
+
+that's the OK part, now into the tail loop - q_32(D) is 1:
+
+  <bb 18> [local count: 9780702]:
+  o.16_80 = o;
+  if (o.16_80 <= 3)
+    goto <bb 13>; [89.00%]
+  else
+    goto <bb 17>; [11.00%]
+
+  <bb 13> [local count: 8704825]:
+  d_lsm0.28_35 = d;
+
+  <bb 14> [local count: 79134774]:
+  # prephitmp_6 = PHI <o.16_80(13), _85(14)>
+  _96 = (int) d_lsm0.28_35;
+  _85 = prephitmp_6 + 1;
+  if (_85 != 4)
+    goto <bb 14>; [89.00%]
+  else
+    goto <bb 16>; [11.00%]
+
+  <bb 16> [local count: 8704825]:
+  a = _96;
+  o = 4;
+
+  <bb 17> [local count: 14598063]:
+  a.17_23 = a;
+  printf ("%d\n", a.17_23);
+  return 0;
+
+and the strlen pass replaces d_lsm0.28_35 = d; with d_lsm0.28_35 = 0; which
+is wrong.
+
+Your assessment
+
+"Here the assignment to *_73 overwrites the value of f (at *e) which then invalidates the use of _72 resulting in the wrong value for d."
+
+seems odd, it's exactly writing the correct value (in fact both stores
+write the value one, only the very original value is zero).
+
+I don't know the strlen pass at all so I can't tell where it goes wrong.
+
+- User: Jakub Jelinek | Time: 2023-10-10 08:21:21 UTC
+  Text: Slightly cleaned up testcase:
+int a, o;
+char b, f, i;
+long c;
+static signed char d;
+static char g;
+unsigned *h;
+signed char *e = &f;
+static signed char **j = &e;
+static long k[2];
+unsigned **l = &h;
+short m;
+volatile int z;
+
+__attribute__((noipa)) void
+foo (char *p)
+{
+  (void) p;
+}
+
+int
+main ()
+{
+  int p = z;
+  signed char *n = &d;
+  *n = 0;
+  while (c)
+    for (; i; i--)
+      ;
+  for (g = 0; g <= 1; g++)
+    {
+      *n = **j;
+      k[g] = 0 != &m;
+      *e = l && k[0];
+    }
+  if (p)
+    foo (&b);
+  for (; o < 4; o++)
+    {
+      a = d;
+      if (p)
+	foo (&b);
+    }
+  if (a != 1)
+    __builtin_abort ();
+}
+
+- User: Richard Biener | Time: 2023-10-10 08:26:17 UTC
+  Text: Reverting
+
+@@ -5089,8 +5123,9 @@ strlen_pass::handle_store (bool *zero_write)
+          return false;
+        }
+ 
+-      if (storing_all_zeros_p
+-         || storing_nonzero_p
++      if (storing_nonzero_p
++         || storing_all_zeros_p
++         || (full_string_p && lenrange[1] == 0)
+          || (offset != 0 && store_before_nul[1] > 0))
+        {
+          /* When STORING_NONZERO_P, we know that the string will start
+
+fixes the issue.  We somehow compute a lenrange of { 0, 0, 1 } for
+d = _8 but also set storing_all_zeros_p to false.
+
+It seems that strlen_pass::count_nonzero_bytes happily skips intermediate
+stores when it handles SSA names here:
+
+      gimple *stmt = SSA_NAME_DEF_STMT (exp);
+      if (gimple_assign_single_p (stmt))
+        {
+          exp = gimple_assign_rhs1 (stmt);
+          if (!DECL_P (exp)
+              && TREE_CODE (exp) != CONSTRUCTOR
+              && TREE_CODE (exp) != MEM_REF)
+            return false;
+          /* Handle DECLs, CONSTRUCTOR and MEM_REF below.  */
+
+we have
+
+    _8 = *_7;
+...
+    *_7 = prephitmp_89;
+    d = _8;
+
+when we recursively process a memory reference we need to verify there
+are no intermediate aliases, the simplest thing would be to pass down
+a virtual use.  Trying some prototype.
+
+- User: Richard Biener | Time: 2023-10-10 08:31:56 UTC
+  Text: Createdattachment 56089[details]patch
+
+This patch (against the 13 branch) fixes the bug but it might be a bit conservative since some entries (the _addr one for example) may not have
+a live virtual use.  Maybe getting the relevant one from up the call chain
+is better.
+
+I'm going to throw this at testing but expect some testsuite fallout because
+of this conservativeness.
+
+- User: Richard Biener | Time: 2023-10-10 08:33:08 UTC
+  Text: I'll note the problem appears to be latent for longer.
+
+- User: Richard Biener | Time: 2023-10-10 10:37:34 UTC
+  Text: (In reply to Richard Biener fromcomment #6)> Createdattachment 56089[details]> patch
+> 
+> This patch (against the 13 branch) fixes the bug but it might be a bit
+> conservative since some entries (the _addr one for example) may not have
+> a live virtual use.  Maybe getting the relevant one from up the call chain
+> is better.
+> 
+> I'm going to throw this at testing but expect some testsuite fallout because
+> of this conservativeness.It causes
+
+FAIL: gcc.dg/Wstringop-overflow-69.c  (test for warnings, line 60)
+FAIL: gcc.dg/Wstringop-overflow-69.c  (test for warnings, line 62)
+
+the testcase has
+
+  *(VC4*)a2 = c4;       // { dg-warning "writing 4 bytes into a region of size 2" }
+  *(VC4*)a3 = c4;       // { dg-warning "writing 4 bytes into a region of size 3" }
+  *(VC8*)a4 = c8;       // { dg-warning "writing 8 bytes into a region of size 4" }
+  *(VC8*)a7 = c8;       // { dg-warning "writing 8 bytes into a region of size 7" }
+
+and the later of the two assignments from c4 and c8 fail to be diagnosed
+as their load is CSEd to a definition before the earlier of the two
+assignments.  Which means the fix is working, not sure if we want to beef
+it up with an alias walk, that definitely would require careful looking
+as to what random trees we feed into this kitchen-sink routine.
+
+I'm inclined to XFAIL the sub-test, at least on branches, and only maybe
+fix it on trunk (well, not myself actually).
+
+- User: GCC Commits | Time: 2023-10-11 07:09:35 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:e75bf1985fdc9a5d3a307882a9251d8fd6e93defcommitr14-4552-ge75bf1985fdc9a5d3a307882a9251d8fd6e93defAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Oct 11 08:58:29 2023 +0200
+
+    tree-ssa-strlen: optimization skips clobbering store [PR111519]
+    
+    The following testcase is miscompiled, because count_nonzero_bytes incorrectly
+    uses get_strinfo information on a pointer from which an earlier instruction
+    loads SSA_NAME stored at the current instruction.  get_strinfo shows a state
+    right before the current store though, so if there are some stores in between
+    the current store and the load, the string length information might have
+    changed.
+    
+    The patch passes around gimple_vuse from the store and punts instead of using
+    strinfo on loads from MEM_REF which have different gimple_vuse from that.
+    
+    2023-10-11  Richard Biener  <rguenther@suse.de>
+                Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/111519* tree-ssa-strlen.cc (strlen_pass::count_nonzero_bytes): Add vuse
+            argument and pass it through to recursive calls and
+            count_nonzero_bytes_addr calls.  Don't shadow the stmt argument, but
+            change stmt for gimple_assign_single_p statements for which we don't
+            immediately punt.
+            (strlen_pass::count_nonzero_bytes_addr): Add vuse argument and pass
+            it through to recursive calls and count_nonzero_bytes calls.  Don't
+            use get_strinfo if gimple_vuse (stmt) is different from vuse.  Don't
+            shadow the stmt argument.
+    
+            * gcc.dg/torture/pr111519.c: New testcase.
+
+- User: GCC Commits | Time: 2023-10-11 07:23:46 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:16a4df27436c8f594a784028591dd3e47cabe5c0commitr13-7944-g16a4df27436c8f594a784028591dd3e47cabe5c0Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Oct 11 08:58:29 2023 +0200
+
+    tree-ssa-strlen: optimization skips clobbering store [PR111519]
+    
+    The following testcase is miscompiled, because count_nonzero_bytes incorrectly
+    uses get_strinfo information on a pointer from which an earlier instruction
+    loads SSA_NAME stored at the current instruction.  get_strinfo shows a state
+    right before the current store though, so if there are some stores in between
+    the current store and the load, the string length information might have
+    changed.
+    
+    The patch passes around gimple_vuse from the store and punts instead of using
+    strinfo on loads from MEM_REF which have different gimple_vuse from that.
+    
+    2023-10-11  Richard Biener  <rguenther@suse.de>
+                Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/111519* tree-ssa-strlen.cc (strlen_pass::count_nonzero_bytes): Add vuse
+            argument and pass it through to recursive calls and
+            count_nonzero_bytes_addr calls.  Don't shadow the stmt argument, but
+            change stmt for gimple_assign_single_p statements for which we don't
+            immediately punt.
+            (strlen_pass::count_nonzero_bytes_addr): Add vuse argument and pass
+            it through to recursive calls and count_nonzero_bytes calls.  Don't
+            use get_strinfo if gimple_vuse (stmt) is different from vuse.  Don't
+            shadow the stmt argument.
+    
+            * gcc.dg/torture/pr111519.c: New testcase.
+    
+    (cherry picked from commit e75bf1985fdc9a5d3a307882a9251d8fd6e93def)
+
+- User: Jakub Jelinek | Time: 2023-10-11 07:24:16 UTC
+  Text: Should be fixed now.
+
+- User: Andrew Pinski | Time: 2023-11-02 09:05:47 UTC
+  Text: ***Bug 112346has been marked as a duplicate of this bug. ***
+

@@ -1,0 +1,95 @@
+Bug Summary: Vect: the epilog vect loop should have small VF if the loop is unrolled during vectorization
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Hao Liu | Time: 2023-06-29 04:35:23 UTC
+  Text: Hi, I'm trying to use tune loop unrolling during vectorization (see more: tree-vect-loop.cc suggested_unroll_factor). I find the unrolling may hurt performance as unrolling also increases the VF (vector factor) of epilog vect loop.
+
+For example:
+int foo(short *A, char *B, int N) {
+    int sum = 0;
+    for (int i = 0; i < N; ++i) {
+        sum += A[i] * B[i];
+    }
+    return sum;
+}
+
+
+Compile it with "-O3 -mtune=neoverse-n2 -mcpu=neoverse-n1 --param aarch64-vect-unroll-limit=2" (I'm using -mcpu n1 as I want to try a target without SVE). GCC vectorization pass unrolls the loop by 2 and generates code as following:
+
+if N >= 32:
+    main vect loop ...
+
+if N >= 16:   # This may hurt performance if N is small (e.g. 8)
+    epilog vect loop ...
+
+epilog scalar code ...
+
+
+If the loop is not unrolled (i.e. use "--param aarch64-vect-unroll-limit=1"). GCC generates code as following:
+
+if N >= 16:
+    main vect loop ...
+
+if N >= 8:
+    epilog vect loop ...
+
+epilog scalar code ...
+
+
+The runtime check is based on the VF of epilog vectorization. There is code in tree-vect-loop.cc (line 2990) to choose epilog vect VF:
+  /* If we're vectorizing an epilogue loop, the vectorized loop either needs
+     to be able to handle fewer than VF scalars, or needs to have a lower VF
+     than the main loop.  */
+  if (LOOP_VINFO_EPILOGUE_P (loop_vinfo)
+      && !LOOP_VINFO_CAN_USE_PARTIAL_VECTORS_P (loop_vinfo)
+      && maybe_ge (LOOP_VINFO_VECT_FACTOR (loop_vinfo),
+		   LOOP_VINFO_VECT_FACTOR (orig_loop_vinfo)))
+    return opt_result::failure_at (vect_location,
+				   "Vectorization factor too high for"
+				   " epilogue loop.\n");
+
+But it doesn't consider about the suggested_unroll_factor. So I'm thinking about adding following code to unscale the orig_loop_vinfo's VF by unroll_factor:
+      unscaled_orig_vf = exact_div (LOOP_VINFO_VECT_FACTOR (orig_loop_vinfo), orig_loop_vinfo->suggested_unroll_factor);
+
+Is this reasonable?
+
+- User: Richard Biener | Time: 2023-06-29 07:33:24 UTC
+  Text: I think it's reasonable to not apply unrolling to the vectorized epilogue, but note we have to be careful to adjust the maximum number of iterations for it we compute.  Note this will also necessarily make the vectorized epilogue iterate.
+
+We could also leave the decision to the target, providing a suggested_epilog_"unroll" factor.  That could also be used to for example
+get a 128bit vector epilogue for a 512bit main loop to address similar
+concerns there.
+
+- User: GCC Commits | Time: 2023-07-06 02:07:29 UTC
+  Text: The master branch has been updated by Hao Liu <hliu@gcc.gnu.org>:https://gcc.gnu.org/g:7339e725b995912747c01c3ec80ce602512f45dfcommitr14-2335-g7339e725b995912747c01c3ec80ce602512f45dfAuthor: Hao Liu <hliu@os.amperecomputing.com>
+Date:   Thu Jul 6 10:03:47 2023 +0800
+
+    tree-optimization/110474 - Vect: select small VF for epilog of unrolled loop
+    
+    If a loop is unrolled during vectorization (i.e. suggested_unroll_factor > 1),
+    the VFs of both main and epilog loop are enlarged.  The epilog vect loop is
+    specific for a loop with small iteration counts, so a large VF may hurt
+    performance.
+    
+    This patch unscales the main loop VF by suggested_unroll_factor while selecting
+    the epilog loop VF, so that it will be the same as vectorized loop without
+    unrolling (i.e. suggested_unroll_factor = 1).
+    
+    gcc/ChangeLog:PR tree-optimization/110474* tree-vect-loop.cc (vect_analyze_loop_2): unscale the VF by suggested
+            unroll factor while selecting the epilog vect loop VF.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/pr110474.c: New testcase.
+
+- User: Hao Liu | Time: 2023-07-06 02:21:00 UTC
+  Text: It's better to have a suggested_epilog_"unroll" factor or support multiple
+epilogues.  But need a lot of work.  Let's support the simple patch firstly.
+

@@ -1,0 +1,819 @@
+Bug Summary: [11 regression] Stack objects with extended alignments (vectors etc) misaligned on detect_stack_use_after_return
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 7.5.0
+Known to Fail: 14.0
+
+Comments:
+- User: Samuel Neves | Time: 2023-05-29 20:18:55 UTC
+  Text: (As reported by Jack O'Connor, along with reproducibility instructions, athttps://gist.github.com/oconnor663/69176654f1db1bb96077d6ff4141a022)
+
+Given the following snippet,
+
+  #include <immintrin.h>
+
+  int main() {
+    __m512i v = _mm512_set1_epi32(0);
+    // It doesn't really matter what we do next, as long as we convince the
+    // compiler to put v on the stack. Here we just read an int from it.
+    return *((int *)&v);
+  }
+
+compiled with `gcc repro.c -g -mavx512f -fsanitize=address` results in a segfault due to a misaligned AVX-512 store. The assembly output is visible athttps://gist.github.com/oconnor663/69176654f1db1bb96077d6ff4141a022#file-repro-s. Specifically, we have the relevant sequence
+
+  andq	$-64, %rsp
+  subq	$192, %rsp
+  leaq	32(%rsp), %rbx
+  ...
+  cmpl	$0, __asan_option_detect_stack_use_after_return(%rip)
+  je	.L1
+  ...
+  call	__asan_stack_malloc_1@PLT
+  ...
+  movq	%rax, %rbx
+  ...
+.L1:
+  leaq	160(%rbx), %rax
+  movq	%rax, %rcx
+  ...
+  vmovdqa64	%zmm0, -128(%rcx)
+
+Now, if `__asan_option_detect_stack_use_after_return` is 0, the variable at %rcx-128 is correctly aligned to 64. However, if it is 1, __asan_stack_malloc_1 returns something aligned to 64 << 1 (as perhttps://github.com/gcc-mirror/gcc/blob/master/gcc/asan.cc#L1917) and adding 160 results in %rcx-128 being only aligned to 32. And thus the segfault.
+
+Interestingly this seems to be only reproducible on Arch Linux. Other gcc 13.1.1 builds, Fedora for instance, seem to behave correctly. It is unclear to me what the reason for this is.
+
+- User: Andrew Pinski | Time: 2023-05-29 20:54:17 UTC
+  Text: (In reply to Samuel Neves fromcomment #0)> Interestingly this seems to be only reproducible on Arch Linux. Other gcc
+> 13.1.1 builds, Fedora for instance, seem to behave correctly. It is unclear
+> to me what the reason for this is.So I figured out where the difference comes from: -fstack-protector-strong .
+That is Arch linux defaults to enabling -fstack-protector-strong while Fedora does not.
+
+apinski@xeond:~/src/upstream-gcc$ ~/upstream-gcc/bin/gcc t.c  -mavx512f -fsanitize=address  -g
+apinski@xeond:~/src/upstream-gcc$ LD_LIBRARY_PATH=~/upstream-gcc/lib64 ./a.out ;echo $?
+0
+
+
+apinski@xeond:~/src/upstream-gcc$ ~/upstream-gcc/bin/gcc t.c  -mavx512f -fsanitize=address  -g  -fstack-protector-strong
+apinski@xeond:~/src/upstream-gcc$ LD_LIBRARY_PATH=~/upstream-gcc/lib64 ./a.out ;echo $?
+AddressSanitizer:DEADLYSIGNAL
+=================================================================
+==22803==ERROR: AddressSanitizer: SEGV on unknown address (pc 0x000000400929 bp 0x7fff1989a900 sp 0x7fff1989a800 T0)
+==22803==The signal is caused by a READ memory access.
+==22803==Hint: this fault was caused by a dereference of a high value address (see register values below).  Disassemble the provided pc to learn which register was used.
+    #0 0x400929 in main /home/apinski/src/upstream-gcc/t.c:5
+    #1 0x7ff88bf72c86 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x21c86) (BuildId: f7307432a8b162377e77a182b6cc2e53d771ec4b)
+    #2 0x400769 in _start (/bajas/pinskia/src/upstream-gcc/a.out+0x400769)
+
+AddressSanitizer can not provide additional info.
+SUMMARY: AddressSanitizer: SEGV /home/apinski/src/upstream-gcc/t.c:5 in main
+==22803==ABORTING
+1
+
+- User: Richard Biener | Time: 2023-05-30 08:06:00 UTC
+  Text: I can't reproduce it.
+
+- User: Jack O'Connor | Time: 2023-05-30 14:49:52 UTC
+  Text: Thanks to Andrew Pinski's comment about -fstack-protector-strong, I can now reproduce this issue on Godbolt:https://godbolt.org/z/47a695sWY. So the minimal set of flags to reproduce on most distros (other than Arch Linux) is: -mavx512f -fsanitize=address -fstack-protector-strong
+
+- User: Christoph Erhardt | Time: 2023-10-22 18:06:51 UTC
+  Text: Createdattachment 56169[details]Reproducer program
+
+Here's a program that can reproduce this issue more reliably - tested on Fedora 38, Ubuntu 23.04 and Ubuntu 23.10.
+
+I have stripped down the code as far as possible. This is how far I could get without losing reproducibility.
+Sources are in a GitHub repo:https://github.com/sicherha/gcc-asan-stack-misalign$ gcc -Wall -Wextra -g -Og -fsanitize=address -fno-stack-protector -mavx512f a-repro.i 
+$ ./a.out 
+AddressSanitizer:DEADLYSIGNAL
+=================================================================
+==3618==ERROR: AddressSanitizer: SEGV on unknown address (pc 0x000000401789 bp 0x7ffeabbcda00 sp 0x7ffeabbcd580 T0)
+==3618==The signal is caused by a READ memory access.
+==3618==Hint: this fault was caused by a dereference of a high value address (see register values below).  Disassemble the provided pc to learn which register was used.
+    #0 0x401789 in blake3_compress_subtree_wide /home/ul26967/Projects/gcc-asan-stack-misalign/a-repro.i:481
+    #1 0x40189b in main /home/ul26967/Projects/gcc-asan-stack-misalign/a-repro.i:488
+    #2 0x7f77a0210b89 in __libc_start_call_main (/lib64/libc.so.6+0x27b89) (BuildId: 3ebe8d97a0ed3e1f13476a02665c5a9442adcd78)
+    #3 0x7f77a0210c4a in __libc_start_main_alias_2 (/lib64/libc.so.6+0x27c4a) (BuildId: 3ebe8d97a0ed3e1f13476a02665c5a9442adcd78)
+    #4 0x4010f4 in _start (/home/ul26967/Projects/gcc-asan-stack-misalign/a.out+0x4010f4) (BuildId: e25b3ac48fa6dd8cff5d228e201834fa1b0cd18a)
+
+AddressSanitizer can not provide additional info.
+SUMMARY: AddressSanitizer: SEGV /home/ul26967/Projects/gcc-asan-stack-misalign/a-repro.i:481 in blake3_compress_subtree_wide
+==3618==ABORTING
+
+- User: Andrew Pinski | Time: 2023-12-01 17:42:07 UTC
+  Text: ***Bug 112812has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-12-01 17:46:10 UTC
+  Text: ***Bug 112510has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-12-17 23:24:25 UTC
+  Text: ***Bug 113053has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2024-03-08 04:13:59 UTC
+  Text: ***Bug 114276has been marked as a duplicate of this bug. ***
+
+- User: Chris Elrod | Time: 2024-03-08 11:41:29 UTC
+  Text: > Interestingly this seems to be only reproducible on Arch Linux. Other gcc 13.1.1 builds, Fedora for instance, seem to behave correctly.I haven't tried that reproducer on Fedora with gcc 13.2.1, which could have regressed since 13.1.1.
+However, the dup example inhttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=114276does reproduce on Fedora with gcc-13.2.1 once you add extra compile flags `-std=c++23 -fstack-protector-strong`.
+I'll try the original reproducer later, it may be the case that adding/removing these flags fuzzes the alignment.
+
+- User: Christoph Erhardt | Time: 2024-03-08 18:10:54 UTC
+  Text: I have just verified that the reproducer program I attached above (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=110027#c4) still crashes as expected on Fedora 39 with GCC 13.2.1. It's not super-tiny, but it fails reliably. :-)
+
+- User: Sam James | Time: 2024-03-08 18:52:09 UTC
+  Text: Calling it a 11..14 regression as we know 14 is bad and 7.5 is OK, but I can't test 11/12 on an avx512 machine right now.
+
+- User: Hongtao Liu | Time: 2024-03-11 03:28:44 UTC
+  Text: (In reply to Sam James fromcomment #11)> Calling it a 11..14 regression as we know 14 is bad and 7.5 is OK, but I
+> can't test 11/12 on an avx512 machine right now.I can't reproduce that with 11/12, but with gcc13 for the case inPR114276.
+
+It looks like the codegen is already wrong in .expand, the offensive part is mentioned in #c0>Now, if `__asan_option_detect_stack_use_after_return` is 0, the variable at >%rcx-128 is correctly aligned to 64. However, if it is 1, __asan_stack_malloc_1 >returns something aligned to 64 << 1 (as perhttps://github.com/gcc->mirror/gcc/blob/master/gcc/asan.cc#L1917) and adding 160 results in %rcx-128 >being only aligned to 32. And thus the segfault.;; Function foo (_Z3foov, funcdef_no=14, decl_uid=3962, cgraph_uid=10, symbol_order=9)
+
+(note 1 0 37 NOTE_INSN_DELETED)
+;; basic block 2, loop depth 0, maybe hot
+;;  prev block 0, next block 3, flags: (NEW, REACHABLE, RTL, MODIFIED)
+;;  pred:       ENTRY (FALLTHRU)
+(note 37 1 2 2 [bb 2] NOTE_INSN_BASIC_BLOCK)
+(insn 2 37 3 2 (parallel [
+            (set (reg:DI 105)
+                (plus:DI (reg/f:DI 19 frame)
+                    (const_int -160 [0xffffffffffffff60])))
+            (clobber (reg:CC 17 flags))
+        ]) "test1.cc":7:12 247 {*adddi_1}
+     (nil))
+(insn 3 2 4 2 (set (reg:DI 106)
+        (reg:DI 105)) "test1.cc":7:12 82 {*movdi_internal}
+     (nil))
+(insn 4 3 5 2 (set (reg:CCZ 17 flags)
+        (compare:CCZ (mem/c:SI (symbol_ref:DI ("__asan_option_detect_stack_use_after_return") [flags 0x40]  <var_decl 0x7f8d26f37900 __asan_option_detect_stack_use_after_return>) [4 __asan_option_detect_stack_use_after_return+0 S4 A32])
+            (const_int 0 [0]))) "test1.cc":7:12 7 {*cmpsi_ccno_1}
+     (nil))
+(jump_insn 5 4 93 2 (set (pc)
+        (if_then_else (eq (reg:CCZ 17 flags)
+                (const_int 0 [0]))
+            (label_ref 11)
+            (pc))) "test1.cc":7:12 995 {*jcc}
+     (nil)
+ -> 11)
+;;  succ:       5
+;;              3 (FALLTHRU)
+
+;; basic block 3, loop depth 0, maybe hot
+;;  prev block 2, next block 4, flags: (NEW, REACHABLE, RTL, MODIFIED)
+;;  pred:       2 (FALLTHRU)
+(note 93 5 6 3 [bb 3] NOTE_INSN_BASIC_BLOCK)
+(insn 6 93 7 3 (set (reg:DI 5 di)
+        (const_int 128 [0x80])) "test1.cc":7:12 82 {*movdi_internal}
+     (nil))
+(call_insn 7 6 8 3 (set (reg:DI 0 ax)
+        (call (mem:QI (symbol_ref:DI ("__asan_stack_malloc_1") [flags 0x41]  <function_decl 0x7f8d26fa2400 __asan_stack_malloc_1>) [0  S1 A8])
+            (const_int 0 [0]))) "test1.cc":7:12 1013 {*call_value}
+     (expr_list:REG_EH_REGION (const_int -2147483648 [0xffffffff80000000])
+        (nil))
+    (expr_list (use (reg:DI 5 di))
+        (nil)))
+(insn 8 7 9 3 (set (reg:CCZ 17 flags)
+        (compare:CCZ (reg:DI 0 ax)
+            (const_int 0 [0]))) "test1.cc":7:12 8 {*cmpdi_ccno_1}
+     (nil))
+(jump_insn 9 8 94 3 (set (pc)
+        (if_then_else (eq (reg:CCZ 17 flags)
+                (const_int 0 [0]))
+            (label_ref 11)
+            (pc))) "test1.cc":7:12 995 {*jcc}
+     (nil)
+ -> 11)
+;;  succ:       5
+;;              4 (FALLTHRU)
+;; basic block 4, loop depth 0, maybe hot
+;;  prev block 3, next block 5, flags: (NEW, REACHABLE, RTL, MODIFIED)
+;;  pred:       3 (FALLTHRU)
+(note 94 9 10 4 [bb 4] NOTE_INSN_BASIC_BLOCK)
+(insn 10 94 11 4 (set (reg:DI 105)
+        (reg:DI 0 ax)) "test1.cc":7:12 82 {*movdi_internal}
+     (nil))
+;;  succ:       5 (FALLTHRU)
+
+- User: Hongtao Liu | Time: 2024-03-12 05:10:55 UTC
+  Text: So the stack is like
+
+----------- stack top
+  
+-32
+
+--------- (offset -32)
+
+-64 (32 bytes redzone)
+
+--------- (offset -64)
+
+-128 (64 bytes __m512)
+
+-------- (offset -128)
+
+ (32-bytes redzone)
+
+-------(offset -160)   <--- __asan_stack_malloc_128 try to allocate an buffer 
+
+
+  /* Emit the prologue sequence.  */
+  if (asan_frame_size > 32 && asan_frame_size <= 65536 && pbase
+      && param_asan_use_after_return)
+    {
+      use_after_return_class = floor_log2 (asan_frame_size - 1) - 5;
+      /* __asan_stack_malloc_N guarantees alignment
+	 N < 6 ? (64 << N) : 4096 bytes.  */
+      if (alignb > (use_after_return_class < 6
+		    ? (64U << use_after_return_class) : 4096U))
+	use_after_return_class = -1;
+      else if (alignb > ASAN_RED_ZONE_SIZE && (asan_frame_size & (alignb - 1)))
+	base_align_bias = ((asan_frame_size + alignb - 1)
+			   & ~(alignb - HOST_WIDE_INT_1)) - asan_frame_size;
+    }
+
+  /* Align base if target is STRICT_ALIGNMENT.  */
+  if (STRICT_ALIGNMENT)
+    {
+      const HOST_WIDE_INT align
+	= (GET_MODE_ALIGNMENT (SImode) / BITS_PER_UNIT) << ASAN_SHADOW_SHIFT;
+      base = expand_binop (Pmode, and_optab, base, gen_int_mode (-align, Pmode),
+			   NULL_RTX, 1, OPTAB_DIRECT);
+    }
+
+  if (use_after_return_class == -1 && pbase)
+    emit_move_insn (pbase, base);
+
+  base = expand_binop (Pmode, add_optab, base,
+		       gen_int_mode (base_offset - base_align_bias, Pmode),
+		       NULL_RTX, 1, OPTAB_DIRECT); ---------- suspicious add
+
+  orig_base = NULL_RTX;
+  if (use_after_return_class != -1)
+    {
+      ...
+      ret = emit_library_call_value (ret, NULL_RTX, LCT_NORMAL, ptr_mode,
+				     GEN_INT (asan_frame_size
+					      + base_align_bias),
+				     TYPE_MODE (pointer_sized_int_node));
+      /* __asan_stack_malloc_[n] returns a pointer to fake stack if succeeded
+	 and NULL otherwise.  Check RET value is NULL here and jump over the
+	 BASE reassignment in this case.  Otherwise, reassign BASE to RET.  */
+      emit_cmp_and_jump_insns (ret, const0_rtx, EQ, NULL_RTX,
+			       VOIDmode, 0, lab,
+			       profile_probability:: very_unlikely ());
+      ret = convert_memory_address (Pmode, ret);
+      emit_move_insn (base, ret);
+      emit_label (lab);
+      emit_move_insn (pbase, expand_binop (Pmode, add_optab, base,
+					   gen_int_mode (base_align_bias
+							 - base_offset, Pmode),
+					   NULL_RTX, 1, OPTAB_DIRECT));
+
+
+base_align_bias is calculated to make (asan_frame_size(128) + base_align_bias(0)) be multiple of alignb (64),  but didn't make `base_offset (160) - base_align_bias (0)` be multiple of 64, so when __asan_stack_malloc_128 return an address aligned to 64, and then plus (base_offset (160) - base_align_bias (0)), it's misaligned.
+
+- User: Hongtao Liu | Time: 2024-03-12 06:35:18 UTC
+  Text: diff --git a/gcc/cfgexpand.cc b/gcc/cfgexpand.cc
+index 0de299c62e3..92062378d8e 100644
+--- a/gcc/cfgexpand.cc
++++ b/gcc/cfgexpand.cc
+@@ -1214,7 +1214,7 @@ expand_stack_vars (bool (*pred) (size_t), class stack_vars_data *data)
+            {
+              if (data->asan_vec.is_empty ())
+                {
+-                 align_frame_offset (ASAN_RED_ZONE_SIZE);
++                 align_frame_offset (MAX (alignb, ASAN_RED_ZONE_SIZE));
+                  prev_offset = frame_offset.to_constant ();
+                }
+              prev_offset = align_base (prev_offset,
+
+
+This can fix the issue, but not sure if it's the correct way.
+
+- User: Hongtao Liu | Time: 2024-03-15 01:51:42 UTC
+  Text: A patch is posted athttps://gcc.gnu.org/pipermail/gcc-patches/2024-March/647604.html
+
+- User: Xi Ruoyao | Time: 2024-04-08 15:43:35 UTC
+  Text: ***Bug 114637has been marked as a duplicate of this bug. ***
+
+- User: Jakub Jelinek | Time: 2024-04-09 18:25:11 UTC
+  Text: Both of the posted patches are incorrect, this needs to be fixed in asan_emit_stack_protection, account for the different offsets[0] which happens when a stack pointer guard is created.
+I'll deal with it tomorrow.
+
+- User: Jakub Jelinek | Time: 2024-04-10 10:25:02 UTC
+  Text: Createdattachment 57915[details]gcc14-pr110027.patch
+
+So far lightly tested patch (make check-gcc check-g++ RUNTESTFLAGS=asan.exp on x86_64-linux and i686-linux).
+
+- User: Hongtao Liu | Time: 2024-04-11 06:53:30 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #17)> Both of the posted patches are incorrect, this needs to be fixed in
+> asan_emit_stack_protection, account for the different offsets[0] which
+> happens when a stack pointer guard is created.
+> I'll deal with it tomorrow.It seems to me that the only offend place is where I've modifed, are there other places where align_frame_offset (ASAN_RED_ZONE_SIZE) is also added?
+
+Also, your patch adds a gcc_assert for offset[0], which seems to me there was an assumption that offset[0] should be a multiple of alignb, thus making my patch more reasonable?
+
+- User: Jakub Jelinek | Time: 2024-04-11 08:16:35 UTC
+  Text: (In reply to Hongtao Liu fromcomment #19)> (In reply to Jakub Jelinek fromcomment #17)
+> > Both of the posted patches are incorrect, this needs to be fixed in
+> > asan_emit_stack_protection, account for the different offsets[0] which
+> > happens when a stack pointer guard is created.
+> > I'll deal with it tomorrow.
+> 
+> It seems to me that the only offend place is where I've modifed, are there
+> other places where align_frame_offset (ASAN_RED_ZONE_SIZE) is also added?
+> 
+> Also, your patch adds a gcc_assert for offset[0], which seems to me there
+> was an assumption that offset[0] should be a multiple of alignb, thus making
+> my patch more reasonable?Your first patch aligned offsets[0] to maximum of alignb and ASAN_RED_ZONE_SIZE.
+But as I wrote in the reply to that mail, alignb there is the alignment of just a single variable which is the first one to appear in the sorted list and is placed in the highest spot in the stack frame.
+That is not necessarily the largest alignment, the sorting ensures that it is a variable with the largest size in the frame (and only if several of them have equal size, largest alignment from the same sized ones).
+Your second patch used maximum of BIGGEST_ALIGNMENT / BITS_PER_UNIT and ASAN_RED_ZONE_SIZE.  That doesn't change anything at all when using -mno-avx512f - offsets[0] is still just 32-byte aligned in that case relative to top of frame, just changes the -mavx512f case to be 64-byte aligned offsets[0] (aka offsets[0] is then either 0 or -64 instead of either 0 or -32).  That will not help if any variable in the frame needs 128-byte, 256-byte, 512-byte ... 4096-byte alignment.
+If you want to fix the bug in the spot you've touched, you'd need to walk all the
+stack_vars[stack_vars_sorted[si2]] for si2 [si + 1, n - 1] and for those where the
+loop would do anything (i.e.
+stack_vars[i2].representative == i2
+&& TREE_CODE (decl2) == SSA_NAME
+   ? SA.partition_to_pseudo[var_to_partition (SA.map, decl2)] == NULL_RTX
+   : DECL_RTL (decl2) == pc_rtx
+and the pred applies (but that means also walking the earlier ones! because with -fstack-protector* the vars can be processed in several calls) and
+alignb2 * BITS_PER_UNIT <= MAX_SUPPORTED_STACK_ALIGNMENT
+and compute maximum of those alignments.
+That maximum is already computed,
+data->asan_alignb = MAX (data->asan_alignb, alignb);
+computes that, but you get the final result only after you do all the expand_stack_vars
+calls.  You'd need to compute it before.
+
+Though, that change would be still in the wrong place.
+The thing is, it would be a waste of the precious stack space when it isn't needed at all (e.g. when asan will not at compile time do the use after return checking, or if it won't do it at runtime, or even if it will do at runtime it will waste the space on the stack).
+My patch enlarges if needed just the __asan_stack_malloc_N allocated chunk, not the stack frame size.
+
+- User: GCC Commits | Time: 2024-04-11 09:14:40 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:467898d513e602f5b5fc4183052217d7e6d6e8abcommitr14-9913-g467898d513e602f5b5fc4183052217d7e6d6e8abAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Apr 11 11:12:11 2024 +0200
+
+    asan, v3: Fix up handling of > 32 byte aligned variables with -fsanitize=address -fstack-protector* [PR110027]
+    
+    On Tue, Mar 26, 2024 at 02:08:02PM +0800, liuhongt wrote:
+    > > > So, try to add some other variable with larger size and smaller alignment
+    > > > to the frame (and make sure it isn't optimized away).
+    > > >
+    > > > alignb above is the alignment of the first partition's var, if
+    > > > align_frame_offset really needs to depend on the var alignment, it probably
+    > > > should be the maximum alignment of all the vars with alignment
+    > > > alignb * BITS_PER_UNIT <=3D MAX_SUPPORTED_STACK_ALIGNMENT
+    > > >
+    >
+    > In asan_emit_stack_protection, when it allocated fake stack, it assume
+    > bottom of stack is also aligned to alignb. And the place violated this
+    > is the first var partition. which is 32 bytes offsets,  it should be
+    > BIGGEST_ALIGNMENT / BITS_PER_UNIT.
+    > So I think we need to use MAX (BIGGEST_ALIGNMENT /
+    > BITS_PER_UNIT, ASAN_RED_ZONE_SIZE) for the first var partition.
+    
+    Your first patch aligned offsets[0] to maximum of alignb and
+    ASAN_RED_ZONE_SIZE.  But as I wrote in the reply to that mail, alignb there
+    is the alignment of just a single variable which is the first one to appear
+    in the sorted list and is placed in the highest spot in the stack frame.
+    That is not necessarily the largest alignment, the sorting ensures that it
+    is a variable with the largest size in the frame (and only if several of
+    them have equal size, largest alignment from the same sized ones).  Your
+    second patch used maximum of BIGGEST_ALIGNMENT / BITS_PER_UNIT and
+    ASAN_RED_ZONE_SIZE.  That doesn't change anything at all when using
+    -mno-avx512f - offsets[0] is still just 32-byte aligned in that case
+    relative to top of frame, just changes the -mavx512f case to be 64-byte
+    aligned offsets[0] (aka offsets[0] is then either 0 or -64 instead of either
+    0 or -32).  That will not help if any variable in the frame needs 128-byte,
+    256-byte, 512-byte ...  4096-byte alignment.  If you want to fix the bug in
+    the spot you've touched, you'd need to walk all the
+    stack_vars[stack_vars_sorted[si2]] for si2 [si + 1, n - 1] and for those
+    where the loop would do anything (i.e.
+    stack_vars[i2].representative == i2
+    && TREE_CODE (decl2) == SSA_NAME
+       ? SA.partition_to_pseudo[var_to_partition (SA.map, decl2)] == NULL_RTX
+       : DECL_RTL (decl2) == pc_rtx
+    and the pred applies (but that means also walking the earlier ones!
+    because with -fstack-protector* the vars can be processed in several calls) and
+    alignb2 * BITS_PER_UNIT <= MAX_SUPPORTED_STACK_ALIGNMENT
+    and compute maximum of those alignments.
+    That maximum is already computed,
+    data->asan_alignb = MAX (data->asan_alignb, alignb);
+    computes that, but you get the final result only after you do all the
+    expand_stack_vars calls.  You'd need to compute it before.
+    
+    Though, that change would be still in the wrong place.
+    The thing is, it would be a waste of the precious stack space when it isn't
+    needed at all (e.g.  when asan will not at compile time do the use after
+    return checking, or if it won't do it at runtime, or even if it will do at
+    runtime it will waste the space on the stack).
+    
+    The following patch fixes it solely for the __asan_stack_malloc_N
+    allocations, doesn't enlarge unnecessarily further the actual stack frame.
+    Because asan is only supported on FRAME_GROWS_DOWNWARD architectures
+    (mips, rs6000 and xtensa are conditional FRAME_GROWS_DOWNWARD arches, which
+    for -fsanitize=address or -fstack-protector* use FRAME_GROWS_DOWNWARD 1,
+    otherwise 0, others supporting asan always just use 1), the assumption for
+    the dynamic stack realignment is that the top of the stack frame (aka offset
+    0) is aligned to alignb passed to the function (which is the maximum of alignb
+    of all the vars in the frame).  As checked by the assertion in the patch,
+    offsets[0] is 0 most of the time and so that assumption is correct, the only
+    case when it is not 0 is if -fstack-protector* is on together with
+    -fsanitize=address and cfgexpand.cc (create_stack_guard) created a stack
+    guard.  That is the only variable which is allocated in the stack frame
+    right away, for all others with -fsanitize=address defer_stack_allocation
+    (or -fstack-protector*) returns true and so they aren't allocated
+    immediately but handled during the frame layout phases.  So, the original
+    frame_offset of 0 is changed because of the stack guard to
+    -pointer_size_in_bytes and later at the
+                  if (data->asan_vec.is_empty ())
+                    {
+                      align_frame_offset (ASAN_RED_ZONE_SIZE);
+                      prev_offset = frame_offset.to_constant ();
+                    }
+    to -ASAN_RED_ZONE_SIZE.  The asan_emit_stack_protection code wasn't
+    taking this into account though, so essentially assumed in the
+    __asan_stack_malloc_N allocated memory it needs to align it such that
+    pointer corresponding to offsets[0] is alignb aligned.  But that isn't
+    correct if alignb > ASAN_RED_ZONE_SIZE, in that case it needs to ensure that
+    pointer corresponding to frame offset 0 is alignb aligned.
+    
+    The following patch fixes that.  Unlike the previous case where
+    we knew that asan_frame_size + base_align_bias falls into the same bucket
+    as asan_frame_size, this isn't in some cases true anymore, so the patch
+    recomputes which bucket to use and if going to bucket 11 (because there is
+    no __asan_stack_malloc_11 function in the library) disables the after return
+    sanitization.
+    
+    2024-04-11  Jakub Jelinek  <jakub@redhat.com>PR middle-end/110027* asan.cc (asan_emit_stack_protection): Assert offsets[0] is
+            zero if there is no stack protect guard, otherwise
+            -ASAN_RED_ZONE_SIZE.  If alignb > ASAN_RED_ZONE_SIZE and there is
+            stack pointer guard, take the ASAN_RED_ZONE_SIZE bytes allocated at
+            the top of the stack into account when computing base_align_bias.
+            Recompute use_after_return_class from asan_frame_size + base_align_bias
+            and set to -1 if that would overflow to 11.
+    
+            * gcc.dg/asan/pr110027.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-04-11 10:06:38 UTC
+  Text: Fixed on the trunk so far.
+
+- User: Carlos Eduardo Seo | Time: 2024-04-12 18:09:25 UTC
+  Text: FYI, the new test is failing on aarch64-linux-gnu.
+
+- User: GCC Commits | Time: 2024-04-21 04:09:10 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:a16d90ec302e588dab5d7d31ccdd7b3fd5c6214ecommitr13-8630-ga16d90ec302e588dab5d7d31ccdd7b3fd5c6214eAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Apr 11 11:12:11 2024 +0200
+
+    asan, v3: Fix up handling of > 32 byte aligned variables with -fsanitize=address -fstack-protector* [PR110027]
+    
+    On Tue, Mar 26, 2024 at 02:08:02PM +0800, liuhongt wrote:
+    > > > So, try to add some other variable with larger size and smaller alignment
+    > > > to the frame (and make sure it isn't optimized away).
+    > > >
+    > > > alignb above is the alignment of the first partition's var, if
+    > > > align_frame_offset really needs to depend on the var alignment, it probably
+    > > > should be the maximum alignment of all the vars with alignment
+    > > > alignb * BITS_PER_UNIT <=3D MAX_SUPPORTED_STACK_ALIGNMENT
+    > > >
+    >
+    > In asan_emit_stack_protection, when it allocated fake stack, it assume
+    > bottom of stack is also aligned to alignb. And the place violated this
+    > is the first var partition. which is 32 bytes offsets,  it should be
+    > BIGGEST_ALIGNMENT / BITS_PER_UNIT.
+    > So I think we need to use MAX (BIGGEST_ALIGNMENT /
+    > BITS_PER_UNIT, ASAN_RED_ZONE_SIZE) for the first var partition.
+    
+    Your first patch aligned offsets[0] to maximum of alignb and
+    ASAN_RED_ZONE_SIZE.  But as I wrote in the reply to that mail, alignb there
+    is the alignment of just a single variable which is the first one to appear
+    in the sorted list and is placed in the highest spot in the stack frame.
+    That is not necessarily the largest alignment, the sorting ensures that it
+    is a variable with the largest size in the frame (and only if several of
+    them have equal size, largest alignment from the same sized ones).  Your
+    second patch used maximum of BIGGEST_ALIGNMENT / BITS_PER_UNIT and
+    ASAN_RED_ZONE_SIZE.  That doesn't change anything at all when using
+    -mno-avx512f - offsets[0] is still just 32-byte aligned in that case
+    relative to top of frame, just changes the -mavx512f case to be 64-byte
+    aligned offsets[0] (aka offsets[0] is then either 0 or -64 instead of either
+    0 or -32).  That will not help if any variable in the frame needs 128-byte,
+    256-byte, 512-byte ...  4096-byte alignment.  If you want to fix the bug in
+    the spot you've touched, you'd need to walk all the
+    stack_vars[stack_vars_sorted[si2]] for si2 [si + 1, n - 1] and for those
+    where the loop would do anything (i.e.
+    stack_vars[i2].representative == i2
+    && TREE_CODE (decl2) == SSA_NAME
+       ? SA.partition_to_pseudo[var_to_partition (SA.map, decl2)] == NULL_RTX
+       : DECL_RTL (decl2) == pc_rtx
+    and the pred applies (but that means also walking the earlier ones!
+    because with -fstack-protector* the vars can be processed in several calls) and
+    alignb2 * BITS_PER_UNIT <= MAX_SUPPORTED_STACK_ALIGNMENT
+    and compute maximum of those alignments.
+    That maximum is already computed,
+    data->asan_alignb = MAX (data->asan_alignb, alignb);
+    computes that, but you get the final result only after you do all the
+    expand_stack_vars calls.  You'd need to compute it before.
+    
+    Though, that change would be still in the wrong place.
+    The thing is, it would be a waste of the precious stack space when it isn't
+    needed at all (e.g.  when asan will not at compile time do the use after
+    return checking, or if it won't do it at runtime, or even if it will do at
+    runtime it will waste the space on the stack).
+    
+    The following patch fixes it solely for the __asan_stack_malloc_N
+    allocations, doesn't enlarge unnecessarily further the actual stack frame.
+    Because asan is only supported on FRAME_GROWS_DOWNWARD architectures
+    (mips, rs6000 and xtensa are conditional FRAME_GROWS_DOWNWARD arches, which
+    for -fsanitize=address or -fstack-protector* use FRAME_GROWS_DOWNWARD 1,
+    otherwise 0, others supporting asan always just use 1), the assumption for
+    the dynamic stack realignment is that the top of the stack frame (aka offset
+    0) is aligned to alignb passed to the function (which is the maximum of alignb
+    of all the vars in the frame).  As checked by the assertion in the patch,
+    offsets[0] is 0 most of the time and so that assumption is correct, the only
+    case when it is not 0 is if -fstack-protector* is on together with
+    -fsanitize=address and cfgexpand.cc (create_stack_guard) created a stack
+    guard.  That is the only variable which is allocated in the stack frame
+    right away, for all others with -fsanitize=address defer_stack_allocation
+    (or -fstack-protector*) returns true and so they aren't allocated
+    immediately but handled during the frame layout phases.  So, the original
+    frame_offset of 0 is changed because of the stack guard to
+    -pointer_size_in_bytes and later at the
+                  if (data->asan_vec.is_empty ())
+                    {
+                      align_frame_offset (ASAN_RED_ZONE_SIZE);
+                      prev_offset = frame_offset.to_constant ();
+                    }
+    to -ASAN_RED_ZONE_SIZE.  The asan_emit_stack_protection code wasn't
+    taking this into account though, so essentially assumed in the
+    __asan_stack_malloc_N allocated memory it needs to align it such that
+    pointer corresponding to offsets[0] is alignb aligned.  But that isn't
+    correct if alignb > ASAN_RED_ZONE_SIZE, in that case it needs to ensure that
+    pointer corresponding to frame offset 0 is alignb aligned.
+    
+    The following patch fixes that.  Unlike the previous case where
+    we knew that asan_frame_size + base_align_bias falls into the same bucket
+    as asan_frame_size, this isn't in some cases true anymore, so the patch
+    recomputes which bucket to use and if going to bucket 11 (because there is
+    no __asan_stack_malloc_11 function in the library) disables the after return
+    sanitization.
+    
+    2024-04-11  Jakub Jelinek  <jakub@redhat.com>PR middle-end/110027* asan.cc (asan_emit_stack_protection): Assert offsets[0] is
+            zero if there is no stack protect guard, otherwise
+            -ASAN_RED_ZONE_SIZE.  If alignb > ASAN_RED_ZONE_SIZE and there is
+            stack pointer guard, take the ASAN_RED_ZONE_SIZE bytes allocated at
+            the top of the stack into account when computing base_align_bias.
+            Recompute use_after_return_class from asan_frame_size + base_align_bias
+            and set to -1 if that would overflow to 11.
+    
+            * gcc.dg/asan/pr110027.c: New test.
+    
+    (cherry picked from commit 467898d513e602f5b5fc4183052217d7e6d6e8ab)
+
+- User: Jakub Jelinek | Time: 2024-04-23 06:44:54 UTC
+  Text: Fixed for 13.3 too.
+
+- User: Christoph Erhardt | Time: 2024-06-02 20:48:04 UTC
+  Text: Createdattachment 58325[details]Reproducer program, new version
+
+Unfortunately, the fix appears to be incomplete. On x86_64 Fedora Linux 40 with the latest GCC 14.1.1, my reproducer program still segfaults with a misaligned `vmovdqa64`.
+I have managed to further strip the program down to a now-manageable size - see attachment.
+
+$ gcc -Wall -Wextra -g -Og -fsanitize=address -fno-stack-protector -mavx512f a-repro.i
+$ ./a.out
+AddressSanitizer:DEADLYSIGNAL
+=================================================================
+==107156==ERROR: AddressSanitizer: SEGV on unknown address (pc 0x000000401463 bp 0x7ffd76144620 sp 0x7ffd76144200 T0)
+==107156==The signal is caused by a READ memory access.
+==107156==Hint: this fault was caused by a dereference of a high value address (see register values below).  Disassemble the provided pc to learn which register was used.
+    #0 0x401463 in blake3_compress_subtree_wide /home/christoph/Projects/gcc-asan-stack-misalign/repro.c:52
+    #1 0x40158c in main /home/christoph/Projects/gcc-asan-stack-misalign/repro.c:57
+    #2 0x7f60dde3d087 in __libc_start_call_main (/lib64/libc.so.6+0x2a087) (BuildId: 4a92fcedbba6d6d2629ce066a2970017faa9995e)
+    #3 0x7f60dde3d14a in __libc_start_main_alias_2 (/lib64/libc.so.6+0x2a14a) (BuildId: 4a92fcedbba6d6d2629ce066a2970017faa9995e)
+    #4 0x4010b4 in _start (/home/christoph/Projects/gcc-asan-stack-misalign/a.out+0x4010b4) (BuildId: 9f1d4d25413300b7347d0776d7087844a8d56649)
+
+AddressSanitizer can not provide additional info.
+SUMMARY: AddressSanitizer: SEGV /home/christoph/Projects/gcc-asan-stack-misalign/repro.c:52 in blake3_compress_subtree_wide
+==107156==ABORTING
+
+- User: GCC Commits | Time: 2024-06-11 10:38:07 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:082fe43efd241caf8f757c056b98e1ae8b55c300commitr12-10522-g082fe43efd241caf8f757c056b98e1ae8b55c300Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Apr 11 11:12:11 2024 +0200
+
+    asan, v3: Fix up handling of > 32 byte aligned variables with -fsanitize=address -fstack-protector* [PR110027]
+    
+    On Tue, Mar 26, 2024 at 02:08:02PM +0800, liuhongt wrote:
+    > > > So, try to add some other variable with larger size and smaller alignment
+    > > > to the frame (and make sure it isn't optimized away).
+    > > >
+    > > > alignb above is the alignment of the first partition's var, if
+    > > > align_frame_offset really needs to depend on the var alignment, it probably
+    > > > should be the maximum alignment of all the vars with alignment
+    > > > alignb * BITS_PER_UNIT <=3D MAX_SUPPORTED_STACK_ALIGNMENT
+    > > >
+    >
+    > In asan_emit_stack_protection, when it allocated fake stack, it assume
+    > bottom of stack is also aligned to alignb. And the place violated this
+    > is the first var partition. which is 32 bytes offsets,  it should be
+    > BIGGEST_ALIGNMENT / BITS_PER_UNIT.
+    > So I think we need to use MAX (BIGGEST_ALIGNMENT /
+    > BITS_PER_UNIT, ASAN_RED_ZONE_SIZE) for the first var partition.
+    
+    Your first patch aligned offsets[0] to maximum of alignb and
+    ASAN_RED_ZONE_SIZE.  But as I wrote in the reply to that mail, alignb there
+    is the alignment of just a single variable which is the first one to appear
+    in the sorted list and is placed in the highest spot in the stack frame.
+    That is not necessarily the largest alignment, the sorting ensures that it
+    is a variable with the largest size in the frame (and only if several of
+    them have equal size, largest alignment from the same sized ones).  Your
+    second patch used maximum of BIGGEST_ALIGNMENT / BITS_PER_UNIT and
+    ASAN_RED_ZONE_SIZE.  That doesn't change anything at all when using
+    -mno-avx512f - offsets[0] is still just 32-byte aligned in that case
+    relative to top of frame, just changes the -mavx512f case to be 64-byte
+    aligned offsets[0] (aka offsets[0] is then either 0 or -64 instead of either
+    0 or -32).  That will not help if any variable in the frame needs 128-byte,
+    256-byte, 512-byte ...  4096-byte alignment.  If you want to fix the bug in
+    the spot you've touched, you'd need to walk all the
+    stack_vars[stack_vars_sorted[si2]] for si2 [si + 1, n - 1] and for those
+    where the loop would do anything (i.e.
+    stack_vars[i2].representative == i2
+    && TREE_CODE (decl2) == SSA_NAME
+       ? SA.partition_to_pseudo[var_to_partition (SA.map, decl2)] == NULL_RTX
+       : DECL_RTL (decl2) == pc_rtx
+    and the pred applies (but that means also walking the earlier ones!
+    because with -fstack-protector* the vars can be processed in several calls) and
+    alignb2 * BITS_PER_UNIT <= MAX_SUPPORTED_STACK_ALIGNMENT
+    and compute maximum of those alignments.
+    That maximum is already computed,
+    data->asan_alignb = MAX (data->asan_alignb, alignb);
+    computes that, but you get the final result only after you do all the
+    expand_stack_vars calls.  You'd need to compute it before.
+    
+    Though, that change would be still in the wrong place.
+    The thing is, it would be a waste of the precious stack space when it isn't
+    needed at all (e.g.  when asan will not at compile time do the use after
+    return checking, or if it won't do it at runtime, or even if it will do at
+    runtime it will waste the space on the stack).
+    
+    The following patch fixes it solely for the __asan_stack_malloc_N
+    allocations, doesn't enlarge unnecessarily further the actual stack frame.
+    Because asan is only supported on FRAME_GROWS_DOWNWARD architectures
+    (mips, rs6000 and xtensa are conditional FRAME_GROWS_DOWNWARD arches, which
+    for -fsanitize=address or -fstack-protector* use FRAME_GROWS_DOWNWARD 1,
+    otherwise 0, others supporting asan always just use 1), the assumption for
+    the dynamic stack realignment is that the top of the stack frame (aka offset
+    0) is aligned to alignb passed to the function (which is the maximum of alignb
+    of all the vars in the frame).  As checked by the assertion in the patch,
+    offsets[0] is 0 most of the time and so that assumption is correct, the only
+    case when it is not 0 is if -fstack-protector* is on together with
+    -fsanitize=address and cfgexpand.cc (create_stack_guard) created a stack
+    guard.  That is the only variable which is allocated in the stack frame
+    right away, for all others with -fsanitize=address defer_stack_allocation
+    (or -fstack-protector*) returns true and so they aren't allocated
+    immediately but handled during the frame layout phases.  So, the original
+    frame_offset of 0 is changed because of the stack guard to
+    -pointer_size_in_bytes and later at the
+                  if (data->asan_vec.is_empty ())
+                    {
+                      align_frame_offset (ASAN_RED_ZONE_SIZE);
+                      prev_offset = frame_offset.to_constant ();
+                    }
+    to -ASAN_RED_ZONE_SIZE.  The asan_emit_stack_protection code wasn't
+    taking this into account though, so essentially assumed in the
+    __asan_stack_malloc_N allocated memory it needs to align it such that
+    pointer corresponding to offsets[0] is alignb aligned.  But that isn't
+    correct if alignb > ASAN_RED_ZONE_SIZE, in that case it needs to ensure that
+    pointer corresponding to frame offset 0 is alignb aligned.
+    
+    The following patch fixes that.  Unlike the previous case where
+    we knew that asan_frame_size + base_align_bias falls into the same bucket
+    as asan_frame_size, this isn't in some cases true anymore, so the patch
+    recomputes which bucket to use and if going to bucket 11 (because there is
+    no __asan_stack_malloc_11 function in the library) disables the after return
+    sanitization.
+    
+    2024-04-11  Jakub Jelinek  <jakub@redhat.com>PR middle-end/110027* asan.cc (asan_emit_stack_protection): Assert offsets[0] is
+            zero if there is no stack protect guard, otherwise
+            -ASAN_RED_ZONE_SIZE.  If alignb > ASAN_RED_ZONE_SIZE and there is
+            stack pointer guard, take the ASAN_RED_ZONE_SIZE bytes allocated at
+            the top of the stack into account when computing base_align_bias.
+            Recompute use_after_return_class from asan_frame_size + base_align_bias
+            and set to -1 if that would overflow to 11.
+    
+            * gcc.dg/asan/pr110027.c: New test.
+    
+    (cherry picked from commit 467898d513e602f5b5fc4183052217d7e6d6e8ab)
+
+- User: Jakub Jelinek | Time: 2024-06-11 10:57:22 UTC
+  Text: Should be fixed for 12.4+ too.
+
+- User: GCC Commits | Time: 2024-06-20 13:23:10 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:043d5fc707842c9b26ba69650e15be73c57f7a1dcommitr11-11504-g043d5fc707842c9b26ba69650e15be73c57f7a1dAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Apr 11 11:12:11 2024 +0200
+
+    asan, v3: Fix up handling of > 32 byte aligned variables with -fsanitize=address -fstack-protector* [PR110027]
+    
+    On Tue, Mar 26, 2024 at 02:08:02PM +0800, liuhongt wrote:
+    > > > So, try to add some other variable with larger size and smaller alignment
+    > > > to the frame (and make sure it isn't optimized away).
+    > > >
+    > > > alignb above is the alignment of the first partition's var, if
+    > > > align_frame_offset really needs to depend on the var alignment, it probably
+    > > > should be the maximum alignment of all the vars with alignment
+    > > > alignb * BITS_PER_UNIT <=3D MAX_SUPPORTED_STACK_ALIGNMENT
+    > > >
+    >
+    > In asan_emit_stack_protection, when it allocated fake stack, it assume
+    > bottom of stack is also aligned to alignb. And the place violated this
+    > is the first var partition. which is 32 bytes offsets,  it should be
+    > BIGGEST_ALIGNMENT / BITS_PER_UNIT.
+    > So I think we need to use MAX (BIGGEST_ALIGNMENT /
+    > BITS_PER_UNIT, ASAN_RED_ZONE_SIZE) for the first var partition.
+    
+    Your first patch aligned offsets[0] to maximum of alignb and
+    ASAN_RED_ZONE_SIZE.  But as I wrote in the reply to that mail, alignb there
+    is the alignment of just a single variable which is the first one to appear
+    in the sorted list and is placed in the highest spot in the stack frame.
+    That is not necessarily the largest alignment, the sorting ensures that it
+    is a variable with the largest size in the frame (and only if several of
+    them have equal size, largest alignment from the same sized ones).  Your
+    second patch used maximum of BIGGEST_ALIGNMENT / BITS_PER_UNIT and
+    ASAN_RED_ZONE_SIZE.  That doesn't change anything at all when using
+    -mno-avx512f - offsets[0] is still just 32-byte aligned in that case
+    relative to top of frame, just changes the -mavx512f case to be 64-byte
+    aligned offsets[0] (aka offsets[0] is then either 0 or -64 instead of either
+    0 or -32).  That will not help if any variable in the frame needs 128-byte,
+    256-byte, 512-byte ...  4096-byte alignment.  If you want to fix the bug in
+    the spot you've touched, you'd need to walk all the
+    stack_vars[stack_vars_sorted[si2]] for si2 [si + 1, n - 1] and for those
+    where the loop would do anything (i.e.
+    stack_vars[i2].representative == i2
+    && TREE_CODE (decl2) == SSA_NAME
+       ? SA.partition_to_pseudo[var_to_partition (SA.map, decl2)] == NULL_RTX
+       : DECL_RTL (decl2) == pc_rtx
+    and the pred applies (but that means also walking the earlier ones!
+    because with -fstack-protector* the vars can be processed in several calls) and
+    alignb2 * BITS_PER_UNIT <= MAX_SUPPORTED_STACK_ALIGNMENT
+    and compute maximum of those alignments.
+    That maximum is already computed,
+    data->asan_alignb = MAX (data->asan_alignb, alignb);
+    computes that, but you get the final result only after you do all the
+    expand_stack_vars calls.  You'd need to compute it before.
+    
+    Though, that change would be still in the wrong place.
+    The thing is, it would be a waste of the precious stack space when it isn't
+    needed at all (e.g.  when asan will not at compile time do the use after
+    return checking, or if it won't do it at runtime, or even if it will do at
+    runtime it will waste the space on the stack).
+    
+    The following patch fixes it solely for the __asan_stack_malloc_N
+    allocations, doesn't enlarge unnecessarily further the actual stack frame.
+    Because asan is only supported on FRAME_GROWS_DOWNWARD architectures
+    (mips, rs6000 and xtensa are conditional FRAME_GROWS_DOWNWARD arches, which
+    for -fsanitize=address or -fstack-protector* use FRAME_GROWS_DOWNWARD 1,
+    otherwise 0, others supporting asan always just use 1), the assumption for
+    the dynamic stack realignment is that the top of the stack frame (aka offset
+    0) is aligned to alignb passed to the function (which is the maximum of alignb
+    of all the vars in the frame).  As checked by the assertion in the patch,
+    offsets[0] is 0 most of the time and so that assumption is correct, the only
+    case when it is not 0 is if -fstack-protector* is on together with
+    -fsanitize=address and cfgexpand.cc (create_stack_guard) created a stack
+    guard.  That is the only variable which is allocated in the stack frame
+    right away, for all others with -fsanitize=address defer_stack_allocation
+    (or -fstack-protector*) returns true and so they aren't allocated
+    immediately but handled during the frame layout phases.  So, the original
+    frame_offset of 0 is changed because of the stack guard to
+    -pointer_size_in_bytes and later at the
+                  if (data->asan_vec.is_empty ())
+                    {
+                      align_frame_offset (ASAN_RED_ZONE_SIZE);
+                      prev_offset = frame_offset.to_constant ();
+                    }
+    to -ASAN_RED_ZONE_SIZE.  The asan_emit_stack_protection code wasn't
+    taking this into account though, so essentially assumed in the
+    __asan_stack_malloc_N allocated memory it needs to align it such that
+    pointer corresponding to offsets[0] is alignb aligned.  But that isn't
+    correct if alignb > ASAN_RED_ZONE_SIZE, in that case it needs to ensure that
+    pointer corresponding to frame offset 0 is alignb aligned.
+    
+    The following patch fixes that.  Unlike the previous case where
+    we knew that asan_frame_size + base_align_bias falls into the same bucket
+    as asan_frame_size, this isn't in some cases true anymore, so the patch
+    recomputes which bucket to use and if going to bucket 11 (because there is
+    no __asan_stack_malloc_11 function in the library) disables the after return
+    sanitization.
+    
+    2024-04-11  Jakub Jelinek  <jakub@redhat.com>PR middle-end/110027* asan.c (asan_emit_stack_protection): Assert offsets[0] is
+            zero if there is no stack protect guard, otherwise
+            -ASAN_RED_ZONE_SIZE.  If alignb > ASAN_RED_ZONE_SIZE and there is
+            stack pointer guard, take the ASAN_RED_ZONE_SIZE bytes allocated at
+            the top of the stack into account when computing base_align_bias.
+            Recompute use_after_return_class from asan_frame_size + base_align_bias
+            and set to -1 if that would overflow to 11.
+    
+            * gcc.dg/asan/pr110027.c: New test.
+    
+    (cherry picked from commit 467898d513e602f5b5fc4183052217d7e6d6e8ab)
+
+- User: Jakub Jelinek | Time: 2024-06-20 13:25:36 UTC
+  Text: Fixed for 11.5 as well.
+

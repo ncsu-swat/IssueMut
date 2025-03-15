@@ -1,0 +1,197 @@
+Bug Summary: [14 Regression] ICE in  dwarf2out_frame_debug_cfa_offset with `-O2 -fstack-protector-strong -fstack-clash-protection`
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2023-12-19 03:44:43 UTC
+  Text: Reduced testcase:
+```
+void add_key(const void *payload);
+void act_keyctl_test(void) {
+  char buf[1030 * 1024];
+  int i = 0;
+  for (i = 0; i < sizeof(buf); i++) 
+  {
+    add_key(buf);
+  }
+}
+
+```
+
+```
+$ ./install/bin/aarch64-linux-gnu-gcc Hgs7.i -O2  -S    -fstack-protector-strong -fstack-clash-protection
+during RTL pass: dwarf2
+keyctl_testing.c: In function ‘act_keyctl_test_limits2’:
+keyctl_testing.c:225:1: internal compiler error: in dwarf2out_frame_debug_cfa_offset, at dwarf2cfi.cc:1376
+0x78228a dwarf2out_frame_debug_cfa_offset
+        ../../gcc/dwarf2cfi.cc:1376
+0x78228a dwarf2out_frame_debug
+        ../../gcc/dwarf2cfi.cc:2285
+0x78228a scan_insn_after
+        ../../gcc/dwarf2cfi.cc:2726
+0xb8c55b scan_trace
+        ../../gcc/dwarf2cfi.cc:2893
+0xb8ccbe create_cfi_notes
+        ../../gcc/dwarf2cfi.cc:2933
+0xb8ccbe execute_dwarf2_frame
+        ../../gcc/dwarf2cfi.cc:3309
+0xb8ccbe execute
+        ../../gcc/dwarf2cfi.cc:3797
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+```
+
+- User: Andrew Pinski | Time: 2023-12-19 03:47:52 UTC
+  Text: Worked withr14-6063-gc6bb413eeb9but fails withr14-6663-g4554a151d0ec62.
+
+- User: Andrew Pinski | Time: 2023-12-19 03:52:01 UTC
+  Text: I suspect it is one of the load/store pair patches which caused this ICE.
+
+- User: Alex Coplan | Time: 2023-12-19 09:44:06 UTC
+  Text: Confirmed, started with myr14-6604-gd7ee988c491cde43d04fe25f2b3dbad9d85ded45, I can take a look.
+
+- User: Alex Coplan | Time: 2024-01-08 14:50:29 UTC
+  Text: So pro_and_epilogue has:
+
+```
+(insn/f 55 54 56 2 (set (mem/c:DI (plus:DI (reg/f:DI 31 sp)
+                (const_int 16 [0x10])) [2  S8 A8])
+        (reg:DI 19 x19)) "t.c":2:28 -1
+     (expr_list:REG_CFA_OFFSET (set (mem/c:DI (plus:DI (reg/f:DI 31 sp)
+                    (const_int 16 [0x10])) [2  S8 A8])
+            (reg:DI 19 x19))
+        (nil)))
+(insn/f 56 55 57 2 (set (reg:DI 13 x13)
+        (plus:DI (reg/f:DI 31 sp)
+            (const_int -1048576 [0xfffffffffff00000]))) "t.c":2:28 -1
+     (expr_list:REG_CFA_DEF_CFA (plus:DI (reg:DI 13 x13)
+            (const_int 1048576 [0x100000]))
+        (nil)))
+(insn/f 57 56 58 2 (set (reg/f:DI 31 sp)
+        (unspec_volatile:DI [
+                (reg/f:DI 31 sp)
+                (reg:DI 13 x13)
+            ] UNSPECV_PROBE_STACK_RANGE)) "t.c":2:28 -1
+     (expr_list:REG_CFA_DEF_CFA (plus:DI (reg/f:DI 31 sp)
+            (const_int 1048576 [0x100000]))
+        (nil)))
+```
+
+which seems fine because in insn 55 the sp is the CFA, insn 56
+changes the CFA to x13, and insn 57 changes it back to sp.
+But by the time we get to dwarf2 we have:
+
+```
+(insn/f 56 54 55 (set (reg:DI 13 x13)
+        (plus:DI (reg/f:DI 31 sp)
+            (const_int -1048576 [0xfffffffffff00000]))) "t.c":2:28 120 {*adddi3_aarch64}
+     (expr_list:REG_CFA_DEF_CFA (plus:DI (reg:DI 13 x13)
+            (const_int 1048576 [0x100000]))
+        (nil)))
+(insn/f:TI 55 56 57 (set (mem/c:DI (plus:DI (reg/f:DI 31 sp)
+                (const_int 16 [0x10])) [2  S8 A8])
+        (reg:DI 19 x19)) "t.c":2:28 70 {*movdi_aarch64}
+     (expr_list:REG_DEAD (reg:DI 19 x19)
+        (expr_list:REG_CFA_OFFSET (set (mem/c:DI (plus:DI (reg/f:DI 31 sp)
+                        (const_int 16 [0x10])) [2  S8 A8])
+                (reg:DI 19 x19))
+            (nil))))
+(insn/f 57 55 58 (set (reg/f:DI 31 sp)
+        (unspec_volatile:DI [
+                (reg/f:DI 31 sp)
+                (reg:DI 13 x13)
+            ] UNSPECV_PROBE_STACK_RANGE)) "t.c":2:28 1151 {probe_stack_range}
+     (expr_list:REG_DEAD (reg:DI 13 x13)
+        (expr_list:REG_CFA_DEF_CFA (plus:DI (reg/f:DI 31 sp)
+                (const_int 1048576 [0x100000]))
+            (nil))))
+```
+
+i.e. the insns have been re-ordered, so now the CFA gets changed to
+x13 in insn 56 and so the `REG_CFA_OFFSET` note in insn 55 becomes invalid,
+because the CFA is no longer the sp when we process that insn.
+
+Not immediately sure what the right fix is, will investigate further.
+
+- User: Jakub Jelinek | Time: 2024-01-08 15:00:37 UTC
+  Text: I think generally one shouldn't be reordering frame related instructions or needs to be extremely careful when doing so.
+
+- User: Alex Coplan | Time: 2024-01-08 15:05:03 UTC
+  Text: Looks like sched_fusion is doing the re-ordering.
+
+- User: Alex Coplan | Time: 2024-01-09 09:13:43 UTC
+  Text: After discussing with Richard S (thanks!), I think the problem is using REG_CFA_OFFSET in aarch64_save_callee_saves is too brittle: it is always required to be expressed in terms of the current CFA reg instead of e.g. just the stack pointer. Before switching to the unspec pair representation the code in dwarf2cfi could directly interpret the RTL and could keep track of things itself.  We can restore that behaviour with the new (unspec) representation by using REG_FRAME_RELATED_EXPR instead (which simply gives dwarf2cfi an alternative pattern to look at).
+
+Testing a patch.
+
+- User: Alex Coplan | Time: 2024-01-09 11:30:54 UTC
+  Text: Initial patch had some fallout, I was missing attaching REG_FRAME_RELATED_EXPR notes in the ldp/stp pass, testing a revised patch now...
+
+- User: Alex Coplan | Time: 2024-01-09 15:38:24 UTC
+  Text: Candidate patch submitted.
+
+- User: Alex Coplan | Time: 2024-01-10 09:57:47 UTC
+  Text: Testing a v2 patch that addresses the review feedback.
+
+- User: Alex Coplan | Time: 2024-01-10 17:02:13 UTC
+  Text: Testing a v3 patch.
+
+- User: Alex Coplan | Time: 2024-01-11 09:39:34 UTC
+  Text: v3 patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2024-January/642530.html
+
+- User: GCC Commits | Time: 2024-01-11 10:17:33 UTC
+  Text: The master branch has been updated by Alex Coplan <acoplan@gcc.gnu.org>:https://gcc.gnu.org/g:5400778f69d19a94017561c7de02510d9c0899e6commitr14-7132-g5400778f69d19a94017561c7de02510d9c0899e6Author: Alex Coplan <alex.coplan@arm.com>
+Date:   Thu Jan 11 10:16:24 2024 +0000
+
+    aarch64: Fix dwarf2cfi ICEs due to recent CFI note changes [PR113077]
+    
+    Inr14-6604-gd7ee988c491cde43d04fe25f2b3dbad9d85ded45we changed the CFI notes
+    attached to callee saves (in aarch64_save_callee_saves).  That patch changed
+    the ldp/stp representation to use unspecs instead of PARALLEL moves.  This meant
+    that we needed to attach CFI notes to all frame-related pair saves such that
+    dwarf2cfi could still emit the appropriate CFI (it cannot interpret the unspecs
+    directly).  The patch also attached REG_CFA_OFFSET notes to individual saves so
+    that the ldp/stp pass could easily preserve them when forming stps.
+    
+    In that change I chose to use REG_CFA_OFFSET, but as the PR shows, that
+    choice was problematic in that REG_CFA_OFFSET requires the attached
+    store to be expressed in terms of the current CFA register at all times.
+    This means that even scheduling of frame-related insns can break this
+    invariant, leading to ICEs in dwarf2cfi.
+    
+    The old behaviour (before that change) allowed dwarf2cfi to interpret the RTL
+    directly for sp-relative saves.  This change restores that behaviour by using
+    REG_FRAME_RELATED_EXPR instead of REG_CFA_OFFSET.  REG_FRAME_RELATED_EXPR
+    effectively just gives a different pattern for dwarf2cfi to look at instead of
+    the main insn pattern.  That allows us to attach the old-style PARALLEL move
+    representation in a REG_FRAME_RELATED_EXPR note and means we are free to always
+    express the save addresses in terms of the stack pointer.
+    
+    Since the ldp/stp fusion pass can combine frame-related stores, this patch also
+    updates it to preserve REG_FRAME_RELATED_EXPR notes, and additionally gives it
+    the ability to synthesize those notes when combining sp-relative saves into an
+    stp (the latter always needs a note due to the unspec representation, the former
+    does not).
+    
+    gcc/ChangeLog:PR target/113077* config/aarch64/aarch64-ldp-fusion.cc (filter_notes): Add
+            fr_expr param to extract REG_FRAME_RELATED_EXPR notes.
+            (combine_reg_notes): Handle REG_FRAME_RELATED_EXPR notes, and
+            synthesize these if needed.  Update caller ...
+            (ldp_bb_info::fuse_pair): ... here.
+            (ldp_bb_info::try_fuse_pair): Punt if either insn has writeback
+            and either insn is frame-related.
+            (find_trailing_add): Punt on frame-related insns.
+            * config/aarch64/aarch64.cc (aarch64_save_callee_saves): Use
+            REG_FRAME_RELATED_EXPR instead of REG_CFA_OFFSET.
+    
+    gcc/testsuite/ChangeLog:PR target/113077* gcc.target/aarch64/pr113077.c: New test.
+
+- User: Alex Coplan | Time: 2024-01-11 10:19:02 UTC
+  Text: Should be fixed, thanks for the report, and sorry for the breakage.
+

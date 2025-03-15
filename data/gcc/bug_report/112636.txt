@@ -1,0 +1,138 @@
+Bug Summary: [14 Regression] ICE on valid code at -O1 (but not at -O{0,s,2,3}) with "-ftree-vectorize": in adjust_loop_info_after_peeling, at tree-ssa-loop-ivcanon.cc:1069
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2023-11-20 11:30:46 UTC
+  Text: This appears to be a recent regression as it does not seem to reproduce with 13.2.
+
+Compiler Explorer:https://godbolt.org/z/WYsasWefh[526] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20231119 (experimental) (GCC) 
+[527] % 
+[527] % gcctk -O1 small.c; ./a.out
+[528] % 
+[528] % gcctk -O1 -ftree-vectorize small.c
+during GIMPLE pass: ch_vect
+small.c: In function ‘main’:
+small.c:3:5: internal compiler error: in adjust_loop_info_after_peeling, at tree-ssa-loop-ivcanon.cc:1069
+    3 | int main() {
+      |     ^~~~
+0x87ac95 adjust_loop_info_after_peeling(loop*, int, bool)
+        ../../gcc-trunk/gcc/tree-ssa-loop-ivcanon.cc:1069
+0x129b514 copy_headers
+        ../../gcc-trunk/gcc/tree-ssa-loop-ch.cc:1108
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+[529] % 
+[529] % cat small.c
+int a[1], b;
+unsigned c;
+int main() {
+  while (b) {
+    if (a[c])
+      break;
+    c--;
+  }
+  return 0;
+}
+
+- User: Richard Biener | Time: 2023-11-20 12:56:20 UTC
+  Text: Confirmed.
+
+      if (wi::leu_p (npeel, loop->nb_iterations_upper_bound))
+        loop->nb_iterations_upper_bound -= npeel;
+      else
+        {
+          /* Peeling maximal number of iterations or more
+             makes no sense and is a bug.
+             We should peel completely.  */
+          gcc_unreachable ();
+
+so we're asking to adjust for peeling of 1 iteration with an upper bound
+of iterations of zero.  We derive this limit from the array size of a[].
+
+Caused by Honzas loop header copying changes.
+
+- User: Richard Biener | Time: 2024-01-11 12:38:21 UTC
+  Text: The issue is that should_duplicate_loop_header_p we call after
+
+      basic_block header = loop->header;
+      if (!get_max_loop_iterations_int (loop))
+        {
+          if (dump_file && (dump_flags & TDF_DETAILS))
+            fprintf (dump_file, "Loop %d never loops.\n", loop->num);
+          scale_loop_profile (loop, profile_probability::always (), 0);
+          loops_to_unloop.safe_push (loop);
+          loops_to_unloop_nunroll.safe_push (0);
+          continue;
+
+ends up calling estimate_numbers_of_iterations () only then actually
+updating the upper bound we check above.  It does so hidden via
+
+#0  estimate_numbers_of_iterations (loop=0x7ffff700e4b0)
+    at /space/rguenther/src/gcc/gcc/tree-ssa-loop-niter.cc:4806
+#1  0x00000000019434ef in loop_exits_before_overflow (
+    base=<ssa_name 0x7ffff71e5120 8>, step=<integer_cst 0x7ffff702d180>, 
+    at_stmt=<gimple_phi 0x7ffff71bb700>, loop=0x7ffff700e4b0)
+    at /space/rguenther/src/gcc/gcc/tree-ssa-loop-niter.cc:5259
+#2  0x00000000019440b0 in scev_probably_wraps_p (var=<tree 0x0>, 
+    base=<ssa_name 0x7ffff71e5120 8>, step=<integer_cst 0x7ffff702d180>, 
+    at_stmt=<gimple_phi 0x7ffff71bb700>, loop=0x7ffff700e4b0, 
+    use_overflow_semantics=true)
+    at /space/rguenther/src/gcc/gcc/tree-ssa-loop-niter.cc:5511
+#3  0x0000000001bb97ea in get_scev_info (r=..., 
+    name=<ssa_name 0x7ffff7016f78 4>, stmt=<gimple_phi 0x7ffff71bb700>, 
+    l=0x7ffff700e4b0, init=@0x7fffffffa898: <ssa_name 0x7ffff71e5120 8>, 
+    step=@0x7fffffffa890: <integer_cst 0x7ffff702d180>, 
+    dir=@0x7fffffffa88c: EV_DIR_DECREASES)
+    at /space/rguenther/src/gcc/gcc/vr-values.cc:204
+#4  0x0000000001bb9d6d in range_of_var_in_loop (v=..., 
+    name=<ssa_name 0x7ffff7016f78 4>, l=0x7ffff700e4b0, 
+    stmt=<gimple_phi 0x7ffff71bb700>, query=0x4961550)
+    at /space/rguenther/src/gcc/gcc/vr-values.cc:271
+#5  0x0000000002edf824 in fold_using_range::range_of_ssa_name_with_loop_info (
+    this=0x7fffffffb46f, r=..., name=<ssa_name 0x7ffff7016f78 4>, 
+...
+#22 0x00000000018f3f77 in should_duplicate_loop_header_p (
+    header=<basic_block 0x7ffff71be6c0 (4)>, loop=0x7ffff700e4b0, 
+    ranger=0x4961550, limit=0x7fffffffd88c, invariant_exits=0x47e60f0, 
+    static_exits=0x4961040)
+    at /space/rguenther/src/gcc/gcc/tree-ssa-loop-ch.cc:251
+#23 0x00000000018f59d7 in (anonymous namespace)::ch_base::copy_headers (
+    this=0x47f2a30, fun=0x7ffff71e2000)
+    at /space/rguenther/src/gcc/gcc/tree-ssa-loop-ch.cc:831
+
+The best is to analyze niters for the loop we try to process.
+
+- User: GCC Commits | Time: 2024-01-11 13:50:36 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:05e8ef2a05b477589cae25af3311bad0f68a90fecommitr14-7138-g05e8ef2a05b477589cae25af3311bad0f68a90feAuthor: Richard Biener <rguenther@suse.de>
+Date:   Thu Jan 11 13:35:51 2024 +0100
+
+    tree-optimization/112636 - estimate niters before header copying
+    
+    The following avoids a mismatch between an early query for maximum
+    number of iterations of a loop and a late one when through ranger
+    we'd get iterations estimated.  Instead make sure we compute niters
+    before querying the iteration bound.PR tree-optimization/112636* tree-ssa-loop-ch.cc (ch_base::copy_headers): Call
+            estimate_numbers_of_iterations before querying
+            get_max_loop_iterations_int.
+            (pass_ch::execute): Initialize SCEV and loops appropriately.
+    
+            * gcc.dg/pr112636.c: New testcase.
+
+- User: Richard Biener | Time: 2024-01-11 13:50:48 UTC
+  Text: Fixed.
+

@@ -1,0 +1,459 @@
+Bug Summary: [13 Regression] Frange miscompilation of ruby since r13-3261
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jakub Jelinek | Time: 2023-01-25 15:48:48 UTC
+  Text: Sincer13-3261-ga0c1a059101a3067d96211cbc4fae5905796d1dbruby is miscompiled with LTO on powerpc64le-linux.
+I've hand reduced it to:
+#include <stdarg.h>
+
+__attribute__((noipa)) void
+bar (const char *cp, unsigned long size, char sign, int dsgn)
+{
+  if (__builtin_strcmp (cp, "ZERO") != 0 || size != 4 || sign != '-' || dsgn != 1)
+    __builtin_abort ();
+}
+
+__attribute__((noipa)) void
+foo (int x, int ch, ...)
+{
+  va_list ap;
+  const char *cp = "";
+  unsigned long size = 0;
+  char sign = '\0';
+  double d;
+  va_start (ap, ch);
+  switch (x)
+    {
+    case 42:
+      d = va_arg (ap, double);
+      if (__builtin_isinf (d))
+	{
+	  if (d < 0)
+	    sign = '-';
+	  cp = "Inf";
+	  size = 3;
+	  break;
+	}
+      if (__builtin_isnan (d))
+	{
+	  cp = "NaN";
+	  size = 3;
+	  break;
+	}
+      if (d < 0)
+	{
+	  d = -d;
+	  sign = '-';
+	}
+      else if (d == 0.0 && __builtin_signbit (d))
+	sign = '-';
+      else
+	sign = '\0';
+      if (ch == 'a' || ch == 'A')
+	{
+	  union U { long long l; double d; } u;
+	  int dsgn;
+	  u.d = d;
+	  if (u.l < 0)
+	    {
+	      dsgn = 1;
+	      u.l &= 0x7fffffffffffffffLL;
+	    }
+	  else
+	    dsgn = 0;
+	  if (__builtin_isinf (d))
+	    {
+	      cp = "INF";
+	      size = 3;
+	    }
+	  else if (__builtin_isnan (d))
+	    {
+	      cp = "NAN";
+	      size = 3;
+	    }
+	  else if (d == 0)
+	    {
+	      cp = "ZERO";
+	      size = 4;
+	    }
+	  else
+	    {
+	      cp = "WRONG";
+	      size = 5;
+	    }
+	  bar (cp, size, sign, dsgn);
+	}
+    }
+  va_end (ap);
+}
+
+int
+main ()
+{
+  foo (42, 'a', -0.0);
+  return 0;
+}
+
+- User: Jakub Jelinek | Time: 2023-01-25 15:52:36 UTC
+  Text: stdarg.h isn't needed, so:
+__attribute__((noipa)) void
+bar (const char *cp, unsigned long size, char sign, int dsgn)
+{
+  if (__builtin_strcmp (cp, "ZERO") != 0 || size != 4 || sign != '-' || dsgn != 1)
+    __builtin_abort ();
+}
+
+__attribute__((noipa)) void
+foo (int x, int ch, double d)
+{
+  const char *cp = "";
+  unsigned long size = 0;
+  char sign = '\0';
+  switch (x)
+    {
+    case 42:
+      if (__builtin_isinf (d))
+	{
+	  if (d < 0)
+	    sign = '-';
+	  cp = "Inf";
+	  size = 3;
+	  break;
+	}
+      if (__builtin_isnan (d))
+	{
+	  cp = "NaN";
+	  size = 3;
+	  break;
+	}
+      if (d < 0)
+	{
+	  d = -d;
+	  sign = '-';
+	}
+      else if (d == 0.0 && __builtin_signbit (d))
+	sign = '-';
+      else
+	sign = '\0';
+      if (ch == 'a' || ch == 'A')
+	{
+	  union U { long long l; double d; } u;
+	  int dsgn;
+	  u.d = d;
+	  if (u.l < 0)
+	    {
+	      dsgn = 1;
+	      u.l &= 0x7fffffffffffffffLL;
+	    }
+	  else
+	    dsgn = 0;
+	  if (__builtin_isinf (d))
+	    {
+	      cp = "INF";
+	      size = 3;
+	    }
+	  else if (__builtin_isnan (d))
+	    {
+	      cp = "NAN";
+	      size = 3;
+	    }
+	  else if (d == 0)
+	    {
+	      cp = "ZERO";
+	      size = 4;
+	    }
+	  else
+	    {
+	      cp = "WRONG";
+	      size = 5;
+	    }
+	  bar (cp, size, sign, dsgn);
+	}
+    }
+}
+
+int
+main ()
+{
+  foo (42, 'a', -0.0);
+  return 0;
+}
+
+The testcase is hand-written from what I see inhttps://github.com/ruby/ruby/blob/a528908271c678360d2d8ca232c178e7cdd340b4/vsnprintf.c#L529https://github.com/ruby/ruby/blob/a528908271c678360d2d8ca232c178e7cdd340b4/vsnprintf.c#L1229https://github.com/ruby/ruby/blob/a528908271c678360d2d8ca232c178e7cdd340b4/missing/dtoa.c#L3387where hdtoa is inlined into cvt which is inlined into vfprintf.  This reduced testcase reproduces on x86_64-linux too.
+
+- User: Jakub Jelinek | Time: 2023-01-26 11:27:49 UTC
+  Text: This goes wrong during thread1 pass I think.
+Before that we have in the IL early exits for x != 42, d NAN or d +-INF, and then:
+  <bb 6> [local count: 96926676]:
+  if (d_16(D) == 0.0)
+    goto <bb 7>; [50.00%]
+  else
+    goto <bb 8>; [50.00%]
+
+  <bb 7> [local count: 48463338]:
+  _2 = __builtin_signbit (d_16(D));
+  if (_2 != 0)
+    goto <bb 9>; [50.00%]
+  else
+    goto <bb 8>; [50.00%]
+
+  <bb 8> [local count: 72695007]:
+
+  <bb 9> [local count: 164282501]:
+  # RANGE [frange] double [-0.0 (-0x0.0p+0), 1.79769313486231570814527423731704356798070567525844996599e+308 (0x0.fffffffffffff8p+1024)]
+  # d_7 = PHI <d_17(5), -0.0(7), d_16(D)(8)>
+  # RANGE [irange] char [0, 0][45, 45] NONZERO 0x2d
+  # sign_10 = PHI <45(5), 45(7), 0(8)>
+  _3 = ch_18(D) == 97;
+  _4 = ch_18(D) == 65;
+  _5 = _3 | _4;
+  if (_5 != 0)
+    goto <bb 10>; [50.00%]
+  else
+    goto <bb 13>; [50.00%]
+
+  <bb 10> [local count: 82141250]:
+  _13 = VIEW_CONVERT_EXPR<long long int>(d_7);
+  _24 = _13 < 0;
+  # RANGE [irange] int [0, 1] NONZERO 0x1
+  _25 = (int) _24;
+  if (d_7 == 0.0)
+    goto <bb 12>; [50.00%]
+  else
+    goto <bb 11>; [50.00%]
+
+  <bb 11> [local count: 41070625]:
+
+  <bb 12> [local count: 82141250]:
+  # PT =
+  # cp_8 = PHI <"WRONG"(11), "ZERO"(10)>
+(#c1 testcase at -O2 on x86_64-linux in sra dump).  The path through the IL on arguments the function is called with is
+d_16(D) == 0.0, __builtin_signbit (d_16(D)) is non-zero and so d_7 is -0.0, sign_10 45, then _5 is non-zero, d_7 == 0.0 is
+again true and so cp_8 is "ZERO".
+But in thread1 this changes:
+  <bb 6> [local count: 96926676]:
+  if (d_16(D) == 0.0)
+    goto <bb 7>; [50.00%]
+  else
+    goto <bb 10>; [50.00%]
+
+  <bb 7> [local count: 48463338]:
+  _2 = __builtin_signbit (d_16(D));
+  if (_2 != 0)
+    goto <bb 8>; [50.00%]
+  else
+    goto <bb 10>; [50.00%]
+
+  <bb 8> [local count: 24231669]:
+  # RANGE [frange] double [-0.0 (-0x0.0p+0), 1.79769313486231570814527423731704356798070567525844996599e+308 (0x0.fffffffffffff8p+1024)]
+  # d_11 = PHI <-0.0(7)>
+  # RANGE [irange] char [0, 0][45, 45] NONZERO 0x2d
+  # sign_26 = PHI <45(7)>
+  _27 = ch_18(D) == 97;
+  _28 = ch_18(D) == 65;
+  _29 = _27 | _28;
+  if (_29 != 0)
+    goto <bb 9>; [50.00%]
+  else
+    goto <bb 14>; [50.00%]
+
+  <bb 9> [local count: 12115835]:
+  _30 = VIEW_CONVERT_EXPR<long long int>(d_11);
+  _31 = _30 < 0;
+  # RANGE [irange] int [0, 1] NONZERO 0x1
+  _32 = (int) _31;
+  goto <bb 12>; [100.00%]
+...
+  <bb 12> [local count: 41070625]:
+  # RANGE [irange] char [0, 0][45, 45] NONZERO 0x2d
+  # sign_33 = PHI <sign_10(11), sign_26(9)>
+  # RANGE [irange] int [0, 1] NONZERO 0x1
+  # _35 = PHI <_25(11), _32(9)>
+
+  <bb 13> [local count: 82141250]:
+  # PT =
+  # cp_8 = PHI <"WRONG"(12), "ZERO"(11)>
+Now the path through for the arguments is again d_16(D) == 0.0, signbit non-zero, d_11 is correctly -0.0 but this is in a threaded block, _29 is non-zero, but we come into bb 13 from bb 12 and so cp_8 is "WRONG" rather than "ZERO".
+
+Aldy, can you please have a look?
+
+- User: Jakub Jelinek | Time: 2023-01-26 11:41:04 UTC
+  Text: I think
+int
+foo (int x, double d)
+{
+  if (x == 42)
+    d = -0.0;
+  if (d == 0.0)
+    return 42;
+  return 12;
+}
+behaves similarly with threading.  The above function is basically return (x == 42 || d == 0.0) ? 42 : 12;
+In forwprop1 at -O2 we still have correct:
+  <bb 2> :
+  if (x_3(D) == 42)
+    goto <bb 3>; [INV]
+  else
+    goto <bb 4>; [INV]
+
+  <bb 3> :
+
+  <bb 4> :
+  # d_1 = PHI <d_4(D)(2), -0.0(3)>
+  if (d_1 == 0.0)
+    goto <bb 5>; [INV]
+  else
+    goto <bb 6>; [INV]
+
+  <bb 5> :
+  // predicted unlikely by early return (on trees) predictor.
+
+  <bb 6> :
+  # RANGE [irange] int [-INF, +INF] NONZERO 0x2e
+  # _2 = PHI <42(5), 12(4)>
+but then comes ethread and turns that into:
+  <bb 2> :
+  if (x_3(D) == 42)
+    goto <bb 3>; [INV]
+  else
+    goto <bb 4>; [INV]
+
+  <bb 3> :
+  # d_5 = PHI <-0.0(2)>
+  goto <bb 6>; [100.00%]
+
+  <bb 4> :
+  # d_1 = PHI <d_4(D)(2)>
+  if (d_1 == 0.0)
+    goto <bb 5>; [INV]
+  else
+    goto <bb 6>; [INV]
+
+  <bb 5> :
+  // predicted unlikely by early return (on trees) predictor.
+
+  <bb 6> :
+  # RANGE [irange] int [-INF, +INF] NONZERO 0x2e
+  # _2 = PHI <42(5), 12(4), 12(3)>
+as if -0.0 == 0.0 was false rather than true.
+
+- User: Jakub Jelinek | Time: 2023-01-26 12:16:45 UTC
+  Text: Ah, so back_threader::find_taken_edge_cond calls path_range_query::range_of_stmt
+on the d_1 == 0.0 with the assumption that d_1 is -0.0, fold_using_range::range_of_range_op sees
+(gdb) p debug (range1)
+[frange] double [-0.0 (-0x0.0p+0), -0.0 (-0x0.0p+0)]
+(gdb) p debug (range2)
+[frange] double [0.0 (0x0.0p+0), 0.0 (0x0.0p+0)]
+(that is correct)  and foperator_equal::fold_range is called on those.
+There we trigger the
+604	  // We can be sure the values are always equal or not if both ranges
+605	  // consist of a single value, and then compare them.
+606	  else if (op1.singleton_p () && op2.singleton_p ())
+607	    {
+608	      if (op1 == op2)
+609		r = range_true (type);
+610	      else
+611		r = range_false (type);
+612	    }
+code, which is clearly wrong if both ops are singleton zeros with different sign.
+
+- User: Jakub Jelinek | Time: 2023-01-26 12:37:42 UTC
+  Text: --- gcc/range-op-float.cc.jj	2023-01-16 09:39:36.191929750 +0100
++++ gcc/range-op-float.cc	2023-01-26 13:33:48.712018907 +0100
+@@ -607,6 +607,10 @@ foperator_equal::fold_range (irange &r,
+     {
+       if (op1 == op2)
+ 	r = range_true (type);
++      // If one operand is -0.0 and other 0.0, they are still equal.
++      else if (real_iszero (&op1.lower_bound ())
++	       && real_iszero (&op2.lower_bound ()))
++	r = range_true (type);
+       else
+ 	r = range_false (type);
+     }
+@@ -617,7 +621,18 @@ foperator_equal::fold_range (irange &r,
+       frange tmp = op1;
+       tmp.intersect (op2);
+       if (tmp.undefined_p ())
+-	r = range_false (type);
++	{
++	  // If one range is [whatever, -0.0] and another
++	  // [0.0, whatever2], we don't know anything either,
++	  // because -0.0 == 0.0.
++	  if ((real_iszero (&op1.upper_bound ())
++	       && real_iszero (&op2.lower_bound ()))
++	      || (real_iszero (&op1.lower_bound ())
++		  && real_iszero (&op2.upper_bound ())))
++	    r = range_true_and_false (type);
++	  else
++	    r = range_false (type);
++	}
+       else
+ 	r = range_true_and_false (type);
+     }
+fixes both testcases, but I'm afraid I need to look at other relations too with -0.0 == 0.0 in mind.
+
+- User: Jakub Jelinek | Time: 2023-01-26 13:08:34 UTC
+  Text: Createdattachment 54351[details]gcc13-pr108540.patch
+
+Untested fix.
+
+- User: Aldy Hernandez | Time: 2023-01-26 13:29:23 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #6)> Createdattachment 54351[details]> gcc13-pr108540.patch
+> 
+> Untested fix.LGTM.  Thanks for looking at this.
+
+- User: GCC Commits | Time: 2023-01-26 16:28:34 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:09176201ec6a21c25b1edb07f19f83be22a123f9commitr13-5397-g09176201ec6a21c25b1edb07f19f83be22a123f9Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Jan 26 17:21:22 2023 +0100
+
+    frange: Fix up foperator_{,not_}equal::fold_range for signed zeros [PR108540]
+    
+    The following testcases are miscompiled, because threader sees some
+    SSA_NAME would have -0.0 value and when computing range of SSA_NAME == 0.0
+    foperator_equal::fold_range sees one operand has [-0.0, -0.0] singleton
+    range, the other [0.0, 0.0], they aren't equal (frange operator== uses
+    real_identical etc. rather than real comparisons) and so it thinks they
+    compare unequal.  With signed zeros -0.0 == 0.0 is true though, so we
+    need to special case the both ranges singleton code.
+    Similarly, if we see op1 range being say [-42.0, -0.0] and op2 range
+    [0.0, 42.0], we'd check that the intersection of the two ranges is empty
+    (that is correct) and fold the result of == between such operands to
+    [0, 0] which is wrong, because -0.0 == 0.0, it needs to be [0, 1].
+    Similarly for foperator_not_equal::fold_range.
+    
+    2023-01-26  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/108540* range-op-float.cc (foperator_equal::fold_range): If both op1 and op2
+            are singletons, use range_true even if op1 != op2
+            when one range is [-0.0, -0.0] and another [0.0, 0.0].  Similarly,
+            even if intersection of the ranges is empty and one has
+            zero low bound and another zero high bound, use range_true_and_false
+            rather than range_false.
+            (foperator_not_equal::fold_range): If both op1 and op2
+            are singletons, use range_false even if op1 != op2
+            when one range is [-0.0, -0.0] and another [0.0, 0.0].  Similarly,
+            even if intersection of the ranges is empty and one has
+            zero low bound and another zero high bound, use range_true_and_false
+            rather than range_true.
+    
+            * gcc.c-torture/execute/ieee/pr108540-1.c: New test.
+            * gcc.c-torture/execute/ieee/pr108540-2.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-01-27 20:39:19 UTC
+  Text: Fixed.
+
+- User: GCC Commits | Time: 2024-10-04 08:16:04 UTC
+  Text: The master branch has been updated by Georg-Johann Lay <gjl@gcc.gnu.org>:https://gcc.gnu.org/g:a0cc6941d8c8fa88441fdae1ffb35396a412ec6bcommitr15-4054-ga0cc6941d8c8fa88441fdae1ffb35396a412ec6bAuthor: Georg-Johann Lay <avr@gjlay.de>
+Date:   Thu Oct 3 13:14:52 2024 +0200
+
+    testsuite - Fix gcc.c-torture/execute/ieee/pr108540-1.cPR testsuite/108540gcc/testsuite/
+            * gcc.c-torture/execute/ieee/pr108540-1.c: Un-preprocess
+            __SIZE_TYPE__ and __INT64_TYPE__.
+            * gcc.c-torture/execute/ieee/pr108540-1.x: New file, requires double64.
+

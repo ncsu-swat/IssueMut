@@ -1,0 +1,526 @@
+Bug Summary: [13 Regression] libsodium miscompilation on power9 starting with r13-2107
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jakub Jelinek | Time: 2023-02-14 15:59:39 UTC
+  Text: The following testcase is miscompiled with -mcpu=power9 -mtune=power9 starting withr13-2107-gdefa08a33672d200edbdd7f87ed7afa442249261.  Doesn't reproduce without -fPIC though.
+
+/* { dg-do run { target int128 } } */
+/* { dg-options "-O2" } */
+/* { dg-additional-options "-fPIC" { target fpic } } */
+
+typedef unsigned __int128 uint128_t;
+
+static inline unsigned long long
+foo (const unsigned char src[8])
+{
+  unsigned long long w;
+  __builtin_memcpy (&w, src, sizeof w);
+  return w;
+}
+ 
+typedef struct S {
+  unsigned long long r[3], h[3];
+  unsigned char final;
+} S;
+
+__attribute__((noipa)) static void
+poly1305_blocks (S *st, const unsigned char *m,
+		 unsigned long long bytes)
+{
+  const unsigned long long hibit = st->final ? 0ULL : (1ULL << 40);
+  unsigned long long r0, r1, r2;
+  unsigned long long s1, s2;
+  unsigned long long h0, h1, h2;
+  unsigned long long c;
+  uint128_t d0, d1, d2, d;
+
+  r0 = st->r[0];
+  r1 = st->r[1];
+  r2 = st->r[2];
+  h0 = st->h[0];
+  h1 = st->h[1];
+  h2 = st->h[2];
+  s1 = r1 * (5 << 2);
+  s2 = r2 * (5 << 2);
+  while (bytes >= 16)
+    {
+      unsigned long long t0, t1;
+
+      t0 = foo (&m[0]);
+      t1 = foo (&m[8]);
+      h0 += t0 & 0xfffffffffff;
+      h1 += ((t0 >> 44) | (t1 << 20)) & 0xfffffffffff;
+      h2 += (((t1 >> 24)) & 0x3ffffffffff) | hibit;
+      d0 = ((uint128_t) h0 * r0);
+      d = ((uint128_t) h1 * s2);
+      d0 += d;
+      d = ((uint128_t) h2 * s1);
+      d0 += d;
+      d1 = ((uint128_t) h0 * r1);
+      d = ((uint128_t) h1 * r0);
+      d1 += d;
+      d = ((uint128_t) h2 * s2);
+      d1 += d;
+      d2 = ((uint128_t) h0 * r2);
+      d = ((uint128_t) h1 * r1);
+      d2 += d;
+      d = ((uint128_t) h2 * r0);
+      d2 += d;
+      c = (unsigned long long) (d0 >> (44));
+      h0 = (unsigned long long) (d0) & 0xfffffffffff;
+      d1 += c;
+      c = (unsigned long long) (d1 >> (44));
+      h1 = (unsigned long long) (d1) & 0xfffffffffff;
+      d2 += c;
+      c = (unsigned long long) (d2 >> (42));
+      h2 = (unsigned long long) (d2) & 0x3ffffffffff;
+      h0 += c * 5;
+      c = (h0 >> 44);
+      h0 = h0 & 0xfffffffffff;
+      h1 += c;
+      m += 16;
+      bytes -= 16;
+    }
+  st->h[0] = h0;
+  st->h[1] = h1;
+  st->h[2] = h2;
+}
+
+int
+main ()
+{
+  if (sizeof (unsigned long long) != 8 || sizeof (uint128_t) != 16)
+    return 0;
+  S st = { .r = { 0x42c052bac7bULL, 0x7ab6080f47bULL, 0x455e9a405ULL },
+	   .h = { 0x3efe88da491ULL, 0xd10577b4a44ULL, 0x3efa677b3dbULL } };
+  unsigned long long l[2] = { 0, 0x72ULL };
+  poly1305_blocks (&st, (unsigned char *) &l[0], sizeof (l));
+  if (st.h[0] != 0xef4cd4260ULL || st.h[1] != 0x5d0e836abb6ULL || st.h[2] != 0x171e724427ULL)
+    __builtin_abort ();
+  return 0;
+}
+
+- User: Jakub Jelinek | Time: 2023-02-14 16:36:18 UTC
+  Text: Correction, -fPIC isn't important.  Even more reduced testcase:
+__attribute__((noipa)) unsigned __int128
+foo (unsigned long long h0, unsigned long long h1, unsigned long long h2, unsigned long long r0, unsigned long long s1, unsigned long long s2)
+{
+  unsigned __int128 d0, d;
+  d0 = ((unsigned __int128) h0 * r0);
+  d = ((unsigned __int128) h1 * s2);
+  d0 += d;
+  d = ((unsigned __int128) h2 * s1);
+  d0 += d;
+  return d0;
+}
+
+int
+main ()
+{
+  if (__CHAR_BIT__ != 8 || __SIZEOF_LONG_LONG__ != 8 || __SIZEOF_INT128__ != 16)
+    return 0;
+  unsigned __int128 x = foo (0x3efe88da491ULL, 0xd105e9b4a44ULL, 0x4efa677b3dbULL, 0x42c052bac7bULL, 0x99638a13199cULL, 0x56b640d064ULL);
+  if ((unsigned long long) (x >> 64) != 0x000000000309ff93ULL
+      || (unsigned long long) x != 0xbd5c98fdf2bdbcafULL)
+    __builtin_abort ();
+  return 0;
+}
+
+The high 64-bits of the result are miscomputed.
+
+- User: Jakub Jelinek | Time: 2023-02-14 17:00:59 UTC
+  Text: In *.optimized dump it looks correct:
+  d_16 = h2_14(D) w* s1_15(D);
+  _19 = WIDEN_MULT_PLUS_EXPR <h1_10(D), s2_11(D), d_16>;
+  d0_17 = WIDEN_MULT_PLUS_EXPR <h0_7(D), r0_8(D), _19>;
+where WIDEN_MULT_EXPR has 2 64-bit unsigned operands and 128-bit result, and
+the 2 WIDEN_MULT_PLUS_EXPR which as documented have 2 64-bit unsigned operands and 128-bit result as well as last argument.
+But the actual rs6000.md implementation looks broken in several ways.
+
+- User: Jakub Jelinek | Time: 2023-02-14 18:00:35 UTC
+  Text: --- gcc/config/rs6000/rs6000.md.jj	2023-01-16 11:52:16.036734757 +0100
++++ gcc/config/rs6000/rs6000.md	2023-02-14 18:53:25.071014954 +0100
+@@ -3231,20 +3231,26 @@
+ 	(plus:TI
+ 	  (mult:TI (any_extend:TI (match_operand:DI 1 "gpc_reg_operand"))
+ 		   (any_extend:TI (match_operand:DI 2 "gpc_reg_operand")))
+-	  (any_extend:TI (match_operand:DI 3 "gpc_reg_operand"))))]
++	  (match_operand:TI 3 "gpc_reg_operand")))]
+   "TARGET_MADDLD && TARGET_POWERPC64"
+ {
+   rtx op0_lo = gen_rtx_SUBREG (DImode, operands[0], BYTES_BIG_ENDIAN ? 8 : 0);
+   rtx op0_hi = gen_rtx_SUBREG (DImode, operands[0], BYTES_BIG_ENDIAN ? 0 : 8);
++  rtx op3_lo = gen_rtx_SUBREG (DImode, operands[3], BYTES_BIG_ENDIAN ? 8 : 0);
++  rtx op3_hi = gen_rtx_SUBREG (DImode, operands[3], BYTES_BIG_ENDIAN ? 0 : 8);
++  rtx hi_temp = gen_reg_rtx (DImode);
+ 
+-  emit_insn (gen_maddlddi4 (op0_lo, operands[1], operands[2], operands[3]));
++  emit_insn (gen_maddlddi4 (op0_lo, operands[1], operands[2], op3_lo));
+ 
+   if (BYTES_BIG_ENDIAN)
+-    emit_insn (gen_<u>madddi4_highpart (op0_hi, operands[1], operands[2],
+-					operands[3]));
++    emit_insn (gen_<u>madddi4_highpart (hi_temp, operands[1], operands[2],
++					op3_lo));
+   else
+-    emit_insn (gen_<u>madddi4_highpart_le (op0_hi, operands[1], operands[2],
+-					   operands[3]));
++    emit_insn (gen_<u>madddi4_highpart_le (hi_temp, operands[1], operands[2],
++					   op3_lo));
++
++  emit_insn (gen_adddi3 (op0_hi, hi_temp, op3_hi));
++
+   DONE;
+ })
+ 
+
+seems to fix this, but I have yet to check if it is the right thing also for the signed case.
+
+- User: Jakub Jelinek | Time: 2023-02-14 18:27:16 UTC
+  Text: long random (void);
+
+__attribute__((noipa)) unsigned __int128
+foo (unsigned long long x, unsigned long long y, unsigned __int128 z)
+{
+  return (unsigned __int128) x * y + z;
+}
+
+__attribute__((noipa)) __int128
+bar (long long x, long long y, __int128 z)
+{
+  return (__int128) x * y + z;
+}
+
+unsigned long long
+baz (void)
+{
+  return (random () & 0x7fffffff) + ((random () & 0x7fffffffLL) << 31) + ((random () & 0x3ULL) << 62);
+}
+
+unsigned __int128
+qux (void)
+{
+  return ((unsigned __int128) baz () << 64) + baz ();
+}
+
+int
+main ()
+{
+  for (int i = 0; i < 10000000; ++i)
+    {
+      volatile unsigned __int128 x, y;
+      unsigned __int128 z;
+      x = baz ();
+      y = baz ();
+      z = qux ();
+      if (foo (x, y, z) != (x * y) + z)
+        __builtin_printf ("U 0x%016llx * 0x%016llx + 0x%016llx%016llx\n", (unsigned long long) x, (unsigned long long) y, (unsigned long long) (z >> 64), (unsigned long long) z);
+    }
+  for (int i = 0; i < 10000000; ++i)
+    {
+      volatile unsigned __int128 x, y;
+      unsigned __int128 z;
+      x = (long long) baz ();
+      y = (long long) baz ();
+      z = qux ();
+      if (bar (x, y, z) != (x * y) + z)
+        __builtin_printf ("S 0x%016llx * 0x%016llx + 0x%016llx%016llx\n", (unsigned long long) x, (unsigned long long) y, (unsigned long long) (z >> 64), (unsigned long long) z);
+    }
+  return 0;
+}
+
+shows that while it is correct for umaddditi4, it is not correct for maddditi4.
+Example of bar arguments which result in different result:
+0xffffffffffffffff834a97f995de5fd5 * 0xffffffffffffffff878d5777da196ad2 + 0x630036472f469716e5be2424d91183d8
+which computes 0x9dad19ebe2fba1e2351c16459af75292 but should compute
+0x9dad19ebe2fba1e3351c16459af75292 instead.
+In fact, the incorrect signed results are exactly all those where z has bit 0x8000000000000000ULL set and the result is ((unsigned __int128) 1) << 64 smaller than it should in that case.
+
+Segher, is it worth adding something more complicated for the maddditi4 case or shall we just drop maddditi4 and only support maddditi4?
+
+- User: Segher Boessenkool | Time: 2023-02-14 19:19:38 UTC
+  Text: The maddhd insn does a sign-extend of the addend as well, so simply adding
+the high part of it is not enough.
+
+I don't see how to solve this with any machine code using the new madd* insns
+that is at least as good code as the mulld;mulhd;addc;adde we would otherwise
+generate.
+
+We should still have machine patterns for the insn we have (it can be used
+if operands[3] here is only one machine word for example), but we shouldn't
+have a define_expand for maddditi4?  (For umaddditi4 we can of course, and
+that is even useful if it results in better generated code).
+
+- User: Jakub Jelinek | Time: 2023-02-14 19:30:48 UTC
+  Text: --- gcc/config/rs6000/rs6000.md.jj	2023-01-16 11:52:16.036734757 +0100
++++ gcc/config/rs6000/rs6000.md	2023-02-14 19:46:13.915782702 +0100
+@@ -3231,20 +3231,38 @@
+ 	(plus:TI
+ 	  (mult:TI (any_extend:TI (match_operand:DI 1 "gpc_reg_operand"))
+ 		   (any_extend:TI (match_operand:DI 2 "gpc_reg_operand")))
+-	  (any_extend:TI (match_operand:DI 3 "gpc_reg_operand"))))]
++	  (match_operand:TI 3 "gpc_reg_operand")))]
+   "TARGET_MADDLD && TARGET_POWERPC64"
+ {
+   rtx op0_lo = gen_rtx_SUBREG (DImode, operands[0], BYTES_BIG_ENDIAN ? 8 : 0);
+   rtx op0_hi = gen_rtx_SUBREG (DImode, operands[0], BYTES_BIG_ENDIAN ? 0 : 8);
++  rtx op3_lo = gen_rtx_SUBREG (DImode, operands[3], BYTES_BIG_ENDIAN ? 8 : 0);
++  rtx op3_hi = gen_rtx_SUBREG (DImode, operands[3], BYTES_BIG_ENDIAN ? 0 : 8);
++  rtx hi_temp = gen_reg_rtx (DImode);
+ 
+-  emit_insn (gen_maddlddi4 (op0_lo, operands[1], operands[2], operands[3]));
++  emit_insn (gen_maddlddi4 (op0_lo, operands[1], operands[2], op3_lo));
+ 
+   if (BYTES_BIG_ENDIAN)
+-    emit_insn (gen_<u>madddi4_highpart (op0_hi, operands[1], operands[2],
+-					operands[3]));
++    emit_insn (gen_<u>madddi4_highpart (hi_temp, operands[1], operands[2],
++					op3_lo));
+   else
+-    emit_insn (gen_<u>madddi4_highpart_le (op0_hi, operands[1], operands[2],
+-					   operands[3]));
++    emit_insn (gen_<u>madddi4_highpart_le (hi_temp, operands[1], operands[2],
++					   op3_lo));
++
++  if (<CODE> == SIGN_EXTEND)
++    {
++      rtx sgn = gen_reg_rtx (DImode);
++      rtx hi_temp2 = gen_reg_rtx (DImode);
++
++      emit_insn (gen_lshrdi3 (sgn, op3_lo, GEN_INT (63)));
++
++      emit_insn (gen_adddi3 (hi_temp2, hi_temp, sgn));
++
++      hi_temp = hi_temp2;
++    }
++
++  emit_insn (gen_adddi3 (op0_hi, hi_temp, op3_hi));
++
+   DONE;
+ })
+ 
+gets it functionally correct.
+But given
+__attribute__((noipa)) unsigned __int128
+foo (unsigned long long x, unsigned long long y, unsigned __int128 z)
+{
+  return (unsigned __int128) x * y + z;
+}
+
+__attribute__((noipa)) __int128
+bar (long long x, long long y, __int128 z)
+{
+  return (__int128) x * y + z;
+}
+
+__attribute__((noipa)) unsigned __int128
+baz (unsigned long long x, unsigned long long y, unsigned long long z)
+{
+  return (unsigned __int128) x * y + z;
+}
+
+__attribute__((noipa)) __int128
+qux (long long x, long long y, long long z)
+{
+  return (__int128) x * y + z;
+}
+we used to emit in GCC 12 4/4/4/5 instructions:
+        mulld 9,3,4
+        mulhdu 4,3,4
+        addc 3,9,5
+        adde 4,4,6
+and
+        mulld 9,3,4
+        mulhd 4,3,4
+        addc 3,9,5
+        adde 4,4,6
+and
+        mulld 9,3,4
+        mulhdu 4,3,4
+        addc 3,9,5
+        addze 4,4
+and
+        mulld 9,3,4
+        mulhd 4,3,4
+        sradi 10,5,63
+        addc 3,9,5
+        adde 4,4,10
+Now, with the patch we get 3/5/3/6 instructions:
+        maddhdu 9,3,4,5
+        maddld 3,3,4,5
+        add 4,9,6
+and
+        maddhd 9,3,4,5
+        srdi 10,5,63
+        maddld 3,3,4,5
+        add 9,9,10
+        add 4,9,6
+and
+        mr 9,3
+        maddld 3,3,4,5
+        maddhdu 4,9,4,5
+and
+        maddhd 9,3,4,5
+        srdi 8,5,63
+        sradi 10,5,63
+        maddld 3,3,4,5
+        add 9,9,8
+        add 4,9,10
+So, unless we can somehow check for the sign extended operands[3], we shouldn't define maddditi3 or FAIL in it or expand it to equivalent of what we used to emit before.
+
+- User: Jakub Jelinek | Time: 2023-02-14 20:27:23 UTC
+  Text: Createdattachment 54460[details]gcc13-pr108787.patch
+
+Patch that kills maddditi4 in addition to fixing umaddditi4.  As mentioned above, in the umaddditi4 case if we later on e.g. during combine find out that
+the high half of the last operand is zero, it will be nicely optimized to the optimal sequence.  Unfortunately, with maddditi4 it is really hard to find out at expansion time if the last operand is sign extended from DImode or narrower,
+there is no SSA_NAME on the pseudo to check say for value ranges, and looking at earlier already emitted instructions checking for one subreg of it set to something and the other to copies of its sign bit would be a total mess.
+And at combine time I'm afraid we'd need 5 instruction combination.
+So if we want to be able to optimize qux above, I'm afraid we'd need to add a new optab.
+
+- User: Segher Boessenkool | Time: 2023-02-14 20:47:46 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #6)> we used to emit in GCC 12 4/4/4/5 instructions:
+>         mulld 9,3,4
+>         mulhdu 4,3,4
+>         addc 3,9,5
+>         adde 4,4,6
+> and
+>         mulld 9,3,4
+>         mulhd 4,3,4
+>         addc 3,9,5
+>         adde 4,4,6
+> and
+>         mulld 9,3,4
+>         mulhdu 4,3,4
+>         addc 3,9,5
+>         addze 4,4
+> and
+>         mulld 9,3,4
+>         mulhd 4,3,4
+>         sradi 10,5,63
+>         addc 3,9,5
+>         adde 4,4,10And it was 2/2/2/2 insns deep.> Now, with the patch we get 3/5/3/6 instructions:
+>         maddhdu 9,3,4,5
+>         maddld 3,3,4,5
+>         add 4,9,6
+> and
+>         maddhd 9,3,4,5
+>         srdi 10,5,63
+>         maddld 3,3,4,5
+>         add 9,9,10
+>         add 4,9,6
+> and
+>         mr 9,3
+>         maddld 3,3,4,5
+>         maddhdu 4,9,4,5
+> and
+>         maddhd 9,3,4,5
+>         srdi 8,5,63
+>         sradi 10,5,63
+>         maddld 3,3,4,5
+>         add 9,9,8
+>         add 4,9,10And this is 2/3/2/3 so the signed are worse than what we had.> So, unless we can somehow check for the sign extended operands[3], we
+> shouldn't define maddditi3 or FAIL in it or expand it to equivalent of what
+> we used to emit before.I wouldn't define the signed version at all, we have no good way of
+generating it.  We still can generate maddhd (and maddld of course), but
+we shouldn't do this for maddditi4, just if e.g. combine comes up with the
+correct RTL for it (there is no machine insn for it, it would require four
+registers in, that is very expensive to do).
+
+- User: Segher Boessenkool | Time: 2023-02-14 20:59:40 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #7)> Createdattachment 54460[details]> gcc13-pr108787.patchThat patch is preapproved, but please add a comment (before umaddditi4)
+saying we do not want maddditi4 as well (and why; just something short,
+maybe reference this PR :-) )  Thanks!> Patch that kills maddditi4 in addition to fixing umaddditi4.  As mentioned
+> above, in the umaddditi4 case if we later on e.g. during combine find out
+> that
+> the high half of the last operand is zero, it will be nicely optimized to
+> the optimal sequence.  Unfortunately, with maddditi4 it is really hard to
+> find out at expansion time if the last operand is sign extended from DImode
+> or narrower,
+> there is no SSA_NAME on the pseudo to check say for value ranges, and
+> looking at earlier already emitted instructions checking for one subreg of
+> it set to something and the other to copies of its sign bit would be a total
+> mess.
+> And at combine time I'm afraid we'd need 5 instruction combination.
+> So if we want to be able to optimize qux above, I'm afraid we'd need to add
+> a new optab.It is easy to optimise if operands[3] is a non-negative 64-bit thing.  I
+expect combine can do it in that case :-)
+
+- User: GCC Commits | Time: 2023-02-15 09:13:35 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:3f71b82596e992eb6e53fe9bbd70a4b52bc908e8commitr13-5999-g3f71b82596e992eb6e53fe9bbd70a4b52bc908e8Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Feb 15 09:56:47 2023 +0100
+
+    powerpc: Fix up expansion for WIDEN_MULT_PLUS_EXPR [PR108787]
+    
+    WIDEN_MULT_PLUS_EXPR as documented has the factor operands with
+    the same precision and the addend and result another one at least twice
+    as wide.
+    Similarly, {,u}maddMN4 is documented as
+    'maddMN4'
+         Multiply operands 1 and 2, sign-extend them to mode N, add operand
+         3, and store the result in operand 0.  Operands 1 and 2 have mode M
+         and operands 0 and 3 have mode N.  Both modes must be integer or
+         fixed-point modes and N must be twice the size of M.
+    
+         In other words, 'maddMN4' is like 'mulMN3' except that it also adds
+         operand 3.
+    
+         These instructions are not allowed to 'FAIL'.
+    
+    'umaddMN4'
+         Like 'maddMN4', but zero-extend the multiplication operands instead
+         of sign-extending them.
+    ThePR103109addition of these expanders to rs6000 didn't handle this
+    correctly though, it treated the last argument as also having mode M
+    sign or zero extended into N.  Unfortunately this means incorrect code
+    generation whenever the last operand isn't really sign or zero extended
+    from DImode to TImode.
+    
+    The following patch removes maddditi4 expander altogether from rs6000.md,
+    because we'd need
+            maddhd 9,3,4,5
+            sradi 10,5,63
+            maddld 3,3,4,5
+            sub 9,9,10
+            add 4,9,6
+    which is longer than
+            mulld 9,3,4
+            mulhd 4,3,4
+            addc 3,9,5
+            adde 4,4,6
+    and nothing would be able to optimize the case of last operand already
+    sign-extended from DImode to TImode into just
+            mr 9,3
+            maddld 3,3,4,5
+            maddhd 4,9,4,5
+    or so.  And fixes umaddditi4, so that it emits an add at the end to add
+    the high half of the last operand, fortunately in this case if the high
+    half of the last operand is known to be zero (i.e. last operand is zero
+    extended from DImode to TImode) then combine will drop the useless add.
+    
+    If we wanted to get back the signed op1 * op2 + op3 all in the DImode
+    into TImode op0, we'd need to introduce a new tree code next to
+    WIDEN_MULT_PLUS_EXPR and maddMN4 expander, because I'm afraid it can't
+    be done at expansion time in maddMN4 expander to detect whether the
+    operand is sign extended especially because of SUBREGs and the awkwardness
+    of looking at earlier emitted instructions, and combine would need 5
+    instruction combination.
+    
+    2023-02-15  Jakub Jelinek  <jakub@redhat.com>PR target/108787PR target/103109* config/rs6000/rs6000.md (<u>maddditi4): Change into umaddditi4 only
+            expander, change operand 3 to be TImode, emit maddlddi4 and
+            umadddi4_highpart{,_le} with its low half and finally add the high
+            half to the result.
+    
+            * gcc.dg/pr108787.c: New test.
+            * gcc.target/powerpc/pr108787.c: New test.
+            * gcc.target/powerpc/pr103109-1.c: Adjust expected instruction counts.
+
+- User: Jakub Jelinek | Time: 2023-02-15 09:28:17 UTC
+  Text: Fixed.
+

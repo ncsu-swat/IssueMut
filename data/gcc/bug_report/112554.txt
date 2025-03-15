@@ -1,0 +1,118 @@
+Bug Summary: [14 Regression] RISC-V ICE: verify_ssa failed with -O3 --param  riscv-autovec-preference=fixed-vlmax
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Patrick O'Neill | Time: 2023-11-15 21:27:02 UTC
+  Text: Createdattachment 56597[details]-freport-bug output> ./bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv -O3 --param riscv-autovec-preference=fixed-vlmax -S ../testcase.c -freport-bug../testcase.c: In function 'b':
+../testcase.c:2:6: error: missing definition
+    2 | void b() {
+      |      ^
+for SSA_NAME: loop_len_8 in statement:
+_1 = -loop_len_8;
+during GIMPLE pass: vect
+../testcase.c:2:6: internal compiler error: verify_ssa failed
+0x14e815d verify_ssa(bool, bool)
+        ../../../gcc/gcc/tree-ssa.cc:1203
+0x1147735 execute_function_todo
+        ../../../gcc/gcc/passes.cc:2095
+0x1147b8b execute_todo
+        ../../../gcc/gcc/passes.cc:2142
+Please submit a full bug report, with preprocessed source.
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+Preprocessed source stored into /tmp/ccaqTwwx.out file, please attach this to your bugreport.
+
+testcase:
+int a;
+void b() {
+  unsigned long c = 18446744073709551612UL;
+d:
+  --c;
+  a ^= c;
+  if (c)
+    goto d;
+}
+
+Bisected tor14-5326-gfb906061e10-freport-bug output attached
+
+- User: GCC Commits | Time: 2023-11-16 06:54:49 UTC
+  Text: The trunk branch has been updated by Lehua Ding <lhtin@gcc.gnu.org>:https://gcc.gnu.org/g:fc6f7ab4e078aaf52c37739da73eb6416f5ec788commitr14-5516-gfc6f7ab4e078aaf52c37739da73eb6416f5ec788Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Thu Nov 16 10:58:16 2023 +0800
+
+    VECT: Clear LOOP_VINFO_USING_SELECT_VL_P when loop is not partial vectorized
+    
+    This patch fixes ICE:https://godbolt.org/z/z8T6o6qov<source>: In function 'b':
+    <source>:2:6: error: missing definition
+        2 | void b() {
+          |      ^
+    for SSA_NAME: loop_len_8 in statement:
+    _1 = -loop_len_8;
+    during GIMPLE pass: vect
+    <source>:2:6: internal compiler error: verify_ssa failed
+    0x7f1b56331082 __libc_start_main
+            ???:0
+    Please submit a full bug report, with preprocessed source (by using -freport-bug).
+    Please include the complete backtrace with any bug report.
+    See <https://gcc.gnu.org/bugs/> for instructions.
+    Compiler returned: 1
+    
+    The root cause is we generate such IR in vectorization:
+    
+      _1 = -loop_len_8;
+      vect_cst__11 = {_1, _1};
+      _18 = vect_vec_iv_.6_14 + vect_cst__11;
+    
+    loop_len_8 is uninitialized value.
+    
+    The IR _18 = vect_vec_iv_.6_14 + vect_cst__11; is generated because of we are adding induction variable with
+    the result of SELECT_VL instead of VF.
+    
+    The code is:
+    
+      else if (LOOP_VINFO_USING_SELECT_VL_P (loop_vinfo))
+        {
+          /* When we're using loop_len produced by SELEC_VL, the non-final
+             iterations are not always processing VF elements.  So vectorize
+             induction variable instead of
+    
+               _21 = vect_vec_iv_.6_22 + { VF, ... };
+    
+             We should generate:
+    
+               _35 = .SELECT_VL (ivtmp_33, VF);
+               vect_cst__22 = [vec_duplicate_expr] _35;
+               _21 = vect_vec_iv_.6_22 + vect_cst__22;  */
+          gcc_assert (!slp_node);
+          gimple_seq seq = NULL;
+          vec_loop_lens *lens = &LOOP_VINFO_LENS (loop_vinfo);
+          tree len = vect_get_loop_len (loop_vinfo, NULL, lens, 1, vectype, 0, 0);
+          expr = force_gimple_operand (fold_convert (TREE_TYPE (step_expr),
+                                                     unshare_expr (len)),
+                                       &seq, true, NULL_TREE);
+          new_name = gimple_build (&seq, MULT_EXPR, TREE_TYPE (step_expr), expr,
+                                   step_expr);
+          gsi_insert_seq_before (&si, seq, GSI_SAME_STMT);
+          step_iv_si = &si;
+        }
+    
+    LOOP_VINFO_USING_SELECT_VL_P is set before loop vectorization analysis so we don't know whether it is partial
+    vectorization or not but the induction variable depends on SELECT_VL_P is true.
+    
+    So update SELECT_VL_P as false when it is not partial vectorization.PR middle-end/112554gcc/ChangeLog:
+    
+            * tree-vect-loop.cc (vect_determine_partial_vectors_and_peeling):
+            Clear SELECT_VL_P for non-partial vectorization.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/pr112554.c: New test.
+
+- User: Richard Biener | Time: 2023-11-16 07:32:14 UTC
+  Text: Fixed.
+

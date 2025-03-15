@@ -1,0 +1,267 @@
+Bug Summary: [13 Regression] ICE: RTL check: expected code 'reg', have 'subreg' in rhs_regno, at rtl.h:1932 when building libgcc on riscv64
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: build, ice-checking, ice-on-valid-code
+Known to Work: 
+Known to Fail: 13.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-03-10 17:32:26 UTC
+  Text: $ cat testcase.c 
+void foo(int i) {}
+
+$ /repo/build-gcc-trunk-riscv64/./gcc/cc1 -mabi=lp64d -march=rv64imafdc testcase.c -quiet
+during RTL pass: vregs
+testcase.c: In function 'foo':
+testcase.c:1:18: internal compiler error: RTL check: expected code 'reg', have 'subreg' in rhs_regno, at rtl.h:1932
+    1 | void foo(int i) {}
+      |                  ^
+0x7a0e7d rtl_check_failed_code1(rtx_def const*, rtx_code, char const*, int, char const*)
+        /repo/gcc-trunk/gcc/rtl.cc:916
+0x93b82e rhs_regno(rtx_def const*)
+        /repo/gcc-trunk/gcc/rtl.h:1932
+0x958236 rhs_regno(rtx_def const*)
+        /repo/gcc-trunk/gcc/config/riscv/pic.md:87
+0x958236 recog_17
+        /repo/gcc-trunk/gcc/config/riscv/riscv.md:1750
+0x1ac76aa recog_174
+        /repo/gcc-trunk/gcc/config/riscv/vector-iterators.md:326
+0xb527dc recog_memoized(rtx_insn*)
+        /repo/gcc-trunk/gcc/recog.h:273
+0xfdff84 extract_insn(rtx_insn*)
+        /repo/gcc-trunk/gcc/recog.cc:2789
+0xd111ff instantiate_virtual_regs_in_insn
+        /repo/gcc-trunk/gcc/function.cc:1611
+0xd111ff instantiate_virtual_regs
+        /repo/gcc-trunk/gcc/function.cc:1985
+0xd111ff execute
+        /repo/gcc-trunk/gcc/function.cc:2034
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+
+Currently build with RTL checking enabled for the riscv64-unknown-linux-gnu target fails.
+
+- User: Andrew Pinski | Time: 2023-03-10 17:37:07 UTC
+  Text: (define_insn "*movsi_internal"
+  [(set (match_operand:SI 0 "nonimmediate_operand" "=r,r,r, m,  *f,*f,*r,*m,r")
+        (match_operand:SI 1 "move_operand"         " r,T,m,rJ,*r*J,*m,*f,*f,vp"))]
+  "(register_operand (operands[0], SImode)
+    || reg_or_0_operand (operands[1], SImode))
+    && !(register_operand (operands[1], SImode)
+         && REGNO (operands[1]) == VL_REGNUM)"
+  { return riscv_output_move (operands[0], operands[1]); }
+  [(set_attr "move_type" "move,const,load,store,mtc,fpload,mfc,fpstore,rdvlenb")
+   (set_attr "mode" "SI")
+   (set_attr "ext" "base,base,base,base,f,f,f,f,vector")])
+
+
+The issue is register_operand accepts subreg but then REGNO is checked on it.
+That is obviously wrong. It should be "REG_P (operands[1]) && REGNO (operands[1]) == VL_REGNUM" instead ...
+
+- User: Uroš Bizjak | Time: 2023-03-13 10:03:13 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> The issue is register_operand accepts subreg but then REGNO is checked on it.
+> That is obviously wrong. It should be "REG_P (operands[1]) && REGNO
+> (operands[1]) == VL_REGNUM" instead ...reg_or_subregno is better.
+
+- User: Jakub Jelinek | Time: 2023-03-13 17:01:37 UTC
+  Text: In this case that would be certainly better, because if the intent is to never match for 
+move from vl register, then even subreg of vl would be a vl register and so if it punted just on moves from vl REG and not SUBREG thereof, after reload it could get vl REG from the SUBREG and fail at that point.
+Note, *zero_extendsidi2_internal uses the #c1 way...
+
+- User: Jeffrey A. Law | Time: 2023-03-14 18:12:29 UTC
+  Text: Also note there's an unsafe REGNO in peephole.md as well. Slightly different in form, but still unprotected and thus for well crafted inputs could probably cause an ICE or incorrect codegen (in a non-checking compiler).
+
+- User: Uroš Bizjak | Time: 2023-03-14 18:30:37 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #2)> (In reply to Andrew Pinski fromcomment #1)
+> 
+> > The issue is register_operand accepts subreg but then REGNO is checked on it.
+> > That is obviously wrong. It should be "REG_P (operands[1]) && REGNO
+> > (operands[1]) == VL_REGNUM" instead ...
+> 
+> reg_or_subregno is better.However, please note that reg_or_subregno asserts that we always have SUBREG of REG:
+
+unsigned int
+reg_or_subregno (const_rtx reg)
+{
+  if (GET_CODE (reg) == SUBREG)
+    reg = SUBREG_REG (reg);
+  gcc_assert (REG_P (reg));
+  return REGNO (reg);
+}
+
+but before reload register_operand allows SUBREG of MEM:
+
+bool
+register_operand (rtx op, machine_mode mode)
+{
+  if (GET_CODE (op) == SUBREG)
+    {
+      rtx sub = SUBREG_REG (op);
+
+      /* Before reload, we can allow (SUBREG (MEM...)) as a register operand
+	 because it is guaranteed to be reloaded into one.
+	 Just make sure the MEM is valid in itself.
+	 (Ideally, (SUBREG (MEM)...) should not exist after reload,
+	 but currently it does result from (SUBREG (REG)...) where the
+	 reg went on the stack.)  */
+      if (!REG_P (sub) && (reload_completed || !MEM_P (sub)))
+	return false;
+    }
+  else if (!REG_P (op))
+    return false;
+  return general_operand (op, mode);
+}
+
+OTOH, we do have:
+
+rtlanal.h:const unsigned int MEM_REGNO = ~0U;
+
+which implies that it is possible to get a REGNO of a MEM, so perhaps the assert in reg_or_subregno is too strict.
+
+- User: JuzheZhong | Time: 2023-03-15 01:53:34 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #5)> (In reply to Uroš Bizjak fromcomment #2)
+> > (In reply to Andrew Pinski fromcomment #1)
+> > 
+> > > The issue is register_operand accepts subreg but then REGNO is checked on it.
+> > > That is obviously wrong. It should be "REG_P (operands[1]) && REGNO
+> > > (operands[1]) == VL_REGNUM" instead ...
+> > 
+> > reg_or_subregno is better.
+> 
+> However, please note that reg_or_subregno asserts that we always have SUBREG
+> of REG:
+> 
+> unsigned int
+> reg_or_subregno (const_rtx reg)
+> {
+>   if (GET_CODE (reg) == SUBREG)
+>     reg = SUBREG_REG (reg);
+>   gcc_assert (REG_P (reg));
+>   return REGNO (reg);
+> }
+> 
+> but before reload register_operand allows SUBREG of MEM:
+> 
+> bool
+> register_operand (rtx op, machine_mode mode)
+> {
+>   if (GET_CODE (op) == SUBREG)
+>     {
+>       rtx sub = SUBREG_REG (op);
+> 
+>       /* Before reload, we can allow (SUBREG (MEM...)) as a register operand
+> 	 because it is guaranteed to be reloaded into one.
+> 	 Just make sure the MEM is valid in itself.
+> 	 (Ideally, (SUBREG (MEM)...) should not exist after reload,
+> 	 but currently it does result from (SUBREG (REG)...) where the
+> 	 reg went on the stack.)  */
+>       if (!REG_P (sub) && (reload_completed || !MEM_P (sub)))
+> 	return false;
+>     }
+>   else if (!REG_P (op))
+>     return false;
+>   return general_operand (op, mode);
+> }
+> 
+> OTOH, we do have:
+> 
+> rtlanal.h:const unsigned int MEM_REGNO = ~0U;
+> 
+> which implies that it is possible to get a REGNO of a MEM, so perhaps the
+> assert in reg_or_subregno is too strict.VL_REGNUM will never be used as (subreg:(reg:VL_REGNUM))
+It's always used as (reg:VL_REGNUM).
+
+So I think the !(REG_P (operands[1]) && REGNO (operands[1]) == VL_REGNUM)
+is enough. I will send a patch to fix it.
+
+- User: GCC Commits | Time: 2023-03-17 09:50:10 UTC
+  Text: The master branch has been updated by Kito Cheng <kito@gcc.gnu.org>:https://gcc.gnu.org/g:02880e7803b19c357718abd2f0d567b4a761f318commitr13-6733-g02880e7803b19c357718abd2f0d567b4a761f318Author: Ju-Zhe Zhong <juzhe.zhong@rivai.ai>
+Date:   Mon Mar 13 22:17:57 2023 +0800
+
+    RISC-V: Use reg_or_subregno to check regno [PR109092]
+    
+    gcc/ChangeLog:PR target/109092* config/riscv/riscv.md: Fix subreg bug.
+
+- User: Andrew Pinski | Time: 2023-03-27 07:44:27 UTC
+  Text: Fixed.
+
+- User: GCC Commits | Time: 2024-01-22 12:55:29 UTC
+  Text: The trunk branch has been updated by Lehua Ding <lhtin@gcc.gnu.org>:https://gcc.gnu.org/g:f625c017e60b6e05675b7d6280f2c7677ce691c3commitr14-8333-gf625c017e60b6e05675b7d6280f2c7677ce691c3Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Mon Jan 22 17:05:07 2024 +0800
+
+    RISC-V: Fix regressions due to 86de9b66480b710202a2898cf513db105d8c432f
+    
+    This patch fixes the recent regression:
+    
+    FAIL: gcc.dg/torture/float32-tg-2.c   -O1  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/float32-tg-2.c   -O1  (test for excess errors)
+    FAIL: gcc.dg/torture/float32-tg-2.c   -O2  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/float32-tg-2.c   -O2  (test for excess errors)
+    FAIL: gcc.dg/torture/float32-tg-2.c   -O2 -flto -fno-use-linker-plugin -flto-partition=none  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/float32-tg-2.c   -O2 -flto -fno-use-linker-plugin -flto-partition=none  (test for excess errors)
+    FAIL: gcc.dg/torture/float32-tg-2.c   -O2 -flto -fuse-linker-plugin -fno-fat-lto-objects  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/float32-tg-2.c   -O2 -flto -fuse-linker-plugin -fno-fat-lto-objects  (test for excess errors)
+    FAIL: gcc.dg/torture/float32-tg-2.c   -O3 -g  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/float32-tg-2.c   -O3 -g  (test for excess errors)
+    FAIL: gcc.dg/torture/float32-tg-2.c   -Os  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/float32-tg-2.c   -Os  (test for excess errors)
+    FAIL: gcc.dg/torture/float32-tg.c   -O1  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/float32-tg.c   -O1  (test for excess errors)
+    FAIL: gcc.dg/torture/float32-tg.c   -O2  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/float32-tg.c   -O2  (test for excess errors)
+    FAIL: gcc.dg/torture/float32-tg.c   -O2 -flto -fno-use-linker-plugin -flto-partition=none  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/float32-tg.c   -O2 -flto -fno-use-linker-plugin -flto-partition=none  (test for excess errors)
+    FAIL: gcc.dg/torture/float32-tg.c   -O2 -flto -fuse-linker-plugin -fno-fat-lto-objects  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/float32-tg.c   -O2 -flto -fuse-linker-plugin -fno-fat-lto-objects  (test for excess errors)
+    FAIL: gcc.dg/torture/float32-tg.c   -O3 -g  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/float32-tg.c   -O3 -g  (test for excess errors)
+    FAIL: gcc.dg/torture/float32-tg.c   -Os  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/float32-tg.c   -Os  (test for excess errors)
+    FAIL: gcc.dg/torture/pr48124-4.c   -O1  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/pr48124-4.c   -O1  (test for excess errors)
+    FAIL: gcc.dg/torture/pr48124-4.c   -O2  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/pr48124-4.c   -O2  (test for excess errors)
+    FAIL: gcc.dg/torture/pr48124-4.c   -O2 -flto -fno-use-linker-plugin -flto-partition=none  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/pr48124-4.c   -O2 -flto -fno-use-linker-plugin -flto-partition=none  (test for excess errors)
+    FAIL: gcc.dg/torture/pr48124-4.c   -O2 -flto -fuse-linker-plugin -fno-fat-lto-objects  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/pr48124-4.c   -O2 -flto -fuse-linker-plugin -fno-fat-lto-objects  (test for excess errors)
+    FAIL: gcc.dg/torture/pr48124-4.c   -O3 -fomit-frame-pointer -funroll-loops -fpeel-loops -ftracer -finline-functions  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/pr48124-4.c   -O3 -fomit-frame-pointer -funroll-loops -fpeel-loops -ftracer -finline-functions  (test for excess errors)
+    FAIL: gcc.dg/torture/pr48124-4.c   -O3 -g  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/pr48124-4.c   -O3 -g  (test for excess errors)
+    FAIL: gcc.dg/torture/pr48124-4.c   -Os  (internal compiler error: in reg_or_subregno, at jump.cc:1895)
+    FAIL: gcc.dg/torture/pr48124-4.c   -Os  (test for excess errors)
+    
+    due to commit 86de9b66480b710202a2898cf513db105d8c432f.
+    
+    The root cause is register_operand and reg_or_subregno are consistent so we reach the assertion fail.
+    
+    We shouldn't worry about subreg:...VL_REGNUM since it's impossible that we can have such situation,
+    that is, we only have (set (reg) (reg:VL_REGNUM)) which generate "csrr vl" ASM for first fault load instructions (vleff).
+    So, using REG_P and REGNO must be totally solid and robostic.
+    
+    Since we don't allow VL_RENUM involved into register allocation and we don't have such constraint, we always use this
+    following pattern to generate "csrr vl" ASM:
+    
+    (define_insn "read_vlsi"
+      [(set (match_operand:SI 0 "register_operand" "=r")
+            (reg:SI VL_REGNUM))]
+      "TARGET_VECTOR"
+      "csrr\t%0,vl"
+      [(set_attr "type" "rdvl")
+       (set_attr "mode" "SI")])
+    
+    So the check in riscv.md is to disallow such situation fall into move pattern in riscv.md
+    
+    Tested on both RV32/RV64 no regression.PR target/109092gcc/ChangeLog:
+    
+            * config/riscv/riscv.md: Use reg instead of subreg.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/base/pr109092.c: New test.
+

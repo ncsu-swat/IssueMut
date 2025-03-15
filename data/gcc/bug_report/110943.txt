@@ -1,0 +1,133 @@
+Bug Summary: RISC-V: vmv.v.x and vmv.s.x pattern combine error
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Lehua Ding | Time: 2023-08-08 09:36:40 UTC
+  Text: Consider this code (https://godbolt.org/z/TKoqjxTPh):
+
+```c
+#include <riscv_vector.h>
+
+void foo9 (void *base, void *out, size_t vl)
+{
+    int64_t scalar = *(int64_t*)(base + 100);
+    vint64m2_t v = __riscv_vmv_v_x_i64m2 (0, 1);
+    *(vint64m2_t*)out = v;
+}
+```
+
+the asm of GCC:
+
+```asm
+foo9:
+        vsetvli a5,zero,e64,m2,ta,ma
+        vmv.v.i v2,0
+        vsetivli        zero,1,e64,m2,ta,ma
+        vse64.v v2,0(a1)
+        ret
+
+```
+
+the asm of LLVM:
+
+```asm
+foo9:                                   # @foo9
+        vsetivli        zero, 1, e64, m2, ta, ma
+        vmv.v.i v8, 0
+        vs2r.v  v8, (a1)
+        ret
+```
+
+I think the GCC changes the semantics of full store `*(vint64m2_t*)out = v;`.If there is a memory exception when storing the second element of v, then LLVM's code will cause but GCC's code doesn't.
+
+Confirmed on GCC 13.2.0 and Trunk.
+
+- User: GCC Commits | Time: 2023-08-29 02:34:35 UTC
+  Text: The trunk branch has been updated by Lehua Ding <lhtin@gcc.gnu.org>:https://gcc.gnu.org/g:973eb0deb467c79cc21f265a710a81054cfd3e8ccommitr14-3535-g973eb0deb467c79cc21f265a710a81054cfd3e8cAuthor: Lehua Ding <lehua.ding@rivai.ai>
+Date:   Tue Aug 29 09:54:22 2023 +0800
+
+    RISC-V: Fix error combine of pred_mov pattern
+    
+    This patch fixPR110943which will produce some error code. This is because
+    the error combine of some pred_mov pattern. Consider this code:
+    
+    ```
+    
+    void foo9 (void *base, void *out, size_t vl)
+    {
+        int64_t scalar = *(int64_t*)(base + 100);
+        vint64m2_t v = __riscv_vmv_v_x_i64m2 (0, 1);
+        *(vint64m2_t*)out = v;
+    }
+    ```
+    
+    RTL before combine pass:
+    
+    ```
+    (insn 11 10 12 2 (set (reg/v:RVVM2DI 134 [ v ])
+            (if_then_else:RVVM2DI (unspec:RVVMF32BI [
+                        (const_vector:RVVMF32BI repeat [
+                                (const_int 1 [0x1])
+                            ])
+                        (const_int 1 [0x1])
+                        (const_int 2 [0x2]) repeated x2
+                        (const_int 0 [0])
+                        (reg:SI 66 vl)
+                        (reg:SI 67 vtype)
+                    ] UNSPEC_VPREDICATE)
+                (const_vector:RVVM2DI repeat [
+                        (const_int 0 [0])
+                    ])
+                (unspec:RVVM2DI [
+                        (reg:SI 0 zero)
+                    ] UNSPEC_VUNDEF))) "/app/example.c":6:20 1089 {pred_movrvvm2di})
+    (insn 14 13 0 2 (set (mem:RVVM2DI (reg/v/f:DI 136 [ out ]) [1 MEM[(vint64m2_t *)out_4(D)]+0 S[32, 32] A128])
+            (reg/v:RVVM2DI 134 [ v ])) "/app/example.c":7:23 717 {*movrvvm2di_whole})
+    ```
+    
+    RTL after combine pass:
+    ```
+    (insn 14 13 0 2 (set (mem:RVVM2DI (reg:DI 138) [1 MEM[(vint64m2_t *)out_4(D)]+0 S[32, 32] A128])
+            (if_then_else:RVVM2DI (unspec:RVVMF32BI [
+                        (const_vector:RVVMF32BI repeat [
+                                (const_int 1 [0x1])
+                            ])
+                        (const_int 1 [0x1])
+                        (const_int 2 [0x2]) repeated x2
+                        (const_int 0 [0])
+                        (reg:SI 66 vl)
+                        (reg:SI 67 vtype)
+                    ] UNSPEC_VPREDICATE)
+                (const_vector:RVVM2DI repeat [
+                        (const_int 0 [0])
+                    ])
+                (unspec:RVVM2DI [
+                        (reg:SI 0 zero)
+                    ] UNSPEC_VUNDEF))) "/app/example.c":7:23 1089 {pred_movrvvm2di})
+    ```
+    
+    This combine change the semantics of insn 14. I split @pred_mov pattern and
+    restrict the conditon of @pred_mov.PR target/110943gcc/ChangeLog:
+    
+            * config/riscv/predicates.md (vector_const_int_or_double_0_operand):
+            New predicate.
+            * config/riscv/riscv-vector-builtins.cc (function_expander::function_expander):
+            force_reg mem target operand.
+            * config/riscv/vector.md (@pred_mov<mode>): Wrapper.
+            (*pred_mov<mode>): Remove imm -> reg pattern.
+            (*pred_broadcast<mode>_imm): Add imm -> reg pattern.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/base/zvfhmin-intrinsic.c: Adjust.
+            * gcc.target/riscv/rvv/base/pr110943.c: New test.
+
+- User: Lehua Ding | Time: 2023-08-29 02:38:39 UTC
+  Text: Fixed.
+

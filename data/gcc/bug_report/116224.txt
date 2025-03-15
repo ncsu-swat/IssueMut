@@ -1,0 +1,179 @@
+Bug Summary: wrong code with _BitInt() division at -O1 and above (breaks in ccp2?)
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 14.2.1, 15.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-08-04 08:05:52 UTC
+  Text: Createdattachment 58819[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -O testcase.c
+$ ./a.out 
+Aborted
+
+The .ccp2 dump shows:
+...
+Folded into: _8 = b.0_6 / -15;
+
+Folding statement: _9 = -15;
+Queued stmt for removal.  Folds to: -15
+Folding statement: _10 = _8 / _9;
+Queued stmt for removal.  Folds to: 0
+...
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r15-2706-20240803001855-gdb9834aead7-checking-yes-rtl-df-extra-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r15-2706-20240803001855-gdb9834aead7-checking-yes-rtl-df-extra-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 15.0.0 20240803 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2024-08-05 09:04:07 UTC
+  Text: This needs to be
+signed char g;
+
+int
+foo (signed char c, int i, _BitInt(65) b)
+{
+  __builtin_memmove (&g, &b, 1);
+  return b / i / c;
+}
+
+int
+main ()
+{
+  int x = foo (-15, -15, 900);
+  if (x != 4)
+    __builtin_abort ();
+}
+
+because you are relying on the char being signed.
+
+- User: Zdenek Sojka | Time: 2024-08-05 09:16:14 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #1)> This needs to be
+> signed char g;
+> 
+> int
+> foo (signed char c, int i, _BitInt(65) b)
+> {
+>   __builtin_memmove (&g, &b, 1);
+>   return b / i / c;
+> }
+> 
+> int
+> main ()
+> {
+>   int x = foo (-15, -15, 900);
+>   if (x != 4)
+>     __builtin_abort ();
+> }
+> 
+> because you are relying on the char being signed.Thank you for reminding me of this; with the original testcase:
+$ aarch64-unknown-linux-gnu-gcc testcase.c -static -O0 -fsigned-char && ./a.out 
+$ aarch64-unknown-linux-gnu-gcc testcase.c -static -O0 -funsigned-char && ./a.out 
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted
+$ aarch64-unknown-linux-gnu-gcc testcase.c -static -O1 -fsigned-char && ./a.out 
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted
+$ aarch64-unknown-linux-gnu-gcc testcase.c -static -O1 -funsigned-char && ./a.out 
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted
+
+it fails with -fsigned-char as well (and of course with your fixed testcase).
+
+But I might have missed something again.
+
+- User: Jakub Jelinek | Time: 2024-08-05 09:52:53 UTC
+  Text: This feels like a bug in mul_internal, when trying to evaluate wi::mul of (_BitInt(65)) -15 times (_BitInt(65)) -15 it computes the right result (225) but sets *overflow to wi::OVF_UNKNOWN.
+
+- User: Jakub Jelinek | Time: 2024-08-05 14:10:53 UTC
+  Text: Createdattachment 58841[details]gcc15-pr116224.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-08-06 09:10:48 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:69093fd8aa682a1b906e80b3c5f10956e692b7c4commitr15-2752-g69093fd8aa682a1b906e80b3c5f10956e692b7c4Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Aug 6 11:09:33 2024 +0200
+
+    wide-int: Fix up mul_internal overflow checking [PR116224]
+    
+    The following testcase is miscompiled, because wi::mul for (_BitInt(65))-15
+    times (_BitInt(65))-15 computes the right value (_BitInt(65))225, but
+    sets *overflow to wi::OVF_UNKNOWN as that it overflowed when it didn't.
+    
+    Even signed operands are unpacked as unsigned but because they are
+    implicitly sign-extended from the represented value (the operands
+    obviously have len==1), we get
+    0xfffffff1, 0xffffffff, 0x1, 0x0
+    in both u and v (0x1 because that is exactly 65 bits).
+    We then multiply these.  Next step is because both the high and
+    overflow handling expects the high half to start at a limb boundary
+    the bits of the result starting with bit 65 are shifted up by 63 such
+    that the bits relevant for high/need_overflow start at the half of the
+    4th half wide int limb.
+    Because both operands are negative that part is then adjusted.
+    
+    The reason mul_internal says there is overflow is because of the unspecified
+    garbage in the most significant bits of the result which the adjusting
+    doesn't clean up.  65 bit multiplication needs 65 bits of result and 65 bits
+    of the high part, can't produce more, so the following patch fixes it by
+    checking for the overflow only in those first 65 bits of the high part, not
+    anything beyond that.  If it was a highpart multiply, we'd have ignored that
+    as well (canonicalized).
+    
+    2024-08-06  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/116224* wide-int.cc (wi::mul_internal): If prec isn't multiple of
+            HOST_BITS_PER_WIDE_INT, for need_overflow checking only look at
+            the least significant prec bits starting with r[half_blocks_needed].
+    
+            * gcc.dg/torture/bitint-72.c: New test.
+
+- User: GCC Commits | Time: 2024-08-06 09:19:11 UTC
+  Text: The releases/gcc-14 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:f2b5ca6be855cede3f0d35d2a1aff08d3c342ac2commitr14-10567-gf2b5ca6be855cede3f0d35d2a1aff08d3c342ac2Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Aug 6 11:09:33 2024 +0200
+
+    wide-int: Fix up mul_internal overflow checking [PR116224]
+    
+    The following testcase is miscompiled, because wi::mul for (_BitInt(65))-15
+    times (_BitInt(65))-15 computes the right value (_BitInt(65))225, but
+    sets *overflow to wi::OVF_UNKNOWN as that it overflowed when it didn't.
+    
+    Even signed operands are unpacked as unsigned but because they are
+    implicitly sign-extended from the represented value (the operands
+    obviously have len==1), we get
+    0xfffffff1, 0xffffffff, 0x1, 0x0
+    in both u and v (0x1 because that is exactly 65 bits).
+    We then multiply these.  Next step is because both the high and
+    overflow handling expects the high half to start at a limb boundary
+    the bits of the result starting with bit 65 are shifted up by 63 such
+    that the bits relevant for high/need_overflow start at the half of the
+    4th half wide int limb.
+    Because both operands are negative that part is then adjusted.
+    
+    The reason mul_internal says there is overflow is because of the unspecified
+    garbage in the most significant bits of the result which the adjusting
+    doesn't clean up.  65 bit multiplication needs 65 bits of result and 65 bits
+    of the high part, can't produce more, so the following patch fixes it by
+    checking for the overflow only in those first 65 bits of the high part, not
+    anything beyond that.  If it was a highpart multiply, we'd have ignored that
+    as well (canonicalized).
+    
+    2024-08-06  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/116224* wide-int.cc (wi::mul_internal): If prec isn't multiple of
+            HOST_BITS_PER_WIDE_INT, for need_overflow checking only look at
+            the least significant prec bits starting with r[half_blocks_needed].
+    
+            * gcc.dg/torture/bitint-72.c: New test.
+    
+    (cherry picked from commit 69093fd8aa682a1b906e80b3c5f10956e692b7c4)
+
+- User: Jakub Jelinek | Time: 2024-09-02 13:38:15 UTC
+  Text: Fixed.
+

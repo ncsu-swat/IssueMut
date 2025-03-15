@@ -1,0 +1,140 @@
+Bug Summary: [14 Regression] Wrong code at -O3 on x86_64-linux-gnu since r14-2944-g3d48c11ad08
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Shaohua Li | Time: 2023-08-12 07:02:33 UTC
+  Text: gcc at -O3 produces the wrong code.
+
+Bisected tor14-2944-g3d48c11ad08Compiler explorer:https://godbolt.org/z/b67W17Gvb$ cat a.c
+int printf(const char *, ...);
+long a = 68;
+int b, d, e;
+int main() {
+  for (; d <= 6; d++) {
+    b = 0;
+    for (; b <= 6; b++) {
+      int c = a;
+      e = c >= 32 || d > 647 >> c ? d : 0;
+    }
+  }
+  printf("%d\n", e);
+}
+$
+$ gcc -O0 a.c &&./a.out
+6
+$ gcc -O3 a.c && ./a.out
+4
+$
+
+- User: Andrew Pinski | Time: 2023-08-13 18:20:07 UTC
+  Text: Confirmed, changed to make it self contained testcase and maybe understand what is going wrong:
+```
+int printf(const char *, ...);
+volatile int a = 68;
+int b, d, e;
+int main() {
+  int t = a;
+  for (; d <= 6; d++) {
+    for (b = 0; b <= 6; b++) {
+      if (t >= 31)
+        e = d;
+      else if (d > (647 >> t))
+        e = d;
+      else
+        e = 0;
+    }
+  }
+  printf("%d\n", e);
+  if (e != 6)
+    __builtin_abort();
+}
+```
+
+- User: Richard Biener | Time: 2023-08-14 08:34:21 UTC
+  Text: we are computing 647 >> t even when that would invoke undefined behavior (but LIM does this already).  Disabling either loop splitting or final value replacement avoids the miscompile.
+
+The only "interesting" replacement is the PHI defining the guard of the
+second loop, thus 'd' after the first loop:
+
+final value replacement:
+  _54 = PHI <_4(10)>
+ with expr: (d.6_22 + 1) + (d.6_22 <= _53 ? (int) ((unsigned int) _53 - (unsigned int) d.6_22) : 0)
+ final stmt:
+  _54 = _67 + _73;
+
+d.6_22 is 'd' at the start of the program, _53 is the loop split adjusted
+exit test value, MIN (647 >> t, 7 - (d + 1)).
+
+When disabling vectorization we instead get
+
+0
+Aborted (core dumped)
+
+likewise when disabling unswitching.  When disabling early invariant motion
+splitting is disabled.  Changing the test to the following, avoiding the
+undefined behavior resolves the miscompile.
+
+int printf(const char *, ...);
+volatile int a = 31;
+int b, d, e;
+int main()
+{
+  int t = a;
+  for (; d <= 6; d++) {
+      for (b = 0; b <= 6; b++) {
+          if (t >= 30)
+            e = d;
+          else if (d > (647 >> t))
+            e = d;
+          else
+            e = 0;
+      }
+  }
+  printf("%d\n", e);
+  if (e != 6)
+    __builtin_abort();
+}
+
+so in the end I think we see the effect of hoisting the shift and then
+involving it in a complex computation + comparison, eventually enabling
+folding that's "invalid" (taking advantage of the undefined behavior).
+
+I will need to see to avoid hoisting shifts (we already rewrite undefined
+signed overflow to unsigned arithmetic).  Unfortunately there's no "safe"
+way to write shifts without adding computation (but maybe we should do
+that, rewrite it to 647 >> min (t, 31)).
+
+- User: GCC Commits | Time: 2023-10-20 11:20:16 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:d118738e71cf4615f170fff8dabe66442206d008commitr14-4786-gd118738e71cf4615f170fff8dabe66442206d008Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Oct 20 11:54:07 2023 +0200
+
+    tree-optimization/111000 - restrict invariant motion of shifts
+    
+    The following restricts moving variable shifts to when they are
+    always executed in the loop as we currently do not have an efficient
+    way to rewrite them to something that is unconditionally
+    well-defined and value range analysis will otherwise compute
+    invalid ranges for the shift operand.PR tree-optimization/111000* stor-layout.h (element_precision): Move ..
+            * tree.h (element_precision): .. here.
+            * tree-ssa-loop-im.cc (movement_possibility_1): Restrict
+            motion of shifts and rotates.
+    
+            * gcc.dg/torture/pr111000.c: New testcase.
+
+- User: Richard Biener | Time: 2023-10-20 11:20:37 UTC
+  Text: Fixed, the issue is latent though.
+
+- User: GCC Commits | Time: 2023-11-13 12:40:54 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:a0b2abef4e62d816f669df478a3cc320647c3b31commitr14-5391-ga0b2abef4e62d816f669df478a3cc320647c3b31Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Nov 13 13:38:57 2023 +0100
+
+    tree-optimization/111792 - new testcase
+    
+    This was fixed as part of thePR111000fix.PR tree-optimization/111792PR tree-optimization/111000* gcc.dg/torture/pr111792.c: New testcase.
+

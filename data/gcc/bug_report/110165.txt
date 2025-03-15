@@ -1,0 +1,207 @@
+Bug Summary: [13 Regression] wrong code with signed 1 bit integers sometimes since r13-4459-g6508d5e5a1a8
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 13.1.1, 14.0
+Known to Fail: 13.1.0
+
+Comments:
+- User: Andrew Pinski | Time: 2023-06-07 23:27:40 UTC
+  Text: Full testcase:
+````
+struct s
+{
+  int t : 1;
+};
+
+[[gnu::noipa]]
+int f(struct s t, int a, int b)
+{
+        int bd = t.t;
+        if (bd) a|=b;
+        return a;
+}
+
+int main(void)
+{
+        struct s t;
+        for(int i = 0;i <= 1; i++)
+        {
+                int a = 0x10;
+                int b = 0x0f;
+                int c = a | b;
+                int r = f((struct s){i}, a, b);
+                int exp = i == 1 ? a | b : a;
+                if (exp != r)
+                 __builtin_abort();
+        }
+}
+```
+
+Found while improving these match patterns.
+
+- User: Andrew Pinski | Time: 2023-06-08 01:24:53 UTC
+  Text: This will fix the issue:
+/* (zero_one == 0) ? y : z <op> y -> ((typeof(y))zero_one * z) <op> y */
+(for op (bit_xor bit_ior plus)
+ (simplify
+  (cond (eq@3 zero_one_valued_p@0
+            integer_zerop)
+        @1
+        (op:c @2 @1))
+  (if (INTEGRAL_TYPE_P (type)
+       && TYPE_PRECISION (type) > 1
+       && (INTEGRAL_TYPE_P (TREE_TYPE (@0))))
+       (op (mult (convert:type @3) @2) @1))))
+
+/* (zero_one != 0) ? z <op> y : y -> ((typeof(y))zero_one * z) <op> y */
+(for op (bit_xor bit_ior plus)
+ (simplify
+  (cond (ne@3 zero_one_valued_p@0
+            integer_zerop)
+       (op:c @2 @1)
+        @1)
+  (if (INTEGRAL_TYPE_P (type)
+       && TYPE_PRECISION (type) > 1
+       && (INTEGRAL_TYPE_P (TREE_TYPE (@0))))
+       (op (mult (convert:type @3) @2) @1))))
+
+Though it could be improved better. maybe convert followed by & 1 and still @0 rather than @3. still deciding.
+
+- User: Andrew Pinski | Time: 2023-06-08 01:52:23 UTC
+  Text: This produces better gimple:
+```
+/* (zero_one == 0) ? y : z <op> y -> ((typeof(y))zero_one * z) <op> y */
+(for op (bit_xor bit_ior plus)
+ (simplify
+  (cond (eq zero_one_valued_p@0
+            integer_zerop)
+        @1
+        (op:c @2 @1))
+  (if (INTEGRAL_TYPE_P (type)
+       && TYPE_PRECISION (type) > 1
+       && (INTEGRAL_TYPE_P (TREE_TYPE (@0))))
+       (op (mult (bit_and (convert:type @0) { build_one_cst(type); }) @2) @1))))
+
+/* (zero_one != 0) ? z <op> y : y -> ((typeof(y))zero_one * z) <op> y */
+(for op (bit_xor bit_ior plus)
+ (simplify
+  (cond (ne zero_one_valued_p@0
+            integer_zerop)
+       (op:c @2 @1)
+        @1)
+  (if (INTEGRAL_TYPE_P (type)
+       && TYPE_PRECISION (type) > 1
+       && (INTEGRAL_TYPE_P (TREE_TYPE (@0))))
+       (op (mult (bit_and (convert:type @0) { build_one_cst(type); }) @2) @1))))
+```
+But it still has extra gimple produced for unsigned 1 bit field:
+```
+Folded into the sequence:
+_7 = (int) _1;
+_8 = (int) _1;
+_9 = b_5(D) * _8;
+_10 = a_4(D) | _9;
+statement un-sinked:
+a_6 = a_4(D) | b_5(D);
+Removing basic block 3
+;; basic block 3, loop depth 0
+;;  pred:       2
+;;  succ:       4
+
+
+Removing dead stmt:a_6 = a_4(D) | b_5(D);
+Removing dead stmt:_7 = (int) _1;
+```
+Maybe that is ok.
+
+For signed 1-bit this is produced:
+```
+Folded into the sequence:
+_7 = (int) _1;
+_8 = _7 & 1;
+_9 = b_5(D) * _8;
+_10 = a_4(D) | _9;
+statement un-sinked:
+a_6 = a_4(D) | b_5(D);
+Removing basic block 3
+;; basic block 3, loop depth 0
+;;  pred:       2
+;;  succ:       4
+
+
+Removing dead stmt:a_6 = a_4(D) | b_5(D);
+```
+
+I think this is the best I am going to get it.
+
+- User: Jakub Jelinek | Time: 2023-06-08 10:17:26 UTC
+  Text: If zero_one_valued_p is true for [-1, 0] valued cases, then it should be fixed.
+
+- User: Andrew Pinski | Time: 2023-06-08 13:39:27 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #3)> If zero_one_valued_p is true for [-1, 0] valued cases, then it should be
+> fixed.I think that is the right appoarch in the end, I will go and implement that.
+
+- User: Andrew Pinski | Time: 2023-06-08 20:49:29 UTC
+  Text: Createdattachment 55287[details]Patch for trunk
+
+Have the testcases but didn't add them to the patch.
+Will also Create the GCC 13 patch later today.
+
+- User: GCC Commits | Time: 2023-06-09 14:15:58 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:72e652f3425079259faa4edefe1dc571f72f91e0commitr14-1653-g72e652f3425079259faa4edefe1dc571f72f91e0Author: Andrew Pinski <apinski@marvell.com>
+Date:   Thu Jun 8 14:25:51 2023 -0700
+
+    MATCH: Fix zero_one_valued_p not to match signed 1 bit integers
+    
+    So for the attached testcase, we assumed that zero_one_valued_p would
+    be the value [0,1] but currently zero_one_valued_p matches also
+    signed 1 bit integers.
+    This changes that not to match that and fixes the 2 new testcases at
+    all optimization levels.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu with no regressions.
+    
+    Note the GCC 13 patch will be slightly different due to the changes
+    made to zero_one_valued_p.PR tree-optimization/110165PR tree-optimization/110166gcc/ChangeLog:
+    
+            * match.pd (zero_one_valued_p): Don't accept
+            signed 1-bit integers.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/execute/pr110165-1.c: New test.
+            * gcc.c-torture/execute/pr110166-1.c: New test.
+
+- User: Andrew Pinski | Time: 2023-06-09 14:18:33 UTC
+  Text: Fixed on the trunk will do a backport with the needed changes.
+
+- User: GCC Commits | Time: 2023-06-09 22:13:53 UTC
+  Text: The releases/gcc-13 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:682bbd364708fe371b8f34546d970051cdbbfd4ccommitr13-7434-g682bbd364708fe371b8f34546d970051cdbbfd4cAuthor: Andrew Pinski <apinski@marvell.com>
+Date:   Thu Jun 8 14:25:51 2023 -0700
+
+    MATCH: Fix zero_one_valued_p not to match signed 1 bit integers
+    
+    So for the attached testcase, we assumed that zero_one_valued_p would
+    be the value [0,1] but currently zero_one_valued_p matches also
+    signed 1 bit integers.
+    This changes that not to match that and fixes the 2 new testcases at
+    all optimization levels.
+    
+    OK for GCC 13? Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/110165PR tree-optimization/110166gcc/ChangeLog:
+    
+            * match.pd (zero_one_valued_p): Don't accept
+            signed 1-bit integers.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/execute/pr110165-1.c: New test.
+            * gcc.c-torture/execute/pr110166-1.c: New test.
+    
+    (cherry picked from commit 72e652f3425079259faa4edefe1dc571f72f91e0)
+
+- User: Andrew Pinski | Time: 2023-06-09 22:15:55 UTC
+  Text: Fixed.
+

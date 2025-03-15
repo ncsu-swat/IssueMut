@@ -1,0 +1,78 @@
+Issue Title: Extend -Wdangling to handle assignments, not just initializations
+Original Post: Currently, `-Wdangling`/`-Wdangling-gsl` detect the following:
+```cpp
+std::string foo() { return ""; }
+int main() {
+    std::string_view v = foo();  // error: object backing the pointer will be destroyed at the end of the full-expression [-Werror,-Wdangling-gsl]
+}
+```
+However, they fail to detect this case:
+```cpp
+std::string foo() { return ""; }
+int main() {
+    std::string_view v;
+    v = foo();  // no error
+}
+```
+It seems the compiler currently only handles initializations, not regular assignments, despite them posing the same issue. So it would be great to handle the second case as well.
+
+More generally, if a `lifetimebound` object is assigned to a non-temporary expression, then I believe it would be correct to issue the diagnostic.
+
+Comment by shafik: CC @Xazax-hun 
+Comment by Xazax-hun: +1, 100% agreed. In fact, MSVC's `/analyze` can warn about the code in the example. Unfortunately, I might not be able to work on this in the near future, but I am always happy to review PRs.
+Comment by shafik: > +1, 100% agreed. In fact, MSVC's `/analyze` can warn about the code in the example. Unfortunately, I might not be able to work on this in the near future, but I am always happy to review PRs.
+
+Do you think you could give pointers to what changes would be needed to support this?
+Comment by Xazax-hun: Sure!
+
+The current implementation is in `clang/lib/Sema/SemaInit.cpp`, one can follow the uses of `IndirectLocalPathEntry` around 
+ https://github.com/llvm/llvm-project/blob/main/clang/lib/Sema/SemaInit.cpp#L7207 to get an idea what is going on.
+
+Unfortunately, the code is somewhat convoluted in the name of performance. The check is done while the AST is being built, so lifetime extension, handling of `lifetimebound`, and the `-Wdangling-gsl` all interleaved with some other Sema stuff making the code somewhat harder to follow, and definitely harder to share between initialization and assignment. 
+
+I am not convinced that the potential performance benefits would worth the cost of complexity here, it might be better to factor the `lifetimebound` and `-Wdanlging-gsl` logic out to some common place and reuse it both for initialization and assignment. 
+
+As for where to put the check for the assignments, one could take a look at `Sema::CheckAssignmentOperands`, but I am not 100% confident whether that is the best place to do this sort of checking.
+Comment by frederick-vs-ja: Duplicate of #54492?
+Comment by Xazax-hun: #46984 also seems to be a duplicate of this.
+Comment by hokein: Dumping my thoughts on this. @Xazax-hun @usx95 @ilya-biryukov @kinu 
+
+The main case we aim to detect is when a pointer object is assigned to an owner object whose lifetime will end at the end of the full expression (still a statement-local analysis).
+
+The compiler needs to know whether a class behaves like a pointer or an owner, as the dangling warning only makes sense for pointer-like objects. The existing `gsl::Owner/gsl::Pointer` attribute seem appropriate for this purpose, and they are already applied to some common STL types (e.g., `std::string_view`) by clang implicitly.
+
+In C++, the assignment operator is a member function, and it can be defined explicitly by users or implicitly by the compiler. Based on the type of `RHS`, we have two major cases to cover in the implementation:
+
+1. **RHS has the pointer-like type:** 
+   - Example: `IntPointer& IntPointer::operator=(const IntPointer& RHS)`
+   - Analogy: assignment between pointers, where both point to the same owner object. When the owner object is destroyed, both are considered to be dangling.
+   
+2. **RHS has the owner-like type:** 
+   - Example: `IntPointer& IntPointer::operator=(const IntOwner& RHS)`
+   - Analogy: assigning the address of an owner object to a pointer.
+
+Supporting 1) is sufficient to detect the common `std::string_view` case:
+
+```cpp
+std::string foo() { return ""; }
+int main() {
+    std::string_view v;
+    // On the RHS of the assignment, we have:
+    // - a temporary object `std::string` (the result of function `foo()` call)
+    // - a temporary object `std::string_view` constructing from the above temporary `std::string`
+    v = foo();  // invokes v.operator=(const std::string_view&)  
+}
+```
+
+Case 2) is probably less common but would be nice to support.
+
+On the other hand, we have the `lifetimebound` attribute, which can be applied to a function parameter (or the implicit `this` parameter) to indicate that the annotated parameter object should outlive the return value of the function. This model doesn't fit well for the assignment case, where we are more concerned with the lifetime of the LHS rather than the return value.
+We could make an assumption: for assignment operators (which return an lvalue reference of the same type as the `LHS`, a form of `T& T::operator=(...)`), we assume that these assignment operators are always canonical, returning the `LHS` (`*this`). With this assumption, case 2) above can be supported with `IntPointer& IntPointer::operator=(const OtherOwner& RHS [[clang::lifetimebound]])` even if the `OtherOwner` type is not annotated with `gsl::Owner`. However, there is no good way to support the most common case 1) with the `lifetimebound` attribute. 
+
+Another tiny bit is how to handle compound assignment operators, such as `+=`, `-=`, and `*=`. Their semantics on the `RHS` are less clear compared to the assignment operator, I think we should not cover them in the analysis.
+Comment by Xazax-hun: Yeah, `lifetimebound` annotations definitely have their limitations. And that is the case for `gsl::Pointer/Owner` as well, as they do not really support types that own some data and has pointers to some non-owned data.
+
+There are a few things we could do to try to generalize:
+* Introduce Rust-style lifetime parameters like the ones in the [lifetimes RFC](https://discourse.llvm.org/t/rfc-lifetime-annotations-for-c/61377). As a first step, we might not even need a syntax. We could hardcode these annotations for the STL. This could help us get the benefits of a rather general solution for some types, without committing to any syntax.
+* Generalize `lifetimebound` annotations, so they can support multiple levels of indirections. And we could introduce a separate annotation like `lifetimecarry` to indicate if a lifetime needs to be "copied". This is also limited as it does not really support having multiple different output lifetimes. 
+* Come up with a completely new annotation language. 

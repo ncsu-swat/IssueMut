@@ -1,0 +1,207 @@
+Bug Summary: IPA replaces stmt with invalid gimple
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Richard Biener | Time: 2023-04-24 12:53:46 UTC
+  Text: On cfghooks.cc we replace
+
+BIT_FIELD_REF <*this_8(D), 8, 56>
+
+with
+
+BIT_FIELD_REF <VIEW_CONVERT_EXPR<const struct profile_count>(ISRA.814), 8, 56>
+
+in ipa_param_body_adjustments::modify_expression.  The replacement seems
+to be of type 'unsigned long'.  This is (should be) invalid GIMPLE unless
+ISRA.814 is made a non-register.
+
+Note when replacing memory with register BIT_FIELD_REFs have to be careful
+with endianess (IIRC), thus the replacement looks dangerous anyway.
+
+A fix forPR109594will make us trip over this new IL checking during bootstrap.
+
+- User: Richard Biener | Time: 2023-04-24 12:57:42 UTC
+  Text: #0  ipa_param_body_adjustments::modify_expression (this=0x4b1f040, 
+    expr_p=0x7ffff37222b8, convert=true)
+    at /space/rguenther/src/gcc/gcc/ipa-param-manipulation.cc:1867
+#1  0x00000000016f7dc5 in ipa_param_body_adjustments::modify_assignment (
+    this=0x4b1f040, stmt=<gimple_assign 0x7ffff33ecdc0>, 
+    extra_stmts=0x7fffffffd0a8)
+    at /space/rguenther/src/gcc/gcc/ipa-param-manipulation.cc:1890
+#2  0x00000000016f927a in ipa_param_body_adjustments::modify_gimple_stmt (
+    this=0x4b1f040, stmt=0x7fffffffd168, extra_stmts=0x7fffffffd0a8, 
+    orig_stmt=<gimple_assign 0x7ffff37fa320>)
+    at /space/rguenther/src/gcc/gcc/ipa-param-manipulation.cc:2273
+#3  0x0000000001abb925 in remap_gimple_stmt (
+    stmt=<gimple_assign 0x7ffff37fa320>, id=0x7fffffffd730)
+    at /space/rguenther/src/gcc/gcc/tree-inline.cc:1961
+
+Supposedly the easiest would be to make any is_gimple_reg_type IPA SRA
+replacement (I suppose all are ...) either address-taken or
+DECL_NOT_GIMPLE_REG_P.
+
+diff --git a/gcc/ipa-param-manipulation.cc b/gcc/ipa-param-manipulation.cc
+index 42488ee09c3..473d759f983 100644
+--- a/gcc/ipa-param-manipulation.cc
++++ b/gcc/ipa-param-manipulation.cc
+@@ -1384,6 +1384,8 @@ ipa_param_body_adjustments::common_initialization (tree old_fndecl,
+          DECL_CONTEXT (new_parm) = m_fndecl;
+          TREE_USED (new_parm) = 1;
+          DECL_IGNORED_P (new_parm) = 1;
++         if (is_gimple_reg_type (new_type))
++           DECL_NOT_GIMPLE_REG_P (new_parm) = 1;
+          layout_decl (new_parm, 0);
+          m_new_decls.quick_push (new_parm);
+ 
+
+seems to work on the testcase I have.
+
+- User: Richard Biener | Time: 2023-04-26 11:05:30 UTC
+  Text: (In reply to Richard Biener fromcomment #1)> #0  ipa_param_body_adjustments::modify_expression (this=0x4b1f040, 
+>     expr_p=0x7ffff37222b8, convert=true)
+>     at /space/rguenther/src/gcc/gcc/ipa-param-manipulation.cc:1867
+> #1  0x00000000016f7dc5 in ipa_param_body_adjustments::modify_assignment (
+>     this=0x4b1f040, stmt=<gimple_assign 0x7ffff33ecdc0>, 
+>     extra_stmts=0x7fffffffd0a8)
+>     at /space/rguenther/src/gcc/gcc/ipa-param-manipulation.cc:1890
+> #2  0x00000000016f927a in ipa_param_body_adjustments::modify_gimple_stmt (
+>     this=0x4b1f040, stmt=0x7fffffffd168, extra_stmts=0x7fffffffd0a8, 
+>     orig_stmt=<gimple_assign 0x7ffff37fa320>)
+>     at /space/rguenther/src/gcc/gcc/ipa-param-manipulation.cc:2273
+> #3  0x0000000001abb925 in remap_gimple_stmt (
+>     stmt=<gimple_assign 0x7ffff37fa320>, id=0x7fffffffd730)
+>     at /space/rguenther/src/gcc/gcc/tree-inline.cc:1961
+> 
+> Supposedly the easiest would be to make any is_gimple_reg_type IPA SRA
+> replacement (I suppose all are ...) either address-taken or
+> DECL_NOT_GIMPLE_REG_P.
+> 
+> diff --git a/gcc/ipa-param-manipulation.cc b/gcc/ipa-param-manipulation.cc
+> index 42488ee09c3..473d759f983 100644
+> --- a/gcc/ipa-param-manipulation.cc
+> +++ b/gcc/ipa-param-manipulation.cc
+> @@ -1384,6 +1384,8 @@ ipa_param_body_adjustments::common_initialization
+> (tree old_fndecl,
+>           DECL_CONTEXT (new_parm) = m_fndecl;
+>           TREE_USED (new_parm) = 1;
+>           DECL_IGNORED_P (new_parm) = 1;
+> +         if (is_gimple_reg_type (new_type))
+> +           DECL_NOT_GIMPLE_REG_P (new_parm) = 1;
+>           layout_decl (new_parm, 0);
+>           m_new_decls.quick_push (new_parm);
+>  
+> 
+> seems to work on the testcase I have.But it doesn't work during bootstrap, in insn-recog.cc we then hit
+
+insn-recog.cc: In function 'int pattern511(rtx)':
+insn-recog.cc:23146:1: error: invalid argument to gimple call
+23146 | pattern511 (rtx x1)
+      | ^~~~~~~~~~
+ISRA.64882
+# VUSE <.MEM_19(D)>
+_9 = pattern510.isra (ISRA.64882);
+during GIMPLE pass: fixup_cfg
+insn-recog.cc:23146:1: internal compiler error: verify_gimple failed
+0x9a3bf4 _start
+        ../sysdeps/x86_64/start.S:115
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+make[3]: *** [Makefile:1157: insn-recog.o] Error 1
+
+the way modify_expression is done is ugly, even more so the special-casing
+of BIT_FIELD_REF and {IMAG,REAL}PART_EXPR.
+
+I'm not sure if we guarantee conversions do not occur in some places?  At
+least the call argument handling looks wrong to me and can result in invalid
+GIMPLE as well.
+
+While I can probably hack around the original assignment that's mishandled
+it will feel like a hack.  Something like
+
+@@ -1827,7 +1825,8 @@ ipa_param_body_adjustments::replace_removed_params_ssa_names (tree old_name,
+    necessary conversions.  */
+ 
+ bool
+-ipa_param_body_adjustments::modify_expression (tree *expr_p, bool convert)
++ipa_param_body_adjustments::modify_expression (tree *expr_p, bool convert,
++                                              gimple_seq *extra_stmts)
+ {
+   tree expr = *expr_p;
+ 
+@@ -1862,6 +1861,11 @@ ipa_param_body_adjustments::modify_expression (tree *expr_p, bool convert)
+       gcc_checking_assert (tree_to_shwi (TYPE_SIZE (TREE_TYPE (expr)))
+                           == tree_to_shwi (TYPE_SIZE (TREE_TYPE (repl))));
+       tree vce = build1 (VIEW_CONVERT_EXPR, TREE_TYPE (expr), repl);
++      if (is_gimple_reg (repl))
++       {
++         gcc_assert (extra_stmts);
++         vce = force_gimple_operand (vce, extra_stmts, true, NULL_TREE);
++       }
+       *expr_p = vce;
+     }
+   else
+@@ -1889,7 +1893,7 @@ ipa_param_body_adjustments::modify_assignment (gimple *stmt,
+   lhs_p = gimple_assign_lhs_ptr (stmt);
+ 
+   any = modify_expression (lhs_p, false);
+-  any |= modify_expression (rhs_p, false);
++  any |= modify_expression (rhs_p, false, extra_stmts);
+   if (any
+       && !useless_type_conversion_p (TREE_TYPE (*lhs_p), TREE_TYPE (*rhs_p)))
+     {
+
+I'm going to test this nevertheless ...
+
+- User: Martin Jambor | Time: 2023-04-26 13:16:00 UTC
+  Text: (In reply to Richard Biener fromcomment #0)> On cfghooks.cc we replace
+> 
+> BIT_FIELD_REF <*this_8(D), 8, 56>
+>An alternative (perhaps for the release branches) would be to avoid SRA if the parameter takes place in souch constructs.
+
+But the patch incomment #2looks like just the right thing to do.
+
+- User: GCC Commits | Time: 2023-04-27 10:31:25 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:d89e23f27215fcd822994fb2fad17fcd31eef5e1commitr14-295-gd89e23f27215fcd822994fb2fad17fcd31eef5e1Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Apr 26 13:05:44 2023 +0200
+
+    ipa/109607 - properly gimplify conversions introduced by IPA param manipulation
+    
+    The following addresses IPA param manipulation (through IPA SRA)
+    replacing
+    
+      BIT_FIELD_REF <*this_8(D), 8, 56>
+    
+    with
+    
+      BIT_FIELD_REF <VIEW_CONVERT_EXPR<const struct profile_count>(ISRA.814), 8, 56>
+    
+    which is supposed to be invalid GIMPLE (ISRA.814 is a register).
+    There's currently insufficient checking in place to catch this in the
+    IL verifier but I am working on that as part of fixingPR109594.
+    
+    The solution for the particular testcase I am running into this is
+    to split the conversion to a separate stmt.  Generally the modification
+    phase is set up for this but the extra_stmts sequence isn't passed
+    around everywhere.  The following passes it to modify_expression
+    from modify_assignment when rewriting the RHS.PR ipa/109607* ipa-param-manipulation.h
+            (ipa_param_body_adjustments::modify_expression): Add extra_stmts
+            argument.
+            * ipa-param-manipulation.cc
+            (ipa_param_body_adjustments::modify_expression): Likewise.
+            When we need a conversion and the replacement is a register
+            split the conversion out.
+            (ipa_param_body_adjustments::modify_assignment): Pass
+            extra_stmts to RHS modify_expression.
+    
+            * g++.dg/torture/pr109607.C: New testcase.
+
+- User: Richard Biener | Time: 2023-04-27 10:31:44 UTC
+  Text: Fixed (this particular case I ran into).
+

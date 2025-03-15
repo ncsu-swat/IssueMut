@@ -1,0 +1,103 @@
+Bug Summary: [14 Regression] ICE: in verify_range, at value-range.cc:1132 at -O2
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, needs-bisection
+Known to Work: 10.5.0, 11.4.1, 12.3.1, 13.2.1
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-03-10 08:17:10 UTC
+  Text: Createdattachment 57659[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O2 testcase.c
+testcase.c: In function 'bar':
+testcase.c:4:3: warning: '__builtin_memset' specified bound 18374966859414961920 exceeds maximum object size 9223372036854775807 [-Wstringop-overflow=]
+    4 |   __builtin_memset (&b, a, 0xFF00FF00FF00FF00);
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+during GIMPLE pass: strlen
+testcase.c: In function 'foo':
+testcase.c:9:1: internal compiler error: in verify_range, at value-range.cc:1132
+    9 | foo (void)
+      | ^~~
+0x8a195e irange::verify_range()
+        /repo/gcc-trunk/gcc/value-range.cc:1132
+0x1853427 irange::set(tree_node*, generic_wide_int<wide_int_storage> const&, generic_wide_int<wide_int_storage> const&, value_range_kind)
+        /repo/gcc-trunk/gcc/value-range.cc:1076
+0x17394e8 int_range<2u, false>::int_range(tree_node*, generic_wide_int<wide_int_storage> const&, generic_wide_int<wide_int_storage> const&, value_range_kind)
+        /repo/gcc-trunk/gcc/value-range.h:1047
+0x17394e8 set_strlen_range(tree_node*, generic_wide_int<wide_int_storage>, generic_wide_int<wide_int_storage>, tree_node*)
+        /repo/gcc-trunk/gcc/tree-ssa-strlen.cc:1942
+0x17455f8 strlen_pass::handle_builtin_strlen()
+        /repo/gcc-trunk/gcc/tree-ssa-strlen.cc:2344
+0x1745ab5 strlen_pass::check_and_optimize_call(bool*)
+        /repo/gcc-trunk/gcc/tree-ssa-strlen.cc:5412
+0x1746499 strlen_pass::check_and_optimize_stmt(bool*)
+        /repo/gcc-trunk/gcc/tree-ssa-strlen.cc:5670
+0x17468d6 strlen_pass::before_dom_children(basic_block_def*)
+        /repo/gcc-trunk/gcc/tree-ssa-strlen.cc:5854
+0x2615eae dom_walker::walk(basic_block_def*)
+        /repo/gcc-trunk/gcc/domwalk.cc:311
+0x1746dd7 printf_strlen_execute
+        /repo/gcc-trunk/gcc/tree-ssa-strlen.cc:5913
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-9409-20240309093707-ge9753f4b633-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-9409-20240309093707-ge9753f4b633-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240309 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-03-10 19:28:47 UTC
+  Text: Better reduced testcase:
+```
+__SIZE_TYPE__ bar (int b)
+{
+  __builtin_memset (&b, 5, -1);
+  return __builtin_strlen ((char *) &b);
+}
+```
+
+
+Confirmed.
+
+- User: Jakub Jelinek | Time: 2024-03-11 09:48:15 UTC
+  Text: Createdattachment 57665[details]gcc14-pr114293.patch
+
+Untested fix.  Like inPR110603, there is UB and we need to pick at most one of the bounds, not both of them as they are in conflict.
+
+- User: GCC Commits | Time: 2024-03-12 09:24:02 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:39737cdf002637c7a652e9c3e36f369cfce581e5commitr14-9437-g39737cdf002637c7a652e9c3e36f369cfce581e5Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Mar 12 10:23:19 2024 +0100
+
+    strlen: Fix another spot that can create invalid ranges [PR114293]
+    
+    This PR is similar toPR110603fixed withr14-8487, except in a different
+    spot.  From the memset with -1 size of non-zero value we determine minimum
+    of (size_t) -1 and the code uses PTRDIFF_MAX - 2 (not really sure I
+    understand why it is - 2 and not - 1, e.g. heap allocated array
+    with PTRDIFF_MAX char elements which contain '\0' in the last element
+    should be fine, no?  One can still represent arr[PTRDIFF_MAX] - arr[0]
+    and arr[0] - arr[PTRDIFF_MAX] in ptrdiff_t and
+    strlen (arr) == PTRDIFF_MAX - 1) as the maximum, so again invalid range.
+    As in the other case, it is just UB that can lead to that, and we have
+    choice to only keep the min and use +inf for max, or only keep max
+    and use 0 for min, or not set the range at all, or use [min, min] or
+    [max, max] etc.  The following patch uses [min, +inf].
+    
+    2024-03-12  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114293* tree-ssa-strlen.cc (strlen_pass::handle_builtin_strlen): If
+            max is smaller than min, set max to ~(size_t)0.
+    
+            * gcc.dg/pr114293.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-03-12 09:25:03 UTC
+  Text: Fixed.
+

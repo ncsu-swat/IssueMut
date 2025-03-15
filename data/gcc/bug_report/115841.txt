@@ -1,0 +1,310 @@
+Bug Summary: [12 Regression] 521.wrf_r ICEs when building with -march=znver4 -Ofast -flto --param vect-partial-vector-usage=1
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, needs-reduction
+Known to Work: 13.3.1, 14.1.1, 15.0
+Known to Fail: 13.3.0, 14.1.0
+
+Comments:
+- User: Richard Biener | Time: 2024-07-09 12:54:58 UTC
+  Text: At LTO link time you get
+
+1720529354.12: module_mp_fast_sbm.fppized.f90: In function 'onecond1.constprop':1720529354.12: module_mp_fast_sbm.fppized.f90:4593:27: error: definition in block 130 does not dominate use in block 127
+1720529354.12:  4593 |         SUBROUTINE ONECOND1 &
+1720529354.12:       |                           ^
+1720529354.12: for SSA_NAME: _632 in statement:
+1720529354.12: _591 = PHI <vect_sfn11s_695.333_592(132), _632(127)>
+1720529354.12: PHI argument
+1720529354.12: _632
+1720529354.12: for PHI node
+1720529354.12: _591 = PHI <vect_sfn11s_695.333_592(132), _632(127)>
+1720529354.12: during GIMPLE pass: vect
+1720529354.12: module_mp_fast_sbm.fppized.f90:4593:27: internal compiler error: verify_ssa failed
+
+- User: Richard Biener | Time: 2024-07-09 13:00:11 UTC
+  Text: Doesn't reproduce w/o LTO :/
+
+- User: Richard Biener | Time: 2024-07-10 13:38:49 UTC
+  Text: <bb 8> [local count: 955630228]:
+  # sfn11s_17 = PHI <sfn11s_156(69), 0.0(7)>
+  # sfn12s_2 = PHI <sfn12s_133(69), 0.0(7)>
+  # kr_4 = PHI <kr_118(69), 1(7)>
+  # ivtmp_966 = PHI <ivtmp_965(69), 32(7)>
+  _420 = kr_4 + -1;
+  _205 = (long int) _420;
+  fk_206 = MEM <float[0:D.7142]> [(float[0:D.7057] *)&A.170][_205];
+  _171 = MEM <float[0:D.7166]> [(float[0:D.7061] *)&xl][_205];
+  _266 = _171 * fk_206;
+  fun_163 = _266 * 6.93149983882904052734375e-1;
+  b11_164 = MEM <float[0:D.7145]> [(float[0:D.7067] *)&A.166][_205];
+  b12_161 = MEM <float[0:D.7148]> [(float[0:D.7071] *)&A.167][_205];
+  _162 = fun_163 * b11_164;
+  sfn11s_156 = sfn11s_17 + _162;
+  _152 = b12_161 * fun_163;
+  sfn12s_133 = sfn12s_2 + _152;
+  kr_118 = kr_4 + 1;
+  ivtmp_965 = ivtmp_966 - 1;
+  if (ivtmp_965 == 0)
+    goto <bb 9>; [12.36%]
+  else
+    goto <bb 69>; [87.64%]
+  
+  <bb 69> [local count: 837518626]:
+  goto <bb 8>; [100.00%]
+
+  <bb 9> [local count: 118111601]:
+  # sfn12s_990 = PHI <sfn12s_133(8)>
+  # sfn11s_989 = PHI <sfn11s_156(8)>
+
+
+
+is the loop vectorized where we somehow peel the prologue and the main
+vect loop (which isn't masked) vectorized epilog has a broken
+prologue (continuing the vect reduction with the vector defs) and that
+epilogue is masked.
+
+- User: Richard Biener | Time: 2024-07-11 06:38:53 UTC
+  Text: Same IL but no ICE:
+
+static unsigned char xl[132];
+
+void jerate (unsigned char *, unsigned char *, unsigned char *, unsigned char *);
+float foo (unsigned n)
+{
+  unsigned char A170[132];
+  unsigned char A166[132];
+  unsigned char A167[132];
+  jerate (xl, A170, A166, A167);
+
+  unsigned i = 32;
+  int kr = 1;
+  float sfn11s = 0.f;
+  float sfn12s = 0.f;
+  do
+    {
+      int krm1 = kr - 1;
+      long j = krm1;
+      float a = (*(float(*)[n])A170)[j];
+      float b = (*(float(*)[n])xl)[j];
+      float c = a * b;
+      float d = c * 6.93149983882904052734375e-1f;
+      float e = (*(float(*)[n])A166)[j];
+      float f = (*(float(*)[n])A167)[j];
+      float g = d * e;
+      sfn11s = sfn11s + g;
+      float h = f * d;
+      sfn12s = sfn12s + h;
+      kr++;
+    }
+  while (--i != 0);
+  float tem = sfn11s + sfn12s;
+  return tem;
+}
+
+- User: Richard Biener | Time: 2024-07-16 09:17:28 UTC
+  Text: r15-2054-g1e3aa9c9278db6, when backported to the branch, avoids the failure, it's still latent of course.
+
+The fortran loop is the DO KR=1,NRM loop from
+module_mp_fast_sbm.fppized.f90:6100 which is the JERTIMESC subroutine
+
+        SUBROUTINE JERTIMESC(FI1,X1,SFN11,SFN12 &
+     &                      ,B11_MY,B12_MY,RIEC,CF,ID,COL,NKR)
+      IMPLICIT NONE
+       INTEGER NRM,KR,ICE,ID,NKR
+      REAL B12,B11,FUN,DELM,FK,CF,SFN12S,SFN11S
+        REAL  COL, &
+     & X1(NKR,ID),FI1(NKR,ID),B11_MY(NKR,ID),B12_MY(NKR,ID) &
+     &,RIEC(NKR,ID),SFN11,SFN12
+
+        NRM=NKR-1
+        DO 1 ICE=1,ID
+             SFN11S=0.
+             SFN12S=0.
+             SFN11=CF*SFN11S
+             SFN12=CF*SFN12S
+             DO KR=1,NRM
+! VALUE OF DISTRIBUTION FUNCTION
+                FK=FI1(KR,ICE)
+! DELTA-M
+                DELM=X1(KR,ICE)*3.*COL
+! INTEGRAL'S EXPRESSION
+                FUN=FK*DELM
+! VALUES OF INTEGRALS
+                B11=B11_MY(KR,ICE)
+                B12=B12_MY(KR,ICE)
+                SFN11S=SFN11S+FUN*B11
+                SFN12S=SFN12S+FUN*B12
+             ENDDO
+! CORRECTION
+             SFN11=CF*SFN11S
+             SFN12=CF*SFN12S
+    1   CONTINUE
+! END
+        RETURN
+        END SUBROUTINE JERTIMESC
+
+It's an inlined copy in ONECOND1 (and that is a IPA CP clone).
+
+The key to reproduce is the peeling for alignment.  We have
+
+module_mp_fast_sbm.fppized.f90:6100:19: note:  vectorization_factor = 16, niters = 32
+module_mp_fast_sbm.fppized.f90:6100:19: note:   === vect_analyze_data_refs_alignment ===
+module_mp_fast_sbm.fppized.f90:6100:19: note:   recording new base alignment for &A.170
+  alignment:    64
+  misalignment: 0
+  based on:     fk_206 = MEM <float[0:D.7150]> [(float[0:D.7065] *)&A.170][_205];
+module_mp_fast_sbm.fppized.f90:6100:19: note:   recording new base alignment for &xl
+  alignment:    32
+  misalignment: 0
+  based on:     _171 = MEM <float[0:D.7174]> [(float[0:D.7069] *)&xl][_205];
+module_mp_fast_sbm.fppized.f90:6100:19: note:   recording new base alignment for &A.166
+  alignment:    64
+  misalignment: 0
+  based on:     b11_164 = MEM <float[0:D.7153]> [(float[0:D.7075] *)&A.166][_205];
+module_mp_fast_sbm.fppized.f90:6100:19: note:   recording new base alignment for &A.167
+  alignment:    64
+  misalignment: 0
+  based on:     b12_161 = MEM <float[0:D.7156]> [(float[0:D.7079] *)&A.167][_205];
+module_mp_fast_sbm.fppized.f90:6100:19: note:   vect_compute_data_ref_alignment:
+module_mp_fast_sbm.fppized.f90:6100:19: missed:   misalign = 0 bytes of ref MEM <float[0:D.7150]> [(float[0:D.7065] *)&A.170][_205]
+module_mp_fast_sbm.fppized.f90:6100:19: note:   vect_compute_data_ref_alignment:
+module_mp_fast_sbm.fppized.f90:6100:19: note:   can't force alignment of ref: MEM <float[0:D.7174]> [(float[0:D.7069] *)&xl][_205]
+module_mp_fast_sbm.fppized.f90:6100:19: note:   vect_compute_data_ref_alignment:
+module_mp_fast_sbm.fppized.f90:6100:19: missed:   misalign = 0 bytes of ref MEM <float[0:D.7153]> [(float[0:D.7075] *)&A.166][_205]
+module_mp_fast_sbm.fppized.f90:6100:19: note:   vect_compute_data_ref_alignment:
+module_mp_fast_sbm.fppized.f90:6100:19: missed:   misalign = 0 bytes of ref MEM <float[0:D.7156]> [(float[0:D.7079] *)&A.167][_205]
+module_mp_fast_sbm.fppized.f90:6100:19: note:   === vect_prune_runtime_alias_test_list ===
+module_mp_fast_sbm.fppized.f90:6100:19: note:   === vect_enhance_data_refs_alignment ===
+module_mp_fast_sbm.fppized.f90:6100:19: missed:   Unknown misalignment, naturally aligned
+module_mp_fast_sbm.fppized.f90:6100:19: note:   vect_can_advance_ivs_p:
+module_mp_fast_sbm.fppized.f90:6100:19: note:   Analyze phi: sfn11s_17 = PHI <sfn11s_156(69), 0.0(7)>
+module_mp_fast_sbm.fppized.f90:6100:19: note:   reduc or virtual phi. skip.
+module_mp_fast_sbm.fppized.f90:6100:19: note:   Analyze phi: sfn12s_2 = PHI <sfn12s_133(69), 0.0(7)>
+...
+module_mp_fast_sbm.fppized.f90:6100:19: note:   Alignment of access forced using peeling.
+module_mp_fast_sbm.fppized.f90:6100:19: note:   Peeling for alignment will be applied.
+
+where we align the xl load and end up with misaligned others.  The C testcase
+has the As aligned to 16 and xl aligned to 32.  We're doing runtime
+alignment of xl with a scalar prologue.
+
+- User: Richard Biener | Time: 2024-07-16 09:31:13 UTC
+  Text: Reduced testcase, fails with -Ofast -mavx512vl -mtune=znver4 --param vect-partial-vector-usage=1 -fcommon (-fcommon is the key from fortran so we can't re-align xl).
+For an arch with "proper" costs (aligned loads cheaper) one would swap
+the static/not static but even with -fno-vect-cost-model which should make
+three loads aligned here it doesn't reproduce.
+
+unsigned char xl[192];
+static unsigned char A170[192*3];
+
+void jerate (unsigned char *, unsigned char *);
+float foo (unsigned n)
+{
+  jerate (xl, A170);
+
+  unsigned i = 32;
+  int kr = 1;
+  float sfn11s = 0.f;
+  float sfn12s = 0.f;
+  do
+    {
+      int krm1 = kr - 1;
+      long j = krm1;
+      float a = (*(float(*)[n])A170)[j];
+      float b = (*(float(*)[n])xl)[j];
+      float c = a * b;
+      float d = c * 6.93149983882904052734375e-1f;
+      float e = (*(float(*)[n])A170)[j+48];
+      float f = (*(float(*)[n])A170)[j+96];
+      float g = d * e;
+      sfn11s = sfn11s + g;
+      float h = f * d;
+      sfn12s = sfn12s + h;
+      kr++;
+    }
+  while (--i != 0);
+  float tem = sfn11s + sfn12s;
+  return tem;
+}
+
+- User: Richard Biener | Time: 2024-07-16 10:00:02 UTC
+  Text: The problem is latent since GCC 12 adding reusable accumulator support.  I'm testing a fix currently and will push to trunk once ready.
+
+- User: GCC Commits | Time: 2024-07-16 14:05:27 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:016c947b02e79a5c0c0c2d4ad5cb71aa04db3efdcommitr15-2065-g016c947b02e79a5c0c0c2d4ad5cb71aa04db3efdAuthor: Richard Biener <rguenther@suse.de>
+Date:   Tue Jul 16 11:53:17 2024 +0200
+
+    tree-optimization/115841 - reduction epilogue placement issue
+    
+    When emitting the compensation to the vectorized main loop for
+    a vector reduction value to be re-used in the vectorized epilogue
+    we fail to place it in the correct block when the main loop is
+    known to be entered (no loop_vinfo->main_loop_edge) but the
+    epilogue is not (a loop_vinfo->skip_this_loop_edge).  The code
+    currently disregards this situation.
+    
+    With the recent znver4 cost fix I couldn't trigger this situation
+    with the testcase but I adjusted it so it could eventually trigger
+    on other targets.PR tree-optimization/115841* tree-vect-loop.cc (vect_transform_cycle_phi): Correctly
+            place the partial vector reduction for the accumulator
+            re-use when the main loop cannot be skipped but the
+            epilogue can.
+    
+            * gcc.dg/vect/pr115841.c: New testcase.
+
+- User: GCC Commits | Time: 2024-07-16 14:23:38 UTC
+  Text: The releases/gcc-14 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:59ed01d5e3d2b0e59163d3248bdba9f1e35de599commitr14-10440-g59ed01d5e3d2b0e59163d3248bdba9f1e35de599Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Jul 16 11:53:17 2024 +0200
+
+    tree-optimization/115841 - reduction epilogue placement issue
+    
+    When emitting the compensation to the vectorized main loop for
+    a vector reduction value to be re-used in the vectorized epilogue
+    we fail to place it in the correct block when the main loop is
+    known to be entered (no loop_vinfo->main_loop_edge) but the
+    epilogue is not (a loop_vinfo->skip_this_loop_edge).  The code
+    currently disregards this situation.
+    
+    With the recent znver4 cost fix I couldn't trigger this situation
+    with the testcase but I adjusted it so it could eventually trigger
+    on other targets.PR tree-optimization/115841* tree-vect-loop.cc (vect_transform_cycle_phi): Correctly
+            place the partial vector reduction for the accumulator
+            re-use when the main loop cannot be skipped but the
+            epilogue can.
+    
+            * gcc.dg/vect/pr115841.c: New testcase.
+    
+    (cherry picked from commit 016c947b02e79a5c0c0c2d4ad5cb71aa04db3efd)
+
+- User: Jakub Jelinek | Time: 2024-08-01 09:41:28 UTC
+  Text: GCC 14.2 is being released, retargeting bugs to GCC 14.3.
+
+- User: GCC Commits | Time: 2024-09-18 10:33:29 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:e87c0c7f7ab1e7acd0ffbac0b15e020275f97ca8commitr13-9041-ge87c0c7f7ab1e7acd0ffbac0b15e020275f97ca8Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Jul 16 11:53:17 2024 +0200
+
+    tree-optimization/115841 - reduction epilogue placement issue
+    
+    When emitting the compensation to the vectorized main loop for
+    a vector reduction value to be re-used in the vectorized epilogue
+    we fail to place it in the correct block when the main loop is
+    known to be entered (no loop_vinfo->main_loop_edge) but the
+    epilogue is not (a loop_vinfo->skip_this_loop_edge).  The code
+    currently disregards this situation.
+    
+    With the recent znver4 cost fix I couldn't trigger this situation
+    with the testcase but I adjusted it so it could eventually trigger
+    on other targets.PR tree-optimization/115841* tree-vect-loop.cc (vect_transform_cycle_phi): Correctly
+            place the partial vector reduction for the accumulator
+            re-use when the main loop cannot be skipped but the
+            epilogue can.
+    
+            * gcc.dg/vect/pr115841.c: New testcase.
+    
+    (cherry picked from commit 016c947b02e79a5c0c0c2d4ad5cb71aa04db3efd)
+
+- User: Richard Biener | Time: 2024-09-18 10:39:20 UTC
+  Text: Fixed, not going to backport further.
+

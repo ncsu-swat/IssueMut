@@ -1,0 +1,1290 @@
+Bug Summary: [12/13 Regression] Vector truncation test program produces incorrect result since r12-6537-g080a06fcb076b3
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 11.3.0
+Known to Fail: 
+
+Comments:
+- User: John Platts | Time: 2023-03-08 21:00:57 UTC
+  Text: The following C++ test program generates a test failure when compiled for big-endian powerpc64-linux-gnu with GCC 12.2.1 with the -mcpu=power10 -O2 options:
+
+#pragma push_macro("vector")
+#pragma push_macro("pixel")
+#pragma push_macro("bool")
+
+#undef vector
+#undef pixel
+#undef bool
+
+#include <altivec.h>
+
+#pragma pop_macro("vector")
+#pragma pop_macro("pixel")
+#pragma pop_macro("bool")
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <iostream>
+#include <string_view>
+#include <type_traits>
+
+template<size_t LaneSize>
+struct AltivecTypes {
+};
+
+template<>
+struct AltivecTypes<1> {
+  using UnsignedLaneT = unsigned char;
+  using SignedLaneT = signed char;
+  using UnsignedVectT = __vector unsigned char;
+  using SignedVectT = __vector signed char;
+  using BoolVectT = __vector __bool char;
+};
+
+template<>
+struct AltivecTypes<2> {
+  using UnsignedLaneT = unsigned short;
+  using SignedLaneT = signed short;
+  using UnsignedVectT = __vector unsigned short;
+  using SignedVectT = __vector signed short;
+  using BoolVectT = __vector __bool short;
+};
+
+template<>
+struct AltivecTypes<4> {
+  using UnsignedLaneT = unsigned int;
+  using SignedLaneT = signed int;
+  using FloatLaneT = float;
+  using UnsignedVectT = __vector unsigned int;
+  using SignedVectT = __vector signed int;
+  using BoolVectT = __vector __bool int;
+  using FloatVectT = __vector float;
+};
+
+template<>
+struct AltivecTypes<8> {
+  using UnsignedLaneT = unsigned long long;
+  using SignedLaneT = signed long long;
+  using FloatLaneT = double;
+  using UnsignedVectT = __vector unsigned long long;
+  using SignedVectT = __vector signed long long;
+  using BoolVectT = __vector __bool long long;
+  using FloatVectT = __vector double;
+};
+
+template<class T, bool = std::is_signed_v<T>, bool = std::is_integral_v<T>,
+                  bool = std::is_floating_point_v<T>, class = void>
+struct MakeAltivecVectorType {
+};
+
+template<class T>
+struct MakeAltivecVectorType<T, true, true, false,
+  std::void_t<typename AltivecTypes<sizeof(T)>::SignedVectT>> {
+  using type = typename AltivecTypes<sizeof(T)>::SignedVectT;
+};
+
+template<class T>
+struct MakeAltivecVectorType<T, false, true, false,
+  std::void_t<typename AltivecTypes<sizeof(T)>::UnsignedVectT>> {
+  using type = typename AltivecTypes<sizeof(T)>::UnsignedVectT;
+};
+
+template<class T>
+struct MakeAltivecVectorType<T, true, false, true,
+  std::void_t<typename AltivecTypes<sizeof(T)>::FloatVectT>> {
+  using type = typename AltivecTypes<sizeof(T)>::FloatVectT;
+};
+
+template<class T>
+using AltivecVectorType = typename MakeAltivecVectorType<T>::type;
+
+template<size_t N, class T, std::enable_if_t<(sizeof(T) * N <= 8)>* = nullptr>
+AltivecVectorType<T> LoadVector(const T* __restrict__ src) {
+  using Bits = typename AltivecTypes<(sizeof(T) * N)>::UnsignedLaneT;
+  Bits bits;
+  __builtin_memcpy(&bits, src, sizeof(T) * N);
+  return reinterpret_cast<AltivecVectorType<T>>(vec_splats(bits));
+}
+
+template<size_t N, class T, std::enable_if_t<(sizeof(T) * N == 16)>* = nullptr>
+AltivecVectorType<T> LoadVector(const T* __restrict__ src) {
+  using LaneT = std::decay_t<decltype(std::declval<AltivecVectorType<T>>()[0])>;
+  typedef LaneT LoadRawT
+    __attribute__((__vector_size__(16), __aligned__(16), __may_alias__));
+  const LoadRawT* __restrict__ p = reinterpret_cast<const LoadRawT*>(src);
+  return reinterpret_cast<AltivecVectorType<T>>(*p);
+}
+
+template<size_t N, class T, std::enable_if_t<(sizeof(T) * N <= 8)>* = nullptr>
+void StoreVector(T* __restrict__ dest, AltivecVectorType<T> vect) {
+  using Bits = typename AltivecTypes<(sizeof(T) * N)>::UnsignedLaneT;
+  typedef Bits BitsVectT __attribute__((__vector_size__(16)));
+  const Bits bits = reinterpret_cast<BitsVectT>(vect)[0];
+  __builtin_memcpy(dest, &bits, sizeof(T) * N);
+}
+
+template<size_t N, class T, std::enable_if_t<(sizeof(T) * N == 16)>* = nullptr>
+void StoreVector(T* __restrict__ dest, AltivecVectorType<T> vect) {
+  using LaneT = std::decay_t<decltype(std::declval<AltivecVectorType<T>>()[0])>;
+  typedef LaneT StoreRawT
+    __attribute__((__vector_size__(16), __aligned__(16), __may_alias__));
+  StoreRawT* __restrict__ p = reinterpret_cast<StoreRawT*>(dest);
+  *p = reinterpret_cast<StoreRawT>(vect);
+}
+
+template<size_t N, class FromV>
+AltivecVectorType<uint8_t> AltivecTruncateToU8(FromV vect) {
+  static_assert(N >= 1, "N >= 1 must be true");
+  
+  using FromLaneT = std::decay_t<decltype(std::declval<FromV>()[0])>;
+  constexpr size_t sizeOfFromLane = sizeof(FromLaneT);
+  static_assert(sizeOfFromLane >= 2, "sizeOfFromLane >= 2 must be true");
+  
+  if constexpr(N == 1) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return reinterpret_cast<__vector unsigned char>(vect);
+#else
+    return reinterpret_cast<__vector unsigned char>(
+      vec_sld(vect, vect, sizeof(FromLaneT) - sizeof(unsigned char)));
+#endif
+  } else {
+    if constexpr(sizeOfFromLane >= 4) {
+      return AltivecTruncateToU8<N>(vec_pack(vect, vect));
+    } else {
+      const __vector unsigned short u16Vect =
+        reinterpret_cast<__vector unsigned short>(vect);
+      return vec_pack(u16Vect, u16Vect);
+    }
+  }
+}
+
+static int TestsFailedCount = 0;
+
+template<class T>
+static constexpr decltype(auto) CharToNumber(T&& val) {
+    using DecayT = std::decay_t<T>;
+    if constexpr(std::is_same_v<DecayT, char>) {
+        if constexpr(std::is_signed_v<char>)
+            return static_cast<short>(val);
+        else
+            return static_cast<unsigned short>(val);
+    } else if constexpr(std::is_same_v<DecayT, signed char>) {
+        return static_cast<short>(val);
+    } else if constexpr(std::is_same_v<DecayT, unsigned char>) {
+        return static_cast<unsigned short>(val);
+    } else if constexpr(std::is_same_v<DecayT, char16_t>
+#if defined(__cpp_char8_t) && __cpp_char8_t >= 201811L
+                        || std::is_same_v<DecayT, char8_t>
+#endif
+        ) {
+        return static_cast<uint_least16_t>(val);
+    } else if constexpr(std::is_same_v<DecayT, char32_t>) {
+        return static_cast<uint_least32_t>(val);
+    } else if constexpr(std::is_same_v<DecayT, wchar_t>) {
+        if constexpr(std::is_signed_v<wchar_t>)
+            return static_cast<std::make_signed_t<wchar_t>>(val);
+        else
+            return static_cast<std::make_unsigned_t<wchar_t>>(val);
+    } else {
+        return static_cast<T&&>(val);
+    }
+}
+
+template<class T, size_t N>
+inline void PrintValuesToCout(T (&vals)[N]) {
+   using namespace std::string_view_literals;
+   for(size_t i = 0; i < N; i++) {
+       if(i != 0)
+           std::cout << ", "sv;
+       
+       std::cout << CharToNumber(vals[i]);
+   }
+}
+
+template<class FromLaneT, size_t N>
+void DoTruncateToU8Test() {
+  using namespace std::string_view_literals;
+  {
+    constexpr uint32_t base = 0xFA578D00;
+    alignas(16) FromLaneT srcValues[N];
+    alignas(16) uint8_t expectedValues[N];
+    alignas(16) uint8_t actualValues[N];
+    for(size_t i = 0; i < N; i++) {
+      srcValues[i] =
+        static_cast<FromLaneT>(base + static_cast<FromLaneT>(i));
+      expectedValues[i] =
+        static_cast<uint8_t>(base + static_cast<uint8_t>(i));
+    }
+    
+    auto srcVect =
+      LoadVector<N>(srcValues);
+    auto resultVect =
+      AltivecTruncateToU8<N>(srcVect);
+    
+    StoreVector<N>(actualValues, resultVect);
+
+    for(size_t i = 0; i < N; i++) {
+      if(expectedValues[i] != actualValues[i]) {
+        std::cout << "Test failed for uint"sv <<
+          (sizeof(FromLaneT) << 3) <<
+          "_t lane type with "sv << N << " lanes\n"sv;
+        std::cout << "Expected values:\n "sv;
+        PrintValuesToCout(expectedValues);
+        std::cout << "\nActual values:\n "sv;
+        PrintValuesToCout(actualValues);
+        std::cout << '\n';
+      
+        ++TestsFailedCount;
+        break;
+      }
+    }
+  }
+  
+  if constexpr(N >= 2) {
+    DoTruncateToU8Test<FromLaneT, N / 2>();
+  }
+}
+
+int main(int argc, char** argv) {
+  using namespace std::string_view_literals;
+  DoTruncateToU8Test<uint64_t, 2>();
+  DoTruncateToU8Test<uint32_t, 4>();
+  DoTruncateToU8Test<uint16_t, 8>();
+  
+  const auto failCnt = TestsFailedCount;
+  std::cout << failCnt << " tests failed\n"sv;
+  
+  return static_cast<int>(failCnt != 0);
+}
+
+Here is the expected output of the above program:
+0 tests failed
+
+Here is the output that is generated when the above program is compiled with gcc 12.2.1 with the -mcpu=power10 -O2 options:
+Test failed for uint32_t lane type with 1 lanes
+Expected values:
+ 0
+Actual values:
+ 250
+Test failed for uint16_t lane type with 1 lanes
+Expected values:
+ 0
+Actual values:
+ 141
+2 tests failed
+
+The program above does generate the correct result when compiled with the -mcpu=power9 -O2 options on the powerpc64-linux-gnu target.
+
+The C++ test program above does generate the correct result if compiled with clang 15 with the -mcpu=power10 -std=c++17 -O2 options.
+
+- User: John Platts | Time: 2023-03-08 21:17:58 UTC
+  Text: The C++ test program below does generate the correct results when compiled with the -mcpu=power10 -O0 options.
+
+- User: Kewen Lin | Time: 2023-03-09 12:45:01 UTC
+  Text: Thanks for reporting, I don't have a handy Power10 ppc64 (BE) env for reproducing this, do you mind to reduce it a bit first? (hint:https://gcc.gnu.org/wiki/A_guide_to_testcase_reduction)
+
+btw, I tried to check if we can reproduce this on Power10 ppc64le as the code having __BYTE_ORDER__ check which seems to say it works on both BE and LE, but it gets segfault on LE, even I used one power9 ppc64le machine and option -mcpu=power8 -O0. Any thoughts?
+
+- User: John Platts | Time: 2023-03-09 15:41:36 UTC
+  Text: Here is another test program that reproduces the vector truncation test issue:
+#pragma push_macro("vector")
+#pragma push_macro("pixel")
+#pragma push_macro("bool")
+
+#undef vector
+#undef pixel
+#undef bool
+
+#include <altivec.h>
+
+#pragma pop_macro("vector")
+#pragma pop_macro("pixel")
+#pragma pop_macro("bool")
+
+#include <stdint.h>
+#include <stddef.h>
+#include <iostream>
+#include <string_view>
+#include <limits>
+#include <type_traits>
+
+template<size_t LaneSize>
+struct AltivecTypes {
+};
+
+template<>
+struct AltivecTypes<1> {
+  using UnsignedLaneT = unsigned char;
+  using SignedLaneT = signed char;
+  using UnsignedVectT = __vector unsigned char;
+  using SignedVectT = __vector signed char;
+  using BoolVectT = __vector __bool char;
+};
+
+template<>
+struct AltivecTypes<2> {
+  using UnsignedLaneT = unsigned short;
+  using SignedLaneT = signed short;
+  using UnsignedVectT = __vector unsigned short;
+  using SignedVectT = __vector signed short;
+  using BoolVectT = __vector __bool short;
+};
+
+template<>
+struct AltivecTypes<4> {
+  using UnsignedLaneT = unsigned int;
+  using SignedLaneT = signed int;
+  using FloatLaneT = float;
+  using UnsignedVectT = __vector unsigned int;
+  using SignedVectT = __vector signed int;
+  using BoolVectT = __vector __bool int;
+  using FloatVectT = __vector float;
+};
+
+template<>
+struct AltivecTypes<8> {
+  using UnsignedLaneT = unsigned long long;
+  using SignedLaneT = signed long long;
+  using FloatLaneT = double;
+  using UnsignedVectT = __vector unsigned long long;
+  using SignedVectT = __vector signed long long;
+  using BoolVectT = __vector __bool long long;
+  using FloatVectT = __vector double;
+};
+
+template<class T, bool = std::is_signed_v<T>, bool = std::is_integral_v<T>,
+                  bool = std::is_floating_point_v<T>, class = void>
+struct MakeAltivecVectorType {
+};
+
+template<class T>
+struct MakeAltivecVectorType<T, true, true, false,
+  std::void_t<typename AltivecTypes<sizeof(T)>::SignedVectT>> {
+  using type = typename AltivecTypes<sizeof(T)>::SignedVectT;
+};
+
+template<class T>
+struct MakeAltivecVectorType<T, false, true, false,
+  std::void_t<typename AltivecTypes<sizeof(T)>::UnsignedVectT>> {
+  using type = typename AltivecTypes<sizeof(T)>::UnsignedVectT;
+};
+
+template<class T>
+struct MakeAltivecVectorType<T, true, false, true,
+  std::void_t<typename AltivecTypes<sizeof(T)>::FloatVectT>> {
+  using type = typename AltivecTypes<sizeof(T)>::FloatVectT;
+};
+
+template<class T>
+using AltivecVectorType = typename MakeAltivecVectorType<T>::type;
+
+template<size_t N, class T, std::enable_if_t<(sizeof(T) * N <= 8)>* = nullptr>
+AltivecVectorType<T> LoadVector(const T* __restrict__ src) {
+  using Bits = typename AltivecTypes<(sizeof(T) * N)>::UnsignedLaneT;
+  Bits bits;
+  __builtin_memcpy(&bits, src, sizeof(T) * N);
+  return reinterpret_cast<AltivecVectorType<T>>(vec_splats(bits));
+}
+
+template<size_t N, class T, std::enable_if_t<(sizeof(T) * N == 16)>* = nullptr>
+AltivecVectorType<T> LoadVector(const T* __restrict__ src) {
+  using LaneT = std::decay_t<decltype(std::declval<AltivecVectorType<T>>()[0])>;
+  typedef LaneT LoadRawT
+    __attribute__((__vector_size__(16), __aligned__(16), __may_alias__));
+  const LoadRawT* __restrict__ p = reinterpret_cast<const LoadRawT*>(src);
+  return reinterpret_cast<AltivecVectorType<T>>(*p);
+}
+
+template<size_t N, class T, std::enable_if_t<(sizeof(T) * N <= 8)>* = nullptr>
+void StoreVector(T* __restrict__ dest, AltivecVectorType<T> vect) {
+  using Bits = typename AltivecTypes<(sizeof(T) * N)>::UnsignedLaneT;
+  typedef Bits BitsVectT __attribute__((__vector_size__(16)));
+  const Bits bits = reinterpret_cast<BitsVectT>(vect)[0];
+  __builtin_memcpy(dest, &bits, sizeof(T) * N);
+}
+
+template<size_t N, class T, std::enable_if_t<(sizeof(T) * N == 16)>* = nullptr>
+void StoreVector(T* __restrict__ dest, AltivecVectorType<T> vect) {
+  using LaneT = std::decay_t<decltype(std::declval<AltivecVectorType<T>>()[0])>;
+  typedef LaneT StoreRawT
+    __attribute__((__vector_size__(16), __aligned__(16), __may_alias__));
+  StoreRawT* __restrict__ p = reinterpret_cast<StoreRawT*>(dest);
+  *p = reinterpret_cast<StoreRawT>(vect);
+}
+
+template<class T, size_t N, class T2>
+AltivecVectorType<T> Iota(const T2 first) {
+    using TU = std::make_unsigned_t<T>;
+
+    alignas(16) T lanes[N];
+    for(size_t i = 0; i < N; i++) {
+        lanes[i] = static_cast<T>(
+            (static_cast<TU>(i) + static_cast<TU>(first)) &
+            std::numeric_limits<TU>::max());
+    }
+
+    return LoadVector<N>(lanes);
+}
+
+template<class T>
+AltivecVectorType<T> LoadTestVectToTruncate() {
+    return Iota<T, 1>(uint32_t{0xFA578D00u});
+}
+
+template<class FromV>
+AltivecVectorType<uint8_t> AltivecTruncateSingleLaneVectToU8(FromV vect) {
+  using FromLaneT = std::decay_t<decltype(std::declval<FromV>()[0])>;
+  constexpr size_t sizeOfFromLane = sizeof(FromLaneT);
+  static_assert(sizeOfFromLane >= 2, "sizeOfFromLane >= 2 must be true");
+  
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return reinterpret_cast<__vector unsigned char>(vect);
+#else
+  return reinterpret_cast<__vector unsigned char>(
+    vec_sld(vect, vect, sizeof(FromLaneT) - sizeof(unsigned char)));
+#endif
+}
+
+static __vector unsigned char TruncateU64TestVectToU8() {
+    __vector unsigned char v =
+      AltivecTruncateSingleLaneVectToU8(LoadTestVectToTruncate<uint64_t>());
+    return v;
+}
+
+static __vector unsigned char TruncateU32TestVectToU8() {
+    __vector unsigned char v =
+      AltivecTruncateSingleLaneVectToU8(LoadTestVectToTruncate<uint32_t>());
+    return v;
+}
+
+static __vector unsigned char TruncateU16TestVectToU8() {
+    __vector unsigned char v =
+      AltivecTruncateSingleLaneVectToU8(LoadTestVectToTruncate<uint16_t>());
+    return v;
+}
+
+static __vector unsigned char TruncateU64TestVectToU8_2() {
+    __vector unsigned long long u64_v = LoadTestVectToTruncate<uint64_t>();
+    __asm__(""
+            : "+wa" (u64_v));
+
+    return AltivecTruncateSingleLaneVectToU8(u64_v);
+}
+
+static __vector unsigned char TruncateU32TestVectToU8_2() {
+    __vector unsigned int u32_v = LoadTestVectToTruncate<uint32_t>();
+    __asm__(""
+            : "+wa" (u32_v));
+
+    return AltivecTruncateSingleLaneVectToU8(u32_v);
+}
+
+static __vector unsigned char TruncateU16TestVectToU8_2() {
+    __vector unsigned short u16_v = LoadTestVectToTruncate<uint16_t>();
+    __asm__(""
+            : "+wa" (u16_v));
+
+    return AltivecTruncateSingleLaneVectToU8(u16_v);
+}
+
+using namespace std::string_view_literals;
+
+template<size_t N>
+inline void PrintUCharValuesToCout(const unsigned char (&vals)[N]) {
+   using namespace std::string_view_literals;
+   for(size_t i = 0; i < N; i++) {
+       if(i != 0)
+           std::cout << ", "sv;
+       
+       std::cout << static_cast<uint16_t>(vals[i]);
+   }
+}
+
+static void DoTruncateTest(std::string_view testName,
+                    AltivecVectorType<uint8_t> (*truncateFunc)()) {
+  alignas(16) unsigned char vals[16];
+  StoreVector<16>(vals, truncateFunc());
+  std::cout << "Result of "sv << testName << "():\n {"sv;
+  PrintUCharValuesToCout(vals);
+  std::cout << "}\n"sv;
+}
+
+#define DO_TRUNCATE_TEST(testName) \
+  DoTruncateTest(#testName ""sv, testName)
+
+int main(int argc, char** argv) {
+    DO_TRUNCATE_TEST(TruncateU16TestVectToU8);
+    DO_TRUNCATE_TEST(TruncateU32TestVectToU8);
+    DO_TRUNCATE_TEST(TruncateU64TestVectToU8);
+    DO_TRUNCATE_TEST(TruncateU16TestVectToU8_2);
+    DO_TRUNCATE_TEST(TruncateU32TestVectToU8_2);
+    DO_TRUNCATE_TEST(TruncateU64TestVectToU8_2);
+    return 0;
+}
+
+Here is the expected output of running the above test program on big-endian POWER8/POWER9/POWER10:
+Result of TruncateU16TestVectToU8():
+ {0, 141, 0, 141, 0, 141, 0, 141, 0, 141, 0, 141, 0, 141, 0, 141}
+Result of TruncateU32TestVectToU8():
+ {0, 250, 87, 141, 0, 250, 87, 141, 0, 250, 87, 141, 0, 250, 87, 141}
+Result of TruncateU64TestVectToU8():
+ {0, 0, 0, 0, 0, 250, 87, 141, 0, 0, 0, 0, 0, 250, 87, 141}
+Result of TruncateU16TestVectToU8_2():
+ {0, 141, 0, 141, 0, 141, 0, 141, 0, 141, 0, 141, 0, 141, 0, 141}
+Result of TruncateU32TestVectToU8_2():
+ {0, 250, 87, 141, 0, 250, 87, 141, 0, 250, 87, 141, 0, 250, 87, 141}
+Result of TruncateU64TestVectToU8_2():
+ {0, 0, 0, 0, 0, 250, 87, 141, 0, 0, 0, 0, 0, 250, 87, 141}
+
+Here is the actual output of running the above test program on big-endian POWER10 when compiled with the -O2 -mcpu=power10 options:
+Result of TruncateU16TestVectToU8():
+ {141, 0, 141, 0, 141, 0, 141, 0, 141, 0, 141, 0, 141, 0, 141, 0}
+Result of TruncateU32TestVectToU8():
+ {250, 87, 141, 0, 250, 87, 141, 0, 250, 87, 141, 0, 250, 87, 141, 0}
+Result of TruncateU64TestVectToU8():
+ {0, 0, 0, 0, 0, 250, 87, 141, 0, 0, 0, 0, 0, 250, 87, 141}
+Result of TruncateU16TestVectToU8_2():
+ {0, 141, 0, 141, 0, 141, 0, 141, 0, 141, 0, 141, 0, 141, 0, 141}
+Result of TruncateU32TestVectToU8_2():
+ {0, 250, 87, 141, 0, 250, 87, 141, 0, 250, 87, 141, 0, 250, 87, 141}
+Result of TruncateU64TestVectToU8_2():
+ {0, 0, 0, 0, 0, 250, 87, 141, 0, 0, 0, 0, 0, 250, 87, 141}
+
+Here is the assembly code that is generated for the TruncateU16TestVectToU8(), TruncateU16TestVectToU8_2(), TruncateU32TestVectToU8(), and TruncateU32TestVectToU8_2() functions when the above program is compiled with the -mcpu=power10 -O2 options:
+.L._ZL23TruncateU16TestVectToU8v:
+.LFB2028:
+	.cfi_startproc
+	xxspltiw 34,2365623552
+	blr
+
+.L._ZL25TruncateU16TestVectToU8_2v:
+.LFB2031:
+	.cfi_startproc
+	xxspltiw 34,2365623552
+	vsldoi 2,2,2,1
+	blr
+
+.L._ZL23TruncateU32TestVectToU8v:
+.LFB2027:
+	.cfi_startproc
+	xxspltiw 34,4200041728
+	blr
+
+.L._ZL25TruncateU32TestVectToU8_2v:
+.LFB2030:
+	.cfi_startproc
+	xxspltiw 34,4200041728
+	vsldoi 2,2,2,3
+	blr
+
+The only difference between the TruncateU16TestVectToU8() and TruncateU16TestVectToU8_2() functions is that there is an __asm__("" : "+wa" (u16_v)) inline assembly statement in between the LoadTestVectToTruncate<uint16_t>() and AltivecTruncateSingleLaneVectToU8(u16_v) calls.
+
+The inline assembly statement in TruncateU16TestVectToU8_2() doesn't change u16_v, but tells the GCC optimizer that u16_v might not be constant, forcing GCC to generate the vsldoi instruction in TruncateU16TestVectToU8_2().
+
+There are similar differences between the TruncateU32TestVectToU8() and TruncateU32TestVectToU8_2() functions on big-endian PPC64.
+
+GCC is incorrectly optimizing the TruncateU16TestVectToU8() and TruncateU32TestVectToU8() functions above when the above code is compiled with the -mcpu=power10 -O2 options on the big-endian powerpc64-linux-gnu target.
+
+- User: John Platts | Time: 2023-03-09 15:53:41 UTC
+  Text: Here is another test program that exposes the optimization bug with applying the vec_sl operation to a constant vector (which generates incorrect results on both big-endian and little-endian POWER10 when compiled with the -O2 -mcpu=power10 options with GCC 12.1.0):
+#pragma push_macro("vector")
+#pragma push_macro("pixel")
+#pragma push_macro("bool")
+
+#undef vector
+#undef pixel
+#undef bool
+
+#include <altivec.h>
+
+#pragma pop_macro("vector")
+#pragma pop_macro("pixel")
+#pragma pop_macro("bool")
+
+#include <stdint.h>
+#include <stddef.h>
+#include <limits>
+#include <type_traits>
+
+template<size_t LaneSize>
+struct AltivecTypes {
+};
+
+template<>
+struct AltivecTypes<1> {
+  using UnsignedLaneT = unsigned char;
+  using SignedLaneT = signed char;
+  using UnsignedVectT = __vector unsigned char;
+  using SignedVectT = __vector signed char;
+  using BoolVectT = __vector __bool char;
+};
+
+template<>
+struct AltivecTypes<2> {
+  using UnsignedLaneT = unsigned short;
+  using SignedLaneT = signed short;
+  using UnsignedVectT = __vector unsigned short;
+  using SignedVectT = __vector signed short;
+  using BoolVectT = __vector __bool short;
+};
+
+template<>
+struct AltivecTypes<4> {
+  using UnsignedLaneT = unsigned int;
+  using SignedLaneT = signed int;
+  using FloatLaneT = float;
+  using UnsignedVectT = __vector unsigned int;
+  using SignedVectT = __vector signed int;
+  using BoolVectT = __vector __bool int;
+  using FloatVectT = __vector float;
+};
+
+template<>
+struct AltivecTypes<8> {
+  using UnsignedLaneT = unsigned long long;
+  using SignedLaneT = signed long long;
+  using FloatLaneT = double;
+  using UnsignedVectT = __vector unsigned long long;
+  using SignedVectT = __vector signed long long;
+  using BoolVectT = __vector __bool long long;
+  using FloatVectT = __vector double;
+};
+
+template<class T, bool = std::is_signed_v<T>, bool = std::is_integral_v<T>,
+                  bool = std::is_floating_point_v<T>, class = void>
+struct MakeAltivecVectorType {
+};
+
+template<class T>
+struct MakeAltivecVectorType<T, true, true, false,
+  std::void_t<typename AltivecTypes<sizeof(T)>::SignedVectT>> {
+  using type = typename AltivecTypes<sizeof(T)>::SignedVectT;
+};
+
+template<class T>
+struct MakeAltivecVectorType<T, false, true, false,
+  std::void_t<typename AltivecTypes<sizeof(T)>::UnsignedVectT>> {
+  using type = typename AltivecTypes<sizeof(T)>::UnsignedVectT;
+};
+
+template<class T>
+struct MakeAltivecVectorType<T, true, false, true,
+  std::void_t<typename AltivecTypes<sizeof(T)>::FloatVectT>> {
+  using type = typename AltivecTypes<sizeof(T)>::FloatVectT;
+};
+
+template<class T>
+using AltivecVectorType = typename MakeAltivecVectorType<T>::type;
+
+template<size_t N, class T, std::enable_if_t<(sizeof(T) * N <= 8)>* = nullptr>
+AltivecVectorType<T> LoadVector(const T* __restrict__ src) {
+  using Bits = typename AltivecTypes<(sizeof(T) * N)>::UnsignedLaneT;
+  Bits bits;
+  __builtin_memcpy(&bits, src, sizeof(T) * N);
+  return reinterpret_cast<AltivecVectorType<T>>(vec_splats(bits));
+}
+
+template<size_t N, class T, std::enable_if_t<(sizeof(T) * N == 16)>* = nullptr>
+AltivecVectorType<T> LoadVector(const T* __restrict__ src) {
+  using LaneT = std::decay_t<decltype(std::declval<AltivecVectorType<T>>()[0])>;
+  typedef LaneT LoadRawT
+    __attribute__((__vector_size__(16), __aligned__(16), __may_alias__));
+  const LoadRawT* __restrict__ p = reinterpret_cast<const LoadRawT*>(src);
+  return reinterpret_cast<AltivecVectorType<T>>(*p);
+}
+
+template<class T, size_t N, class T2>
+AltivecVectorType<T> Iota(const T2 first) {
+    using TU = std::make_unsigned_t<T>;
+
+    alignas(16) T lanes[N];
+    for(size_t i = 0; i < N; i++) {
+        lanes[i] = static_cast<T>(
+            (static_cast<TU>(i) + static_cast<TU>(first)) &
+            std::numeric_limits<TU>::max());
+    }
+
+    return LoadVector<N>(lanes);
+}
+
+template<class T>
+AltivecVectorType<T> LoadTestVectToShift() {
+    return Iota<T, 1>(uint32_t{0xFA578D00u});
+}
+
+template<class FromV>
+AltivecVectorType<uint8_t> DoVectorShiftToU8(FromV vect) {
+  using FromLaneT = std::decay_t<decltype(std::declval<FromV>()[0])>;
+  constexpr size_t sizeOfFromLane = sizeof(FromLaneT);
+  static_assert(sizeOfFromLane >= 2, "sizeOfFromLane >= 2 must be true");
+
+  return reinterpret_cast<__vector unsigned char>(
+    vec_sld(vect, vect, sizeof(FromLaneT) - sizeof(unsigned char)));
+}
+
+__vector unsigned char U64ShiftedVect() {
+    __vector unsigned char v =
+      DoVectorShiftToU8(LoadTestVectToShift<uint64_t>());
+    return v;
+}
+
+__vector unsigned char U32ShiftedVect() {
+    __vector unsigned char v =
+      DoVectorShiftToU8(LoadTestVectToShift<uint32_t>());
+    return v;
+}
+
+__vector unsigned char U16ShiftedVect() {
+    __vector unsigned char v =
+      DoVectorShiftToU8(LoadTestVectToShift<uint16_t>());
+    return v;
+}
+
+__vector unsigned char U64ShiftedVect_2() {
+    __vector unsigned long long u64_v = LoadTestVectToShift<uint64_t>();
+    __asm__(""
+            : "+wa" (u64_v));
+
+    return DoVectorShiftToU8(u64_v);
+}
+
+__vector unsigned char U32ShiftedVect_2() {
+    __vector unsigned int u32_v = LoadTestVectToShift<uint32_t>();
+    __asm__(""
+            : "+wa" (u32_v));
+
+    return DoVectorShiftToU8(u32_v);
+}
+
+__vector unsigned char U16ShiftedVect_2() {
+    __vector unsigned short u16_v = LoadTestVectToShift<uint16_t>();
+    __asm__(""
+            : "+wa" (u16_v));
+
+    return DoVectorShiftToU8(u16_v);
+}
+
+Here is the assembly code that is generated when the above code is compiled with the -O2 -mcpu=power10 options on the powerpc64-linux-gnu target:
+	.file	"vsx_power10_shift_test_snippet_030923.cpp"
+	.machine power10
+	.section	".text"
+	.align 2
+	.p2align 4,,15
+	.globl _Z14U64ShiftedVectv
+	.section	".opd","aw"
+	.align 3
+_Z14U64ShiftedVectv:
+	.quad	.L._Z14U64ShiftedVectv,.TOC.@tocbase,0
+	.previous
+	.type	_Z14U64ShiftedVectv, @function
+.L._Z14U64ShiftedVectv:
+.LFB206:
+	.cfi_startproc
+	plxv 34,.LC0@pcrel
+	vsldoi 2,2,2,7
+	blr
+	.long 0
+	.byte 0,9,0,0,0,0,0,0
+	.cfi_endproc
+.LFE206:
+	.size	_Z14U64ShiftedVectv,.-.L._Z14U64ShiftedVectv
+	.align 2
+	.p2align 4,,15
+	.globl _Z14U32ShiftedVectv
+	.section	".opd","aw"
+	.align 3
+_Z14U32ShiftedVectv:
+	.quad	.L._Z14U32ShiftedVectv,.TOC.@tocbase,0
+	.previous
+	.type	_Z14U32ShiftedVectv, @function
+.L._Z14U32ShiftedVectv:
+.LFB207:
+	.cfi_startproc
+	xxspltiw 34,4200041728
+	blr
+	.long 0
+	.byte 0,9,0,0,0,0,0,0
+	.cfi_endproc
+.LFE207:
+	.size	_Z14U32ShiftedVectv,.-.L._Z14U32ShiftedVectv
+	.align 2
+	.p2align 4,,15
+	.globl _Z14U16ShiftedVectv
+	.section	".opd","aw"
+	.align 3
+_Z14U16ShiftedVectv:
+	.quad	.L._Z14U16ShiftedVectv,.TOC.@tocbase,0
+	.previous
+	.type	_Z14U16ShiftedVectv, @function
+.L._Z14U16ShiftedVectv:
+.LFB208:
+	.cfi_startproc
+	xxspltiw 34,2365623552
+	blr
+	.long 0
+	.byte 0,9,0,0,0,0,0,0
+	.cfi_endproc
+.LFE208:
+	.size	_Z14U16ShiftedVectv,.-.L._Z14U16ShiftedVectv
+	.align 2
+	.p2align 4,,15
+	.globl _Z16U64ShiftedVect_2v
+	.section	".opd","aw"
+	.align 3
+_Z16U64ShiftedVect_2v:
+	.quad	.L._Z16U64ShiftedVect_2v,.TOC.@tocbase,0
+	.previous
+	.type	_Z16U64ShiftedVect_2v, @function
+.L._Z16U64ShiftedVect_2v:
+.LFB209:
+	.cfi_startproc
+	plxv 34,.LC0@pcrel
+	vsldoi 2,2,2,7
+	blr
+	.long 0
+	.byte 0,9,0,0,0,0,0,0
+	.cfi_endproc
+.LFE209:
+	.size	_Z16U64ShiftedVect_2v,.-.L._Z16U64ShiftedVect_2v
+	.align 2
+	.p2align 4,,15
+	.globl _Z16U32ShiftedVect_2v
+	.section	".opd","aw"
+	.align 3
+_Z16U32ShiftedVect_2v:
+	.quad	.L._Z16U32ShiftedVect_2v,.TOC.@tocbase,0
+	.previous
+	.type	_Z16U32ShiftedVect_2v, @function
+.L._Z16U32ShiftedVect_2v:
+.LFB210:
+	.cfi_startproc
+	xxspltiw 34,4200041728
+	vsldoi 2,2,2,3
+	blr
+	.long 0
+	.byte 0,9,0,0,0,0,0,0
+	.cfi_endproc
+.LFE210:
+	.size	_Z16U32ShiftedVect_2v,.-.L._Z16U32ShiftedVect_2v
+	.align 2
+	.p2align 4,,15
+	.globl _Z16U16ShiftedVect_2v
+	.section	".opd","aw"
+	.align 3
+_Z16U16ShiftedVect_2v:
+	.quad	.L._Z16U16ShiftedVect_2v,.TOC.@tocbase,0
+	.previous
+	.type	_Z16U16ShiftedVect_2v, @function
+.L._Z16U16ShiftedVect_2v:
+.LFB211:
+	.cfi_startproc
+	xxspltiw 34,2365623552
+	vsldoi 2,2,2,1
+	blr
+	.long 0
+	.byte 0,9,0,0,0,0,0,0
+	.cfi_endproc
+.LFE211:
+	.size	_Z16U16ShiftedVect_2v,.-.L._Z16U16ShiftedVect_2v
+	.section	.rodata.cst16,"aM",@progbits,16
+	.align 4
+.LC0:
+	.quad	4200041728
+	.quad	4200041728
+	.ident	"GCC: (Ubuntu 12.1.0-2ubuntu1~22.04) 12.1.0"
+
+Here is the assembly code that is generated when the above code is compiled with the -O2 -mcpu=power10 options on the powerpc64le-linux-gnu target:
+	.file	"vsx_power10_shift_test_snippet_030923.cpp"
+	.machine power10
+	.abiversion 2
+	.section	".text"
+	.align 2
+	.p2align 4,,15
+	.globl _Z14U64ShiftedVectv
+	.type	_Z14U64ShiftedVectv, @function
+_Z14U64ShiftedVectv:
+.LFB206:
+	.cfi_startproc
+	.localentry	_Z14U64ShiftedVectv,1
+	plxv 34,.LC0@pcrel
+	vsldoi 2,2,2,7
+	blr
+	.long 0
+	.byte 0,9,0,0,0,0,0,0
+	.cfi_endproc
+.LFE206:
+	.size	_Z14U64ShiftedVectv,.-_Z14U64ShiftedVectv
+	.align 2
+	.p2align 4,,15
+	.globl _Z14U32ShiftedVectv
+	.type	_Z14U32ShiftedVectv, @function
+_Z14U32ShiftedVectv:
+.LFB207:
+	.cfi_startproc
+	.localentry	_Z14U32ShiftedVectv,1
+	xxspltiw 34,4200041728
+	blr
+	.long 0
+	.byte 0,9,0,0,0,0,0,0
+	.cfi_endproc
+.LFE207:
+	.size	_Z14U32ShiftedVectv,.-_Z14U32ShiftedVectv
+	.align 2
+	.p2align 4,,15
+	.globl _Z14U16ShiftedVectv
+	.type	_Z14U16ShiftedVectv, @function
+_Z14U16ShiftedVectv:
+.LFB208:
+	.cfi_startproc
+	.localentry	_Z14U16ShiftedVectv,1
+	xxspltiw 34,2365623552
+	blr
+	.long 0
+	.byte 0,9,0,0,0,0,0,0
+	.cfi_endproc
+.LFE208:
+	.size	_Z14U16ShiftedVectv,.-_Z14U16ShiftedVectv
+	.align 2
+	.p2align 4,,15
+	.globl _Z16U64ShiftedVect_2v
+	.type	_Z16U64ShiftedVect_2v, @function
+_Z16U64ShiftedVect_2v:
+.LFB209:
+	.cfi_startproc
+	.localentry	_Z16U64ShiftedVect_2v,1
+	plxv 34,.LC0@pcrel
+	vsldoi 2,2,2,7
+	blr
+	.long 0
+	.byte 0,9,0,0,0,0,0,0
+	.cfi_endproc
+.LFE209:
+	.size	_Z16U64ShiftedVect_2v,.-_Z16U64ShiftedVect_2v
+	.align 2
+	.p2align 4,,15
+	.globl _Z16U32ShiftedVect_2v
+	.type	_Z16U32ShiftedVect_2v, @function
+_Z16U32ShiftedVect_2v:
+.LFB210:
+	.cfi_startproc
+	.localentry	_Z16U32ShiftedVect_2v,1
+	xxspltiw 34,4200041728
+	vsldoi 2,2,2,3
+	blr
+	.long 0
+	.byte 0,9,0,0,0,0,0,0
+	.cfi_endproc
+.LFE210:
+	.size	_Z16U32ShiftedVect_2v,.-_Z16U32ShiftedVect_2v
+	.align 2
+	.p2align 4,,15
+	.globl _Z16U16ShiftedVect_2v
+	.type	_Z16U16ShiftedVect_2v, @function
+_Z16U16ShiftedVect_2v:
+.LFB211:
+	.cfi_startproc
+	.localentry	_Z16U16ShiftedVect_2v,1
+	xxspltiw 34,2365623552
+	vsldoi 2,2,2,1
+	blr
+	.long 0
+	.byte 0,9,0,0,0,0,0,0
+	.cfi_endproc
+.LFE211:
+	.size	_Z16U16ShiftedVect_2v,.-_Z16U16ShiftedVect_2v
+	.section	.rodata.cst16,"aM",@progbits,16
+	.align 4
+.LC0:
+	.quad	4200041728
+	.quad	4200041728
+	.ident	"GCC: (Ubuntu 12.1.0-2ubuntu1~22.04) 12.1.0"
+	.section	.note.GNU-stack,"",@progbits
+
+- User: John Platts | Time: 2023-03-09 16:45:16 UTC
+  Text: Here is another test program that shows the same code generation bug when a splat followed by a vec_sld is incorrectly optimized by gcc 12.2.0 on powerpc64-linux-gnu and powerpc64le-linux-gnu with the -mcpu=power10 -O2 options:
+#pragma push_macro("vector")
+#pragma push_macro("pixel")
+#pragma push_macro("bool")
+
+#undef vector
+#undef pixel
+#undef bool
+
+#include <altivec.h>
+
+#pragma pop_macro("vector")
+#pragma pop_macro("pixel")
+#pragma pop_macro("bool")
+
+#include <stdint.h>
+#include <type_traits>
+
+template<class T>
+struct MakeSimdVectorType {
+    typedef T type __attribute__((__vector_size__(16)));
+};
+
+template<class T>
+using SimdVectorType = typename MakeSimdVectorType<T>::type;
+
+template<class T, std::enable_if_t<(sizeof(T) == 1 &&
+    std::is_integral_v<std::decay_t<T>>)>* = nullptr>
+static inline SimdVectorType<T> Splat(T val) {
+    return reinterpret_cast<SimdVectorType<T>>(
+        vec_splats(static_cast<unsigned char>(val)));
+}
+
+template<class T, std::enable_if_t<(sizeof(T) == 2 &&
+    std::is_integral_v<std::decay_t<T>>)>* = nullptr>
+static inline SimdVectorType<T> Splat(T val) {
+    return reinterpret_cast<SimdVectorType<T>>(
+        vec_splats(static_cast<unsigned short>(val)));
+}
+
+template<class T, std::enable_if_t<(sizeof(T) == 4 &&
+    std::is_integral_v<std::decay_t<T>>)>* = nullptr>
+static inline SimdVectorType<T> Splat(T val) {
+    return reinterpret_cast<SimdVectorType<T>>(
+        vec_splats(static_cast<unsigned int>(val)));
+}
+
+template<class T, std::enable_if_t<(sizeof(T) == 8 &&
+    std::is_integral_v<std::decay_t<T>>)>* = nullptr>
+static inline SimdVectorType<T> Splat(T val) {
+    return reinterpret_cast<SimdVectorType<T>>(
+        vec_splats(static_cast<unsigned long long>(val)));
+}
+
+static inline __vector float Splat(float val) {
+    return vec_splats(val);
+}
+
+static inline __vector double Splat(double val) {
+    return vec_splats(val);
+}
+
+using AltivecUCharVectType = __vector unsigned char;
+
+template<int kShiftAmount, class T>
+AltivecUCharVectType SplatAndShift(T val) {
+    const auto splatResult = Splat(val);
+    return vec_sld(reinterpret_cast<AltivecUCharVectType>(splatResult),
+        reinterpret_cast<AltivecUCharVectType>(splatResult), kShiftAmount);
+}
+
+template<int kShiftAmount, class T>
+AltivecUCharVectType SplatAndShift_2(T val) {
+    auto splatResult = Splat(val);
+    __asm__(""
+            : "+wa" (splatResult));
+    return vec_sld(reinterpret_cast<AltivecUCharVectType>(splatResult),
+        reinterpret_cast<AltivecUCharVectType>(splatResult), kShiftAmount);
+}
+
+auto SplatAndShift_I16_1() {
+    return SplatAndShift<5>(int16_t{-32346});
+}
+
+auto SplatAndShift_I16_2() {
+    return SplatAndShift_2<5>(int16_t{-32346});
+}
+
+auto SplatAndShift_I32_1() {
+    return SplatAndShift<3>(int32_t{-1394373889});
+}
+
+auto SplatAndShift_I32_2() {
+    return SplatAndShift_2<3>(int32_t{-1394373889});
+}
+
+Here is the assembly code that is generated for the above code on powerpc64le-linux-gnu with the -O2 -mcpu=power10 options:
+_Z19SplatAndShift_I16_1v:
+        xxspltiw 34,2175173030
+        blr
+_Z19SplatAndShift_I16_2v:
+        xxspltiw 34,2175173030
+        vsldoi 2,2,2,5
+        blr
+_Z19SplatAndShift_I32_1v:
+        xxspltiw 34,2900593407
+        blr
+_Z19SplatAndShift_I32_2v:
+        xxspltiw 34,2900593407
+        vsldoi 2,2,2,3
+        blr
+
+Here is the assembly code that is generated for the above code on powerpc64-linux-gnu with the -O2 -mcpu=power10 options:
+_Z19SplatAndShift_I16_1v:
+        .quad   .L._Z19SplatAndShift_I16_1v,.TOC.@tocbase,0
+.L._Z19SplatAndShift_I16_1v:
+        xxspltiw 34,2175173030
+        blr
+_Z19SplatAndShift_I16_2v:
+        .quad   .L._Z19SplatAndShift_I16_2v,.TOC.@tocbase,0
+.L._Z19SplatAndShift_I16_2v:
+        xxspltiw 34,2175173030
+        vsldoi 2,2,2,5
+        blr
+_Z19SplatAndShift_I32_1v:
+        .quad   .L._Z19SplatAndShift_I32_1v,.TOC.@tocbase,0
+.L._Z19SplatAndShift_I32_1v:
+        xxspltiw 34,2900593407
+        blr
+_Z19SplatAndShift_I32_2v:
+        .quad   .L._Z19SplatAndShift_I32_2v,.TOC.@tocbase,0
+.L._Z19SplatAndShift_I32_2v:
+        xxspltiw 34,2900593407
+        vsldoi 2,2,2,3
+        blr
+
+- User: Kewen Lin | Time: 2023-03-10 07:03:43 UTC
+  Text: Confirmed, thanks for the case on LE, it's reproducible.
+
+It looks like something wrong in some special vector constant folding, I'll have a look.
+
+- User: Kewen Lin | Time: 2023-03-10 09:58:51 UTC
+  Text: One test case can be:
+
+#include <altivec.h>
+
+__attribute__ ((noipa))
+vector signed int
+test ()
+{
+  vector signed int v = {-16, -16, -16, -16};
+  vector signed int res = vec_sld (v, v, 3);
+  return res;
+}
+
+int
+main ()
+{
+  vector signed int res = test ();
+  if (res[0] != 0xf0ffffff)
+    __builtin_abort ();
+  return 0;
+}
+
+It fails on Power7,8,9,10. It starts to fail fromr12-6537-g080a06fcb076b3, when the two input operands are the same, it's only safe to optimize it into a vector move no matter what's the shift count is that the given vector is a const vec_duplicate and the duplicated element is affordable in a byte. The culprit commit is incorrect to use easy_vector_constant as predicate, which just guards those vector constants without memory loading.
+
+The reason why the reporter only saw this on Power10 is that the given constant 0xFA578D00u can only satisfy "easy_vector_constant" till power10. The constructed test case above adopts one constant which can be built with vspltisw, then we can easily see the failure.
+
+- User: GCC Commits | Time: 2023-04-26 05:22:23 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:fd75f6ae5625f087980ff4a7e76cc6284cfe5a3ecommitr14-239-gfd75f6ae5625f087980ff4a7e76cc6284cfe5a3eAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Wed Apr 26 00:21:05 2023 -0500
+
+    rs6000: Fix predicate for const vector in sldoi_to_mov [PR109069]
+    
+    AsPR109069shows, commitr12-6537-g080a06fcb076b3which
+    introduces define_insn_and_split sldoi_to_mov adopts
+    easy_vector_constant for const vector of interest, but it's
+    wrong since predicate easy_vector_constant doesn't guarantee
+    each byte in the const vector is the same.  One counter
+    example is the const vector inpr109069-1.c.  This patch is
+    to introduce new predicate const_vector_each_byte_same to
+    ensure all bytes in the given const vector are the same by
+    considering both int and float, meanwhile for the constants
+    which don't meet easy_vector_constant we need to gen a move
+    instead of just a set, and uses VECTOR_MEM_ALTIVEC_OR_VSX_P
+    rather than VECTOR_UNIT_ALTIVEC_OR_VSX_P for V2DImode support
+    under VSX since vector long long type of vec_sld is guarded
+    under stanza vsx.PR target/109069gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (sldoi_to_mov<mode>): Replace predicate
+            easy_vector_constant with const_vector_each_byte_same, add
+            handlings in preparation for !easy_vector_constant, and update
+            VECTOR_UNIT_ALTIVEC_OR_VSX_P with VECTOR_MEM_ALTIVEC_OR_VSX_P.
+            * config/rs6000/predicates.md (const_vector_each_byte_same): New
+            predicate.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr109069-1.c: New test.
+            * gcc.target/powerpc/pr109069-2-run.c: New test.
+            * gcc.target/powerpc/pr109069-2.c: New test.
+            * gcc.target/powerpc/pr109069-2.h: New test.
+
+- User: Richard Biener | Time: 2023-05-08 12:26:41 UTC
+  Text: GCC 12.3 is being released, retargeting bugs to GCC 12.4.
+
+- User: GCC Commits | Time: 2023-05-09 05:18:14 UTC
+  Text: The releases/gcc-12 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:ce5c5fe9953bc0acdd563b78db8689dd4d9b7b07commitr12-9520-gce5c5fe9953bc0acdd563b78db8689dd4d9b7b07Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Wed Apr 26 00:21:05 2023 -0500
+
+    rs6000: Fix predicate for const vector in sldoi_to_mov [PR109069]
+    
+    AsPR109069shows, commitr12-6537-g080a06fcb076b3which
+    introduces define_insn_and_split sldoi_to_mov adopts
+    easy_vector_constant for const vector of interest, but it's
+    wrong since predicate easy_vector_constant doesn't guarantee
+    each byte in the const vector is the same.  One counter
+    example is the const vector inpr109069-1.c.  This patch is
+    to introduce new predicate const_vector_each_byte_same to
+    ensure all bytes in the given const vector are the same by
+    considering both int and float, meanwhile for the constants
+    which don't meet easy_vector_constant we need to gen a move
+    instead of just a set, and uses VECTOR_MEM_ALTIVEC_OR_VSX_P
+    rather than VECTOR_UNIT_ALTIVEC_OR_VSX_P for V2DImode support
+    under VSX since vector long long type of vec_sld is guarded
+    under stanza vsx.PR target/109069gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (sldoi_to_mov<mode>): Replace predicate
+            easy_vector_constant with const_vector_each_byte_same, add
+            handlings in preparation for !easy_vector_constant, and update
+            VECTOR_UNIT_ALTIVEC_OR_VSX_P with VECTOR_MEM_ALTIVEC_OR_VSX_P.
+            * config/rs6000/predicates.md (const_vector_each_byte_same): New
+            predicate.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr109069-1.c: New test.
+            * gcc.target/powerpc/pr109069-2-run.c: New test.
+            * gcc.target/powerpc/pr109069-2.c: New test.
+            * gcc.target/powerpc/pr109069-2.h: New test.
+    
+    (cherry picked from commit fd75f6ae5625f087980ff4a7e76cc6284cfe5a3e)
+
+- User: GCC Commits | Time: 2023-05-09 08:29:31 UTC
+  Text: The releases/gcc-13 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:5e24077cbe72d9335a2b23a3e4023cfd4707bd97commitr13-7308-g5e24077cbe72d9335a2b23a3e4023cfd4707bd97Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Wed Apr 26 00:21:05 2023 -0500
+
+    rs6000: Fix predicate for const vector in sldoi_to_mov [PR109069]
+    
+    AsPR109069shows, commitr12-6537-g080a06fcb076b3which
+    introduces define_insn_and_split sldoi_to_mov adopts
+    easy_vector_constant for const vector of interest, but it's
+    wrong since predicate easy_vector_constant doesn't guarantee
+    each byte in the const vector is the same.  One counter
+    example is the const vector inpr109069-1.c.  This patch is
+    to introduce new predicate const_vector_each_byte_same to
+    ensure all bytes in the given const vector are the same by
+    considering both int and float, meanwhile for the constants
+    which don't meet easy_vector_constant we need to gen a move
+    instead of just a set, and uses VECTOR_MEM_ALTIVEC_OR_VSX_P
+    rather than VECTOR_UNIT_ALTIVEC_OR_VSX_P for V2DImode support
+    under VSX since vector long long type of vec_sld is guarded
+    under stanza vsx.PR target/109069gcc/ChangeLog:
+    
+            * config/rs6000/altivec.md (sldoi_to_mov<mode>): Replace predicate
+            easy_vector_constant with const_vector_each_byte_same, add
+            handlings in preparation for !easy_vector_constant, and update
+            VECTOR_UNIT_ALTIVEC_OR_VSX_P with VECTOR_MEM_ALTIVEC_OR_VSX_P.
+            * config/rs6000/predicates.md (const_vector_each_byte_same): New
+            predicate.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr109069-1.c: New test.
+            * gcc.target/powerpc/pr109069-2-run.c: New test.
+            * gcc.target/powerpc/pr109069-2.c: New test.
+            * gcc.target/powerpc/pr109069-2.h: New test.
+    
+    (cherry picked from commit fd75f6ae5625f087980ff4a7e76cc6284cfe5a3e)
+
+- User: Kewen Lin | Time: 2023-05-09 08:33:16 UTC
+  Text: Should be fixed on trunk and release branches gcc-13 and gcc-12.
+

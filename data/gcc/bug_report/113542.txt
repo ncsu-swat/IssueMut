@@ -1,0 +1,153 @@
+Bug Summary: [14 Regression] gcc.target/arm/bics_3.c regression after change for pr111267
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization, testsuite-fail
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Roger Sayle | Time: 2024-01-22 15:46:01 UTC
+  Text: This patch is a placeholder for tracking the reported failures of
+FAIL: gcc.target/arm/bics_3.c scan-assembler-times bics\tr[0-9]+, r[0-9]+, r[0-9]+ 2
+FAIL: gcc.target/arm/bics_3.c scan-assembler-times bics\tr[0-9]+, r[0-9]+, r[0-9]+, .sl #2 1
+Seehttps://linaro.atlassian.net/browse/GNU-1117Alas, I've been unable to reproduce the failure on cross compilers to either arm-linux-gnueabihf nor armv8l-unknown-linux-gnueabihf, so I suspect that there's some configuration option or compile-time flag I'm missing that's required to trigger these failures (which I'm hoping is "missed optimization" rather than "wrong code").
+
+Hopefully, filing this PR provides a mechanism to allow folks to help me investigate this issue.  My apologies for the temporary inconvenience.
+Setting the component to "rtl-optimization" until this is confirmed to be a target (ARM backend) issue.
+
+- User: Richard Earnshaw | Time: 2024-01-24 12:48:44 UTC
+  Text: Options to reproduce
+
+-O2 -mcpu=cortex-m3 -mthumb
+
+The problem is really a back-end issue.  But the cause is that the fwprop pass is now merging
+
+propagating insn 9 into insn 10, replacing:
+(set (reg:SI 124 [ _7 ])
+    (ne:SI (reg:CC 100 cc)
+        (const_int 0 [0])))
+
+with the flag setting instruction to form
+
+(parallel [
+        (set (reg:SI 124 [ _7 ])
+            (ne:SI (reg:SI 122 [ _2 ])
+                (const_int 0 [0])))
+        (clobber (reg:CC 100 cc))
+    ])
+
+That's OK, but it means that the combine pass is no-longer able to merge the flag setter with an earlier result producer.
+
+A similar thing starts to happen arm state this is dropped because the costs are working out as the same (it has to reduce the cost).
+
+So I think it's that the cost model for thumb2 needs tweaking.
+
+- User: Richard Earnshaw | Time: 2024-01-24 16:42:58 UTC
+  Text: The costing code is expecting
+
+(parallel [
+        (set (reg:SI 124 [ _7 ])
+            (ne:SI (reg:SI 122 [ _2 ])
+                (const_int 0 [0])))
+        (clobber (reg:CC 100 cc))
+    ])
+
+
+To result in the assembler output
+
+SUBS r124, R122, #1
+SBC  r124, R122, r124
+
+so really should have a cost of 8 (two insns).  But for some reason the thumb2 back-end is not generating that output in this case.  Overall, that means that for bic_si_test
+
+BIC r0, r0, r1
+SUBS r1, r0, #1
+SBC r0, r0, r1
+
+is neither better nor worse than
+
+BICS r0, r0, r1
+IT ne
+MOVNE r0, #1
+
+and certainly better than
+
+BICS r0, r0, r1
+ITE ne
+MOVNE r2, #1
+MOVEQ r2, #0
+
+at least when it comes to code size.
+
+So the test is somewhat flaky, but there is a further problem with the compiler not generating the expected sequence for NE(reg, 0) in Thumb2.
+
+- User: Maxim Kuvyrkov | Time: 2024-01-25 09:51:13 UTC
+  Text: Copy-pasting my comment fromhttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=111267#c15:
+
+I've looked into the reason for the above failures, and it seems to be not an issue.
+
+After the patch fwprop1 decides to do an additional propagation, which was considered as "would increase complexity of pattern" before the patch.  This results in change from "bics; mov" to "bic; subs".  If I understand ARM assembler correctly, handling of sign was shifted from "bics" to "subs" instruction.
+
+This is the actual code: BEFORE:
+	bics	r0, r0, r1	@ 9	[c=4 l=4]  *andsi_notsi_si_compare0_scratch
+	mov	r0, #1	@ 23	[c=4 l=4]  *thumb2_movsi_vfp/1
+	it	eq
+	moveq	r0, #0	@ 26	[c=8 l=4]  *p *thumb2_movsi_vfp/2
+	bx	lr	@ 29	[c=8 l=4]  *thumb2_return
+
+and AFTER:
+	bic	r0, r0, r1	@ 8	[c=4 l=4]  andsi_notsi_si
+	subs	r0, r0, #0	@ 22	[c=4 l=4]  cmpsi2_addneg/0
+	it	ne
+	movne	r0, #1	@ 23	[c=8 l=4]  *p *thumb2_movsi_vfp/2
+	bx	lr	@ 26	[c=8 l=4]  *thumb2_return
+
+If I don't hear anything to the contrary, I'll update the testcase to accept both "bic" and "bics".
+
+- User: Maxim Kuvyrkov | Time: 2024-02-21 12:47:54 UTC
+  Text: Reply from Richard Earnshaw on gcc-patches@ to my patch to make the testcase accept both "bic" and "bics" instructions:
+
+The test was added (r6-823-g0454e698401a3e) specifically to check that a BICS instruction was being generated.  Whether or not that is right is somewhat debatable, but this change seems to be papering over a different issue.
+
+Either we should generate BICS, making this change incorrect, or we should disable the test for thumb code on the basis that this isn't really a win.
+
+But really, we should fix the compiler to do better here.  We really want something like
+
+	BICS  r0, r0, r1  // r0 is 0 or non-zero
+	MOVNE r0, #1      // convert all non-zero to 1
+
+in Arm state (ie using the BICS instruction to set the result to zero); and in thumb2, perhaps something like:
+
+	BICS  r0, r0, r1
+	IT    ne
+	MOVNE r0, #1
+
+or maybe even better:
+
+	BIC  r0, r0, r1
+	SUBS r1, r0, #1
+	SBC  r0, r0, r1
+
+which is slightly better than BICS because SUBS breaks a condition-code chain (all the flag bits are set).
+
+There are similar quality issues for other NE(arith-op, 0) cases; we just don't have tests for those.
+
+- User: GCC Commits | Time: 2024-03-08 17:08:18 UTC
+  Text: The master branch has been updated by Richard Earnshaw <rearnsha@gcc.gnu.org>:https://gcc.gnu.org/g:ac829a89fb56cfd914d5e29ed4695e499b0dbc95commitr14-9399-gac829a89fb56cfd914d5e29ed4695e499b0dbc95Author: Richard Earnshaw <rearnsha@arm.com>
+Date:   Fri Mar 8 16:23:53 2024 +0000
+
+    arm: testsuite: tweak bics_3.c [PR113542]
+    
+    This test was too simple, which meant that the compiler was sometimes
+    able to find a better optimization of the code than using a BICS
+    instruction.  Fix this by changing the test slightly to produce a
+    sequence where BICS should always be the preferred solution.
+    
+    gcc/testsuite:PR target/113542* gcc.target/arm/bics_3.c: Adjust code to something which should
+            always result in BICS.
+
+- User: Richard Earnshaw | Time: 2024-03-08 17:15:49 UTC
+  Text: Change the test slightly to avoid the insn matching issues.  This does leave open the question of how best to optimize the slightly simpler sequences, where we could do even better than we do now, but that's an enhancement and not appropriate for gcc-14.
+

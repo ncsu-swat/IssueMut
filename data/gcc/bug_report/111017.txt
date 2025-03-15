@@ -1,0 +1,176 @@
+Bug Summary: [12/13/14 Regression][OpenMP] Wrong code with non-rectangular loop nest
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: openmp, wrong-code
+Known to Work: 11.4.0
+Known to Fail: 12.3.1, 13.2.1
+
+Comments:
+- User: Tobias Burnus | Time: 2023-08-14 16:28:55 UTC
+  Text: At a glance, the following looks fine to me - but it fails with UBSAN as follows:
+
+
+test.c:10:15: runtime error: index -42 out of bounds for type 'int [1024]'
+test.c:10:8: runtime error: index -42 out of bounds for type 'int [1024]'
+=================================================================
+==619433==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x7f2942e01060 at pc 0x000000401856 bp 0x7f29415fecb0 sp 0x7f29415feca8
+READ of size 4 at 0x7f2942e01060 thread T1
+test.c:10:22: runtime error: index -4210096 out of bounds for type 'int [1024]'
+
+
+#define DIM 32
+#define N (DIM*DIM)
+
+int
+main() {
+  int a[N] = {}, b[N] = {}, c[N];
+#pragma omp parallel for collapse(2)
+  for (int i = 0; i < DIM; i++) {
+    for (int j = (i*DIM); j < (i*DIM + DIM); j++) {
+      c[j] = a[j] + b[j];
+    }
+  }
+}
+
+
+Longer version using 'target teams loop', which segfault here (w/o offloading configured + w/o UBSAN):https://github.com/SOLLVE/sollve_vv/blob/master/tests/5.0/teams_loop/test_target_teams_loop_collapse.c
+
+- User: Tobias Burnus | Time: 2023-08-16 12:21:02 UTC
+  Text: Works with GCC 11, fails since GCC 12.
+---------
+For 'if (0)', there is an off-by-one problem:
+e.g. for DIM=2, printing 'j' shows:
+-1 0 1 2  instead of the expected 0 1 2 3.
+
+
+With N=32 and if(1), I see for num_threads = 12 for thread 0:
+-12 -11 -10 -9 -8 -7 -6 -5 -4
+
+Thus, the value is off by omp_get_num_threads();
+
+For the other threads, I see values between -4198732 and -4198822.
+
+- User: Tobias Burnus | Time: 2023-08-16 13:07:52 UTC
+  Text: Bisecting points at:r12-5295-g47de0b56ee455ec82ec7d61a20988f11b67aa4e9openmp: Regimplify operands of GIMPLE_COND in a few more places [PR103208]
+Date:   Tue Nov 16 10:19:22 2021 +0100
+
+which fixed an ICE such as: "Existing SSA name for symbol marked for renaming: .omp_data_i_14(D)" / "during GIMPLE pass: sccp".
+
+- User: Tobias Burnus | Time: 2023-08-16 13:34:17 UTC
+  Text: Looking at the dump, the only relevant change seems to be
+  .count.5 = 0;
+which is now in a different basic block.
+
+In the working case, it comes in a basic block executed shortly after the bb containing the __builtin_omp_get_thread_num() call.
+
+In the failing case it shifts from right before the following 'if' into the '<bb 12>' - such that it is not executed if the condition is false:
+
+  if (0 != 0)
+    goto <bb 12>; [80.00%]
+  else
+    goto <bb 17>; [20.00%]
+
+- User: Tobias Burnus | Time: 2023-08-16 13:44:03 UTC
+  Text: I tried the following - without understanding the code.
+
+But I looked at what the failing commit changes (GSI_SAME_STMT instead of GSI_CONTINUE_LINKING for the 'factor' case). The latter is used again (only effect) by passing true to the last argument 'bool after = false' of the newly added function. Currently, no call does pass 'true' thus it seems to be a simple oversight.
+
+And indeed the following change fixes the testcase for me:
+
+--- a/gcc/omp-expand.cc
++++ b/gcc/omp-expand.cc
+@@ -2565 +2565,2 @@ expand_omp_for_init_vars (struct omp_for_data *fd, gimple_stmt_iterator *gsi,
+-					 build_zero_cst (TREE_TYPE (factor)));
++					 build_zero_cst (TREE_TYPE (factor)),
++					 true);
+
+- User: GCC Commits | Time: 2023-08-19 05:50:08 UTC
+  Text: The master branch has been updated by Tobias Burnus <burnus@gcc.gnu.org>:https://gcc.gnu.org/g:1dc65003b66e5a97200f454eeddcccfce34416b3commitr14-3332-g1dc65003b66e5a97200f454eeddcccfce34416b3Author: Tobias Burnus <tobias@codesourcery.com>
+Date:   Sat Aug 19 07:49:06 2023 +0200
+
+    omp-expand.cc: Fix wrong code with non-rectangular loop nest [PR111017]
+    
+    Before commitr12-5295-g47de0b56ee455e, all gimple_build_cond in
+    expand_omp_for_* were inserted with
+      gsi_insert_before (gsi_p, cond_stmt, GSI_SAME_STMT);
+    except the one dealing with the multiplicative factor that was
+      gsi_insert_after (gsi, cond_stmt, GSI_CONTINUE_LINKING);
+    
+    That commit forPR103208fixed the issue of some missing regimplify of
+    operands of GIMPLE_CONDs by moving the condition handling to the new function
+    expand_omp_build_cond. While that function has an 'bool after = false'
+    argument to switch between the two variants.
+    
+    However, all callers ommited this argument. This commit reinstates the
+    prior behavior by passing 'true' for the factor != 0 condition, fixing
+    the included testcase.PR middle-end/111017gcc/
+            * omp-expand.cc (expand_omp_for_init_vars): Pass after=true
+            to expand_omp_build_cond for 'factor != 0' condition, resulting
+            in pre-r12-5295-g47de0b56ee455ecode for the gimple insert.
+    
+    libgomp/
+            * testsuite/libgomp.c-c++-common/non-rect-loop-1.c: New test.
+
+- User: GCC Commits | Time: 2023-08-24 11:55:05 UTC
+  Text: The releases/gcc-13 branch has been updated by Tobias Burnus <burnus@gcc.gnu.org>:https://gcc.gnu.org/g:d4648a00df7a6950f7e1d12743e17a8583af0e5fcommitr13-7756-gd4648a00df7a6950f7e1d12743e17a8583af0e5fAuthor: Tobias Burnus <tobias@codesourcery.com>
+Date:   Sat Aug 19 07:49:06 2023 +0200
+
+    omp-expand.cc: Fix wrong code with non-rectangular loop nest [PR111017]
+    
+    Before commitr12-5295-g47de0b56ee455e, all gimple_build_cond in
+    expand_omp_for_* were inserted with
+      gsi_insert_before (gsi_p, cond_stmt, GSI_SAME_STMT);
+    except the one dealing with the multiplicative factor that was
+      gsi_insert_after (gsi, cond_stmt, GSI_CONTINUE_LINKING);
+    
+    That commit forPR103208fixed the issue of some missing regimplify of
+    operands of GIMPLE_CONDs by moving the condition handling to the new function
+    expand_omp_build_cond. While that function has an 'bool after = false'
+    argument to switch between the two variants.
+    
+    However, all callers ommited this argument. This commit reinstates the
+    prior behavior by passing 'true' for the factor != 0 condition, fixing
+    the included testcase.PR middle-end/111017gcc/
+            * omp-expand.cc (expand_omp_for_init_vars): Pass after=true
+            to expand_omp_build_cond for 'factor != 0' condition, resulting
+            in pre-r12-5295-g47de0b56ee455ecode for the gimple insert.
+    
+    libgomp/
+            * testsuite/libgomp.c-c++-common/non-rect-loop-1.c: New test.
+    
+    (cherry picked from commit 1dc65003b66e5a97200f454eeddcccfce34416b3)
+
+- User: GCC Commits | Time: 2023-09-01 12:39:14 UTC
+  Text: The releases/gcc-12 branch has been updated by Tobias Burnus <burnus@gcc.gnu.org>:https://gcc.gnu.org/g:2f8ccacd41a45bccf3e19625c0fbd2627472b45ecommitr12-9841-g2f8ccacd41a45bccf3e19625c0fbd2627472b45eAuthor: Tobias Burnus <tobias@codesourcery.com>
+Date:   Sat Aug 19 07:49:06 2023 +0200
+
+    omp-expand.cc: Fix wrong code with non-rectangular loop nest [PR111017]
+    
+    Before commitr12-5295-g47de0b56ee455e, all gimple_build_cond in
+    expand_omp_for_* were inserted with
+      gsi_insert_before (gsi_p, cond_stmt, GSI_SAME_STMT);
+    except the one dealing with the multiplicative factor that was
+      gsi_insert_after (gsi, cond_stmt, GSI_CONTINUE_LINKING);
+    
+    That commit forPR103208fixed the issue of some missing regimplify of
+    operands of GIMPLE_CONDs by moving the condition handling to the new function
+    expand_omp_build_cond. While that function has an 'bool after = false'
+    argument to switch between the two variants.
+    
+    However, all callers ommited this argument. This commit reinstates the
+    prior behavior by passing 'true' for the factor != 0 condition, fixing
+    the included testcase.PR middle-end/111017gcc/
+            * omp-expand.cc (expand_omp_for_init_vars): Pass after=true
+            to expand_omp_build_cond for 'factor != 0' condition, resulting
+            in pre-r12-5295-g47de0b56ee455ecode for the gimple insert.
+    
+    libgomp/
+            * testsuite/libgomp.c-c++-common/non-rect-loop-1.c: New test.
+    
+    (cherry picked from commit 1dc65003b66e5a97200f454eeddcccfce34416b3)
+
+- User: Tobias Burnus | Time: 2023-09-01 12:39:54 UTC
+  Text: FIXED on all affected branches: mainline, GCC 13 and GCC 12. -> Close.
+

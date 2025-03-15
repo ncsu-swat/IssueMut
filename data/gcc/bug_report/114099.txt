@@ -1,0 +1,102 @@
+Bug Summary: [14 regression] ICE in find_uses_to_rename_use when building darktable-4.6.1
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, needs-bisection
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sam James | Time: 2024-02-25 15:39:04 UTC
+  Text: Createdattachment 57525[details]PentaxDecompressor.cpp.ii.xz
+
+This was found after applying the patch fromPR114068. I can hit it without too though.
+
+Initially reported downstream in Gentoo by tdr.
+
+```
+$ gcc -c PentaxDecompressor.cpp.ii -O3 -march=sapphirerapids -std=c++20
+during GIMPLE pass: vect
+/var/tmp/portage/media-gfx/darktable-4.6.1/work/darktable-4.6.1/src/external/rawspeed/src/librawspeed/decompressors/PentaxDecompressor.cpp: In static member function ‘static rawspeed::HuffmanCode<rawspeed::BaselineCodeTag> rawspeed::PentaxDecompressor::SetupPrefixCodeDecoder_Modern(rawspeed::ByteStream)’:
+/var/tmp/portage/media-gfx/darktable-4.6.1/work/darktable-4.6.1/src/external/rawspeed/src/librawspeed/decompressors/PentaxDecompressor.cpp:81:1: internal compiler error: Segmentation fault
+0x55743ad30b10 crash_signal
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/toplev.cc:319
+0x55743bb50b1f find_uses_to_rename_use
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/tree-ssa-loop-manip.cc:414
+0x55743bb50b1f find_uses_to_rename_bb(basic_block_def*, bitmap_head**, bitmap_head*, int) [clone .constprop.0]
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/tree-ssa-loop-manip.cc:489
+0x55743b993aed find_uses_to_rename
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/tree-ssa-loop-manip.cc:521
+0x55743b993aed rewrite_into_loop_closed_ssa_1
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/tree-ssa-loop-manip.cc:588
+0x55743b993aed rewrite_into_loop_closed_ssa(bitmap_head*, unsigned int)
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/tree-ssa-loop-manip.cc:628
+0x55743bd1e8d9 execute
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/tree-vectorizer.cc:1360
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://bugs.gentoo.org/> for instructions.
+```
+
+- User: Sam James | Time: 2024-02-25 15:40:23 UTC
+  Text: Createdattachment 57526[details]reduced.ii
+
+Attached reduced version from tdr too. I can reproduce with `gcc -c PentaxDecompressor.cpp.ii -O3 -mavx -std=c++20`.
+
+- User: Sam James | Time: 2024-02-25 16:18:13 UTC
+  Text: Createdattachment 57527[details]reduced.ii
+
+- User: Andrew Pinski | Time: 2024-02-25 22:49:56 UTC
+  Text: Note the reduced testcase is undefined code.
+c::j is not initialized when c::k() is called.
+
+- User: Andrew Pinski | Time: 2024-02-25 23:34:04 UTC
+  Text: Createdattachment 57532[details]Reduced further but still has undefined code in it
+
+- User: Andrew Pinski | Time: 2024-02-25 23:36:02 UTC
+  Text: Createdattachment 57533[details]Reduced all the way without undefined code in it
+
+This ICEs on aarch64 with just -O3.
+
+- User: Andrew Pinski | Time: 2024-02-25 23:36:20 UTC
+  Text: Confirmed.
+
+- User: Andrew Pinski | Time: 2024-02-25 23:45:55 UTC
+  Text: Note the difference between noreturn vs __builtin_unreachable BB is the noreturn bb has:
+  # _21 = PHI <_2(4)>
+  m = _21;
+
+But the one with unreachable does not.
+It feels like that difference is causing the issue here. Replacing unreachable with another noreturn function removes the ICE even.
+
+I am 99% sure this is related to the early out vect changes too.
+
+- User: Tamar Christina | Time: 2024-02-26 06:55:45 UTC
+  Text: Createdattachment 57537[details]uses.patch
+
+new code seems sensitive to visitation order as get_virtual_phi returns NULL for blocks which don't define or use a virtual PHI.
+
+testing patch.
+
+- User: Richard Biener | Time: 2024-02-26 10:38:50 UTC
+  Text: Let me handle this as well.
+
+- User: GCC Commits | Time: 2024-02-26 14:21:49 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:fb68e2cac1283f731a3a979cb714621afb1ddfcccommitr14-9182-gfb68e2cac1283f731a3a979cb714621afb1ddfccAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Feb 26 12:27:42 2024 +0100
+
+    tree-optimization/114099 - virtual LC PHIs and early exit vect
+    
+    In some cases exits can lack LC PHI nodes for the virtual operand.
+    We have to create them when the epilog loop requires them which also
+    allows us to remove some only halfway correct fixups.  This is the
+    variant triggering for alternate exits.PR tree-optimization/114099* tree-vect-loop-manip.cc (slpeel_tree_duplicate_loop_to_edge_cfg):
+            Create and fill in a needed virtual LC PHI for the alternate
+            exits.  Remove code dealing with that missing.
+    
+            * gcc.dg/vect/vect-early-break_120-pr114099.c: New testcase.
+
+- User: Richard Biener | Time: 2024-02-26 14:22:46 UTC
+  Text: Fixed.
+

@@ -1,0 +1,267 @@
+Bug Summary: LTO: ltrans temporary file is used as module name in ASAN
+Product: gcc
+Component: sanitizer
+
+  (show other bugs)
+Keywords: 
+Known to Work: 13.0
+Known to Fail: 12.2.0
+
+Comments:
+- User: Martin Liška | Time: 2023-02-17 11:23:59 UTC
+  Text: We originally noticed that accidentally in openSUSE bugzilla:https://bugzilla.opensuse.org/show_bug.cgi?id=1208386$ cat jhead.i
+int foo;
+
+$ gcc -flto -fsanitize=address jhead.i -shared -fPIC -o jhead && md5sum jhead
+4e0fb88f928272b4962c6dcd8b845d71  jhead
+$ gcc -flto -fsanitize=address jhead.i -shared -fPIC -o jhead && md5sum jhead
+e3c77e7ce9d54afb812add5b87a254d1  jhead
+
+$ strings jhead | grep ltrans
+/tmp/ccIzP3oh.ltrans0.o
+
+it comes from ASAN module name:
+
+...
+.LC2:
+	.string	"./jhead.ltrans0.o"
+	.section	.data.rel,"aw"
+	.align 32
+	.type	.LASAN0.2, @object
+	.size	.LASAN0.2, 64
+.LASAN0.2:
+	.quad	.LASAN1.0
+	.quad	4
+	.quad	64
+	.quad	.LC1
+	.quad	.LC2
+
+which is main_input_filename:
+gcc/asan.cc:3290
+
+Anyway, I can fix it.
+
+- User: Richard Biener | Time: 2023-02-17 11:48:39 UTC
+  Text: But those should be all generated early?  Or if not by walking DECL_CONTEXT up to the TRANSLATION_UNIT_DECL and from its location derive the filename.
+
+- User: Martin Liška | Time: 2023-02-17 13:32:35 UTC
+  Text: So the module name is a string that is displayed when an ASAN error happens and I see a discrepancy in between GCC and Clang (with LTO):
+
+$ cat jhead.i
+int x;
+int *p;
+int main() {
+  p = &x;
+  *(p + 1) = 123;
+
+  return 0;
+}
+
+$ clang jhead.i -fsanitize=address -flto && ./a.out
+...
+0x555555fc34e4 is located 28 bytes to the left of the global variable 'p' defined in 'jhead.i' (0x555555fc3500) of size 8
+
+$ gcc jhead.i -fsanitize=address -flto && ./a.out
+...
+0x000000404104 is located 60 bytes before global variable 'p' defined in '/tmp/cci9oq4s.ltrans0.o' (0x404140) of size 8
+
+$ gcc jhead.i -fsanitize=address && ./a.out
+...
+0x000000404104 is located 0 bytes after global variable 'x' defined in 'jhead.i' (0x404100) of size 4
+
+So, yes, we should follow the DECL_CONTEXT.
+
+- User: Jakub Jelinek | Time: 2023-02-17 14:39:59 UTC
+  Text: This is in the arrays passed to __asan_{,un}register_globals.
+Now, we emit
+/* Build
+   struct __asan_global
+   {
+     const void *__beg;
+     uptr __size;
+     uptr __size_with_redzone;
+     const void *__name;
+     const void *__module_name;
+     uptr __has_dynamic_init;
+     __asan_global_source_location *__location;
+     char *__odr_indicator;
+   } type.  */
+so __module_name should be the filename the global appeared in (so for LTO DECL_NAME of corresponding TRANSLATION_UNIT_DECL?), while __location has more details.
+But, looking on the libsanitizer side, it has
+  // This structure describes an instrumented global variable.
+  struct __asan_global {
+    uptr beg;                // The address of the global.
+    uptr size;               // The original size of the global.
+    uptr size_with_redzone;  // The size with the redzone.
+    const char *name;        // Name as a C string.
+    const char *module_name; // Module name as a C string. This pointer is a
+                             // unique identifier of a module.
+    uptr has_dynamic_init;   // Non-zero if the global has dynamic initializer.
+    uptr windows_padding;    // TODO: Figure out how to remove this padding
+                             // that's simply here to make the MSVC incremental
+                             // linker happy...
+    uptr odr_indicator;      // The address of the ODR indicator symbol.
+  };
+so I wonder if emitting the locations isn't just wasted .rodata if libasan considers it being a windows_padding.  In GCC 12 libsanitizer it was still location:
+--- gcc-12/libsanitizer/asan/asan_interface_internal.h  2022-04-28 15:56:17.730640966 +0200
++++ gcc/libsanitizer/asan/asan_interface_internal.h     2022-11-15 22:57:18.450207911 +0100
+@@ -53,8 +53,9 @@ extern "C" {
+     const char *module_name; // Module name as a C string. This pointer is a
+                              // unique identifier of a module.
+     uptr has_dynamic_init;   // Non-zero if the global has dynamic initializer.
+-    __asan_global_source_location *location;  // Source location of a global,
+-                                              // or NULL if it is unknown.
++    uptr windows_padding;    // TODO: Figure out how to remove this padding
++                             // that's simply here to make the MSVC incremental
++                             // linker happy...
+     uptr odr_indicator;      // The address of the ODR indicator symbol.
+   };
+ 
+So I wonder what kind of mess upstream introduced again.
+
+- User: Jakub Jelinek | Time: 2023-02-17 14:43:49 UTC
+  Text: https://reviews.llvm.org/D127552So I guess we need to look also if (and if not, why not) we get the same symbolization from debug info and drop the location stuff there.
+
+- User: Martin Liška | Time: 2023-02-17 14:59:16 UTC
+  Text: Thank you Jakub for the investigation. I'm saying yes, using symbol names from debuginfo seems to me a nice improvement. Lemme take a look at it..
+
+- User: Martin Liška | Time: 2023-02-20 13:59:45 UTC
+  Text: > so I wonder if emitting the locations isn't just wasted .rodata if libasan
+> considers it being a windows_padding.  In GCC 12 libsanitizer it was still
+> location:You are correct, we lost the ability to print line number and column since gcc-12:
+
+$ gcc-12 jhead.i -fsanitize=address && ./a.out 2>&1 | grep "is located"
+0x000000404104 is located 0 bytes after global variable 'myglobal' defined in 'jhead.i' (0x404100) of size 4
+
+$ gcc-11 jhead.i -fsanitize=address && ./a.out 2>&1 | grep "is located"
+0x000000404104 is located 0 bytes to the right of global variable 'myglobal' defined in 'jhead.i:1:5' (0x404100) of size 4
+
+It's a pity we don't have a test-case for it and we didn't notice :(> --- gcc-12/libsanitizer/asan/asan_interface_internal.h  2022-04-28
+> 15:56:17.730640966 +0200
+> +++ gcc/libsanitizer/asan/asan_interface_internal.h     2022-11-15
+> 22:57:18.450207911 +0100
+> @@ -53,8 +53,9 @@ extern "C" {
+>      const char *module_name; // Module name as a C string. This pointer is a
+>                               // unique identifier of a module.
+>      uptr has_dynamic_init;   // Non-zero if the global has dynamic
+> initializer.
+> -    __asan_global_source_location *location;  // Source location of a
+> global,
+> -                                              // or NULL if it is unknown.
+> +    uptr windows_padding;    // TODO: Figure out how to remove this padding
+> +                             // that's simply here to make the MSVC
+> incremental
+> +                             // linker happy...
+>      uptr odr_indicator;      // The address of the ODR indicator symbol.
+>    };
+>  
+> So I wonder what kind of mess upstream introduced again.Ok, so they newly support the DWARF symbolizer in LLVM:
+
+$ clang jhead.i -fsanitize=address && ./a.out 2>&1 | grep "is located"
+0x555555fc34e4 is located 28 bytes to the left of global variable 'myptr' defined in 'jhead.i' (0x555555fc3500) of size 8
+
+And this is with the debuginfo:
+
+$ clang jhead.i -fsanitize=address -g && ./a.out 2>&1 | grep "is located"
+0x555555fc34e4 is located 28 bytes to the left of global variable 'myptr' defined in '/home/marxin/Programming/testcases/fiasco/jhead.i:2' (0x555555fc3500) of size 8
+
+When we build with -g option, I debugged the run-time and the symbolizer can find a module:
+
+#0  __sanitizer::Symbolizer::SymbolizeData (this=0x7ffff7f95018, addr=2112608, info=0x7fffffffbaa0) at /home/marxin/Programming/gcc/libsanitizer/sanitizer_common/sanitizer_symbolizer_libcdep.cpp:116
+#1  0x00007ffff787c850 in __asan::PrintGlobalLocation (str=0x7fffffffbb30, g=...) at /home/marxin/Programming/gcc/libsanitizer/asan/asan_globals.cpp:282
+#2  0x00007ffff786fe7e in __asan::DescribeAddressRelativeToGlobal (addr=2112612, access_size=4, g=...) at /home/marxin/Programming/gcc/libsanitizer/asan/asan_descriptions.cpp:296
+#3  0x00007ffff786ff76 in __asan::GlobalAddressDescription::Print (this=0x7ffff79840f8 <__asan::ScopedInErrorReport::current_error_+1048>, bug_type=0x7ffff785dc6a "global-buffer-overflow") at /home/marxin/Programming/gcc/libsanitizer/asan/asan_descriptions.cpp:329
+#4  0x00007ffff7874185 in __asan::AddressDescription::Print (bug_descr=<optimized out>, this=<optimized out>) at /home/marxin/Programming/gcc/libsanitizer/asan/asan_descriptions.h:246
+#5  __asan::ErrorGeneric::Print (this=0x7ffff7983ce8 <__asan::ScopedInErrorReport::current_error_+8>) at /home/marxin/Programming/gcc/libsanitizer/asan/asan_errors.cpp:593
+#6  0x00007ffff7922360 in __asan::ScopedInErrorReport::~ScopedInErrorReport (this=0x7fffffffc4a6, __in_chrg=<optimized out>) at /home/marxin/Programming/gcc/libsanitizer/asan/asan_report.cpp:143
+#7  0x00007ffff79218f3 in __asan::ReportGenericError (pc=2103431, bp=140737488343312, sp=sp@entry=140737488343304, addr=2112612, is_write=is_write@entry=true, access_size=4, fatal=true, exp=<optimized out>) at /home/marxin/Programming/gcc/libsanitizer/asan/asan_report.cpp:485
+#8  0x00007ffff7921a6e in __asan::ReportGenericError (pc=<optimized out>, bp=bp@entry=140737488343312, sp=sp@entry=140737488343304, addr=<optimized out>, is_write=is_write@entry=true, access_size=access_size@entry=4, exp=<optimized out>, fatal=true) at /home/marxin/Programming/gcc/libsanitizer/asan/asan_report.cpp:485
+#9  0x00007ffff7922d1f in __asan::__asan_report_store4 (addr=<optimized out>) at /home/marxin/Programming/gcc/libsanitizer/asan/asan_rtl.cpp:126
+#10 0x0000000000201887 in main ()
+
+(gdb) p *info
+$3 = {
+  module = 0x7ffff4f01230 "/home/marxin/Programming/testcases/fiasco/a.out",
+  module_offset = 2112608,
+  module_arch = __sanitizer::kModuleArchUnknown,
+  file = 0x0,
+  line = 0,
+  name = 0x0,
+  start = 0,
+  size = 0
+}
+
+but libbacktrace can't find a line/number info. I'm going to continue with debugging..
+
+- User: Martin Liška | Time: 2023-02-20 15:40:29 UTC
+  Text: So clang uses __sanitizer::LLVMSymbolizer:
+
+$ clang jhead.i -fsanitize=address -g && strace -f -s512 ./a.out 2>&1 | grep execv
+execve("./a.out", ["./a.out"], 0x7fffffffd520 /* 116 vars */) = 0
+[pid  5529] execve("/usr/bin/llvm-symbolizer", ["/usr/bin/llvm-symbolizer", "--demangle", "--inlines", "--default-arch=x86_64"], 0x7fffffffd528 /* 116 vars */) = 0
+
+which is probably not something we want to use.
+
+- User: Jakub Jelinek | Time: 2023-02-20 15:44:04 UTC
+  Text: Sure, we want to keep using libbacktrace.  But libbacktrace can be extended if Ian is ok with it, or some extensions can be done on the libsanitizer/libbacktrace side of it.
+
+- User: Martin Liška | Time: 2023-02-20 16:03:58 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #8)> Sure, we want to keep using libbacktrace.  But libbacktrace can be extended
+> if Ian is ok with it, or some extensions can be done on the
+> libsanitizer/libbacktrace side of it.I've got a quite small patch that partially reverts the LLVM commit and does a fallback to Global::location if Symbolizer can't find a location. I'm going to suggest it to upstream.
+
+- User: Martin Liška | Time: 2023-02-20 20:10:57 UTC
+  Text: I've filed an upstream review request:https://reviews.llvm.org/D144424
+
+- User: GCC Commits | Time: 2023-02-24 15:23:26 UTC
+  Text: The master branch has been updated by Martin Liska <marxin@gcc.gnu.org>:https://gcc.gnu.org/g:94c9b1bb79f63d000ebb05efc155c149325e332dcommitr13-6330-g94c9b1bb79f63d000ebb05efc155c149325e332dAuthor: Martin Liska <mliska@suse.cz>
+Date:   Fri Feb 17 15:11:02 2023 +0100
+
+    asan: adjust module name for global variables
+    
+    As mentioned in the PR, when we use LTO, we wrongly use ltrans output
+    file name as a module name of a global variable. That leads to a
+    non-reproducible output.
+    
+    After the suggested change, we emit context name of normal global
+    variables. And for artificial variables (like .Lubsan_data3), we use
+    aux_base_name (e.g. "./a.ltrans0.ltrans").PR sanitizer/108834gcc/ChangeLog:
+    
+            * asan.cc (asan_add_global): Use proper TU name for normal
+            global variables (and aux_base_name for the artificial one).
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/asan/global-overflow-1.c: Test line and column
+            info for a global variable.
+
+- User: Martin Liška | Time: 2023-02-24 15:24:04 UTC
+  Text: Fixed on master so far, I'm going to cherry-pick it at least for gcc-12.
+
+- User: GCC Commits | Time: 2023-02-27 08:32:36 UTC
+  Text: The releases/gcc-12 branch has been updated by Martin Liska <marxin@gcc.gnu.org>:https://gcc.gnu.org/g:b8e496d132ec087c9db5951fea23551dcc831d8ccommitr12-9207-gb8e496d132ec087c9db5951fea23551dcc831d8cAuthor: Martin Liska <mliska@suse.cz>
+Date:   Fri Feb 17 15:11:02 2023 +0100
+
+    asan: adjust module name for global variables
+    
+    As mentioned in the PR, when we use LTO, we wrongly use ltrans output
+    file name as a module name of a global variable. That leads to a
+    non-reproducible output.
+    
+    After the suggested change, we emit context name of normal global
+    variables. And for artificial variables (like .Lubsan_data3), we use
+    aux_base_name (e.g. "./a.ltrans0.ltrans").PR sanitizer/108834gcc/ChangeLog:
+    
+            * asan.cc (asan_add_global): Use proper TU name for normal
+            global variables (and aux_base_name for the artificial one).
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/asan/global-overflow-1.c: Test line and column
+            info for a global variable.
+    
+    (cherry picked from commit 94c9b1bb79f63d000ebb05efc155c149325e332d)
+
+- User: Martin Liška | Time: 2023-02-27 08:32:45 UTC
+  Text: Fixed now.
+

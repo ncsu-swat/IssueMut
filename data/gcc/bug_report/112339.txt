@@ -1,0 +1,221 @@
+Bug Summary: ICE with clang::no_sanitize and -fsanitize=
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Niall Douglas | Time: 2023-11-01 18:37:18 UTC
+  Text: This, if compiled with trunk GCC or any recent major version of GCC:
+
+```
+[[clang::no_sanitize("bounds")]] void foo() 
+{
+}
+```
+
+... with options `-Wno-attributes=clang::no_sanitize -fsanitize=undefined` produces ICE:
+
+```
+<source>: In function 'void foo()':
+<source>:3:1: internal compiler error: in tree_to_uhwi, at tree.cc:6469
+    3 | }
+      | ^
+0x266430e internal_error(char const*, ...)
+	???:0
+0xb01c2c fancy_abort(char const*, int, char const*)
+	???:0
+0xb97938 cp_genericize(tree_node*)
+	???:0
+0xbe33ef finish_function(bool)
+	???:0
+0xcebe49 c_parse_file()
+	???:0
+0xe2ceb9 c_common_parse_file()
+	???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+Compiler returned: 1
+```
+
+Godbolt demo:https://godbolt.org/z/hs3xqeqn1
+
+- User: Andrew Pinski | Time: 2023-11-01 18:45:28 UTC
+  Text: Confirmed.
+
+Happens with both front-ends.
+
+I wonder if we should not add the attribute if using an unknown scope.
+
+- User: Jakub Jelinek | Time: 2023-11-02 09:45:41 UTC
+  Text: Createdattachment 56488[details]gcc14-pr112339.patch
+
+Indeed.  For -Wno-attributes= registered attributes we don't really parse their
+arguments and there is no handler for them, so if they are added, their
+argument will be always error_mark_node and they'll just confuse any
+lookup_attribute done later.
+
+I must say I'm a little bit afraid of what happens when one uses -Wno-attributes=gnu:: or -Wno-attributes=gnu::some_standard_gnu_attribute,
+but this patch shouldn't make that worse.
+
+- User: Niall Douglas | Time: 2023-11-08 22:32:27 UTC
+  Text: Thanks for the patch. I've sent it on to the originator of the bug, if they confirm it fixes their issue to me I'll let you know.
+
+- User: GCC Commits | Time: 2023-11-09 08:07:38 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:533241c6c60bc7c9f7dc47a94e94b5eed1b370e6commitr14-5265-g533241c6c60bc7c9f7dc47a94e94b5eed1b370e6Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Nov 9 09:05:54 2023 +0100
+
+    attribs: Fix ICE with -Wno-attributes= [PR112339]
+    
+    The following testcase ICEs, because with -Wno-attributes=foo::no_sanitize
+    (but generally any other non-gnu namespace and some gnu well known attribute
+    name within that other namespace) the FEs don't really parse attribute
+    arguments of such attribute, but lookup_attribute_spec is non-NULL with
+    NULL handler and such attributes are added to DECL_ATTRIBUTES or
+    TYPE_ATTRIBUTES and then when e.g. middle-end does lookup_attribute
+    on a particular attribute and expects the attribute to mean something
+    and/or have a particular verified arguments, it can crash when seeing
+    the foreign attribute in there instead.
+    
+    The following patch fixes that by never adding ignored attributes
+    to DECL_ATTRIBUTES/TYPE_ATTRIBUTES, previously that was the case just
+    for attributes in ignored namespace (where lookup_attribute_space
+    returned NULL).  We don't really know anything about those attributes,
+    so shouldn't pretend we know something about them, especially when
+    the arguments are error_mark_node or NULL instead of something that
+    would have been parsed.  And it would be really weird if we normally
+    ignore say [[clang::unused]] attribute, but when people use
+    -Wno-attributes=clang::unused we actually treated it as gnu::unused.
+    All the user asked for is suppress warnings about that attribute being
+    unknown.
+    
+    The first hunk is just playing safe, I'm worried people could
+    -Wno-attributes=gnu::
+    and get various crashes with known GNU attributes not being actually
+    parsed and recorded (or worse e.g. when we tweak standard attributes
+    into GNU attributes and we wouldn't add those).
+    The -Wno-attributes= documentation says that it suppresses warning about
+    unknown attributes, so I think -Wno-attributes=gnu:: should prevent
+    warning about say [[gnu::foobarbaz]] attribute, but not about
+    [[gnu::unused]] because the latter is a known attribute.
+    The routine would return true for any scoped attribute in the ignored
+    namespace, with the change it ignores only unknown attributes in ignored
+    namespace, known ones in there will be ignored only if they have
+    max_length of -2 (e.g.. with
+    -Wno-attributes=gnu:: -Wno-attributes=gnu::foobarbaz).
+    
+    2023-11-09  Jakub Jelinek  <jakub@redhat.com>PR c/112339* attribs.cc (attribute_ignored_p): Only return true for
+            attr_namespace_ignored_p if as is NULL.
+            (decl_attributes): Never add ignored attributes.
+    
+            * c-c++-common/ubsan/Wno-attributes-1.c: New test.
+
+- User: GCC Commits | Time: 2023-12-05 16:32:30 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:ef88041a578644b8e4f964903b2fbbcf0f1d7ce8commitr13-8120-gef88041a578644b8e4f964903b2fbbcf0f1d7ce8Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Nov 9 09:05:54 2023 +0100
+
+    attribs: Fix ICE with -Wno-attributes= [PR112339]
+    
+    The following testcase ICEs, because with -Wno-attributes=foo::no_sanitize
+    (but generally any other non-gnu namespace and some gnu well known attribute
+    name within that other namespace) the FEs don't really parse attribute
+    arguments of such attribute, but lookup_attribute_spec is non-NULL with
+    NULL handler and such attributes are added to DECL_ATTRIBUTES or
+    TYPE_ATTRIBUTES and then when e.g. middle-end does lookup_attribute
+    on a particular attribute and expects the attribute to mean something
+    and/or have a particular verified arguments, it can crash when seeing
+    the foreign attribute in there instead.
+    
+    The following patch fixes that by never adding ignored attributes
+    to DECL_ATTRIBUTES/TYPE_ATTRIBUTES, previously that was the case just
+    for attributes in ignored namespace (where lookup_attribute_space
+    returned NULL).  We don't really know anything about those attributes,
+    so shouldn't pretend we know something about them, especially when
+    the arguments are error_mark_node or NULL instead of something that
+    would have been parsed.  And it would be really weird if we normally
+    ignore say [[clang::unused]] attribute, but when people use
+    -Wno-attributes=clang::unused we actually treated it as gnu::unused.
+    All the user asked for is suppress warnings about that attribute being
+    unknown.
+    
+    The first hunk is just playing safe, I'm worried people could
+    -Wno-attributes=gnu::
+    and get various crashes with known GNU attributes not being actually
+    parsed and recorded (or worse e.g. when we tweak standard attributes
+    into GNU attributes and we wouldn't add those).
+    The -Wno-attributes= documentation says that it suppresses warning about
+    unknown attributes, so I think -Wno-attributes=gnu:: should prevent
+    warning about say [[gnu::foobarbaz]] attribute, but not about
+    [[gnu::unused]] because the latter is a known attribute.
+    The routine would return true for any scoped attribute in the ignored
+    namespace, with the change it ignores only unknown attributes in ignored
+    namespace, known ones in there will be ignored only if they have
+    max_length of -2 (e.g.. with
+    -Wno-attributes=gnu:: -Wno-attributes=gnu::foobarbaz).
+    
+    2023-11-09  Jakub Jelinek  <jakub@redhat.com>PR c/112339* attribs.cc (attribute_ignored_p): Only return true for
+            attr_namespace_ignored_p if as is NULL.
+            (decl_attributes): Never add ignored attributes.
+    
+            * c-c++-common/ubsan/Wno-attributes-1.c: New test.
+    
+    (cherry picked from commit 533241c6c60bc7c9f7dc47a94e94b5eed1b370e6)
+
+- User: GCC Commits | Time: 2023-12-16 00:37:43 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:029b826f62d2d193e93539749a534b9a13ade728commitr12-10048-g029b826f62d2d193e93539749a534b9a13ade728Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Nov 9 09:05:54 2023 +0100
+
+    attribs: Fix ICE with -Wno-attributes= [PR112339]
+    
+    The following testcase ICEs, because with -Wno-attributes=foo::no_sanitize
+    (but generally any other non-gnu namespace and some gnu well known attribute
+    name within that other namespace) the FEs don't really parse attribute
+    arguments of such attribute, but lookup_attribute_spec is non-NULL with
+    NULL handler and such attributes are added to DECL_ATTRIBUTES or
+    TYPE_ATTRIBUTES and then when e.g. middle-end does lookup_attribute
+    on a particular attribute and expects the attribute to mean something
+    and/or have a particular verified arguments, it can crash when seeing
+    the foreign attribute in there instead.
+    
+    The following patch fixes that by never adding ignored attributes
+    to DECL_ATTRIBUTES/TYPE_ATTRIBUTES, previously that was the case just
+    for attributes in ignored namespace (where lookup_attribute_space
+    returned NULL).  We don't really know anything about those attributes,
+    so shouldn't pretend we know something about them, especially when
+    the arguments are error_mark_node or NULL instead of something that
+    would have been parsed.  And it would be really weird if we normally
+    ignore say [[clang::unused]] attribute, but when people use
+    -Wno-attributes=clang::unused we actually treated it as gnu::unused.
+    All the user asked for is suppress warnings about that attribute being
+    unknown.
+    
+    The first hunk is just playing safe, I'm worried people could
+    -Wno-attributes=gnu::
+    and get various crashes with known GNU attributes not being actually
+    parsed and recorded (or worse e.g. when we tweak standard attributes
+    into GNU attributes and we wouldn't add those).
+    The -Wno-attributes= documentation says that it suppresses warning about
+    unknown attributes, so I think -Wno-attributes=gnu:: should prevent
+    warning about say [[gnu::foobarbaz]] attribute, but not about
+    [[gnu::unused]] because the latter is a known attribute.
+    The routine would return true for any scoped attribute in the ignored
+    namespace, with the change it ignores only unknown attributes in ignored
+    namespace, known ones in there will be ignored only if they have
+    max_length of -2 (e.g.. with
+    -Wno-attributes=gnu:: -Wno-attributes=gnu::foobarbaz).
+    
+    2023-11-09  Jakub Jelinek  <jakub@redhat.com>PR c/112339* attribs.cc (attribute_ignored_p): Only return true for
+            attr_namespace_ignored_p if as is NULL.
+            (decl_attributes): Never add ignored attributes.
+    
+            * c-c++-common/ubsan/Wno-attributes-1.c: New test.
+    
+    (cherry picked from commit 533241c6c60bc7c9f7dc47a94e94b5eed1b370e6)
+
+- User: Jakub Jelinek | Time: 2023-12-16 08:46:22 UTC
+  Text: Fixed.
+

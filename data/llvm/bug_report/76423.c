@@ -1,0 +1,1 @@
+__typeof_unqual__(int) u = 12;

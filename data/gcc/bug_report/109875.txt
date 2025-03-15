@@ -1,0 +1,164 @@
+Bug Summary: [OpenMP] nteams-var / OMP_NUM_TEAMS → ICV not passed to the device / default value
+Product: gcc
+Component: libgomp
+
+  (show other bugs)
+Keywords: openmp
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Tobias Burnus | Time: 2023-05-16 17:39:28 UTC
+  Text: Related:https://github.com/SOLLVE/sollve_vv/pull/728and
+OpenMP Spec Issue 3619.
+
+The following is with host fallback - and I might miss something because of this.
+
+However, I get only a single team with the following code;
+even though max_num_teams == 3.
+
+Replacing the set_num_teams by
+  OMP_NUM_TEAMS=7 OMP_NUM_TEAMS_DEV=8
+will yield the expected 7 for max_teams.
+
+But it will still execute with a single team. — Using num_teams(3) as clause will have an effect, however.
+
+TODO:
+
+* Check whether TEAMS = 1 makes sense for host fallback
+  and what the result is with actual offloading.
+
+EXPECTED:
+
+* The value of the ICV is honored on the device side
+
+* Possibly, the initial value should be not 0 but a different value,
+  but that depends on the OpenMP Spec Issue 3619.
+
+  NOTE: While the init value is now changed, as omp_get_max_teams()
+  is confusingly written, just changing the default is undetectable
+  inside the program as only omp_get_max_teams() or display-env can be
+  used to determine the value - and the values returned by the latter
+  is not really available for consumption inside of the program.
+
+* On the host side, the default seems to be 3, given that there is:
+    libgomp/teams.c:    num_teams = gomp_nteams_var ? gomp_nteams_var : 3;
+
+
+It seems as if get_gomp_offload_icvs sets the ICV for the device but it does not seem to get actually get used. – At least not for host fallback.
+
+
+#include <omp.h>
+int main ()
+{
+  int num_teams;
+#if 1 // set to 0 to test the environment variables
+  omp_set_num_teams(2);
+  #pragma omp target
+  omp_set_num_teams(3);
+#endif
+
+  __builtin_printf("max_teams: %d\n", omp_get_max_teams());
+  #pragma omp target teams map(tofrom: num_teams) //num_teams(4)
+        {
+                if (omp_get_team_num() == 0) {
+                        num_teams = omp_get_num_teams();
+                }
+        }               
+  __builtin_printf("num_teams: %d\n", num_teams);
+  return 0;
+}
+
+- User: Tobias Burnus | Time: 2023-05-17 09:47:00 UTC
+  Text: Tested it now also with true offloading.
+
+For AMD GCN, I get:
+  host: max_teams: 2
+  tgt: max_teams: 3
+  num_teams: 120
+
+For nvptx, I get:
+  host: max_teams: 2
+  tgt: max_teams: 3
+  num_teams: 240
+
+And for completeness, for host fallback:
+  host: max_teams: 3
+  tgt: max_teams: 3
+  num_teams: 1
+
+i.e. the ICV is handled correctly. However, the ICV is not honored for the target region.
+
+By contrast, an explicit 'num_teams(4)' is honored by GCN/nvptx/host fallback ...
+
+ * * *
+
+The spec wording is:
+"If the *num_teams* clause is not specified on a construct then the effect is as if _upper-bound_ was specified as follows. If the value of the nteams-var ICV is greater than zero, the effect is as if upper-bound was specified to an implementation-defined value greater than zero but less than or equal to the value of the nteams-var ICV."
+
+- User: Tobias Burnus | Time: 2023-05-17 10:11:44 UTC
+  Text: The host-fallback explicitly sets the number of teams to the lower_bound,
+if available, and otherwise to 1 - which is fine.
+
+Regarding changing the default from 0 to the actually used number,
+the problem is on the device side it is only known at runtime
+→ issue with OMP_DISPLAY_ENV.
+BTW, the "[host] OMP_NUM_TEAMS = '0'" should be "[all] OMP_NUM_TEAMS = '0'
+for the default.
+
+For the device side, I think we need (untested):
+
+--- a/libgomp/config/gcn/target.c
++++ b/libgomp/config/gcn/target.c
+@@ -51 +51,3 @@ GOMP_teams4 (unsigned int num_teams_lower, unsigned int -    num_teams_upper = num_workgroups;
++    num_teams_upper = ((GOMP_ADDITIONAL_ICVS.nteams > 0
++			&& num_workgroups > GOMP_ADDITIONAL_ICVS.nteams)
++		       ? GOMP_ADDITIONAL_ICVS.nteams : num_workgroups);
+diff --git a/libgomp/config/nvptx/target.c b/libgomp/config/nvptx/target.c
+index f102d7d02d9..125d92a2ea9 100644
+--- a/libgomp/config/nvptx/target.c
++++ b/libgomp/config/nvptx/target.c
+@@ -58 +58,3 @@ GOMP_teams4 (unsigned int num_teams_lower, unsigned int 
+-    num_teams_upper = num_blocks;
++    num_teams_upper = ((GOMP_ADDITIONAL_ICVS.nteams > 0
++			&& num_blocks > GOMP_ADDITIONAL_ICVS.nteams)
++		       ? GOMP_ADDITIONAL_ICVS.nteams : num_blocks);
+
+- User: GCC Commits | Time: 2023-05-21 18:44:35 UTC
+  Text: The master branch has been updated by Tobias Burnus <burnus@gcc.gnu.org>:https://gcc.gnu.org/g:ad0f80d945cc36fbb60fd1e04d90681d4302de8bcommitr14-1026-gad0f80d945cc36fbb60fd1e04d90681d4302de8bAuthor: Tobias Burnus <tobias@codesourcery.com>
+Date:   Sun May 21 20:36:19 2023 +0200
+
+    libgomp: Honor OpenMP's nteams-var ICV as upper limit on num teams [PR109875]
+    
+    The nteams-var ICV exists per device and can be set either via the routine
+    omp_set_num_teams or as environment variable (OMP_NUM_TEAMS with optional
+    _ALL/_DEV/_DEV_<num> suffix); it is default-initialized to zero. The number
+    of teams created is described under the num_teams clause. If the clause is
+    absent, the number of teams is implementation defined but at least
+    one team must exist and, if nteams-var is positive, at most nteams-var
+    teams may exist.
+    
+    The latter condition was not honored in a target region before this
+    commit, such that too many teams were created.
+    
+    Already before this commit, both the num_teams([lower:]upper) clause
+    (on the host and in target regions) and, only on the host, the nteams-var
+    ICV were honored. And as only one teams is created for host fallback,
+    unless the clause specifies otherwise, the nteams-var ICV was and is
+    effectively honored.
+    
+    libgomp/ChangeLog:PR libgomp/109875* config/gcn/target.c (GOMP_teams4): Honor nteams-var ICV.
+            * config/nvptx/target.c (GOMP_teams4): Likewise.
+            * testsuite/libgomp.c-c++-common/teams-nteams-icv-1.c: New test.
+            * testsuite/libgomp.c-c++-common/teams-nteams-icv-2.c: New test.
+            * testsuite/libgomp.c-c++-common/teams-nteams-icv-3.c: New test.
+            * testsuite/libgomp.c-c++-common/teams-nteams-icv-4.c: New test.
+
+- User: Tobias Burnus | Time: 2023-05-21 18:56:52 UTC
+  Text: FIXED the issue that the number of teams in target regions exceeded the limit set by the nteams-var ICV. (→ GCC mainline/14).
+
+
+Unsolved: Checking whether the omp_get_max_teams() returns the proper value or not. — This depends on the outcome of OpenMP Spec Issue 3619.
+
+Still close this issue as a likely solution could be to keep the current implementation (init = 0, return value of the ICV, which is 0), possibly except for permitting 0 for the env var (0 is already accepted for omp_set_num_devices), but the outcome should be tracked in a new issue.
+

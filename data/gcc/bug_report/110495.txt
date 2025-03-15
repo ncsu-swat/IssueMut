@@ -1,0 +1,180 @@
+Bug Summary: fre introduces signed wrap for vector
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Krister Walfridsson | Time: 2023-06-30 09:06:41 UTC
+  Text: The following function (from gcc.dg/tree-ssa/addadd-2.c)
+
+typedef int S __attribute__((vector_size(64)));
+void j(S*x){
+  *x += __INT_MAX__;
+  *x += __INT_MAX__;
+}
+
+is optimized by fre1 to 
+
+void j (S * x)
+{
+  vector(16) int _1;
+  vector(16) int _2;
+  vector(16) int _4;
+
+  <bb 2> :
+  _1 = *x_6(D);
+  _2 = _1 + { 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647 };
+  *x_6(D) = _2;
+  _4 = _1 + { -2(OVF), -2(OVF), -2(OVF), -2(OVF), -2(OVF), -2(OVF), -2(OVF), -2(OVF), -2(OVF), -2(OVF), -2(OVF), -2(OVF), -2(OVF), -2(OVF), -2(OVF), -2(OVF) };
+  *x_6(D) = _4;
+  return;
+}
+
+which has signed wrap for the cases where the original did not wrap.
+
+- User: Richard Biener | Time: 2023-06-30 09:33:09 UTC
+  Text: Applying pattern match.pd:3029, gimple-match-2.cc:1090
+Applying pattern match.pd:3029, gimple-match-2.cc:1090
+
+but that specifically checks for
+
+         (if (cst && !TREE_OVERFLOW (cst))
+          (inner_op @0 { cst; } )
+
+ah, but we are dealing with vectors here and the VECTOR_CST doesn't
+inherit TREE_OVERFLOW here.  I don't think we ever actually set
+TREE_OVERFLOW on VECTOR_CSTs even though that's documented to be a thing.
+
+We are relying on TREE_OVERFLOW in some more patterns that are also
+applying to VECTOR_CST.  _Complex int is probably similarly affected.
+
+diff --git a/gcc/tree-vector-builder.cc b/gcc/tree-vector-builder.cc
+index 0e51bcefa4f..78688ef4331 100644
+--- a/gcc/tree-vector-builder.cc
++++ b/gcc/tree-vector-builder.cc
+@@ -43,6 +43,12 @@ tree_vector_builder::build ()
+   gcc_assert (pow2p_hwi (npatterns ()));
+   tree v = make_vector (exact_log2 (npatterns ()), nelts_per_pattern ());
+   TREE_TYPE (v) = m_type;
++  bool ovf = false;
++  for (tree elt : *this)
++    if (TREE_OVERFLOW (elt))
++      ovf = true;
++  if (ovf)
++    TREE_OVERFLOW (v) = true;
+   memcpy (VECTOR_CST_ENCODED_ELTS (v), address (),
+          encoded_nelts () * sizeof (tree));
+   return v;
+
+fixes this and results in
+
+  <bb 2> :
+  _1 = *x_6(D);
+  _2 = _1 + { 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647, 2147483647 };
+  *x_6(D) = _2;
+  _9 = VIEW_CONVERT_EXPR<vector(16) unsigned int>(_1);
+  _10 = _9 + { 4294967294, 4294967294, 4294967294, 4294967294, 4294967294, 4294967294, 4294967294, 4294967294, 4294967294, 4294967294, 4294967294, 4294967294, 4294967294, 4294967294, 4294967294, 4294967294 };
+  _4 = VIEW_CONVERT_EXPR<vector(16) int>(_10);
+  *x_6(D) = _4;
+  return;
+
+there are some more VECTOR_CST builders that would need adjustment for
+consistency.  Maybe not relying on TREE_OVERFLOW would be a better idea
+here, but while for plain integers we have wide_int for vectors or
+complex there's no such thing ...
+
+- User: Richard Sandiford | Time: 2023-07-03 08:09:13 UTC
+  Text: The point of the builder is that, if you know the pattern,
+you don't need to supply every element value to the builder.
+(And indeed you can't when the vector is variable length.)
+
+So something might push:
+
+  { a, b, c, ... }
+
+and leave the other elements implicit.  Same when computing
+the result of adding two vectors with the same pattern
+(new_binary_operation).  It might be that the overflow
+happens in elements that are not encoded.  But something
+later could still ask for the value of the fourth or fifth
+element and get something that overflows, even if the vector
+itself is not marked as overflowing.
+
+E.g. to take chars as an example, we could build:
+
+    { 0x3c, 0x3d, …, 0x43 }
+  + { 0x3c, 0x3d, …, 0x43 }
+
+by pushing all 8 elements of each vector, and seeing the
+overflow for 0x40+0x40.  We'd then set TREE_OVERFLOW on
+the VECTOR_CST.  But we could also just push 0x3c, 0x3d, 0x3e,
+add those together, and get the same constant without the
+TREE_OVERFLOW.
+
+So I'm not sure that TREE_OVERFLOW on a VECTOR_CST is really meaningful.
+
+- User: Richard Biener | Time: 2023-07-03 08:40:42 UTC
+  Text: OK, that's a reasonable stance give we have VL vectors.  I'll note that
+previously build_vector looked like the following, so TREE_OVERFLOW was
+set according to the encoded elements.  Now that's no longer the case.
+I'll post a patch for comments.
+
+
+/* Return a new VECTOR_CST node whose type is TYPE and whose values
+   are in a list pointed to by VALS.  */
+
+tree
+build_vector_stat (tree type, tree *vals MEM_STAT_DECL)
+{
+  int over = 0;
+  unsigned cnt = 0;
+  tree v = make_vector (TYPE_VECTOR_SUBPARTS (type));
+  TREE_TYPE (v) = type;
+
+  /* Iterate through elements and check for overflow.  */
+  for (cnt = 0; cnt < TYPE_VECTOR_SUBPARTS (type); ++cnt)
+    {
+      tree value = vals[cnt];
+
+      VECTOR_CST_ELT (v, cnt) = value;
+
+      /* Don't crash if we get an address constant.  */
+      if (!CONSTANT_CLASS_P (value))
+        continue;
+
+      over |= TREE_OVERFLOW (value);
+    }
+
+  TREE_OVERFLOW (v) = over;
+  return v;
+
+- User: GCC Commits | Time: 2023-07-04 07:08:14 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:f703d2fd3f03890a180e8cc04df087c208999e81commitr14-2282-gf703d2fd3f03890a180e8cc04df087c208999e81Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Jul 3 10:28:10 2023 +0200
+
+    middle-end/110495 - avoid associating constants with (VL) vectors
+    
+    When trying to associate (v + INT_MAX) + INT_MAX we are using
+    the TREE_OVERFLOW bit to check for correctness.  That isn't
+    working for VECTOR_CSTs and it can't in general when one considers
+    VL vectors.  It looks like it should work for COMPLEX_CSTs but
+    I didn't try to single out _Complex int in this change.
+    
+    The following makes sure that for vectors we use the fallback of
+    using unsigned arithmetic when associating the above to
+    v + (INT_MAX + INT_MAX).PR middle-end/110495* tree.h (TREE_OVERFLOW): Do not mention VECTOR_CSTs
+            since we do not set TREE_OVERFLOW on those since the
+            introduction of VL vectors.
+            * match.pd (x +- CST +- CST): For VECTOR_CST do not look
+            at TREE_OVERFLOW to determine validity of association.
+    
+            * gcc.dg/tree-ssa/addadd-2.c: Amend.
+            * gcc.dg/tree-ssa/forwprop-27.c: Adjust.
+
+- User: Richard Biener | Time: 2023-07-04 07:09:01 UTC
+  Text: Fixed.
+

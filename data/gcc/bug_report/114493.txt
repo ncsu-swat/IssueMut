@@ -1,0 +1,352 @@
+Bug Summary: [11 Regression] internal compiler error: in fld_incomplete_type_of with may_alias
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: ice-on-valid-code, lto
+Known to Work: 8.1.0
+Known to Fail: 9.1.0
+
+Comments:
+- User: Sam James | Time: 2024-03-27 03:14:20 UTC
+  Text: Createdattachment 57819[details]odb_pack.c.i.xz
+
+11/12/13/14 all fail. 10 fails b/c of malloc attribute so needs to be checked.
+
+I hit this after adding may_alias to a struct.
+
+```
+$ gcc src/libgit2/CMakeFiles/libgit2.dir/odb_pack.c.i -std=c90 -c -flto
+during IPA pass: *free_lang_data
+/home/sam/git/libgit2/src/libgit2/odb_pack.c:986:1: internal compiler error: in fld_incomplete_type_of, at ipa-free-lang-data.cc:257
+  986 | }
+      | ^
+0x55e8b946cd88 fld_incomplete_type_of
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/ipa-free-lang-data.cc:257
+0x55e8baa704cd fld_simplified_type
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/ipa-free-lang-data.cc:344
+0x55e8baa704cd free_lang_data_in_type
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/ipa-free-lang-data.cc:439
+0x55e8bb0d2280 free_lang_data_in_cgraph
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/ipa-free-lang-data.cc:1072
+0x55e8bb0d2280 free_lang_data
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/ipa-free-lang-data.cc:1109
+0x55e8bb0d2280 execute
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/ipa-free-lang-data.cc:1176
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://bugs.gentoo.org/> for instructions.
+``
+
+- User: Andrew Pinski | Time: 2024-03-27 03:18:05 UTC
+  Text: I have seen TYPE_CANONICAL issues with may_alias before.
+
+- User: Sam James | Time: 2024-03-27 03:40:03 UTC
+  Text: Pfff.
+
+```
+typedef struct git_midx_writer git_midx_writer;
+int git_futils_rmdir_flags;
+int __attribute__git_midx_writer_new(git_midx_writer **);
+struct __attribute__((__may_alias__)) git_midx_writer {};
+```
+
+- User: Andrew Pinski | Time: 2024-03-27 03:50:21 UTC
+  Text: Works with the C++ front-end ...
+
+- User: Andrew Pinski | Time: 2024-03-27 04:00:28 UTC
+  Text: Also related is commitr7-1272-g5545a9071573a5.
+
+- User: Andrew Pinski | Time: 2024-03-27 04:01:45 UTC
+  Text: Ah yesPR 35980which describes the exact issue ...
+
+- User: matoro | Time: 2024-06-01 21:22:19 UTC
+  Text: Hit this as well building samba on 14.
+
+Minimized:
+
+void _talloc_array();
+struct sockaddr_storage
+resolve_lmhosts_file_as_sockaddr(struct sockaddr_storage **);
+struct __attribute__((__may_alias__)) sockaddr_storage {
+} resolve_name_multiple_recv() {
+  _talloc_array();
+}
+
+$ x86_64-pc-linux-gnu-gcc-14 -flto -c resolve.c.10.i
+during IPA pass: *free_lang_data
+resolve.c.10.i:7:1: internal compiler error: in fld_incomplete_type_of, at ipa-free-lang-data.cc:257
+    7 | }
+      | ^
+
+- User: Sam James | Time: 2024-06-02 02:35:05 UTC
+  Text: I've been scratching my head as to why matoro and someone else reported it with Samba today out of nowhere.
+
+I assume it's because ofhttps://sourceware.org/git/?p=glibc.git;a=commit;h=26e7005728f0eea2972474e6be2905c467661237.
+
+I think it was suggested that a forward decl might work to mitigate the ICE but I haven't tried (yet).
+
+- User: Jakub Jelinek | Time: 2024-06-03 17:47:43 UTC
+  Text: This doesn't ICE in C++, because the C++ FE forcibly updates the corresponding pointer types in:
+#0  fixup_may_alias (klass=<record_type 0x7fffea2dec78 S>) at ../../gcc/cp/class.cc:2328
+#1  0x0000000000456835 in fixup_attribute_variants (t=<record_type 0x7fffea2dec78 S>) at ../../gcc/cp/class.cc:2354
+#2  0x00000000006f3024 in cp_parser_class_head (parser=0x7fffea2dea80, nested_name_specifier_p=0x7fffffffd5ff) at ../../gcc/cp/parser.cc:27831
+
+/* KLASS is a class that we're applying may_alias to after the body is
+   parsed.  Fixup any POINTER_TO and REFERENCE_TO types.  The
+   canonical type(s) will be implicitly updated.  */
+
+static void
+fixup_may_alias (tree klass)
+{
+  tree t, v;
+
+  for (t = TYPE_POINTER_TO (klass); t; t = TYPE_NEXT_PTR_TO (t))
+    for (v = TYPE_MAIN_VARIANT (t); v; v = TYPE_NEXT_VARIANT (v))
+      TYPE_REF_CAN_ALIAS_ALL (v) = true;
+  for (t = TYPE_REFERENCE_TO (klass); t; t = TYPE_NEXT_REF_TO (t))
+    for (v = TYPE_MAIN_VARIANT (t); v; v = TYPE_NEXT_VARIANT (v))
+      TYPE_REF_CAN_ALIAS_ALL (v) = true;
+}
+
+Now, fixup_attribute_variants also does:
+  for (variants = TYPE_NEXT_VARIANT (t);
+       variants;
+       variants = TYPE_NEXT_VARIANT (variants))
+    {
+      /* These are the two fields that check_qualified_type looks at and
+         are affected by attributes.  */
+      TYPE_ATTRIBUTES (variants) = attrs;
+      unsigned valign = align;
+      if (TYPE_USER_ALIGN (variants))
+        valign = MAX (valign, TYPE_ALIGN (variants));
+      else
+        TYPE_USER_ALIGN (variants) = user_align;
+      SET_TYPE_ALIGN (variants, valign);
+      TYPE_PACKED (variants) = packed;
+      if (may_alias)
+        fixup_may_alias (variants);
+    }
+I think the TYPE_ATTRIBUTES update isn't needed, because
+decl_attributes (&t, attributes, (int) ATTR_FLAG_TYPE_IN_PLACE);
+should update the variants already:
+984			  TYPE_ATTRIBUTES (*anode) = r;
+985			  /* If this is the main variant, also push the attributes
+986			     out to the other variants.  */
+987			  if (*anode == TYPE_MAIN_VARIANT (*anode))
+988			    {
+989			      for (tree variant = *anode; variant;
+990				   variant = TYPE_NEXT_VARIANT (variant))
+991				{
+992				  if (TYPE_ATTRIBUTES (variant) == old_attrs)
+993				    TYPE_ATTRIBUTES (variant)
+994				      = TYPE_ATTRIBUTES (*anode);
+995				  else if (!find_same_attribute
+996					   (attr, TYPE_ATTRIBUTES (variant)))
+997				    TYPE_ATTRIBUTES (variant) = tree_cons
+998				      (name, args, TYPE_ATTRIBUTES (variant));
+999				}
+1000			    }
+Seems finish_struct doesn't actually call layout_type on the type variants, wonder what does that, but I'd think that stuff like TYPE_USER_ALIGN, TYPE_ALIGN would be finalized when layout_type is performed for those.  TYPE_PACKED is apparently done in
+finish_record_layout even for the variants (called from layout_type).
+
+- User: Jakub Jelinek | Time: 2024-06-03 18:05:57 UTC
+  Text: That was added for C++ inPR70512.
+
+- User: Jakub Jelinek | Time: 2024-06-03 18:08:47 UTC
+  Text: Createdattachment 58337[details]gcc15-pr114493.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-06-06 20:12:52 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d5a3c6d43acb8b2211d9fb59d59482d74c010f01commitr15-1080-gd5a3c6d43acb8b2211d9fb59d59482d74c010f01Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Jun 6 22:12:11 2024 +0200
+
+    c: Fix up pointer types to may_alias structures [PR114493]
+    
+    The following testcase ICEs in ipa-free-lang, because the
+    fld_incomplete_type_of
+              gcc_assert (TYPE_CANONICAL (t2) != t2
+                          && TYPE_CANONICAL (t2) == TYPE_CANONICAL (TREE_TYPE (t)));
+    assertion doesn't hold.
+    This is because t is a struct S * type which was created while struct S
+    was still incomplete and without the may_alias attribute (and TYPE_CANONICAL
+    of a pointer type is a type created with can_alias_all = false argument),
+    while later on on the struct definition may_alias attribute was used.
+    fld_incomplete_type_of then creates an incomplete distinct copy of the
+    structure (but with the original attributes) but pointers created for it
+    are because of the "may_alias" attribute TYPE_REF_CAN_ALIAS_ALL, including
+    their TYPE_CANONICAL, because while that is created with !can_alias_all
+    argument, we later set it because of the "may_alias" attribute on the
+    to_type.
+    
+    This doesn't ICE with C++ sincePR70512fix because the C++ FE sets
+    TYPE_REF_CAN_ALIAS_ALL on all pointer types to the class type (and its
+    variants) when the may_alias is added.
+    
+    The following patch does that in the C FE as well.
+    
+    2024-06-06  Jakub Jelinek  <jakub@redhat.com>PR c/114493* c-decl.cc (c_fixup_may_alias): New function.
+            (finish_struct): Call it if "may_alias" attribute is
+            specified.
+    
+            * gcc.dg/pr114493-1.c: New test.
+            * gcc.dg/pr114493-2.c: New test.
+
+- User: GCC Commits | Time: 2024-06-06 20:19:30 UTC
+  Text: The releases/gcc-14 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:56c73729c3eab08ca48f366bd435f98457743e45commitr14-10286-g56c73729c3eab08ca48f366bd435f98457743e45Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Jun 6 22:12:11 2024 +0200
+
+    c: Fix up pointer types to may_alias structures [PR114493]
+    
+    The following testcase ICEs in ipa-free-lang, because the
+    fld_incomplete_type_of
+              gcc_assert (TYPE_CANONICAL (t2) != t2
+                          && TYPE_CANONICAL (t2) == TYPE_CANONICAL (TREE_TYPE (t)));
+    assertion doesn't hold.
+    This is because t is a struct S * type which was created while struct S
+    was still incomplete and without the may_alias attribute (and TYPE_CANONICAL
+    of a pointer type is a type created with can_alias_all = false argument),
+    while later on on the struct definition may_alias attribute was used.
+    fld_incomplete_type_of then creates an incomplete distinct copy of the
+    structure (but with the original attributes) but pointers created for it
+    are because of the "may_alias" attribute TYPE_REF_CAN_ALIAS_ALL, including
+    their TYPE_CANONICAL, because while that is created with !can_alias_all
+    argument, we later set it because of the "may_alias" attribute on the
+    to_type.
+    
+    This doesn't ICE with C++ sincePR70512fix because the C++ FE sets
+    TYPE_REF_CAN_ALIAS_ALL on all pointer types to the class type (and its
+    variants) when the may_alias is added.
+    
+    The following patch does that in the C FE as well.
+    
+    2024-06-06  Jakub Jelinek  <jakub@redhat.com>PR c/114493* c-decl.cc (c_fixup_may_alias): New function.
+            (finish_struct): Call it if "may_alias" attribute is
+            specified.
+    
+            * gcc.dg/pr114493-1.c: New test.
+            * gcc.dg/pr114493-2.c: New test.
+    
+    (cherry picked from commit d5a3c6d43acb8b2211d9fb59d59482d74c010f01)
+
+- User: Jakub Jelinek | Time: 2024-06-06 20:48:12 UTC
+  Text: Should be fixed now for 14.2+ and 15+ for now.
+
+- User: GCC Commits | Time: 2024-06-11 06:17:55 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:7813d94393f60ac641265cb3fc3a446f9f3aea7ecommitr13-8838-g7813d94393f60ac641265cb3fc3a446f9f3aea7eAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Jun 6 22:12:11 2024 +0200
+
+    c: Fix up pointer types to may_alias structures [PR114493]
+    
+    The following testcase ICEs in ipa-free-lang, because the
+    fld_incomplete_type_of
+              gcc_assert (TYPE_CANONICAL (t2) != t2
+                          && TYPE_CANONICAL (t2) == TYPE_CANONICAL (TREE_TYPE (t)));
+    assertion doesn't hold.
+    This is because t is a struct S * type which was created while struct S
+    was still incomplete and without the may_alias attribute (and TYPE_CANONICAL
+    of a pointer type is a type created with can_alias_all = false argument),
+    while later on on the struct definition may_alias attribute was used.
+    fld_incomplete_type_of then creates an incomplete distinct copy of the
+    structure (but with the original attributes) but pointers created for it
+    are because of the "may_alias" attribute TYPE_REF_CAN_ALIAS_ALL, including
+    their TYPE_CANONICAL, because while that is created with !can_alias_all
+    argument, we later set it because of the "may_alias" attribute on the
+    to_type.
+    
+    This doesn't ICE with C++ sincePR70512fix because the C++ FE sets
+    TYPE_REF_CAN_ALIAS_ALL on all pointer types to the class type (and its
+    variants) when the may_alias is added.
+    
+    The following patch does that in the C FE as well.
+    
+    2024-06-06  Jakub Jelinek  <jakub@redhat.com>PR c/114493* c-decl.cc (c_fixup_may_alias): New function.
+            (finish_struct): Call it if "may_alias" attribute is
+            specified.
+    
+            * gcc.dg/pr114493-1.c: New test.
+            * gcc.dg/pr114493-2.c: New test.
+    
+    (cherry picked from commit d5a3c6d43acb8b2211d9fb59d59482d74c010f01)
+
+- User: GCC Commits | Time: 2024-06-11 10:39:16 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d4126b329b2ae4f2b60efa1c7ad51b576de168bdcommitr12-10534-gd4126b329b2ae4f2b60efa1c7ad51b576de168bdAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Jun 6 22:12:11 2024 +0200
+
+    c: Fix up pointer types to may_alias structures [PR114493]
+    
+    The following testcase ICEs in ipa-free-lang, because the
+    fld_incomplete_type_of
+              gcc_assert (TYPE_CANONICAL (t2) != t2
+                          && TYPE_CANONICAL (t2) == TYPE_CANONICAL (TREE_TYPE (t)));
+    assertion doesn't hold.
+    This is because t is a struct S * type which was created while struct S
+    was still incomplete and without the may_alias attribute (and TYPE_CANONICAL
+    of a pointer type is a type created with can_alias_all = false argument),
+    while later on on the struct definition may_alias attribute was used.
+    fld_incomplete_type_of then creates an incomplete distinct copy of the
+    structure (but with the original attributes) but pointers created for it
+    are because of the "may_alias" attribute TYPE_REF_CAN_ALIAS_ALL, including
+    their TYPE_CANONICAL, because while that is created with !can_alias_all
+    argument, we later set it because of the "may_alias" attribute on the
+    to_type.
+    
+    This doesn't ICE with C++ sincePR70512fix because the C++ FE sets
+    TYPE_REF_CAN_ALIAS_ALL on all pointer types to the class type (and its
+    variants) when the may_alias is added.
+    
+    The following patch does that in the C FE as well.
+    
+    2024-06-06  Jakub Jelinek  <jakub@redhat.com>PR c/114493* c-decl.cc (c_fixup_may_alias): New function.
+            (finish_struct): Call it if "may_alias" attribute is
+            specified.
+    
+            * gcc.dg/pr114493-1.c: New test.
+            * gcc.dg/pr114493-2.c: New test.
+    
+    (cherry picked from commit d5a3c6d43acb8b2211d9fb59d59482d74c010f01)
+
+- User: Jakub Jelinek | Time: 2024-06-11 10:55:23 UTC
+  Text: Should be fixed for 12.4+ and 13.4+ too.
+
+- User: GCC Commits | Time: 2024-06-20 13:24:10 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:5736bc05ea1546328cad9b6cefb5a389d2a2994ecommitr11-11515-g5736bc05ea1546328cad9b6cefb5a389d2a2994eAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Jun 6 22:12:11 2024 +0200
+
+    c: Fix up pointer types to may_alias structures [PR114493]
+    
+    The following testcase ICEs in ipa-free-lang, because the
+    fld_incomplete_type_of
+              gcc_assert (TYPE_CANONICAL (t2) != t2
+                          && TYPE_CANONICAL (t2) == TYPE_CANONICAL (TREE_TYPE (t)));
+    assertion doesn't hold.
+    This is because t is a struct S * type which was created while struct S
+    was still incomplete and without the may_alias attribute (and TYPE_CANONICAL
+    of a pointer type is a type created with can_alias_all = false argument),
+    while later on on the struct definition may_alias attribute was used.
+    fld_incomplete_type_of then creates an incomplete distinct copy of the
+    structure (but with the original attributes) but pointers created for it
+    are because of the "may_alias" attribute TYPE_REF_CAN_ALIAS_ALL, including
+    their TYPE_CANONICAL, because while that is created with !can_alias_all
+    argument, we later set it because of the "may_alias" attribute on the
+    to_type.
+    
+    This doesn't ICE with C++ sincePR70512fix because the C++ FE sets
+    TYPE_REF_CAN_ALIAS_ALL on all pointer types to the class type (and its
+    variants) when the may_alias is added.
+    
+    The following patch does that in the C FE as well.
+    
+    2024-06-06  Jakub Jelinek  <jakub@redhat.com>PR c/114493* c-decl.c (c_fixup_may_alias): New function.
+            (finish_struct): Call it if "may_alias" attribute is
+            specified.
+    
+            * gcc.dg/pr114493-1.c: New test.
+            * gcc.dg/pr114493-2.c: New test.
+    
+    (cherry picked from commit d5a3c6d43acb8b2211d9fb59d59482d74c010f01)
+
+- User: Jakub Jelinek | Time: 2024-06-20 13:39:29 UTC
+  Text: Fixed for 11.5 as well.
+

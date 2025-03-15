@@ -1,0 +1,136 @@
+Bug Summary: [11/12/13/14/15 Regression] MIPS: INS is used for long long, before SLL
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: needs-bisection, wrong-code
+Known to Work: 5.4.0
+Known to Fail: 11.2.0
+
+Comments:
+- User: YunQiang Su | Time: 2023-12-30 10:36:47 UTC
+  Text: ```
+struct xx {
+        int a:4;
+        int b:24;
+        int c:3;
+        int d:1;
+};
+
+void xx (struct xx *a, long long b) {
+        a->d = b;
+}
+```
+
+When this code is built on -mabi=64, it generates asm like this:
+
+```
+        lw      $2,0($4)
+        ins     $2,$5,31,1
+        jr      $31
+        sw      $2,0($4)
+```
+
+Since the argument B is `long long`, we cannot be sure that it is well sign-extended, while INS asks for it:
+
+```
+If either GPR rs or GPR rt does not contain sign-extended 32-bit values (bits 63..31 equal), then the result of the operation is UNPREDICTABLE.
+```
+
+- User: Andrew Pinski | Time: 2023-12-31 06:42:13 UTC
+  Text: Confirmed, this is a regression. I think it used to work in GCC 7.3.0 also (but I have around is modified octeon compiler).
+
+- User: Andrew Pinski | Time: 2023-12-31 06:44:21 UTC
+  Text: 5.4 produced during expand:
+```
+(insn 10 7 11 2 (set (reg:QI 198 [ D.1502 ])
+        (truncate:QI (reg/v:DI 197 [ b ]))) /app/example.cpp:10 -1
+     (nil))
+(insn 11 10 12 2 (set (reg:SI 199)
+        (mem/j:SI (reg/v/f:DI 196 [ a ]) [1 a_5(D)->d+-3 S4 A32])) /app/example.cpp:10 -1
+     (nil))
+(insn 12 11 13 2 (set (zero_extract:SI (reg:SI 199)
+            (const_int 1 [0x1])
+            (const_int 0 [0]))
+        (subreg:SI (reg:QI 198 [ D.1502 ]) 0)) /app/example.cpp:10 -1
+     (nil))
+```
+
+But 11.2.0 produces:
+```
+(insn 10 7 11 2 (set (reg:SI 197)
+        (mem/j:SI (reg/v/f:DI 195 [ a ]) [1 a_4(D)->d+-3 S4 A32])) "/app/example.cpp":10:14 -1
+     (nil))
+(insn 11 10 12 2 (set (zero_extract:SI (reg:SI 197)
+            (const_int 1 [0x1])
+            (const_int 0 [0]))
+        (subreg:SI (reg/v:DI 196 [ b ]) 4)) "/app/example.cpp":10:14 -1
+     (nil))
+```
+
+The truncate is missing ...
+
+Would be interesting to do a bisect here on what caused the wrong code ...
+
+- User: YunQiang Su | Time: 2024-04-27 09:16:41 UTC
+  Text: 36088299955f95ab58a5758cba2f29b84c8fbfbc is the first bad commit                                                       
+commit 36088299955f95ab58a5758cba2f29b84c8fbfbc         
+Author: Richard Biener <rguenther@suse.de>                                                                             
+Date:   Wed Jun 29 07:17:57 2016 +0000                  
+                                                           
+    match.pd ((T)(T2)x -> (T)x): Remove restriction on final precision not matching mode precision.                    
+                                                           
+    2016-07-29  Richard Biener  <rguenther@suse.de>                                                                    
+                                                           
+            * match.pd ((T)(T2)x -> (T)x): Remove restriction on final                                                 
+            precision not matching mode precision.         
+                                                                                                                       
+    From-SVN:r237838gcc/ChangeLog |  5 +++++                                                                                              
+ gcc/match.pd  | 11 +++--------                                                                                        
+ 2 files changed, 8 insertions(+), 8 deletions(-)
+
+- User: GCC Commits | Time: 2024-05-06 04:10:49 UTC
+  Text: The master branch has been updated by YunQiang Su <syq@gcc.gnu.org>:https://gcc.gnu.org/g:7d5d2b879ae7636ca118fb4f3a08b22705cdeacbcommitr15-171-g7d5d2b879ae7636ca118fb4f3a08b22705cdeacbAuthor: YunQiang Su <syq@gcc.gnu.org>
+Date:   Mon Apr 29 00:33:44 2024 +0800
+
+    expmed: TRUNCATE value1 if needed in store_bit_field_using_insvPR target/113179.
+    
+    In `store_bit_field_using_insv`, we just use SUBREG if value_mode
+    >= op_mode, while in some ports, a sign_extend will be needed,
+    such as MIPS64:
+      If either GPR rs or GPR rt does not contain sign-extended 32-bit
+      values (bits 63..31 equal), then the result of the operation is
+      UNPREDICTABLE.
+    
+    The problem happens for the code like:
+      struct xx {
+            int a:4;
+            int b:24;
+            int c:3;
+            int d:1;
+      };
+    
+      void xx (struct xx *a, long long b) {
+            a->d = b;
+      }
+    
+    In the above code, the hard register contains `b`, may be note well
+    sign-extended.
+    
+    gcc/PR target/113179* expmed.cc(store_bit_field_using_insv): TRUNCATE value1 if
+            needed.
+    
+    gcc/testsuitePR target/113179* gcc.target/mips/pr113179.c: New tests.
+
+- User: YunQiang Su | Time: 2024-05-06 04:13:53 UTC
+  Text: Fixed in GCC 15. Should we backport it to the previous versions?
+
+- User: YunQiang Su | Time: 2024-05-06 04:15:51 UTC
+  Text: With some test on some CPUs, in fact, the lacking of `sll` won't make troubles to us.
+It seems that most of MIPS64 CPUs can process it well as expected.
+
+- User: Andrew Pinski | Time: 2024-05-06 04:18:38 UTC
+  Text: (In reply to YunQiang Su fromcomment #6)> With some test on some CPUs, in fact, the lacking of `sll` won't make
+> troubles to us.
+> It seems that most of MIPS64 CPUs can process it well as expected.When I was working at Marvell(Cavium), only the Octeon simulator which cause issues with the lacking of `sll` rather than the actual hardware.
+

@@ -1,0 +1,159 @@
+Bug Summary: [14 regression] ICE when building liblc3-1.0.4 with -fno-vect-cost-model -march=x86-64-v4
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, needs-bisection
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sam James | Time: 2024-03-25 17:18:25 UTC
+  Text: Createdattachment 57811[details]spec.c.i
+
+Initially reported downstream in Gentoo by tdr.
+
+```
+$ gcc-14 /tmp/foo.c -c -O2 -fno-vect-cost-model -march=x86-64-v4
+/tmp/foo.c: In function ‘quantize’:
+/tmp/foo.c:4:6: error: type mismatch in binary expression
+    4 | void quantize(int i, short x1) {
+      |      ^~~~~~~~
+vector(2) <signed-boolean:16>
+
+vector(2) <signed-boolean:16>
+
+vector(2) <signed-boolean:8>
+
+mask_patt_47.14_40 = mask__2.11_44 & mask_patt_48.13_41;
+during GIMPLE pass: slp
+/tmp/foo.c:4:6: internal compiler error: verify_gimple failed
+0x55ab954d6b85 verify_gimple_in_cfg(function*, bool, bool)
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/tree-cfg.cc:5663
+0x55ab96a54818 execute_function_todo
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/passes.cc:2088
+0x55ab96a54818 do_per_function
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/passes.cc:1687
+0x55ab96a54818 execute_todo
+        /usr/src/debug/sys-devel/gcc-14.0.9999/gcc-14.0.9999/gcc/passes.cc:2142
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://bugs.gentoo.org/> for instructions.
+```
+
+- User: Sam James | Time: 2024-03-25 17:20:32 UTC
+  Text: The original failed with:
+```
+../liblc3-1.0.4/src/spec.c: In function ‘quantize’:
+../liblc3-1.0.4/src/spec.c:210:21: error: type mismatch in binary expression
+  210 | LC3_HOT static void quantize(enum lc3_dt dt, enum lc3_srate sr,
+      |                     ^~~~~~~~
+vector(2) <signed-boolean:16>
+
+vector(2) <signed-boolean:16>
+
+vector(2) <signed-boolean:8>
+
+mask_patt_142.112_162 = mask__23.109_158 & mask_patt_141.111_161;
+during GIMPLE pass: vect
+../liblc3-1.0.4/src/spec.c:210:21: internal compiler error: verify_gimple failed
+0x559439cc2712 verify_gimple_in_cfg(function*, bool, bool)
+	/usr/src/debug/sys-devel/gcc-14.0.1_pre20240324/gcc-14-20240324/gcc/tree-cfg.cc:5663
+0x559439ad9a28 execute_function_todo
+	/usr/src/debug/sys-devel/gcc-14.0.1_pre20240324/gcc-14-20240324/gcc/passes.cc:2088
+0x559439ad9c8b do_per_function
+	/usr/src/debug/sys-devel/gcc-14.0.1_pre20240324/gcc-14-20240324/gcc/passes.cc:1687
+0x559439ad9c8b execute_todo
+	/usr/src/debug/sys-devel/gcc-14.0.1_pre20240324/gcc-14-20240324/gcc/passes.cc:2142
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://bugs.gentoo.org/> for instructions.
+ninja: build stopped: subcommand failed.
+```
+
+i.e. vect, not slp.
+
+- User: Sam James | Time: 2024-03-25 17:21:03 UTC
+  Text: Createdattachment 57812[details]spec.i.orig.xz
+
+- User: Sam James | Time: 2024-03-25 18:02:09 UTC
+  Text: float quantize_x_1, quantize_x_0;
+short *quantize_xq;
+short quantize_x0;
+void quantize() {
+  short x1 = quantize_xq[0] =
+      quantize_x0 + ((quantize_x0 > 0) & (quantize_x_0 < 0));
+  quantize_xq[1] = 1 + ((x1 > 0) & (quantize_x_1 < 0));
+}
+
+- User: Andrew Pinski | Time: 2024-03-25 22:51:41 UTC
+  Text: A little cleaned up testcase which might show what can and cannot be SLP'ed:
+```
+float f1, f0, fa[2];
+short sa[2];
+void quantize(short s0) {
+  _Bool ta[2] = {(fa[0] < 0), (fa[1] < 0)};
+  _Bool t = ((s0 > 0) & ta[0]);
+  short x1 = s0 + t;
+  _Bool t1 = ((x1 > 0) & ta[1]);
+  sa[0] = x1;
+  sa[1] = s0 + t1;
+}
+```
+
+Confirmed.
+
+- User: Hongtao Liu | Time: 2024-03-26 03:58:17 UTC
+  Text: Maybe we should always use kmask under AVX512, currently only >= 128-bits vector of vector _Float16 use kmask, < 128 bits vector still use vector mask.
+
+24628  /* Scalar mask case.  */
+24629  if ((TARGET_AVX512F && TARGET_EVEX512 && vector_size == 64)
+24630      || (TARGET_AVX512VL && (vector_size == 32 || vector_size == 16))
+24631      /* AVX512FP16 only supports vector comparison
+24632         to kmask for _Float16.  */
+24633      || (TARGET_AVX512VL && TARGET_AVX512FP16
+24634          && GET_MODE_INNER (data_mode) == E_HFmode))
+24635    {
+24636      if (elem_size == 4
+24637          || elem_size == 8
+24638          || (TARGET_AVX512BW && (elem_size == 1 || elem_size == 2)))
+24639        return smallest_int_mode_for_size (nunits);
+24640    }
+24641
+24642  scalar_int_mode elem_mode
+24643    = smallest_int_mode_for_size (elem_size * BITS_PER_UNIT);
+24644
+24645  gcc_assert (elem_size * nunits == vector_size);
+24646
+24647  return mode_for_vector (elem_mode, nunits);
+
+- User: Hongtao Liu | Time: 2024-03-26 04:09:22 UTC
+  Text: (In reply to Hongtao Liu fromcomment #5)> Maybe we should always use kmask under AVX512, currently only >= 128-bits
+> vector of vector _Float16 use kmask, < 128 bits vector still use vector mask.
+>and we need to support vec_cmp/vcond_mask for 64/32/16-bit vectors.
+For the testcase, there's no kmask used at all, why x86-64-v3 doesn't issue an error.
+
+- User: Richard Biener | Time: 2024-03-26 07:58:26 UTC
+  Text: Mine.
+
+- User: GCC Commits | Time: 2024-03-26 10:06:02 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:f4e92d62dccb96ade753f3a8f49be1b5f61c31f1commitr14-9666-gf4e92d62dccb96ade753f3a8f49be1b5f61c31f1Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Mar 26 09:11:00 2024 +0100
+
+    tree-optimization/114471 - ICE with mismatching vector types
+    
+    The following fixes too lax verification of vector type compatibility
+    in vectorizable_operation.  When we only have a single vector size then
+    comparing the number of elements is enough but with SLP we mix those
+    and thus for operations like BIT_AND_EXPR we need to verify compatible
+    element types as well.  Allow sign changes for ABSU_EXPR though.PR tree-optimization/114471* tree-vect-stmts.cc (vectorizable_operation): Verify operand
+            types are compatible with the result type.
+    
+            * gcc.dg/vect/pr114471.c: New testcase.
+
+- User: Richard Biener | Time: 2024-03-26 10:07:49 UTC
+  Text: Fixed, possibly latent.  Note this didn't fix the vector types chosen (bool patterns ...) but instead hardens against choices that don't work out.
+
+A missed-optimization bug might be filed (ISTR there are some around bool
+patterns already).
+

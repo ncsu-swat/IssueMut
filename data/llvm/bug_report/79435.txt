@@ -1,0 +1,63 @@
+Issue Title: Clang is not triggering `-Wtautological-constant-compare` when using `-std=c23`
+Original Post: When compiling the minimal sample with any std flag (that i have tried) other than `-std=c23`, we get the warning:
+ 
+`warning: converting the result of '<<' to a boolean always evaluates to true [-Wtautological-constant-compare]`
+
+This warning is not triggered for c23.
+
+
+
+This regression was introduced somewhere between 14.0.0 and 15.0.0.
+
+
+
+I have never worked with LLVM before, but i have decided to take a stab at solving the issue.
+
+My initial hunch is that its related to the introduction of built in bools, as that seemed to be introduced in 15.0.0.
+
+#Minimal example
+[Godbolt](https://godbolt.org/z/hvdrbP19s)
+```c
+int test() {
+  if (1 << 5) {
+    return 0;
+  }
+  return 1;
+}
+```
+
+Comment by pileghoff: `warn_integer_constants_in_conditional_always_true` does not trigger either when doing:
+```c
+int test() {
+  if (1 ? 5 : 2) {
+    return 0;
+  }
+  return 0;
+}
+```
+
+Leading me to believe that `DiagnoseIntInBoolContext` is never hit.
+
+Also, the following code does produce a warning:
+```c
+void test() {
+  bool a = 1 << 5;
+}
+```
+Comment by pileghoff: I think i have found the issue.
+In `CheckBooleanCondition`, we use `CheckBoolLikeConversion` (whereas C++ uses `CheckCXXBooleanCondition`), but `CheckBoolLikeConversion` returns early if the language has bools. 
+
+I dont know what a good fix would look like. We could modify the check inside `CheckBoolLikeConversion` to allow C23, even though the language has bools.
+
+Alternatively i could dig deeper into why languages with proper bools are excluded from the check and make sure that C23 follows the same route as those.
+My fear with that approach is that the answer is that C23 does not expect bool inside `if` and that `&&`, `||` etc. does not generate bools (but ints), and therefore its sufficiently different from all other languages with bools.
+Comment by shafik: CC @AaronBallman @cor3ntin any suggestions?
+Comment by pileghoff: Just confirmed that the following change does indeed fix all the issues i have found. I cant find any new issued caused by the change. I will make a PR later today if i find nothing new.
+```diff
+static void CheckBoolLikeConversion(Sema &S, Expr *E, SourceLocation CC) {
+  -if (S.getLangOpts().Bool) +
+      if (S.getLangOpts().Bool && !S.getLangOpts().C23) return;
+  if (E->IgnoreParenImpCasts()->getType()->isAtomicType())
+    return;
+  CheckImplicitConversion(S, E->IgnoreParenImpCasts(), S.Context.BoolTy, CC);
+}

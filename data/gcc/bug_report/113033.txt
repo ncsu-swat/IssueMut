@@ -1,0 +1,164 @@
+Bug Summary: GCC 14 (20231203 snapshot) ICE when building LSX vector rotate code on LoongArch
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code, missed-optimization, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jiajie Chen | Time: 2023-12-15 16:44:29 UTC
+  Text: Source code:
+
+```
+#include <lsxintrin.h>
+
+v2u64 test(v2u64 a, int imm) {
+  return (a << (imm & 63)) | (a >> (64 - (imm & 63)));
+}
+
+```
+
+Command line to reproduce:
+
+```
+gcc-14 -mlsx -c test.c
+```
+
+Error message:
+
+```
+test.c: In function ‘test’:
+test.c:5:1: error: unrecognizable insn:
+    5 | }
+      | ^
+(insn 16 15 17 2 (set (reg:DI 92)
+        (and:DI (neg:DI (reg:DI 80 [ _1 ]))
+            (const_int 63 [0x3f]))) "test.c":4:28 -1
+     (nil))
+during RTL pass: vregs
+test.c:5:1: internal compiler error: in extract_insn, at recog.cc:2804
+0x5555591d419f internal_error(char const*, ...)
+        ???:0
+0x5555577b4d87 fancy_abort(char const*, int, char const*)
+        ???:0
+0x5555577998bb _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+        ???:0
+0x5555577998ef _fatal_insn_not_found(rtx_def const*, char const*, int, char const*)
+        ???:0
+0x5555580704f7 extract_insn(rtx_insn*)
+        ???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://bugs.gentoo.org/> for instructions.
+```
+
+- User: Xi Ruoyao | Time: 2023-12-16 17:47:31 UTC
+  Text: Confirmed.
+
+- User: Xi Ruoyao | Time: 2023-12-16 18:16:46 UTC
+  Text: It looks like we are missing a force_reg () somewhere.
+
+- User: Xi Ruoyao | Time: 2023-12-16 18:32:53 UTC
+  Text: (define_expand "vec_init<mode><unitmode>"
+  [(match_operand:LSX 0 "register_operand")
+   (match_operand:LSX 1 "")] 
+  "ISA_HAS_LSX"
+{
+  loongarch_expand_vector_init (operands[0], operands[1]);
+  DONE;
+})
+
+We need to add a predicate for operand 1...
+
+- User: Xi Ruoyao | Time: 2023-12-16 18:44:46 UTC
+  Text: Strange... Most backends do not have predicate for op2 of vec_init but how do they evade this issue?
+
+- User: Xi Ruoyao | Time: 2023-12-16 20:11:24 UTC
+  Text: It looks like we should do:
+
+diff --git a/gcc/expmed.cc b/gcc/expmed.cc
+index b294eabb08d..b87e09a8a65 100644
+--- a/gcc/expmed.cc
++++ b/gcc/expmed.cc
+@@ -2628,9 +2628,7 @@ expand_shift_1 (enum tree_code code, machine_mode mode, rtx shifted,
+ 		  (mode, GET_MODE_BITSIZE (scalar_mode) - INTVAL (op1));
+ 	      else
+ 		{
+-		  other_amount
+-		    = simplify_gen_unary (NEG, GET_MODE (op1),
+-					  op1, GET_MODE (op1));
++		  other_amount = negate_rtx (GET_MODE (op1), op1);
+ 		  HOST_WIDE_INT mask = GET_MODE_PRECISION (scalar_mode) - 1;
+ 		  other_amount
+ 		    = simplify_gen_binary (AND, GET_MODE (op1), other_amount,
+
+??
+
+- User: Xi Ruoyao | Time: 2023-12-16 21:35:09 UTC
+  Text: There is also a missed-optimization on LoongArch.  vrotlM3 should be expanded to (rotatert X, (neg Y)) instead of two shifts and an ior.
+
+- User: Xi Ruoyao | Time: 2023-12-18 13:47:08 UTC
+  Text: Patch:https://gcc.gnu.org/pipermail/gcc-patches/2023-December/640871.htmlI'm not convinced the ICE is a target issue.  The missed-optimization is a target issue though.
+
+- User: Xi Ruoyao | Time: 2023-12-18 20:17:56 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #2)> It looks like we are missing a force_reg () somewhere.Per Jakub's review my first gut feeling seems actually correct...
+
+- User: Xi Ruoyao | Time: 2023-12-18 20:34:39 UTC
+  Text: diff --git a/gcc/config/loongarch/loongarch.cc b/gcc/config/loongarch/loongarch.cc
+index 256fa7d048d..65a2915329e 100644
+--- a/gcc/config/loongarch/loongarch.cc
++++ b/gcc/config/loongarch/loongarch.cc
+@@ -10770,7 +10770,7 @@ loongarch_expand_vector_init_same (rtx target, rtx vals, unsigned nvar)
+ 	  gcc_unreachable ();
+ 	}
+     }
+-  temp = gen_reg_rtx (imode);
++
+   if (imode == GET_MODE (same))
+     temp2 = same;
+   else if (GET_MODE_SIZE (imode) >= UNITS_PER_WORD)
+@@ -10795,7 +10795,8 @@ loongarch_expand_vector_init_same (rtx target, rtx vals, unsigned nvar)
+       else
+ 	temp2 = lowpart_subreg (imode, same, GET_MODE (same));
+     }
+-  emit_move_insn (temp, temp2);
++
++  temp = force_reg (imode, temp2);
+ 
+   switch (vmode)
+     {
+
+I mistakenly thought force_reg is just creating an reg and moving into it (if the operand is not already in reg) but I was wrong.
+
+- User: GCC Commits | Time: 2023-12-20 12:02:58 UTC
+  Text: The master branch has been updated by Xi Ruoyao <xry111@gcc.gnu.org>:https://gcc.gnu.org/g:c7eefea622e70bd63b0e00e896f67cf9ee9916bccommitr14-6746-gc7eefea622e70bd63b0e00e896f67cf9ee9916bcAuthor: Xi Ruoyao <xry111@xry111.site>
+Date:   Tue Dec 19 04:48:03 2023 +0800
+
+    LoongArch: Use force_reg instead of gen_reg_rtx + emit_move_insn in vec_init expander [PR113033]
+    
+    Jakub says:
+    
+        Then that seems like a bug in the loongarch vec_init pattern(s).
+        Those really don't have a predicate in any of the backends on the
+        input operand, so they need to force_reg it if it is something it
+        can't handle. I've looked e.g. at i386 vec_init and that is exactly
+        what it does, see the various tests + force_reg calls in
+        ix86_expand_vector_init*.
+    
+    So replace gen_reg_rtx + emit_move_insn with force_reg to fixPR 113033.
+    
+    gcc/ChangeLog:PR target/113033* config/loongarch/loongarch.cc
+            (loongarch_expand_vector_init_same): Replace gen_reg_rtx +
+            emit_move_insn with force_reg.
+            (loongarch_expand_vector_init): Likewise.
+    
+    gcc/testsuite/ChangeLog:PR target/113033* gcc.target/loongarch/pr113033.c: New test.
+
+- User: Xi Ruoyao | Time: 2023-12-20 12:05:31 UTC
+  Text: ICE fixed.  Missed-optimization ishttps://gcc.gnu.org/pipermail/gcc-patches/2023-December/640872.html.
+
+- User: Xi Ruoyao | Time: 2023-12-27 11:05:07 UTC
+  Text: Missed-optimization fixed atr14-6851.
+

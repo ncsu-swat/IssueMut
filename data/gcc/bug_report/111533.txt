@@ -1,0 +1,125 @@
+Bug Summary: [14 Regression] ICE: RTL check: expected code 'reg', have 'const_int' in rhs_regno, at rtl.h:1934
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Patrick O'Neill | Time: 2023-09-22 01:24:46 UTC
+  Text: Broken on trunk:r14-4211-g29862e21f6dBisected to/Caused by:r14-3508-ge030af3e6f6rv64gcv fails to build glibc with --enable-checking=rtl
+This same failure/backtrace shows up on rv32gc with testcases like gcc.target/riscv/rvv/autovec/reduc/reduc_call-1.c with --enable-checking=rtl.
+
+Backtrace (from run usingr14-4211-g29862e21f6d):
+
+during RTL pass: vsetvl
+res_debug.c: In function '__dn_count_labels':
+res_debug.c:1050:1: internal compiler error: RTL check: expected code 'reg', have 'const_int' in rhs_regno, at rtl.h:1934
+ 1050 | }
+      | ^
+0x90a441 rtl_check_failed_code1(rtx_def const*, rtx_code, char const*, int, char const*)
+        ../../../gcc/gcc/rtl.cc:770
+0x941ad7 rhs_regno(rtx_def const*)
+        ../../../gcc/gcc/rtl.h:1934
+0x942458 rhs_regno(rtx_def const*)
+        ../../../gcc/gcc/config/riscv/riscv-vsetvl.cc:314
+0x942458 anticipatable_occurrence_p
+        ../../../gcc/gcc/config/riscv/riscv-vsetvl.cc:348
+0x942458 pass_vsetvl::compute_local_properties()
+        ../../../gcc/gcc/config/riscv/riscv-vsetvl.cc:3215
+0x1680d25 pass_vsetvl::vsetvl_fusion()
+        ../../../gcc/gcc/config/riscv/riscv-vsetvl.cc:3438
+0x1683590 pass_vsetvl::lazy_vsetvl()
+        ../../../gcc/gcc/config/riscv/riscv-vsetvl.cc:4373
+0x16837a7 pass_vsetvl::execute(function*)
+        ../../../gcc/gcc/config/riscv/riscv-vsetvl.cc:4413
+0x16837a7 pass_vsetvl::execute(function*)
+        ../../../gcc/gcc/config/riscv/riscv-vsetvl.cc:4394
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: xuli1@eswincomputing.com | Time: 2023-09-25 01:51:26 UTC
+  Text: Hi, Patrick,
+
+I can't reproduce your problem, my steps are as follows:
+
+cd riscv_gnu_toolchian
+
+../configure --with-arch=rv64gc --with-abi=lp64d --enable-multilib --enable-gcc-checking=rtl
+
+make -j32
+
+Am I doing the right thing?
+
+- User: Patrick O'Neill | Time: 2023-09-25 15:59:58 UTC
+  Text: Hi,
+
+I believe the issue is that you're using rv64gc, not rv64gcv.
+
+I haven't tried building with multilib, so my commands are:
+
+../configure --with-arch=rv64gcv --with-abi=lp64d --enable-gcc-checking=rtl
+
+make linux -j32
+
+- User: xuli1@eswincomputing.com | Time: 2023-09-26 02:10:11 UTC
+  Text: The problem has been reproduced, thank you.
+
+- User: GCC Commits | Time: 2023-09-28 01:47:57 UTC
+  Text: The master branch has been updated by Li Xu <xuli@gcc.gnu.org>:https://gcc.gnu.org/g:110ffb2d8d3a64b32dd56ac995c2e30e8f64d4dccommitr14-4301-g110ffb2d8d3a64b32dd56ac995c2e30e8f64d4dcAuthor: xuli <xuli1@eswincomputing.com>
+Date:   Thu Sep 28 01:29:12 2023 +0000
+
+    RISC-V: Bugfix for RTL check[PR111533]
+    
+    Consider the flowing situation:
+    BB5: local_dem(RVV Insn 1, AVL(reg zero))
+    RVV Insn 1: vmv.s.x, AVL (const_int 1)
+    RVV Insn 2: vredsum.vs, AVL(reg zero)
+    
+    vmv.s.x has vl operand, the following code will get
+    avl (cosnt_int) from RVV Insn 1.
+    rtx avl = has_vl_op (insn->rtl ()) ? get_vl (insn->rtl ())
+                                       : dem.get_avl ();
+    
+    If use REGNO for const_int, the compiler will crash:
+    
+    during RTL pass: vsetvl
+    res_debug.c: In function '__dn_count_labels':
+    res_debug.c:1050:1: internal compiler error: RTL check: expected code 'reg',
+    have 'const_int' in rhs_regno, at rtl.h:1934
+     1050 | }
+          | ^
+    0x8fb169 rtl_check_failed_code1(rtx_def const*, rtx_code, char const*, int, char const*)
+            ../.././gcc/gcc/rtl.cc:770
+    0x1399818 rhs_regno(rtx_def const*)
+            ../.././gcc/gcc/rtl.h:1934
+    0x1399818 anticipatable_occurrence_p
+            ../.././gcc/gcc/config/riscv/riscv-vsetvl.cc:348
+    
+    So in this case avl should be obtained from dem.
+    
+    Another issue is caused by the following code:
+    HOST_WIDE_INT diff = INTVAL (builder.elt (i)) - i;
+    
+    during RTL pass: expand
+    ../../.././gcc/libgfortran/generated/matmul_c4.c: In function 'matmul_c4':
+    ../../.././gcc/libgfortran/generated/matmul_c4.c:2906:39: internal compiler error: RTL check:
+    expected code 'const_int', have 'const_poly_int' in expand_const_vector,
+    at config/riscv/riscv-v.cc:1149
+    
+    The builder.elt (i) can be either const_int or const_poly_int.PR target/111533gcc/ChangeLog:
+    
+            * config/riscv/riscv-v.cc (expand_const_vector): Fix bug.
+            * config/riscv/riscv-vsetvl.cc (anticipatable_occurrence_p): Fix bug.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/base/pr111533-1.c: New test.
+            * gcc.target/riscv/rvv/base/pr111533-2.c: New test.
+
+- User: Patrick O'Neill | Time: 2023-09-28 16:00:21 UTC
+  Text: Fix tested and confirmed to resolve the failures on glibc rv32gcv and rv64gcv. Thanks!
+

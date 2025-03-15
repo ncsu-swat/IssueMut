@@ -1,0 +1,309 @@
+Bug Summary: -mfull-toc (-mfp-in-toc) yields incorrect _Float128 constants on power9
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 13.1.0
+
+Comments:
+- User: Vincent Lefèvre | Time: 2023-05-28 00:32:35 UTC
+  Text: Note: I selected version 8.3.1, because this is what I had for my tests, but at least 13.1.0 is still affected (see below).
+
+We got a report of a GNU MPFR failure on an IBM POWER9 machine:https://sympa.inria.fr/sympa/arc/mpfr/2023-05/msg00000.htmlWith additional information given in a private discussion, Matthew R. Wilson found that the failure came from the use of -mfull-toc in CFLAGS (this is not visible in the report mentioned above), and he could reproduce the behavior with GCC 13.1.0, 12.2.0, as well as the Debian-provided GCC 10.2.1. As he noticed, -mfull-toc is documented to be the default, so that this shouldn't have any effect.
+
+I could reproduce the failure on gcc135 at the Compile Farm with /opt/at12.0/bin/gcc
+(gcc (GCC) 8.3.1 20190304 (Advance-Toolchain-at12.0) [revision 269374]), and I did some tests with it.
+
+It appears that when -mfull-toc is provided, the cause is incorrect _Float128 constants MPFR_FLOAT128_MAX and -MPFR_FLOAT128_MAX, where one has
+
+#define MPFR_FLOAT128_MAX 0x1.ffffffffffffffffffffffffffffp+16383f128
+
+Indeed, I added
+
+  _Float128 m = MPFR_FLOAT128_MAX, n = -MPFR_FLOAT128_MAX;
+
+at the beginning of the mpfr_set_float128 function in src/set_float128.c, and did the following:
+
+1. Compile MPFR (and the testsuite) using
+   CFLAGS="-mcpu=power9 -O0 -g -mfull-toc"
+2. In the "tests" directory, gdb ./tset_float128
+3. Add a breakpoint on mpfr_set_float128, then run, next, and print values:
+
+(gdb) print m
+$1 = 5.96937875341074040910051755689516189e-4947
+(gdb) print n
+$2 = 1.19416736664469867978830578385372193e-4946
+
+Both are wrong.
+
+If I do the same test with CFLAGS="-mcpu=power9 -O0 -g" (i.e. without -mfull-toc), then I get
+
+(gdb) print m
+$1 = 1.18973149535723176508575932662800702e+4932
+(gdb) print n
+$2 = -1.18973149535723176508575932662800702e+4932
+
+These are the expected values.
+
+Unfortunately, I couldn't reproduce the issue with a simple C program.
+
+- User: Andrew Pinski | Time: 2023-05-28 03:41:11 UTC
+  Text: -mfull-toc does
+```
+      opts->x_rs6000_isa_flags &= ~OPTION_MASK_MINIMAL_TOC;
+      opts->x_TARGET_NO_FP_IN_TOC = 0;
+      opts->x_TARGET_NO_SUM_IN_TOC = 0;
+      opts_set->x_rs6000_isa_flags |= OPTION_MASK_MINIMAL_TOC;
+```
+And then:
+```
+  /* Place FP constants in the constant pool instead of TOC
+     if section anchors enabled.  */
+  if (flag_section_anchors
+      && !OPTION_SET_P (TARGET_NO_FP_IN_TOC))
+    TARGET_NO_FP_IN_TOC = 1;
+```
+
+
+Short testcase which shows the issue at -O2 -mfull-toc (or -O2 -mfp-in-toc):
+```
+#define MPFR_FLOAT128_MAX 0x1.ffffffffffffffffffffffffffffp+16383f128
+  _Float128 m1 = MPFR_FLOAT128_MAX, n1 = -MPFR_FLOAT128_MAX;
+
+  _Float128 f()
+  {
+        return MPFR_FLOAT128_MAX ;
+  }
+
+  _Float128 f1()
+  {
+        return -MPFR_FLOAT128_MAX ;
+  }
+```
+
+m1 is:
+```
+m1:
+        .long   -1
+        .long   -1
+        .long   -1
+        .long   2147418111
+```
+While the toc version is:
+```
+.LC0:
+        .quad   0x7ff0000000000000,0x000000000
+```
+
+That is just totally different. (I can't comment on which one is correct but them being different seems wrong).
+
+- User: Andrew Pinski | Time: 2023-05-28 03:54:26 UTC
+  Text: (In reply to Vincent Lefèvre fromcomment #0)> (gdb) print m
+> $1 = 5.96937875341074040910051755689516189e-4947Note This corresponds to:
+m2:
+        .long   0
+        .long   2146435072
+        .long   0
+        .long   0
+
+Which is the same as what was printed in the TOC:
+
+.LC0:
+        .quad   0x7ff0000000000000,0x000000000
+
+- User: Kewen Lin | Time: 2023-05-30 06:47:35 UTC
+  Text: Thanks for reporting, this exposes one issue that: when encoding KFmode constant into toc, it uses the format for the current long double, it could be wrong if the current long double is with IBM format instead of IEEE format. I have a patch.
+
+- User: Vincent Lefèvre | Time: 2023-05-30 07:51:35 UTC
+  Text: (In reply to Kewen Lin fromcomment #3)> Thanks for reporting, this exposes one issue that: when encoding KFmode
+> constant into toc, it uses the format for the current long double, it could
+> be wrong if the current long double is with IBM format instead of IEEE
+> format. I have a patch.OK, but why does an explicit `-mfull-toc` make this issue appear while this is documented to be the default?
+
+- User: Kewen Lin | Time: 2023-05-30 08:09:15 UTC
+  Text: (In reply to Vincent Lefèvre fromcomment #4)> (In reply to Kewen Lin fromcomment #3)
+> > Thanks for reporting, this exposes one issue that: when encoding KFmode
+> > constant into toc, it uses the format for the current long double, it could
+> > be wrong if the current long double is with IBM format instead of IEEE
+> > format. I have a patch.
+> 
+> OK, but why does an explicit `-mfull-toc` make this issue appear while this
+> is documented to be the default?Good question, the reason is that we actually don't put fp in toc for -mcmodel=medium if -mfp-in-toc (or -mfull-toc) isn't explicitly specified, since we can address them efficiently even outside the TOC.
+
+Some codes like:
+
+      if (rs6000_current_cmodel != CMODEL_SMALL)
+	{
+	  if (!OPTION_SET_P (TARGET_NO_FP_IN_TOC))
+	    TARGET_NO_FP_IN_TOC = rs6000_current_cmodel == CMODEL_MEDIUM;
+	  if (!OPTION_SET_P (TARGET_NO_SUM_IN_TOC))
+	    TARGET_NO_SUM_IN_TOC = 0;
+	}
+
+I think you can still see the wrong constant if not specifying -mfull-toc but with the specified -mcmodel=small (or large). Anyway, IMHO the documentation also needs some updates.
+
+- User: Kewen Lin | Time: 2023-05-30 08:11:47 UTC
+  Text: btw, one simple fix is under testing:
+
+diff --git a/gcc/config/rs6000/rs6000.cc b/gcc/config/rs6000/rs6000.cc
+index 3f129ea37d2..330c6a6fa5f 100644
+--- a/gcc/config/rs6000/rs6000.cc
++++ b/gcc/config/rs6000/rs6000.cc
+@@ -17314,7 +17314,7 @@ output_toc (FILE *file, rtx x, int labelno, machine_mode mode)
+       if (DECIMAL_FLOAT_MODE_P (GET_MODE (x)))
+         REAL_VALUE_TO_TARGET_DECIMAL128 (*CONST_DOUBLE_REAL_VALUE (x), k);
+       else
+-        REAL_VALUE_TO_TARGET_LONG_DOUBLE (*CONST_DOUBLE_REAL_VALUE (x), k);
++        real_to_target (k, CONST_DOUBLE_REAL_VALUE (x), GET_MODE (x));
+
+       if (TARGET_64BIT)
+         {
+
+- User: GCC Commits | Time: 2023-06-12 06:10:45 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:388809f2afde874180da0669c669e241037eeba0commitr14-1703-g388809f2afde874180da0669c669e241037eeba0Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Mon Jun 12 01:07:52 2023 -0500
+
+    rs6000: Don't use TFmode for 128 bits fp constant in toc [PR110011]
+    
+    AsPR110011shows, when encoding 128 bits fp constant into
+    toc, we adopts REAL_VALUE_TO_TARGET_LONG_DOUBLE which is
+    to find the first float mode with LONG_DOUBLE_TYPE_SIZE
+    bits of precision, it would be TFmode here.  But the 128
+    bits fp constant can be with mode IFmode or KFmode, which
+    doesn't necessarily have the same underlying float format
+    as the one of TFmode, like this PR exposes, with option
+    -mabi=ibmlongdouble TFmode has ibm_extended_format while
+    KFmode has ieee_quad_format, mixing up the formats (the
+    encoding/decoding ways) would cause unexpected results.
+    
+    This patch is to make it use constant's own mode instead
+    of TFmode for real_to_target call.PR target/110011gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.cc (output_toc): Use the mode of the 128-bit
+            floating constant itself for real_to_target call.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr110011.c: New test.
+
+- User: GCC Commits | Time: 2023-06-19 09:29:28 UTC
+  Text: The releases/gcc-10 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:a137fc8de056c7e0e93047b865bcc1948bd8ee03commitr10-11453-ga137fc8de056c7e0e93047b865bcc1948bd8ee03Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Mon Jun 12 01:07:52 2023 -0500
+
+    rs6000: Don't use TFmode for 128 bits fp constant in toc [PR110011]
+    
+    AsPR110011shows, when encoding 128 bits fp constant into
+    toc, we adopts REAL_VALUE_TO_TARGET_LONG_DOUBLE which is
+    to find the first float mode with LONG_DOUBLE_TYPE_SIZE
+    bits of precision, it would be TFmode here.  But the 128
+    bits fp constant can be with mode IFmode or KFmode, which
+    doesn't necessarily have the same underlying float format
+    as the one of TFmode, like this PR exposes, with option
+    -mabi=ibmlongdouble TFmode has ibm_extended_format while
+    KFmode has ieee_quad_format, mixing up the formats (the
+    encoding/decoding ways) would cause unexpected results.
+    
+    This patch is to make it use constant's own mode instead
+    of TFmode for real_to_target call.PR target/110011gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.c (output_toc): Use the mode of the 128-bit
+            floating constant itself for real_to_target call.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr110011.c: New test.
+    
+    (cherry picked from commit 388809f2afde874180da0669c669e241037eeba0)
+
+- User: GCC Commits | Time: 2023-06-20 03:20:48 UTC
+  Text: The releases/gcc-12 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:90e1030d4c6d981c2293d89db6d1d57c057ad61dcommitr12-9712-g90e1030d4c6d981c2293d89db6d1d57c057ad61dAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Mon Jun 12 01:07:52 2023 -0500
+
+    rs6000: Don't use TFmode for 128 bits fp constant in toc [PR110011]
+    
+    AsPR110011shows, when encoding 128 bits fp constant into
+    toc, we adopts REAL_VALUE_TO_TARGET_LONG_DOUBLE which is
+    to find the first float mode with LONG_DOUBLE_TYPE_SIZE
+    bits of precision, it would be TFmode here.  But the 128
+    bits fp constant can be with mode IFmode or KFmode, which
+    doesn't necessarily have the same underlying float format
+    as the one of TFmode, like this PR exposes, with option
+    -mabi=ibmlongdouble TFmode has ibm_extended_format while
+    KFmode has ieee_quad_format, mixing up the formats (the
+    encoding/decoding ways) would cause unexpected results.
+    
+    This patch is to make it use constant's own mode instead
+    of TFmode for real_to_target call.PR target/110011gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.cc (output_toc): Use the mode of the 128-bit
+            floating constant itself for real_to_target call.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr110011.c: New test.
+    
+    (cherry picked from commit 388809f2afde874180da0669c669e241037eeba0)
+
+- User: GCC Commits | Time: 2023-06-20 03:21:29 UTC
+  Text: The releases/gcc-13 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:cefe925fe49af81bb4ae7a27fa2c96f0926fe22ecommitr13-7456-gcefe925fe49af81bb4ae7a27fa2c96f0926fe22eAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Mon Jun 12 01:07:52 2023 -0500
+
+    rs6000: Don't use TFmode for 128 bits fp constant in toc [PR110011]
+    
+    AsPR110011shows, when encoding 128 bits fp constant into
+    toc, we adopts REAL_VALUE_TO_TARGET_LONG_DOUBLE which is
+    to find the first float mode with LONG_DOUBLE_TYPE_SIZE
+    bits of precision, it would be TFmode here.  But the 128
+    bits fp constant can be with mode IFmode or KFmode, which
+    doesn't necessarily have the same underlying float format
+    as the one of TFmode, like this PR exposes, with option
+    -mabi=ibmlongdouble TFmode has ibm_extended_format while
+    KFmode has ieee_quad_format, mixing up the formats (the
+    encoding/decoding ways) would cause unexpected results.
+    
+    This patch is to make it use constant's own mode instead
+    of TFmode for real_to_target call.PR target/110011gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.cc (output_toc): Use the mode of the 128-bit
+            floating constant itself for real_to_target call.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr110011.c: New test.
+    
+    (cherry picked from commit 388809f2afde874180da0669c669e241037eeba0)
+
+- User: GCC Commits | Time: 2023-06-20 08:24:44 UTC
+  Text: The releases/gcc-11 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:bccc9960eb728bfd890c9388593bd166efcd0591commitr11-10865-gbccc9960eb728bfd890c9388593bd166efcd0591Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Mon Jun 12 01:07:52 2023 -0500
+
+    rs6000: Don't use TFmode for 128 bits fp constant in toc [PR110011]
+    
+    AsPR110011shows, when encoding 128 bits fp constant into
+    toc, we adopts REAL_VALUE_TO_TARGET_LONG_DOUBLE which is
+    to find the first float mode with LONG_DOUBLE_TYPE_SIZE
+    bits of precision, it would be TFmode here.  But the 128
+    bits fp constant can be with mode IFmode or KFmode, which
+    doesn't necessarily have the same underlying float format
+    as the one of TFmode, like this PR exposes, with option
+    -mabi=ibmlongdouble TFmode has ibm_extended_format while
+    KFmode has ieee_quad_format, mixing up the formats (the
+    encoding/decoding ways) would cause unexpected results.
+    
+    This patch is to make it use constant's own mode instead
+    of TFmode for real_to_target call.PR target/110011gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.c (output_toc): Use the mode of the 128-bit
+            floating constant itself for real_to_target call.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr110011.c: New test.
+    
+    (cherry picked from commit 388809f2afde874180da0669c669e241037eeba0)
+
+- User: Kewen Lin | Time: 2023-06-20 08:27:06 UTC
+  Text: Should be fixed everywhere.
+

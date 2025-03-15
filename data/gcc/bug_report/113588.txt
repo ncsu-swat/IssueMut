@@ -1,0 +1,114 @@
+Bug Summary: [14 Regression] The vectorizer is introducing out-of-bounds memory access
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Krister Walfridsson | Time: 2024-01-24 23:05:42 UTC
+  Text: The following function is miscompiled for x86_64 when compiled with
+-O3 -march=x86-64-v2
+
+
+unsigned long
+foo (const char *s, unsigned long n)
+{
+ unsigned long len = 0;
+ while (*s++ && n--)
+   ++len;
+ return len;
+}
+
+
+The original function reads two bytes from 's' when called as:
+
+ char a[4];
+ a[0] = 1;
+ a[1] = 0;
+ foo(a, 1000);
+
+However, the vectorized function reads 16 bytes (thereby accessing the buffer out of bounds) as it reads one vector at a time when s[0] != 0 and n >= 16.
+
+- User: Andrew Pinski | Time: 2024-01-24 23:17:57 UTC
+  Text: Confirmed, runable testcase:
+```
+#include <sys/mman.h>
+#include <unistd.h>
+
+__attribute__((noipa))
+int foo (const char *s, unsigned long n)
+{
+ unsigned long len = 0;
+ while (*s++ && n--)
+   ++len;
+ return len;
+}
+
+int main()
+{
+  long pgsz = sysconf (_SC_PAGESIZE);
+  void *p = mmap (NULL, pgsz * 3, PROT_READ|PROT_WRITE,
+     MAP_ANONYMOUS|MAP_PRIVATE, 0, 0);
+  if (p == MAP_FAILED)
+    return 0;
+  mprotect (p, pgsz, PROT_NONE);
+  mprotect (p+2*pgsz, pgsz, PROT_NONE);
+  char *p1 = p + pgsz;
+  p1[0] = 1;
+  p1[1] = 0;
+  foo (p1, 1000);
+  p1 = p + 2*pgsz - 2;
+  p1[0] = 1;
+  p1[1] = 0;
+  foo (p1, 1000);
+  return 0;
+}
+```
+
+- User: Jakub Jelinek | Time: 2024-01-25 06:48:30 UTC
+  Text: Started to ICE withr14-7194-g6cb155a6cf314232248a12bdd395ed4151ae5a28and sincer14-7196-g99c0a540d6689ede068f9ba98af6f38c3cd71362#c1 no longer ICEs but
+segfaults.  Inr14-7193it passed.
+
+- User: Tamar Christina | Time: 2024-01-25 08:49:06 UTC
+  Text: hmm that shouldn't have vectorized. the read is from a buffer of unknown size.
+
+I think (need to verify) it's because the read ends up on the normal loop latch connected exit which we don't validate.
+
+- User: Tamar Christina | Time: 2024-01-25 09:47:48 UTC
+  Text: The change Richi made this morning to only allow may_be_zero  for the last exit makes it not rotate this loop anymore.
+
+However the bug is simply that if the final exit has a memory access it should be checked as well.  I'll fix the underlying issue.
+
+- User: Tamar Christina | Time: 2024-01-29 17:29:36 UTC
+  Text: ***Bug 113661has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2024-02-02 23:56:06 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:85094e2aa6dba7908f053046f02dd443e8f65d72commitr14-8768-g85094e2aa6dba7908f053046f02dd443e8f65d72Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Fri Feb 2 23:52:27 2024 +0000
+
+    middle-end: check memory accesses in the destination block [PR113588].
+    
+    When analyzing loads for early break it was always the intention that for the
+    exit where things get moved to we only check the loads that can be reached from
+    the condition.
+    
+    However the main loop checks all loads and we skip the destination BB.  As such
+    we never actually check the loads reachable from the COND in the last BB unless
+    this BB was also the exit chosen by the vectorizer.
+    
+    This leads us to incorrectly vectorize the loop in the PR and in doing so access
+    out of bounds.
+    
+    gcc/ChangeLog:PR tree-optimization/113588PR tree-optimization/113467* tree-vect-data-refs.cc
+            (vect_analyze_data_ref_dependence):  Choose correct dest and fix checks.
+            (vect_analyze_early_break_dependences): Update comments.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/113588PR tree-optimization/113467* gcc.dg/vect/vect-early-break_108-pr113588.c: New test.
+            * gcc.dg/vect/vect-early-break_109-pr113588.c: New test.
+
+- User: Sam James | Time: 2024-02-03 22:03:59 UTC
+  Text: done, I think
+

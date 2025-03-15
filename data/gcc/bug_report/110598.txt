@@ -1,0 +1,278 @@
+Bug Summary: [14 Regression] wrong code on llvm-14.0.6 due to memcmp being miscompiled
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 14.0
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2023-07-08 17:00:04 UTC
+  Text: Initially observed the failure as llvm-14.0.6 testsuite hangup on gcc 15bbf1826a01f5beb2d7c0f74d6270bbc94ece91.
+
+Initially observed on llvm-src-14.0.6/llvm/lib/Target/AMDGPU/AMDGPUPropagateAttributes.cpp code around 
+    'AMDGPUPropagateAttributes::FnProperties:: bool operator == (const FnProperties &Other) const' miscompilation.
+
+Managed to extract the following example form it:
+
+// $ cat bug.cpp
+#include <iterator>
+
+typedef unsigned long long u64;
+
+const unsigned MAX_SUBTARGET_WORDS = 4;
+
+struct FeatureBitset {
+  u64 Bits[MAX_SUBTARGET_WORDS] = {0, 0, 0, 0};
+
+  constexpr FeatureBitset() = default;
+  constexpr FeatureBitset(std::initializer_list<unsigned> Init) {
+    for (auto I : Init) {
+      Bits[I] = 1;
+    }
+  }
+
+  constexpr FeatureBitset operator&(const FeatureBitset &RHS) const {
+    FeatureBitset Result = *this;
+    for (unsigned I = 0, E = MAX_SUBTARGET_WORDS; I != E; ++I) {
+      Result.Bits[I] &= RHS.Bits[I];
+    }
+    return Result;
+  }
+
+  bool operator!=(const FeatureBitset &RHS) const {
+      return !std::equal(std::begin(Bits), std::end(Bits), std::begin(RHS.Bits));
+  }
+};
+
+static constexpr const FeatureBitset TargetFeatures = { 0, 0, 0, 0, };
+
+__attribute__((noipa))
+bool is_eq_buggy (const FeatureBitset & lf, const FeatureBitset & rf) {
+  if ((lf & TargetFeatures) != (rf & TargetFeatures))
+    return false;
+  return true;
+}
+
+__attribute__((noipa))
+void bug(void) {
+    FeatureBitset lf, rf;
+    lf.Bits[0] = rf.Bits[0] = 1;
+    lf.Bits[1] = rf.Bits[1] = 1;
+    lf.Bits[2] = rf.Bits[2] = 1;
+    lf.Bits[3] = rf.Bits[3] = 1;
+
+    bool r = is_eq_buggy (lf, rf);
+    if (!r) __builtin_trap();
+}
+
+__attribute__((noipa))
+int main(void) {
+    bug();
+}
+
+Triggering:
+
+$ g++ -O1 bug.cpp -o bug "$@" && ./bug
+# ok
+$ g++ -O2 bug.cpp -o bug "$@" && ./bug
+Illegal instruction     (core dumped) ./bug
+
+$ g++ -v
+Using built-in specs.
+COLLECT_GCC=/<<NIX>>/gcc-14.0.0/bin/g++
+COLLECT_LTO_WRAPPER=/<<NIX>>/gcc-14.0.0/libexec/gcc/x86_64-unknown-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-unknown-linux-gnu
+Configured with: ../source/configure --prefix=/<<NIX>>/gcc-14.0.0 --with-gmp-include=/<<NIX>>/gmp-6.2.1-dev/include --with-gmp-lib=/<<NIX>>/gmp-6.2.1/lib --with-mpfr-include=/<<NIX>>/mpfr-4.2.0-dev/include --with-mpfr-lib=/<<NIX>>/mpfr-4.2.0/lib --with-mpc=/<<NIX>>/libmpc-1.3.1 --with-native-system-header-dir=/<<NIX>>/glibc-2.37-8-dev/include --with-build-sysroot=/ --program-prefix= --enable-lto --disable-libstdcxx-pch --without-included-gettext --with-system-zlib --enable-checking=release --enable-static --enable-languages=c,c++ --disable-multilib --enable-plugin --disable-libcc1 --with-isl=/<<NIX>>/isl-0.20 --disable-bootstrap --build=x86_64-unknown-linux-gnu --host=x86_64-unknown-linux-gnu --target=x86_64-unknown-linux-gnu
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 99999999 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2023-07-08 17:32:41 UTC
+  Text: Confirmed looks like a target issue dealing with memcmp.
+Take:
+```
+
+// $ cat bug.cpp
+#include <iterator>
+
+typedef unsigned long long u64;
+
+const unsigned MAX_SUBTARGET_WORDS = 4;
+
+[[gnu::noipa]]
+int notequal(const void *a, const void *b)
+{
+        return __builtin_memcmp(a,b,MAX_SUBTARGET_WORDS*sizeof(u64)) != 0;
+}
+
+struct FeatureBitset {
+  u64 Bits[MAX_SUBTARGET_WORDS] = {0, 0, 0, 0};
+
+  constexpr FeatureBitset() = default;
+  constexpr FeatureBitset(std::initializer_list<unsigned> Init) {
+    for (auto I : Init) {
+      Bits[I] = 1;
+    }
+  }
+
+  constexpr FeatureBitset operator&(const FeatureBitset &RHS) const {
+    FeatureBitset Result = *this;
+    for (unsigned I = 0, E = MAX_SUBTARGET_WORDS; I != E; ++I) {
+      Result.Bits[I] &= RHS.Bits[I];
+    }
+    return Result;
+  }
+
+  bool operator!=(const FeatureBitset &RHS) const {
+      return notequal(Bits, RHS.Bits);
+  }
+};
+
+static constexpr const FeatureBitset TargetFeatures = { 0, 0, 0, 0, };
+
+__attribute__((noipa))
+bool is_eq_buggy (const FeatureBitset & lf, const FeatureBitset & rf) {
+  if ((lf & TargetFeatures) != (rf & TargetFeatures))
+    return false;
+  return true;
+}
+
+__attribute__((noipa))
+void bug(void) {
+    FeatureBitset lf, rf;
+    lf.Bits[0] = rf.Bits[0] = 1;
+    lf.Bits[1] = rf.Bits[1] = 1;
+    lf.Bits[2] = rf.Bits[2] = 1;
+    lf.Bits[3] = rf.Bits[3] = 1;
+
+    bool r = is_eq_buggy (lf, rf);
+    if (!r) __builtin_trap();
+}
+
+__attribute__((noipa))
+int main(void) {
+    bug();
+}
+```
+
+The above is not miscompiled but once the gnu::noipa on the notequal is removed, it is.
+
+- User: Andrew Pinski | Time: 2023-07-08 17:41:52 UTC
+  Text: Here is a C testcase:
+```
+#include <stdbool.h>
+
+typedef unsigned long long u64;
+
+#define MAX_SUBTARGET_WORDS 4
+
+//[[gnu::noipa]]
+int notequal(const void *a, const void *b)
+{
+        return __builtin_memcmp(a,b,MAX_SUBTARGET_WORDS*sizeof(u64)) != 0;
+}
+typedef struct FeatureBitset {
+  u64 Bits[MAX_SUBTARGET_WORDS];
+}FeatureBitset;
+
+__attribute__((noipa))
+bool is_eq_buggy (const FeatureBitset * lf, const FeatureBitset * rf) {
+        u64 Bits_l[MAX_SUBTARGET_WORDS];
+        Bits_l[0] = lf->Bits[0]&1;
+        Bits_l[1] = 0;
+        Bits_l[2] = 0;
+        Bits_l[3] = 0;
+        u64 Bits_r[MAX_SUBTARGET_WORDS];
+        Bits_r[0] = rf->Bits[0]&1;
+        Bits_r[1] = 0;
+        Bits_r[2] = 0;
+        Bits_r[3] = 0;
+        return !notequal(Bits_l, Bits_r);
+}
+
+__attribute__((noipa))
+void bug(void) {
+    FeatureBitset lf, rf;
+    lf.Bits[0] = rf.Bits[0] = 1;
+    lf.Bits[1] = rf.Bits[1] = 1;
+    lf.Bits[2] = rf.Bits[2] = 1;
+    lf.Bits[3] = rf.Bits[3] = 1;
+
+    bool r = is_eq_buggy (&lf, &rf);
+    if (!r) __builtin_trap();
+}
+
+__attribute__((noipa))
+int main(void) {
+    bug();
+}
+```
+
+Again uncomment the attribute on notequal, if you want to see it works without inlining of memcmp here ...
+
+- User: Sergei Trofimovich | Time: 2023-07-08 20:31:46 UTC
+  Text: git bisect landed on ther14-2087-g83269719640689:
+
+$ git bisect good
+83269719640689415c0d5026ebfe05a0cf2bab72 is the first bad commit
+commit 83269719640689415c0d5026ebfe05a0cf2bab72
+Author: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Mon Jun 26 09:36:02 2023 +0100
+
+    i386: New *ashl<dwi3>_doubleword_highpart define_insn_and_split.
+
+- User: Roger Sayle | Time: 2023-07-09 22:34:50 UTC
+  Text: Mine.  The new peephole2 is misbehaving with the (odd) RTL sequence:
+(insn 62 61 63 2 (set (reg:DI 1 dx [111])
+        (const_int 0 [0])) "pr110598.c":10:10 90 {*movdi_internal}
+
+(insn 63 62 64 2 (parallel [
+            (set (reg:DI 1 dx [110])
+                (xor:DI (reg:DI 1 dx [111])
+                    (reg:DI 1 dx)))
+            (clobber (reg:CC 17 flags))
+        ]) "pr110598.c":10:10 626 {*xordi_1}
+     (expr_list:REG_UNUSED (reg:CC 17 flags)
+        (nil)))
+
+Doh!  I need to confirm/check that rega != regb.  Interesting that DF doesn't consider insn 62 as REG_UNUSED (i.e. dead), a classic false dependency.
+
+- User: GCC Commits | Time: 2023-07-12 13:13:13 UTC
+  Text: The master branch has been updated by Roger Sayle <sayle@gcc.gnu.org>:https://gcc.gnu.org/g:d2c18b4a16f9e1a6ed271ec1efaf94533d1c4a94commitr14-2465-gd2c18b4a16f9e1a6ed271ec1efaf94533d1c4a94Author: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Wed Jul 12 14:12:34 2023 +0100PR target/110598: Fix rega = 0; rega ^= rega regression in i386.md
+    
+    This patch fixes the regressionPR target/110598caused by my recent
+    addition of a peephole2.  The intention of that optimization was to
+    simplify zeroing a register, followed by an IOR, XOR or PLUS operation
+    on it into a move, or as described in the comment:
+    ;; Peephole2 rega = 0; rega op= regb into rega = regb.
+    
+    The issue is that I'd failed to consider the (rare and unusual) case,
+    where regb is rega, where the transformation leads to the incorrect
+    "rega = rega", when it should be "rega = 0".  The minimal fix is to
+    add a !reg_mentioned_p check to the recent peephole2.
+    
+    In addition to resolving the regression, I've added a second peephole2
+    to optimize the problematic case above, which contains a false
+    dependency and is therefore tricky to optimize elsewhere.  This is an
+    improvement over GCC 13, for example, that generates the redundant:
+    
+            xorl    %edx, %edx
+            xorq    %rdx, %rdx
+    
+    2023-07-12  Roger Sayle  <roger@nextmovesoftware.com>
+    
+    gcc/ChangeLogPR target/110598* config/i386/i386.md (peephole2): Check !reg_mentioned_p when
+            optimizing rega = 0; rega op= regb for op in [XOR,IOR,PLUS].
+            (peephole2): Simplify rega = 0; rega op= rega cases.
+    
+    gcc/testsuite/ChangeLogPR target/110598* gcc.target/i386/pr110598.c: New test case.
+
+- User: Sergei Trofimovich | Time: 2023-07-12 16:15:28 UTC
+  Text: The change fixed test suite on llvm-14.0.6 and on llvm-12.0.1. Thank you!
+
+- User: Roger Sayle | Time: 2023-07-12 19:42:31 UTC
+  Text: Many thanks to Sergei for confirming this issue is now resolved.  Sorry again for the inconvenience.
+

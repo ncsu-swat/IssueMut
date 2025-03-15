@@ -1,0 +1,150 @@
+Bug Summary: __has_include argument expansion results in unexpected filename
+Product: gcc
+Component: preprocessor
+
+  (show other bugs)
+Keywords: patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: N/A | Time: 2023-07-05 11:29:59 UTC
+  Text: Hello!
+I am building a path to an include file using a function like macro and then checking if the file exists using __has_include.
+However, if the argument to that macro is padded with spaces it will fail to find the file.
+
+Here an example with following 2 files in the same directory:
+
+
+my.header.h:
+--------
+#pragma message("included my.header.h")
+--------
+
+
+test.c:
+--------
+#ifndef USE_IMPL
+#   define USE_IMPL my
+#endif
+
+#define STRINGIFY_(X) #X
+#define STRINGIFY(X) STRINGIFY_(X)
+#define MAKE_INCLUDE_PATH_(IMPL, NAME) STRINGIFY(IMPL.NAME)
+#define MAKE_INCLUDE_PATH(NAME) MAKE_INCLUDE_PATH_(USE_IMPL, NAME)
+
+// checking __has_include with spaces
+#if __has_include(MAKE_INCLUDE_PATH( header.h )) // this will return false!
+#   pragma message("\""MAKE_INCLUDE_PATH( header.h )"\" exists")
+#else
+#   pragma message("\""MAKE_INCLUDE_PATH( header.h )"\" does NOT exist!") // except it does
+#endif
+#include MAKE_INCLUDE_PATH( header.h ) // works nonetheless
+
+// checking __has_include without spaces
+#if __has_include(MAKE_INCLUDE_PATH(header.h)) // works
+#   pragma message("\""MAKE_INCLUDE_PATH(header.h)"\" exists")
+#else
+#   pragma message("\""MAKE_INCLUDE_PATH(header.h)"\" does NOT exist!")
+#endif
+#include MAKE_INCLUDE_PATH(header.h)
+
+
+int main() { return 0; }
+--------
+
+
+Then to compile:
+
+# gcc -Wall -Wextra test.c                                                                                                                                                                                                                                test.c:14:12: note: ‘#pragma message: "my.header.h" does NOT exist!’
+   14 | #   pragma message("\""MAKE_INCLUDE_PATH( header.h )"\" does NOT exist!") // except it does
+      |            ^~~~~~~
+In file included from test.c:16:
+my.header.h:1:9: note: ‘#pragma message: included my.header.h’
+    1 | #pragma message("included my.header.h")
+      |         ^~~~~~~
+test.c:20:12: note: ‘#pragma message: "my.header.h" exists’
+   20 | #   pragma message("\""MAKE_INCLUDE_PATH(header.h)"\" exists")
+      |            ^~~~~~~
+In file included from test.c:24:
+my.header.h:1:9: note: ‘#pragma message: included my.header.h’
+    1 | #pragma message("included my.header.h")
+      |         ^~~~~~~
+
+
+The first __has_include fails to find "my.header.h" but the subsequent #include works.
+The second __has_include works as expected.
+
+Using strace I noticed that an extra space character ended up in the filename:
+openat(AT_FDCWD, "my. header.h", O_RDONLY|O_NOCTTY) = -1 ENOENT (No such file or directory)
+
+I would have expected the first __has_include to behave like the second one.
+
+- User: Andrew Pinski | Time: 2023-07-05 13:21:43 UTC
+  Text: I think this is a dup ofbug 80753.
+
+- User: N/A | Time: 2023-07-05 14:46:52 UTC
+  Text: Not quite, but you will run intobug 80753if the header file does not exist:
+The second #include will not cause an error in that case.
+The first #include however will cause an error as expected - presumably only because the first __has_include ends up with a different file name.
+
+- User: Florian Weimer | Time: 2023-12-11 10:44:36 UTC
+  Text: It tries to read "my. header.h" for some reason, even though the MAKE_INCLUDE_PATH macro produces "my.header.h" in other contexts (not just in #include directives). I doubt this is related tobug 80753.
+
+- User: Lewis Hyatt | Time: 2023-12-11 22:06:35 UTC
+  Text: __has_include was added I think in GCC 5, and re-implemented in GCC 10, but this issue with padding in the macro expansion was never handled correctly it seems. I am testing the below which will fix it, will submit it soon with a testcase. Not sure if it would be eligible for backport or not, but it would apply cleanly to all active branches also.
+
+diff --git a/libcpp/macro.cc b/libcpp/macro.cc
+index 6f24a9d6f3a..15140c60023 100644
+--- a/libcpp/macro.cc
++++ b/libcpp/macro.cc
+@@ -398,6 +398,8 @@ builtin_has_include (cpp_reader *pfile, cpp_hashnode *op, bool has_next)
+               NODE_NAME (op));
+
+   pfile->state.angled_headers = true;
++  const auto sav_padding = pfile->state.directive_wants_padding;
++  pfile->state.directive_wants_padding = true;
+   const cpp_token *token = cpp_get_token_no_padding (pfile);
+   bool paren = token->type == CPP_OPEN_PAREN;
+   if (paren)
+@@ -406,6 +408,7 @@ builtin_has_include (cpp_reader *pfile, cpp_hashnode *op, bool has_next)
+     cpp_error (pfile, CPP_DL_ERROR,
+               "missing '(' before \"%s\" operand", NODE_NAME (op));
+   pfile->state.angled_headers = false;
++  pfile->state.directive_wants_padding = sav_padding;
+
+   bool bracket = token->type != CPP_STRING;
+   char *fname = NULL;
+
+- User: Lewis Hyatt | Time: 2023-12-12 23:20:32 UTC
+  Text: Patch submitted for review:https://gcc.gnu.org/pipermail/gcc-patches/2023-December/640386.html
+
+- User: GCC Commits | Time: 2024-03-14 11:33:51 UTC
+  Text: The master branch has been updated by Lewis Hyatt <lhyatt@gcc.gnu.org>:https://gcc.gnu.org/g:942497ad74272e0ef16020d628e471c5f21474b0commitr14-9465-g942497ad74272e0ef16020d628e471c5f21474b0Author: Lewis Hyatt <lhyatt@gmail.com>
+Date:   Tue Dec 12 17:46:36 2023 -0500
+
+    libcpp: Fix macro expansion for argument of __has_include [PR110558]
+    
+    When the file name for a #include directive is the result of stringifying a
+    macro argument, libcpp needs to take some care to get the whitespace
+    correct; in particular stringify_arg() needs to see a CPP_PADDING token
+    between macro tokens so that it can figure out when to output space between
+    tokens. The CPP_PADDING tokens are not normally generated when handling a
+    preprocessor directive, but for #include-like directives, libcpp sets the
+    state variable pfile->state.directive_wants_padding to TRUE so that the
+    CPP_PADDING tokens will be output, and then everything works fine for
+    computed includes.
+    
+    As the PR points out, things do not work fine for __has_include. Fix that by
+    setting the state variable the same as is done for #include.
+    
+    libcpp/ChangeLog:PR preprocessor/110558* macro.cc (builtin_has_include): Set
+            pfile->state.directive_wants_padding prior to lexing the
+            file name, in case it comes from macro expansion.
+    
+    gcc/testsuite/ChangeLog:PR preprocessor/110558* c-c++-common/cpp/has-include-2.c: New test.
+            * c-c++-common/cpp/has-include-2.h: New test.
+
+- User: Lewis Hyatt | Time: 2024-03-14 11:36:09 UTC
+  Text: Fixed for GCC 14.
+

@@ -1,0 +1,249 @@
+Bug Summary: Uninit false positive from -fanalyzer when longjmp unwinds frames with return stmts
+Product: gcc
+Component: analyzer
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Malcolm | Time: 2023-03-10 20:00:49 UTC
+  Text: Trunk ICEs on the attached:
+
+$ ./xgcc -B. -fanalyzer  -S ../../src/target_i386_tcg_translate.c \
+  -Wall -Wno-array-parameter -Wno-unused-function -Wno-unused-variable
+
+/home/david/more-coding/gcc-newgit-analyzer-dsl/src/target_i386_tcg_translate.c:48985:29: internal compiler error: in get_region_for_local, at analyzer/region.cc:920
+48985 |   if (s->base.num_insns > 1 && !is_same_page(&s->base, s->pc + num_bytes - 1)) {
+      |       ~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+0x1af2cb3 ana::frame_region::get_region_for_local(ana::region_model_manager*, tree_node*, ana::region_model_context const*) const
+	../../src/gcc/analyzer/region.cc:920
+0x1afc3f8 ana::region_model::get_lvalue_1(ana::path_var, ana::region_model_context*) const
+	../../src/gcc/analyzer/region-model.cc:2101
+0x1afc5c7 ana::region_model::get_lvalue(ana::path_var, ana::region_model_context*) const
+	../../src/gcc/analyzer/region-model.cc:2153
+0x1afcac1 ana::region_model::get_rvalue_1(ana::path_var, ana::region_model_context*) const
+	../../src/gcc/analyzer/region-model.cc:2219
+0x1afcf08 ana::region_model::get_rvalue(ana::path_var, ana::region_model_context*) const
+	../../src/gcc/analyzer/region-model.cc:2297
+0x1afcfc7 ana::region_model::get_rvalue(tree_node*, ana::region_model_context*) const
+	../../src/gcc/analyzer/region-model.cc:2312
+0x1b172ac ana::poisoned_value_diagnostic::check_valid_fpath_p(ana::feasible_node const&, gimple const*) const
+	../../src/gcc/analyzer/region-model.cc:596
+0x2f1f2d7 ana::epath_finder::process_worklist_item(ana::feasible_worklist*, ana::trimmed_graph const&, ana::feasible_graph*, ana::exploded_node const*, gimple const*, ana::pending_diagnostic const&, unsigned int, std::unique_ptr<ana::exploded_path, std::default_delete<ana::exploded_path> >*) const
+	../../src/gcc/analyzer/diagnostic-manager.cc:538
+0x2f1ee71 ana::epath_finder::explore_feasible_paths(ana::exploded_node const*, gimple const*, ana::pending_diagnostic const&, char const*, unsigned int)
+	../../src/gcc/analyzer/diagnostic-manager.cc:434
+0x2f1e9d8 ana::epath_finder::get_best_epath(ana::exploded_node const*, gimple const*, ana::pending_diagnostic const&, char const*, unsigned int, std::unique_ptr<ana::feasibility_problem, std::default_delete<ana::feasibility_problem> >*)
+	../../src/gcc/analyzer/diagnostic-manager.cc:175
+0x2f201fa ana::saved_diagnostic::calc_best_epath(ana::epath_finder*)
+	../../src/gcc/analyzer/diagnostic-manager.cc:839
+0x2f2541d ana::dedupe_winners::add(ana::logger*, ana::epath_finder*, ana::saved_diagnostic*)
+	../../src/gcc/analyzer/diagnostic-manager.cc:1207
+0x2f20d21 ana::diagnostic_manager::emit_saved_diagnostics(ana::exploded_graph const&)
+	../../src/gcc/analyzer/diagnostic-manager.cc:1357
+0x1aa1816 ana::impl_run_checkers(ana::logger*)
+	../../src/gcc/analyzer/engine.cc:6139
+0x1aa1b70 ana::run_checkers()
+	../../src/gcc/analyzer/engine.cc:6213
+0x1a9404a execute
+	../../src/gcc/analyzer/analyzer-pass.cc:87
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+Unfortunately it takes about 12 minutes to ICE.
+
+Haven't yet tested with earlier versions.
+
+- User: David Malcolm | Time: 2023-03-10 20:10:06 UTC
+  Text: Createdattachment 54637[details]Unreduced reproducer
+
+- User: GCC Commits | Time: 2023-03-15 22:18:42 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:79aaba0a71f34ac1ac2c4cec907ff74740a6cf1acommitr13-6701-g79aaba0a71f34ac1ac2c4cec907ff74740a6cf1aAuthor: David Malcolm <dmalcolm@redhat.com>
+Date:   Wed Mar 15 18:16:17 2023 -0400
+
+    diagnostics: attempt to capture crash info in SARIF output [PR109097]
+    
+    As noted inPR analyzer/109097, if an internal compiler error occurs
+    when -fdiagnostics-format=sarif-file is specified, we currently fail
+    to write out a .sarif file, and the output to stderr doesn't contain
+    "internal compiler error" or "Internal compiler error"; just the
+    backtrace if we're lucky, and the "Please submit a full bug report"
+    messages.
+    
+    This is a nuisance e.g. for my integration testing of -fanalyzer, where
+    I'm gathering the results of builds via the .sarif output: if it crashes
+    on a particular source file, then no output is generated, and it's
+    effectively silent about the crash.
+    
+    This patch fixes things by adding a callback to diagnostic_context so
+    that the SARIF output code can make one final attempt to write its
+    output if an ICE occurs.  It also special-cases the output, so that an
+    ICE is treated as an "error"-level "notification" relating to the
+    operation of the tool (SARIF v2.1.0 section 3.58), rather than a
+    "result" about the code being analyzed by the tool.
+    
+    The patch adds test coverage for this via a plugin that can inject:
+    * calls to internal_compiler_error, and
+    * writes through a NULL pointer
+    and verifying that a  .sarif file is written out capturing the crash
+    (and also that an ICE occurs via dg-ice, which seems to treat the ICE as
+    an XFAIL, which is reasonable).
+    
+    I've added support for this to my integration-testing scripts: testing
+    shows that with this patch we capture analyzer crashes in .sarif files
+    (specifically, the analyzer crash on qemu:PR analyzer/109094), and I've
+    updated my scripts to work with and report such output.
+    
+    I manually verified that the resulting .sarif files validate against the
+    schema.
+    
+    gcc/ChangeLog:PR analyzer/109097* diagnostic-format-sarif.cc (class sarif_invocation): New.
+            (class sarif_ice_notification): New.
+            (sarif_builder::m_invocation_obj): New field.
+            (sarif_invocation::add_notification_for_ice): New.
+            (sarif_invocation::prepare_to_flush): New.
+            (sarif_ice_notification::sarif_ice_notification): New.
+            (sarif_builder::sarif_builder): Add m_invocation_obj.
+            (sarif_builder::end_diagnostic): Special-case DK_ICE and
+            DK_ICE_NOBT.
+            (sarif_builder::flush_to_file): Call prepare_to_flush on
+            m_invocation_obj.  Pass the latter to make_top_level_object.
+            (sarif_builder::make_result_object): Move creation of "locations"
+            array to...
+            (sarif_builder::make_locations_arr): ...this new function.
+            (sarif_builder::make_top_level_object): Add "invocation_obj" param
+            and pass it to make_run_object.
+            (sarif_builder::make_run_object): Add "invocation_obj" param and
+            use it.
+            (sarif_ice_handler): New callback.
+            (diagnostic_output_format_init_sarif): Wire up sarif_ice_handler.
+            * diagnostic.cc (diagnostic_initialize): Initialize new field
+            "ice_handler_cb".
+            (diagnostic_action_after_output): If it is set, make one attempt
+            to call ice_handler_cb.
+            * diagnostic.h (diagnostic_context::ice_handler_cb): New field.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/109097* c-c++-common/diagnostic-format-sarif-file-1.c: Verify that we
+            have an invocation object marked as succeeding, with no
+            notifications.
+            * gcc.dg/plugin/crash-test-ice-sarif.c: New test.
+            * gcc.dg/plugin/crash-test-ice-stderr.c: New test.
+            * gcc.dg/plugin/crash-test-write-though-null-sarif.c: New test.
+            * gcc.dg/plugin/crash-test-write-though-null-stderr.c: New test.
+            * gcc.dg/plugin/crash_test_plugin.c: New plugin.
+            * gcc.dg/plugin/plugin.exp (plugin_test_list): Add the new plugin
+            and test cases.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: Martin Liška | Time: 2023-03-16 08:45:53 UTC
+  Text: Fixed?
+
+- User: David Malcolm | Time: 2023-03-16 13:00:43 UTC
+  Text: (In reply to Martin Liška fromcomment #3)> Fixed?Sadly no, the comment above is just to mention that at least the crash is now captured in the .sarif dump.
+
+- User: David Malcolm | Time: 2023-03-16 13:29:20 UTC
+  Text: I'm working on reducing this.
+
+- User: David Malcolm | Time: 2023-03-17 22:11:34 UTC
+  Text: Createdattachment 54699[details]Reduced reproducer
+
+- User: David Malcolm | Time: 2023-03-17 22:14:11 UTC
+  Text: Trunk:https://godbolt.org/z/MKh4h1ccP12.2:https://godbolt.org/z/73EY4TMcx(no ICE, but assertions likely disabled)
+
+- User: David Malcolm | Time: 2023-03-17 23:07:44 UTC
+  Text: Createdattachment 54700[details]Patch that I'm about to put through full testing
+
+- User: GCC Commits | Time: 2023-03-18 16:49:08 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:430d7d88c1a123d787f529dbc29e6632c6e556fbcommitr13-6749-g430d7d88c1a123d787f529dbc29e6632c6e556fbAuthor: David Malcolm <dmalcolm@redhat.com>
+Date:   Sat Mar 18 12:48:01 2023 -0400
+
+    analyzer: fix ICE on certain longjmp calls [PR109094]PR analyzer/109094reports an ICE in the analyzer seen on qemu's
+    target/i386/tcg/translate.c
+    
+    The issue turned out to be that when handling a longjmp, the code
+    to pop the frames was generating an svalue for the result_decl of any
+    popped frame that had a non-void return type (and discarding it) leading
+    to "uninit" poisoned_svalue_diagnostic instances being saved since the
+    result_decl is only set by the greturn stmt.  Later, when checking the
+    feasibility of the path to these diagnostics, m_check_expr was evaluated
+    in the context of the frame of the longjmp, leading to an attempt to
+    evaluate the result_decl of each intervening frames whilst in the
+    context of the topmost frame, leading to an assertion failure in
+    frame_region::get_region_for_local here:
+    
+    919             case RESULT_DECL:
+    920               gcc_assert (DECL_CONTEXT (expr) == m_fun->decl);
+    921               break;
+    
+    This patch updates the analyzer's longjmp implementation so that it
+    doesn't attempt to generate svalues for the result_decls when popping
+    frames, fixing the assertion failure (and presumably fixing "uninit"
+    false positives in a release build).
+    
+    gcc/analyzer/ChangeLog:PR analyzer/109094* region-model.cc (region_model::on_longjmp): Pass false for
+            new "eval_return_svalue" param of pop_frame.
+            (region_model::pop_frame): Add new "eval_return_svalue" param and
+            use it to suppress the call to get_rvalue on the result when
+            needed by on_longjmp.
+            * region-model.h (region_model::pop_frame): Add new
+            "eval_return_svalue" param.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/109094* gcc.dg/analyzer/setjmp-pr109094.c: New test.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2023-03-18 16:55:10 UTC
+  Text: The above patch fixes the ICE for trunk.
+
+This isn't an ICE, but is a false positive for GCC 12:https://godbolt.org/z/73EY4TMcxwhich I hope is trivially fixable by backporting this patch.
+
+Keeping open to track the backport to gcc 12; adjusting subject.
+
+- User: GCC Commits | Time: 2023-03-29 18:19:17 UTC
+  Text: The releases/gcc-12 branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:7903e0bca003840751c109cfa41e5a1528ece12acommitr12-9367-g7903e0bca003840751c109cfa41e5a1528ece12aAuthor: David Malcolm <dmalcolm@redhat.com>
+Date:   Wed Mar 29 14:16:49 2023 -0400
+
+    analyzer: fix ICE on certain longjmp calls [PR109094]PR analyzer/109094reports an ICE in the analyzer seen on qemu's
+    target/i386/tcg/translate.c
+    
+    The issue turned out to be that when handling a longjmp, the code
+    to pop the frames was generating an svalue for the result_decl of any
+    popped frame that had a non-void return type (and discarding it) leading
+    to "uninit" poisoned_svalue_diagnostic instances being saved since the
+    result_decl is only set by the greturn stmt.  Later, when checking the
+    feasibility of the path to these diagnostics, m_check_expr was evaluated
+    in the context of the frame of the longjmp, leading to an attempt to
+    evaluate the result_decl of each intervening frames whilst in the
+    context of the topmost frame, leading to an assertion failure in
+    frame_region::get_region_for_local here:
+    
+    919             case RESULT_DECL:
+    920               gcc_assert (DECL_CONTEXT (expr) == m_fun->decl);
+    921               break;
+    
+    This patch updates the analyzer's longjmp implementation so that it
+    doesn't attempt to generate svalues for the result_decls when popping
+    frames, fixing the assertion failure (and presumably fixing "uninit"
+    false positives in a release build).
+    
+    Cherrypicked fromr13-6749-g430d7d88c1a123.
+    
+    gcc/analyzer/ChangeLog:PR analyzer/109094* region-model.cc (region_model::on_longjmp): Pass false for
+            new "eval_return_svalue" param of pop_frame.
+            (region_model::pop_frame): Add new "eval_return_svalue" param and
+            use it to suppress the call to get_rvalue on the result when
+            needed by on_longjmp.
+            * region-model.h (region_model::pop_frame): Add new
+            "eval_return_svalue" param.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/109094* gcc.dg/analyzer/setjmp-pr109094.c: New test.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2023-03-29 19:11:37 UTC
+  Text: Fixed for gcc 12 by the above commit; marking as resolved.
+

@@ -1,0 +1,571 @@
+Bug Summary: vec_widen_smult_{odd,even}_M ineffective for a simple widening dot product (vect_used_by_reduction is not set?)
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Xi Ruoyao | Time: 2024-07-30 12:38:17 UTC
+  Text: On LoongArch, for this test case:
+
+short x[8], y[8];
+
+int dot() {
+	int ret = 0;
+	for (int i = 0; i < 8; i++)
+		ret += x[i] * y[i];
+	return ret;
+}
+
+The compiler produces:
+
+	vld	$vr1,$r12,0
+	vld	$vr0,$r12,32
+	vslti.h	$vr2,$vr1,0
+	vslti.h	$vr3,$vr0,0
+	vilvh.h	$vr4,$vr2,$vr1
+	vilvh.h	$vr5,$vr3,$vr0
+	vilvl.h	$vr1,$vr2,$vr1
+	vilvl.h	$vr0,$vr3,$vr0
+	vmul.w	$vr0,$vr0,$vr1
+	vmadd.w	$vr0,$vr5,$vr4
+	vhaddw.d.w	$vr0,$vr0,$vr0
+	vhaddw.q.d	$vr0,$vr0,$vr0
+	vpickve2gr.w	$r4,$vr0,0
+	slli.w	$r4,$r4,0
+	jr	$r1
+
+This is stupid and we just want:
+
+	vld	$vr1,$r12,0
+	vld	$vr0,$r12,32
+	vmulwev.w.h $vr2, $vr1, $vr0
+	vmulwod.w.h $vr3, $vr1, $vr0
+	vadd.w	$vr2, $vr2, $vr3
+	vhaddw.d.w	$vr2,$vr2,$vr2
+	vhaddw.q.d	$vr2,$vr2,$vr2
+	vpickve2gr.w	$r4,$vr2,0
+	jr	$r1
+
+After reading GCC internal I found we missed vec_widen_smult_even_v8hi and vec_widen_smult_odd_v8hi.  So I added them:
+
++(define_expand "vec_widen_smult_even_v8hi"
++  [(match_operand:V4SI 0 "register_operand" "=f")
++   (match_operand:V8HI 1 "register_operand" " f")
++   (match_operand:V8HI 2 "register_operand" " f")]
++  "ISA_HAS_LSX"
++{
++  emit_insn (gen_lsx_vmulwev_w_h (operands[0], operands[1], operands[2]));
++  DONE;
++})
++
++(define_expand "vec_widen_smult_odd_v8hi"
++  [(match_operand:V4SI 0 "register_operand" "=f")
++   (match_operand:V8HI 1 "register_operand" " f")
++   (match_operand:V8HI 2 "register_operand" " f")]
++  "ISA_HAS_LSX"
++{
++  emit_insn (gen_lsx_vmulwod_w_h (operands[0], operands[1], operands[2]));
++  DONE;
++})
++
+
+But they are not used at all, despite some comment in tree-vect-stmts.cc suggests this approach should work:
+
+         However, in the special case that the result of the widening
+         operation is used in a reduction computation only, the order doesn't
+         matter (because when vectorizing a reduction we change the order of
+         the computation).  Some targets can take advantage of this and
+         generate more efficient code.  For example, targets like Altivec,
+         that support widen_mult using a sequence of {mult_even,mult_odd}
+         generate the following vectors:
+                vect1: [res1,res3,res5,res7],
+                vect2: [res2,res4,res6,res8].
+
+... ...
+
+      if (vect_loop
+          && STMT_VINFO_RELEVANT (stmt_info) == vect_used_by_reduction
+          && !nested_in_vect_loop_p (vect_loop, stmt_info)
+          && supportable_widening_operation (vinfo, VEC_WIDEN_MULT_EVEN_EXPR,
+                                             stmt_info, vectype_out,
+                                             vectype_in, code1,
+                                             code2, multi_step_cvt,
+                                             interm_types))
+        {
+          /* Elements in a vector with vect_used_by_reduction property cannot
+             be reordered if the use chain with this property does not have the
+             same operation.  One such an example is s += a * b, where elements
+             in a and b cannot be reordered.  Here we check if the vector defined
+             by STMT is only directly used in the reduction statement.  */
+          tree lhs = gimple_assign_lhs (stmt_info->stmt);
+          stmt_vec_info use_stmt_info = loop_info->lookup_single_use (lhs);
+          if (use_stmt_info
+              && STMT_VINFO_DEF_TYPE (use_stmt_info) == vect_reduction_def)
+            return true;
+        }
+      c1 = VEC_WIDEN_MULT_LO_EXPR;
+      c2 = VEC_WIDEN_MULT_HI_EXPR;
+      break;
+
+When I use gdb to debug cc1 I found STMT_VINFO_RELEVANT (stmt_info) is never vect_used_by_reduction for my test case, but (obviously) the result of the multiplication is only used by a reduction.  So IMO there's a bug in tree optimization.  Or am I missing something?
+
+- User: Richard Biener | Time: 2024-07-30 13:15:28 UTC
+  Text: To make it used by the reduction you'd need to have a dot_product covering the accumulation as well.
+
+- User: Xi Ruoyao | Time: 2024-07-31 01:21:18 UTC
+  Text: (In reply to Richard Biener fromcomment #1)> To make it used by the reduction you'd need to have a dot_product covering
+> the accumulation as well.I can add that, but what if we slightly alter it to something like
+
+short x[8], y[8];
+
+int dot() {
+	int ret = 0;
+	for (int i = 0; i < 8; i++)
+		ret ^= x[i] * y[i];
+	return ret;
+}
+
+?  It's no longer a dot product but shouldn't vec_widen_smult_{even,odd}_v8hi be used anyway?
+
+- User: Richard Biener | Time: 2024-07-31 06:55:11 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #2)> (In reply to Richard Biener fromcomment #1)
+> > To make it used by the reduction you'd need to have a dot_product covering
+> > the accumulation as well.
+> 
+> I can add that, but what if we slightly alter it to something like
+> 
+> short x[8], y[8];
+> 
+> int dot() {
+> 	int ret = 0;
+> 	for (int i = 0; i < 8; i++)
+> 		ret ^= x[i] * y[i];
+> 	return ret;
+> }
+> 
+> ?  It's no longer a dot product but shouldn't
+> vec_widen_smult_{even,odd}_v8hi be used anyway?Sure, you should see
+
+t.c:5:20: note:   Analyze phi: ret_13 = PHI <ret_9(5), 0(2)>
+t.c:5:20: note:   reduction path: ret_9 ret_13 
+t.c:5:20: note:   reduction: detected reduction
+t.c:5:20: note:   Detected reduction. 
+...
+t.c:5:20: note:   vect_recog_widen_mult_pattern: detected: _5 = _2 * _4;
+t.c:5:20: note:   widen_mult pattern recognized: patt_24 = _1 w* _3;
+
+and then
+
+  # vect_ret_13.11_12 = PHI <vect_ret_9.12_7(5), { 0, 0, 0, 0 }(2)>
+  # ivtmp_29 = PHI <ivtmp_30(5), 0(2)>
+  vect__1.6_20 = MEM <vector(8) short int> [(short int *)vectp_x.4_22];
+  _1 = x[i_15];
+  _2 = (int) _1;
+  vect__3.9_17 = MEM <vector(8) short int> [(short int *)vectp_y.7_19];
+  vect_patt_23.10_16 = WIDEN_MULT_LO_EXPR <vect__1.6_20, vect__3.9_17>;
+  vect_patt_23.10_14 = WIDEN_MULT_HI_EXPR <vect__1.6_20, vect__3.9_17>;
+  vect_ret_9.12_11 = vect_patt_23.10_16 ^ vect_ret_13.11_12;
+  vect_ret_9.12_7 = vect_patt_23.10_14 ^ vect_ret_9.12_11;
+
+at least that's what happens on x86.  It should also work with _EVEN/_ODD.
+
+- User: Xi Ruoyao | Time: 2024-07-31 10:17:28 UTC
+  Text: (In reply to Richard Biener fromcomment #3)> (In reply to Xi Ruoyao fromcomment #2)
+> > (In reply to Richard Biener fromcomment #1)
+> > > To make it used by the reduction you'd need to have a dot_product covering
+> > > the accumulation as well.
+> > 
+> > I can add that, but what if we slightly alter it to something like
+> > 
+> > short x[8], y[8];
+> > 
+> > int dot() {
+> > 	int ret = 0;
+> > 	for (int i = 0; i < 8; i++)
+> > 		ret ^= x[i] * y[i];
+> > 	return ret;
+> > }
+> > 
+> > ?  It's no longer a dot product but shouldn't
+> > vec_widen_smult_{even,odd}_v8hi be used anyway?
+> 
+> Sure, you should see
+> 
+> t.c:5:20: note:   Analyze phi: ret_13 = PHI <ret_9(5), 0(2)>
+> t.c:5:20: note:   reduction path: ret_9 ret_13 
+> t.c:5:20: note:   reduction: detected reduction
+> t.c:5:20: note:   Detected reduction. 
+> ...
+> t.c:5:20: note:   vect_recog_widen_mult_pattern: detected: _5 = _2 * _4;
+> t.c:5:20: note:   widen_mult pattern recognized: patt_24 = _1 w* _3;
+> 
+> and then
+> 
+>   # vect_ret_13.11_12 = PHI <vect_ret_9.12_7(5), { 0, 0, 0, 0 }(2)>
+>   # ivtmp_29 = PHI <ivtmp_30(5), 0(2)>
+>   vect__1.6_20 = MEM <vector(8) short int> [(short int *)vectp_x.4_22];
+>   _1 = x[i_15];
+>   _2 = (int) _1;
+>   vect__3.9_17 = MEM <vector(8) short int> [(short int *)vectp_y.7_19];
+>   vect_patt_23.10_16 = WIDEN_MULT_LO_EXPR <vect__1.6_20, vect__3.9_17>;
+>   vect_patt_23.10_14 = WIDEN_MULT_HI_EXPR <vect__1.6_20, vect__3.9_17>;
+>   vect_ret_9.12_11 = vect_patt_23.10_16 ^ vect_ret_13.11_12;
+>   vect_ret_9.12_7 = vect_patt_23.10_14 ^ vect_ret_9.12_11;
+> 
+> at least that's what happens on x86.  It should also work with _EVEN/_ODD.The condition of _EVEN/_ODD is more strict than _HI/_LO.  It requires STMT_VINFO_RELEVANT (stmt_info) == vect_used_by_reduction but this condition seems not true for my test cases.
+
+- User: Xi Ruoyao | Time: 2024-07-31 10:19:25 UTC
+  Text: And if I add sdot_prodv8hi it works for the test case 1 as expected, but not the test case 2.
+
+- User: Richard Biener | Time: 2024-07-31 11:18:54 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #4)> (In reply to Richard Biener fromcomment #3)
+> > (In reply to Xi Ruoyao fromcomment #2)
+> > > (In reply to Richard Biener fromcomment #1)
+> > > > To make it used by the reduction you'd need to have a dot_product covering
+> > > > the accumulation as well.
+> > > 
+> > > I can add that, but what if we slightly alter it to something like
+> > > 
+> > > short x[8], y[8];
+> > > 
+> > > int dot() {
+> > > 	int ret = 0;
+> > > 	for (int i = 0; i < 8; i++)
+> > > 		ret ^= x[i] * y[i];
+> > > 	return ret;
+> > > }
+> > > 
+> > > ?  It's no longer a dot product but shouldn't
+> > > vec_widen_smult_{even,odd}_v8hi be used anyway?
+> > 
+> > Sure, you should see
+> > 
+> > t.c:5:20: note:   Analyze phi: ret_13 = PHI <ret_9(5), 0(2)>
+> > t.c:5:20: note:   reduction path: ret_9 ret_13 
+> > t.c:5:20: note:   reduction: detected reduction
+> > t.c:5:20: note:   Detected reduction. 
+> > ...
+> > t.c:5:20: note:   vect_recog_widen_mult_pattern: detected: _5 = _2 * _4;
+> > t.c:5:20: note:   widen_mult pattern recognized: patt_24 = _1 w* _3;
+> > 
+> > and then
+> > 
+> >   # vect_ret_13.11_12 = PHI <vect_ret_9.12_7(5), { 0, 0, 0, 0 }(2)>
+> >   # ivtmp_29 = PHI <ivtmp_30(5), 0(2)>
+> >   vect__1.6_20 = MEM <vector(8) short int> [(short int *)vectp_x.4_22];
+> >   _1 = x[i_15];
+> >   _2 = (int) _1;
+> >   vect__3.9_17 = MEM <vector(8) short int> [(short int *)vectp_y.7_19];
+> >   vect_patt_23.10_16 = WIDEN_MULT_LO_EXPR <vect__1.6_20, vect__3.9_17>;
+> >   vect_patt_23.10_14 = WIDEN_MULT_HI_EXPR <vect__1.6_20, vect__3.9_17>;
+> >   vect_ret_9.12_11 = vect_patt_23.10_16 ^ vect_ret_13.11_12;
+> >   vect_ret_9.12_7 = vect_patt_23.10_14 ^ vect_ret_9.12_11;
+> > 
+> > at least that's what happens on x86.  It should also work with _EVEN/_ODD.
+> 
+> The condition of _EVEN/_ODD is more strict than _HI/_LO.  It requires
+> STMT_VINFO_RELEVANT (stmt_info) == vect_used_by_reduction but this condition
+> seems not true for my test cases.Ah, that's because EVEN/ODD will de-interleave the vector and to make
+use of those we'd need to re-interleave to build a hi/lo pair.  Consider
+
+  ret[i] = x[i] * y[i];
+
+it's safe for reductions in case the summation can be re-ordered.
+
+I'll note the check in question is redundant since we have
+
+          /* Elements in a vector with vect_used_by_reduction property cannot
+             be reordered if the use chain with this property does not have the
+             same operation.  One such an example is s += a * b, where elements
+             in a and b cannot be reordered.  Here we check if the vector defined
+             by STMT is only directly used in the reduction statement.  */
+          tree lhs = gimple_assign_lhs (stmt_info->stmt);
+          stmt_vec_info use_stmt_info = loop_info->lookup_single_use (lhs);
+          if (use_stmt_info
+              && STMT_VINFO_DEF_TYPE (use_stmt_info) == vect_reduction_def)
+            return true;
+
+but it also seems that vect_used_by_reduction is not set very optimistically.
+It's definition
+
+  /* defs that feed computations that end up (only) in a reduction. These
+     defs may be used by non-reduction stmts, but eventually, any
+     computations/values that are affected by these defs are used to compute
+     a reduction (i.e. don't get stored to memory, for example). We use this
+     to identify computations that we can change the order in which they are
+     computed.  */
+  vect_used_by_reduction,
+
+is also not quite correct since that would mean
+
+  a = b[i];
+  d = x w* y;
+  c = a * d;
+  res += c;
+
+would be OK but clearly it would mix even/odd permuted lanes in 'd' with
+unpermuted lanes of 'a', computing a wrong value.  So the
+STMT_VINFO_RELEVANT (stmt_info) == vect_used_by_reduction check isn't
+enough to guarantee correctness here.  I think the latter test is on
+it's own though.
+
+I think we want to remove vect_used_in_outer_by_reduction/vect_used_by_reduction
+and instead propagate a flag that lanes might be arbitrarily permutated.
+
+Can you check if the following makes things work for you?
+
+diff --git a/gcc/tree-vect-stmts.cc b/gcc/tree-vect-stmts.cc
+index 67f6e5df255..7496e31164c 100644
+--- a/gcc/tree-vect-stmts.cc
++++ b/gcc/tree-vect-stmts.cc
+@@ -14200,7 +14200,6 @@ supportable_widening_operation (vec_info *vinfo,
+         are properly set up for the caller.  If we fail, we'll continue with
+         a VEC_WIDEN_MULT_LO/HI_EXPR check.  */
+       if (vect_loop
+-         && STMT_VINFO_RELEVANT (stmt_info) == vect_used_by_reduction
+          && !nested_in_vect_loop_p (vect_loop, stmt_info)
+          && supportable_widening_operation (vinfo, VEC_WIDEN_MULT_EVEN_EXPR,
+                                             stmt_info, vectype_out,
+
+- User: Xi Ruoyao | Time: 2024-07-31 15:34:33 UTC
+  Text: (In reply to Richard Biener fromcomment #6)> Can you check if the following makes things work for you?
+> 
+> diff --git a/gcc/tree-vect-stmts.cc b/gcc/tree-vect-stmts.cc
+> index 67f6e5df255..7496e31164c 100644
+> --- a/gcc/tree-vect-stmts.cc
+> +++ b/gcc/tree-vect-stmts.cc
+> @@ -14200,7 +14200,6 @@ supportable_widening_operation (vec_info *vinfo,
+>          are properly set up for the caller.  If we fail, we'll continue with
+>          a VEC_WIDEN_MULT_LO/HI_EXPR check.  */
+>        if (vect_loop
+> -         && STMT_VINFO_RELEVANT (stmt_info) == vect_used_by_reduction
+>           && !nested_in_vect_loop_p (vect_loop, stmt_info)
+>           && supportable_widening_operation (vinfo, VEC_WIDEN_MULT_EVEN_EXPR,
+>                                              stmt_info, vectype_out,Still not.  I get something like
+
+t1.c:5:20: note:   ==> examining pattern statement: patt_24 = _1 w* _3; 
+t1.c:5:20: note:   vect_is_simple_use: operand x[i_15], type of def: internal
+t1.c:5:20: note:   vect_is_simple_use: vectype vector(8) short int 
+t1.c:5:20: note:   vect_is_simple_use: operand y[i_15], type of def: internal
+t1.c:5:20: note:   vect_is_simple_use: vectype vector(8) short int 
+t1.c:5:20: missed:   conversion not supported by target.
+t1.c:5:20: note:   vect_is_simple_use: operand x[i_15], type of def: internal
+t1.c:5:20: note:   vect_is_simple_use: vectype vector(8) short int 
+t1.c:3:5: missed:   not vectorized: relevant stmt not supported: patt_24 = _1 w* _3; 
+t1.c:5:20: missed:  bad operation or unsupported loop bound.
+t1.c:5:20: note:  ***** Analysis failed with vector mode V8HI
+
+As an experiment I renamed the {even,odd} expanders to {lo,hi} (doing so is definitely wrong in reality) and I got the "expected" result.
+
+- User: Richard Biener | Time: 2024-08-01 10:59:59 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #7)> (In reply to Richard Biener fromcomment #6)
+> 
+> > Can you check if the following makes things work for you?
+> > 
+> > diff --git a/gcc/tree-vect-stmts.cc b/gcc/tree-vect-stmts.cc
+> > index 67f6e5df255..7496e31164c 100644
+> > --- a/gcc/tree-vect-stmts.cc
+> > +++ b/gcc/tree-vect-stmts.cc
+> > @@ -14200,7 +14200,6 @@ supportable_widening_operation (vec_info *vinfo,
+> >          are properly set up for the caller.  If we fail, we'll continue with
+> >          a VEC_WIDEN_MULT_LO/HI_EXPR check.  */
+> >        if (vect_loop
+> > -         && STMT_VINFO_RELEVANT (stmt_info) == vect_used_by_reduction
+> >           && !nested_in_vect_loop_p (vect_loop, stmt_info)
+> >           && supportable_widening_operation (vinfo, VEC_WIDEN_MULT_EVEN_EXPR,
+> >                                              stmt_info, vectype_out,
+> 
+> Still not.  I get something like
+> 
+> t1.c:5:20: note:   ==> examining pattern statement: patt_24 = _1 w* _3; 
+> t1.c:5:20: note:   vect_is_simple_use: operand x[i_15], type of def: internal
+> t1.c:5:20: note:   vect_is_simple_use: vectype vector(8) short int 
+> t1.c:5:20: note:   vect_is_simple_use: operand y[i_15], type of def: internal
+> t1.c:5:20: note:   vect_is_simple_use: vectype vector(8) short int 
+> t1.c:5:20: missed:   conversion not supported by target.
+> t1.c:5:20: note:   vect_is_simple_use: operand x[i_15], type of def: internal
+> t1.c:5:20: note:   vect_is_simple_use: vectype vector(8) short int 
+> t1.c:3:5: missed:   not vectorized: relevant stmt not supported: patt_24 =
+> _1 w* _3; 
+> t1.c:5:20: missed:  bad operation or unsupported loop bound.
+> t1.c:5:20: note:  ***** Analysis failed with vector mode V8HI
+> 
+> As an experiment I renamed the {even,odd} expanders to {lo,hi} (doing so is
+> definitely wrong in reality) and I got the "expected" result.You have to debug why it's still not happy with this.
+
+- User: Xi Ruoyao | Time: 2024-08-01 16:02:42 UTC
+  Text: In the following call stack:
+
+#0  single_imm_use (var=0x7ffff564a3a8, use_p=0x7fffffffc9d8, 
+    stmt=0x7fffffffc9e0) at ../../gcc/gcc/ssa-iterators.h:427
+#1  0x0000000001aabcde in vec_info::lookup_single_use (this=0x33a1b80, 
+    lhs=0x7ffff564a3a8) at ../../gcc/gcc/tree-vectorizer.cc:581
+#2  0x0000000001a1a40a in supportable_widening_operation (vinfo=0x33a1b80, 
+    code=..., stmt_info=0x3482b50, vectype_out=0x7ffff595a1f8, 
+    vectype_in=0x7ffff595a000, code1=0x7fffffffcb90, code2=0x7fffffffcb94, 
+    multi_step_cvt=0x7fffffffcba0, interm_types=0x7fffffffcc48)
+    at ../../gcc/gcc/tree-vect-stmts.cc:14196
+#3  0x00000000019f7c2d in vectorizable_conversion (vinfo=0x33a1b80, 
+    stmt_info=0x3482b50, gsi=0x0, vec_stmt=0x0, slp_node=0x33b4cc8, 
+    cost_vec=0x7fffffffd190) at ../../gcc/gcc/tree-vect-stmts.cc:5438
+#4  0x0000000001a16ecc in vect_analyze_stmt (vinfo=0x33a1b80, 
+    stmt_info=0x3482b50, need_to_vectorize=0x7fffffffcf73, node=0x33b4cc8, 
+    node_instance=0x32fb6e0, cost_vec=0x7fffffffd190)
+    at ../../gcc/gcc/tree-vect-stmts.cc:13291
+
+"ptr == ptr->next" is satisfied (the comment says it means "there aren't any uses whatsoever" but I don't really understand it: I knows almost nothing about tree vectorization) and single_imm_use directly returns false.
+
+- User: rguenther@suse.de | Time: 2024-08-02 08:08:01 UTC
+  Text: On Thu, 1 Aug 2024, xry111 at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=116142> 
+> ---Comment #9from Xi Ruoyao <xry111 at gcc dot gnu.org> ---
+> In the following call stack:
+> 
+> #0  single_imm_use (var=0x7ffff564a3a8, use_p=0x7fffffffc9d8, 
+>     stmt=0x7fffffffc9e0) at ../../gcc/gcc/ssa-iterators.h:427
+> #1  0x0000000001aabcde in vec_info::lookup_single_use (this=0x33a1b80, 
+>     lhs=0x7ffff564a3a8) at ../../gcc/gcc/tree-vectorizer.cc:581
+> #2  0x0000000001a1a40a in supportable_widening_operation (vinfo=0x33a1b80, 
+>     code=..., stmt_info=0x3482b50, vectype_out=0x7ffff595a1f8, 
+>     vectype_in=0x7ffff595a000, code1=0x7fffffffcb90, code2=0x7fffffffcb94, 
+>     multi_step_cvt=0x7fffffffcba0, interm_types=0x7fffffffcc48)
+>     at ../../gcc/gcc/tree-vect-stmts.cc:14196
+> #3  0x00000000019f7c2d in vectorizable_conversion (vinfo=0x33a1b80, 
+>     stmt_info=0x3482b50, gsi=0x0, vec_stmt=0x0, slp_node=0x33b4cc8, 
+>     cost_vec=0x7fffffffd190) at ../../gcc/gcc/tree-vect-stmts.cc:5438
+> #4  0x0000000001a16ecc in vect_analyze_stmt (vinfo=0x33a1b80, 
+>     stmt_info=0x3482b50, need_to_vectorize=0x7fffffffcf73, node=0x33b4cc8, 
+>     node_instance=0x32fb6e0, cost_vec=0x7fffffffd190)
+>     at ../../gcc/gcc/tree-vect-stmts.cc:13291
+> 
+> "ptr == ptr->next" is satisfied (the comment says it means "there aren't any
+> uses whatsoever" but I don't really understand it: I knows almost nothing about
+> tree vectorization) and single_imm_use directly returns false.So likely 
+
+          tree lhs = gimple_assign_lhs (stmt_info->stmt);
+          stmt_vec_info use_stmt_info = loop_info->lookup_single_use 
+(lhs);
+          if (use_stmt_info
+
+needs to be
+
+          tree lhs = gimple_assign_lhs (vect_orig_stmt (stmt_info)->stmt);
+          stmt_vec_info use_stmt_info = loop_info->lookup_single_use 
+(lhs);
+
+- User: Xi Ruoyao | Time: 2024-08-06 09:54:03 UTC
+  Text: (In reply torguenther@suse.defromcomment #10)> On Thu, 1 Aug 2024, xry111 at gcc dot gnu.org wrote:
+> 
+> >https://gcc.gnu.org/bugzilla/show_bug.cgi?id=116142> > 
+> > ---Comment #9from Xi Ruoyao <xry111 at gcc dot gnu.org> ---
+> > In the following call stack:
+> > 
+> > #0  single_imm_use (var=0x7ffff564a3a8, use_p=0x7fffffffc9d8, 
+> >     stmt=0x7fffffffc9e0) at ../../gcc/gcc/ssa-iterators.h:427
+> > #1  0x0000000001aabcde in vec_info::lookup_single_use (this=0x33a1b80, 
+> >     lhs=0x7ffff564a3a8) at ../../gcc/gcc/tree-vectorizer.cc:581
+> > #2  0x0000000001a1a40a in supportable_widening_operation (vinfo=0x33a1b80, 
+> >     code=..., stmt_info=0x3482b50, vectype_out=0x7ffff595a1f8, 
+> >     vectype_in=0x7ffff595a000, code1=0x7fffffffcb90, code2=0x7fffffffcb94, 
+> >     multi_step_cvt=0x7fffffffcba0, interm_types=0x7fffffffcc48)
+> >     at ../../gcc/gcc/tree-vect-stmts.cc:14196
+> > #3  0x00000000019f7c2d in vectorizable_conversion (vinfo=0x33a1b80, 
+> >     stmt_info=0x3482b50, gsi=0x0, vec_stmt=0x0, slp_node=0x33b4cc8, 
+> >     cost_vec=0x7fffffffd190) at ../../gcc/gcc/tree-vect-stmts.cc:5438
+> > #4  0x0000000001a16ecc in vect_analyze_stmt (vinfo=0x33a1b80, 
+> >     stmt_info=0x3482b50, need_to_vectorize=0x7fffffffcf73, node=0x33b4cc8, 
+> >     node_instance=0x32fb6e0, cost_vec=0x7fffffffd190)
+> >     at ../../gcc/gcc/tree-vect-stmts.cc:13291
+> > 
+> > "ptr == ptr->next" is satisfied (the comment says it means "there aren't any
+> > uses whatsoever" but I don't really understand it: I knows almost nothing about
+> > tree vectorization) and single_imm_use directly returns false.
+> 
+> So likely 
+> 
+>           tree lhs = gimple_assign_lhs (stmt_info->stmt);
+>           stmt_vec_info use_stmt_info = loop_info->lookup_single_use 
+> (lhs);
+>           if (use_stmt_info
+> 
+> needs to be
+> 
+>           tree lhs = gimple_assign_lhs (vect_orig_stmt (stmt_info)->stmt);
+>           stmt_vec_info use_stmt_info = loop_info->lookup_single_use 
+> (lhs);Works for me!
+
+- User: rguenther@suse.de | Time: 2024-08-06 10:06:15 UTC
+  Text: On Tue, 6 Aug 2024, xry111 at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=116142> 
+> ---Comment #11from Xi Ruoyao <xry111 at gcc dot gnu.org> ---
+> (In reply torguenther@suse.defromcomment #10)
+> > On Thu, 1 Aug 2024, xry111 at gcc dot gnu.org wrote:
+> > 
+> > >https://gcc.gnu.org/bugzilla/show_bug.cgi?id=116142> > > 
+> > > ---Comment #9from Xi Ruoyao <xry111 at gcc dot gnu.org> ---
+> > > In the following call stack:
+> > > 
+> > > #0  single_imm_use (var=0x7ffff564a3a8, use_p=0x7fffffffc9d8, 
+> > >     stmt=0x7fffffffc9e0) at ../../gcc/gcc/ssa-iterators.h:427
+> > > #1  0x0000000001aabcde in vec_info::lookup_single_use (this=0x33a1b80, 
+> > >     lhs=0x7ffff564a3a8) at ../../gcc/gcc/tree-vectorizer.cc:581
+> > > #2  0x0000000001a1a40a in supportable_widening_operation (vinfo=0x33a1b80, 
+> > >     code=..., stmt_info=0x3482b50, vectype_out=0x7ffff595a1f8, 
+> > >     vectype_in=0x7ffff595a000, code1=0x7fffffffcb90, code2=0x7fffffffcb94, 
+> > >     multi_step_cvt=0x7fffffffcba0, interm_types=0x7fffffffcc48)
+> > >     at ../../gcc/gcc/tree-vect-stmts.cc:14196
+> > > #3  0x00000000019f7c2d in vectorizable_conversion (vinfo=0x33a1b80, 
+> > >     stmt_info=0x3482b50, gsi=0x0, vec_stmt=0x0, slp_node=0x33b4cc8, 
+> > >     cost_vec=0x7fffffffd190) at ../../gcc/gcc/tree-vect-stmts.cc:5438
+> > > #4  0x0000000001a16ecc in vect_analyze_stmt (vinfo=0x33a1b80, 
+> > >     stmt_info=0x3482b50, need_to_vectorize=0x7fffffffcf73, node=0x33b4cc8, 
+> > >     node_instance=0x32fb6e0, cost_vec=0x7fffffffd190)
+> > >     at ../../gcc/gcc/tree-vect-stmts.cc:13291
+> > > 
+> > > "ptr == ptr->next" is satisfied (the comment says it means "there aren't any
+> > > uses whatsoever" but I don't really understand it: I knows almost nothing about
+> > > tree vectorization) and single_imm_use directly returns false.
+> > 
+> > So likely 
+> > 
+> >           tree lhs = gimple_assign_lhs (stmt_info->stmt);
+> >           stmt_vec_info use_stmt_info = loop_info->lookup_single_use 
+> > (lhs);
+> >           if (use_stmt_info
+> > 
+> > needs to be
+> > 
+> >           tree lhs = gimple_assign_lhs (vect_orig_stmt (stmt_info)->stmt);
+> >           stmt_vec_info use_stmt_info = loop_info->lookup_single_use 
+> > (lhs);
+> 
+> Works for me!Can you produce, test and post a patch?
+
+- User: Xi Ruoyao | Time: 2024-08-07 05:54:25 UTC
+  Text: https://gcc.gnu.org/pipermail/gcc-patches/2024-August/659673.html
+
+- User: GCC Commits | Time: 2024-08-07 08:02:33 UTC
+  Text: The master branch has been updated by Xi Ruoyao <xry111@gcc.gnu.org>:https://gcc.gnu.org/g:2083389a18d36684a88d9e2653bacc87ad894b50commitr15-2791-g2083389a18d36684a88d9e2653bacc87ad894b50Author: Xi Ruoyao <xry111@xry111.site>
+Date:   Tue Aug 6 17:48:42 2024 +0800
+
+    vect: Fix vect_reduction_def check for odd/even widen mult [PR116142]
+    
+    The check was implemented incorrectly, so vec_widen_smult_{even,odd}_M
+    was never used.  This is not good for targets with native even/odd
+    widening multiplication but not lo/hi multiplication.
+    
+    The fix is actually developed by Richard Biener.
+    
+    gcc/ChangeLog:PR tree-optimization/116142* tree-vect-stmts.cc (supportable_widening_operation): Remove an
+            redundant and incorrect vect_reduction_def check, and fix the
+            operand of another vect_reduction_def check.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/116142* gcc.target/i386/pr116142.c: New test.
+    
+    Co-authored-by: Richard Biener <rguenther@suse.de>
+
+- User: Xi Ruoyao | Time: 2024-08-07 08:04:48 UTC
+  Text: Fixed for trunk.
+

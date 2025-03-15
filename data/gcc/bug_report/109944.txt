@@ -1,0 +1,360 @@
+Bug Summary: vector CTOR with byte elements and SSE2 has STLF fail
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Richard Biener | Time: 2023-05-23 13:48:26 UTC
+  Text: I've experimented with CTORs from smaller elements and byte handling with
+plain SSE2 is quite bad (for word we have pinsrw).
+
+void foo(char *a, char *m, char d, char e)
+{
+  char b = *m;
+  char c = m[2];
+  a[0] = b;
+  a[1] = c;
+  a[2] = d;
+  a[3] = e;
+  a[4] = b;
+  a[5] = c;
+  a[6] = b;
+  a[7] = c;
+  a[8] = b;
+  a[9] = c;
+  a[10] = b;
+  a[11] = c;
+  a[12] = b;
+  a[13] = c;
+  a[14] = b;
+  a[15] = c;
+}
+
+generates
+
+        movzbl  2(%rsi), %r8d
+        movl    %edx, %r9d
+        movzbl  (%rsi), %edx
+        movzbl  %cl, %ecx
+        movzbl  %r9b, %r9d
+        movq    %r8, %rax
+        salq    $8, %rax
+        orq     %rdx, %rax
+        salq    $8, %rax
+        orq     %r8, %rax
+        salq    $8, %rax
+        orq     %rdx, %rax
+        salq    $8, %rax
+        orq     %rax, %rcx
+        orq     %r8, %rax
+        salq    $8, %rcx
+        salq    $8, %rax
+        orq     %r9, %rcx
+        orq     %rdx, %rax
+        salq    $8, %rcx
+        salq    $8, %rax
+        orq     %r8, %rcx
+        orq     %r8, %rax
+        salq    $8, %rcx
+        salq    $8, %rax
+        orq     %rdx, %rcx
+        orq     %rdx, %rax
+        movq    %rcx, -24(%rsp)
+        movq    %rax, -16(%rsp)
+        movdqa  -24(%rsp), %xmm0
+        movups  %xmm0, (%rdi)
+
+while we can handle a splat from QImode via
+
+        movzbl  (%rsi), %eax
+        movd    %eax, %xmm0
+        punpcklbw       %xmm0, %xmm0
+        punpcklwd       %xmm0, %xmm0
+        pshufd  $0, %xmm0, %xmm0
+        movups  %xmm0, (%rdi)
+
+I think we can go and for a generic V16QImode CTOR and SSE2 create two
+V8HImode vectors using pinsrw, for the first from zero-extended QImode
+values of the even elements and for the second from zero-extended and
+left-shifted values of the odd elements and then IOR the two vectors.
+
+Alternatively the above needs to be pessimized better in the cost model.
+
+Btw, for HImode elements I see we do
+
+        movzwl  (%rsi), %eax
+        movd    %eax, %xmm0
+        movdqa  %xmm0, %xmm1
+        movdqa  %xmm0, %xmm2
+        pinsrw  $1, 4(%rsi), %xmm1
+...
+
+not sure why we don't do
+
+        pxor %xmm1, %xmm1
+        pinsrw  $0, (%rsi), %xmm1
+
+and thus avoid the round-trip through the GPR for the initial element?
+
+- User: GCC Commits | Time: 2023-05-23 16:10:18 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:f504b70eb0fc1339322960041a85606df4547897commitr14-1137-gf504b70eb0fc1339322960041a85606df4547897Author: Richard Biener <rguenther@suse.de>
+Date:   Tue May 23 15:12:33 2023 +0200
+
+    Account for vector splat GPR->XMM move cost
+    
+    The following also accounts for a GPR->XMM move cost for splat
+    operations and properly guards eliding the cost when moving from
+    memory only for SSE4.1 or HImode or larger operands.  This
+    doesn't fix the PR fully yet.PR target/109944* config/i386/i386.cc (ix86_vector_costs::add_stmt_cost):
+            For vector construction or splats apply GPR->XMM move
+            costing.  QImode memory can be handled directly only
+            with SSE4.1 pinsrb.
+
+- User: Hongtao.liu | Time: 2023-05-24 06:26:14 UTC
+  Text: > I think we can go and for a generic V16QImode CTOR and SSE2 create two
+> V8HImode vectors using pinsrw, for the first from zero-extended QImode
+> values of the even elements and for the second from zero-extended and
+> left-shifted values of the odd elements and then IOR the two vectors.Or the backend can recognize as as a HImode(b,c) broadcast + HImode(d,e) vec_set(the middle end can recognize it as VEC_DUPLICATE_EXPR + .VEC_SET/BIT_INSERT_EXPR when available?)
+
+
+void foo1(short* a, char *m)
+{
+  char d = *m;
+  char e = m[2];
+  short b = d | e << 8;
+  a[0] = b;
+  a[1] = b;
+  a[2] = b;
+  a[3] = b;
+  a[4] = b;
+  a[5] = b;
+  a[6] = b;
+  a[7] = b;
+}
+
+foo1:
+        movsbw  2(%rsi), %ax
+        movsbw  (%rsi), %dx
+        sall    $8, %eax
+        orl     %edx, %eax
+        movd    %eax, %xmm0
+        punpcklwd       %xmm0, %xmm0
+        pshufd  $0, %xmm0, %xmm0
+        movups  %xmm0, (%rdi)
+        ret
+
+- User: rguenther@suse.de | Time: 2023-05-24 07:55:26 UTC
+  Text: On Wed, 24 May 2023, crazylht at gmail dot com wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109944> 
+> ---Comment #2from Hongtao.liu <crazylht at gmail dot com> ---
+> > I think we can go and for a generic V16QImode CTOR and SSE2 create two
+> > V8HImode vectors using pinsrw, for the first from zero-extended QImode
+> > values of the even elements and for the second from zero-extended and
+> > left-shifted values of the odd elements and then IOR the two vectors.
+> 
+> Or the backend can recognize as as a HImode(b,c) broadcast + HImode(d,e)
+> vec_set(the middle end can recognize it as VEC_DUPLICATE_EXPR +
+> .VEC_SET/BIT_INSERT_EXPR when available?)Yeah.  Note we need to handle the general case with 16 distinct
+elements as well.  For simplicity I'm using a memory input below
+instead of 16 function parameters.
+
+void foo (char * __restrict a, char *b)
+{
+  a[0] = b[0];
+  a[1] = b[16];
+  a[2] = b[32];
+  a[3] = b[48];
+  a[4] = b[64];
+  a[5] = b[80];
+  a[6] = b[96];
+  a[7] = b[112];
+  a[8] = b[128];
+  a[9] = b[144];
+  a[10] = b[160];
+  a[11] = b[176];
+  a[12] = b[192];
+  a[13] = b[208];
+  a[14] = b[224];
+  a[15] = b[240];
+}
+
+with -O2 generates
+
+foo:
+.LFB0:
+        .cfi_startproc
+        movzbl  112(%rsi), %edx
+        movzbl  96(%rsi), %eax
+        movzbl  224(%rsi), %r8d
+        movzbl  (%rsi), %ecx
+        salq    $8, %rdx
+        orq     %rax, %rdx
+        movzbl  80(%rsi), %eax
+        salq    $8, %rdx
+        orq     %rax, %rdx
+        movzbl  64(%rsi), %eax
+... more of that ...
+        orq     %r8, %rax
+        movzbl  144(%rsi), %r8d
+        movzbl  128(%rsi), %esi
+        salq    $8, %rax
+        orq     %r8, %rax
+        salq    $8, %rax
+        orq     %rsi, %rax
+        movq    %rax, -16(%rsp)
+        movdqa  -24(%rsp), %xmm0
+        movups  %xmm0, (%rdi)
+        ret
+
+so a way is to form HImode elements in GPRs by shift and or
+and then build a V8HImode vector from that.  Note
+code generation for a V8HImode CTOR also looks imperfect
+(change char to short and only do elements 0 to 7 above):
+
+foo:
+.LFB0:
+        .cfi_startproc
+        movzwl  (%rsi), %eax
+        movd    %eax, %xmm0
+        movzwl  64(%rsi), %eax
+        pinsrw  $1, 32(%rsi), %xmm0
+        movd    %eax, %xmm3
+        movzwl  128(%rsi), %eax
+        pinsrw  $1, 96(%rsi), %xmm3
+        movd    %eax, %xmm1
+        movzwl  192(%rsi), %eax
+        punpckldq       %xmm3, %xmm0
+        pinsrw  $1, 160(%rsi), %xmm1
+        movd    %eax, %xmm2
+        pinsrw  $1, 224(%rsi), %xmm2
+        punpckldq       %xmm2, %xmm1
+        punpcklqdq      %xmm1, %xmm0
+        movups  %xmm0, (%rdi)
+        ret
+
+so we're building SImode elements in %xmm regs and then
+unpack them - that's probably better than a series of
+pinsrw due to dependences.  For uarchs where grp->xmm
+moves are costly it might be better to do
+
+  pxor %xmm0, %xmm0
+  pinsrw $0, (%rsi), %xmm0
+  pinsrw $1, 32(%rsi), %xmm0
+
+though?  pinsr* are not especially fast (2uops on zen,
+latency 3, throughput 1 - on zen4 it got worse), so maybe
+forming SImode in GPRs might be better for them (or mixing
+both to better utilize execution resources).  For the 16
+or 8 (distinct) element CTORs there's hardly surrounding
+code we can hope to execute in parallel.  I wonder if we
+can easily determine in the expander whether we deal with
+elements that are nicely available in GPRs or in XMMs
+or whether we need to deal with wrong choices later,
+for example in STV.
+
+But of course first we need to avoid spill/reload.
+That's from ix86_expand_vector_init_general doing
+
+      else if (n_words == 2)
+        {
+          rtx tmp = gen_reg_rtx (mode);
+          emit_clobber (tmp);
+          emit_move_insn (gen_lowpart (tmp_mode, tmp), words[0]);
+          emit_move_insn (gen_highpart (tmp_mode, tmp), words[1]);
+          emit_move_insn (target, tmp);
+
+which generates (subreg:DI (reg:V16QI 146) 0) and
+(subreg:DI (reg:V16QI 146) 8) and then
+
+(insn 52 51 53 2 (parallel [
+            (set (subreg:DI (reg:V16QI 146) 0)
+                (ior:DI (reg:DI 122) 
+                    (reg:DI 121 [ *b_18(D) ])))
+            (clobber (reg:CC 17 flags))
+        ]) "t.c":3:8 612 {*iordi_1}
+     (expr_list:REG_DEAD (reg:DI 122)
+        (expr_list:REG_DEAD (reg:DI 121 [ *b_18(D) ])
+            (expr_list:REG_UNUSED (reg:CC 17 flags)
+                (nil)))))
+(insn 53 52 55 2 (parallel [
+            (set (subreg:DI (reg:V16QI 146) 8)
+                (ior:DI (reg:DI 144)
+                    (reg:DI 143 [ MEM[(char *)b_18(D) + 128B] ])))
+            (clobber (reg:CC 17 flags))
+        ]) "t.c":3:8 612 {*iordi_1} 
+     (expr_list:REG_DEAD (reg:DI 144)
+        (expr_list:REG_DEAD (reg:DI 143 [ MEM[(char *)b_18(D) + 128B] ])
+            (expr_list:REG_UNUSED (reg:CC 17 flags)
+                (nil))))) 
+
+which makes LRA spill.  Doing like n_words == 4 and dispatching to
+ix86_expand_vector_init_general avoids this and code generates
+
+        movq    %rax, %xmm0
+...
+        movq    %rdx, %xmm1
+        punpcklqdq      %xmm1, %xmm0
+        movups  %xmm0, (%rdi)
+
+diff --git a/gcc/config/i386/i386-expand.cc 
+b/gcc/config/i386/i386-expand.cc
+index ff3d382f1b4..70754d8f710 100644
+--- a/gcc/config/i386/i386-expand.cc
++++ b/gcc/config/i386/i386-expand.cc
+@@ -16367,11 +16367,11 @@ quarter:
+        emit_move_insn (target, gen_lowpart (mode, words[0]));
+       else if (n_words == 2)
+        {
+-         rtx tmp = gen_reg_rtx (mode);
+-         emit_clobber (tmp);
+-         emit_move_insn (gen_lowpart (tmp_mode, tmp), words[0]);
+-         emit_move_insn (gen_highpart (tmp_mode, tmp), words[1]);
+-         emit_move_insn (target, tmp);
++         rtx tmp = gen_reg_rtx (V2DImode);
++         gcc_assert (tmp_mode == DImode);
++         vals = gen_rtx_PARALLEL (V2DImode, gen_rtvec_v (2, words));
++         ix86_expand_vector_init_general (false, V2DImode, tmp, vals);
++         emit_move_insn (target, gen_lowpart (mode, tmp));
+        }
+       else if (n_words == 4)
+        {
+
+- User: Richard Biener | Time: 2023-05-24 08:10:31 UTC
+  Text: I'm testing that.
+
+- User: Alexander Monakov | Time: 2023-05-24 12:29:52 UTC
+  Text: (In reply to Richard Biener fromcomment #3)> so we're building SImode elements in %xmm regs and then
+> unpack them - that's probably better than a series of
+> pinsrw due to dependences.  For uarchs where grp->xmm
+> moves are costly it might be better to do
+> 
+>   pxor %xmm0, %xmm0
+>   pinsrw $0, (%rsi), %xmm0
+>   pinsrw $1, 32(%rsi), %xmm0
+> 
+> though?I'm afraid that is impossible, pinsrw will attempt to load 2 bytes, but only 1 is accessible (if at end of page).
+
+- User: GCC Commits | Time: 2023-05-24 12:47:18 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:affee7dcfa1ee272d43ac7cb68cf423dbd956fd8commitr14-1166-gaffee7dcfa1ee272d43ac7cb68cf423dbd956fd8Author: Richard Biener <rguenther@suse.de>
+Date:   Wed May 24 10:07:36 2023 +0200
+
+    target/109944 - avoid STLF fail for V16QImode CTOR expansion
+    
+    The following dispatches to V2DImode CTOR expansion instead of
+    using sets of (subreg:DI (reg:V16QI 146) [08]) which causes
+    LRA to spill DImode and reload V16QImode.  The same applies for
+    V8QImode or V4HImode construction from SImode parts which happens
+    during 32bit libgcc build.PR target/109944* config/i386/i386-expand.cc (ix86_expand_vector_init_general):
+            Perform final vector composition using
+            ix86_expand_vector_init_general instead of setting
+            the highpart and lowpart which causes spilling.
+    
+            * gcc.target/i386/pr109944-1.c: New testcase.
+            * gcc.target/i386/pr109944-2.c: Likewise.
+
+- User: Richard Biener | Time: 2023-05-24 12:48:19 UTC
+  Text: Summary is fixed now.  Any other changes require actual benchmarking I think.
+

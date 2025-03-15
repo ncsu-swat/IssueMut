@@ -1,0 +1,724 @@
+Bug Summary: Missing "too long" warning when string-array size doesn't include NULL byte
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: diagnostic
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Konstantin Kharlamov | Time: 2024-05-22 10:07:14 UTC
+  Text: It's a common pattern to have some `enum Foo { one, two, three }`, and then some 2-dimensinal array `FooAsString`, which allows one to get name of the `Foo` field by passing an index, like `printf("%s", FooAsString[my_Foo_variable])`.
+
+Problem though is that it isn't allowed to declare multi-dimensinal array and omit all dimensions, so one have to declare as `FooAsString[][6]` for example. That makes programmer to rely on the compiler to detect when the `6` is not enough to hold the string.
+
+GCC kind of tries to warn about that, however its check is off-by-one because it does not take into account the NULL byte that the C-string has to end with.
+
+
+# Steps to reproduce (in terms of terminal commands)
+
+    λ cat test.c
+    #include <stdio.h>
+
+    int main() {
+        enum Foo {
+            hello,
+        } obj = hello;
+        static const char description[][5] = {[hello] = "hello"};
+
+        printf("%s", description[obj]);
+    }
+    λ gcc test.c -o a -Wall -Wextra
+
+
+## Expected
+
+A warning:
+
+    test.c:7:53: warning: initializer-string for array of ‘char’ is too long
+        7 |     static const char description[][5] = {[hello] = "hello"};
+
+## Actual
+
+No warnings.
+
+- User: Andrew Pinski | Time: 2024-05-22 10:32:18 UTC
+  Text: Note in c, "abc" is valid for [3] initializer . This is different from c++.
+
+There is a dup of this bug already filed asking to add the warning. I think it was added but it is not included in either -Wextra nor -Wall.
+
+- User: Andrew Pinski | Time: 2024-05-22 11:53:48 UTC
+  Text: It is included in -Wc++-compat .
+
+- User: Konstantin Kharlamov | Time: 2024-05-22 11:56:51 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> It is included in -Wc++-compat .Cool, thanks! I'll add the warning to the list we compile the project with, thank you!
+
+- User: Andrew Pinski | Time: 2024-05-22 12:00:48 UTC
+  Text: <source>: In function 'main':
+<source>:8:57: warning: initializer-string for array of 'char' is too long for C++ [-Wc++-compat]
+    8 |         static const char description[][5] = {[hello] = "hello"};
+      |                                                         ^~~~~~~
+
+
+There is a patch floating around to add it as a different option besides just C++-compat too:https://gcc.gnu.org/pipermail/gcc-patches/2024-May/651664.html
+
+- User: Konstantin Kharlamov | Time: 2024-06-29 10:49:33 UTC
+  Text: (In reply to Konstantin Kharlamov fromcomment #3)> (In reply to Andrew Pinski fromcomment #2)
+> > It is included in -Wc++-compat .
+> 
+> Cool, thanks! I'll add the warning to the list we compile the project with,
+> thank you!FWIW, I tried that yesterday and I think the cons of -Wc++-compat far overweight its pros. The immediate problem is that it starts to warn about every `MyType* foo = malloc(…)` construction due to `MyType*` and `void*` being different.
+
+So basically -Wc++-compat warns about every heap memory allocation, of which there are dozens and hundreds in every C file. This warning alone can't be turned off. So apparently you're supposed to replace every memory allocation with a custom macro that takes type of the variable as an additional parameter just to shove in a cast.
+
+This is such a huge and inconvenient task that I would be very surprised if anybody uses -Wc++-compat at all.
+
+- User: N/A | Time: 2024-06-29 10:59:07 UTC
+  Text: Yes, -Wc++-compat is definitely not suitable or recommended for C code. I think we should split this warning out.
+
+- User: Alejandro Colomar | Time: 2024-06-29 15:19:37 UTC
+  Text: (In reply to Konstantin Kharlamov fromcomment #5)> So basically -Wc++-compat warns about every heap memory allocation, of which
+> there are dozens and hundreds in every C file. This warning alone can't be
+> turned off. So apparently you're supposed to replace every memory allocation
+> with a custom macro that takes type of the variable as an additional
+> parameter just to shove in a cast.Off-topic, but "replac[ing] every memory allocation with a custom macro that takes [the] type of the variable as an additional parameter just to shove in a cast" is actually a good thing.  It improves the safety of such calls.  I found and fixed several bugs in allocation calls in shadow utils thanks to these macros.
+
+See:
+
+<https://github.com/shadow-maint/shadow/commit/d81506de1e8e2ba544a30e54e863fcafda9cde86>
+<https://github.com/shadow-maint/shadow/commit/191f04f7dcb92a2c7de99dbf1108563ea8832927>
+<https://github.com/shadow-maint/shadow/commit/6e58c1275252f3314d1aa5cc4d7e7f9068e3a902>
+<https://github.com/shadow-maint/shadow/commit/efbbcade43ff2dca2b7a271dcbd186be08ac1913>
+<https://github.com/shadow-maint/shadow/commit/09775d3718df216c75b62d73bbcc5aa060e0fc94>
+
+Anyway, I hope my patch to add -Wunterminated-string-initialization is merged soon.  :)
+
+- User: N/A | Time: 2024-06-29 15:30:57 UTC
+  Text: (In reply to Alejandro Colomar fromcomment #7)> (In reply to Konstantin Kharlamov fromcomment #5)
+> > So basically -Wc++-compat warns about every heap memory allocation, of which
+> > there are dozens and hundreds in every C file. This warning alone can't be
+> > turned off. So apparently you're supposed to replace every memory allocation
+> > with a custom macro that takes type of the variable as an additional
+> > parameter just to shove in a cast.
+> 
+> Off-topic, but "replac[ing] every memory allocation with a custom macro that
+> takes [the] type of the variable as an additional parameter just to shove in
+> a cast" is actually a good thing.  It improves the safety of such calls.  I
+> found and fixed several bugs in allocation calls in shadow utils thanks to
+> these macros.
+> 
+> See:
+> 
+> <https://github.com/shadow-maint/shadow/commit/> d81506de1e8e2ba544a30e54e863fcafda9cde86>
+> <https://github.com/shadow-maint/shadow/commit/> 191f04f7dcb92a2c7de99dbf1108563ea8832927>
+> <https://github.com/shadow-maint/shadow/commit/> 6e58c1275252f3314d1aa5cc4d7e7f9068e3a902>
+> <https://github.com/shadow-maint/shadow/commit/> efbbcade43ff2dca2b7a271dcbd186be08ac1913>
+> <https://github.com/shadow-maint/shadow/commit/> 09775d3718df216c75b62d73bbcc5aa060e0fc94>
+> 
+> Anyway, I hope my patch to add -Wunterminated-string-initialization is
+> merged soon.  :)Have you considered adding the alloc_size attribute to your allocation functions?
+
+- User: Alejandro Colomar | Time: 2024-06-29 15:51:37 UTC
+  Text: (In reply to uecker fromcomment #8)> Have you considered adding the alloc_size attribute to your allocation
+> functions?I didn't know about it; I will do.  Thanks!  :-)
+
+- User: Konstantin Kharlamov | Time: 2024-06-29 16:41:59 UTC
+  Text: (In reply to Alejandro Colomar fromcomment #7)> (In reply to Konstantin Kharlamov fromcomment #5)
+> > So basically -Wc++-compat warns about every heap memory allocation, of which
+> > there are dozens and hundreds in every C file. This warning alone can't be
+> > turned off. So apparently you're supposed to replace every memory allocation
+> > with a custom macro that takes type of the variable as an additional
+> > parameter just to shove in a cast.
+> 
+> Off-topic, but "replac[ing] every memory allocation with a custom macro that
+> takes [the] type of the variable as an additional parameter just to shove in
+> a cast" is actually a good thing.  It improves the safety of such calls.  I
+> found and fixed several bugs in allocation calls in shadow utils thanks to
+> these macros.
+> 
+> See:
+> 
+> <https://github.com/shadow-maint/shadow/commit/> d81506de1e8e2ba544a30e54e863fcafda9cde86>
+> <https://github.com/shadow-maint/shadow/commit/> 191f04f7dcb92a2c7de99dbf1108563ea8832927>
+> <https://github.com/shadow-maint/shadow/commit/> 6e58c1275252f3314d1aa5cc4d7e7f9068e3a902>
+> <https://github.com/shadow-maint/shadow/commit/> efbbcade43ff2dca2b7a271dcbd186be08ac1913>
+> <https://github.com/shadow-maint/shadow/commit/> 09775d3718df216c75b62d73bbcc5aa060e0fc94>
+> 
+> Anyway, I hope my patch to add -Wunterminated-string-initialization is
+> merged soon.  :)Thank you, these are interesting commits, but they just add the macros, don't seem to fix any bugs. Or if they do, the fixes are lost among other changes. I would rather be sold if you linked the fixes specifically 😊
+
+- User: Alejandro Colomar | Time: 2024-06-29 17:01:41 UTC
+  Text: (In reply to Konstantin Kharlamov fromcomment #10)> (In reply to Alejandro Colomar fromcomment #7)
+> > (In reply to Konstantin Kharlamov fromcomment #5)
+> > > So basically -Wc++-compat warns about every heap memory allocation, of which
+> > > there are dozens and hundreds in every C file. This warning alone can't be
+> > > turned off. So apparently you're supposed to replace every memory allocation
+> > > with a custom macro that takes type of the variable as an additional
+> > > parameter just to shove in a cast.
+> > 
+> > Off-topic, but "replac[ing] every memory allocation with a custom macro that
+> > takes [the] type of the variable as an additional parameter just to shove in
+> > a cast" is actually a good thing.  It improves the safety of such calls.  I
+> > found and fixed several bugs in allocation calls in shadow utils thanks to
+> > these macros.
+> > 
+> > See:
+> > 
+> > <https://github.com/shadow-maint/shadow/commit/> > d81506de1e8e2ba544a30e54e863fcafda9cde86>
+> > <https://github.com/shadow-maint/shadow/commit/> > 191f04f7dcb92a2c7de99dbf1108563ea8832927>
+> > <https://github.com/shadow-maint/shadow/commit/> > 6e58c1275252f3314d1aa5cc4d7e7f9068e3a902>
+> > <https://github.com/shadow-maint/shadow/commit/> > efbbcade43ff2dca2b7a271dcbd186be08ac1913>
+> > <https://github.com/shadow-maint/shadow/commit/> > 09775d3718df216c75b62d73bbcc5aa060e0fc94>
+> > 
+> > Anyway, I hope my patch to add -Wunterminated-string-initialization is
+> > merged soon.  :)
+> 
+> Thank you, these are interesting commits, but they just add the macros,
+> don't seem to fix any bugs. Or if they do, the fixes are lost among other
+> changes. I would rather be sold if you linked the fixes specifically 😊Ahh, no I was remembering slightly wrong.  It was in neomutt(1) where I found bugs.  I have some work-in-progress to add the same macros to neomutt(1), and while doing the change, I found (and fixed) this bug from 1999:
+
+<https://github.com/neomutt/neomutt/pull/4297>
+
+Luckily, the program worked correctly, since it was using a type with a compatible size.
+
+- User: GCC Commits | Time: 2024-07-14 09:41:38 UTC
+  Text: The master branch has been updated by Martin Uecker <uecker@gcc.gnu.org>:https://gcc.gnu.org/g:44c9403ed1833ae71a59e84f9e37af3182be0df5commitr15-2026-g44c9403ed1833ae71a59e84f9e37af3182be0df5Author: Alejandro Colomar <alx@kernel.org>
+Date:   Sat Jun 29 15:10:43 2024 +0200
+
+    c, objc: Add -Wunterminated-string-initialization
+    
+    Warn about the following:
+    
+        char  s[3] = "foo";
+    
+    Initializing a char array with a string literal of the same length as
+    the size of the array is usually a mistake.  Rarely is the case where
+    one wants to create a non-terminated character sequence from a string
+    literal.
+    
+    In some cases, for writing faster code, one may want to use arrays
+    instead of pointers, since that removes the need for storing an array of
+    pointers apart from the strings themselves.
+    
+        char  *log_levels[]   = { "info", "warning", "err" };
+    vs.
+        char  log_levels[][7] = { "info", "warning", "err" };
+    
+    This forces the programmer to specify a size, which might change if a
+    new entry is later added.  Having no way to enforce null termination is
+    very dangerous, however, so it is useful to have a warning for this, so
+    that the compiler can make sure that the programmer didn't make any
+    mistakes.  This warning catches the bug above, so that the programmer
+    will be able to fix it and write:
+    
+        char  log_levels[][8] = { "info", "warning", "err" };
+    
+    This warning already existed as part of -Wc++-compat, but this patch
+    allows enabling it separately.  It is also included in -Wextra, since
+    it may not always be desired (when unterminated character sequences are
+    wanted), but it's likely to be desired in most cases.
+    
+    Since Wc++-compat now includes this warning, the test has to be modified
+    to expect the text of the new warning too, in <gcc.dg/Wcxx-compat-14.c>.
+    
+    Link:https://lists.gnu.org/archive/html/groff/2022-11/msg00059.htmlLink:https://lists.gnu.org/archive/html/groff/2022-11/msg00063.htmlLink:https://inbox.sourceware.org/gcc/36da94eb-1cac-5ae8-7fea-ec66160cf413@gmail.com/T/PR c/115185gcc/c-family/ChangeLog:
+    
+            * c.opt: Add -Wunterminated-string-initialization.
+    
+    gcc/c/ChangeLog:
+    
+            * c-typeck.cc (digest_init): Separate warnings about character
+            arrays being initialized as unterminated character sequences
+            with string literals, from -Wc++-compat, into a new warning,
+            -Wunterminated-string-initialization.
+    
+    gcc/ChangeLog:
+    
+            * doc/invoke.texi: Document the new
+            -Wunterminated-string-initialization.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/Wcxx-compat-14.c: Adapt the test to match the new text
+            of the warning, which doesn't say anything about C++ anymore.
+            * gcc.dg/Wunterminated-string-initialization.c: New test.
+    
+    Acked-by: Doug McIlroy <douglas.mcilroy@dartmouth.edu>
+    Acked-by: Mike Stump <mikestump@comcast.net>
+    Reviewed-by: Sandra Loosemore <sloosemore@baylibre.com>
+    Reviewed-by: Martin Uecker <uecker@tugraz.at>
+    Signed-off-by: Alejandro Colomar <alx@kernel.org>
+    Reviewed-by: Marek Polacek <polacek@redhat.com>
+
+- User: Sam James | Time: 2024-07-14 23:42:11 UTC
+  Text: Fixed for 15.
+
+- User: Sergei Trofimovich | Time: 2024-07-15 20:57:50 UTC
+  Text: This generates warning on reasonably looking code.
+
+On strace-6.9:https://github.com/strace/strace/blob/v6.9/src/print_utils.h#L16In file included from v4l2.c:40:
+  print_utils.h:16:35: error: initializer-string for array of 'char' is too long [-Werror=unterminated-string-initialization]
+     16 | static const char hex_chars[16] = "0123456789abcdef";
+        |                                   ^~~~~~~~~~~~~~~~~~
+
+/cc Dmitry
+
+On elfutils-0.191:https://sourceware.org/git/?p=elfutils.git;a=blob;f=backends/x86_64_regs.c;h=ef987daf43f01187c468d29e4d412ecafdcb2878;hb=18a015c0b0787ba5acb39801ab7c17dac50f584d#l85x86_64_regs.c: In function 'x86_64_register_info':
+  x86_64_regs.c:85:11: error: initializer-string for array of 'char' is too long [-Werror=unterminated-string-initialization]
+   85 |           "ax", "dx", "cx", "bx", "si", "di", "bp", "sp
+      |           ^~~~
+
+/cc Mark
+
+I would say both uses are reasonable even if they strip trailing '\0'.
+
+Warning-free code that does the equivalent might be a bit ugly:
+
+    static const char hex_chars[17] = "0123456789abcdef"; // extra byte
+
+or
+
+    static const char hex_chars[16] = { '0', '1', ..., 'f' }; // lots of boilerplate
+
+WDYT of relaxing gcc warning a bit and not complain if the only thing it strips is a '\0'? Otherwise at least strace and elfutils would have to adapt.
+
+- User: Alejandro Colomar | Time: 2024-07-15 21:18:28 UTC
+  Text: (In reply to Sergei Trofimovich fromcomment #14)> This generates warning on reasonably looking code.
+> 
+> On strace-6.9:
+>https://github.com/strace/strace/blob/v6.9/src/print_utils.h#L16> 
+>   In file included from v4l2.c:40:
+>   print_utils.h:16:35: error: initializer-string for array of 'char' is too
+> long [-Werror=unterminated-string-initialization]
+>      16 | static const char hex_chars[16] = "0123456789abcdef";
+>         |                                   ^~~~~~~~~~~~~~~~~~This is the kind of code I'd warn about.  One may be tempted to do
+
+    strchr(hex_chars, *p);
+
+in a loop to parse a hex number from a string.  And then bug.
+That would probably be triggered to easily, admittedly.
+
+Surrounding that with a pragma to turn off the warning there
+would let the programmer clearly know that it's not a string.> 
+> /cc Dmitry
+> 
+> On elfutils-0.191:
+>https://sourceware.org/git/?p=elfutils.git;a=blob;f=backends/x86_64_regs.c;
+> h=ef987daf43f01187c468d29e4d412ecafdcb2878;
+> hb=18a015c0b0787ba5acb39801ab7c17dac50f584d#l85
+> 
+>   x86_64_regs.c: In function 'x86_64_register_info':
+>   x86_64_regs.c:85:11: error: initializer-string for array of 'char' is too
+> long [-Werror=unterminated-string-initialization]
+>    85 |           "ax", "dx", "cx", "bx", "si", "di", "bp", "sp
+>       |           ^~~~
+> 
+> /cc Mark
+> 
+> I would say both uses are reasonable even if they strip trailing '\0'.Agree, which is why I didn't include it in Wall.> 
+> Warning-free code that does the equivalent might be a bit ugly:
+> 
+>     static const char hex_chars[17] = "0123456789abcdef"; // extra byte
+> 
+> or
+> 
+>     static const char hex_chars[16] = { '0', '1', ..., 'f' }; // lots of
+> boilerplateAgree, I don't like the workarounds.  Maybe a project that does that often
+would better use -Wno-unterminated-string-initialization, or if it's only
+sporadically, use a pragma around the specific uses.> 
+> WDYT of relaxing gcc warning a bit and not complain if the only thing it
+> strips is a '\0'?That's precisely the purpose of that warning: warn when it's an off-by-one,
+so the '\0' is removed.
+
+When it's an off-by-two-or-more, it's a (pedantic) error:
+
+
+$ cat offbytwo.c 
+char x[2] = "foo";
+
+
+$ cc offbytwo.c -S
+offbytwo.c:1:13: warning: initializer-string for array of ‘char’ is too long
+    1 | char x[2] = "foo";
+      |             ^~~~~
+
+
+$ cc offbytwo.c -pedantic-errors -S
+offbytwo.c:1:13: error: initializer-string for array of ‘char’ is too long
+    1 | char x[2] = "foo";
+      |             ^~~~~> Otherwise at least strace and elfutils would have to adapt.The only option I would see is to not enable this in -Wextra.  But I think the implicit contract with -Wextra is that you want this kind of warnings that are often useful but sometimes not.
+
+- User: Sergei Trofimovich | Time: 2024-07-15 21:33:44 UTC
+  Text: Sounds reasonable. Proposed possible changes upstream:
+- elfutils:https://patchwork.sourceware.org/project/elfutils/patch/20240715212340.190915-1-slyich@gmail.com/- strace:https://github.com/strace/strace/pull/308
+
+- User: Alejandro Colomar | Time: 2024-07-15 22:33:28 UTC
+  Text: (In reply to Sergei Trofimovich fromcomment #16)> Sounds reasonable. Proposed possible changes upstream:
+> - elfutils:
+>https://patchwork.sourceware.org/project/elfutils/patch/20240715212340.In the elfutils case:
+
+diff --git a/backends/i386_regs.c b/backends/i386_regs.c
+index 7ec93bb9..4bca1b1a 100644
+--- a/backends/i386_regs.c
++++ b/backends/i386_regs.c
+@@ -83,7 +83,7 @@  i386_register_info (Ebl *ebl __attribute__ ((unused)),
+ 
+   switch (regno)
+     {
+-      static const char baseregs[][2] =
++      static const char baseregs[][3] =
+ 	{
+ 	  "ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "ip"
+ 	};
+diff --git a/backends/x86_64_regs.c b/backends/x86_64_regs.c
+index ef987daf..c92c862a 100644
+--- a/backends/x86_64_regs.c
++++ b/backends/x86_64_regs.c
+@@ -80,7 +80,7 @@  x86_64_register_info (Ebl *ebl __attribute__ ((unused)),
+ 
+   switch (regno)
+     {
+-      static const char baseregs[][2] =
++      static const char baseregs[][3] =
+ 	{
+ 	  "ax", "dx", "cx", "bx", "si", "di", "bp", "sp"
+ 	};
+
+
+If you want to transform those into strings, I would use a size of 4, for better alignment.  I didn't look into the code to know if it's valid, but I assume that if 3 is valid, 4 also should be.>190915-1-slyich@gmail.com/
+> - strace:https://github.com/strace/strace/pull/308
+
+- User: Wentao Zhang | Time: 2024-07-25 03:50:26 UTC
+  Text: This produces warnings in kernel defconfig builds and they become errors due to 
+CONFIG_WERROR.
+
+Cases I've observed so far:
+
+1. initializationhttps://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/pnp/quirks.c#L412related definitionhttps://elixir.bootlin.com/linux/v6.10-rc7/source/include/linux/pnp.h#L2932. initializationhttps://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/nhlt.c#L23related definitionhttps://elixir.bootlin.com/linux/v6.10-rc7/source/include/acpi/actbl.h#L693.https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/tables.c#L3854. initializationhttps://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/acpredef.h#L187related definitionhttps://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/aclocal.h#L2965. initializationhttps://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/nsrepair.c#L66related definitionhttps://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/aclocal.h#L3736. initializationhttps://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/nsrepair2.c#L114related definitionhttps://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/nsrepair2.c#L287.https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/gpu/drm/display/drm_dp_dual_mode_helper.c#L1638. initializationhttps://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/power/supply/power_supply_sysfs.c#L182related definitionhttps://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/power/supply/power_supply_sysfs.c#L269.https://elixir.bootlin.com/linux/v6.10-rc7/source/fs/proc/task_mmu.c#L648In the "drivers/power/supply/power_supply_sysfs.c" case, 
+
+static struct power_supply_attr power_supply_attrs[] = {
+	...
+	POWER_SUPPLY_ATTR(CHARGE_CONTROL_START_THRESHOLD),
+	...
+}
+
+will get expanded to 
+
+	[POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD] = {
+		.prop_name = "CHARGE_CONTROL_START_THRESHOLD",
+		.attr_name = "j" "\0",
+		.text_values = ((void *)0),
+		.text_values_len = 0,
+	},
+
+It still triggers the warning even if "\0" is explicitly specified and the
+length is exactly MAX_PROP_NAME_LEN + 1 (31).
+
+- User: Andrew Pinski | Time: 2024-07-25 03:58:50 UTC
+  Text: (In reply to Wentao Zhang fromcomment #18)> 
+> will get expanded to 
+> 
+> 	[POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD] = {
+> 		.prop_name = "CHARGE_CONTROL_START_THRESHOLD",
+> 		.attr_name = "j" "\0",
+> 		.text_values = ((void *)0),
+> 		.text_values_len = 0,
+> 	},
+> 
+> It still triggers the warning even if "\0" is explicitly specified and the
+> length is exactly MAX_PROP_NAME_LEN + 1 (31).Actually it gets expanded to something like:
+char t[31] = "CHARGE_CONTROL_START_THRESHOLD""\0";
+
+Yes I think the above should not warn in the case of -Wunterminated-string-initialization but it should warn in the case of -Wc++-compat . Let me file a bug about that.
+
+- User: Wentao Zhang | Time: 2024-07-25 04:05:17 UTC
+  Text: (In reply to Wentao Zhang fromcomment #18)> 
+> will get expanded to 
+> 
+> 	[POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD] = {
+> 		.prop_name = "CHARGE_CONTROL_START_THRESHOLD",
+> 		.attr_name = "j" "\0",
+> 		.text_values = ((void *)0),
+> 		.text_values_len = 0,
+> 	},
+> 
+> It still triggers the warning even if "\0" is explicitly specified and the
+> length is exactly MAX_PROP_NAME_LEN + 1 (31).Sorry I mistyped. It should be
+
+	[POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD] = {
+		.prop_name = "CHARGE_CONTROL_START_THRESHOLD",
+		.attr_name = "CHARGE_CONTROL_START_THRESHOLD" "\0",
+		.text_values = ((void *)0),
+		.text_values_len = 0,
+	},
+
+Thanks, Andrew!
+
+- User: Andrew Pinski | Time: 2024-07-25 04:14:50 UTC
+  Text: (In reply to Wentao Zhang fromcomment #18)> This produces warnings in kernel defconfig builds and they become errors due
+> to 
+> CONFIG_WERROR.
+> 
+> Cases I've observed so far:
+> 
+> 1. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/pnp/quirks.c#L412>    related definition>https://elixir.bootlin.com/linux/v6.10-rc7/source/include/linux/pnp.h#L293That is a real bug:
+```
+        for (f = pnp_fixups; *f->id; f++) {
+                if (!compare_pnp_id(dev->id, f->id))
+                        continue;
+...
+int compare_pnp_id(struct pnp_id *pos, const char *id)
+{
+        if (!pos || !id || (strlen(id) != 7))
+                return 0;
+
+....
+```
+strlen(id) is dependent on the value of the fixup function and what endian and such.> 2. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/nhlt.c#L23>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/include/acpi/actbl.h#L69This might be ok though but maybe the warning should be disabled for this initialization (in the source).> 3.
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/tables.c#L385> 4. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> acpredef.h#L187
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> aclocal.h#L296This looks ok but only indirectly uses strncmp.> 5. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> nsrepair.c#L66
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> aclocal.h#L373Likewise.> 6. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> nsrepair2.c#L114
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> nsrepair2.c#L28
+> 7.
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/gpu/drm/display/> drm_dp_dual_mode_helper.c#L163
+> 8. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/power/supply/> power_supply_sysfs.c#L182
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/power/supply/> power_supply_sysfs.c#L26 
+> 9.https://elixir.bootlin.com/linux/v6.10-rc7/source/fs/proc/task_mmu.c#L648This one is ok, I think.> 
+> It still triggers the warning even if "\0" is explicitly specified and the
+> length is exactly MAX_PROP_NAME_LEN + 1 (31).Filed asPR 116082.
+
+- User: Alejandro Colomar | Time: 2024-07-25 09:44:34 UTC
+  Text: (In reply to Wentao Zhang fromcomment #18)> This produces warnings in kernel defconfig builds and they become errors due
+> to 
+> CONFIG_WERROR.
+> 
+> Cases I've observed so far:
+> 
+> 1. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/pnp/quirks.c#L412>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/include/linux/pnp.h#L293> 2. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/nhlt.c#L23>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/include/acpi/actbl.h#L69> 3.
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/tables.c#L385> 4. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> acpredef.h#L187
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> aclocal.h#L296 
+> 5. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> nsrepair.c#L66
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> aclocal.h#L373 
+> 6. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> nsrepair2.c#L114
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> nsrepair2.c#L28
+> 7.
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/gpu/drm/display/> drm_dp_dual_mode_helper.c#L163
+> 8. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/power/supply/> power_supply_sysfs.c#L182
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/power/supply/> power_supply_sysfs.c#L26 
+> 9.https://elixir.bootlin.com/linux/v6.10-rc7/source/fs/proc/task_mmu.c#L648> 
+> In the "drivers/power/supply/power_supply_sysfs.c" case, 
+> 
+> static struct power_supply_attr power_supply_attrs[] = {
+> 	...
+> 	POWER_SUPPLY_ATTR(CHARGE_CONTROL_START_THRESHOLD),
+> 	...
+> }
+> 
+> will get expanded to 
+> 
+> 	[POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD] = {
+> 		.prop_name = "CHARGE_CONTROL_START_THRESHOLD",
+> 		.attr_name = "j" "\0",
+> 		.text_values = ((void *)0),
+> 		.text_values_len = 0,
+> 	},
+> 
+> It still triggers the warning even if "\0" is explicitly specified and the
+> length is exactly MAX_PROP_NAME_LEN + 1 (31).As Martin questioned in <https://gcc.gnu.org/bugzilla/show_bug.cgi?id=116082>, I think this should be warned.  You've asked to initialize the array with two null bytes, and you only got one.
+
+You were trying to achieve the same thing that now can be achieved by enabling -Wunterminated-string-initialization.  I suggest that you now remove the "\0", and rely on the warning.
+
+For the cases where you do NOT want a string, you can surround it with pragmas to turn off the warning there.  These cases should be minimal, and justified.
+Or you can do like elfutils did, and use array notation: {'f', 'o', 'o'}; this makes it clear that there's no null byte, and won't trigger the warning.
+
+- User: Alejandro Colomar | Time: 2024-07-25 09:45:25 UTC
+  Text: (In reply to Wentao Zhang fromcomment #18)> This produces warnings in kernel defconfig builds and they become errors due
+> to 
+> CONFIG_WERROR.
+> 
+> Cases I've observed so far:
+> 
+> 1. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/pnp/quirks.c#L412>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/include/linux/pnp.h#L293> 2. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/nhlt.c#L23>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/include/acpi/actbl.h#L69> 3.
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/tables.c#L385> 4. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> acpredef.h#L187
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> aclocal.h#L296 
+> 5. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> nsrepair.c#L66
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> aclocal.h#L373 
+> 6. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> nsrepair2.c#L114
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> nsrepair2.c#L28
+> 7.
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/gpu/drm/display/> drm_dp_dual_mode_helper.c#L163
+> 8. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/power/supply/> power_supply_sysfs.c#L182
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/power/supply/> power_supply_sysfs.c#L26 
+> 9.https://elixir.bootlin.com/linux/v6.10-rc7/source/fs/proc/task_mmu.c#L648Would you mind writing here how those cases look like after macro expansion?  It's hard to read through all of those indirections.
+
+- User: Alejandro Colomar | Time: 2024-07-25 11:42:19 UTC
+  Text: (In reply to Wentao Zhang fromcomment #18)> This produces warnings in kernel defconfig builds and they become errors due
+> to 
+> CONFIG_WERROR.
+> 
+> Cases I've observed so far:
+> 
+> 1. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/pnp/quirks.c#L412>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/include/linux/pnp.h#L293> 2. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/nhlt.c#L23>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/include/acpi/actbl.h#L69> 3.
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/tables.c#L385> 4. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> acpredef.h#L187
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> aclocal.h#L296 
+> 5. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> nsrepair.c#L66
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> aclocal.h#L373 
+> 6. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> nsrepair2.c#L114
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> nsrepair2.c#L28
+> 7.
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/gpu/drm/display/> drm_dp_dual_mode_helper.c#L163
+> 8. initialization    
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/power/supply/> power_supply_sysfs.c#L182
+>    related definition
+>https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/power/supply/> power_supply_sysfs.c#L26 
+> 9.https://elixir.bootlin.com/linux/v6.10-rc7/source/fs/proc/task_mmu.c#L648> 
+> In the "drivers/power/supply/power_supply_sysfs.c" case, 
+> 
+> static struct power_supply_attr power_supply_attrs[] = {
+> 	...
+> 	POWER_SUPPLY_ATTR(CHARGE_CONTROL_START_THRESHOLD),
+> 	...
+> }
+> 
+> will get expanded to 
+> 
+> 	[POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD] = {
+> 		.prop_name = "CHARGE_CONTROL_START_THRESHOLD",
+> 		.attr_name = "j" "\0",
+> 		.text_values = ((void *)0),
+> 		.text_values_len = 0,
+> 	},
+> 
+> It still triggers the warning even if "\0" is explicitly specified and the
+> length is exactly MAX_PROP_NAME_LEN + 1 (31).(In reply to Alejandro Colomar fromcomment #23)> (In reply to Wentao Zhang fromcomment #18)
+> > This produces warnings in kernel defconfig builds and they become errors due
+> > to 
+> > CONFIG_WERROR.
+> > 
+> > Cases I've observed so far:
+> > 
+> > 1. initialization    
+> >https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/pnp/quirks.c#L412> >    related definition
+> >https://elixir.bootlin.com/linux/v6.10-rc7/source/include/linux/pnp.h#L293> > 2. initialization    
+> >https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/nhlt.c#L23> >    related definition
+> >https://elixir.bootlin.com/linux/v6.10-rc7/source/include/acpi/actbl.h#L69> > 3.
+> >https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/tables.c#L385> > 4. initialization    
+> >https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> > acpredef.h#L187
+> >    related definition
+> >https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> > aclocal.h#L296 
+> > 5. initialization    
+> >https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> > nsrepair.c#L66
+> >    related definition
+> >https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> > aclocal.h#L373 
+> > 6. initialization    
+> >https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> > nsrepair2.c#L114
+> >    related definition
+> >https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/acpi/acpica/> > nsrepair2.c#L28
+> > 7.
+> >https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/gpu/drm/display/> > drm_dp_dual_mode_helper.c#L163
+> > 8. initialization    
+> >https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/power/supply/> > power_supply_sysfs.c#L182
+> >    related definition
+> >https://elixir.bootlin.com/linux/v6.10-rc7/source/drivers/power/supply/> > power_supply_sysfs.c#L26 
+> > 9.https://elixir.bootlin.com/linux/v6.10-rc7/source/fs/proc/task_mmu.c#L648> 
+> 
+> Would you mind writing here how those cases look like after macro expansion?
+> It's hard to read through all of those indirections.(Sorry, I started with the only link that had the macros.  The other were easy to read.)
+
+Here's a summary.  There's only a bug.
+
+   (1)  Bug
+
+        <https://gcc.gnu.org/bugzilla/show_bug.cgi?id=115185#c21>
+
+   (2)  False positive.
+
+        It only uses strncmp(3), AFAICS.  Could use array notation.
+        Also, memcmp(3) might be more appropriate.
+
+   (3)  False positive.
+
+        It only uses memcmp(3).
+
+   (4)  False positive.
+
+        It only uses strncmp(3), AFAICS.  Could use array notation.
+        Also, memcmp(3) might be more appropriate.
+
+   (5)  False positive.
+
+        Seems similar to (4).
+
+   (6)  False positive.
+
+        Seems similar to (5).
+
+   (7)  False positive.
+
+        It only uses memcmp(3).  Could use a pragma.
+
+   (8)  False positive.
+
+        The explicit "\0" was a clever trick to get a diagnostic if it
+        wasn't a string.  We now have this warning flag, so that trick
+        can be removed.
+
+   (9)  False positive.
+
+        It uses the bytes separately.  Could use array notation.
+
+- User: Alejandro Colomar | Time: 2024-07-26 20:20:02 UTC
+  Text: BTW, since this seems to be a de-facto place to report bugs found by this warning, let's also list here another one found in Linux by Sam the other day:
+
+Report:
+<https://lore.kernel.org/linux-btrfs/87ttgmz7q7.fsf@gentoo.org/T/>
+
+Fix (patch):
+<https://lore.kernel.org/linux-btrfs/b6633fbd1110ce2b5ff03ff9605f59e508ff31d0.1721380874.git.wqu@suse.com/T/>
+

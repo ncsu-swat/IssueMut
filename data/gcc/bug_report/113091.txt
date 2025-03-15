@@ -1,0 +1,375 @@
+Bug Summary: Over-estimate SLP vector-to-scalar cost for non-live pattern statement
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Feng Xue | Time: 2023-12-20 09:54:01 UTC
+  Text: Gcc fails to vectorize the below testcase on aarch64.
+
+  int test(unsigned array[8]);
+
+  int foo(char *a, char *b)
+  {
+    unsigned array[8];
+
+    array[0] = (a[0] - b[0]);
+    array[1] = (a[1] - b[1]);
+    array[2] = (a[2] - b[2]);
+    array[3] = (a[3] - b[3]);
+    array[4] = (a[4] - b[4]);
+    array[5] = (a[5] - b[5]);
+    array[6] = (a[6] - b[6]);
+    array[7] = (a[7] - b[7]);
+
+    return test(array);
+  }
+
+The dump shows that loads to a[i] and b[i] are considered to be live as scalar references, which results in over-estimated vector-to-scalar cost.
+
+*a_50(D) 1 times vec_to_scalar costs 2 in epilogue
+MEM[(char *)a_50(D) + 1B] 1 times vec_to_scalar costs 2 in epilogue
+MEM[(char *)a_50(D) + 2B] 1 times vec_to_scalar costs 2 in epilogue
+MEM[(char *)a_50(D) + 3B] 1 times vec_to_scalar costs 2 in epilogue
+MEM[(char *)a_50(D) + 4B] 1 times vec_to_scalar costs 2 in epilogue
+MEM[(char *)a_50(D) + 5B] 1 times vec_to_scalar costs 2 in epilogue
+MEM[(char *)a_50(D) + 6B] 1 times vec_to_scalar costs 2 in epilogue
+MEM[(char *)a_50(D) + 7B] 1 times vec_to_scalar costs 2 in epilogue
+*b_51(D) 1 times vec_to_scalar costs 2 in epilogue
+MEM[(char *)b_51(D) + 1B] 1 times vec_to_scalar costs 2 in epilogue
+MEM[(char *)b_51(D) + 2B] 1 times vec_to_scalar costs 2 in epilogue
+MEM[(char *)b_51(D) + 3B] 1 times vec_to_scalar costs 2 in epilogue
+MEM[(char *)b_51(D) + 4B] 1 times vec_to_scalar costs 2 in epilogue
+MEM[(char *)b_51(D) + 5B] 1 times vec_to_scalar costs 2 in epilogue
+MEM[(char *)b_51(D) + 6B] 1 times vec_to_scalar costs 2 in epilogue
+MEM[(char *)b_51(D) + 7B] 1 times vec_to_scalar costs 2 in epilogue
+
+Subtraction on char type is recognized as widen-sub, and involves two kinds of pattern replacement.
+
+ * Original
+ _1 = *a_50(D);
+ _2 = (int) _1;
+ _3 = *b_51(D);
+ _4 = (int) _3;
+ _5 = _2 - _4;
+
+
+ * After pattern replacement
+ patt_63 = (unsigned short) _1;  //  _2 = (int) _1;
+ patt_64 = (int) patt_63;        //  _2 = (int) _1;
+
+ patt_65 = (unsigned short) _3;  //  _4 = (int) _3;
+ patt_66 = (int) patt_65;        //  _4 = (int) _3;
+
+ patt_67 = .VEC_WIDEN_MINUS (_1, _3);  //  _5 = _2 - _4;
+ patt_68 = (signed short) patt_67;     //  _5 = _2 - _4;
+ patt_69 = (int) patt_68;              //  _5 = _2 - _4;
+
+For the statement "_2 = (int) _1", its vectorization representative "patt_64 = (int) patt_63" is not marked as PURE_SLP, so it is conservatively considered to having scalar use and being live outside of SLP bb (in the function vect_bb_slp_mark_live_stmts). However, the pattern definition is actually dead, should not contribute to vector-to-scalar cost. 
+
+Those defs from pattern statements are not part of function body, we could not track def/use chain as ordinary SSAs. Probably, we may have a quick fix for one situation, if the original SSA "_2" has single use, its existence should be only covered by vectorized operation, no matter what/how it would be w/o pattern replacement.
+
+- User: Richard Biener | Time: 2023-12-20 13:09:34 UTC
+  Text: It's the logic
+
+  FOR_EACH_VEC_ELT (SLP_TREE_SCALAR_STMTS (node), i, stmt_info)
+    {
+      if (svisited.contains (stmt_info))
+        continue;
+      stmt_vec_info orig_stmt_info = vect_orig_stmt (stmt_info);
+      if (STMT_VINFO_IN_PATTERN_P (orig_stmt_info)
+          && STMT_VINFO_RELATED_STMT (orig_stmt_info) != stmt_info)
+        /* Only the pattern root stmt computes the original scalar value.  */
+        continue;
+      bool mark_visited = true;
+      gimple *orig_stmt = orig_stmt_info->stmt;
+      ssa_op_iter op_iter;
+      def_operand_p def_p;
+      FOR_EACH_PHI_OR_STMT_DEF (def_p, orig_stmt, op_iter, SSA_OP_DEF)
+        {
+          imm_use_iterator use_iter;
+          gimple *use_stmt;
+          stmt_vec_info use_stmt_info;
+          FOR_EACH_IMM_USE_STMT (use_stmt, use_iter, DEF_FROM_PTR (def_p))
+            if (!is_gimple_debug (use_stmt))
+              {
+                use_stmt_info = bb_vinfo->lookup_stmt (use_stmt);
+                if (!use_stmt_info
+                    || !PURE_SLP_STMT (vect_stmt_to_vectorize (use_stmt_info)))
+                  {
+                    STMT_VINFO_LIVE_P (stmt_info) = true;
+
+specifically the last check.  That's supposed to pick up the "main" pattern
+that's now covering the scalar stmt.
+
+But somehow the "main" pattern,
+
+patt_67 = .VEC_WIDEN_MINUS (_1, _3);  //  _5 = _2 - _4;
+ patt_68 = (signed short) patt_67;     //  _5 = _2 - _4;
+ patt_69 = (int) patt_68;              //  _5 = _2 - _4;
+
+doesn't get picked up here.  I wonder what's the orig_stmt and the def
+picked and what original scalar use we end up in where the
+vect_stmt_to_vectorize isn't the "last" pattern.  Maybe we really want
+these "overlapping" patterns, but IMHO having "two entries" into
+a chain of scalar stmts is bad and we should link up the whole matched
+sequence to the final "root" instead?
+
+That said, the current code doesn't see that wherever we end up isn't
+dead code (aka fully covered by the vectorization).
+
+IMO vect_stmt_to_vectorize for each of those stmts should end up at
+
+patt_69 = (int) patt_68;
+
+- User: Feng Xue | Time: 2023-12-21 05:25:32 UTC
+  Text: (In reply to Richard Biener fromcomment #1)> It's the logic
+> 
+>   FOR_EACH_VEC_ELT (SLP_TREE_SCALAR_STMTS (node), i, stmt_info)
+>     {
+>       if (svisited.contains (stmt_info))
+>         continue;
+>       stmt_vec_info orig_stmt_info = vect_orig_stmt (stmt_info);
+>       if (STMT_VINFO_IN_PATTERN_P (orig_stmt_info)
+>           && STMT_VINFO_RELATED_STMT (orig_stmt_info) != stmt_info)
+>         /* Only the pattern root stmt computes the original scalar value.  */
+>         continue;
+>       bool mark_visited = true;
+>       gimple *orig_stmt = orig_stmt_info->stmt;
+>       ssa_op_iter op_iter;
+>       def_operand_p def_p;
+>       FOR_EACH_PHI_OR_STMT_DEF (def_p, orig_stmt, op_iter, SSA_OP_DEF)
+>         {
+>           imm_use_iterator use_iter;
+>           gimple *use_stmt;
+>           stmt_vec_info use_stmt_info;
+>           FOR_EACH_IMM_USE_STMT (use_stmt, use_iter, DEF_FROM_PTR (def_p))
+>             if (!is_gimple_debug (use_stmt))
+>               {
+>                 use_stmt_info = bb_vinfo->lookup_stmt (use_stmt);
+>                 if (!use_stmt_info
+>                     || !PURE_SLP_STMT (vect_stmt_to_vectorize
+> (use_stmt_info)))
+>                   {
+>                     STMT_VINFO_LIVE_P (stmt_info) = true;
+> 
+> specifically the last check.  That's supposed to pick up the "main" pattern
+> that's now covering the scalar stmt.
+> 
+> But somehow the "main" pattern,
+> 
+> patt_67 = .VEC_WIDEN_MINUS (_1, _3);  //  _5 = _2 - _4;
+>  patt_68 = (signed short) patt_67;     //  _5 = _2 - _4;
+>  patt_69 = (int) patt_68;              //  _5 = _2 - _4;
+> 
+> doesn't get picked up here.  I wonder what's the orig_stmt and the def
+> picked and what original scalar use we end up in where the
+> vect_stmt_to_vectorize isn't the "last" pattern.  Maybe we really wantThis problem happens at slp node:
+
+ note: node 0x425bc38 (max_nunits=8, refcnt=1) vector(8) char
+ note: op template: _1 = *a_50(D);
+ note:  stmt 0 _1 = *a_50(D);
+ note:  stmt 1 _7 = MEM[(char *)a_50(D) + 1B];
+ note:  stmt 2 _13 = MEM[(char *)a_50(D) + 2B];
+ note:  stmt 3 _19 = MEM[(char *)a_50(D) + 3B];
+ note:  stmt 4 _25 = MEM[(char *)a_50(D) + 4B];
+ note:  stmt 5 _31 = MEM[(char *)a_50(D) + 5B];
+ note:  stmt 6 _37 = MEM[(char *)a_50(D) + 6B];
+ note:  stmt 7 _43 = MEM[(char *)a_50(D) + 7B];
+
+The orig_stmt is "_1 = *a_50(D)"
+
+The use stmt is "_2 = (int) _1", whose pattern statement is "patt_64 = (int) patt_63", which is not referenced by any original or other pattern statements. Or in other word, the orig_stmt could be absorbed into a vector operation, without any outlier scalar use.
+
+The fore-mentioned "last check" in vect_bb_slp_mark_live_stmts would make the orig_stmt to be STMT_VINFO_LIVE_P, which actually implies it has scalar use (though it should not have), the difference is re-generating the def somewhere, rather than retaining the original scalar statement. And the following "vectorizable_live_operation" would account the new operations into vectorization cost of the SLP instance.
+
+The function vect_bb_vectorization_profitable_p resorts to a recursive way to identify scalar use, for this case, setting STMT_VINFO_LIVE_P or not would change scalar cost computation. If we can avoid such fake-liveness adjustment on the statements we are interested in, vectorization cost could beat scalar cost, and make the former succeed.
+
+   Unvectorized: 
+        mov     x2, x0
+        stp     x29, x30, [sp, -48]!
+        mov     x29, sp
+        ldrb    w3, [x1]
+        ldrb    w4, [x1, 1]
+        add     x0, sp, 16
+        ldrb    w9, [x2]
+        ldrb    w8, [x2, 1]
+        sub     w9, w9, w3
+        ldrb    w7, [x2, 2]
+        ldrb    w3, [x1, 2]
+        sub     w8, w8, w4
+        ldrb    w6, [x2, 3]
+        ldrb    w4, [x1, 3]
+        sub     w7, w7, w3
+        ldrb    w10, [x1, 5]
+        ldrb    w3, [x1, 4]
+        sub     w6, w6, w4
+        ldrb    w5, [x2, 4]
+        ldrb    w4, [x2, 5]
+        sub     w5, w5, w3
+        ldrb    w3, [x2, 6]
+        sub     w4, w4, w10
+        ldrb    w2, [x2, 7]
+        ldrb    w10, [x1, 6]
+        ldrb    w1, [x1, 7]
+        sub     w3, w3, w10
+        stp     w9, w8, [sp, 16]
+        sub     w1, w2, w1
+        stp     w7, w6, [sp, 24]
+        stp     w5, w4, [sp, 32]
+        stp     w3, w1, [sp, 40]
+        bl      test
+        ldp     x29, x30, [sp], 48
+        ret
+
+
+    Vectorized:
+        mov     x2, x0
+        stp     x29, x30, [sp, -48]!
+        mov     x29, sp
+        ldr     d1, [x1]
+        add     x0, sp, 16
+        ldr     d0, [x2]
+        usubl   v0.8h, v0.8b, v1.8b
+        sxtl    v1.4s, v0.4h
+        sxtl2   v0.4s, v0.8h
+        stp     q1, q0, [sp, 16]
+        bl      test
+        ldp     x29, x30, [sp], 48
+        ret> these "overlapping" patterns, but IMHO having "two entries" into
+> a chain of scalar stmts is bad and we should link up the whole matched
+> sequence to the final "root" instead?
+> 
+> That said, the current code doesn't see that wherever we end up isn't
+> dead code (aka fully covered by the vectorization).
+> 
+> IMO vect_stmt_to_vectorize for each of those stmts should end up at
+> 
+> patt_69 = (int) patt_68;
+
+- User: Feng Xue | Time: 2023-12-21 05:27:41 UTC
+  Text: The function vect_bb_vectorization_profitable_p resorts to a recursive way to identify scalar use, for this case, setting STMT_VINFO_LIVE_P or not would not change scalar cost computation.
+
+- User: Richard Biener | Time: 2023-12-21 07:31:22 UTC
+  Text: "The use stmt is "_2 = (int) _1", whose pattern statement is "patt_64 = (int) patt_63", which is not referenced by any original or other pattern statements. Or in other word, the orig_stmt could be absorbed into a vector operation, without any outlier scalar use."
+
+That means the code sees that _2 = (int) _1 isn't vectorized (the pattern
+stmt isn't actually used) which means _2 = (int) _1 stays in the code and
+thus _1 is live.
+
+The issue here is that because the "outer" pattern consumes
+patt_64 = (int) patt_63 it should have adjusted _2 = (int) _1 stmt-to-vectorize
+as being the outer pattern root stmt for all this logic to work correctly.
+
+Otherwise we have no means of identifying whether a scalar stmt takes part
+in vectorization or not.
+
+I'm not sure what restrictions we place on pattern recognition of patterns - do we require single-uses or do we allow the situation that one vectorization
+path picks up the "inner" pattern while another picks the "outer" one?
+
+In theory we can hack up the liveness analysis but as you noticed that
+isn't the part doing the costing.  The costing part is just written in
+the very same way (vect_bb_vectorization_profitable_p, specifically
+vect_slp_gather_vectorized_scalar_stmts and vect_bb_slp_scalar_cost).
+Basically the scalar cost is
+the cost of the scalar stmts that are fully replaced (can be DCEd after
+vectorization) by the vector stmts.
+
+- User: Richard Sandiford | Time: 2023-12-21 11:01:11 UTC
+  Text: > The issue here is that because the "outer" pattern consumes
+> patt_64 = (int) patt_63 it should have adjusted _2 = (int) _1 stmt-to-vectorize
+> as being the outer pattern root stmt for all this logic to work correctly.I don't think it can though, at least not in general.  The final pattern
+stmt has to compute the same value as the original scalar stmt.
+
+- User: Feng Xue | Time: 2023-12-22 03:55:43 UTC
+  Text: (In reply to Richard Sandiford fromcomment #5)> > The issue here is that because the "outer" pattern consumes
+> > patt_64 = (int) patt_63 it should have adjusted _2 = (int) _1 stmt-to-vectorize
+> > as being the outer pattern root stmt for all this logic to work correctly.
+> 
+> I don't think it can though, at least not in general.  The final pattern
+> stmt has to compute the same value as the original scalar stmt.Could current pattern replacement support N:1 mapping (N stmts -> 1 pattern)? If not, probably this handing would break related code somewhere.
+
+- User: Feng Xue | Time: 2023-12-26 15:16:11 UTC
+  Text: > The issue here is that because the "outer" pattern consumes
+> patt_64 = (int) patt_63 it should have adjusted _2 = (int) _1
+> stmt-to-vectorize
+> as being the outer pattern root stmt for all this logic to work correctly.We could not simply make this adjustment since pattern recognition does not require replaced SSA to be of single-use. If we change the above case to attach another scalar use to "_2" as:
+
+  int foo(char *a, char *b)
+  {
+    unsigned array[8];
+    int a0 = a[0];  // _2 = (int) _1;
+
+    array[0] = (a0 - b[0]);
+    array[1] = (a[1] - b[1]);
+    array[2] = (a[2] - b[2]);
+    array[3] = (a[3] - b[3]);
+    array[4] = (a[4] - b[4]);
+    array[5] = (a[5] - b[5]);
+    array[6] = (a[6] - b[6]);
+    array[7] = (a[7] - b[7]);
+
+    return test(array) + a0;
+  }
+
+The pattern statement "patt_64 = (int) patt_63" for "_2 = (int) _1" should be kept. So we also need the check of "identifying whether a scalar stmt takes part
+in vectorization or not" to ensure the adjustment is doable.
+
+- User: Feng Xue | Time: 2023-12-29 10:35:14 UTC
+  Text: https://gcc.gnu.org/pipermail/gcc-patches/2023-December/641547.html
+
+- User: GCC Commits | Time: 2024-01-16 03:36:35 UTC
+  Text: The master branch has been updated by Feng Xue <fxue@gcc.gnu.org>:https://gcc.gnu.org/g:57f611604e8bab67af6c0bcfe6ea88c001408412commitr14-7272-g57f611604e8bab67af6c0bcfe6ea88c001408412Author: Feng Xue <fxue@os.amperecomputing.com>
+Date:   Thu Dec 28 16:55:39 2023 +0800
+
+    Do not count unused scalar use when marking STMT_VINFO_LIVE_P [PR113091]
+    
+    When pattern recognition is involved, a statement whose definition is
+    consumed in some pattern, may not be included in the final replacement
+    pattern statements, and would be skipped when building SLP graph.
+    
+     * Original
+      char a_c = *(char *) a;
+      char b_c = *(char *) b;
+      unsigned short a_s = (unsigned short) a_c;
+      int a_i = (int) a_s;
+      int b_i = (int) b_c;
+      int r_i = a_i - b_i;
+    
+     * After pattern replacement
+      a_s = (unsigned short) a_c;
+      a_i = (int) a_s;
+    
+      patt_b_s = (unsigned short) b_c;    // b_i = (int) b_c
+      patt_b_i = (int) patt_b_s;          // b_i = (int) b_c
+    
+      patt_r_s = widen_minus(a_c, b_c);   // r_i = a_i - b_i
+      patt_r_i = (int) patt_r_s;          // r_i = a_i - b_i
+    
+    The definitions of a_i(original statement) and b_i(pattern statement)
+    are related to, but actually not part of widen_minus pattern.
+    Vectorizing the pattern does not cause these definition statements to
+    be marked as PURE_SLP.  For this case, we need to recursively check
+    whether their uses are all absorbed into vectorized code.  But there
+    is an exception that some use may participate in an vectorized
+    operation via an external SLP node containing that use as an element.
+    
+    gcc/ChangeLog:PR tree-optimization/113091* tree-vect-slp.cc (vect_slp_has_scalar_use): New function.
+            (vect_bb_slp_mark_live_stmts): New parameter scalar_use_map, check
+            scalar use with new function.
+            (vect_bb_slp_mark_live_stmts): New function as entry to existing
+            overriden functions with same name.
+            (vect_slp_analyze_operations): Call new entry function to mark
+            live statements.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/bb-slp-pr113091.c: New test.
+
+- User: Feng Xue | Time: 2024-01-31 03:13:33 UTC
+  Text: Fixed
+

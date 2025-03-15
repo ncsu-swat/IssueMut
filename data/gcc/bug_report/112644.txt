@@ -1,0 +1,169 @@
+Bug Summary: [14 Regression] Some of the hwasan testcase fail after the recent merge
+Product: gcc
+Component: sanitizer
+
+  (show other bugs)
+Keywords: missed-optimization, testsuite-fail
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2023-11-21 01:01:40 UTC
+  Text: +FAIL: c-c++-common/hwasan/halt_on_error-1.c   -O0  output pattern test
++FAIL: c-c++-common/hwasan/halt_on_error-1.c   -O1  output pattern test
++FAIL: c-c++-common/hwasan/halt_on_error-1.c   -O2  output pattern test
++FAIL: c-c++-common/hwasan/halt_on_error-1.c   -O2 -flto -fno-use-linker-plugin -flto-partition=none  output pattern test
++FAIL: c-c++-common/hwasan/halt_on_error-1.c   -O2 -flto -fuse-linker-plugin -fno-fat-lto-objects  output pattern test
++FAIL: c-c++-common/hwasan/halt_on_error-1.c   -O3 -g  output pattern test
++FAIL: c-c++-common/hwasan/halt_on_error-1.c   -Os  output pattern test
++FAIL: c-c++-common/hwasan/hwasan-thread-clears-stack.c   -O0  output pattern test
++FAIL: c-c++-common/hwasan/hwasan-thread-clears-stack.c   -O1  output pattern test
++FAIL: c-c++-common/hwasan/hwasan-thread-clears-stack.c   -O2  output pattern test
++FAIL: c-c++-common/hwasan/hwasan-thread-clears-stack.c   -O2 -flto -fno-use-linker-plugin -flto-partition=none  output pattern test
++FAIL: c-c++-common/hwasan/hwasan-thread-clears-stack.c   -O2 -flto -fuse-linker-plugin -fno-fat-lto-objects  output pattern test
++FAIL: c-c++-common/hwasan/hwasan-thread-clears-stack.c   -O3 -g  output pattern test
++FAIL: c-c++-common/hwasan/hwasan-thread-clears-stack.c   -Os  output pattern test
+
+- User: Andrew Pinski | Time: 2023-11-21 01:04:30 UTC
+  Text: for halt_on_error-1.c, it is trying to match:
+WRITE of size 17 at 0x[0-9a-f]+.*READ of size 1 at 0x[0-9a-f]+.*WRITE of size 1 at 0x[0-9a-f]+.*READ of size 1 at 0x[0-9a-f]+.*
+
+
+But we get just:
+WRITE of size 17 at 0xffffffff8d60 tags: 01/00 (ptr/mem) in thread T0
+...
+SUMMARY: HWAddressSanitizer: tag-mismatch gcc/libsanitizer/hwasan/hwasan_checks.h:107 in SigTrap<(__hwasan::ErrorAction)0, (__hwasan::AccessType)1>
+
+- User: Andrew Pinski | Time: 2023-11-21 01:10:54 UTC
+  Text: hwasan-thread-clears-stack.c looks like it now able to describe the location. So that seems like only a testsuite issue.
+
+halt_on_error-1.c does look like we just halt on a failure instead of continue ...
+
+- User: Jakub Jelinek | Time: 2023-11-21 10:26:01 UTC
+  Text: I'm afraid I know nothing about hwasan, so we'll need somebody familiar with it.
+
+- User: Tamar Christina | Time: 2023-11-22 11:19:42 UTC
+  Text: I've asked Matthew to take a look since he wrote the initial support.
+
+- User: Jakub Jelinek | Time: 2023-11-22 11:20:29 UTC
+  Text: Thanks.
+
+- User: Tamar Christina | Time: 2023-12-01 10:40:33 UTC
+  Text: Matthew has been working on this and so far has concluded:
+
+Summary of main problem:
+
+New libhwasan runtime libraries have added interceptors for various mem*, str* functions (and I think others -- I do not have full list).
+
+With old runtime libraries these were not intercepted, and we emitted inline instrumentation to accommodate.
+Removing our instrumentation is fine (though with the caveat that we need to ensure we have the full list of functions which are now intercepted).
+
+However, the libraries hard-code the choice to abort on error, which means the HWASAN_OPTIONS environment variable can no longer be used to ensure recover on error (-fsanitize-recover=hwaddress option).
+
+Changes I believe should happen:
+- LLVM upstream libsanitizer code be changed to allow recovery -- AFAIK there is no functional loss from using ErrorAction::Recover in the checking.
+- We find the list of functions which are now instrumented, and update asan_instrumented_p accordingly (plus a testcase or two for this).
+
+The first one was discussed on the LLVM discourse and it was deemed a bughttps://discourse.llvm.org/t/hwasan-question-about-the-recent-interceptors-being-added/75351/4and a PR made to fix ithttps://github.com/llvm/llvm-project/pull/74000Once that's merged we can re-sync and we need to update the list of intercepted functions in asan_intercepted_p (in gcc/asan.h).  One of the reasons for the change is that LLVM now replaces calls to e.g. memset with __hwasan_memset to avoid later passes optimizing the call.  It looks like we need to do that for GCC as well.
+
+Matthew will be away for a while so will take over the patch from him in stage-4.
+
+- User: Tamar Christina | Time: 2023-12-05 10:18:02 UTC
+  Text: Upstream fixed, will prepare GCC patch.
+
+- User: Tamar Christina | Time: 2024-01-29 17:26:57 UTC
+  Text: ***Bug 113661has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2024-01-31 14:49:34 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:a73421bcf301911f2cbdb1c58316ddf3473ea6d5commitr14-8659-ga73421bcf301911f2cbdb1c58316ddf3473ea6d5Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Wed Jan 31 14:44:35 2024 +0000
+
+    libsanitizer: Sync fixes for asan interceptors from upstream
+    
+    This cherry-picks and squashes the differences between commits
+    
+    d3e5c20ab846303874a2a25e5877c72271fc798b..76e1e45922e6709392fb82aac44bebe3dbc2ea63
+    from LLVM upstream from compiler-rt/lib/hwasan/ to GCC on the changes relevant
+    for GCC.
+    
+    This is required to fix the linked PR.
+    
+    As mentioned in the PR the last sync brought in a bug from upstream[1] where
+    operations became non-recoverable and as such the tests in AArch64 started
+    failing.  This cherry picks the fix and there are minor updates needed to GCC
+    after this to fix the cases.
+    
+    [1]https://github.com/llvm/llvm-project/pull/74000PR sanitizer/112644Cherry-pick llvm-project revision
+    672b71cc1003533460a82f06b7d24fbdc02ffd58,
+    5fcf3bbb1acfe226572474636714ede86fffcce8,
+    3bded112d02632209bd55fb28c6c5c234c23dec3 and
+    76e1e45922e6709392fb82aac44bebe3dbc2ea63.
+
+- User: GCC Commits | Time: 2024-01-31 14:50:58 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:0debaceb11dee9781f9a8b320cb5893836324878commitr14-8660-g0debaceb11dee9781f9a8b320cb5893836324878Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Wed Jan 31 14:50:33 2024 +0000
+
+    hwasan: instrument new memory and string functions [PR112644]
+    
+    Recent libhwasan updates[1] intercept various string and memory functions.
+    These functions have checking in them, which means there's no need to
+    inline the checking.
+    
+    This patch marks said functions as intercepted, and adjusts a testcase
+    to handle the difference.  It also looks for HWASAN in a check in
+    expand_builtin.  This check originally is there to avoid using expand to
+    inline the behaviour of builtins like memset which are intercepted by
+    ASAN and hence which we rely on the function call staying as a function
+    call.  With the new reliance on function calls in HWASAN we need to do
+    the same thing for HWASAN too.
+    
+    HWASAN and ASAN don't seem to however instrument the same functions.
+    
+    Looking into libsanitizer/sanitizer_common/sanitizer_common_interceptors_memintrinsics.inc
+    it looks like the common ones are memset, memmove and memcpy.
+    
+    The rest of the routines for asan seem to be defined in
+    compiler-rt/lib/asan/asan_interceptors.h however compiler-rt/lib/hwasan/
+    does not have such a file but it does have
+    compiler-rt/lib/hwasan/hwasan_platform_interceptors.h which it looks like is
+    forcing off everything but memset, memmove, memcpy, memcmp and bcmp.
+    
+    As such I've taken those as the final list that hwasan currently supports.
+    This also means that on future updates this list should be cross checked.
+    
+    [1]https://discourse.llvm.org/t/hwasan-question-about-the-recent-interceptors-being-added/75351gcc/ChangeLog:PR sanitizer/112644* asan.h (asan_intercepted_p): Incercept memset, memmove, memcpy and
+            memcmp.
+            * builtins.cc (expand_builtin): Include HWASAN when checking for
+            builtin inlining.
+    
+    gcc/testsuite/ChangeLog:PR sanitizer/112644* c-c++-common/hwasan/builtin-special-handling.c: Update testcase.
+    
+    Co-Authored-By: Matthew Malcomson <matthew.malcomson@arm.com>
+
+- User: GCC Commits | Time: 2024-01-31 14:52:22 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:0a640455928a050315f6addd88ace5d945eba130commitr14-8661-g0a640455928a050315f6addd88ace5d945eba130Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Wed Jan 31 14:51:36 2024 +0000
+
+    hwasan: Remove testsuite check for a complaint message [PR112644]
+    
+    With recent updates to hwasan runtime libraries, the error reporting for
+    this particular check is has been reworked.
+    
+    I would question why it has lost this message.  To me it looks strange
+    that num_descriptions_printed is incremented whenever we call
+    PrintHeapOrGlobalCandidate whether that function prints anything or not.
+    (See PrintAddressDescription in libsanitizer/hwasan/hwasan_report.cpp).
+    
+    The message is no longer printed because we increment this
+    num_descriptions_printed variable indicating that we have found some
+    description.
+    
+    I would like to question this upstream, but it doesn't look that much of
+    a problem and if pressed for time we should just change our testsuite.
+    Bootstrapped Regtested on aarch64-none-linux-gnu and no issues.
+    
+    gcc/testsuite/ChangeLog:PR sanitizer/112644* c-c++-common/hwasan/hwasan-thread-clears-stack.c: Update testcase.
+
+- User: Tamar Christina | Time: 2024-01-31 14:54:30 UTC
+  Text: Fixed. Thanks
+

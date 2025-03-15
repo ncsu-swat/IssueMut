@@ -1,0 +1,297 @@
+Bug Summary: [11/12/13/14 Regression] Optimization eliminating necessary assignment before 0-byte memcpy since r10-5451
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 9.5.0
+Known to Fail: 10.5.0, 14.0
+
+Comments:
+- User: Eric Rosenberger | Time: 2023-08-05 15:46:37 UTC
+  Text: Given the attached source file, when compiled with "g++ -O2 test.cpp", no code is generated for the line "val_int = 0;" in the Int8_buf constructor. In the case where the memcpy on the following line is instructed to copy 0 bytes, this results in val_int remaining uninitialized (and just containing whatever random value was in memory previously).
+
+In this test program, the result is that the output from main() is "49 49", when it should be "49 0". (This is because the second 49 is the value remaining in stack memory from the first call to foo(...) that is never initialized to 0 by the skipped line.)
+
+If the skipped line is changed to initialize to a value other than 0, then correct code is generated. If compiled with -O1, correct code is also generated.
+
+Using Compiler Explorer it appears that gcc 9 and earlier produce the correct code, and gcc 10 is the first version to produce incorrect code.
+
+gcc -v:
+Using built-in specs.
+COLLECT_GCC=/usr/bin/gcc
+COLLECT_LTO_WRAPPER=/usr/lib/gcc/x86_64-linux-gnu/11/lto-wrapper
+OFFLOAD_TARGET_NAMES=nvptx-none:amdgcn-amdhsa
+OFFLOAD_TARGET_DEFAULT=1
+Target: x86_64-linux-gnu
+Configured with: ../src/configure -v --with-pkgversion='Ubuntu 11.4.0-1ubuntu1~22.04' --with-bugurl=file:///usr/share/doc/gcc-11/README.Bugs --enable-languages=c,ada,c++,go,brig,d,fortran,objc,obj-c++,m2 --prefix=/usr --with-gcc-major-version-only --program-suffix=-11 --program-prefix=x86_64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/lib --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --enable-bootstrap --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-gnu-unique-object --disable-vtable-verify --enable-plugin --enable-default-pie --with-system-zlib --enable-libphobos-checking=release --with-target-system-zlib=auto --enable-objc-gc=auto --enable-multiarch --disable-werror --enable-cet --with-arch-32=i686 --with-abi=m64 --with-multilib-list=m32,m64,mx32 --enable-multilib --with-tune=generic --enable-offload-targets=nvptx-none=/build/gcc-11-XeT9lY/gcc-11-11.4.0/debian/tmp-nvptx/usr,amdgcn-amdhsa=/build/gcc-11-XeT9lY/gcc-11-11.4.0/debian/tmp-gcn/usr --without-cuda-driver --enable-checking=release --build=x86_64-linux-gnu --host=x86_64-linux-gnu --target=x86_64-linux-gnu --with-build-config=bootstrap-lto-lean --enable-link-serialization=2
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 11.4.0 (Ubuntu 11.4.0-1ubuntu1~22.04)
+
+- User: Eric Rosenberger | Time: 2023-08-05 15:47:37 UTC
+  Text: Createdattachment 55693[details]Test program
+
+Note: preprocessed .ii is too big to attach
+
+- User: Andrew Pinski | Time: 2023-08-05 16:14:38 UTC
+  Text: Confirmed, The strlen pass is removing it ...
+
+Self contained testcase:
+```
+
+struct Int8_buf
+{
+    Int8_buf(const char* s, __SIZE_TYPE__ l)
+    {
+        val_int = 0;
+        __builtin_memcpy(&val_int, s, l!=0);
+    }
+
+    unsigned char val_int;
+};
+
+int __attribute__ ((noinline)) foo(const char* s, __SIZE_TYPE__ l)
+{
+    Int8_buf b(s, l);
+    return b.val_int;
+}
+
+int main()
+{
+    const char *cs="123456";
+    int a = foo(cs, __builtin_strlen(cs) - 5);
+    int b = foo(cs, __builtin_strlen(cs) - 6);
+    if (a != '1')
+     __builtin_abort();
+    if (b != 0)
+     __builtin_abort();
+}
+```
+
+- User: Jakub Jelinek | Time: 2023-08-29 15:50:32 UTC
+  Text: Started withr10-5451-gef29b12cfbb4979a89b3cC testcase for -O2:
+__attribute__ ((noipa)) int
+foo (const char *s, unsigned long l)
+{
+  unsigned char r = 0;
+  __builtin_memcpy (&r, s, l != 0);
+  return r;
+}
+
+int
+main ()
+{
+  const char *p = "123456";
+  int a = foo (p, __builtin_strlen (p) - 5);
+  int b = foo (p, __builtin_strlen (p) - 6);
+  if (a != '1')
+    __builtin_abort ();
+  if (b != 0)
+    __builtin_abort ();
+}
+
+- User: Jakub Jelinek | Time: 2023-08-29 16:55:52 UTC
+  Text: Createdattachment 55813[details]gcc14-pr110914.patch
+
+Untested fix.
+
+The bogus change in the above mentioned commit was the:
+   if (olddsi != NULL
+-      && tree_fits_uhwi_p (len)
+       && !integer_zerop (len))
+-    adjust_last_stmt (olddsi, stmt, false);
++    {
++      maybe_warn_overflow (stmt, len, rvals, olddsi, false, true);
++      adjust_last_stmt (olddsi, stmt, false);
++    }
+part.  I haven't analyzed what exactly maybe_warn_overflow does, it is some warning stuff and perhaps can be called when len is not constant, but the previous guarding of adjust_last_stmt was completely intentional.
+As adjust_last_stmt function comment says:
+    If the last .MEM setter statement before STMT is
+    memcpy (x, y, strlen (y) + 1), the only .MEM use of it is STMT
+    and STMT is known to overwrite x[strlen (x)], adjust the last memcpy to
+    just memcpy (x, y, strlen (y)).  SI must be the zero length
+    strinfo.
+so obviously the fact that memcpy (the second one) doesn't have last argument constant 0 doesn't mean that it is non-zero length memcpy, we only know it either if it is constant non-zero length, or variable where say value-range could prove it is not zero.  We have an adjust_last_stmt call later in the function which handles length of strlen (x) + 1 though.  So, this patch just reverts the guard of that function back to what it was before.
+
+- User: GCC Commits | Time: 2023-08-30 09:22:54 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:398842e7038ea0f34054f0f694014d0ecd656846commitr14-3564-g398842e7038ea0f34054f0f694014d0ecd656846Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Aug 30 11:21:45 2023 +0200
+
+    tree-ssa-strlen: Fix up handling of conditionally zero memcpy [PR110914]
+    
+    The following testcase is miscompiled sincer279392akar10-5451-gef29b12cfbb4979The strlen pass has adjust_last_stmt function, which performs mainly strcat
+    or strcat-like optimizations (say strcpy (x, "abcd"); strcat (x, p);
+    or equivalent memcpy (x, "abcd", strlen ("abcd") + 1); char *q = strchr (x, 0);
+    memcpy (x, p, strlen (p)); etc. where the first stmt stores '\0' character
+    at the end but next immediately overwrites it and so the first memcpy can be
+    adjusted to store 1 fewer bytes.  handle_builtin_memcpy called this function
+    in two spots, the first one guarded like:
+      if (olddsi != NULL
+          && tree_fits_uhwi_p (len)
+          && !integer_zerop (len))
+        adjust_last_stmt (olddsi, stmt, false);
+    i.e. only for constant non-zero length.  The other spot can call it even
+    for non-constant length but in that case we punt before that if that length
+    isn't length of some string + 1, so again non-zero.
+    Ther279392change I assume wanted to add some warning stuff and changed it
+    like
+       if (olddsi != NULL
+    -      && tree_fits_uhwi_p (len)
+           && !integer_zerop (len))
+    -    adjust_last_stmt (olddsi, stmt, false);
+    +    {
+    +      maybe_warn_overflow (stmt, len, rvals, olddsi, false, true);
+    +      adjust_last_stmt (olddsi, stmt, false);
+    +    }
+    While maybe_warn_overflow possibly handles non-constant length fine,
+    adjust_last_stmt really relies on length to be non-zero, which
+    !integer_zerop (len) alone doesn't guarantee.  While we could for
+    len being SSA_NAME ask the ranger or tree_expr_nonzero_p, I think
+    adjust_last_stmt will not benefit from it much, so the following patch
+    just restores the above condition/previous behavior for the adjust_last_stmt
+    call only.
+    
+    2023-08-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/110914* tree-ssa-strlen.cc (strlen_pass::handle_builtin_memcpy): Don't call
+            adjust_last_stmt unless len is known constant.
+    
+            * gcc.c-torture/execute/pr110914.c: New test.
+
+- User: GCC Commits | Time: 2023-08-30 09:33:15 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:8b3d6cfad21a61cdc65bb0bb445cba907c190c21commitr13-7768-g8b3d6cfad21a61cdc65bb0bb445cba907c190c21Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Aug 30 11:21:45 2023 +0200
+
+    tree-ssa-strlen: Fix up handling of conditionally zero memcpy [PR110914]
+    
+    The following testcase is miscompiled sincer279392akar10-5451-gef29b12cfbb4979The strlen pass has adjust_last_stmt function, which performs mainly strcat
+    or strcat-like optimizations (say strcpy (x, "abcd"); strcat (x, p);
+    or equivalent memcpy (x, "abcd", strlen ("abcd") + 1); char *q = strchr (x, 0);
+    memcpy (x, p, strlen (p)); etc. where the first stmt stores '\0' character
+    at the end but next immediately overwrites it and so the first memcpy can be
+    adjusted to store 1 fewer bytes.  handle_builtin_memcpy called this function
+    in two spots, the first one guarded like:
+      if (olddsi != NULL
+          && tree_fits_uhwi_p (len)
+          && !integer_zerop (len))
+        adjust_last_stmt (olddsi, stmt, false);
+    i.e. only for constant non-zero length.  The other spot can call it even
+    for non-constant length but in that case we punt before that if that length
+    isn't length of some string + 1, so again non-zero.
+    Ther279392change I assume wanted to add some warning stuff and changed it
+    like
+       if (olddsi != NULL
+    -      && tree_fits_uhwi_p (len)
+           && !integer_zerop (len))
+    -    adjust_last_stmt (olddsi, stmt, false);
+    +    {
+    +      maybe_warn_overflow (stmt, len, rvals, olddsi, false, true);
+    +      adjust_last_stmt (olddsi, stmt, false);
+    +    }
+    While maybe_warn_overflow possibly handles non-constant length fine,
+    adjust_last_stmt really relies on length to be non-zero, which
+    !integer_zerop (len) alone doesn't guarantee.  While we could for
+    len being SSA_NAME ask the ranger or tree_expr_nonzero_p, I think
+    adjust_last_stmt will not benefit from it much, so the following patch
+    just restores the above condition/previous behavior for the adjust_last_stmt
+    call only.
+    
+    2023-08-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/110914* tree-ssa-strlen.cc (strlen_pass::handle_builtin_memcpy): Don't call
+            adjust_last_stmt unless len is known constant.
+    
+            * gcc.c-torture/execute/pr110914.c: New test.
+    
+    (cherry picked from commit 398842e7038ea0f34054f0f694014d0ecd656846)
+
+- User: GCC Commits | Time: 2023-08-30 09:49:44 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:487390818c6b10daa29dd1db205fa8566296c084commitr12-9837-g487390818c6b10daa29dd1db205fa8566296c084Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Aug 30 11:21:45 2023 +0200
+
+    tree-ssa-strlen: Fix up handling of conditionally zero memcpy [PR110914]
+    
+    The following testcase is miscompiled sincer279392akar10-5451-gef29b12cfbb4979The strlen pass has adjust_last_stmt function, which performs mainly strcat
+    or strcat-like optimizations (say strcpy (x, "abcd"); strcat (x, p);
+    or equivalent memcpy (x, "abcd", strlen ("abcd") + 1); char *q = strchr (x, 0);
+    memcpy (x, p, strlen (p)); etc. where the first stmt stores '\0' character
+    at the end but next immediately overwrites it and so the first memcpy can be
+    adjusted to store 1 fewer bytes.  handle_builtin_memcpy called this function
+    in two spots, the first one guarded like:
+      if (olddsi != NULL
+          && tree_fits_uhwi_p (len)
+          && !integer_zerop (len))
+        adjust_last_stmt (olddsi, stmt, false);
+    i.e. only for constant non-zero length.  The other spot can call it even
+    for non-constant length but in that case we punt before that if that length
+    isn't length of some string + 1, so again non-zero.
+    Ther279392change I assume wanted to add some warning stuff and changed it
+    like
+       if (olddsi != NULL
+    -      && tree_fits_uhwi_p (len)
+           && !integer_zerop (len))
+    -    adjust_last_stmt (olddsi, stmt, false);
+    +    {
+    +      maybe_warn_overflow (stmt, len, rvals, olddsi, false, true);
+    +      adjust_last_stmt (olddsi, stmt, false);
+    +    }
+    While maybe_warn_overflow possibly handles non-constant length fine,
+    adjust_last_stmt really relies on length to be non-zero, which
+    !integer_zerop (len) alone doesn't guarantee.  While we could for
+    len being SSA_NAME ask the ranger or tree_expr_nonzero_p, I think
+    adjust_last_stmt will not benefit from it much, so the following patch
+    just restores the above condition/previous behavior for the adjust_last_stmt
+    call only.
+    
+    2023-08-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/110914* tree-ssa-strlen.cc (strlen_pass::handle_builtin_memcpy): Don't call
+            adjust_last_stmt unless len is known constant.
+    
+            * gcc.c-torture/execute/pr110914.c: New test.
+    
+    (cherry picked from commit 398842e7038ea0f34054f0f694014d0ecd656846)
+
+- User: GCC Commits | Time: 2023-08-30 09:57:58 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:cf3aa538317d6c525739f339b79010ae82dc20f5commitr11-10969-gcf3aa538317d6c525739f339b79010ae82dc20f5Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Aug 30 11:21:45 2023 +0200
+
+    tree-ssa-strlen: Fix up handling of conditionally zero memcpy [PR110914]
+    
+    The following testcase is miscompiled sincer279392akar10-5451-gef29b12cfbb4979The strlen pass has adjust_last_stmt function, which performs mainly strcat
+    or strcat-like optimizations (say strcpy (x, "abcd"); strcat (x, p);
+    or equivalent memcpy (x, "abcd", strlen ("abcd") + 1); char *q = strchr (x, 0);
+    memcpy (x, p, strlen (p)); etc. where the first stmt stores '\0' character
+    at the end but next immediately overwrites it and so the first memcpy can be
+    adjusted to store 1 fewer bytes.  handle_builtin_memcpy called this function
+    in two spots, the first one guarded like:
+      if (olddsi != NULL
+          && tree_fits_uhwi_p (len)
+          && !integer_zerop (len))
+        adjust_last_stmt (olddsi, stmt, false);
+    i.e. only for constant non-zero length.  The other spot can call it even
+    for non-constant length but in that case we punt before that if that length
+    isn't length of some string + 1, so again non-zero.
+    Ther279392change I assume wanted to add some warning stuff and changed it
+    like
+       if (olddsi != NULL
+    -      && tree_fits_uhwi_p (len)
+           && !integer_zerop (len))
+    -    adjust_last_stmt (olddsi, stmt, false);
+    +    {
+    +      maybe_warn_overflow (stmt, len, rvals, olddsi, false, true);
+    +      adjust_last_stmt (olddsi, stmt, false);
+    +    }
+    While maybe_warn_overflow possibly handles non-constant length fine,
+    adjust_last_stmt really relies on length to be non-zero, which
+    !integer_zerop (len) alone doesn't guarantee.  While we could for
+    len being SSA_NAME ask the ranger or tree_expr_nonzero_p, I think
+    adjust_last_stmt will not benefit from it much, so the following patch
+    just restores the above condition/previous behavior for the adjust_last_stmt
+    call only.
+    
+    2023-08-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/110914* tree-ssa-strlen.c (strlen_pass::handle_builtin_memcpy): Don't call
+            adjust_last_stmt unless len is known constant.
+    
+            * gcc.c-torture/execute/pr110914.c: New test.
+    
+    (cherry picked from commit 398842e7038ea0f34054f0f694014d0ecd656846)
+
+- User: Jakub Jelinek | Time: 2023-08-30 10:00:11 UTC
+  Text: Fixed.
+

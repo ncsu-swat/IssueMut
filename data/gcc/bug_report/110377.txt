@@ -1,0 +1,206 @@
+Bug Summary: Early VRP and IPA-PROP should work out value ranges from __builtin_unreachable
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jan Hubicka | Time: 2023-06-23 15:37:29 UTC
+  Text: In the following testcase
+void test2(int);
+void
+test(int n)
+{
+        if (n > 5)
+          __builtin_unreachable ();
+        test2(n);
+}
+we should work out that value range of n passed to test2 is [INT_MIN,4].
+This would help optimizing some code in libstdc++, which now uses similar constructs to ensure known value ranges.
+
+I think it is a common case where such unreachable test can be retrofited to the SSA_NAME based on the fact that program can not terminate between definition and the conditional.
+
+We currently get:
+  function  test/0 parameter descriptors:
+    param #0 n used undescribed_use
+  Jump functions of caller  test/0:
+    callsite  test/0 -> test2/2 : 
+       param 0: PASS THROUGH: 0, op nop_expr
+         value: 0x0, mask: 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+         Unknown VR
+    callsite  test/0 -> __builtin_unreachable/1 :
+
+- User: Richard Biener | Time: 2023-06-26 08:56:38 UTC
+  Text: I think the [[assume]] stuff can actually do this
+
+- User: Andrew Macleod | Time: 2023-06-26 14:20:18 UTC
+  Text: (In reply to Jan Hubicka fromcomment #0)> In the following testcase
+> void test2(int);
+> void
+> test(int n)
+> {
+>         if (n > 5)
+>           __builtin_unreachable ();
+>         test2(n);
+> }
+> we should work out that value range of n passed to test2 is [INT_MIN,4].
+> This would help optimizing some code in libstdc++, which now uses similar
+> constructs to ensure known value ranges.Ranger does already know this at the call site (this is output from what it know during EVRP for instance):
+
+=========== BB 4 ============
+n_1(D)  [irange] int [-INF, 5]
+    <bb 4> :
+    test2 (n_1(D));
+    return;
+
+All you need to do is either query a ranger during processing of the parameter, or tag the parameter on the call at some point..  It would be far more effective than trying to use global ranges to communicate the information.
+
+I had always presumed we would eventually get to the place where we can use context sensitive range information at each call site during IPA analysis.  And that likewise, we'd communicate back at call sites what the return range might be when available.  (That would be a range query at the return locations of the value on the return)
+
+- User: Jan Hubicka | Time: 2023-06-26 16:48:47 UTC
+  Text: IPA code takes value ranges from jump functions that are computed by ipa-prop::ipa_compute_jump_functions_for_edge which seems to do:
+          if (TREE_CODE (arg) == SSA_NAME
+              && param_type
+              /* Limit the ranger query to integral types as the rest
+                 of this file uses value_range's, which only hold
+                 integers and pointers.  */
+              && irange::supports_p (TREE_TYPE (arg))
+              && irange::supports_p (param_type)
+              && get_range_query (cfun)->range_of_expr (vr, arg)
+              && !vr.undefined_p ())
+Which looks like a ragner query. I wonder why it does not return the limited range?
+
+- User: Andrew Macleod | Time: 2023-06-26 19:49:33 UTC
+  Text: If I were to guess, I'd guess that its using the default query which simply picks up global ranges from the global_range_query.
+
+If enable_range() was called at the start, and disable_ranger() at the end of the pass, it would switch to a  context sensitive query.. as long as the IL isnt going thru too much funny stuff.
+
+My guess is Aldy has been converting the OLD API to rangers API, and simply hasn't enabled a context ranger yet... Or if he even had plans for that..   Aldy?
+
+- User: Jan Hubicka | Time: 2023-06-27 07:45:01 UTC
+  Text: OK,
+I think we want to use ranger in the analysis stage then. I am testing
+the following.
+
+diff --git a/gcc/ipa-prop.cc b/gcc/ipa-prop.cc
+index 704fe01b02c..4bc142e1471 100644
+--- a/gcc/ipa-prop.cc
++++ b/gcc/ipa-prop.cc
+@@ -2339,7 +2339,8 @@ ipa_set_jfunc_vr (ipa_jump_func *jf, value_range *tmp)
+ 
+ static void
+ ipa_compute_jump_functions_for_edge (struct ipa_func_body_info *fbi,
+-                                    struct cgraph_edge *cs)
++                                    struct cgraph_edge *cs,
++                                    gimple_ranger *ranger)
+ {
+   ipa_node_params *info = ipa_node_params_sum->get (cs->caller);
+   ipa_edge_args *args = ipa_edge_args_sum->get_create (cs);
+@@ -2384,7 +2385,7 @@ ipa_compute_jump_functions_for_edge (struct ipa_func_body_info *fbi,
+ 
+          if (TREE_CODE (arg) == SSA_NAME
+              && param_type
+-             && get_range_query (cfun)->range_of_expr (vr, arg)
++             && get_range_query (cfun)->range_of_expr (vr, arg, cs->call_stmt)
+              && vr.nonzero_p ())
+            addr_nonzero = true;
+          else if (tree_single_nonzero_warnv_p (arg, &strict_overflow))
+@@ -2407,7 +2408,7 @@ ipa_compute_jump_functions_for_edge (struct ipa_func_body_info *fbi,
+                 integers and pointers.  */
+              && irange::supports_p (TREE_TYPE (arg))
+              && irange::supports_p (param_type)
+-             && get_range_query (cfun)->range_of_expr (vr, arg)
++             && ranger->range_of_expr (vr, arg, cs->call_stmt)
+              && !vr.undefined_p ())
+            {
+              value_range resvr = vr;
+@@ -2516,7 +2517,8 @@ ipa_compute_jump_functions_for_edge (struct ipa_func_body_info *fbi,
+    from BB.  */
+ 
+ static void
+-ipa_compute_jump_functions_for_bb (struct ipa_func_body_info *fbi, basic_block bb)
++ipa_compute_jump_functions_for_bb (struct ipa_func_body_info *fbi, basic_block bb,
++                                  gimple_ranger *ranger)
+ {
+   struct ipa_bb_info *bi = ipa_get_bb_info (fbi, bb);
+   int i;
+@@ -2535,7 +2537,7 @@ ipa_compute_jump_functions_for_bb (struct ipa_func_body_info *fbi, basic_block b
+              && !gimple_call_fnspec (cs->call_stmt).known_p ())
+            continue;
+        }
+-      ipa_compute_jump_functions_for_edge (fbi, cs);
++      ipa_compute_jump_functions_for_edge (fbi, cs, ranger);
+     }
+ }
+ 
+@@ -3109,19 +3111,27 @@ class analysis_dom_walker : public dom_walker
+ {
+ public:
+   analysis_dom_walker (struct ipa_func_body_info *fbi)
+-    : dom_walker (CDI_DOMINATORS), m_fbi (fbi) {}
++    : dom_walker (CDI_DOMINATORS), m_fbi (fbi)
++  {
++    m_ranger = enable_ranger (cfun, false);
++  }
++  ~analysis_dom_walker ()
++  {
++    disable_ranger (cfun);
++  }
+ 
+   edge before_dom_children (basic_block) final override;
+ 
+ private:
+   struct ipa_func_body_info *m_fbi;
++  gimple_ranger *m_ranger;
+ };
+ 
+ edge
+ analysis_dom_walker::before_dom_children (basic_block bb)
+ {
+   ipa_analyze_params_uses_in_bb (m_fbi, bb);
+-  ipa_compute_jump_functions_for_bb (m_fbi, bb);
++  ipa_compute_jump_functions_for_bb (m_fbi, bb, m_ranger);
+   return NULL;
+ }
+ 
+diff --git a/gcc/testsuite/gcc.dg/tree-ssa/pr110377.c b/gcc/testsuite/gcc.dg/tree-ssa/pr110377.c
+new file mode 100644
+index 00000000000..d770f8babba
+--- /dev/null
++++ b/gcc/testsuite/gcc.dg/tree-ssa/pr110377.c
+@@ -0,0 +1,17 @@
++/* { dg-do compile */
++/* { dg-options "-O2 -fdump-ipa-fnsummary" } */
++int test3(int);
++__attribute__ ((noinline))
++void test2(int a)
++{
++       test3(a);
++}
++void
++test(int n)
++{
++        if (n > 5)
++          __builtin_unreachable ();
++        test2(n);
++}
++/* { dg-final { scan-tree-dump "-INF, 5-INF" "fnsummary" } }  */
+
+- User: GCC Commits | Time: 2023-06-28 07:35:43 UTC
+  Text: The master branch has been updated by Jan Hubicka <hubicka@gcc.gnu.org>:https://gcc.gnu.org/g:7198573f44fb579843bff8deda695107858d8cffcommitr14-2152-g7198573f44fb579843bff8deda695107858d8cffAuthor: Jan Hubicka <jh@suse.cz>
+Date:   Wed Jun 28 09:34:53 2023 +0200
+
+    Enable ranger for ipa-prop
+    
+    gcc/ChangeLog:PR tree-optimization/110377* ipa-prop.cc (ipa_compute_jump_functions_for_edge): Pass statement to
+            the ranger query.
+            (ipa_analyze_node): Enable ranger.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/110377* gcc.dg/ipa/pr110377.c: New test.
+
+- User: Jan Hubicka | Time: 2023-11-21 15:12:57 UTC
+  Text: Fixed.
+

@@ -1,0 +1,287 @@
+Bug Summary: kmovw storing to memory is assumed to zero-extend
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 12.4.1, 13.3.1, 14.2.1, 15.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-10-15 16:02:43 UTC
+  Text: Createdattachment 59352[details]reduced testcase
+
+Output (using Intel SDE):
+$ x86_64-pc-linux-gnu-gcc -mavx512bw -Os testcase.c
+$ for I in `seq 1 10`; do sde -cnl -- ./a.out; done
+Aborted
+000000000000000000000000Aborted
+0000000000000000Aborted
+00000000Aborted
+
+The output is random, depending on how the stack is initialized.
+
+In the ASM code:
+...
+# testcase.c:10:   unsigned k = __builtin_ia32_pcmpgtd512_mask ((V) { }, v, m);
+	kmovw	WORD PTR [rsp+44], k0	# %sfp, tmp120
+# testcase.c:11:   W r = (W) k + w;
+	vmovd	xmm1, DWORD PTR [rsp+44]	# tmp121, %sfp
+...
+
+kmovw stores only word, but vmovd loads whole dword
+
+According to Intel SDM, KMOVW operates as:
+
+KMOVW
+IF *destination is a memory location*
+DEST[15:0] := SRC[15:0]
+IF *destination is a mask register or a GPR *
+DEST := ZeroExtension(SRC[15:0])
+
+
+eg. the zero-extension is done only when storing to memory.
+I cannot verify this on a real hardware.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r15-4354-20241015190608-g97f98855d41-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r15-4354-20241015190608-g97f98855d41-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 15.0.0 20241014 (experimental) (GCC)
+
+- User: Hongtao Liu | Time: 2024-10-16 02:03:53 UTC
+  Text: zero_extend is transformed into a subreg which make reload think the upper part is garbage, it's related to below pattern, I'll take a look.
+
+ 4299;; Since vpcmpd implicitly clear the upper bits of dest, transform                                                                                                                                                                                       
+ 4300;; vpcmpd + zero_extend to vpcmpd since the instruction                                                                                                                                                                                                  
+ 4301(define_insn_and_split "*<avx512>_cmp<V48H_AVX512VL:mode>3_zero_extend<SWI248x:mode>"                                                                                                                                                                    
+ 4302  [(set (match_operand:SWI248x 0 "register_operand")                                                                                                                                                                                                     
+ 4303    (zero_extend:SWI248x                                                                                                                                                                                                                                 
+ 4304      (unspec:<V48H_AVX512VL:avx512fmaskmode>                                                                                                                                                                                                            
+ 4305        [(match_operand:V48H_AVX512VL 1 "nonimmediate_operand")                                                                                                                                                                                          
+ 4306         (match_operand:V48H_AVX512VL 2 "nonimmediate_operand")                                                                                                                                                                                          
+ 4307         (match_operand:SI 3 "const_0_to_7_operand")]                                                                                                                                                                                                    
+ 4308        UNSPEC_PCMP)))]                                                                                                                                                                                                                                  
+ 4309  "TARGET_AVX512F                                                                                                                                                                                                                                        
+ 4310   && (!VALID_MASK_AVX512BW_MODE (<SWI248x:MODE>mode) || TARGET_AVX512BW)                                                                                                                                                                                
+ 4311   && ix86_pre_reload_split ()                                                                                                                                                                                                                           
+ 4312   && (GET_MODE_NUNITS (<V48H_AVX512VL:MODE>mode)                                                                                                                                                                                                        
+ 4313      < GET_MODE_PRECISION (<SWI248x:MODE>mode))"                                                                                                                                                                                                        
+ 4314  "#"                                                                                                                                                                                                                                                    
+ 4315  "&& 1"                                                                                                                                                                                                                                                 
+ 4316  [(set (match_dup 0)                                                                                                                                                                                                                                    
+ 4317    (unspec:<V48H_AVX512VL:avx512fmaskmode>                                                                                                                                                                                                              
+ 4318      [(match_dup 1)                                                                                                                                                                                                                                     
+ 4319       (match_dup 2)                                                                                                                                                                                                                                     
+ 4320       (match_dup 3)]                                                                                                                                                                                                                                    
+ 4321      UNSPEC_PCMP))]                                                                                                                                                                                                                                     
+ 4322{                                                                                                                                                                                                                                                        
+ 4323  operands[1] = force_reg (<V48H_AVX512VL:MODE>mode, operands[1]);                                                                                                                                                                                       
+ 4324  operands[0] = lowpart_subreg (<V48H_AVX512VL:avx512fmaskmode>mode,                                                                                                                                                                                     
+ 4325                 operands[0], <SWI248x:MODE>mode);                                                                                                                                                                                                       
+ 4326}                                                                                                                                                                                                                                                        
+ 4327  [(set_attr "type" "ssecmp")                                                                                                                                                                                                                            
+ 4328   (set_attr "length_immediate" "1")                                                                                                                                                                                                                     
+ 4329   (set_attr "prefix" "evex")                                                                                                                                                                                                                            
+ 4330   (set_attr "mode" "<V48H_AVX512VL:sseinsnmode>")])
+
+- User: Hongtao Liu | Time: 2024-10-16 05:41:04 UTC
+  Text: typedef __attribute__((__vector_size__ (4))) unsigned char W;
+typedef __attribute__((__vector_size__ (64))) int V;
+typedef __attribute__((__vector_size__ (64))) long long Vq;
+
+W w;
+V v;
+Vq vq;
+
+static inline W
+foo (short m)
+{
+  unsigned k = __builtin_ia32_pcmpgtq512_mask ((Vq) { }, vq, m);
+  W r = (W) k + w;
+  return r;
+}
+
+static inline W
+foo1 (short m)
+{
+  unsigned k = __builtin_ia32_pcmpgtd512_mask ((V) {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, v, m);
+  W r = (W) k + w;
+  return r;
+}
+
+int
+main ()
+{
+  if (!__builtin_cpu_supports ("avx512bw"))
+    return 0;
+  W y = foo1 (65535);
+  if (!y[0] || !y[1] || y[2] || y[3])
+    __builtin_abort();
+  W x = foo (65535);
+  if (x[0] || x[1] || x[2] || x[3])
+    __builtin_abort();
+
+  return 0;
+}
+
+
+This is the testcase to reproduce the issue.
+
+- User: GCC Commits | Time: 2024-10-21 02:29:02 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:5259d3927c1c8e3a15b4b844adef59b48c241233commitr15-4510-g5259d3927c1c8e3a15b4b844adef59b48c241233Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Oct 16 13:43:48 2024 +0800
+
+    Refine splitters related to "combine vpcmpuw + zero_extend to vpcmpuw"r12-6103-g1a7ce8570997ebcombines vpcmpuw + zero_extend to vpcmpuw
+    with the pre_reload splitter, but the splitter transforms the
+    zero_extend into a subreg which make reload think the upper part is
+    garbage, it's not correct.
+    
+    The patch adjusts the zero_extend define_insn_and_split to
+    define_insn to keep zero_extend.
+    
+    gcc/ChangeLog:PR target/117159* config/i386/sse.md
+            (*<avx512>_cmp<V48H_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Change from define_insn_and_split to define_insn.
+            (*<avx512>_cmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Ditto.
+            (*<avx512>_ucmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Ditto.
+            (*<avx512>_ucmp<VI48_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Ditto.
+            (*<avx512>_cmp<V48H_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Split to the zero_extend pattern.
+            (*<avx512>_cmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Ditto.
+            (*<avx512>_ucmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Ditto.
+            (*<avx512>_ucmp<VI48_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr117159.c: New test.
+            * gcc.target/i386/avx512bw-pr103750-1.c: Remove xfail.
+            * gcc.target/i386/avx512bw-pr103750-2.c: Remove xfail.
+
+- User: GCC Commits | Time: 2024-10-21 02:29:32 UTC
+  Text: The releases/gcc-14 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:79e7e02b7cc578d03eab2b50c029f44409ef8e26commitr14-10807-g79e7e02b7cc578d03eab2b50c029f44409ef8e26Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Oct 16 13:43:48 2024 +0800
+
+    Refine splitters related to "combine vpcmpuw + zero_extend to vpcmpuw"r12-6103-g1a7ce8570997ebcombines vpcmpuw + zero_extend to vpcmpuw
+    with the pre_reload splitter, but the splitter transforms the
+    zero_extend into a subreg which make reload think the upper part is
+    garbage, it's not correct.
+    
+    The patch adjusts the zero_extend define_insn_and_split to
+    define_insn to keep zero_extend.
+    
+    gcc/ChangeLog:PR target/117159* config/i386/sse.md
+            (*<avx512>_cmp<V48H_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Change from define_insn_and_split to define_insn.
+            (*<avx512>_cmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Ditto.
+            (*<avx512>_ucmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Ditto.
+            (*<avx512>_ucmp<VI48_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Ditto.
+            (*<avx512>_cmp<V48H_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Split to the zero_extend pattern.
+            (*<avx512>_cmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Ditto.
+            (*<avx512>_ucmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Ditto.
+            (*<avx512>_ucmp<VI48_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr117159.c: New test.
+            * gcc.target/i386/avx512bw-pr103750-1.c: Remove xfail.
+            * gcc.target/i386/avx512bw-pr103750-2.c: Remove xfail.
+    
+    (cherry picked from commit 5259d3927c1c8e3a15b4b844adef59b48c241233)
+
+- User: GCC Commits | Time: 2024-10-21 03:24:58 UTC
+  Text: The releases/gcc-13 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:fca35b417c236e3448bc3666820fd1ba423fe6e9commitr13-9139-gfca35b417c236e3448bc3666820fd1ba423fe6e9Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Oct 16 13:43:48 2024 +0800
+
+    Refine splitters related to "combine vpcmpuw + zero_extend to vpcmpuw"r12-6103-g1a7ce8570997ebcombines vpcmpuw + zero_extend to vpcmpuw
+    with the pre_reload splitter, but the splitter transforms the
+    zero_extend into a subreg which make reload think the upper part is
+    garbage, it's not correct.
+    
+    The patch adjusts the zero_extend define_insn_and_split to
+    define_insn to keep zero_extend.
+    
+    gcc/ChangeLog:PR target/117159* config/i386/sse.md
+            (*<avx512>_cmp<V48H_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Change from define_insn_and_split to define_insn.
+            (*<avx512>_cmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Ditto.
+            (*<avx512>_ucmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Ditto.
+            (*<avx512>_ucmp<VI48_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Ditto.
+            (*<avx512>_cmp<V48H_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Split to the zero_extend pattern.
+            (*<avx512>_cmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Ditto.
+            (*<avx512>_ucmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Ditto.
+            (*<avx512>_ucmp<VI48_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr117159.c: New test.
+            * gcc.target/i386/avx512bw-pr103750-1.c: Remove xfail.
+            * gcc.target/i386/avx512bw-pr103750-2.c: Remove xfail.
+    
+    (cherry picked from commit 5259d3927c1c8e3a15b4b844adef59b48c241233)
+
+- User: GCC Commits | Time: 2024-10-21 03:26:54 UTC
+  Text: The releases/gcc-12 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:91800a70a2af1349eefc5f3380be2b254b1db395commitr12-10778-g91800a70a2af1349eefc5f3380be2b254b1db395Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Oct 16 13:43:48 2024 +0800
+
+    Refine splitters related to "combine vpcmpuw + zero_extend to vpcmpuw"r12-6103-g1a7ce8570997ebcombines vpcmpuw + zero_extend to vpcmpuw
+    with the pre_reload splitter, but the splitter transforms the
+    zero_extend into a subreg which make reload think the upper part is
+    garbage, it's not correct.
+    
+    The patch adjusts the zero_extend define_insn_and_split to
+    define_insn to keep zero_extend.
+    
+    gcc/ChangeLog:PR target/117159* config/i386/sse.md
+            (*<avx512>_cmp<V48H_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Change from define_insn_and_split to define_insn.
+            (*<avx512>_cmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Ditto.
+            (*<avx512>_ucmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Ditto.
+            (*<avx512>_ucmp<VI48_AVX512VL:mode>3_zero_extend<SWI248x:mode>):
+            Ditto.
+            (*<avx512>_cmp<V48H_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Split to the zero_extend pattern.
+            (*<avx512>_cmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Ditto.
+            (*<avx512>_ucmp<VI12_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Ditto.
+            (*<avx512>_ucmp<VI48_AVX512VL:mode>3_zero_extend<SWI248x:mode>_2):
+            Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr117159.c: New test.
+            * gcc.target/i386/avx512bw-pr103750-1.c: Remove xfail.
+            * gcc.target/i386/avx512bw-pr103750-2.c: Remove xfail.
+    
+    (cherry picked from commit 5259d3927c1c8e3a15b4b844adef59b48c241233)
+
+- User: Hongtao Liu | Time: 2024-10-21 04:59:54 UTC
+  Text: Fixed everywhere.
+

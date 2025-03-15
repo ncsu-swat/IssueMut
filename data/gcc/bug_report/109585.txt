@@ -1,0 +1,301 @@
+Bug Summary: [10 regression] Carla/sord miscompiled with -O2 on ARM64 with flexible array member
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: alias, wrong-code
+Known to Work: 11.3.1, 12.2.1, 13.1.1, 14.0
+Known to Fail: 10.5.0, 11.3.0, 12.2.0, 13.1.0
+
+Comments:
+- User: Hector Martin | Time: 2023-04-21 10:39:20 UTC
+  Text: Createdattachment 54900[details]Manually annotated disassembly identifying the problem
+
+GCC 12.1.0 miscompiles sord_free() with -O2 due to bad inlining on ARM64. Reproducible on Compiler Explorer on 12.2 and also trunk.https://godbolt.org/z/rvxP1oodh(includes full preprocessed input)
+
+I've attached an annotated disassembly. The problem is that zix_btree_iter_increment() and zix_btree_iter_is_end() are inlined together into sord_free(), but the `i->stack[0].node == NULL` check in zix_btree_iter_is_end() somehow got hoisted before the `f->node = NULL;` in zix_btree_iter_increment(), so the check fails when it pass (ending the loop), and then the loop body goes on to deref a NULL pointer.
+
+- User: Hector Martin | Time: 2023-04-21 10:40:20 UTC
+  Text: Createdattachment 54901[details]Preprocessed input
+
+- User: Richard Biener | Time: 2023-04-21 10:52:51 UTC
+  Text: I wonder if you can provide a harness exercising this at runtime?
+
+Can you try -fno-schedule-insns -fno-schedule-insns2?
+
+- User: Hector Martin | Time: 2023-04-21 11:36:31 UTC
+  Text: Createdattachment 54903[details]lv2 plugin bundle for testing
+
+- User: Hector Martin | Time: 2023-04-21 11:37:37 UTC
+  Text: This whole codebase is complex, and the problem is in btree code which is hard to simplify down. Best I can do right now is this. First grab the lv2.tar.gz attachment and extract it into /tmp. Then:
+
+$ git clonehttps://github.com/falkTX/Carla$ cd Carla && make -C source/modules/lilv
+$ cat > test.c << EOF
+#include "lilv/lilv.h"
+
+int main(int argc, char **argv)
+{
+    LilvWorld* world = lilv_world_new();
+
+    lilv_world_load_all(world, "/tmp/lv2");
+}
+EOF
+$ gcc -I source/includes/ -I source/modules/lilv/lilv-0.24.0/ -o test test.c ./build/modules/Release/lilv.a -lm
+$ ./test
+
+Compiling with -fno-schedule-insns -fno-schedule-insns2 seems to work properly.
+
+- User: Hector Martin | Time: 2023-04-21 16:36:27 UTC
+  Text: Createdattachment 54904[details]self-contained reproducer
+
+- User: Hector Martin | Time: 2023-04-21 16:38:00 UTC
+  Text: Cleaned it up into a self-contained repro. Simply compiling with `gcc -O2 -o test test.c && test` gives a segfault. -O1 or -fno-schedule-insns -fno-schedule-insns2 avoids the issue.
+
+Looking at assembly output on godbolt, it seems this likely goes at least as far back as 11.1 if not earlier.
+
+- User: Andrew Pinski | Time: 2023-04-21 16:43:15 UTC
+  Text: -fno-strict-aliasing also fixes the issue ...
+
+- User: Andrew Pinski | Time: 2023-04-21 16:50:34 UTC
+  Text: Interesting compiling with the C++ front-end (with one minor change of adding a cast to the malloc) does not seg fault at -O2.
+
+- User: Hector Martin | Time: 2023-04-21 16:55:29 UTC
+  Text: Yes, a strict aliasing violation could explain the behavior of the optimizer here... but given all the types are identical and there is no casting going on, clearly there is no strict aliasing violation.
+
+- User: Andrew Pinski | Time: 2023-04-21 17:05:02 UTC
+  Text: If I change zix_btree_iter_is_end to:
+
+ZIX_API bool
+zix_btree_iter_is_end(const struct ZixBTreeIterImpl* const i)
+{
+  if (!i)
+    return 1;
+  if (i->stack[0].node == NULL)
+    return 1;
+  return 0;
+}
+
+Then both the C and C++ front-end generated IR causes the segfault.
+
+- User: Hector Martin | Time: 2023-04-21 17:08:47 UTC
+  Text: Giving a nonzero size to the `ZixBTreeIterFrame stack[]` member also avoids the segfault, so this might be a flexible array member thing.
+
+- User: Andrew Pinski | Time: 2023-04-21 17:16:16 UTC
+  Text: Looks like the aliasing code is getting the flexible array member aliasing wrong.
+
+Replacing:
+ZixBTreeIterFrame stack[];
+
+With:
+ZixBTreeIterFrame stack[1];
+
+Fixes the issue ...
+
+- User: Alexander Monakov | Time: 2023-04-22 21:48:19 UTC
+  Text: The small repro fromcomment #5is reproducible on x86_64 trunk as well with -O2 -DNDEBUG (as well as on older x86_64 branches without -DNDEBUG).
+
+sched2 is lifting
+
+(insn:TI 295 100 101 12 (set (reg:CCZ 17 flags)
+        (compare:CCZ (mem/f:DI (plus:DI (reg/v/f:DI 3 bx [orig:133 t ] [133])
+                    (const_int 8 [0x8])) [2 MEM[(const struct ZixBTreeIter *)t_3(D)].stack[0].node+0 S8 A64])
+            (const_int 0 [0]))) "/app/example.c":65:12 discrim 2 8 {*cmpdi_ccno_1}
+     (nil))
+
+above conflicting 
+
+(insn 101 295 102 12 (set (mem/f:DI (reg/v/f:DI 0 ax [orig:96 f ] [96]) [2 f_69->node+0 S8 A64])
+        (const_int 0 [0])) "/app/example.c":86:14 88 {*movdi_internal}
+     (nil))
+
+- User: Sam James | Time: 2023-04-23 07:06:15 UTC
+  Text: (In reply to Alexander Monakov fromcomment #13)> The small repro fromcomment #5is reproducible on x86_64 trunk as well with
+> -O2 -DNDEBUG (as well as on older x86_64 branches without -DNDEBUG).
+>I'll add x86_64-linux-gnu to target then, hopefully that's alright (unclear b/c it's only the reduced one seemingly).
+
+- User: Hector Martin | Time: 2023-04-23 07:08:07 UTC
+  Text: The prior repro was too complex and depended on other environmental stuff (some other people couldn't repro it on arm64 either), so please ignore it. If the reduced repro triggers the issue, it's the same bug.
+
+- User: Xi Ruoyao | Time: 2023-04-23 07:50:51 UTC
+  Text: (In reply to Hector Martin fromcomment #15)> The prior repro was too complex and depended on other environmental stuff
+> (some other people couldn't repro it on arm64 either), so please ignore it.
+> If the reduced repro triggers the issue, it's the same bug.I can reproduce the issue with the reduced repro on x86_64-linux-gnu too.
+
+- User: Xi Ruoyao | Time: 2023-04-23 07:55:35 UTC
+  Text: With GCC 9 it was fine, but not GCC 10.  I guess we can try a bisect...
+
+- User: Richard Biener | Time: 2023-04-24 06:40:40 UTC
+  Text: (In reply to Alexander Monakov fromcomment #13)> The small repro fromcomment #5is reproducible on x86_64 trunk as well with
+> -O2 -DNDEBUG (as well as on older x86_64 branches without -DNDEBUG).
+> 
+> sched2 is lifting
+> 
+> (insn:TI 295 100 101 12 (set (reg:CCZ 17 flags)
+>         (compare:CCZ (mem/f:DI (plus:DI (reg/v/f:DI 3 bx [orig:133 t ] [133])
+>                     (const_int 8 [0x8])) [2 MEM[(const struct ZixBTreeIter
+> *)t_3(D)].stack[0].node+0 S8 A64])
+>             (const_int 0 [0]))) "/app/example.c":65:12 discrim 2 8
+> {*cmpdi_ccno_1}
+>      (nil))
+> 
+> above conflicting 
+> 
+> (insn 101 295 102 12 (set (mem/f:DI (reg/v/f:DI 0 ax [orig:96 f ] [96]) [2
+> f_69->node+0 S8 A64])
+>         (const_int 0 [0])) "/app/example.c":86:14 88 {*movdi_internal}
+>      (nil))since MEM_ALIAS_SET are the same it must be MEM_EXPR handling going wrong,
+or points-to info giving the wrong answer.
+
+- User: Alexander Monakov | Time: 2023-04-24 08:46:49 UTC
+  Text: Manually minimized testcase for investigation, miscompiled at -O2:
+
+struct P {
+	long v;
+	struct P *n;
+};
+
+struct F {
+	long x;
+	struct P fam[];
+};
+
+int f(struct F *f, int i)
+{
+	struct P *p = f->fam;
+	asm("" : "+r"(f): "r"(p));
+	p->v = 0;
+	p->n = 0;
+	return f->fam->n != 0;
+}
+
+Trunk emits:
+f:
+        lea     rdx, [rdi+8]
+        mov     rax, rdi
+        mov     QWORD PTR [rdi+8], 0
+        cmp     QWORD PTR [rax+16], 0
+        mov     QWORD PTR [rdi+16], 0
+        setne   al
+        movzx   eax, al
+        ret
+
+- User: Jakub Jelinek | Time: 2023-04-24 09:04:02 UTC
+  Text: On the #c5 testcase on x86_64 at -O2 this bisects tor10-514-gc6b84edb6110dd2b4fb
+
+- User: Richard Biener | Time: 2023-04-24 09:54:35 UTC
+  Text: aliasing_component_refs_p seems to try handle trailing arrays via
+component_ref_to_zero_sized_trailing_array_p.  It properly detects
+
+f_5->fam[0].n
+
+but fails on
+
+MEM[(struct P *)f_3(D) + 8B].n
+
+but it would also in all cases happily continue with the base ref type
+when comparing sizes:
+
+  /* Now search for the type1 in the access path of ref2.  This
+     would be a common base for doing offset based disambiguation on.
+     This however only makes sense if type2 is big enough to hold type1.  */
+  int cmp_outer = compare_type_sizes (type2, type1);
+
+I also wonder if
+
+  /* If we didn't find a common base, try the other way around.  */
+  if (cmp_outer <= 0
+      || (end_struct_ref1
+          && compare_type_sizes (TREE_TYPE (end_struct_ref1), type1) <= 0))
+
+here type1 shouldn't be type2?
+
+In any case we end up failing the access_path_may_continue_p checks and
+disambiguate.
+
+diff --git a/gcc/tree-ssa-alias.cc b/gcc/tree-ssa-alias.cc
+index 81bc51ed4ad..8a1ec9091fa 100644
+--- a/gcc/tree-ssa-alias.cc
++++ b/gcc/tree-ssa-alias.cc
+@@ -1330,7 +1330,7 @@ aliasing_component_refs_p (tree ref1,
+   /* If we didn't find a common base, try the other way around.  */
+   if (cmp_outer <= 0 
+       || (end_struct_ref1
+-         && compare_type_sizes (TREE_TYPE (end_struct_ref1), type1) <= 0))
++         && compare_type_sizes (TREE_TYPE (end_struct_ref1), type2) <= 0))
+     {
+       int res = aliasing_component_refs_walk (ref2, type2, base2,
+                                              offset2, max_size2,
+
+seems to fix the testcase - can anybody confirm?
+
+Honza, is that indeed a typo or do I just hide the issue?
+
+- User: Richard Biener | Time: 2023-04-24 11:35:26 UTC
+  Text: Createdattachment 54911[details]patch I am testing
+
+I am testing the attached.
+
+- User: GCC Commits | Time: 2023-04-25 12:24:17 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:6d4bd27a60447c7505cb4783e675e98a191a8904commitr14-219-g6d4bd27a60447c7505cb4783e675e98a191a8904Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Apr 24 13:31:07 2023 +0200
+
+    rtl-optimization/109585 - alias analysis typo
+    
+    Whenr10-514-gc6b84edb6110dd2b4fbimproved access path analysis
+    it introduced a typo that triggers when there's an access to a
+    trailing array in the first access path leading to false
+    disambiguation.PR rtl-optimization/109585* tree-ssa-alias.cc (aliasing_component_refs_p): Fix typo.
+    
+            * gcc.dg/torture/pr109585.c: New testcase.
+
+- User: Richard Biener | Time: 2023-04-25 12:25:23 UTC
+  Text: Fixed on trunk sofar.
+
+- User: GCC Commits | Time: 2023-04-26 09:33:56 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:bb406a6aea336966681927a27f54ee89c4fd4ea1commitr13-7251-gbb406a6aea336966681927a27f54ee89c4fd4ea1Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Apr 24 13:31:07 2023 +0200
+
+    rtl-optimization/109585 - alias analysis typo
+    
+    Whenr10-514-gc6b84edb6110dd2b4fbimproved access path analysis
+    it introduced a typo that triggers when there's an access to a
+    trailing array in the first access path leading to false
+    disambiguation.PR rtl-optimization/109585* tree-ssa-alias.cc (aliasing_component_refs_p): Fix typo.
+    
+            * gcc.dg/torture/pr109585.c: New testcase.
+    
+    (cherry picked from commit 6d4bd27a60447c7505cb4783e675e98a191a8904)
+
+- User: GCC Commits | Time: 2023-04-26 10:41:21 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:ef6051b36241bf130bf76af0b775248635dc616ecommitr12-9473-gef6051b36241bf130bf76af0b775248635dc616eAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Apr 24 13:31:07 2023 +0200
+
+    rtl-optimization/109585 - alias analysis typo
+    
+    Whenr10-514-gc6b84edb6110dd2b4fbimproved access path analysis
+    it introduced a typo that triggers when there's an access to a
+    trailing array in the first access path leading to false
+    disambiguation.PR rtl-optimization/109585* tree-ssa-alias.cc (aliasing_component_refs_p): Fix typo.
+    
+            * gcc.dg/torture/pr109585.c: New testcase.
+    
+    (cherry picked from commit 6d4bd27a60447c7505cb4783e675e98a191a8904)
+
+- User: GCC Commits | Time: 2023-05-02 12:04:04 UTC
+  Text: The releases/gcc-11 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:e54ecbcbe625847f384b11c41562038477a3eb2ccommitr11-10678-ge54ecbcbe625847f384b11c41562038477a3eb2cAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Apr 24 13:31:07 2023 +0200
+
+    rtl-optimization/109585 - alias analysis typo
+    
+    Whenr10-514-gc6b84edb6110dd2b4fbimproved access path analysis
+    it introduced a typo that triggers when there's an access to a
+    trailing array in the first access path leading to false
+    disambiguation.PR rtl-optimization/109585* tree-ssa-alias.c (aliasing_component_refs_p): Fix typo.
+    
+            * gcc.dg/torture/pr109585.c: New testcase.
+    
+    (cherry picked from commit 6d4bd27a60447c7505cb4783e675e98a191a8904)
+
+- User: Richard Biener | Time: 2023-07-07 10:08:25 UTC
+  Text: Fixed in GCC 11.4
+

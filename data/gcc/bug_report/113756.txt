@@ -1,0 +1,101 @@
+Bug Summary: [14 regression] Wrong code at -O2 on x86_64-linux-gnu since r14-2780-g39f117d6c87
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Shaohua Li | Time: 2024-02-04 14:14:50 UTC
+  Text: gcc at -O2 produced the wrong code.
+
+Bisected tor14-2780-g39f117d6c87Compiler explorer:https://godbolt.org/z/qWd4196h6% cat reduced.c
+int printf(const char *, ...);
+int d, e, i, k, l = -8;
+char h, j;
+int m(int n, int o, int p3) {
+  int a = o - p3, b = n - p3, c = a + b, f = -b, g = c < 0 ? -c : c;
+  return a <= f && a <= g ? o : p3;
+}
+void q(int *n, unsigned short o) {
+  unsigned p = 8896;
+  for (; e >= 0; e--)
+    p = 5377;
+  for (; h <= 0; h++)
+    for (; j <= 0; j++) {
+      *n = 1611581749;
+      i = m(34, p - 5294, *n - 1611581687);
+      k = i + p + 65535 + o + *n - 1611718251;
+      printf("%d\n", k);
+    }
+}
+int main() {
+  q(&l, l);
+}
+%
+% gcc -O0 reduced.c &&./a.out
+0
+% gcc -O2 reduced.c &&./a.out
+21
+%
+
+- User: Andrew Pinski | Time: 2024-02-04 18:17:45 UTC
+  Text: Confirmed.
+
+- User: Jakub Jelinek | Time: 2024-02-06 15:59:01 UTC
+  Text: I think the issue is that ABSU_EXPR is an unary operation with signed operand and unsigned result.  And update_known_bitmask was using result rather than operand sign to the operand's value/mask, so I think
+--- gcc/range-op.cc.jj	2024-01-03 11:51:28.199777434 +0100
++++ gcc/range-op.cc	2024-02-06 16:51:55.549127825 +0100
+@@ -435,8 +435,10 @@ update_known_bitmask (irange &r, tree_co
+       bit_value_unop (code, sign, prec, &widest_value, &widest_mask,
+ 		      TYPE_SIGN (lh.type ()),
+ 		      TYPE_PRECISION (lh.type ()),
+-		      widest_int::from (lh_bits.value (), sign),
+-		      widest_int::from (lh_bits.mask (), sign));
++		      widest_int::from (lh_bits.value (),
++					TYPE_SIGN (lh.type ())),
++		      widest_int::from (lh_bits.mask (),
++					TYPE_SIGN (lh.type ())));
+       break;
+     case GIMPLE_BINARY_RHS:
+       bit_value_binop (code, sign, prec, &widest_value, &widest_mask,
+ought to fix this.  Of course even better would be rewrite tree-ssa-cpp.cc to use wide_int rather than widest_int, but I'm afraid that is stage1 material.
+
+- User: Jakub Jelinek | Time: 2024-02-06 16:05:44 UTC
+  Text: Createdattachment 57342[details]gcc14-pr113756.patch
+
+Full untested patch.
+
+- User: GCC Commits | Time: 2024-02-07 09:59:58 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:29998cc8a21b3a52f706275923166cd1f95d0555commitr14-8837-g29998cc8a21b3a52f706275923166cd1f95d0555Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Feb 7 10:59:06 2024 +0100
+
+    range-op: Fix up ABSU_EXPR handling [PR113756]
+    
+    ABSU_EXPR unary expr is special because it has a signed integer
+    argument and unsigned integer result (of the same precision).
+    
+    The following testcase is miscompiled since ABSU_EXPR handling has
+    been added to range-op because it uses widest_int::from with the
+    result sign (i.e. UNSIGNED) rather than the operand sign (i.e. SIGNED),
+    so e.g. for the 32-bit int argument mask ends up 0xffffffc1 or something
+    similar and even when it has most significant bit in the precision set,
+    in widest_int (tree-ssa-ccp.cc really should stop using widest_int, but
+    that is I think stage1 task) it doesn't appear to be negative and so
+    bit_value_unop ABSU_EXPR doesn't set the resulting mask/value from
+    oring of the argument and its negation.
+    
+    Fixed thusly, not doing that for GIMPLE_BINARY_RHS because I don't know
+    about a binary op that would need something similar.
+    
+    2024-02-06  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113756* range-op.cc (update_known_bitmask): For GIMPLE_UNARY_RHS,
+            use TYPE_SIGN (lh.type ()) instead of sign for widest_int::from
+            of lh_bits value and mask.
+    
+            * gcc.dg/pr113756.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-07 10:00:33 UTC
+  Text: Fixed.
+

@@ -1,0 +1,303 @@
+Issue Title: clang 16.0.0-rc1 regression: Illegal Instruction in `__init_libc` for musl on aarch64
+Original Post: When compiling musl libc with Clang 15.0.7, the machine code looks like this:
+
+```objdump
+000000000040befc <__init_libc>:
+  40befc: d10603ff     	sub	sp, sp, #0x180
+  40bf00: a9174ff4     	stp	x20, x19, [sp, #0x170]
+  40bf04: aa0103f3     	mov	x19, x1
+  40bf08: aa0003f4     	mov	x20, x0
+  40bf0c: 9100c3e0     	add	x0, sp, #0x30
+  40bf10: 2a1f03e1     	mov	w1, wzr
+  40bf14: 52802602     	mov	w2, #0x130
+  40bf18: a9167bfd     	stp	x29, x30, [sp, #0x160]
+  40bf1c: 94000ea9     	bl	0x40f9c0 <memset>
+  40bf20: d00000c8     	adrp	x8, 0x425000 <Thread.LinuxThreadImpl.tls_thread_id+0x424ff8>
+  40bf24: f941a508     	ldr	x8, [x8, #0x348]
+  40bf28: f9000114     	str	x20, [x8]
+  40bf2c: f8408688     	ldr	x8, [x20], #0x8
+```
+
+With Clang 16.0.0-rc1, the machine code looks like this:
+
+```objdump
+000000000040be5c <__init_libc>:
+  40be5c: d105c3ff     	sub	sp, sp, #0x170
+  40be60: d00000ca     	adrp	x10, 0x425000 <Thread.LinuxThreadImpl.tls_thread_id+0x424ff8>
+  40be64: a9167bfd     	stp	x29, x30, [sp, #0x160]
+  40be68: 52802608     	mov	w8, #0x130
+  40be6c: 9100c3e9     	add	x9, sp, #0x30
+  40be70: f9416d4a     	ldr	x10, [x10, #0x2d8]
+=>40be74: 19df0509     	setp	[x9]!, x8!, xzr
+  40be78: 19df4509     	setm	[x9]!, x8!, xzr
+  40be7c: 19df8509     	sete	[x9]!, x8!, xzr
+  40be80: f9000140     	str	x0, [x10]
+  40be84: f8408408     	ldr	x8, [x0], #0x8
+  40be88: b5ffffe8     	cbnz	x8, 0x40be84 <__init_libc+0x28>
+```
+
+At the `=>`, Illegal Instruction occurs. I have discovered this bug by running the Zig behavior tests. I do not yet have a reduction that is limited to LLVM IR, but here are the steps to reproduce that I do have:
+
+```shell
+git clone https://github.com/ziglang/zig
+cd zig
+git checkout llvm16
+mkdir build
+cd build
+cmake .. -DCMAKE_PREFIX_PATH="$LLVM_16_PREFIX"
+make install
+stage3/bin/zig test ../test/behavior.zig -lc -target aarch64-linux-musl --test-cmd qemu-aarch64 --test-cmd-bin  -I../test -femit-bin=test
+```
+
+Output:
+
+```console
+$ stage3/bin/zig test ../test/behavior.zig -lc -target aarch64-linux-musl --test-cmd qemu-aarch64 --test-cmd-bin  -I../test -femit-bin=test
+error: the following test command crashed:
+qemu-aarch64 ./test
+$ qemu-aarch64 ./test
+Illegal instruction (core dumped)
+```
+
+Observed with qemu-aarch64 version 7.1.0. I have also observed Illegal Instruction occurring on real AArch64 hardware.
+
+I will attempt to work on reduction steps for this bug report that involve only C code or LLVM IR, but this is what information I have so far.
+
+Comment by llvmbot: @llvm/issue-subscribers-bug
+Comment by llvmbot: @llvm/issue-subscribers-backend-aarch64
+Comment by davemgreen: Hello. Those instructions are some of the new memset instructions added in FEAT_MOP, an Armv8.8 / Armv9.3 extension. It is quite new and hardware would not accept those instructions. I'm not sure about qemu support but it is probably too new too.
+
+Do you know why that extension would be enabled? Is that intended? Could it have something to do with the "+all" feature from https://reviews.llvm.org/D128029?
+Comment by andrewrk: Thanks for the clue. These are the CLI flags related to the target being passed to clang:
+
+```
+-target aarch64-unknown-linux-musl
+-Xclang -target-cpu -Xclang generic
+-Xclang -target-feature -Xclang -a510
+-Xclang -target-feature -Xclang -a65
+-Xclang -target-feature -Xclang -a710
+-Xclang -target-feature -Xclang -a76
+-Xclang -target-feature -Xclang -a78
+-Xclang -target-feature -Xclang -a78c
+-Xclang -target-feature -Xclang -aes
+-Xclang -target-feature -Xclang -aggressive-fma
+-Xclang -target-feature -Xclang -alternate-sextload-cvt-f32-pattern
+-Xclang -target-feature -Xclang -altnzcv
+-Xclang -target-feature -Xclang -am
+-Xclang -target-feature -Xclang -amvs
+-Xclang -target-feature -Xclang -arith-bcc-fusion
+-Xclang -target-feature -Xclang -arith-cbz-fusion
+-Xclang -target-feature -Xclang -ascend-store-address
+-Xclang -target-feature -Xclang -b16b16
+-Xclang -target-feature -Xclang -balance-fp-ops
+-Xclang -target-feature -Xclang -bf16
+-Xclang -target-feature -Xclang -brbe
+-Xclang -target-feature -Xclang -bti
+-Xclang -target-feature -Xclang -call-saved-x10
+-Xclang -target-feature -Xclang -call-saved-x11
+-Xclang -target-feature -Xclang -call-saved-x12
+-Xclang -target-feature -Xclang -call-saved-x13
+-Xclang -target-feature -Xclang -call-saved-x14
+-Xclang -target-feature -Xclang -call-saved-x15
+-Xclang -target-feature -Xclang -call-saved-x18
+-Xclang -target-feature -Xclang -call-saved-x8
+-Xclang -target-feature -Xclang -call-saved-x9
+-Xclang -target-feature -Xclang -ccdp
+-Xclang -target-feature -Xclang -ccidx
+-Xclang -target-feature -Xclang -ccpp
+-Xclang -target-feature -Xclang -clrbhb
+-Xclang -target-feature -Xclang -cmp-bcc-fusion
+-Xclang -target-feature -Xclang -complxnum
+-Xclang -target-feature -Xclang -CONTEXTIDREL2
+-Xclang -target-feature -Xclang -cortex-r82
+-Xclang -target-feature -Xclang -crc
+-Xclang -target-feature -Xclang -crypto
+-Xclang -target-feature -Xclang -cssc
+-Xclang -target-feature -Xclang -custom-cheap-as-move
+-Xclang -target-feature -Xclang -d128
+-Xclang -target-feature -Xclang -disable-latency-sched-heuristic
+-Xclang -target-feature -Xclang -dit
+-Xclang -target-feature -Xclang -dotprod
+-Xclang -target-feature -Xclang -ecv
+-Xclang -target-feature -Xclang -el2vmsa
+-Xclang -target-feature -Xclang -el3
+-Xclang -target-feature -Xclang +enable-select-opt
+-Xclang -target-feature -Xclang +ete
+-Xclang -target-feature -Xclang -exynos-cheap-as-move
+-Xclang -target-feature -Xclang -f32mm
+-Xclang -target-feature -Xclang -f64mm
+-Xclang -target-feature -Xclang -fgt
+-Xclang -target-feature -Xclang -fix-cortex-a53-835769
+-Xclang -target-feature -Xclang -flagm
+-Xclang -target-feature -Xclang -fmv
+-Xclang -target-feature -Xclang -force-32bit-jump-tables
+-Xclang -target-feature -Xclang -fp16fml
+-Xclang -target-feature -Xclang +fp-armv8
+-Xclang -target-feature -Xclang -fptoint
+-Xclang -target-feature -Xclang -fullfp16
+-Xclang -target-feature -Xclang -fuse-address
+-Xclang -target-feature -Xclang +fuse-adrp-add
+-Xclang -target-feature -Xclang +fuse-aes
+-Xclang -target-feature -Xclang -fuse-arith-logic
+-Xclang -target-feature -Xclang -fuse-crypto-eor
+-Xclang -target-feature -Xclang -fuse-csel
+-Xclang -target-feature -Xclang -fuse-literals
+-Xclang -target-feature -Xclang -harden-sls-blr
+-Xclang -target-feature -Xclang -harden-sls-nocomdat
+-Xclang -target-feature -Xclang -harden-sls-retbr
+-Xclang -target-feature -Xclang -hbc
+-Xclang -target-feature -Xclang -hcx
+-Xclang -target-feature -Xclang -i8mm
+-Xclang -target-feature -Xclang -ite
+-Xclang -target-feature -Xclang -jsconv
+-Xclang -target-feature -Xclang -lor
+-Xclang -target-feature -Xclang -ls64
+-Xclang -target-feature -Xclang -lse
+-Xclang -target-feature -Xclang -lse128
+-Xclang -target-feature -Xclang -lse2
+-Xclang -target-feature -Xclang -lsl-fast
+-Xclang -target-feature -Xclang -mec
+-Xclang -target-feature -Xclang -mops
+-Xclang -target-feature -Xclang -mpam
+-Xclang -target-feature -Xclang -mte
+-Xclang -target-feature -Xclang +neon
+-Xclang -target-feature -Xclang -nmi
+-Xclang -target-feature -Xclang -no-bti-at-return-twice
+-Xclang -target-feature -Xclang -no-neg-immediates
+-Xclang -target-feature -Xclang -no-zcz-fp
+-Xclang -target-feature -Xclang -nv
+-Xclang -target-feature -Xclang -outline-atomics
+-Xclang -target-feature -Xclang -pan
+-Xclang -target-feature -Xclang -pan-rwv
+-Xclang -target-feature -Xclang -pauth
+-Xclang -target-feature -Xclang -perfmon
+-Xclang -target-feature -Xclang -predictable-select-expensive
+-Xclang -target-feature -Xclang -predres
+-Xclang -target-feature -Xclang -prfm-slc-target
+-Xclang -target-feature -Xclang -rand
+-Xclang -target-feature -Xclang -ras
+-Xclang -target-feature -Xclang -rasv2
+-Xclang -target-feature -Xclang -rcpc
+-Xclang -target-feature -Xclang -rcpc3
+-Xclang -target-feature -Xclang -rcpc-immo
+-Xclang -target-feature -Xclang -rdm
+-Xclang -target-feature -Xclang -reserve-x1
+-Xclang -target-feature -Xclang -reserve-x10
+-Xclang -target-feature -Xclang -reserve-x11
+-Xclang -target-feature -Xclang -reserve-x12
+-Xclang -target-feature -Xclang -reserve-x13
+-Xclang -target-feature -Xclang -reserve-x14
+-Xclang -target-feature -Xclang -reserve-x15
+-Xclang -target-feature -Xclang -reserve-x18
+-Xclang -target-feature -Xclang -reserve-x2
+-Xclang -target-feature -Xclang -reserve-x20
+-Xclang -target-feature -Xclang -reserve-x21
+-Xclang -target-feature -Xclang -reserve-x22
+-Xclang -target-feature -Xclang -reserve-x23
+-Xclang -target-feature -Xclang -reserve-x24
+-Xclang -target-feature -Xclang -reserve-x25
+-Xclang -target-feature -Xclang -reserve-x26
+-Xclang -target-feature -Xclang -reserve-x27
+-Xclang -target-feature -Xclang -reserve-x28
+-Xclang -target-feature -Xclang -reserve-x3
+-Xclang -target-feature -Xclang -reserve-x30
+-Xclang -target-feature -Xclang -reserve-x4
+-Xclang -target-feature -Xclang -reserve-x5
+-Xclang -target-feature -Xclang -reserve-x6
+-Xclang -target-feature -Xclang -reserve-x7
+-Xclang -target-feature -Xclang -reserve-x9
+-Xclang -target-feature -Xclang -rme
+-Xclang -target-feature -Xclang -sb
+-Xclang -target-feature -Xclang -sel2
+-Xclang -target-feature -Xclang -sha2
+-Xclang -target-feature -Xclang -sha3
+-Xclang -target-feature -Xclang -slow-misaligned-128store
+-Xclang -target-feature -Xclang -slow-paired-128
+-Xclang -target-feature -Xclang -slow-strqro-store
+-Xclang -target-feature -Xclang -sm4
+-Xclang -target-feature -Xclang -sme
+-Xclang -target-feature -Xclang -sme2
+-Xclang -target-feature -Xclang -sme2p1
+-Xclang -target-feature -Xclang -sme-f16f16
+-Xclang -target-feature -Xclang -sme-f64f64
+-Xclang -target-feature -Xclang -sme-i16i64
+-Xclang -target-feature -Xclang -spe
+-Xclang -target-feature -Xclang -spe-eef
+-Xclang -target-feature -Xclang -specres2
+-Xclang -target-feature -Xclang -specrestrict
+-Xclang -target-feature -Xclang -ssbs
+-Xclang -target-feature -Xclang -strict-align
+-Xclang -target-feature -Xclang -sve
+-Xclang -target-feature -Xclang -sve2
+-Xclang -target-feature -Xclang -sve2-aes
+-Xclang -target-feature -Xclang -sve2-bitperm
+-Xclang -target-feature -Xclang -sve2-sha3
+-Xclang -target-feature -Xclang -sve2-sm4
+-Xclang -target-feature -Xclang -sve2p1
+-Xclang -target-feature -Xclang -tagged-globals
+-Xclang -target-feature -Xclang -the
+-Xclang -target-feature -Xclang -tlb-rmi
+-Xclang -target-feature -Xclang -tme
+-Xclang -target-feature -Xclang -tpidr-el1
+-Xclang -target-feature -Xclang -tpidr-el2
+-Xclang -target-feature -Xclang -tpidr-el3
+-Xclang -target-feature -Xclang -tracev8.4
+-Xclang -target-feature -Xclang +trbe
+-Xclang -target-feature -Xclang -uaops
+-Xclang -target-feature -Xclang -use-experimental-zeroing-pseudos
+-Xclang -target-feature -Xclang +use-postra-scheduler
+-Xclang -target-feature -Xclang -use-reciprocal-square-root
+-Xclang -target-feature -Xclang -use-scalar-inc-vl
+-Xclang -target-feature -Xclang -v8.1a
+-Xclang -target-feature -Xclang -v8.2a
+-Xclang -target-feature -Xclang -v8.3a
+-Xclang -target-feature -Xclang -v8.4a
+-Xclang -target-feature -Xclang -v8.5a
+-Xclang -target-feature -Xclang -v8.6a
+-Xclang -target-feature -Xclang -v8.7a
+-Xclang -target-feature -Xclang -v8.8a
+-Xclang -target-feature -Xclang -v8.9a
+-Xclang -target-feature -Xclang -v8a
+-Xclang -target-feature -Xclang -v8r
+-Xclang -target-feature -Xclang -v9.1a
+-Xclang -target-feature -Xclang -v9.2a
+-Xclang -target-feature -Xclang -v9.3a
+-Xclang -target-feature -Xclang -v9.4a
+-Xclang -target-feature -Xclang -v9a
+-Xclang -target-feature -Xclang -vh
+-Xclang -target-feature -Xclang -wfxt
+-Xclang -target-feature -Xclang -xs
+-Xclang -target-feature -Xclang -zcm
+-Xclang -target-feature -Xclang -zcz
+-Xclang -target-feature -Xclang -zcz-fp-workaround
+-Xclang -target-feature -Xclang -zcz-gp
+```
+
+This corresponds to the "generic" CPU model, with the dependencies recursively chased.
+
+As you can see, `mops` is being explicitly disabled.
+Comment by davemgreen: I see. It looks like specifying `-v9.3a` is currently _enabling_ the dependant target features, including lower architecture revisions.
+https://godbolt.org/z/e6qGsrc8c
+
+I don't think clang will set -features for architectures, so it may not have come up before. I will see if we can improve it.
+Comment by davemgreen: There is hopefully a fix for this in https://reviews.llvm.org/D142963.
+Comment by andrewrk: Thank you for working on a fix! The fix also reveals a workaround, which is to avoid passing negative -target-feature flags to clang.
+
+(edit: your comment above also provides a workaround :+1:)
+Comment by tru: /cherry-pick f559e78
+Comment by tru: Re-opened to land in the release branch.
+Comment by llvmbot: <!--IGNORE-->
+Failed to cherry-pick: f559e78
+
+https://github.com/llvm/llvm-project/actions/runs/4064604307
+
+Please manually backport the fix and push it to your github fork.  Once this is done, please add a comment like this:
+
+`/branch <user>/<repo>/<branch>`
+Comment by tru: @davemgreen, can you make a merge branch for this fix?
+Comment by davemgreen: Does this work OK? https://github.com/davemgreen/llvm-project/commit/1ec00cca7ed203e8497fa6e8e2e1ecccfb4dffdc
+It passed tests locally.
+Comment by tru: Let's try!
+
+/branch davemgreen/llvm-project/D142963
+Comment by llvmbot: /pull-request llvm/llvm-project-release-prs#257

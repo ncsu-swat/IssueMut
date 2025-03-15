@@ -1,0 +1,133 @@
+Bug Summary: (a ? -1 : 0) | b could be optimized better for aarch64
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2023-04-27 22:47:15 UTC
+  Text: Take (at -O2):
+```
+unsigned b(unsigned a, unsigned b){
+    if(b){
+        return -1;
+    }
+    return a;
+}
+unsigned b1(unsigned a, unsigned b){
+    unsigned t = b ? -1 : 0;
+    return a | t;
+}
+```
+Right now we produce:
+```
+b:
+        cmp     w1, 0
+        csinv   w0, w0, wzr, eq
+        ret
+b1:
+        cmp     w1, 0
+        csetm   w1, ne
+        orr     w0, w1, w0
+        ret
+```
+
+We can help combine here by adding a pattern for:
+(set (reg/i:SI 0 x0)
+    (ior:SI (neg:SI (ne:SI (reg:CC 66 cc)
+                (const_int 0 [0])))
+        (reg:SI 102)))
+
+Which is the same as 
+(set (reg/i:SI 0 x0)
+    (if_then_else:SI (eq (reg:CC 66 cc)
+            (const_int 0 [0]))
+        (reg:SI 97)
+        (const_int -1 [0xffffffffffffffff])))
+pattern.
+
+I suspect both are considered canonical too.
+
+- User: Andrew Pinski | Time: 2023-04-28 05:07:38 UTC
+  Text: diff --git a/gcc/config/aarch64/aarch64.md b/gcc/config/aarch64/aarch64.md
+index 022eef80bc1..5109e8abdbe 100644
+--- a/gcc/config/aarch64/aarch64.md
++++ b/gcc/config/aarch64/aarch64.md
+@@ -4203,6 +4203,30 @@ (define_insn "*cmovsi_insn_uxtw"
+   [(set_attr "type" "csel, csel, csel, csel, csel, mov_imm, mov_imm")]
+ )
+
++;; Convert -(cmp) | a into cmp ? -1 : a to be canonical in the backend.
++;;(set (reg/i:SI 0 x0)
++;;    (ior:SI (neg:SI (ne:SI (reg:CC 66 cc)
++;;                (const_int 0 [0])))
++;;        (reg:SI 102)))
++
++
++(define_insn_and_split "*cmov<mode>_insn_m1"
++  [(set (match_operand:GPI 0 "register_operand" "=r")
++        (ior:GPI
++        (neg:GPI
++         (match_operator:GPI 1 "aarch64_comparison_operator"
++          [(match_operand 2 "cc_register" "") (const_int 0)]))
++        (match_operand 3 "register_operand" "r")))]
++  ""
++  "#"
++  "&& true"
++  [(set (match_dup 0)
++       (if_then_else:GPI (match_dup 1)
++        (const_int -1) (match_dup 3)))]
++  {}
++  [(set_attr "type" "csel")]
++)
++
+ (define_insn "*cmovdi_insn_uxtw"
+   [(set (match_operand:DI 0 "register_operand" "=r")
+        (if_then_else:DI
+
+
+Will clean up the comment and add a testcase tomorrow.
+
+- User: Andrew Pinski | Time: 2023-04-28 23:35:47 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2023-April/617108.html
+
+- User: GCC Commits | Time: 2023-05-02 21:10:54 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:7cc33d12dca84befde69259a17fab8224e2e4025commitr14-412-g7cc33d12dca84befde69259a17fab8224e2e4025Author: Andrew Pinski <apinski@marvell.com>
+Date:   Fri Apr 28 05:22:34 2023 +0000
+
+    target: [PR109657] (a ? -1 : 0) | b could be optimized better for aarch64
+    
+    There is no canonical form for this case defined. So the aarch64 backend needs
+    a pattern to match both of these forms.
+    
+    The forms are:
+    (set (reg/i:SI 0 x0)
+        (if_then_else:SI (eq (reg:CC 66 cc)
+                (const_int 0 [0]))
+            (reg:SI 97)
+            (const_int -1 [0xffffffffffffffff])))
+    and
+    (set (reg/i:SI 0 x0)
+        (ior:SI (neg:SI (ne:SI (reg:CC 66 cc)
+                    (const_int 0 [0])))
+            (reg:SI 102)))
+    
+    Currently the aarch64 backend matches the first form so this
+    patch adds a insn_and_split to match the second form and
+    convert it to the first form.
+    
+    OK? Bootstrapped and tested on aarch64-linux-gnu with no regressionsPR target/109657gcc/ChangeLog:
+    
+            * config/aarch64/aarch64.md (*cmov<mode>_insn_m1): New
+            insn_and_split pattern.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/csinv-2.c: New test.
+
+- User: Andrew Pinski | Time: 2023-05-02 21:11:32 UTC
+  Text: Fixed.
+

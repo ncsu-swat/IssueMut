@@ -1,0 +1,121 @@
+Bug Summary: RISC-V: Missed AVL propagation for complicate reduction case
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2023-11-06 01:40:18 UTC
+  Text: double foo (double *__restrict a, 
+double *__restrict b, 
+double *__restrict c,
+int n)
+{
+  double result = 0;
+  for (int i = 0; i < n; i++)
+    result += a[i] * b[i] * c[i];
+  return result;
+}https://godbolt.org/z/znqcf7ehzvsetvli a5,a3,e8,mf8,ta,ma   -----> should be change into e64m1 Tuma
+        slli    a4,a5,3
+        vle64.v v4,0(a0)
+        vle64.v v1,0(a1)
+        vle64.v v3,0(a2)
+        sub     a3,a3,a5
+        vsetvli a6,zero,e64,m1,ta,ma   ---> redundant 
+        add     a0,a0,a4
+        vfmul.vv        v1,v1,v4
+        add     a1,a1,a4
+        vsetvli zero,a5,e64,m1,tu,ma   ---> redundant 
+        add     a2,a2,a4
+        vfmacc.vv       v2,v3,v1
+        bne     a3,zero,.L3
+        fmv.d.x fa5,zero
+        vsetvli a6,zero,e64,m1,ta,ma
+        vfmv.s.f        v1,fa5
+        vfredusum.vs    v2,v2,v1
+        vfmv.f.s        fa0,v2
+        ret
+
+- User: GCC Commits | Time: 2023-11-07 07:02:27 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:f1e084c6c3ef1d1233e35823dacfdf9cee722430commitr14-5179-gf1e084c6c3ef1d1233e35823dacfdf9cee722430Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Mon Nov 6 11:34:26 2023 +0800
+
+    RISC-V: Enhance AVL propagation for complicate reduction auto-vectorization
+    
+    I notice we failed to AVL propagate for reduction with more complicate situation:
+    
+    double foo (double *__restrict a,
+    double *__restrict b,
+    double *__restrict c,
+    int n)
+    {
+      double result = 0;
+      for (int i = 0; i < n; i++)
+        result += a[i] * b[i] * c[i];
+      return result;
+    }
+    
+            vsetvli a5,a3,e8,mf8,ta,ma           -> should be fused into e64m1,TU
+            slli    a4,a5,3
+            vle64.v v3,0(a0)
+            vle64.v v1,0(a1)
+            vsetvli a6,zero,e64,m1,ta,ma         -> redundant
+            vfmul.vv        v1,v1,v3
+            vsetvli zero,a5,e64,m1,tu,ma         -> redundant
+            vle64.v v3,0(a2)
+            vfmacc.vv       v2,v1,v3
+            add     a0,a0,a4
+            add     a1,a1,a4
+            add     a2,a2,a4
+            sub     a3,a3,a5
+            bne     a3,zero,.L3
+    
+    The failed AVL propgation causes redundant AVL/VL togglling.
+    The root cause as follows:
+    
+    vsetvl a5, zero
+    vadd.vv def r136
+    vsetvl zero, a3, ... TU
+    vsub.vv (use r136)
+    
+    We propagate AVL (r136) from 'vsub.vv' into 'vadd.vv' when 'vsub.vv' is TA policy.
+    However, it's too restrict so we missed optimization here. We enhance AVL propation
+    for TU policy for following situation:
+    
+    vsetvl a5, zero
+    vadd.vv def r136
+    vsetvl zero, a3, ... TU
+    vsub.vv (use r136, merge != r136)
+    
+    Note that we should only propagate AVL when merge != r136 for 'vsub.vv' doesn't
+    depend on the tail elements.
+    After this patch:
+    
+            vsetvli a5,a3,e64,m1,tu,ma
+            slli    a4,a5,3
+            vle64.v v3,0(a0)
+            vle64.v v1,0(a1)
+            vfmul.vv        v1,v1,v3
+            vle64.v v3,0(a2)
+            vfmacc.vv       v2,v3,v1
+            add     a0,a0,a4
+            add     a1,a1,a4
+            add     a2,a2,a4
+            sub     a3,a3,a5
+            bne     a3,zero,.L3PR target/112399gcc/ChangeLog:
+    
+            * config/riscv/riscv-avlprop.cc
+            (pass_avlprop::get_vlmax_ta_preferred_avl): Enhance AVL propagation.
+            * config/riscv/t-riscv: Add new include.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/vsetvl/imm_switch-2.c: Adapt test.
+            * gcc.target/riscv/rvv/autovec/pr112399.c: New test.
+
+- User: JuzheZhong | Time: 2023-11-07 07:03:11 UTC
+  Text: Fixed
+

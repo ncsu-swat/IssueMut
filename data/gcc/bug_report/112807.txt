@@ -1,0 +1,134 @@
+Bug Summary: ICE: SIGSEGV in contains_struct_check (tree.h:3747) with _BitInt() at -O1 and above
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-12-01 09:56:25 UTC
+  Text: Createdattachment 56751[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O testcase.c -wrapper valgrind,-q
+==11799== Invalid read of size 2
+==11799==    at 0x253EF3F: contains_struct_check (tree.h:3747)
+==11799==    by 0x253EF3F: (anonymous namespace)::bitint_large_huge::lower_addsub_overflow(tree_node*, gimple*) (gimple-lower-bitint.cc:3951)
+==11799==    by 0x2543129: (anonymous namespace)::bitint_large_huge::lower_call(tree_node*, gimple*) (gimple-lower-bitint.cc:5039)
+==11799==    by 0x254D626: gimple_lower_bitint() (gimple-lower-bitint.cc:6386)
+==11799==    by 0x13A2D3A: execute_one_pass(opt_pass*) (passes.cc:2641)
+==11799==    by 0x13A361F: execute_pass_list_1(opt_pass*) (passes.cc:2750)
+==11799==    by 0x13A3631: execute_pass_list_1(opt_pass*) (passes.cc:2751)
+==11799==    by 0x13A3658: execute_pass_list(function*, opt_pass*) (passes.cc:2761)
+==11799==    by 0xFB0755: expand (cgraphunit.cc:1841)
+==11799==    by 0xFB0755: cgraph_node::expand() (cgraphunit.cc:1794)
+==11799==    by 0xFB1A9A: expand_all_functions (cgraphunit.cc:2024)
+==11799==    by 0xFB1A9A: symbol_table::compile() [clone .part.0] (cgraphunit.cc:2398)
+==11799==    by 0xFB4607: compile (cgraphunit.cc:2311)
+==11799==    by 0xFB4607: symbol_table::finalize_compilation_unit() (cgraphunit.cc:2583)
+==11799==    by 0x14E5F21: compile_file() (toplev.cc:473)
+==11799==    by 0xDD221B: do_compile (toplev.cc:2150)
+==11799==    by 0xDD221B: toplev::main(int, char**) (toplev.cc:2306)
+==11799==  Address 0x0 is not stack'd, malloc'd or (recently) free'd
+==11799== 
+during GIMPLE pass: bitintlower
+testcase.c: In function 'foo':
+testcase.c:2:1: internal compiler error: Segmentation fault
+    2 | foo (unsigned a, _BitInt (2) b, _BitInt (256) c)
+      | ^~~
+0x14e5a3f crash_signal
+        /repo/gcc-trunk/gcc/toplev.cc:316
+0x253ef3f contains_struct_check(tree_node*, tree_node_structure_enum, char const*, int, char const*)
+        /repo/gcc-trunk/gcc/tree.h:3747
+0x253ef3f lower_addsub_overflow
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:3951
+0x2543129 lower_call
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:5039
+0x254d626 gimple_lower_bitint
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:6386
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-6048-20231201170246-g6563d6767ed-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-6048-20231201170246-g6563d6767ed-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20231201 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2023-12-01 17:03:11 UTC
+  Text: Ah, the problem is that lower_addsub_overflow was written for lowering of large/huge _BitInt operations, so for .{ADD,SUB}_OVERFLOW where one of the 2 operands is in the x86_64 case at least 129 bit or the result is a complex type with 129+ bit element type.
+That is the case here, because the first operand is _BitInt(256), but as result is just 32-bit and VRP tells us the first argument is in [0, 0xffffffff] range which needs 32-bits unsigned and the second argument is in [-2, 1] range, we don't actually cast the second argument to a large/huge _BitInt type and so it fails miserably.
+Now, we could fix that either by tweaking the
+  tree type0 = TREE_TYPE (arg0);
+  tree type1 = TREE_TYPE (arg1);
+  if (TYPE_PRECISION (type0) < prec3)
+    {
+      type0 = build_bitint_type (prec3, TYPE_UNSIGNED (type0));
+      if (TREE_CODE (arg0) == INTEGER_CST)
+        arg0 = fold_convert (type0, arg0);
+    }
+  if (TYPE_PRECISION (type1) < prec3)
+    {              
+      type1 = build_bitint_type (prec3, TYPE_UNSIGNED (type1));
+      if (TREE_CODE (arg1) == INTEGER_CST)
+        arg1 = fold_convert (type1, arg1);
+    }
+such that if bitint_precision_kind (prec3) < bitint_prec_large we actually use
+smallest possible bitint_prec_large, or during the preparation phase check if .{ADD,SUB}_OVERFLOW with small/medium return and both operands with range_for_prec absolute values also small/medium we actually turn it into a small/medium .{ADD,SUB}_OVERFLOW and expand just the casts.
+
+- User: Jakub Jelinek | Time: 2023-12-01 17:52:52 UTC
+  Text: Createdattachment 56756[details]gcc14-pr112807.patch
+
+Untested implementation of the first option.  The other could be done incrementally later on if it proves to be a win (but this one doesn't seem that bad either).
+
+- User: GCC Commits | Time: 2023-12-03 16:54:56 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:eef6aea3052b4b8a60df211015dafcb4573d19fbcommitr14-6095-geef6aea3052b4b8a60df211015dafcb4573d19fbAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Sun Dec 3 17:54:03 2023 +0100
+
+    lower-bitint: Fix up lower_addsub_overflow [PR112807]
+    
+    lower_addsub_overflow uses handle_cast or handle_operand to extract current
+    limb from the operands.  Both of those functions heavily assume that they
+    return a large or huge BITINT_TYPE.  The problem in the testcase is that
+    this is violated.  Normally, lower_addsub_overflow isn't even called if
+    neither the return's type element type nor any of the operand is large/huge
+    BITINT_TYPE (on x86_64 129+ bits), for middle BITINT_TYPE (on x86_64 65-128
+    bits) some other code casts such operands to {,unsigned }__int128.
+    In the testcase the result is complex unsigned, so small, but one of the
+    arguments is _BitInt(256), so lower_addsub_overflow is called.  But
+    range_for_prec asks the ranger for ranges of the operands and in this
+    case the first argument has [0, 0xffffffff] range and second [-2, 1], so
+    unsigned 32-bit and signed 2-bit, and in such case the code for
+    handle_operand/handle_cast purposes would use the _BitInt(256) type for the
+    first operand (ok), but because prec3 aka maximum of result precision and
+    the VRP computes ranges of the arguments is 32, use cast to 32-bit
+    BITINT_TYPE, which is why it didn't work correctly.
+    The following patch ensures that in such cases we use handle_cast to the
+    type of the other argument.
+    
+    Perhaps incrementally, we could try to optimize this in an earlier phase,
+    see that while the .{ADD,SUB}_OVERFLOW has large/huge _BitInt argument, as
+    ranger says it fits into a smaller type, add a cast of the larger argument
+    to the smaller precision type in which it fits.  Either in
+    gimple_lower_bitint, or match.pd.  An argument for the latter is that e.g.
+    complex unsigned .ADD_OVERFLOW (unsigned_long_long_arg, unsigned_arg)
+    where ranger says unsigned_long_long_arg fits into unsigned 32-bit could
+    be also more efficient as
+    .ADD_OVERFLOW ((unsigned) unsigned_long_long_arg, unsigned_arg)
+    
+    2023-12-03  Jakub Jelinek  <jakub@redhat.com>PR middle-end/112807* gimple-lower-bitint.cc (bitint_large_huge::lower_addsub_overflow):
+            When choosing type0 and type1 types, if prec3 has small/middle bitint
+            kind, use maximum of type0 and type1's precision instead of prec3.
+    
+            * gcc.dg/bitint-46.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-12-03 16:56:33 UTC
+  Text: Fixed.
+

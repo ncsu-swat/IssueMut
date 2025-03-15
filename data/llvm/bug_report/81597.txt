@@ -1,0 +1,125 @@
+Issue Title: false positive: `Argument to free() is the address of ..., which is not memory allocated by malloc()`
+Original Post: we are seeing the above error in our CI (running clang-tidy on the https://github.com/envoyproxy/envoy project)
+
+it would appear this is a false positive that should not trigger on a member function
+
+full log:
+
+```console
+/b/f/w/source/common/stats/symbol_table.cc:623:3: error: Argument to free() is the address of a local stack variable, which is not memory allocated by malloc() [clang-analyzer-unix.Malloc,-warnings-as-errors]
+  table.free(statName());
+  ^
+/b/f/w/source/common/stats/symbol_table.cc:629:5: note: Calling 'StatNameStorage::free'
+    storage.free(symbol_table_);
+    ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+/b/f/w/source/common/stats/symbol_table.cc:623:3: note: Argument to free() is the address of a local stack variable, which is not memory allocated by malloc()
+  table.free(statName());
+  ^          ~~~~~~~~~~
+/b/f/w/source/common/stats/symbol_table.cc:736:5: error: Argument to free() is the address of the parameter 'stat_name', which is not memory allocated by malloc() [clang-analyzer-unix.Malloc,-warnings-as-errors]
+    symbol_table.free(stat_name);
+    ^
+/b/f/w/source/common/stats/symbol_table.cc:735:3: note: Calling 'StatNameList::iterate'
+  iterate([&symbol_table](StatName stat_name) -> bool {
+  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/b/f/w/source/common/stats/symbol_table.cc:725:24: note: Assuming 'i' is < 'num_elements'
+  for (uint32_t i = 0; i < num_elements; ++i) {
+                       ^~~~~~~~~~~~~~~~
+/b/f/w/source/common/stats/symbol_table.cc:725:3: note: Loop condition is true.  Entering loop body
+  for (uint32_t i = 0; i < num_elements; ++i) {
+  ^
+             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/b/f/w/source/common/stats/symbol_table.cc:736:5: note: Argument to free() is the address of the parameter 'stat_name', which is not memory allocated by malloc()
+    symbol_table.free(stat_name);
+    ^                 ~~~~~~~~~
+```
+
+Comment by phlax: cc @ravenblackx
+Comment by chrchr-github: Reduced:
+~~~c++
+struct S {};
+struct T {
+	void free(const S& s);
+};
+void f(T& t) {
+	S s;
+	t.free(s);
+}
+~~~
+~~~
+<source>:7:2: warning: Argument to free() is the address of the local variable 's', which is not memory allocated by malloc() [clang-analyzer-unix.Malloc]
+    7 |         t.free(s);
+      |         ^      ~
+<source>:7:2: note: Argument to free() is the address of the local variable 's', which is not memory allocated by malloc()
+    7 |         t.free(s);
+      |         ^      ~
+~~~
+https://godbolt.org/z/qvWrEG3a6
+Comment by phlax: for ref:
+
+```console
+$ bazel run //tools/clang-tidy -- --version
+...
+LLVM (http://llvm.org/):
+  LLVM version 14.0.6
+```
+Comment by llvmbot: 
+@llvm/issue-subscribers-clang-static-analyzer
+
+Author: None (phlax)
+
+<details>
+we are seeing the above error in our CI (running clang-tidy on the https://github.com/envoyproxy/envoy project)
+
+it would appear this is a false positive that should not trigger on a member function
+
+full log:
+
+```console
+/b/f/w/source/common/stats/symbol_table.cc:623:3: error: Argument to free() is the address of a local stack variable, which is not memory allocated by malloc() [clang-analyzer-unix.Malloc,-warnings-as-errors]
+  table.free(statName());
+  ^
+/b/f/w/source/common/stats/symbol_table.cc:629:5: note: Calling 'StatNameStorage::free'
+    storage.free(symbol_table_);
+    ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+/b/f/w/source/common/stats/symbol_table.cc:623:3: note: Argument to free() is the address of a local stack variable, which is not memory allocated by malloc()
+  table.free(statName());
+  ^          ~~~~~~~~~~
+/b/f/w/source/common/stats/symbol_table.cc:736:5: error: Argument to free() is the address of the parameter 'stat_name', which is not memory allocated by malloc() [clang-analyzer-unix.Malloc,-warnings-as-errors]
+    symbol_table.free(stat_name);
+    ^
+/b/f/w/source/common/stats/symbol_table.cc:735:3: note: Calling 'StatNameList::iterate'
+  iterate([&amp;symbol_table](StatName stat_name) -&gt; bool {
+  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/b/f/w/source/common/stats/symbol_table.cc:725:24: note: Assuming 'i' is &lt; 'num_elements'
+  for (uint32_t i = 0; i &lt; num_elements; ++i) {
+                       ^~~~~~~~~~~~~~~~
+/b/f/w/source/common/stats/symbol_table.cc:725:3: note: Loop condition is true.  Entering loop body
+  for (uint32_t i = 0; i &lt; num_elements; ++i) {
+  ^
+             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/b/f/w/source/common/stats/symbol_table.cc:736:5: note: Argument to free() is the address of the parameter 'stat_name', which is not memory allocated by malloc()
+    symbol_table.free(stat_name);
+    ^                 ~~~~~~~~~
+```
+</details>
+
+Comment by NagyDonat: The reproducer also triggers the bug on recent clang main; I'll try to investigate and fix the bug.
+Comment by NagyDonat: This kind of confusion between well-known functions and methods that accidentally have the same name probably affects many other checkers as well, because the method `bool CallDescription::matches(const CallEvent &)` doesn't distinguish function calls and method calls.
+
+I'll try to survey all the 30 checkers that use `CallDescription`s and design a solution that would eliminate all occurrences of this issue.
+Comment by steakhal: > because the method `bool CallDescription::matches(const CallEvent &)` doesn't distinguish function calls and method calls.
+
+That was on purpose, and exploited in the llvm-convections checker I think. I agree that this shouldn't be the default behavior. `CallDescriptions` should be strict about what they match, and be explicit about when you want a fuzzy match.
+Comment by NagyDonat: Yes, I see that there are several checkers (the one checking the `getAs()` and `castAs()` methods, and also `ContainterModeling.cpp`, and probably others as well) that use `CallDescription`s to match methods.
+
+I will pay attention to preserve their current behavior while I'm fixing all the other checkers. My rough plan is that by default call descriptions only match functions, and it's possible to specify "is a method call" (and perhaps "may be a method call or a function call") as a flag that's passed to their constructor; but this may evolve as I survey all applications of `CallDescription`s.
+Comment by NagyDonat: Github automatically closed this when I referenced this ticket in a commit that's tangentially related to it (but far from a full solution).
+Comment by mjklemm: Sorry, for some reason GitHub closes tickets when pushing a branch to a private copy of the repository.  Does anyone know how to prevent this?
+Comment by steakhal: > Sorry, for some reason GitHub closes tickets when pushing a branch to a private copy of the repository.  Does anyone know how to prevent this?
+
+Yea, thats a hard learning for us, I guess.
+I think the best we can do is to create a copy of this ticket and close this xD
+(While crossreferencing that here)
+Comment by NagyDonat: That sounds to be a github bug... :bug:
+
+Why does it close a PR on *this* repository when a commit is pushed to a *different* repository?? That sounds like a doctor saying "the medicine will cure your illness" after giving the medicine to *a different person*... :upside_down_face: 

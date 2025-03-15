@@ -1,0 +1,208 @@
+Bug Summary: [12/13/14/15 Regression] vzeroupper emitted even though the upper half of the z registers are returned
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 7.1.0
+Known to Fail: 10.1.0, 9.1.0
+
+Comments:
+- User: Lim Sung-Taek | Time: 2024-08-28 08:07:14 UTC
+  Text: Code:
+#include <immintrin.h>
+
+struct B {
+    union {
+        __m512 f;
+        __m512i s;
+    };
+};
+
+auto foo(int n) {
+    B res;
+    res.s = _mm512_set1_epi32(n);
+
+    return res;
+}
+
+auto bar(int n) {
+    B res;
+    res.s = _mm512_set1_epi32(n);
+
+    return res.s;
+}
+
+Compiled with:
+g++ -O2 -std=c++2a -march=skylake-avx512 test.cpp
+
+Result:
+foo(int):
+        vpbroadcastd    zmm0, edi
+        vzeroupper
+        ret
+bar(int):
+        vpbroadcastd    zmm0, edi
+        ret
+
+
+Unlike bar(), foo() has wrong vzeroupper which clears upper bits of zmm0 except the lower 128-bits.
+
+- User: Lim Sung-Taek | Time: 2024-08-28 08:17:44 UTC
+  Text: Using -O0 or -O1 over -O2 seems to clear the problem
+
+- User: Andrew Pinski | Time: 2024-08-28 08:25:46 UTC
+  Text: Confirmed.
+
+Looks like the use of XImode which is missed.
+
+- User: Hongtao Liu | Time: 2024-08-28 08:28:35 UTC
+  Text: 14881static bool                                                                                                                                                                                                                                              
+14882ix86_check_avx_upper_register (const_rtx exp)                                                                                                                                                                                                            
+14883{                                                                                                                                                                                                                                                        
+14884  return (SSE_REG_P (exp)                                                                                                                                                                                                                                
+14885          && !EXT_REX_SSE_REG_P (exp)                                                                                                                                                                                                                    
+14886          && GET_MODE_BITSIZE (GET_MODE (exp)) > 128);                                                                                                                                                                                                   
+14887}                                                                                                                                                                                                                                                        
+14888      
+
+But the code doesn't check modes.
+
+- User: Hongtao Liu | Time: 2024-08-28 08:34:44 UTC
+  Text: gdb shows crtl->return_rtx is
+
+21(parallel/i:BLK [                                                                                                                                                                                                                                           
+22        (expr_list:REG_DEP_TRUE (reg:XI 20 xmm0)                                                                                                                                                                                                            
+23            (const_int 0 [0]))                                                                                                                                                                                                                              
+24    ])
+
+- User: Andrew Pinski | Time: 2024-08-28 08:36:51 UTC
+  Text: (In reply to Hongtao Liu fromcomment #4)> gdb shows crtl->return_rtx is
+> 
+> 21(parallel/i:BLK [                                                         
+> 
+> 22        (expr_list:REG_DEP_TRUE (reg:XI 20 xmm0)                          
+> 
+> 23            (const_int 0 [0]))                                            
+> 
+> 24    ])Oh, so ix86_avx_u128_mode_exit does not understand parallel here.
+
+- User: Hongtao Liu | Time: 2024-08-28 08:52:30 UTC
+  Text: (In reply to Andrew Pinski fromcomment #5)> (In reply to Hongtao Liu fromcomment #4)
+> > gdb shows crtl->return_rtx is
+> > 
+> > 21(parallel/i:BLK [                                                         
+> > 
+> > 22        (expr_list:REG_DEP_TRUE (reg:XI 20 xmm0)                          
+> > 
+> > 23            (const_int 0 [0]))                                            
+> > 
+> > 24    ])
+> 
+> Oh, so ix86_avx_u128_mode_exit does not understand parallel here.For function arguments/return, when it's BLK mode, it's put in parallel with an expr_list which needs extra handle.
+
+- User: GCC Commits | Time: 2024-08-30 05:52:25 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:ab214ef734bfc3dcffcf79ff9e1dd651c2b40566commitr15-3314-gab214ef734bfc3dcffcf79ff9e1dd651c2b40566Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Aug 29 11:39:20 2024 +0800
+
+    Check avx upper register for parallel.
+    
+    For function arguments/return, when it's BLK mode, it's put in a
+    parallel with an expr_list, and the expr_list contains the real mode
+    and registers.
+    Current ix86_check_avx_upper_register only checked for SSE_REG_P, and
+    failed to handle that. The patch extend the handle to each subrtx.
+    
+    gcc/ChangeLog:PR target/116512* config/i386/i386.cc (ix86_check_avx_upper_register): Iterate
+            subrtx to scan for avx upper register.
+            (ix86_check_avx_upper_stores): Inline old
+            ix86_check_avx_upper_register.
+            (ix86_avx_u128_mode_needed): Ditto, and replace
+            FOR_EACH_SUBRTX with call to new
+            ix86_check_avx_upper_register.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr116512.c: New test.
+
+- User: GCC Commits | Time: 2024-09-02 05:10:12 UTC
+  Text: The releases/gcc-14 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:ba9a3f105ea552a22d08f2d54dfdbef16af7c99ecommitr14-10625-gba9a3f105ea552a22d08f2d54dfdbef16af7c99eAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Aug 29 11:39:20 2024 +0800
+
+    Check avx upper register for parallel.
+    
+    For function arguments/return, when it's BLK mode, it's put in a
+    parallel with an expr_list, and the expr_list contains the real mode
+    and registers.
+    Current ix86_check_avx_upper_register only checked for SSE_REG_P, and
+    failed to handle that. The patch extend the handle to each subrtx.
+    
+    gcc/ChangeLog:PR target/116512* config/i386/i386.cc (ix86_check_avx_upper_register): Iterate
+            subrtx to scan for avx upper register.
+            (ix86_check_avx_upper_stores): Inline old
+            ix86_check_avx_upper_register.
+            (ix86_avx_u128_mode_needed): Ditto, and replace
+            FOR_EACH_SUBRTX with call to new
+            ix86_check_avx_upper_register.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr116512.c: New test.
+    
+    (cherry picked from commit ab214ef734bfc3dcffcf79ff9e1dd651c2b40566)
+
+- User: GCC Commits | Time: 2024-09-02 05:10:34 UTC
+  Text: The releases/gcc-13 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:5e049ada87842947adaca5c607516396889f64d6commitr13-8999-g5e049ada87842947adaca5c607516396889f64d6Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Aug 29 11:39:20 2024 +0800
+
+    Check avx upper register for parallel.
+    
+    For function arguments/return, when it's BLK mode, it's put in a
+    parallel with an expr_list, and the expr_list contains the real mode
+    and registers.
+    Current ix86_check_avx_upper_register only checked for SSE_REG_P, and
+    failed to handle that. The patch extend the handle to each subrtx.
+    
+    gcc/ChangeLog:PR target/116512* config/i386/i386.cc (ix86_check_avx_upper_register): Iterate
+            subrtx to scan for avx upper register.
+            (ix86_check_avx_upper_stores): Inline old
+            ix86_check_avx_upper_register.
+            (ix86_avx_u128_mode_needed): Ditto, and replace
+            FOR_EACH_SUBRTX with call to new
+            ix86_check_avx_upper_register.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr116512.c: New test.
+    
+    (cherry picked from commit ab214ef734bfc3dcffcf79ff9e1dd651c2b40566)
+
+- User: GCC Commits | Time: 2024-09-02 05:10:54 UTC
+  Text: The releases/gcc-12 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:6585b06303d8fd9da907f443fc0da9faed303712commitr12-10694-g6585b06303d8fd9da907f443fc0da9faed303712Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Aug 29 11:39:20 2024 +0800
+
+    Check avx upper register for parallel.
+    
+    For function arguments/return, when it's BLK mode, it's put in a
+    parallel with an expr_list, and the expr_list contains the real mode
+    and registers.
+    Current ix86_check_avx_upper_register only checked for SSE_REG_P, and
+    failed to handle that. The patch extend the handle to each subrtx.
+    
+    gcc/ChangeLog:PR target/116512* config/i386/i386.cc (ix86_check_avx_upper_register): Iterate
+            subrtx to scan for avx upper register.
+            (ix86_check_avx_upper_stores): Inline old
+            ix86_check_avx_upper_register.
+            (ix86_avx_u128_mode_needed): Ditto, and replace
+            FOR_EACH_SUBRTX with call to new
+            ix86_check_avx_upper_register.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr116512.c: New test.
+    
+    (cherry picked from commit ab214ef734bfc3dcffcf79ff9e1dd651c2b40566)
+
+- User: Hongtao Liu | Time: 2024-09-02 05:11:28 UTC
+  Text: Fixed in GCC12.5/GCC13.4/GCC14.3/GCC15
+

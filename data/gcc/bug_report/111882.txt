@@ -1,0 +1,134 @@
+Bug Summary: [13 Regression] : internal compiler error: in get_expr_operand in ifcvt with Variable length arrays and bitfields inside a struct
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-checking, ice-on-valid-code
+Known to Work: 11.2.0, 12.1.0, 13.2.1, 14.0
+Known to Fail: 13.2.0
+
+Comments:
+- User: wierton | Time: 2023-10-19 16:32:47 UTC
+  Text: Compiler Explorer:https://gcc.godbolt.org/z/h9MMnxbvKWhen compile this program with option -O2, gcc crashes:
+```
+static void __attribute__((noipa)) f(int n) {
+  int i, j;
+  struct S { char d[n]; int a; int b : 17; int c : 12; };
+  struct S A[100][1111];
+  for (i = 0; i < 100; i++) {
+    asm volatile("" : : "g"(&A[0][0]) : "memory");
+    for (j = 0; j < 1111; j++) A[i][j].b = 2;
+  }
+}
+
+void g(void) { f(1); }
+```
+
+The stack dump:
+```
+unhandled expression in get_expr_operands():
+ <save_expr 0x7fe6f6035440
+    type <integer_type 0x7fe6f5ea55e8 int sizes-gimplified asm_written public SI
+        size <integer_cst 0x7fe6f5ea7180 constant 32>
+        unit-size <integer_cst 0x7fe6f5ea7198 constant 4>
+        align:32 warn_if_not_align:0 symtab:-167332928 alias-set 3 canonical-type 0x7fe6f5ea55e8 precision:32 min <integer_cst 0x7fe6f5ea7138 -2147483648> max <integer_cst 0x7fe6f5ea7150 2147483647>
+        pointer_to_this <pointer_type 0x7fe6f5eadb28>>
+    side-effects public
+    arg:0 <var_decl 0x7fe6f5e94f30 n.0 type <integer_type 0x7fe6f5ea55e8 int>
+        used ignored SI <source>:3:10 size <integer_cst 0x7fe6f5ea7180 32> unit-size <integer_cst 0x7fe6f5ea7198 4>
+        align:32 warn_if_not_align:0 context <function_decl 0x7fe6f6033b00 f>>>
+
+during GIMPLE pass: ifcvt
+<source>: In function 'f':
+<source>:1:36: internal compiler error: in get_expr_operands, at tree-ssa-operands.cc:940
+    1 | static void __attribute__((noipa)) f(int n) {
+      |                                    ^
+0x231788e internal_error(char const*, ...)
+	???:0
+0xa0002a fancy_abort(char const*, int, char const*)
+	???:0
+0x12e792d operands_scanner::get_expr_operands(tree_node**, int)
+	???:0
+0x12e71b8 operands_scanner::get_expr_operands(tree_node**, int)
+	???:0
+0x12e71b8 operands_scanner::get_expr_operands(tree_node**, int)
+	???:0
+0x12e71b8 operands_scanner::get_expr_operands(tree_node**, int)
+	???:0
+0x12e7e50 operands_scanner::parse_ssa_operands()
+	???:0
+0x12e8cfa operands_scanner::build_ssa_operands()
+	???:0
+0x12e8f44 update_stmt_operands(function*, gimple*)
+	???:0
+0xd66fec gsi_insert_before(gimple_stmt_iterator*, gimple*, gsi_iterator_update)
+	???:0
+0x1196551 tree_if_conversion(loop*, vec<gimple*, va_heap, vl_ptr>*)
+	???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+```
+
+- User: Andrew Pinski | Time: 2023-10-19 16:39:48 UTC
+  Text: We start out with:
+  (*A.1_23)[i_33]{lb: 0 sz: _10 * 4}[j_34]{lb: 0 sz: _11 * 4}.b{off: _13 * 4} = 2;
+
+And then we add:
+  _ifc__49 = (*A.1_23)[i_33]{lb: 0 sz: _10 * 4}[j_34]{lb: 0 sz: _11 * 4}.D.2748{off: ((sizetype) SAVE_EXPR <n.0> + 3 & 18446744073709551612) + 4};
+
+- User: Andrew Pinski | Time: 2023-10-19 16:43:40 UTC
+  Text: Looks like this was broken when bitfield expansion was added to ifcvt (I thinkr13-3219-g25413fdb2ac24933214123e24ba165026452a6f2).
+
+- User: N/A | Time: 2023-10-20 09:55:01 UTC
+  Text: Taking this, first time I see a SAVE_EXPR. It looks like it indicates side-effects, I'm gonna see if I can detect the presence of side-effects and reject lowering if so. Does that sound OK?
+
+- User: GCC Commits | Time: 2023-10-20 16:03:36 UTC
+  Text: The master branch has been updated by Andre Simoes Dias Vieira <avieira@gcc.gnu.org>:https://gcc.gnu.org/g:24cf1f600b8ad34c68a51f48884e72d01f729893commitr14-4798-g24cf1f600b8ad34c68a51f48884e72d01f729893Author: Andre Vieira <andre.simoesdiasvieira@arm.com>
+Date:   Fri Oct 20 17:02:32 2023 +0100
+
+    ifcvt: Don't lower bitfields with non-constant offsets [PR 111882]
+    
+    This patch stops lowering of bitfields by ifcvt when they have non-constant
+    offsets as we are not likely to be able to do anything useful with those during
+    vectorization.  That also fixes the issue reported inPR 111882, which was
+    being caused by an offset with a side-effect being lowered, but constants have
+    no side-effects so we will no longer run into that problem.
+    
+    gcc/ChangeLog:PR tree-optimization/111882* tree-if-conv.cc (get_bitfield_rep): Return NULL_TREE for bitfields
+            with non-constant offsets.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/vect/pr111882.c: New test.
+
+- User: N/A | Time: 2024-04-30 16:50:32 UTC
+  Text: Fixed on gcc-14 (when it was trunk, so removing 14 and 15 tag. Still needs backport to gcc-13
+
+- User: Richard Ball | Time: 2024-05-02 21:22:06 UTC
+  Text: Confirmed error exists on gcc-13. Backport applies cleanly and fixes the error. Will request permission to backport on the mailing list.
+
+- User: GCC Commits | Time: 2024-05-03 10:10:25 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Ball <ricbal02@gcc.gnu.org>:https://gcc.gnu.org/g:4950f6bcd3cce9deb630b76af42cd6d6968ba03fcommitr13-8678-g4950f6bcd3cce9deb630b76af42cd6d6968ba03fAuthor: Andre Vieira <andre.simoesdiasvieira@arm.com>
+Date:   Fri Oct 20 17:02:32 2023 +0100
+
+    ifcvt: Don't lower bitfields with non-constant offsets [PR 111882]
+    
+    This patch stops lowering of bitfields by ifcvt when they have non-constant
+    offsets as we are not likely to be able to do anything useful with those during
+    vectorization.  That also fixes the issue reported inPR 111882, which was
+    being caused by an offset with a side-effect being lowered, but constants have
+    no side-effects so we will no longer run into that problem.
+    
+    gcc/ChangeLog:PR tree-optimization/111882* tree-if-conv.cc (get_bitfield_rep): Return NULL_TREE for bitfields
+            with non-constant offsets.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/vect/pr111882.c: New test.
+    
+    (cherry picked from commit 24cf1f600b8ad34c68a51f48884e72d01f729893)
+
+- User: Richard Biener | Time: 2024-05-08 12:48:39 UTC
+  Text: Fixed.
+

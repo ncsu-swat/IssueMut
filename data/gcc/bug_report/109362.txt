@@ -1,0 +1,131 @@
+Bug Summary: codegen adds unnecessary extra add when reading atomic member
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Barry Revzin | Time: 2023-03-31 14:01:16 UTC
+  Text: This program:
+
+#include <atomic>
+
+struct S {
+    long size;
+    std::atomic<char*> read_ptr;
+
+    auto peek() const -> const char* {    
+        return read_ptr.load(std::memory_order_acquire);
+    }
+};
+
+auto with_atomic(S const& v) {
+    while (true) {
+        if (v.peek()) {
+            return true;
+        }
+    }
+}
+
+emits (on gcc 12.2 -O3):
+
+with_atomic(S const&):
+        add     rdi, 8
+.L2:
+        mov     rax, QWORD PTR [rdi]
+        test    rax, rax
+        je      .L2
+        mov     eax, 1
+        ret
+
+But that add is completely necessary, the mov could just be:
+
+        mov     rax, QWORD PTR [rdi + 8]
+
+which is what clang (16.0 -O3) generates:
+
+with_atomic(S const&):                    # @with_atomic(S const&)
+.LBB0_1:                                # =>This Inner Loop Header: Depth=1
+        mov     rax, qword ptr [rdi + 8]
+        test    rax, rax
+        je      .LBB0_1
+        mov     al, 1
+        ret
+
+It's not just an extra add, it's consuming an extra register - which has more downstream optimization effects.
+
+- User: Barry Revzin | Time: 2023-03-31 14:38:19 UTC
+  Text: Sorry, in this reduced example, it doesn't actually consume an extra register - only rdi is used. 
+
+In this slightly less reduced example:
+
+#include <atomic>
+
+struct S {
+    std::atomic<long> size;
+    std::atomic<char*> read_ptr;
+
+    auto peek() const -> const char* {    
+        auto const s = size.load(std::memory_order_acquire);
+        return read_ptr.load(std::memory_order_acquire);
+    }
+};
+
+auto with_atomic(S const& v) {
+    while (true) {
+        if (v.peek()) {
+            return true;
+        }
+    }
+}
+
+
+the codegen is:
+
+with_atomic(WithAtomic const&):
+        lea     rdx, [rdi+8]
+.L2:
+        mov     rax, QWORD PTR [rdi]
+        mov     rax, QWORD PTR [rdx]
+        test    rax, rax
+        je      .L2
+        mov     eax, 1
+        ret
+
+which now does consume rdx unnecessarily.
+
+- User: Jakub Jelinek | Time: 2023-03-31 15:26:29 UTC
+  Text: This got fixed withr13-137-gee1cb43bc76de800efa0ade6on the trunk.
+
+- User: Jakub Jelinek | Time: 2023-03-31 15:27:43 UTC
+  Text: Reduced C testcase would be
+struct S { long a, b; };
+
+int
+foo (struct S *v)
+{
+  while (1)
+    {
+      __atomic_load_n (&v->a, __ATOMIC_ACQUIRE);
+      if (__atomic_load_n (&v->b, __ATOMIC_ACQUIRE))
+	return 1;
+    }
+}
+
+- User: Barry Revzin | Time: 2023-03-31 15:29:39 UTC
+  Text: Awesome!
+
+- User: GCC Commits | Time: 2023-04-01 07:01:57 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:87d3bc53b177037699f7f8dda3a3d17e647c459dcommitr13-6966-g87d3bc53b177037699f7f8dda3a3d17e647c459dAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Sat Apr 1 09:00:22 2023 +0200
+
+    testsuite: Add testcase for already fixed PR [PR109362]
+    
+    This PR got fixed withr13-137.
+    Add a testcase to make sure it doesn't reappear.
+    
+    2023-04-01  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109362* gcc.target/i386/pr109362.c: New test.
+

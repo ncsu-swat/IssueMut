@@ -1,0 +1,152 @@
+Bug Summary: [14 Regression] ICE in make_ssa_name_fn with VLA inside type and inlining since r14-1142
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 13.2.0
+Known to Fail: 14.0
+
+Comments:
+- User: wierton | Time: 2023-11-12 09:05:03 UTC
+  Text: Compiler explorer:https://gcc.godbolt.org/z/h9aen36q7When compile this program with `gcc-14 -O1`, gcc ICEs:
+```
+extern void abort(void);
+
+int test(int *n) {
+  struct T { char a[*n], b[*n]; };
+  return sizeof(struct T) - sizeof(struct T);
+}
+
+void f1(int *p) {
+  if (test(p)) abort();
+}
+```
+
+The crash output:
+```
+during IPA pass: inline
+In function 'test':
+cc1: internal compiler error: in make_ssa_name_fn, at tree-ssanames.cc:354
+0x238b15e internal_error(char const*, ...)
+	???:0
+0xa11270 fancy_abort(char const*, int, char const*)
+	???:0
+0x11bd6ff copy_tree_body_r(tree_node**, int*, void*)
+	???:0
+0x147a55c walk_tree_1(tree_node**, tree_node* (*)(tree_node**, int*, void*), void*, hash_set<tree_node*, false, default_hash_traits<tree_node*> >*, tree_node* (*)(tree_node**, int*, tree_node* (*)(tree_node**, int*, void*), void*, hash_set<tree_node*, false, default_hash_traits<tree_node*> >*))
+	???:0
+0x147a8c4 walk_tree_1(tree_node**, tree_node* (*)(tree_node**, int*, void*), void*, hash_set<tree_node*, false, default_hash_traits<tree_node*> >*, tree_node* (*)(tree_node**, int*, tree_node* (*)(tree_node**, int*, void*), void*, hash_set<tree_node*, false, default_hash_traits<tree_node*> >*))
+	???:0
+0x147a8c4 walk_tree_1(tree_node**, tree_node* (*)(tree_node**, int*, void*), void*, hash_set<tree_node*, false, default_hash_traits<tree_node*> >*, tree_node* (*)(tree_node**, int*, tree_node* (*)(tree_node**, int*, void*), void*, hash_set<tree_node*, false, default_hash_traits<tree_node*> >*))
+	???:0
+0x11b8ac9 remap_type(tree_node*, copy_body_data*)
+	???:0
+0x11b8bdf remap_decl(tree_node*, copy_body_data*)
+	???:0
+0x11c5b59 tree_function_versioning(tree_node*, tree_node*, vec<ipa_replace_map*, va_gc, vl_embed>*, ipa_param_adjustments*, bool, bitmap_head*, basic_block_def*)
+	???:0
+0xe698db inline_transform(cgraph_node*)
+	???:0
+0xfec7fb execute_all_ipa_transforms(bool)
+	???:0
+0xbfe2d9 cgraph_node::expand()
+	???:0
+0xc027bb symbol_table::finalize_compilation_unit()
+	???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+```
+
+- User: Andrew Pinski | Time: 2023-11-12 19:25:22 UTC
+  Text: Confirmed.
+
+- User: Richard Biener | Time: 2023-11-13 08:59:24 UTC
+  Text: We are remapping a TYPE_DECL, but IIRC we do not "gimplify" those, so their
+TYPE_SIZE and friends are still GENERIC trees, and more importantly _shared_
+which means released SSA names can appear there.
+
+This happens during remapping BLOCK_VARS, so I think it's probably desired(?)
+it means the "error" is in clobbering the shared tree here.  But
+unshare_body doesn't look at the BLOCK tree.  It ends up at the TYPE_DECL
+itself via walking the BIND_EXPR_VARS and we are properly gimplifying
+the TYPE_DECLs sizes, but walk_tree doesn't recurse into types.
+
+I'm not sure whether we are expecting a DECL_EXPR for the TYPE_DECL here
+(but there's explicit code in walk_tree_1 for that).  But I'll note the
+unsharing walker would depend on that.
+
+So I think this is a C frontend issue which fails to emit a DECL_EXPR
+for the typedef.
+
+- User: Andrew Pinski | Time: 2023-11-13 18:29:22 UTC
+  Text: ***Bug 112517has been marked as a duplicate of this bug. ***
+
+- User: Jakub Jelinek | Time: 2023-11-13 18:33:37 UTC
+  Text: Started withr14-1142-gf9b5be322358ee63798e02a9103b6bbe459e7aea
+
+- User: N/A | Time: 2023-11-13 18:35:41 UTC
+  Text: Oh well, more to fix.
+
+I wonder whether we could validate the trees created by the front-end FE somehow.
+
+- User: N/A | Time: 2023-11-13 20:19:25 UTC
+  Text: So adding back the DECL_EXPR ( TYPE_DECL (t) ) in finish_struct fixes it, but I am not sure this is completely correct...
+
+- User: N/A | Time: 2023-11-13 20:23:13 UTC
+  Text: And this example also fails with this fix:
+
+extern void abort(void);
+
+int test(int *n, struct T { char a[*n], b[*n]; }*) {
+  return sizeof(struct T) - sizeof(struct T);
+}
+
+void f1(int *p) {
+  if (test(p, 0)) abort();
+}
+
+- User: Andrew Pinski | Time: 2023-12-07 09:33:14 UTC
+  Text: ***Bug 112898has been marked as a duplicate of this bug. ***
+
+- User: Martin Uecker | Time: 2023-12-07 22:19:28 UTC
+  Text: Createdattachment 56830[details]patch
+
+
+Here is a patch, but it causes an ICE in 
+
+FAIL: gcc.dg/debug/pr39412.c -gctf (internal compiler error: in AT_unsigned, at dwarf2out.cc:4590)
+
+which I do not understand so far.
+
+- User: Martin Uecker | Time: 2023-12-08 17:19:21 UTC
+  Text: PATCH:https://gcc.gnu.org/pipermail/gcc-patches/2023-December/639961.html
+
+- User: GCC Commits | Time: 2023-12-11 22:20:22 UTC
+  Text: The master branch has been updated by Martin Uecker <uecker@gcc.gnu.org>:https://gcc.gnu.org/g:6cf9654c3b06c076502a39a3bf2222dd6e43b73bcommitr14-6436-g6cf9654c3b06c076502a39a3bf2222dd6e43b73bAuthor: Martin Uecker <uecker@tugraz.at>
+Date:   Wed Nov 15 09:22:55 2023 +0100
+
+    Fix regression causing ICE for structs with VLAs [PR 112488]
+    
+    A previous patch that fixed several ICEs related to size expressions
+    of VM types (PR c/70418, ...) caused a regression for structs where
+    a DECL_EXPR is not generated anymore although reqired.  We now call
+    add_decl_expr introduced by the previous patch from finish_struct.
+    The function is revised with a new argument to not set the TYPE_NAME
+    for the type to the DECL_EXPR in this specific case.PR c/112488gcc/c
+            * c-decl.cc (add_decl_expr): Revise.
+            (finish_struct): Create DECL_EXPR.
+            * c-parser.cc (c_parser_struct_or_union_specifier): Call
+            finish_struct with expression for VLA sizes.
+            * c-tree.h (finish_struct): Add argument.
+    
+    gcc/testsuite
+            * gcc.dg/pr112488-1.c: New test.
+            * gcc.dg/pr112488-2.c: New test.
+            * gcc.dg/pr112898.c: New test.
+            * gcc.misc-tests/gcov-pr85350.c: Adapt.
+
+- User: N/A | Time: 2023-12-13 17:49:41 UTC
+  Text: Fixed on trunk.
+

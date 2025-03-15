@@ -1,0 +1,124 @@
+Bug Summary: Optimizing __builtin_signbit(x) ? -x : x or abs for FP
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Antony Polukhin | Time: 2023-05-12 13:23:50 UTC
+  Text: Consider the following 2 functions:
+
+__float128 abs1(__float128 x) { return __builtin_fabsf128(x); }
+__float128 abs2(__float128 x) { return __builtin_signbit(x) ? -x : x; }
+
+They should provide the same results, however the codegen is different:
+
+abs1(__float128):
+        pand    xmm0, XMMWORD PTR .LC0[rip]
+        ret
+abs2(__float128):
+        movmskps        eax, xmm0
+        test    al, 8
+        je      .L4
+        pxor    xmm0, XMMWORD PTR .LC1[rip]
+.L4:
+        ret
+
+
+Looks like match.pd miss the __builtin_signbit(x) ? -x : x -> __builtin_fabs*(x) pattern.
+
+Playground:https://godbolt.org/z/bsxeozGqv
+
+- User: Andrew Pinski | Time: 2023-05-12 18:16:55 UTC
+  Text: From phiopt1:
+phiopt match-simplify trying:
+	_1 != 0 ? iftmp.0_5 : x_3(D)
+
+Where _1 is defined as:
+  _1 = signbitD.1026 (x_3(D));
+and iftmp.0_5 is defined as:
+  iftmp.0_5 = -x_3(D);
+
+This should fix it then:
+(simplify
+ (cond (ne (SIGNBIT @0) zero_p@1) (neg @0) @0)
+ (abs @0))
+
+- User: Andrew Pinski | Time: 2023-05-12 19:25:21 UTC
+  Text: I will implement this since it is only 3 lines or so. Just need some testcases.
+
+- User: Andrew Pinski | Time: 2023-05-12 19:34:02 UTC
+  Text: Should add this one too:
+
+(simplify
+ (cond (ne (SIGNBIT @0) zero_p@1) @0 (neg @0))
+ (neg (abs @0)))
+
+- User: Jakub Jelinek | Time: 2023-05-12 20:02:23 UTC
+  Text: Don't you need also
+(simplify
+ (cond (eq (SIGNBIT @0) zero_p@1) (neg @0) @0)
+ (neg (abs @0)))
+(simplify
+ (cond (eq (SIGNBIT @0) zero_p@1) @0 (neg @0))
+ (abs @0))
+?
+Or does match.pd try to invert all the COND_EXPR conditions and swap the operands?
+
+- User: Jakub Jelinek | Time: 2023-05-12 20:03:41 UTC
+  Text: Or canonicalize COND_EXPRs such that only ne and not eq appears in condition (and similarly to other comparisons)?
+
+- User: Andrew Pinski | Time: 2023-05-12 20:18:27 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #4)> Or does match.pd try to invert all the COND_EXPR conditions and swap the
+> operands?match does not try but phiopt does in gimple_simplify_phiopt .
+
+Or even something like this would work better. 
+(for neeq (ne eq)
+ (simplify
+  (cond (neeq (SIGNBIT @0) zero_p@1) (neg @0) @0)
+   (if (neqeq == NE_EXPR)
+    (abs @0)
+    (neg (abs @0))
+   )
+  )
+ )
+)
+
+I need to double check if == 1 will show up here though.
+
+- User: Andrew Pinski | Time: 2023-05-13 15:53:46 UTC
+  Text: (In reply to Andrew Pinski fromcomment #6)> I need to double check if == 1 will show up here though.The only thing we know about __builtin_signbit is that is 0 or non-zero. The exact value is unspecified for the non-zero case. So we can only optimize the !=/== 0 cases.
+
+- User: Andrew Pinski | Time: 2023-05-13 22:29:57 UTC
+  Text: Createdattachment 55079[details]Patch which I am testing
+
+- User: Andrew Pinski | Time: 2023-05-14 04:04:02 UTC
+  Text: Patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2023-May/618435.html
+
+- User: GCC Commits | Time: 2023-05-14 23:08:31 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:82502b5c3463bde98d4b7ffb9ecef9b123799ed1commitr14-813-g82502b5c3463bde98d4b7ffb9ecef9b123799ed1Author: Andrew Pinski <apinski@marvell.com>
+Date:   Sat May 13 22:25:21 2023 +0000
+
+    MATCH: Add pattern for `signbit(x) ? x : -x` into abs (and swapped)
+    
+    This adds a simple pattern to match.pd for `signbit(x) ? x : -x`
+    into abs<x>. This can be done for all types even ones that honor
+    signed zeros and NaNs because both signbit and - are considered
+    only looking at/touching the sign bit of those types and does
+    not trap either.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/109829gcc/ChangeLog:
+    
+            * match.pd: Add pattern for `signbit(x) !=/== 0 ? x : -x`.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/abs-3.c: New test.
+            * gcc.dg/tree-ssa/abs-4.c: New test.
+
+- User: Andrew Pinski | Time: 2023-05-14 23:09:18 UTC
+  Text: Fixed.
+

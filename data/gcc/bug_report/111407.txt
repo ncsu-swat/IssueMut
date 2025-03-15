@@ -1,0 +1,194 @@
+Bug Summary: [11/12/13 Regression] ICE: SSA corruption due to widening_mul opt on conflict across an abnormal edge
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-checking, ice-on-valid-code
+Known to Work: 14.0, 6.4.0
+Known to Fail: 7.5.0, 8.5.0
+
+Comments:
+- User: N/A | Time: 2023-09-13 16:39:34 UTC
+  Text: this bug was originally reported against GCC8.5 with profiling feedback. 
+there were multiple similar failures due to this issue for our large application. 
+
+Although we reduced the testing case to a very small size, and changed the variable names. the failure can only be repeated with -fprofile-use and the .gcda files. As a result, we cannot expose the testing case.
+
+With the small testing case, and debugging into GCC8, I finally locate the issue is:
+
+this is a bug in tree-ssa-math-opts.cc, when applying the widening mul optimization, 
+The compiler needs to check whether the operand is in a ABNORMAL PHI, if YES, we should avoid the transformation.
+
+the following patch against GCC8 can fix the failure very well:
+
+diff -u -r -N -p gcc-8.5.0-20210514-org/gcc/tree-ssa-math-opts.c gcc-8.5.0-20210514/gcc/tree-ssa-math-opts.c
+--- gcc-8.5.0-20210514-org/gcc/tree-ssa-math-opts.c 2023-09-11 21:04:17.891403319 +0000
++++ gcc-8.5.0-20210514/gcc/tree-ssa-math-opts.c 2023-09-13 15:35:44.962336530 +0000
+@@ -2346,6 +2346,14 @@ convert_mult_to_widen (gimple *stmt, gim
+if (!is_widening_mult_p (stmt, &type1, &rhs1, &type2, &rhs2))
+return false;
+
++ /* if any one of rhs1 and rhs2 is subjust to abnormal coalescing
++ * avoid the tranform. */ 
++ if ((TREE_CODE (rhs1) == SSA_NAME
++ && SSA_NAME_OCCURS_IN_ABNORMAL_PHI (rhs1))
++ || (TREE_CODE (rhs2) == SSA_NAME
++ && SSA_NAME_OCCURS_IN_ABNORMAL_PHI (rhs2)))
++ return false;
++
+to_mode = SCALAR_INT_TYPE_MODE (type);
+from_mode = SCALAR_INT_TYPE_MODE (type1);
+if (to_mode == from_mode)
+
+I checked the latest upstream GCC14, and found that the function "convert_mult_to_widen" has the same issue, need to be patched as well.
+
+- User: Andrew Pinski | Time: 2023-09-13 17:02:35 UTC
+  Text: Do you have a testcase?
+
+- User: Andrew Pinski | Time: 2023-09-13 17:04:28 UTC
+  Text: Also what target is this for?
+I suspect aarch64 since x86_64 does not have widening multiply ...
+
+- User: N/A | Time: 2023-09-13 17:05:51 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> Do you have a testcase?I have, but I cannot expose it to public.
+I can provide the Bad IR and Good IR if you think it's okay.
+
+- User: N/A | Time: 2023-09-13 17:06:32 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> Also what target is this for?
+> I suspect aarch64 since x86_64 does not have widening multiply ...you are right, it's aarch64.
+
+- User: Andrew Pinski | Time: 2023-09-13 17:14:51 UTC
+  Text: Testcase:
+```
+enum { SEND_TOFILE } __sigsetjmp();
+void fclose();
+void foldergets();
+void sendpart_stats(int *p1, int a1, int b1) {
+  int *a = p1;
+  fclose();
+  p1 = 0;
+  long t = b1;
+  if (__sigsetjmp()) {
+    {
+      long t1 = a1;
+      a1+=1;
+      fclose(a1*(long)t1);
+    }
+  }
+  if (p1)
+    fclose();
+}
+```
+
+- User: Andrew Pinski | Time: 2023-09-13 17:26:37 UTC
+  Text: (In reply to Andrew Pinski fromcomment #5)> Testcase:The way I figured out this testcase was trial and error and starting with the testcase fromPR 69167.
+
+- User: N/A | Time: 2023-09-13 18:19:59 UTC
+  Text: (In reply to Andrew Pinski fromcomment #5)> Testcase:thanks a lot for the testing case. GCC8 failed with this, disable tree-widening_mul fixed the failure.
+and my patch for GCC8 also fixed the failure.
+
+will test GCC14 as well.
+
+- User: N/A | Time: 2023-09-13 18:52:52 UTC
+  Text: the latest GCC14 has the same issue.
+
+with the patch proposed incomment #1, the failure has been fixed.
+
+- User: GCC Commits | Time: 2023-09-15 13:47:21 UTC
+  Text: The master branch has been updated by Qing Zhao <qinzhao@gcc.gnu.org>:https://gcc.gnu.org/g:4aca1cfd6235090e48a53dab734437740671bbf3commitr14-4034-g4aca1cfd6235090e48a53dab734437740671bbf3Author: Qing Zhao <qing.zhao@oracle.com>
+Date:   Fri Sep 15 13:46:52 2023 +0000
+
+    FixPR111407--SSA corruption due to widening_mul opt on conflict across an abnormal edge
+    
+    This is a bug in tree-ssa-math-opts.cc, when applying the widening mul
+    optimization, the compiler needs to check whether the operand is in a
+    ABNORMAL PHI, if YES, we should avoid the transformation.PR tree-optimization/111407gcc/ChangeLog:
+    
+            * tree-ssa-math-opts.cc (convert_mult_to_widen): Avoid the transform
+            when one of the operands is subject to abnormal coalescing.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr111407.c: New test.
+
+- User: N/A | Time: 2023-09-15 13:56:52 UTC
+  Text: (In reply to Andrew Pinski fromcomment #6)
+the fix has been in GCC14, shall we backport the patch to previous releases?
+
+- User: Andrew Pinski | Time: 2024-02-29 07:36:33 UTC
+  Text: For aarch64, this has worked in GCC 6.4.0.
+
+s/long/long long/ it also fails for arm starting in GCC 7.x. Likewise for mips64 and mips.
+
+- User: Andrew Pinski | Time: 2024-02-29 07:37:01 UTC
+  Text: (In reply to qinzhao fromcomment #10)> (In reply to Andrew Pinski fromcomment #6)
+> the fix has been in GCC14, shall we backport the patch to previous releases?Since it is a regression, yes please.
+
+- User: N/A | Time: 2024-02-29 14:43:29 UTC
+  Text: (In reply to Andrew Pinski fromcomment #12)> (In reply to qinzhao fromcomment #10)
+> > (In reply to Andrew Pinski fromcomment #6)
+> > the fix has been in GCC14, shall we backport the patch to previous releases?
+> 
+> Since it is a regression, yes please.So, How far back should I add the fix? gcc13, gcc12, till ?
+
+- User: GCC Commits | Time: 2024-04-02 14:50:12 UTC
+  Text: The releases/gcc-13 branch has been updated by Qing Zhao <qinzhao@gcc.gnu.org>:https://gcc.gnu.org/g:2d9a9488e26233eb9497722fa9ccb88258f7402ccommitr13-8556-g2d9a9488e26233eb9497722fa9ccb88258f7402cAuthor: Qing Zhao <qing.zhao@oracle.com>
+Date:   Thu Feb 29 15:07:49 2024 +0000
+
+    Fix SSA corruption due to widening_mul opt on conflict across an abnormal edge [PR111407]
+    
+    This is a bug in tree-ssa-math-opts.cc, when applying the widening mul
+    optimization, the compiler needs to check whether the operand is in a
+    ABNORMAL PHI, if YES, we should avoid the transformation.PR tree-optimization/111407gcc/ChangeLog:
+    
+            * tree-ssa-math-opts.cc (convert_mult_to_widen): Avoid the transform
+            when one of the operands is subject to abnormal coalescing.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr111407.c: New test.
+    
+    (cherry picked from commit 4aca1cfd6235090e48a53dab734437740671bbf3)
+
+- User: GCC Commits | Time: 2024-04-02 15:56:56 UTC
+  Text: The releases/gcc-12 branch has been updated by Qing Zhao <qinzhao@gcc.gnu.org>:https://gcc.gnu.org/g:5f23f9f141c4b52e8f4a9aadc88b8155cf1959a3commitr12-10306-g5f23f9f141c4b52e8f4a9aadc88b8155cf1959a3Author: Qing Zhao <qing.zhao@oracle.com>
+Date:   Thu Feb 29 15:07:49 2024 +0000
+
+    Fix SSA corruption due to widening_mul opt on conflict across an abnormal edge [PR111407]
+    
+    This is a bug in tree-ssa-math-opts.cc, when applying the widening mul
+    optimization, the compiler needs to check whether the operand is in a
+    ABNORMAL PHI, if YES, we should avoid the transformation.PR tree-optimization/111407gcc/ChangeLog:
+    
+            * tree-ssa-math-opts.cc (convert_mult_to_widen): Avoid the transform
+            when one of the operands is subject to abnormal coalescing.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr111407.c: New test.
+    
+    (cherry picked from commit 4aca1cfd6235090e48a53dab734437740671bbf3)
+
+- User: GCC Commits | Time: 2024-04-02 16:54:20 UTC
+  Text: The releases/gcc-11 branch has been updated by Qing Zhao <qinzhao@gcc.gnu.org>:https://gcc.gnu.org/g:4de35949e462d89926a171cd1ef7b6f40a308dabcommitr11-11306-g4de35949e462d89926a171cd1ef7b6f40a308dabAuthor: Qing Zhao <qing.zhao@oracle.com>
+Date:   Mon Mar 25 14:17:56 2024 +0000
+
+    Fix SSA corruption due to widening_mul opt on conflict across an abnormal edge [PR111407]
+    
+    This is a bug in tree-ssa-math-opts.c, when applying the widening mul
+    optimization, the compiler needs to check whether the operand is in a
+    ABNORMAL PHI, if YES, we should avoid the transformation.PR tree-optimization/111407gcc/ChangeLog:
+    
+            * tree-ssa-math-opts.c (convert_mult_to_widen): Avoid the transform
+            when one of the operands is subject to abnormal coalescing.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr111407.c: New test.
+    
+    (cherry picked from commit 4aca1cfd6235090e48a53dab734437740671bbf3)
+
+- User: N/A | Time: 2024-04-02 16:56:06 UTC
+  Text: the patch has been back ported to all supported releases: GCC13, GCC12 and GCC11.
+close it as fixed.
+

@@ -1,0 +1,263 @@
+Bug Summary: arm: ICE in arm_effective_regno when compiling for MVE
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code, ra
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Stam Markianos-Wright | Time: 2023-11-01 15:49:15 UTC
+  Text: Hi all,
+
+I found this ICE when compiling CMSIS-NN with latest trunk:
+
+./build-arm-eabi-armv8.1-m.main+mve.fp+fp.dp/install/bin/arm-eabi-gcc -mcpu=cortex-m55 ~/gnu/CMSIS-NN/Source/NNSupportFunctions/arm_nn_depthwise_conv_nt_t_padded_s8.c -I ~/gnu/CMSIS-NN/Include/ -O3 -S
+during RTL pass: ira
+/home/stamar01/gnu/CMSIS-NN/Source/NNSupportFunctions/arm_nn_depthwise_conv_nt_t_padded_s8.c: In function 'arm_nn_depthwise_conv_nt_t_padded_s8':
+/home/stamar01/gnu/CMSIS-NN/Source/NNSupportFunctions/arm_nn_depthwise_conv_nt_t_padded_s8.c:172:1: internal compiler error: in arm_effective_regno, at config/arm/arm.cc:13671
+  172 | }
+      | ^
+0x1b590f2 arm_effective_regno
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/config/arm/arm.cc:13671
+0x1b5923a mve_vector_mem_operand(machine_mode, rtx_def*, bool)
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/config/arm/arm.cc:13701
+0x23015c2 mve_memory_operand(rtx_def*, machine_mode)
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/config/arm/predicates.md:39
+0x23d79fa recog_235
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/config/arm/mve.md:3636
+0x241db9c recog_287
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/config/arm/neon.md:6161
+0x24540af recog_344
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/config/arm/mve.md:6390
+0x2459355 recog(rtx_def*, rtx_insn*, int*)
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/config/arm/sync.md:462
+0x15663f5 insn_invalid_p(rtx_insn*, bool)
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/recog.cc:358
+0x15667ad verify_changes(int)
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/recog.cc:469
+0x1350f89 equiv_can_be_consumed_p
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/ira-costs.cc:1767
+0x13518f0 calculate_equiv_gains
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/ira-costs.cc:1887
+0x1351fbe find_costs_and_classes
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/ira-costs.cc:2007
+0x135404c ira_costs()
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/ira-costs.cc:2564
+0x1347e82 ira_build()
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/ira-build.cc:3481
+0x133d895 ira
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/ira.cc:5793
+0x133e215 execute
+	/home/stamar01/gnu/v8.X-M/src/gcc/gcc/ira.cc:6117
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+opening this up in GDB I see that:
+
+#1  0x0000000001b590f3 in arm_effective_regno (op=0x7ffff6e130a8, strict=false) at /home/stamar01/gnu/v8.X-M/src/gcc/gcc/config/arm/arm.cc:13671
+13671	  gcc_assert (REG_P (op));
+(gdb) p debug_rtx (op)
+(mem/f/c:SI (plus:SI (reg/f:SI 103 afp)
+        (const_int 28 [0x1c])) [2 output_bias+0 S4 A32])
+
+
+And slightly further up:
+
+#3  0x00000000023015c3 in mve_memory_operand (op=0x7ffff6e24b70, mode=E_V4SImode) at /home/stamar01/gnu/v8.X-M/src/gcc/gcc/config/arm/predicates.md:39
+39			    && mve_vector_mem_operand (GET_MODE (op), XEXP (op, 0),
+(gdb) p debug_rtx (op)
+(mem:V4SI (post_inc:SI (mem/f/c:SI (plus:SI (reg/f:SI 103 afp)
+                (const_int 28 [0x1c])) [2 output_bias+0 S4 A32])) [0 MEM[(int[4] *)bias_176]+0 S16 A32])
+
+
+
+I've started a bisect.
+
+- User: Richard Biener | Time: 2023-11-02 10:02:57 UTC
+  Text: Can you attach preprocessed sources?
+
+- User: Stam Markianos-Wright | Time: 2023-11-02 15:04:46 UTC
+  Text: Createdattachment 56492[details]creduced reproducer
+
+- User: Stam Markianos-Wright | Time: 2023-11-02 15:05:16 UTC
+  Text: Createdattachment 56493[details]Full preprocessor reproducer
+
+- User: Stam Markianos-Wright | Time: 2023-11-02 15:05:48 UTC
+  Text: Bisected to f55cdce3f8dd8503e080e35be59c5f5390f6d95e
+
+Attached preprocessed source and a creduced-reproducer of it
+
+- User: Saurabh Jha | Time: 2023-11-07 16:11:34 UTC
+  Text: Hey,
+
+I did some digging into it. The ICE is happening on this assert:
+
+gcc_assert (REG_P (op))
+
+Here the op->code is MEM while it was expecting a REG. For the test program above, the function arm_effective_regno is called some number of times and that assert passes before it fails and cause ICE.
+
+Could it be that the additional conditions that are causing it to use lra causing it to fail? I am still continuing to investigate here.
+
+Regards,
+Saurabh
+
+- User: Alex Coplan | Time: 2023-11-07 17:10:53 UTC
+  Text: Confirmed. Here's a slightly cleaned up reproducer that doesn't warn:
+
+#pragma GCC arm "arm_mve_types.h"
+int32x4_t h(void *p) { return __builtin_mve_vldrwq_sv4si(p); }
+void g(int32x4_t);
+void f(int, int, int, short, int *p) {
+  int *bias = p;
+  for (;;) {
+    int32x4_t d = h(bias);
+    bias += 4;
+    g(d);
+  }
+}
+
+ICEs with -O2 -march=armv8.1-m.main+mve -mfloat-abi=hard on the trunk.
+
+- User: Vladimir Makarov | Time: 2023-11-08 12:41:08 UTC
+  Text: (In reply to Alex Coplan fromcomment #6)> Confirmed. Here's a slightly cleaned up reproducer that doesn't warn:
+> 
+> #pragma GCC arm "arm_mve_types.h"
+> int32x4_t h(void *p) { return __builtin_mve_vldrwq_sv4si(p); }
+> void g(int32x4_t);
+> void f(int, int, int, short, int *p) {
+>   int *bias = p;
+>   for (;;) {
+>     int32x4_t d = h(bias);
+>     bias += 4;
+>     g(d);
+>   }
+> }
+> 
+> ICEs with -O2 -march=armv8.1-m.main+mve -mfloat-abi=hard on the trunk.Looking at the dump, I can guess INC/DEC operand is not a reg after IRA temporary transformation.  It can be fixed in arm.cc by checking that the operand is reg instead of using the assert but it could be wrong because the documentation says the operand should be a reg.  Also such solution would not work for possible problem on other targets.
+
+Could you provide me preprocessed test file. I'll try to find a solution as soon as possible.
+
+- User: Alex Coplan | Time: 2023-11-08 12:50:14 UTC
+  Text: (In reply to Vladimir Makarov fromcomment #7)> (In reply to Alex Coplan fromcomment #6)
+> > Confirmed. Here's a slightly cleaned up reproducer that doesn't warn:
+> > 
+> > #pragma GCC arm "arm_mve_types.h"
+> > int32x4_t h(void *p) { return __builtin_mve_vldrwq_sv4si(p); }
+> > void g(int32x4_t);
+> > void f(int, int, int, short, int *p) {
+> >   int *bias = p;
+> >   for (;;) {
+> >     int32x4_t d = h(bias);
+> >     bias += 4;
+> >     g(d);
+> >   }
+> > }
+> > 
+> > ICEs with -O2 -march=armv8.1-m.main+mve -mfloat-abi=hard on the trunk.
+> 
+> Looking at the dump, I can guess INC/DEC operand is not a reg after IRA
+> temporary transformation.  It can be fixed in arm.cc by checking that the
+> operand is reg instead of using the assert but it could be wrong because the
+> documentation says the operand should be a reg.  Also such solution would
+> not work for possible problem on other targets.
+> 
+> Could you provide me preprocessed test file. I'll try to find a solution as
+> soon as possible.The quoted code above is a preprocessed testcase.
+
+FWIW,https://gcc.gnu.org/onlinedocs/gccint/Incdec.htmlseems to document that mem inside pre_dec is valid.  If that's no longer the case, we should update the documentation (and then IRA needs fixing).  If the documentation is correct, then we need to fix this in arm.cc.
+
+- User: GCC Commits | Time: 2023-11-10 16:47:46 UTC
+  Text: The master branch has been updated by Vladimir Makarov <vmakarov@gcc.gnu.org>:https://gcc.gnu.org/g:df66fa08578a28b3acc8bdb6257b68c245a6a0facommitr14-5333-gdf66fa08578a28b3acc8bdb6257b68c245a6a0faAuthor: Vladimir N. Makarov <vmakarov@redhat.com>
+Date:   Fri Nov 10 11:14:46 2023 -0500
+
+    [IRA]: Check autoinc and memory address after temporary equivalence substitution
+    
+    My previous RA patches to take register equivalence into account do
+    temporary register equivalence substitution to find out that the
+    equivalence can be consumed by insns.  The insn with the substitution is
+    checked on validity using target-depended code.  This code expects that
+    autoinc operations work on register but this register can be substituted
+    by equivalent memory.  The patch fixes this problem.  The patch also adds
+    checking that the substitution can be consumed in memory address too.
+    
+    gcc/ChangeLog:PR target/112337* ira-costs.cc: (validate_autoinc_and_mem_addr_p): New function.
+            (equiv_can_be_consumed_p): Use it.
+    
+    gcc/testsuite/ChangeLog:PR target/112337* gcc.target/arm/pr112337.c: New.
+
+- User: Saurabh Jha | Time: 2023-11-14 14:41:03 UTC
+  Text: Hey,
+
+This ICE uncovered something in Arm MVE. We proposed a fix in this patch:https://gcc.gnu.org/pipermail/gcc-patches/2023-November/635789.htmlRegards,
+Saurabh
+
+- User: GCC Commits | Time: 2023-11-14 14:50:31 UTC
+  Text: The master branch has been updated by Kyrylo Tkachov <ktkachov@gcc.gnu.org>:https://gcc.gnu.org/g:ddb479e796bee3964ddb6a2daa8f79598e47cedecommitr14-5447-gddb479e796bee3964ddb6a2daa8f79598e47cedeAuthor: Saurabh Jha <saurabh.jha@arm.com>
+Date:   Tue Nov 14 14:48:40 2023 +0000
+
+    Add a REG_P check for inc and dec for Arm MVE
+    
+    This patch tightens mve_vector_mem_operand to reject non-register operands inside {PRE,POST}_{INC,DEC} addresses by introducing a REG_P check.
+    
+    This patch fixes this ICE:https://gcc.gnu.org/bugzilla/show_bug.cgi?id=112337gcc/ChangeLog:PR target/112337* config/arm/arm.cc (mve_vector_mem_operand): Add a REG_P check for INC
+            and DEC operations.
+    
+    gcc/testsuite/ChangeLog:PR target/112337* gcc.target/arm/mve/pr112337.c: Test for REG_P check for INC and DEC
+            operations.
+
+- User: Adhemerval Zanella | Time: 2024-01-18 13:21:31 UTC
+  Text: We are seeing failures for gcc/testsuite/gcc.target/arm/pr112337.c for our arm_v7a_softfp_eabi buildbot (configure with --disable-multiarch --disable-multilib --with-mode=arm --with-arch=armv7-a --with-fpu=vfpv3-d16 --with-float=softfp --with-newlib):
+
+spawn -ignore SIGHUP /home/tcwg-buildslave/workspace/tcwg_gnu_0/abe/builds/destdir/x86_64-pc-linux-gnu/bin/arm-eabi-gcc /home/tcwg-buildslave/workspace/tcwg_gnu_0/abe/snapshots/gcc.git~master/gcc/testsuite/gcc.target/arm/pr112337.c -marm -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=softfp -fdiagnostics-plain-output -O2 -march=armv8.1-m.main+fp.dp+mve.fp -mfloat-abi=hard -S -opr112337.s
+cc1: error: target CPU does not support ARM mode
+compiler exited with status 1
+output is:
+cc1: error: target CPU does not support ARM mode
+
+comp_output (pruned) is:
+cc1: error: target CPU does not support ARM mode
+
+FAIL: gcc.target/arm/pr112337.c (test for excess errors)
+Excess errors:
+cc1: error: target CPU does not support ARM mode
+
+I am not sure if this is a test contraint failure or something else.
+
+- User: Christophe Lyon | Time: 2024-01-18 18:01:43 UTC
+  Text: (In reply to Adhemerval Zanella fromcomment #12)> I am not sure if this is a test contraint failure or something else.I think this is a test issue, the test is for v8.1-m, so requires thumb mode and our scripts force -marm, leading to the error.
+
+The test should check whether it can use the options it wants to use, like other tests do.
+
+Something around
+
+/* { dg-require-effective-target arm_hard_ok } */
+/* { dg-require-effective-target arm_v8_1m_mve_ok } */
+/* { dg-add-options arm_v8_1m_mve } */
+/* { dg-additional-options "-O2 -mfloat-abi=hard" } */
+
+Not sure if/why fp.dp nor mve.fp are required? (#c6 does not mention them)
+
+- User: Saurabh Jha | Time: 2024-01-19 09:12:54 UTC
+  Text: I will look into this.
+
+- User: Saurabh Jha | Time: 2024-02-05 09:30:37 UTC
+  Text: Have a patch for review here:https://gcc.gnu.org/pipermail/gcc-patches/2024-January/644454.html
+
+- User: GCC Commits | Time: 2024-03-05 15:29:32 UTC
+  Text: The master branch has been updated by Richard Earnshaw <rearnsha@gcc.gnu.org>:https://gcc.gnu.org/g:2ba3171f161452df476485272cc966bc523d9859commitr14-9321-g2ba3171f161452df476485272cc966bc523d9859Author: Saurabh Jha <saujha01@e130340.arm.com>
+Date:   Tue Jan 30 15:03:36 2024 +0000
+
+    Fix testcasepr112337.c to check the options [PR112337]
+    
+    gcc.target/arm/pr112337.c was failing to validate that adding MVE options
+    was compatible with the test environment, so add the missing checks.
+    
+    gcc/testsuite/ChangeLog:PR target/112337* gcc.target/arm/pr112337.c: Check for, then use the right MVE
+            options.
+
+- User: Richard Earnshaw | Time: 2024-03-05 15:35:48 UTC
+  Text: Should now be fixed.
+

@@ -1,0 +1,109 @@
+Bug Summary: [aarch64] ldp_fusion fails to merge 2 strs due to imprecise alignment info
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: missed-optimization, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Di Zhao | Time: 2024-04-10 07:41:23 UTC
+  Text: For the case below:
+
+	typedef struct {
+		unsigned int f1;
+		unsigned int f2;
+	} test_struct;
+
+	static test_struct ts = {
+		123, 456
+	};
+
+	void foo(void)
+	{
+		ts.f2 = 36969 * (ts.f2 & 65535) + (ts.f1 >> 16);
+		ts.f1 = 18000 * (ts.f2 & 65535) + (ts.f2 >> 16);
+	}
+
+When compiled with "-O3 --param=aarch64-stp-policy=aligned", gcc failed to fuse the memory access instructions into stp/ldp, the dump file 312r.ldp_fusion1 says "ldp/stp policy says no". However, the accessing to ts.f1 is aligned to 64 bit:
+
+(insn 26 23 33 2 (set (mem/c:SI (lo_sum:DI (reg/f:DI 113)
+                (symbol_ref:DI ("*.LANCHOR0") [flags 0x182])) [1 ts.f1+0 S4 A64])
+...
+
+So it looks like the 2 str instructions should be fused with aarch64-stp-policy=aligned.
+
+After debugged this a bit, it seems the problem is ldp_bb_info::fuse_pair changed the alignment info when calling adjust_address_nv, to rewrite the base of ts.f1.
+
+- User: Di Zhao | Time: 2024-04-10 07:43:32 UTC
+  Text: Here's a quick fix I tried, that works on the small test case above:
+
+diff --git a/gcc/config/aarch64/aarch64-ldp-fusion.cc b/gcc/config/aarch64/aarch64-ldp-fusion.cc
+index 365dcf48b22..43478ede72b 100644
+--- a/gcc/config/aarch64/aarch64-ldp-fusion.cc
++++ b/gcc/config/aarch64/aarch64-ldp-fusion.cc
+@@ -1735,6 +1735,9 @@ ldp_bb_info::fuse_pair (bool load_p,
+       rtx new_mem = adjust_address_nv (effective_base,
+                                       mode_for_mem,
+                                       adjust_amt);
++      // Keep original alignment info for ldp/stp policy.
++      set_mem_align (new_mem, MEM_ALIGN (change_mem));
++
+       rtx new_set = load_p
+        ? gen_rtx_SET (change_reg, new_mem)
+        : gen_rtx_SET (new_mem, change_reg);
+
+
+Is is OK?
+
+- User: Alex Coplan | Time: 2024-04-10 08:34:24 UTC
+  Text: Thanks for the report (and patch), I'll look into this.
+
+- User: Alex Coplan | Time: 2024-04-10 13:27:04 UTC
+  Text: Confirmed.
+
+I think it might be best to take the maximum MEM_ALIGN between the adjusted mem (new_mem) and the original mem (change_mem).  In this case it happens that the original mem (change_mem) has a stronger alignment guarantee, but in general it could be the case that the adjusted mem gives a better alignment guarantee.  Since both locations are known to point to the same address, it seems best to me to take the largest alignment of the two.
+
+- User: Alex Coplan | Time: 2024-04-10 14:00:56 UTC
+  Text: Discussing offline with Richard S an alternative approach would be to use replace_equiv_address[_nv] instead of adjust_address[_nv]; that way we preserve most properties of the original mem and just take the address from the other.
+
+In fact this is what aarch64_check_consecutive_mems already does so I think we should follow that.
+
+I'll try a patch along those lines for stage 1.
+
+- User: Di Zhao | Time: 2024-04-11 06:40:39 UTC
+  Text: Yes it's better to take a maximum MEM_ALIGN. I've missed that. Thanks.
+
+- User: GCC Commits | Time: 2024-05-07 13:44:03 UTC
+  Text: The master branch has been updated by Alex Coplan <acoplan@gcc.gnu.org>:https://gcc.gnu.org/g:74690ff96b263b8609639b7fbc5d6afd3f19cb98commitr15-282-g74690ff96b263b8609639b7fbc5d6afd3f19cb98Author: Alex Coplan <alex.coplan@arm.com>
+Date:   Wed Apr 10 16:30:36 2024 +0100
+
+    aarch64: Preserve mem info on change of base for ldp/stp [PR114674]
+    
+    The ldp/stp fusion pass can change the base of an access so that the two
+    accesses end up using a common base register.  So far we have been using
+    adjust_address_nv to do this, but this means that we don't preserve
+    other properties of the mem we're replacing.  It seems better to use
+    replace_equiv_address_nv, as this will preserve e.g. the MEM_ALIGN of the
+    mem whose address we're changing.
+    
+    The PR shows that by adjusting the other mem we lose alignment
+    information about the original access and therefore end up rejecting an
+    otherwise viable pair when --param=aarch64-stp-policy=aligned is passed.
+    This patch fixes that by using replace_equiv_address_nv instead.
+    
+    Notably this is the same approach as taken by
+    aarch64_check_consecutive_mems when a change of base is required, so
+    this at least makes things more consistent between the ldp fusion pass
+    and the peepholes.
+    
+    gcc/ChangeLog:PR target/114674* config/aarch64/aarch64-ldp-fusion.cc (ldp_bb_info::fuse_pair):
+            Use replace_equiv_address_nv on a change of base instead of
+            adjust_address_nv on the other access.
+    
+    gcc/testsuite/ChangeLog:PR target/114674* gcc.target/aarch64/pr114674.c: New test.
+
+- User: Alex Coplan | Time: 2024-05-07 13:46:41 UTC
+  Text: Fixed for GCC 15, thanks for the report.
+

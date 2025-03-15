@@ -1,0 +1,391 @@
+Bug Summary: [14 Regression] Missed Dead Code Elimination since  r14-573-g69f1a8af45d
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Theodoros Theodoridis | Time: 2023-09-05 15:05:36 UTC
+  Text: https://godbolt.org/z/7GTzj8Ea1Given the following code:
+
+void foo(void);
+static short a;
+static int b, c, d;
+static int *e, *f = &d;
+static int **g = &e;
+static unsigned char h;
+static short(i)(short j, int k) { return j > k ?: j; }
+static char l() {
+    if (a) return b;
+    return c;
+}
+int main() {
+    b = 0;
+    for (; b < 5; ++b)
+        ;
+    h = l();
+    if (a ^ 3 >= i(h, 11))
+        a = 0;
+    else {
+        *g = f;
+        if (e == &d & b) {
+            __builtin_unreachable();
+        } else
+            foo();
+        ;
+    }
+}
+
+gcc-trunk -Os does not eliminate the call to foo:
+
+main:
+	movswl	a(%rip), %eax
+	xorl	%edx, %edx
+	movl	$5, b(%rip)
+	testw	%ax, %ax
+	je	.L2
+	movl	$5, %edx
+.L2:
+	cmpl	$3, %edx
+	setle	%dl
+	movzbl	%dl, %edx
+	cmpl	%edx, %eax
+	je	.L3
+	movw	$0, a(%rip)
+	xorl	%eax, %eax
+	ret
+.L3:
+	pushq	%rax
+	movq	$d, e(%rip)
+	call	foo
+	xorl	%eax, %eax
+	popq	%rdx
+	ret
+
+gcc-13.2.0 -Os eliminates the call to foo:
+
+main:
+	movl	$5, b(%rip)
+	xorl	%eax, %eax
+	movw	$0, a(%rip)
+	ret
+
+Bisects tor14-573-g69f1a8af45d
+
+- User: Andrew Pinski | Time: 2023-09-05 15:47:40 UTC
+  Text: In .optimized we have:
+  <bb 4> [local count: 118111600]:
+  # _31 = PHI <5(2), 0(3)>
+  _6 = (int) a.9_28;
+  _8 = _31 <= 3;
+  _9 = (int) _8;
+  if (_6 != _9)
+    goto <bb 5>; [66.00%]
+  else
+    goto <bb 6>; [34.00%]
+
+Except nothing optimizes _8 into the phi post pre (note _31 is only used in the definition of _8 even).
+
+- User: Andrew Pinski | Time: 2023-09-05 16:03:48 UTC
+  Text: The difference is jump threading:
+old (able to remove foo):
+```
+ Registering killing_def (path_oracle) _4
+ Registering value_relation (path_oracle) (_4 pe8 _33) (root: bb5)
+Checking profitability of path (backwards): 
+  [1] Registering jump thread: (5, 7) incoming edge;  (7, 9) nocopy; 
+path: 5->7->9 SUCCESS
+```
+
+vs
+new (not able to remove foo):
+```
+ Registering killing_def (path_oracle) _33
+ Registering value_relation (path_oracle) (_33 pe8 _31) (root: bb5)
+Checking profitability of path (backwards):   FAIL: Jump-thread path not considered: duplication of 2 insns is needed and optimizing for size.
+path: 5->7->xx REJECTED
+```
+
+
+Old IR before jump threading:
+```
+
+  <bb 5> [local count: 118111600]:
+  a.9_28 = a;
+  if (a.9_28 != 0)
+    goto <bb 6>; [34.00%]
+  else
+    goto <bb 7>; [66.00%]
+
+  <bb 6> [local count: 40157944]:
+  _30 = (char) b.1_2;
+
+  <bb 7> [local count: 118111600]:
+  # _33 = PHI <_30(6), 0(5)>
+  _4 = (unsigned char) _33;
+  _6 = (int) a.9_28;
+  j_22 = (short int) _4;
+  _20 = (int) _4;
+  if (_4 > 11)
+    goto <bb 8>; [50.00%]
+  else
+    goto <bb 9>; [50.00%]
+```
+
+New:
+```
+  <bb 5> [local count: 118111600]:
+  a.9_28 = a;
+  if (a.9_28 != 0)
+    goto <bb 6>; [34.00%]
+  else
+    goto <bb 7>; [66.00%]
+
+  <bb 6> [local count: 40157944]:
+
+  <bb 7> [local count: 118111600]:
+  # _31 = PHI <b.1_2(6), 0(5)>
+  _32 = (char) _31;
+  _4 = (unsigned char) _31;
+  _6 = (int) a.9_28;
+  j_22 = (short int) _4;
+  _33 = _31 & 255;
+  if (_33 > 11)
+    goto <bb 8>; [50.00%]
+  else
+    goto <bb 9>; [50.00%]
+```
+
+But _32 will be 0, _4 will be 0, j_22 will be 0, _33 will be 0.
+But I think jump threading does not recognize j_22 will be 0 on that edge and considers it a copy ... I think.
+
+- User: Andrew Pinski | Time: 2023-09-05 16:32:35 UTC
+  Text: Confirmed.(In reply to Andrew Pinski fromcomment #2)> 
+> But _32 will be 0, _4 will be 0, j_22 will be 0, _33 will be 0.
+> But I think jump threading does not recognize j_22 will be 0 on that edge
+> and considers it a copy ... I think.after:
+Checking profitability of path (backwards):  bb:7 (4 insns) bb:5
+  Control statement insns: 2
+  Overall: 2 insns
+
+before:
+Checking profitability of path (backwards):  bb:7 (3 insns) bb:5
+  Control statement insns: 2
+  Overall: 1 insns
+
+
+Actually I think it is counting an already dead statement. The statement:
+  _32 = (charD.10) _31;
+
+
+is dead but is being counted.
+
+- User: Andrew Pinski | Time: 2023-09-05 21:02:00 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> In .optimized we have:
+>   <bb 4> [local count: 118111600]:
+>   # _31 = PHI <5(2), 0(3)>
+>   _6 = (int) a.9_28;
+>   _8 = _31 <= 3;
+>   _9 = (int) _8;
+>   if (_6 != _9)
+>     goto <bb 5>; [66.00%]
+>   else
+>     goto <bb 6>; [34.00%]
+> 
+> Except nothing optimizes _8 into the phi post pre (note _31 is only used in
+> the definition of _8 even).But optimizing that does not help here.
+
+Someone who understands jump threading should look into this.
+
+- User: Richard Biener | Time: 2023-09-12 11:08:04 UTC
+  Text: I will have a look (the const code is old & odd)
+
+- User: Richard Biener | Time: 2023-09-13 13:35:12 UTC
+  Text: So the issue is that forwprop & folding has a hard time in cleaning up dead code afterwards but it would also benefit from doing that more aggressively (and early) because of single_use () and friends.
+
+I'm thinking of hooking into update_stmt to discover candidates for simple-dce-from-worklist (likely not early and aggressive enough though).
+
+- User: Andrew Pinski | Time: 2023-09-13 15:51:11 UTC
+  Text: Createdattachment 55892[details]version of using simple_dce_from_worklist in forwprop
+
+This is a version of using simple_dce_from_worklist in forwprop I had tried at one point, but I don't remember why I did finish up this patch.
+
+- User: Richard Biener | Time: 2023-09-14 07:12:20 UTC
+  Text: (In reply to Andrew Pinski fromcomment #7)> Createdattachment 55892[details]> version of using simple_dce_from_worklist in forwprop
+> 
+> This is a version of using simple_dce_from_worklist in forwprop I had tried
+> at one point, but I don't remember why I did finish up this patch.That wouldn't catch the case in question.  The issue is when we simplify
+
+   _32 = (char) _31;
+-  _4 = (unsigned char) _32;
++  _4 = (unsigned char) _31;
+
+we don't realize _32 becomes unused.  I think it might be enough to add
+all original SSA uses of a stmt we fold to the DCE worklist if we simplified
+it (and also before substituting from the fwprop lattice?).  I think it
+doesn't work to look at orig_stmt operands before we do update_stmt on the
+new stmt.
+
+Sth like the attached works though.
+
+- User: Richard Biener | Time: 2023-09-14 07:12:46 UTC
+  Text: Createdattachment 55898[details]alternative patch for simple_dce_from_worklist
+
+- User: Richard Biener | Time: 2023-09-14 07:32:50 UTC
+  Text: But this stmt isn't the issue, BB7 is
+
+  <bb 7> [local count: 118111600]:
+  # _31 = PHI <b.1_2(6), 0(5)>
+  _4 = (unsigned char) _31;
+  _6 = (int) a.8_28;
+  j_22 = (short int) _4;
+  _33 = _31 & 255;
+  if (_33 > 11)
+
+and that does have one more stmt.  It's
+
+  if (a.8_28 != 0)
+    goto <bb 6>; [34.00%]
+  else
+    goto <bb 7>; [66.00%]
+
+  <bb 6> [local count: 40157944]:
+
+  <bb 7> [local count: 118111600]:
+  # _31 = PHI <b.1_2(6), 0(5)> 
+  _4 = (unsigned char) _31;
+  _6 = (int) a.8_28;
+  j_22 = (short int) _4;
+  _33 = _31 & 255;
+  if (_33 > 11)
+    goto <bb 8>; [50.00%]
+  else
+    goto <bb 9>; [50.00%]
+
+  <bb 8> [local count: 59055800]:
+  
+  <bb 9> [local count: 118111600]:
+  # iftmp.11_27 = PHI <j_22(7), 1(8)>
+
+so what the cost model fails to see is that j_22 and _4 are only live
+on one path to BB9.
+
+It's that odd code again I attempted to remove at some point:
+
+          /* PHIs in the path will create degenerate PHIS in the
+             copied path which will then get propagated away, so
+             looking at just the duplicate path the PHIs would
+             seem unimportant.
+
+             But those PHIs, because they're assignments to objects
+             typically with lives that exist outside the thread path,
+             will tend to generate PHIs (or at least new PHI arguments)
+             at points where we leave the thread path and rejoin
+             the original blocks.  So we do want to account for them.
+
+             We ignore virtual PHIs.  We also ignore cases where BB
+             has a single incoming edge.  That's the most common
+             degenerate PHI we'll see here.  Finally we ignore PHIs
+             that are associated with the value we're tracking as
+             that object likely dies.  */
+          if (EDGE_COUNT (bb->succs) > 1 && EDGE_COUNT (bb->preds) > 1)
+            {
+              for (gphi_iterator gsip = gsi_start_phis (bb);
+                   !gsi_end_p (gsip);
+                   gsi_next (&gsip))
+                {
+                  gphi *phi = gsip.phi ();
+                  tree dst = gimple_phi_result (phi);
+
+                  /* Note that if both NAME and DST are anonymous
+                     SSA_NAMEs, then we do not have enough information
+                     to consider them associated.  */
+                  if (dst != name
+                      && name
+                      && TREE_CODE (name) == SSA_NAME
+                      && (SSA_NAME_VAR (dst) != SSA_NAME_VAR (name)
+                          || !SSA_NAME_VAR (dst))
+                      && !virtual_operand_p (dst))
+                    ++m_n_insns;
+                }
+            }
+
+there's also a missed canonicalization I think:
+
+  _4 = (unsigned char) _31;
+  _6 = (int) a.8_28;
+  j_22 = (short int) _4; 
+  _33 = _31 & 255;
+
+we canonicalize (int)(unsigned char) _31 to _31 & 255 but we fail to
+do the same for (short)(unsigned char) _31 or rather we fail to
+anticipate that (short)_33 could be used for j_22, eliding _4.
+
+Maybe costing "lowparts" as zero would be useful here.
+
+- User: GCC Commits | Time: 2023-09-14 11:17:18 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:9ea74d235c7e7816b996a17c61288f02ef767985commitr14-3982-g9ea74d235c7e7816b996a17c61288f02ef767985Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Sep 14 09:31:23 2023 +0200
+
+    tree-optimization/111294 - better DCE after forwprop
+    
+    The following adds more aggressive DCE to forwprop to clean up dead
+    stmts when folding a stmt leaves some operands unused.  The patch
+    uses simple_dce_from_worklist for this purpose, queueing original
+    operands before substitution and folding, but only if we folded the
+    stmt.
+    
+    This removes one dead stmt biasing threading costs in a later pass
+    but it doesn't resolve the optimization issue in the PR yet.PR tree-optimization/111294* tree-ssa-forwprop.cc (pass_forwprop::execute): Track
+            operands that eventually become dead and use simple_dce_from_worklist
+            to remove their definitions if they did so.
+    
+            * gcc.dg/tree-ssa/evrp10.c: Adjust.
+            * gcc.dg/tree-ssa/evrp6.c: Likewise.
+            * gcc.dg/tree-ssa/forwprop-31.c: Likewise.
+            * gcc.dg/tree-ssa/neg-cast-3.c: Likewise.
+
+- User: GCC Commits | Time: 2023-09-18 08:56:46 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:d45ddc2c04e471d0dcee016b6edacc00b8341b16commitr14-4089-gd45ddc2c04e471d0dcee016b6edacc00b8341b16Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Sep 14 13:06:51 2023 +0200
+
+    tree-optimization/111294 - backwards threader PHI costing
+    
+    This revives an earlier patch since the problematic code applying
+    extra costs to PHIs in copied blocks we couldn't make any sense of
+    prevents a required threading in this case.  Instead of coming up
+    with an artificial other costing the following simply removes the
+    bits.
+    
+    As with all threading changes this requires a plethora of testsuite
+    adjustments, but only the last three are unfortunate as is the
+    libgomp team.c adjustment which is required to avoid a bogus -Werror
+    diagnostic during bootstrap.PR tree-optimization/111294gcc/
+            * tree-ssa-threadbackward.cc (back_threader_profitability::m_name):
+            Remove
+            (back_threader::find_paths_to_names): Adjust.
+            (back_threader::maybe_thread_block): Likewise.
+            (back_threader_profitability::possibly_profitable_path_p): Remove
+            code applying extra costs to copies PHIs.
+    
+    libgomp/
+            * team.c (gomp_team_start): Assert alloca size to avoid false
+            positive alloc-size diagnostic.
+    
+    gcc/testsuite/
+            * gcc.dg/tree-ssa/pr111294.c: New test.
+            * gcc.dg/tree-ssa/phi_on_compare-4.c: Adjust.
+            * gcc.dg/tree-ssa/pr59597.c: Likewise.
+            * gcc.dg/tree-ssa/pr61839_2.c: Likewise.
+            * gcc.dg/tree-ssa/ssa-sink-18.c: Likewise.
+            * g++.dg/warn/Wstringop-overflow-4.C: XFAIL subtest on ilp32.
+            * gcc.dg/uninit-pred-9_b.c: XFAIL subtest everywhere.
+            * gcc.dg/vect/vect-117.c: Make scan for not Invalid sum
+            conditional on lp64.
+
+- User: Richard Biener | Time: 2023-09-18 08:57:58 UTC
+  Text: Fixed.
+

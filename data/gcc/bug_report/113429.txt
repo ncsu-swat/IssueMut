@@ -1,0 +1,356 @@
+Bug Summary: RISC-V: SPEC2017 527 cam4 miscompilation in autovec VLA build
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Vineet Gupta | Time: 2024-01-16 20:37:51 UTC
+  Text: cam4 gets a runtime segv early on due to VSETVLI clobbering a reg (issue obviously goes away with simple-vsetvl)
+
+00000000002abc76 <__zm_conv_MOD_closure.constprop.0.isra.0>:
+...
+...
+  2acebe:	mv	s2,a5
+  2acec0:	sll	a4,s2,0x3
+  2acec4:	li	a3,32
+  2acec8:	add	a5,sp,224			<--- a5 is some address on stack
+  2aceca:	bgeu	a4,a3,2ad2b6
+  2acece:	li	a3,16
+  2aced0:	bgeu	a4,a3,2ad294
+...
+...
+  2ad294:	vsetvli	a5,s2,e8,mf4,ta,ma 		<--- BUG here as a5 clobbered
+  2ad298:	vsetivli	zero,8,e8,mf2,ta,ma
+  2ad29c:	add	a3,a5,8
+  2ad2a0:	vmv.v.i	v1,0
+  2ad2a4:	vse8.v	v1,(a5)   			<--- SEGV
+  2ad2a8:	vse8.v	v1,(a3)
+  2ad2ac:	add	a4,a4,-16
+  2ad2ae:	li	a3,8
+  2ad2b0:	bltu	a4,a3,2aceda
+  2ad2b4:	j	2ad282
+  2ad2b6:	vsetivli	zero,8,e8,mf2,ta,ma
+  2ad2ba:	add	a3,a5,8
+  2ad2be:	vmv.v.i	v1,0
+  2ad2c2:	vse8.v	v1,(a5)
+  2ad2c6:	vse8.v	v1,(a3)
+  2ad2ca:	add	a3,a5,16
+  2ad2ce:	vse8.v	v1,(a3)
+  2ad2d2:	add	a3,a5,24
+  2ad2d6:	vse8.v	v1,(a3)
+  2ad2da:	add	a4,a4,-32
+  2ad2dc:	li	a3,16
+  2ad2de:	bltu	a4,a3,2aced4
+  2ad2e2:	j	2ad294 <__zm_conv_MOD_closure.constprop.0.isra.0+0x161e>
+
+- User: Vineet Gupta | Time: 2024-01-16 20:39:06 UTC
+  Text: Createdattachment 57107[details]Reduced cam4 test
+
+- User: Vineet Gupta | Time: 2024-01-16 20:42:02 UTC
+  Text: Here's my analysis as to whats going on in vsetvl pass.
+
+Reduced Test with annotated BBs.
+
+	.globl	__a_MOD_f
+	.type	__a_MOD_f, @function
+__a_MOD_f:
+
+...
+	ble	s1,zero,.L49
+	slli	a4,s1,3
+	li	a3,32
+	addi	a5,sp,48
+	bgeu	a4,a3,.L67
+
+   <--- BB 14
+
+	li	a3,16
+	bgeu	a4,a3,.L68
+
+   <--- BB 16 
+
+.L36
+	li	a3,8
+	bgeu	a4,a3,.L69
+
+   <--- BB 18
+
+.L37:
+	vsetvli	a5,s1,e8,mf4,ta,ma		<--- (2) rtl insn 440
+	li	a3,-2147483648
+...
+...
+
+   <--- BB 17
+
+.L69:
+	vsetvli	a5,s1,e8,mf4,ta,ma
+	vsetivli	zero,8,e8,mf2,ta,ma
+	vmv.v.i	v1,0
+	vse8.v	v1,0(a5)
+	j	.L37
+
+   <--- BB 15  (BUG manifests in BB 15)
+
+.L68:
+	vsetvli	a5,s1,e8,mf4,ta,ma   <--- (1) rtl insn 472 (copy of insn 440): clobbers a5 (BUG)
+	vsetivli	zero,8,e8,mf2,ta,ma
+	addi	a3,a5,8
+	vmv.v.i	v1,0			<--- insn 88 (imp)
+	vse8.v	v1,0(a5)
+	vse8.v	v1,0(a3)
+	addi	a4,a4,-16
+	li	a3,8
+	bltu	a4,a3,.L37
+	j	.L69
+
+
+The issue manifests in BB 15, but the issue is insn 440 making its way across BBs.
+
+The problem is introduced in Phase 2 (hack to disable phase 2 elides the issue).
+
+
+Phase 2: Lift up vsetvl info.
+
+  Try lift up 0.
+...
+...
+...
+
+ Try lift up 2.
+
+  Compute LCM earliest insert data:
+
+      Expr[5]: VALID (insn 88, bb 14)
+      Expr[6]: VALID (insn 88, bb 15)
+      Expr[7]: VALID (insn 440, bb 16)
+ 
+      earliest:
+        Edge(BB 14 -> BB 16): n_bits = 15, set = {7 }
+        Edge(BB 15 -> BB 16): n_bits = 15, set = {7 }
+        Edge(BB 16 -> BB 18): n_bits = 15, set = {9 }
+        Edge(BB 16 -> BB 17): n_bits = 15, set = {8 }
+
+    Fused global info result:
+
+      Change BB 14 from:VALID (insn 88, BB 14)
+         to (higher probability):VALID (insn 440, BB 16)  <--- likely issue ???
+
+...
+
+  Try lift up 3.
+
+  Compute LCM earliest insert data:
+
+      Expr[5]: VALID (insn 440, bb 14)
+      Expr[6]: VALID (insn 88, bb 15)
+      Expr[7]: VALID (insn 440, bb 16)
+
+      earliest:
+       Edge(bb 14 -> bb 16): n_bits = 15, set = {7 }
+       Edge(bb 14 -> bb 15): n_bits = 15, set = {6 }
+       Edge(bb 15 -> bb 16): n_bits = 15, set = {7 }
+
+
+VSETVL infos after phase 2
+
+  BB 14:
+    probability: 2.4% (guessed)
+    Header vsetvl info:VALID (insn 440, BB 14)
+    Footer vsetvl info:VALID (insn 440, BB 14)
+  BB 15:
+    probability: 1.2% (guessed)
+    Header vsetvl info:VALID (insn 88, BB 15)	<-- seem OK pertains to VMV insn
+    Footer vsetvl info:VALID (insn 88, BB 15)
+    insn 88 vsetvl info:VALID (insn 88, BB 15)
+  BB 16:
+    probability: 2.4% (guessed)
+    Header vsetvl info:VALID (insn 440, BB 16)
+    Footer vsetvl info:VALID (insn 440, BB 16)
+
+However...
+
+Phase 4: Insert, modify and remove vsetvl insns.
+
+  Insert vsetvl info before insn 88: VALID (insn 88, BB 15)  <--- OK VMV
+    Demand fields: demand_sew_lmul demand_avl
+    SEW=8, VLMUL=mf2, RATIO=16, MAX_SEW=64
+    TAIL_POLICY=agnostic, MASK_POLICY=agnostic
+    AVL=(const_int 8 [0x8])
+    VL=(nil)
+scanning new insn with uid = 460.		         <--- OK: VSETVL of VMV
+  Insert vsetvl insn before insn 88:
+(insn 460 94 88 15 (parallel [
+            (set (reg:SI 66 vl)
+                (unspec:SI [
+                        (const_int 8 [0x8]) repeated x2
+                        (const_int 7 [0x7])
+                    ] UNSPEC_VSETVL))
+            (set (reg:SI 67 vtype)
+                (unspec:SI [
+                        (const_int 8 [0x8])
+                        (const_int 7 [0x7])
+                        (const_int 1 [0x1]) repeated x2
+                    ] UNSPEC_VSETVL))
+        ]) "cam4red.f90":96:18 discrim 2 -1
+     (nil))
+
+
+  Insert missed vsetvl info at edge (BB 14 -> BB 15): VALID (insn 440, BB 14)	<-- BUG
+    Demand fields: demand_ratio_only demand_avl
+    SEW=8, VLMUL=mf4, RATIO=32, MAX_SEW=64
+    TAIL_POLICY=agnostic, MASK_POLICY=agnostic
+    AVL=(reg:DI 9 s1 [orig:138 _37 ] [138])
+    VL=(reg:DI 15 a5 [orig:140 _42 ] [140])
+  Insert vsetvl insn 472:
+
+- User: Vineet Gupta | Time: 2024-01-16 20:58:20 UTC
+  Text: The toggles used to build are
+
+riscv64-unknown-linux-gnu-gfortran -c -o cam4red.o -I. -Iinclude -Inetcdf/include -Ofast -fno-lto -static -march=rv64gcv_zba_zbb_zbs_zicond -ftree-vectorize --param=riscv-autovec-preference=scalable --param=vsetvl-strategy=optim -fallow-argument-mismatch -fmax-stack-var-size=65536 cam4red.f90
+
+- User: JuzheZhong | Time: 2024-01-16 22:29:31 UTC
+  Text: Thanks. Will take a look
+
+- User: JuzheZhong | Time: 2024-01-17 02:02:25 UTC
+  Text: Hi, Vineet.
+
+I failed to compile it.
+
+bug.f90:2:7:
+
+    2 |   use shr_kind_mod,    b => shr_kind_r8
+      |       1
+Fatal Error: Cannot open module file 'shr_kind_mod.mod' for reading at (1): No such file or directory
+
+
+I guess I may need some fotran lib.
+
+Could you give me a tar or zip with wrapping all needed fortran lib ?
+
+- User: Vineet Gupta | Time: 2024-01-17 02:40:42 UTC
+  Text: Createdattachment 57111[details]additional modules
+
+- User: JuzheZhong | Time: 2024-01-17 22:24:59 UTC
+  Text: I have fixed patch which is approved:https://patchwork.sourceware.org/project/gcc/patch/20240117143151.3812116-1-juzhe.zhong@rivai.ai/Could you commit it for me and test CAM4 again ?
+
+Or you are not able to commit it, I can ask Li Pan commit it later.
+
+Thanks.
+
+- User: Vineet Gupta | Time: 2024-01-17 22:45:03 UTC
+  Text: Thx for the quick fix. I'll validate and commit !
+
+- User: GCC Commits | Time: 2024-01-18 01:31:02 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:e935c0662fe6301d524c54bb5bd75e923abb61e9commitr14-8199-ge935c0662fe6301d524c54bb5bd75e923abb61e9Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Thu Jan 18 09:08:15 2024 +0800
+
+    RISC-V: Add has compatible check for conflict vsetvl fusion
+    
+    V3: Rebase to trunk and commit it.
+    
+    This patch fixes SPEC2017 cam4 mismatch issue due to we miss has compatible check
+    for conflict vsetvl fusion.
+    
+    Buggy assembler before this patch:
+    
+    .L69:
+            vsetvli a5,s1,e8,mf4,ta,ma                  -> buggy vsetvl
+            vsetivli        zero,8,e8,mf2,ta,ma
+            vmv.v.i v1,0
+            vse8.v  v1,0(a5)
+            j       .L37
+    .L68:
+            vsetvli a5,s1,e8,mf4,ta,ma                  -> buggy vsetvl
+            vsetivli        zero,8,e8,mf2,ta,ma
+            addi    a3,a5,8
+            vmv.v.i v1,0
+            vse8.v  v1,0(a5)
+            vse8.v  v1,0(a3)
+            addi    a4,a4,-16
+            li      a3,8
+            bltu    a4,a3,.L37
+            j       .L69
+    .L67:
+            vsetivli        zero,8,e8,mf2,ta,ma
+            vmv.v.i v1,0
+            vse8.v  v1,0(a5)
+            addi    a5,sp,56
+            vse8.v  v1,0(a5)
+            addi    s4,sp,64
+            addi    a3,sp,72
+            vse8.v  v1,0(s4)
+            vse8.v  v1,0(a3)
+            addi    a4,a4,-32
+            li      a3,16
+            bltu    a4,a3,.L36
+            j       .L68
+    
+    After this patch:
+    
+    .L63:
+            ble     s1,zero,.L49
+            slli    a4,s1,3
+            li      a3,32
+            addi    a5,sp,48
+            bltu    a4,a3,.L62
+            vsetivli        zero,8,e8,mf2,ta,ma
+            vmv.v.i v1,0
+            vse8.v  v1,0(a5)
+            addi    a5,sp,56
+            vse8.v  v1,0(a5)
+            addi    s4,sp,64
+            addi    a3,sp,72
+            vse8.v  v1,0(s4)
+            addi    a4,a4,-32
+            addi    a5,sp,80
+            vse8.v  v1,0(a3)
+    .L35:
+            li      a3,16
+            bltu    a4,a3,.L36
+            addi    a3,a5,8
+            vmv.v.i v1,0
+            addi    a4,a4,-16
+            vse8.v  v1,0(a5)
+            addi    a5,a5,16
+            vse8.v  v1,0(a3)
+    .L36:
+            li      a3,8
+            bltu    a4,a3,.L37
+            vmv.v.i v1,0
+            vse8.v  v1,0(a5)
+    
+    Tested on both RV32/RV64 no regression, Ok for trunk ?PR target/113429gcc/ChangeLog:
+    
+            * config/riscv/riscv-vsetvl.cc (pre_vsetvl::earliest_fuse_vsetvl_info): Fix bug.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/vsetvl/vlmax_conflict-4.c: Adapt test.
+            * gcc.target/riscv/rvv/vsetvl/vlmax_conflict-5.c: Ditto.
+
+- User: JuzheZhong | Time: 2024-01-18 01:33:09 UTC
+  Text: I have commit V3 patch with rebasing since V2 patch conflicts with the trunk.
+
+I think you can use trunk GCC validate CAM4 directly now.
+
+- User: Vineet Gupta | Time: 2024-01-19 03:23:33 UTC
+  Text: Verified works now.
+
+- User: GCC Commits | Time: 2024-01-24 01:19:29 UTC
+  Text: The master branch has been updated by Patrick O'Neill <poneill@gcc.gnu.org>:https://gcc.gnu.org/g:7f7d9c525c694e36ae525ed93ccd5b6ffad0f1d8commitr14-8379-g7f7d9c525c694e36ae525ed93ccd5b6ffad0f1d8Author: Patrick O'Neill <patrick@rivosinc.com>
+Date:   Tue Jan 23 16:36:53 2024 -0800
+
+    RISC-V: Add regression test for vsetvl bugpr113429The reduced testcase forpr113429(cam4 failure) needed additional
+    modules so it wasn't committed.
+    The fuzzer found a c testcase that was also fixed withpr113429's fix.
+    Adding it as a regression test.PR target/113429gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/vsetvl/pr113429.c: New test.
+    
+    Signed-off-by: Patrick O'Neill <patrick@rivosinc.com>
+

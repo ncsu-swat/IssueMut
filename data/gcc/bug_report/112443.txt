@@ -1,0 +1,121 @@
+Bug Summary: [12/13/14 Regression] Misoptimization of _mm256_blendv_epi8 intrinsic on avx512bw+avx512vl
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 10.2.0, 11.2.0, 11.3.0
+Known to Fail: 12.2.0, 12.3.0, 13.2.0
+
+Comments:
+- User: Alexander Grund | Time: 2023-11-08 14:27:24 UTC
+  Text: Createdattachment 56533[details]Reproducer code extracted from actual source
+
+I came around some piece of code in PyTorch using AVX2 intrinsics that is misoptimized producing wrong results, when compiled for newer CPUS.
+In particular I was able to reproduce this with `-mavx512bw -mavx512vl -O2`
+
+We usually compile with `-march=native` which on the Sapphire Rapids system enables the above AVX512 flags, but so does `-march=cannonlake` and above.
+
+The piece of code in question is a call to `_mm256_blendv_epi8(a, b, mask)` that seemingly produces inverted semantics, i.e. I have a mask with all bits set and it returns a and for a mask with all bits unset it returns b.
+
+It is also a bit complicated to reproduce as it seems to require hiding some details behind a lambda called through `std::function`.
+In the attached example a zero and one vector is created once and copied into the lambda where it is reused for potentially many iterations (removing the loop also reproduces the issue)
+Either of the following actions causes the bug to disappear:
+- Removing either of the 2 `-mavx512` flags
+- Reducing to `-O1` or lower
+- Moving the zero_vec inside the lambda (moving one_vec makes no difference)
+- Not calling through std::function (either run the lambda directly or pass through as a template param instead of std::function)
+- `-DREGEN_MASK` to create a new mask through a (superflous) `_mm256_cmpeq_epi8` against all 1 bits
+
+Reproducing:
+g++ -std=c++17 -mavx512bw -mavx512vl -O2 bug.cpp && ./a.out
+
+Expected output (last line, first line shows the inverted semantic):
+vec[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+
+Actual output:
+vec[255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+
+- User: Hongtao.liu | Time: 2023-11-09 02:54:39 UTC
+  Text: The below can fix that, there's typo for 2 splitters.
+
+@@ -17082,7 +17082,7 @@ (define_insn_and_split "*avx2_pcmp<mode>3_4"
+              (match_dup 4))]
+              UNSPEC_BLENDV))]
+ {
+-  if (INTVAL (operands[5]) == 1)
++  if (INTVAL (operands[5]) == 5)
+     std::swap (operands[1], operands[2]);
+   operands[3] = gen_lowpart (<MODE>mode, operands[3]);
+ })
+@@ -17112,7 +17112,7 @@ (define_insn_and_split "*avx2_pcmp<mode>3_5"
+              (match_dup 4))]
+              UNSPEC_BLENDV))]
+ {
+-  if (INTVAL (operands[5]) == 1)
++  if (INTVAL (operands[5]) == 5)
+     std::swap (operands[1], operands[2]);
+ })
+
+- User: Alexander Grund | Time: 2023-11-09 09:11:42 UTC
+  Text: I can confirm that the suggested patch can be applied to 12.2.0 and fixes the issue I observed
+
+- User: Alexander Grund | Time: 2023-11-09 12:38:00 UTC
+  Text: > I can confirm that the suggested patch can be applied to 12.2.0 and fixes
+> the issue I observedAlso tested 12.1, 12.3, 13.1, 13.2 with this patch and it works (as expected) too
+
+- User: GCC Commits | Time: 2023-11-10 00:22:51 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:9a0cc04b9c9b02426762892b88efc5c44ba546bdcommitr14-5305-g9a0cc04b9c9b02426762892b88efc5c44ba546bdAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Nov 9 13:20:05 2023 +0800
+
+    Fix wrong code due to vec_merge + pcmp to blendvb splitter.
+    
+    gcc/ChangeLog:PR target/112443* config/i386/sse.md (*avx2_pcmp<mode>3_4): Fix swap condition
+            from LT to GT since there's not in the pattern.
+            (*avx2_pcmp<mode>3_5): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/i386/pr112443.C: New test.
+
+- User: GCC Commits | Time: 2023-11-10 00:24:23 UTC
+  Text: The releases/gcc-13 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:5437160f4e205f991c829661f221448a97bef2d3commitr13-8035-g5437160f4e205f991c829661f221448a97bef2d3Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Nov 9 13:20:05 2023 +0800
+
+    Fix wrong code due to vec_merge + pcmp to blendvb splitter.
+    
+    gcc/ChangeLog:PR target/112443* config/i386/sse.md (*avx2_pcmp<mode>3_4): Fix swap condition
+            from LT to GT since there's not in the pattern.
+            (*avx2_pcmp<mode>3_5): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/i386/pr112443.C: New test.
+    
+    (cherry picked from commit 9a0cc04b9c9b02426762892b88efc5c44ba546bd)
+
+- User: GCC Commits | Time: 2023-11-10 00:25:10 UTC
+  Text: The releases/gcc-12 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:1808ebfd8164cc90629b7308af3ef2b6fa965453commitr12-9967-g1808ebfd8164cc90629b7308af3ef2b6fa965453Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Nov 9 13:20:05 2023 +0800
+
+    Fix wrong code due to vec_merge + pcmp to blendvb splitter.
+    
+    gcc/ChangeLog:PR target/112443* config/i386/sse.md (*avx2_pcmp<mode>3_4): Fix swap condition
+            from LT to GT since there's not in the pattern.
+            (*avx2_pcmp<mode>3_5): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/i386/pr112443.C: New test.
+    
+    (cherry picked from commit 9a0cc04b9c9b02426762892b88efc5c44ba546bd)
+
+- User: Hongtao.liu | Time: 2023-11-10 00:28:59 UTC
+  Text: Should be Fixed in GCC14/GCC13/GCC12
+
+- User: Mikael Pettersson | Time: 2023-11-25 17:27:44 UTC
+  Text: Can this be closed now?
+
+- User: Sam James | Time: 2023-11-26 01:19:04 UTC
+  Text: Fixed for 12.4/13.3/14.
+

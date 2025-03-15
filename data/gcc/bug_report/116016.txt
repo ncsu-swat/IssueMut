@@ -1,0 +1,1447 @@
+Bug Summary: enhancement: add __builtin_set_counted_by(P->FAM, COUNT) or equivalent
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Kees Cook | Time: 2024-07-20 18:32:35 UTC
+  Text: With the wonderful addition of the 'counted_by' attribute and its wide roll-out within the Linux kernel, we have found a use case that would be very nice to have for object allocators: being able to set the counted_by counter variable without knowing its name.
+
+For example, given:
+
+  struct foo {
+    ...
+    int counter;
+    ...
+    struct bar array[] __attribute__((counted_by(counter)));
+  } *p;
+
+one thought was to have __builtin_set_counted_by(P->FAM, COUNT), which would have the behavior of:
+
+  if has_counted_by_attribute(P->FAM):
+    P->COUNT_MEMBER = COUNT
+  else
+    do nothing
+
+The existing Linux object allocators are roughly:
+
+  #define alloc(P, FAM, COUNT) ({ \
+    size_t __size = sizeof(*P) + sizeof(*P->FAM) * COUNT; \
+    kmalloc(__size, GFP); \
+  })
+
+Right now, any addition of a counted_by annotation must also include an open-coded assignment of the counter variable after the allocation:
+
+  p = alloc(p, array, how_many);
+  p->counter = how_many;
+
+Instead, the central allocator could be updated to:
+
+  #define alloc(P, FAM, COUNT) ({ \
+    typeof(P) __p; \
+    size_t __size = sizeof(*P) + sizeof(*P->FAM) * COUNT; \
+    __p = kmalloc(__size, GFP); \
+    __builtin_set_counted_by(__p->FAM, COUNT); \
+    __p; \
+  })
+
+And now structs can gain the counted_by attribute without needing additional open-coded counter assignments for each struct, and unannotated structs could still use the same allocator. (i.e. we are able to more cleanly continue to migrate FAM structs.)
+
+- User: Kees Cook | Time: 2024-07-20 18:36:57 UTC
+  Text: Matching Clang feature request:https://github.com/llvm/llvm-project/issues/99774
+
+- User: Jakub Jelinek | Time: 2024-07-22 07:47:53 UTC
+  Text: So, what would be the prototype of the builtin?
+Would it be type-generic for both arguments, i.e. effectively
+void __builtin_set_counted_by (...);
+which would just verify that 2 arguments are passed, the first one is some flexible array member with counted_by argument and the second argument has some type implicitly convertible to the type of the counted_by member?
+
+- User: N/A | Time: 2024-07-22 13:35:54 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #2)> So, what would be the prototype of the builtin?
+> Would it be type-generic for both arguments, i.e. effectively
+> void __builtin_set_counted_by (...);
+> which would just verify that 2 arguments are passed, the first one is some
+> flexible array member with counted_by argument and the second argument has
+> some type implicitly convertible to the type of the counted_by member?Is the prototype of this builtin good enough:
+
+void __builtin_set_counted_by (ptr->FAM, const_exp_with_int_type)
+
+i.e, the first argument should be a FAM array reference (in which, ptr is a pointer to the object that include the FAM), and the second argument is a constant expression with integer type.
+
+- User: Jakub Jelinek | Time: 2024-07-22 13:46:28 UTC
+  Text: That is not a prototype.  Prototype is what is the C or C++ function type of the builtin.  Neither ptr->FAM nor const_exp_with_int_type are valid C types.
+There is no reason why the second argument should be const, it can be anything convertible to whatever type size_t has, including say for C++ classes with operator long (), _Bool/bool, enumerators, floating point expressions, ...
+
+- User: N/A | Time: 2024-07-22 14:23:10 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #4)> That is not a prototype.  Prototype is what is the C or C++ function type of
+> the builtin.  Neither ptr->FAM nor const_exp_with_int_type are valid C types.
+> There is no reason why the second argument should be const, it can be
+> anything convertible to whatever type size_t has, including say for C++
+> classes with operator long (), _Bool/bool, enumerators, floating point
+> expressions, ...From GCC doc: (https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html#index-_005f_005fbuiltin_005fcall_005fwith_005fstatic_005fchain)
+
+Built-in Function: type __builtin_call_with_static_chain (call_exp, pointer_exp) The call_exp expression must be a function call, and the pointer_exp expression must be a pointer.
+
+If we allow the second argument to be variable, I am fine.
+
+Then how about:
+
+void __builtin_set_counted_by (FAM_exp, exp)
+
+The FAM_exp expression must be a flexible array member reference. The second argument must be an expression that can be converted to the type of the flexible array member.
+
+- User: Jakub Jelinek | Time: 2024-07-22 14:27:33 UTC
+  Text: That is a bad example, __builtin_call_with_static_chain is not a builtin function, but a keyword.
+
+- User: N/A | Time: 2024-07-22 15:31:33 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #6)> That is a bad example, __builtin_call_with_static_chain is not a builtin
+> function, but a keyword.A little confused here, this function is clearly listed as a built_in function provided by gcc, why it's not a builtin function? can you explain a little bit here? is it convenient for you to provide a good example for reference? thanks.
+
+- User: Jakub Jelinek | Time: 2024-07-22 15:35:25 UTC
+  Text: It doesn't matter how it is documented, what matters is how it is implemented.
+E.g. can you do (__builtin_call_with_static_chain) (fn, ptr)?
+Or __typeof (__builtin_call_with_static_chain)?
+Regular builtins are what is defined in builtins.def.
+
+- User: N/A | Time: 2024-07-22 16:16:54 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #8)> It doesn't matter how it is documented, what matters is how it is
+> implemented.
+> E.g. can you do (__builtin_call_with_static_chain) (fn, ptr)?
+> Or __typeof (__builtin_call_with_static_chain)?
+> Regular builtins are what is defined in builtins.def.Okay, I guess what did you mean is the following:
+
+there are two categories of all the builtin functions provided by GCC to the user as documented in gcc documentation:https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html#index-_005f_005fbuiltin_005fcall_005fwith_005fstatic_005fchainCategory A: a C/C++ language extension (RID_BUILTIN), which is implemented in the 
+language FE by the parser. For example, __buitlin_call_with_static_chain, __builtin_has_attribute, both belong to this category;
+
+Category B: a regular builtin that is defined in builtins.def, which is implemented in the middle-end. For example, __builtin_object_size, __builtin_strcmp_eq, belong to this category;
+
+From my understanding, the new __builtin_set_counted_by could be either implemented in C FE as an C language extension, or in Middle-end as a regular builtin. just depend on what's the user interface we are planing to provide to the user.
+
+- User: Bill Wendling | Time: 2024-07-25 00:25:47 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #2)> So, what would be the prototype of the builtin?
+> Would it be type-generic for both arguments, i.e. effectively
+> void __builtin_set_counted_by (...);
+> which would just verify that 2 arguments are passed, the first one is some
+> flexible array member with counted_by argument and the second argument has
+> some type implicitly convertible to the type of the counted_by member?The Clang implementation will probably have a prototype of something like:
+
+  void __builtin_set_counted_by(void *, size_t)
+
+The 'void *' could be questionable, but I'm not sure how else to specify it (of course the compiler will do its magic internally to verify that it's a pointer to a FAM and has the 'counted_by' attribute, etc.). If we use 'void *', is it considered an error for the first parameter to NOT be a FAM? Or does the builtin silently become a no-op?
+
+- User: N/A | Time: 2024-07-25 13:47:35 UTC
+  Text: > 
+> there are two categories of all the builtin functions provided by GCC to the
+> user as documented in gcc documentation:
+>https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html#index-
+> _005f_005fbuiltin_005fcall_005fwith_005fstatic_005fchain
+> 
+> Category A: a C/C++ language extension (RID_BUILTIN), which is implemented
+> in the language FE by the parser. For example, __buitlin_call_with_static_chain,
+> __builtin_has_attribute, both belong to this category;
+> 
+> Category B: a regular builtin that is defined in builtins.def, which is
+> implemented in the middle-end. For example, __builtin_object_size,
+> __builtin_strcmp_eq, belong to this category;
+> 
+> From my understanding, the new __builtin_set_counted_by could be either
+> implemented in C FE as an C language extension, or in Middle-end as a
+> regular builtin. just depend on what's the user interface we are planing to
+> provide to the user.After the discussion with Kees on the major usage of this new builtin, I think that the above Category A might be a natural fit for this new __builtin_set_counted_by. i.e, a C language extension (RID_BUILTIN). 
+
+We could define the new __builtin_set_counted_by as
+
+void __builtin_set_counted_by (FAM_exp, count_exp)
+
+The FAM_exp expression must be a flexible array member reference. The second argument count_exp must be an expression that can be converted to the type of the flexible array member.
+
+The new RID_BUILTIN will be converted to:
+
+if has_counted_by_attribute (FAM_exp)
+ FAM_counted_by_field = count_exp;
+else
+ ;
+
+- User: N/A | Time: 2024-07-25 13:50:06 UTC
+  Text: (In reply to Bill Wendling fromcomment #10)> The Clang implementation will probably have a prototype of something like:
+> 
+>   void __builtin_set_counted_by(void *, size_t)
+> 
+> The 'void *' could be questionable, but I'm not sure how else to specify it
+> (of course the compiler will do its magic internally to verify that it's a
+> pointer to a FAM and has the 'counted_by' attribute, etc.). If we use 'void
+> *', is it considered an error for the first parameter to NOT be a FAM? Or
+> does the builtin silently become a no-op?my question, is it possible for CLANG to define this builtin as a language extension as well?
+
+- User: Siddhesh Poyarekar | Time: 2024-07-25 13:59:46 UTC
+  Text: (In reply to qinzhao fromcomment #11)> After the discussion with Kees on the major usage of this new builtin, I
+> think that the above Category A might be a natural fit for this new
+> __builtin_set_counted_by. i.e, a C language extension (RID_BUILTIN). 
+> 
+> We could define the new __builtin_set_counted_by as
+> 
+> void __builtin_set_counted_by (FAM_exp, count_exp)
+> 
+> The FAM_exp expression must be a flexible array member reference. The secondDoes it have to be a FAM?  What is the problem if this is used on, e.g. an arbitrary pointer?> argument count_exp must be an expression that can be converted to the type
+> of the flexible array member.Shouldn't count_exp be __SIZE_TYPE__?  Why should it be convertible to the type of the FAM?
+
+- User: N/A | Time: 2024-07-25 14:30:41 UTC
+  Text: (In reply to Siddhesh Poyarekar fromcomment #13)>> Does it have to be a FAM?  What is the problem if this is used on, e.g. an
+> arbitrary pointer?If we go with the category B (as I mentioned inComment #9), define the new builtin as  a regular builtin,
+Then, arbitrary pointer for the 1st parameter is fine. 
+If we go with the category A, i.e, define the new builtin as a C language extension as a key word, then I think that
+The 1st parameter is better to be a FAM_exp. 
+
+I think for our purpose of using this new builtin, defining it as a RID_BUITLIN should be enough. 
+
+However, I am open to define it as a regular builtin and implement it in the middle-end.> 
+> > argument count_exp must be an expression that can be converted to the type
+> > of the flexible array member.
+> 
+> Shouldn't count_exp be __SIZE_TYPE__?  Why should it be convertible to the
+> type of the FAM?my bad, yes, you are right.
+
+- User: Siddhesh Poyarekar | Time: 2024-07-25 14:41:37 UTC
+  Text: (In reply to qinzhao fromcomment #14)> If we go with the category B (as I mentioned inComment #9), define the new
+> builtin as  a regular builtin,
+> Then, arbitrary pointer for the 1st parameter is fine. 
+> If we go with the category A, i.e, define the new builtin as a C language
+> extension as a key word, then I think that
+> The 1st parameter is better to be a FAM_exp. 
+> 
+> I think for our purpose of using this new builtin, defining it as a
+> RID_BUITLIN should be enough. 
+> 
+> However, I am open to define it as a regular builtin and implement it in the
+> middle-end.If there are no actual problems with associating a size expression with an object then I'd lean towards making it arbitrary.
+
+Either way though, one thing the compiler would have to guard against (and document) is the possibility of an object changing after this association is made.  This could either be due to reallocation or the pointer pointing to a different object.  The compiler can probably make out if this happens within the function where this builtin is called, but if the object gets modified in a different function which the compiler cannot see into, or in a different thread in parallel, then it will be the responsibility of the user to make sure that the modification gets reflected in the size expression somehow.
+
+Also, I reckon this expression will have to become a barrier to code reordering, similar to the .ACCESS_WITH_SIZE internal builtin.
+
+- User: N/A | Time: 2024-07-25 15:13:01 UTC
+  Text: (In reply to Siddhesh Poyarekar fromcomment #15)> (In reply to qinzhao fromcomment #14)
+> > If we go with the category B (as I mentioned inComment #9), define the new
+> > builtin as  a regular builtin,
+> > Then, arbitrary pointer for the 1st parameter is fine. 
+> > If we go with the category A, i.e, define the new builtin as a C language
+> > extension as a key word, then I think that
+> > The 1st parameter is better to be a FAM_exp. 
+> > 
+> > I think for our purpose of using this new builtin, defining it as a
+> > RID_BUITLIN should be enough. 
+> > 
+> > However, I am open to define it as a regular builtin and implement it in the
+> > middle-end.
+> 
+> If there are no actual problems with associating a size expression with an
+> object then I'd lean towards making it arbitrary.
+> 
+> Either way though, one thing the compiler would have to guard against (and
+> document) is the possibility of an object changing after this association is
+> made.  This could either be due to reallocation or the pointer pointing to a
+> different object.  The compiler can probably make out if this happens within
+> the function where this builtin is called, but if the object gets modified
+> in a different function which the compiler cannot see into, or in a
+> different thread in parallel, then it will be the responsibility of the user
+> to make sure that the modification gets reflected in the size expression
+> somehow.
+> 
+> Also, I reckon this expression will have to become a barrier to code
+> reordering, similar to the .ACCESS_WITH_SIZE internal builtin.I guess that all the above is the complication if we implement this builtin as a regular builtin in middle-end. 
+
+If we just simply define it as a C RID_BUILTIN (Please see gcc/c-family/c-common.), then this is just a language extension, user just use it as a simple C statement. 
+
+In C FE, when see 
+
+__builtin_set_counted_by (p->fam, count_exp)
+
+
+
+if has_counted_by_attribute (p->fam)
+
+   p->count = count_exp;
+
+else
+
+   ;
+
+then that's it. The compiler's responsibility is:
+
+- User: N/A | Time: 2024-07-25 15:17:10 UTC
+  Text: (continue with thecomment #16):
+the compiler's responsibility is:
+A. check whether p->fam has counted-by attribute or not;
+B. get the corresponding counted-by field for p->fam and set it the value;
+
+this is mainly to resolve the source code problem as Kees explained in the description part. 
+no need to make it more complicate than necessary.
+
+- User: Bill Wendling | Time: 2024-07-25 19:10:56 UTC
+  Text: (In reply to qinzhao fromcomment #12)> (In reply to Bill Wendling fromcomment #10)
+> > The Clang implementation will probably have a prototype of something like:
+> > 
+> >   void __builtin_set_counted_by(void *, size_t)
+> > 
+> > The 'void *' could be questionable, but I'm not sure how else to specify it
+> > (of course the compiler will do its magic internally to verify that it's a
+> > pointer to a FAM and has the 'counted_by' attribute, etc.). If we use 'void
+> > *', is it considered an error for the first parameter to NOT be a FAM? Or
+> > does the builtin silently become a no-op?
+> 
+> my question, is it possible for CLANG to define this builtin as a language
+> extension as well?I'm not sure what the difference is with builtins, to be honest. I think of a language extension as something like 'attribute' or 'asm', which didn't show up in the original KNR, but were added later and then codified. If the only difference is that the builtin will be handled in the FE rather than the ME, then that's what I was planning on doing. So in that case, yes, it would be a "language extension."
+
+- User: Bill Wendling | Time: 2024-07-25 19:13:26 UTC
+  Text: (In reply to Siddhesh Poyarekar fromcomment #13)> (In reply to qinzhao fromcomment #11)
+> > After the discussion with Kees on the major usage of this new builtin, I
+> > think that the above Category A might be a natural fit for this new
+> > __builtin_set_counted_by. i.e, a C language extension (RID_BUILTIN). 
+> > 
+> > We could define the new __builtin_set_counted_by as
+> > 
+> > void __builtin_set_counted_by (FAM_exp, count_exp)
+> > 
+> > The FAM_exp expression must be a flexible array member reference. The second
+> 
+> Does it have to be a FAM?  What is the problem if this is used on, e.g. an
+> arbitrary pointer?
+>IMO once we have support for 'counted_by' on pointers the builtin should handle it. In that case, a 'void *', or equivalent, seems like the better option for future expansion.
+
+- User: N/A | Time: 2024-07-25 20:46:01 UTC
+  Text: (In reply to Bill Wendling fromcomment #19)> > Does it have to be a FAM?  What is the problem if this is used on, e.g. an
+> > arbitrary pointer?
+> > 
+> 
+> IMO once we have support for 'counted_by' on pointers the builtin should
+> handle it. In that case, a 'void *', or equivalent, seems like the better
+> option for future expansion.agreed. sounds reasonable.
+
+- User: Bill Wendling | Time: 2024-07-25 21:46:15 UTC
+  Text: Another question: Should we allow side-effects in the builtin? I think it would cause too much pain if we did. If we don't allow it, should it emit a warning or silently become a no-op?
+
+- User: N/A | Time: 2024-07-26 18:56:26 UTC
+  Text: the following is the user documentation I came up based on all the discussion so far, let me know any comment and suggestion. (refer to GCC's __builtin_clear_padding doc on the prototype of the new builtin:https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html#index-_005f_005fbuiltin_005fclear_005fpadding)
+
+
+Builtin-in Function: void __builtin_set_counted_by (ptr, type expr) 
+
+The built-in function __builtin_set_counted_by checks whether the array object pointed by the pointer PTR has another object associated with it that represents the number of elements in the array object through counted_by attribute (i.e, the counted-by object). If so, sets the corresponding counted-by object to EXPR. If such counted-by object does not exist, do nothing.
+
+The first argument must be a pointer to an array.
+The TYPE of the second argument may be any integral type.
+
+This built-in never evaluates its argument for side effects. If there are any side effects in them, the compiler does not set the counted-by object if there is one and issues warnings at the same time. 
+
+For example:
+
+for the following:
+
+  struct foo1 {
+    int counter1;
+    struct bar1 array[] __attribute__((counted_by(counter)));
+  } *p;
+
+  struct foo2 {
+    int other;
+    struct bar2 array[];
+  } *q;
+
+  __builtin_set_counted_by (p->array, COUNT)
+
+behaves like:
+
+  p->counter1 = COUNT;
+
+However, 
+
+  __builtin_set_counted_by (q->array, COUNT)
+
+behaves like a no-op since q->array does not have any associated counted-by object through counted-by attribute.
+
+- User: Bill Wendling | Time: 2024-07-26 22:34:53 UTC
+  Text: (In reply to qinzhao fromcomment #22)> the following is the user documentation I came up based on all the
+> discussion so far, let me know any comment and suggestion. (refer to GCC's
+> __builtin_clear_padding doc on the prototype of the new builtin:
+>https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html#index-
+> _005f_005fbuiltin_005fclear_005fpadding)
+> 
+> 
+> Builtin-in Function: void __builtin_set_counted_by (ptr, type expr) 
+> 
+> The built-in function __builtin_set_counted_by checks whether the array
+> object pointed by the pointer PTR has another object associated with it that
+> represents the number of elements in the array object through counted_by
+> attribute (i.e, the counted-by object). If so, sets the corresponding
+> counted-by object to EXPR. If such counted-by object does not exist, do
+> nothing.
+> 
+> The first argument must be a pointer to an array.
+> The TYPE of the second argument may be any integral type.The documentation for the 'counted_by' attribute says this about the field value:
+
+"The field that represents the number of the elements should have an integer type. Otherwise, the compiler reports an error and ignores the attribute."
+
+I think we should specify that the type of the second argument must (or should) be an integral type. Using "may" seems less strict.> This built-in never evaluates its argument for side effects. If there ares/argument/arguments/> any side effects in them, the compiler does not set the counted-by object if
+> there is one and issues warnings at the same time.Suggested alternative to the second sentence:
+
+If there are any side effects in them, the builtin becomes a no-op and the compiler issues a diagnostic.> For example:
+> 
+> for the following:
+> 
+>   struct foo1 {
+>     int counter1;
+>     struct bar1 array[] __attribute__((counted_by(counter)));
+>   } *p;
+> 
+>   struct foo2 {
+>     int other;
+>     struct bar2 array[];
+>   } *q;
+> 
+>   __builtin_set_counted_by (p->array, COUNT)
+> 
+> behaves like:
+> 
+>   p->counter1 = COUNT;
+> 
+> However, 
+> 
+>   __builtin_set_counted_by (q->array, COUNT)
+> 
+> behaves like a no-op since q->array does not have any associated counted-by
+> object through counted-by attribute.
+
+- User: Martin Uecker | Time: 2024-07-30 12:30:25 UTC
+  Text: A builtin that returns the name or an lvalue for the member would seem to be more useful, but then harder to ignore when there is no attribute. 
+
+But I wonder why a new assignment is needed. Shouldn't there be an assignment anyway?
+
+- User: Qing Zhao | Time: 2024-07-30 13:46:24 UTC
+  Text: > ---Comment #24from Martin Uecker <muecker at gwdg dot de> ---
+> 
+> A builtin that returns the name or an lvalue for the member would seem to be
+> more useful, but then harder to ignore when there is no attribute.You mean, instead of providing __builtin_set_counted_by (P->FAM, COUNT), providing the following:
+
+__builtin_get_counted_by (P->FAM)
+
+To return the counted_by field P->count, then let the user to add the assignment in the source code. 
+
+i.e,  in the source code level, instead of
+
+__builtin_set_counted_by (P->FAM, COUNT);
+
+The source code need to be:
+
+If (__builtin_get_counted_by (P->FAM))
+  __builtin_get_counted_by (P->FAM) = COUNT;
+
+Yes, I agree that this is good too for the original purpose. And also even simpler and more flexible.
+Kees might have more comments here. (Not sure any other impact on handling the original problem he had with the new __builtin_get_counted_by).> 
+> But I wonder why a new assignment is needed. Shouldn't there be an assignment
+> anyway?I think the assignment could be easily to be added in the source code.
+
+- User: Siddhesh Poyarekar | Time: 2024-07-30 13:51:22 UTC
+  Text: (In reply to Qing Zhao fromcomment #25)> If (__builtin_get_counted_by (P->FAM))
+>   __builtin_get_counted_by (P->FAM) = COUNT;Do we have language constructs where the existence of an identifier/expression (and not its value) is evaluated in a condition like this?
+
+- User: Qing Zhao | Time: 2024-07-30 13:58:19 UTC
+  Text: ---Comment #26from Siddhesh Poyarekar <siddhesh at gcc dot gnu.org> ---> (In reply to Qing Zhao fromcomment #25)
+>> If (__builtin_get_counted_by (P->FAM))
+>>  __builtin_get_counted_by (P->FAM) = COUNT;
+> 
+> Do we have language constructs where the existence of an identifier/expression
+> (and not its value) is evaluated in a condition like this?Good point (I am not sure here). Any suggestion on what’s the prototype of this new __builtin_get_counted_by, and how to 
+use it in the source code to resolve the original problem?
+
+- User: Jakub Jelinek | Time: 2024-07-30 14:08:00 UTC
+  Text: It would need to be a FE keyword where __builtin_get_counted_by would return some pointer, either e.g. (void *)0 if it doesn't have a count, or a pointer to the count (with type of the pointer dependent on what type the count has).
+
+Speaking of counted_by, I see support for it in c-family/ and c/, but not in cp/ at all, what is the attribute supposed to do in C++?
+If it isn't supported, it should be documented that it doesn't apply to C++ and should be rejected in C++.  If it is to be supported, the support (including support for templates) needs to be there before GCC 15.
+
+- User: N/A | Time: 2024-07-30 15:01:22 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #28)> It would need to be a FE keyword where __builtin_get_counted_by would return
+> some pointer, either e.g. (void *)0 if it doesn't have a count, or a pointer
+> to the count (with type of the pointer dependent on what type the count has).So, a RID_BUILTIN (i.e, FE keyword) like the following:
+
+  (void *) __builtin_get_counted_by (ptr)
+
+Then the user source code becomes the following:
+
+If (__builtin_get_counted_by (P->FAM))
+  *__builtin_get_counted_by (P->FAM) = COUNT;> 
+> Speaking of counted_by, I see support for it in c-family/ and c/, but not in
+> cp/ at all, what is the attribute supposed to do in C++?The initial plan is to support it in both C and C++ (since C++ can use flexible array member too through GCC extension), but I didn't implement it in C++ in the initial patch.> If it isn't supported, it should be documented that it doesn't apply to C++
+> and should be rejected in C++.  If it is to be supported, the support
+> (including support for templates) needs to be there before GCC 15.I will try to support it in C++ too in GCC15. If not, I will update the documentation to indicate this limitation.
+
+- User: Jakub Jelinek | Time: 2024-07-30 15:25:44 UTC
+  Text: (In reply to qinzhao fromcomment #29)> (In reply to Jakub Jelinek fromcomment #28)
+> > It would need to be a FE keyword where __builtin_get_counted_by would return
+> > some pointer, either e.g. (void *)0 if it doesn't have a count, or a pointer
+> > to the count (with type of the pointer dependent on what type the count has).
+> 
+> So, a RID_BUILTIN (i.e, FE keyword) like the following:
+> 
+>   (void *) __builtin_get_counted_by (ptr)Well, without that void *.  I think the closest behavior match would be something like
+__builtin_shuffle (though that has 2 arguments rather than one).
+Basically, parse the argument expression list, error if it isn't one, determine if it is a FAM with counted_by, if yes, replace the call with &P->COUNT (note, side-effects in the argument need to be evaluated exactly once), otherwise return (void) (P->FAM), (void *) 0 (again, evaluate side-effects but return NULL).> The initial plan is to support it in both C and C++ (since C++ can use
+> flexible array member too through GCC extension), but I didn't implement it
+> in C++ in the initial patch. 
+> > If it isn't supported, it should be documented that it doesn't apply to C++
+> > and should be rejected in C++.  If it is to be supported, the support
+> > (including support for templates) needs to be there before GCC 15.
+> I will try to support it in C++ too in GCC15. If not, I will update the
+> documentation to indicate this limitation.Then perhaps we should ASAP change 
+handle_counted_by_attribute so that it emits a sorry message if (c_dialect_cxx ()),
+either as the first thing, or perhaps after doing the current diagnostics.
+
+- User: Kees Cook | Time: 2024-07-30 17:24:56 UTC
+  Text: (In reply to Qing Zhao fromcomment #25)> The source code need to be:
+> 
+> If (__builtin_get_counted_by (P->FAM))
+>   __builtin_get_counted_by (P->FAM) = COUNT;
+> 
+> Yes, I agree that this is good too for the original purpose. And also even
+> simpler and more flexible.
+> Kees might have more comments here. (Not sure any other impact on handling
+> the original problem he had with the new __builtin_get_counted_by).Yeah, I like this. It gives much more obvious semantics instead of hiding a no-op, and this could be used for _reading_ as well as writing the value. This means we could also write, for example, loop constructs with only the FAM:
+
+
+  typeof(*__builtin_get_counted_by(P->FAM)) idx;
+
+  for (idx = 0; idx < *__builtin_get_counted_by(P->FAM); idx++)
+    do_things(P->FAM[idx]);
+
+- User: Kees Cook | Time: 2024-07-30 17:28:09 UTC
+  Text: (In reply to qinzhao fromcomment #29)> (In reply to Jakub Jelinek fromcomment #28)
+> > Speaking of counted_by, I see support for it in c-family/ and c/, but not in
+> > cp/ at all, what is the attribute supposed to do in C++?
+> The initial plan is to support it in both C and C++ (since C++ can use
+> flexible array member too through GCC extension), but I didn't implement it
+> in C++ in the initial patch. 
+> > If it isn't supported, it should be documented that it doesn't apply to C++
+> > and should be rejected in C++.  If it is to be supported, the support
+> > (including support for templates) needs to be there before GCC 15.
+> I will try to support it in C++ too in GCC15. If not, I will update the
+> documentation to indicate this limitation.FWIW, the Linux kernel only needs this for C (obviously), so if C++ support is at all a burden, my vote would to be having these features be C-only. (But from a completeness perspective, it would be nice to have it in C++ too.)
+
+- User: Bill Wendling | Time: 2024-07-30 19:20:26 UTC
+  Text: (In reply to Kees Cook fromcomment #31)> (In reply to Qing Zhao fromcomment #25)
+> > The source code need to be:
+> > 
+> > If (__builtin_get_counted_by (P->FAM))
+> >   __builtin_get_counted_by (P->FAM) = COUNT;
+> > 
+> > Yes, I agree that this is good too for the original purpose. And also even
+> > simpler and more flexible.
+> > Kees might have more comments here. (Not sure any other impact on handling
+> > the original problem he had with the new __builtin_get_counted_by).
+> 
+> Yeah, I like this. It gives much more obvious semantics instead of hiding a
+> no-op, and this could be used for _reading_ as well as writing the value.
+> This means we could also write, for example, loop constructs with only the
+> FAM:
+> 
+> 
+>   typeof(*__builtin_get_counted_by(P->FAM)) idx;
+> 
+>   for (idx = 0; idx < *__builtin_get_counted_by(P->FAM); idx++)
+>     do_things(P->FAM[idx]);I have a rough version of __builtin_set_counted_by working in Clang. I'm not happy with it because it hides no-ops. I think the suggestions here are going in the correct direction. I'd like to throw out some alternatives so that the builtins could be more general.
+
+If we had a way of testing for an attribute, we could avoid the need to return ( void *)0 when the '__builtin_get' can't find the attribute:
+
+  __builtin_has_attr (ptr, attr_name);
+
+We could then have a builtin to get the attribute's argument:
+
+  __builtin_get_attr_arg (ptr, attr_name)
+
+This could have an optional argument to specify which argument to get if the attr has more than one:
+
+  __builtin_get_attr_arg (ptr, attr_name, pos)
+
+If we do all of this, we could use it directly to set the value:
+
+  if (__builtin_has_attr (ptr->FAM, counted_by))
+    ptr->__builtin_get_attr_arg (ptr-FAM, counted_by, 0) = count;
+
+If the user requires the value be set, they could do something a bit more drastic in the 'else' case:
+
+  size_t *counted_by_field = NULL; /* size_t or whatever type */
+
+  if (__builtin_has_attr (ptr->FAM, counted_by))
+    counted_by = &ptr->__builtin_get_attr_arg (ptr-FAM, counted_by, 0);
+
+  if (!counted_by)
+    /* Do something horrible and slow */
+
+It's more verbose, but it makes the programmer think about the case when either the 'counted_by' attribute (or any other attribute) doesn't exist. It also eases the burden on the compiler to look through arbitrary casts for the FAM / count objects in a struct (this is probably more of an issue with Clang than GCC). It's also generic which allows us to use it for any future expansions.
+
+- User: N/A | Time: 2024-07-30 19:27:59 UTC
+  Text: (In reply to Bill Wendling fromcomment #33)> 
+> If we had a way of testing for an attribute, we could avoid the need to
+> return ( void *)0 when the '__builtin_get' can't find the attribute:
+> 
+>   __builtin_has_attr (ptr, attr_name);GCC currently supports such builtin already:https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html#index-_005f_005fbuiltin_005fhas_005fattributeBuilt-in Function: bool __builtin_has_attribute (type-or-expression, attribute)
+
+- User: N/A | Time: 2024-07-30 20:12:03 UTC
+  Text: (In reply to Bill Wendling fromcomment #33)> 
+> We could then have a builtin to get the attribute's argument:
+> 
+>   __builtin_get_attr_arg (ptr, attr_name);not sure whether it's worth the effort to provide this general builtin or not for all the attributes. the main question is, what's the exact attribute's argument for each of the attributes that the compiler provided.
+
+But, I think it's a good idea to further simplify the functionality of the new builtin __builtin_get_counted_by (P->FAM) by eliminating the check for whether "P->FAM) has the counted_by attribute, instead, this new builtin assumes that "P->FAM" has the counted_by attribute, just return the corresponding counted_by field.
+
+Then, the user needs to write the following:
+
+if (__builtin_has_attribute (P->FAM, counted_by))
+   *__builtin_get_counted_by (P->FAM) = COUNT
+
+- User: Jakub Jelinek | Time: 2024-07-30 21:17:35 UTC
+  Text: (In reply to Bill Wendling fromcomment #33)>   __builtin_get_attr_arg (ptr, attr_name)
+> 
+> This could have an optional argument to specify which argument to get if the
+> attr has more than one:
+> 
+>   __builtin_get_attr_arg (ptr, attr_name, pos)This is a bad idea.  The first argument of counted_by attribute is an identifier, that isn't really useful for anything and how you'd return that?  And for other attributes which do have arguments, what exactly the argument is is heavily dependent on the attribute and there is simply no way how to represent those easily.
+Consider
+  [[omp::sequence (directive (parallel private (p)),
+    omp::directive (single copyprivate (p) firstprivate (f) allocate (f)))]]
+or
+  __attribute__((mode (DI)))
+or
+  __attribute__((vector_size (16)))
+or
+  __attribute__ ((__format__(__printf__, 1, 2)))
+or
+  [[gnu::alias ("foobar")]]
+etc.
+What would be the argument of some of these attributes for the return of the builtin, what types it would have, ...?
+
+- User: Bill Wendling | Time: 2024-07-30 21:32:49 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #36)> (In reply to Bill Wendling fromcomment #33)
+> >   __builtin_get_attr_arg (ptr, attr_name)
+> > 
+> > This could have an optional argument to specify which argument to get if the
+> > attr has more than one:
+> > 
+> >   __builtin_get_attr_arg (ptr, attr_name, pos)
+> 
+> This is a bad idea.  The first argument of counted_by attribute is an
+> identifier, that isn't really useful for anything and how you'd return that?
+> And for other attributes which do have arguments, what exactly the argument
+> is is heavily dependent on the attribute and there is simply no way how to
+> represent those easily.
+> Consider
+>   [[omp::sequence (directive (parallel private (p)),
+>     omp::directive (single copyprivate (p) firstprivate (f) allocate (f)))]]
+> or
+>   __attribute__((mode (DI)))
+> or
+>   __attribute__((vector_size (16)))
+> or
+>   __attribute__ ((__format__(__printf__, 1, 2)))
+> or
+>   [[gnu::alias ("foobar")]]
+> etc.
+> What would be the argument of some of these attributes for the return of the
+> builtin, what types it would have, ...?I realized my error after sending this. So yeah it's not going to work. I'm okay with what's being discussed. I just want to make it clear to the programmer that it's _possible_ that the builtin may become a no-op and they need to handle that, which will be DCE'ed if the attribute exists, etc.
+
+That does make me wonder at the usefulness of this feature. The user will need to set the count whether or not this builtin is used (either because 'counted_by' wasn't specified or the compiler couldn't find the COUNT variable for some reason (a compiler bug, but still...)). Isn't that basically creating a feature useful for only this specific use case?
+
+- User: N/A | Time: 2024-07-31 16:36:58 UTC
+  Text: (In reply to Bill Wendling fromcomment #37)> I realized my error after sending this. So yeah it's not going to work. I'm
+> okay with what's being discussed. I just want to make it clear to the
+> programmer that it's _possible_ that the builtin may become a no-op and they
+> need to handle that, which will be DCE'ed if the attribute exists, etc.As mentioned in the previous comment, I think that separating the attribute checking from the functionality of the new "__builtin_get_counted_by (PTR)" is reasonable, and make the new builtin even more simpler and cleaner. 
+
+that's a good idea.
+
+GCC's current __builtin_has_attribute should be available to be used by the programmer in their source code. 
+Does CLANG provide a similar builtin currently?> That does make me wonder at the usefulness of this feature. The user will
+> need to set the count whether or not this builtin is used (either because
+> 'counted_by' wasn't specified or the compiler couldn't find the COUNT
+> variable for some reason (a compiler bug, but still...)). Isn't that
+> basically creating a feature useful for only this specific use case?I think that this new builtin (actually a new C keyword) is useful to be provided to the user to help the programming experience when using the new attribute "counted_by", two basic use cases are described incomment #1, and #31. 
+
+currently, there is a GCC patch being proposed recentlyhttps://gcc.gnu.org/pipermail/gcc-patches/2024-July/658483.htmlc: Add _Lengthof operator
+
+From my understanding, the new __builtin_get_counted_by serves similar functionality as this potential future new C operator, but for flexiable array members or (later) pointers if we extend the counted-by to pointers.
+
+- User: Bill Wendling | Time: 2024-07-31 19:25:37 UTC
+  Text: (In reply to qinzhao fromcomment #38)> (In reply to Bill Wendling fromcomment #37)
+> > That does make me wonder at the usefulness of this feature. The user will
+> > need to set the count whether or not this builtin is used (either because
+> > 'counted_by' wasn't specified or the compiler couldn't find the COUNT
+> > variable for some reason (a compiler bug, but still...)). Isn't that
+> > basically creating a feature useful for only this specific use case?
+> 
+> I think that this new builtin (actually a new C keyword) is useful to be
+> provided to the user to help the programming experience when using the new
+> attribute "counted_by", two basic use cases are described incomment #1, and
+> #31. 
+> 
+> currently, there is a GCC patch being proposed recently
+>https://gcc.gnu.org/pipermail/gcc-patches/2024-July/658483.html> 
+> c: Add _Lengthof operator
+> 
+> From my understanding, the new __builtin_get_counted_by serves similar
+> functionality as this potential future new C operator, but for flexiable
+> array members or (later) pointers if we extend the counted-by to pointers.But this all relies upon the 'counted_by' attribute existing. For this example:
+
+  typeof(*__builtin_get_counted_by(P->FAM)) idx;
+
+  for (idx = 0; idx < *__builtin_get_counted_by (P->FAM); idx++)
+    do_things (P->FAM[idx]);
+
+This needs an if-then around it:
+
+  if (__builtin_has_attribute (P->FAM, counted_by)) {
+    typeof(*__builtin_get_counted_by (P->FAM)) idx;
+
+    for (idx = 0; idx < *__builtin_get_counted_by (P->FAM); idx++)
+      do_things (P->FAM[idx]);
+  }
+
+Does this code need to be executed only when 'counted_by' exists? If so, it's far better to write this, because the 'count' needs to be at the same "level" as the FAM:
+
+  if (__builtin_has_attribute (P->FAM, counted_by)) {
+    typeof(P->COUNT) idx;
+
+    for (idx = 0; idx < P->COUNT; idx++)
+      do_things (P->FAM[idx]);
+  }
+
+If it must be executed whether or not 'counted_by' exists, then the first form is overkill and requires duplication of code.
+
+I know that it's just an example, but it shows the issue I'm having with this feature request. The 'count' may be used in code that's not connected to 'counted_by'. In which case, the user will have to set the variable even after the allocation:
+
+  struct bar {
+    ...
+    int some_field;
+    ...
+  };
+
+  struct foo {
+    ...
+    int counter;
+    ...
+    struct bar array[] __attribute__((counted_by(counter)));
+  } *p;
+
+  #define alloc(P, FAM, COUNT) ({ \
+    typeof (P) __p;                                         \
+    size_t __size = sizeof (*P) + sizeof (*P->FAM) * COUNT; \
+    __p = kmalloc (__size, GFP);                            \
+    __builtin_set_counted_by (__p->FAM, COUNT);             \
+    __p;                                                    \
+  })
+
+  void allocate_foo (int count) {
+    p = alloc (p, array, count);
+    p->count = count; /* << ensure count is set for non-sanitizer uses */
+  }
+
+  void do_something (int val) {
+    int idx;
+
+    for (idx = 0; idx < p->count; ++idx)
+      p->array[idx].some_field = val++;
+  }
+
+Perhaps I'm missing something...
+
+- User: N/A | Time: 2024-07-31 20:52:55 UTC
+  Text: (In reply to Bill Wendling fromcomment #39)> 
+> But this all relies upon the 'counted_by' attribute existing. For this
+> example:
+> 
+>   typeof(*__builtin_get_counted_by(P->FAM)) idx;
+> 
+>   for (idx = 0; idx < *__builtin_get_counted_by (P->FAM); idx++)
+>     do_things (P->FAM[idx]);
+> 
+> This needs an if-then around it:
+> 
+>   if (__builtin_has_attribute (P->FAM, counted_by)) {
+>     typeof(*__builtin_get_counted_by (P->FAM)) idx;
+> 
+>     for (idx = 0; idx < *__builtin_get_counted_by (P->FAM); idx++)
+>       do_things (P->FAM[idx]);
+>   }
+> 
+> Does this code need to be executed only when 'counted_by' exists? If so,
+> it's far better to write this, because the 'count' needs to be at the same
+> "level" as the FAM:
+> 
+>   if (__builtin_has_attribute (P->FAM, counted_by)) {
+>     typeof(P->COUNT) idx;
+> 
+>     for (idx = 0; idx < P->COUNT; idx++)
+>       do_things (P->FAM[idx]);
+>   }Note, our original purpose of adding this new builtin is explicitly described in description section as:
+
+with the new builtin, "structs can gain the counted_by attribute without needing additional open-coded counter assignments for each struct". that will ease the adoption of "counted-by" attribute in the large application like linux kernel. 
+
+the above second code segment clearly is a open-coded usage of the counted-by field.
+
+- User: N/A | Time: 2024-07-31 21:00:50 UTC
+  Text: I also do not yet understand why this feature is needed. The count should be set anyway.   Is the reason that in existing kernel code the array is initialized before the count is set, and adding it to "alloc" will then initialize it earlier, so that the code does not have to be modified?
+
+- User: Jakub Jelinek | Time: 2024-07-31 21:05:29 UTC
+  Text: (In reply to qinzhao fromcomment #40)> Note, our original purpose of adding this new builtin is explicitly
+> described in description section as:
+> 
+> with the new builtin, "structs can gain the counted_by attribute without
+> needing additional open-coded counter assignments for each struct". that
+> will ease the adoption of "counted-by" attribute in the large application
+> like linux kernel. 
+> 
+> the above second code segment clearly is a open-coded usage of the
+> counted-by field.But for the kernel you'll need to have fallback code which will set the actual counter manually for compilers without support for counted_by attribute or the new builtin, so at least for 5-6 years it won't simplify anything, right?  Just result in larger source code.  Of course, when kernel stops supporting GCC < 15 and clang < 19 or when the support would be added, it can simplify things.
+
+- User: Bill Wendling | Time: 2024-07-31 21:19:15 UTC
+  Text: (In reply to qinzhao fromcomment #40)> Note, our original purpose of adding this new builtin is explicitly
+> described in description section as:
+> 
+> with the new builtin, "structs can gain the counted_by attribute without
+> needing additional open-coded counter assignments for each struct". that
+> will ease the adoption of "counted-by" attribute in the large application
+> like linux kernel. 
+> 
+> the above second code segment clearly is a open-coded usage of the
+> counted-by field.I understand that it would be a convenience for large adaptations. My point is that, unless the 'count' field exists solely for the sanitizer's use, it must be set no matter what. And since the builtin Kees is asking for could potentially turn into a no-op, that means to me that an explicit setting of the 'count' field should always occur (unless it's solely for the sanitizer's use). What this feature would help alleviate are issues like this:
+
+  struct foo *p = alloc (... + sizeof (<typeof FAM>) * count);
+
+  for (int idx = 0; idx < count; ++idx)
+    p->FAM[idx] = 42; /* sanitizer error: p->count hasn't been set yet */
+
+  p->count = count; /* this should be done first */
+
+This is a pain point, because I'm sure not everyone tests sanitizer builds. But a good buildbot farm (testing sanitizer builds) with some helpful warnings could alleviate some of that pain.
+
+- User: N/A | Time: 2024-07-31 21:33:31 UTC
+  Text: (In reply to uecker fromcomment #41)> I also do not yet understand why this feature is needed. The count should be
+> set anyway.Yes. But setting the count in _every_ place where a structure with a FAM is allocated will be a pain if there are a lot of places need to be modified to add such setting (open-coded assignment as Kees mentioned)>  Is the reason that in existing kernel code the array is
+> initialized before the count is set, and adding it to "alloc" will then
+> initialize it earlier, so that the code does not have to be modified?from Kees description, I guess that in the current kernel, the structures with FAMs is allocated by a MACRO:
+
+  #define alloc(P, FAM, COUNT) ({ \
+    size_t __size = sizeof(*P) + sizeof(*P->FAM) * COUNT; \
+    kmalloc(__size, GFP); \
+  })
+
+when adding "counted-by" attribute to the FAMs, each structure with a FAM need to explicitly set its counted-by field in the source code, which is a very tedious coding experience. 
+
+With this new builtin, the above allocation MACRO can be modified as following:
+
+  #define alloc(P, FAM, COUNT) ({ \
+    typeof(P) __p; \
+    size_t __size = sizeof(*P) + sizeof(*P->FAM) * COUNT; \
+    __p = kmalloc(__size, GFP); \
+    if __builtin_has_attribute (__p->FAM, counted_by) \
+      *__builtin_get_counted_by(__p->FAM) = COUNT; \
+    __p; \
+  })
+
+Then eliminate the need to add a open-coded assignment for each structure with a FAM. 
+hope this makes sense.
+
+- User: N/A | Time: 2024-07-31 21:41:57 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #42)> 
+> But for the kernel you'll need to have fallback code which will set the
+> actual counter manually for compilers without support for counted_by
+> attribute or the new builtin,The counter will not need to be set if there is no "counted_by" attribute. 
+Only when "counted_by" attribute is added into kernel, the corresponding counter field need to be set explicitly (that's a requirement for the "counted_by" attribute).
+
+- User: Bill Wendling | Time: 2024-07-31 21:47:37 UTC
+  Text: (In reply to qinzhao fromcomment #45)> (In reply to Jakub Jelinek fromcomment #42)
+> > 
+> > But for the kernel you'll need to have fallback code which will set the
+> > actual counter manually for compilers without support for counted_by
+> > attribute or the new builtin,
+> The counter will not need to be set if there is no "counted_by" attribute. 
+> Only when "counted_by" attribute is added into kernel, the corresponding
+> counter field need to be set explicitly (that's a requirement for the
+> "counted_by" attribute).Not necessarily. The 'count' field may be used for purposes other than the sanitizer, which is why the requirement exists.
+
+- User: Kees Cook | Time: 2024-08-01 17:29:18 UTC
+  Text: Yes, the counter must be manually set until Linux minimum compiler versions are raised to include counted_by support, but this is about making the transition to using counted_by easier and less prone to bugs.
+
+If the allocator is setting the counter (via the new builtin), then it will always be correct for compilers that support counted_by. There will be a later open-coded assignment as well, but that will be optimized away in most cases.
+
+Basically, the situation is that when counted_by is added to a struct, all allocations must be identified and corrected manually right now to avoid the sanitizer tripping at runtime. When the allocator can do the setting, this "bad code pattern" goes away. i.e. using counted_by currently introduces a new bad code pattern that is only present for compilers that support counted_by. So if we can solve it in the allocator, the problem goes away.
+
+e.g. this code pattern is valid today:
+
+p = alloc(count);
+for (i = 0; i < count; i++)
+  fill(&p->array[i]);
+p->counter = count;
+
+Adding counted_by(counter) to "array" means that suddenly the sanitizer will trip at "fill". While obvious cases where we need to move "p->counter = count" to immediate after the alloc can be found and changed at the time counted_by is added, Linux has a lot of complicated corner cases where allocation and array usage are distant or obfuscated.
+
+So, with the builtin being used within the allocator to set counter, now the old code pattern still works (as counter has been initialized early enough), and the duplicate store to p->counter doesn't matter (and may even get optimized away).
+
+- User: N/A | Time: 2024-08-02 15:58:26 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #30)> Then perhaps we should ASAP change 
+> handle_counted_by_attribute so that it emits a sorry message if
+> (c_dialect_cxx ()),
+> either as the first thing, or perhaps after doing the current diagnostics.agreed, and a patch is under testing now, will submit for review soon.
+
+- User: Alejandro Colomar | Time: 2024-08-04 12:34:01 UTC
+  Text: For reading the counted_by value, that is, for reading the number of elements in the FAM, I'm implementing a __lengthof__ operator, which returns the value that the typical ARRAY_SIZE() macro returns, but also works with FAMs declared with this attribute (and I also want to make it work on function parameters declared as arrays).
+
+Consider that for your design of a builtin for setting the counted_by value, since you don't need to have a built-in for reading the value.  ;)
+
+<https://inbox.sourceware.org/gcc-patches/p33myw2zqvtysc3ayfygcvarw4ka3wwltycqjyehdgy64wsgug@ewi3uvid6rrb/T/>
+
+That is, __lengthof__ should be useful in all of the following cases:
+
+    #define memberof(T, m)  (((T *) NULL)->m)
+
+    struct s {
+        size_t n;
+        int fam[] __attribute__((counted_by(n)));
+    };
+
+    __attribute__((access(read_only, 3, 4)))
+    void
+    f(size_t n1, int p[n1], int q[], size_t n2)
+    {
+        int       a[3];
+        size_t    m;
+        struct s  *s;
+
+        m = offsetof(struct s, fam) + sizeof(memberof(struct s, fam)[0]) * 7;
+        s = malloc(m);
+
+        assert(__lengthof__(a) == 3);
+        assert(__lengthof__(p) == n1);
+        assert(__lengthof__(q) == n2);
+        assert(__lengthof__(memberof(struct s, fam)) == m);
+    }
+
+- User: Alejandro Colomar | Time: 2024-08-04 12:36:27 UTC
+  Text: I forgot to set:> That is, __lengthof__ should be useful in all of the following cases:
+> 
+>     #define memberof(T, m)  (((T *) NULL)->m)
+> 
+>     struct s {
+>         size_t n;
+>         int fam[] __attribute__((counted_by(n)));
+>     };
+> 
+>     __attribute__((access(read_only, 3, 4)))
+>     void
+>     f(size_t n1, int p[n1], int q[], size_t n2)
+>     {
+>         int       a[3];
+>         size_t    m;
+>         struct s  *s;
+> 
+>         m = offsetof(struct s, fam) + sizeof(memberof(struct s, fam)[0]) * 7;
+>         s = malloc(m);s->n = m;> 
+>         assert(__lengthof__(a) == 3);
+>         assert(__lengthof__(p) == n1);
+>         assert(__lengthof__(q) == n2);
+>         assert(__lengthof__(memberof(struct s, fam)) == m);
+>     }
+
+- User: Alejandro Colomar | Time: 2024-08-04 13:04:24 UTC
+  Text: (In reply to Siddhesh Poyarekar fromcomment #13)> (In reply to qinzhao fromcomment #11)
+> > After the discussion with Kees on the major usage of this new builtin, I
+> > think that the above Category A might be a natural fit for this new
+> > __builtin_set_counted_by. i.e, a C language extension (RID_BUILTIN). 
+> > 
+> > We could define the new __builtin_set_counted_by as
+> > 
+> > void __builtin_set_counted_by (FAM_exp, count_exp)
+> > 
+> > The FAM_exp expression must be a flexible array member reference. The second
+> 
+> Does it have to be a FAM?  What is the problem if this is used on, e.g. an
+> arbitrary pointer?I would make it a compile-time error.  Why would we want to allow a non-FAM there?  (Unless the [[gnu::counted_by()]] attribute makes sense elsewhere.)
+
+- User: N/A | Time: 2024-08-05 17:45:54 UTC
+  Text: (In reply to Alejandro Colomar fromcomment #51)> I would make it a compile-time error.  Why would we want to allow a non-FAM
+> there?  (Unless the [[gnu::counted_by()]] attribute makes sense elsewhere.)The "counted_by" attribute is planned to be extended to pointers too.
+
+- User: Alejandro Colomar | Time: 2024-08-05 17:50:42 UTC
+  Text: (In reply to qinzhao fromcomment #52)> (In reply to Alejandro Colomar fromcomment #51)
+> > I would make it a compile-time error.  Why would we want to allow a non-FAM
+> > there?  (Unless the [[gnu::counted_by()]] attribute makes sense elsewhere.)
+> The "counted_by" attribute is planned to be extended to pointers too.I would then make it a compile-time error if the attribute is not present in the pointer.  Does it make sense?
+
+- User: Alejandro Colomar | Time: 2024-08-05 17:59:45 UTC
+  Text: In a similar manner, I've made the following cases compile-time errors for __lengthof__ (still under development):
+
+extern int x[];
+
+void
+f(int a[])
+{
+    size_t  n;
+
+    n = __lengthof__(a);
+    n = __lengthof__(x);
+}
+
+error: invalid application of ‘lengthof’ to incomplete type ‘int[]’
+
+Because it doesn't make sense at all.
+
+- User: Kees Cook | Time: 2024-08-05 18:51:04 UTC
+  Text: (In reply to Alejandro Colomar fromcomment #49)> For reading the counted_by value, that is, for reading the number of
+> elements in the FAM, I'm implementing a __lengthof__ operator, which returns
+> the value that the typical ARRAY_SIZE() macro returns, but also works with
+> FAMs declared with this attribute (and I also want to make it work on
+> function parameters declared as arrays).
+> 
+> Consider that for your design of a builtin for setting the counted_by value,
+> since you don't need to have a built-in for reading the value.  ;)
+> 
+> <https://inbox.sourceware.org/gcc-patches/> p33myw2zqvtysc3ayfygcvarw4ka3wwltycqjyehdgy64wsgug@ewi3uvid6rrb/T/>
+> 
+> That is, __lengthof__ should be useful in all of the following cases:
+> 
+>     #define memberof(T, m)  (((T *) NULL)->m)
+> 
+>     struct s {
+>         size_t n;
+>         int fam[] __attribute__((counted_by(n)));
+>     };
+> 
+>     __attribute__((access(read_only, 3, 4)))
+>     void
+>     f(size_t n1, int p[n1], int q[], size_t n2)
+>     {
+>         int       a[3];
+>         size_t    m;
+>         struct s  *s;
+> 
+>         m = offsetof(struct s, fam) + sizeof(memberof(struct s, fam)[0]) * 7;
+>         s = malloc(m);
+> 
+>         assert(__lengthof__(a) == 3);
+>         assert(__lengthof__(p) == n1);
+>         assert(__lengthof__(q) == n2);
+>         assert(__lengthof__(memberof(struct s, fam)) == m);
+>     }I was expecting "s->n = 7", not " ...= m", and for "__lengthof__(memberof(struct s, fam))" to be "== 7". It should be reporting the array element count, not the bytes, (nor the bytes of the entire allocation).
+
+- User: N/A | Time: 2024-08-05 20:21:16 UTC
+  Text: https://gcc.gnu.org/pipermail/gcc-patches/2024-August/659478.html
+
+- User: Bill Wendling | Time: 2024-08-05 20:29:54 UTC
+  Text: (In reply to Kees Cook fromcomment #47)> Yes, the counter must be manually set until Linux minimum compiler versions
+> are raised to include counted_by support, but this is about making the
+> transition to using counted_by easier and less prone to bugs.
+> 
+> If the allocator is setting the counter (via the new builtin), then it will
+> always be correct for compilers that support counted_by. There will be a
+> later open-coded assignment as well, but that will be optimized away in most
+> cases.
+> 
+> Basically, the situation is that when counted_by is added to a struct, all
+> allocations must be identified and corrected manually right now to avoid the
+> sanitizer tripping at runtime. When the allocator can do the setting, this
+> "bad code pattern" goes away. i.e. using counted_by currently introduces a
+> new bad code pattern that is only present for compilers that support
+> counted_by. So if we can solve it in the allocator, the problem goes away.
+> 
+> e.g. this code pattern is valid today:
+> 
+> p = alloc(count);
+> for (i = 0; i < count; i++)
+>   fill(&p->array[i]);
+> p->counter = count;
+> 
+> Adding counted_by(counter) to "array" means that suddenly the sanitizer will
+> trip at "fill". While obvious cases where we need to move "p->counter =
+> count" to immediate after the alloc can be found and changed at the time
+> counted_by is added, Linux has a lot of complicated corner cases where
+> allocation and array usage are distant or obfuscated.
+> 
+> So, with the builtin being used within the allocator to set counter, now the
+> old code pattern still works (as counter has been initialized early enough),
+> and the duplicate store to p->counter doesn't matter (and may even get
+> optimized away).I get that. My question then becomes why a diagnostic isn't sufficient to get programmers to "do the right thing" (similar to the "uninitialized variable" diagnostic). Cases where setting 'count' isn't local and/or is obfuscated are "easily" handled by simply adding the assignment directly after the allocation,because that's what this solution is doing.
+
+I'm pushing back so much for a couple of reasons:
+
+1. Updating current Linux to use 'counted_by' already forces you to fix the bad code patterns, because of minimum compiler versions. So by the time Linux's minimal compiler versions support the 'counted_by' feature, this builtin won't have as much of an impact.
+
+2. I believe a good warning would be more effective. It forces the programmer to get the initialization sequence "correct" and doesn't hide the initialization of one of the fields.
+
+3. Having the allocator initialize a field (beyond zeroing out memory) is unexpected in C. I know this happens in C++, but initialing a class member happens with non-default c'tors that are explicitly called by the programmer. The initialization of the 'count' field will be "hidden" by macros which eventually calls some kind of 'kmalloc' which before the 'counted_by' feature didn't pre-set programmer-defined fields.
+
+4. The utility of this builtin seems very limited to this anti-pattern. There aren't any savings to using '__builtin_get_counted_by(ptr->FAM) = val' rather than 'ptr->count = val' in any other situation. (I understand *why* you need the builtin, because of the difficulty finding the 'count' field during parsing in a generic way.)
+
+5. I'm not sure if this builtin will be used outside of Linux, unless a project has a similar allocation method as Linux.
+
+Personally, I like having the programmer think about their code rather than simply slapping on the 'counted_by' attribute and calling it done. Sure it's more convenient to set this field in the allocator, but the attribute does so much under the covers and the requirements placed on the 'count' value are very strict. The programmer needs to audit their code to ensure it follows those requirements.
+
+- User: Alejandro Colomar | Time: 2024-08-05 20:50:23 UTC
+  Text: (In reply to Kees Cook fromcomment #55)> I was expecting "s->n = 7", not " ...= m", and for
+> "__lengthof__(memberof(struct s, fam))" to be "== 7". It should be reporting
+> the array element count, not the bytes, (nor the bytes of the entire
+> allocation).My bad;  I wrote it fast.  Your correction is correct.
+
+(Since this is just hypothetical --__lengthof__ is still not working for counted_by--, I couldn't actually test that.)  :)
+
+- User: Kees Cook | Time: 2024-08-05 22:02:36 UTC
+  Text: (In reply to Bill Wendling fromcomment #57)> (In reply to Kees Cook fromcomment #47)
+> > So, with the builtin being used within the allocator to set counter, now the
+> > old code pattern still works (as counter has been initialized early enough),
+> > and the duplicate store to p->counter doesn't matter (and may even get
+> > optimized away).
+> 
+> I get that. My question then becomes why a diagnostic isn't sufficient to
+> get programmers to "do the right thing" (similar to the "uninitialized
+> variable" diagnostic). Cases where setting 'count' isn't local and/or is
+> obfuscated are "easily" handled by simply adding the assignment directly
+> after the allocation,because that's what this solution is doing.A diagnostic only works in the simple cases, and the simple cases can already be trivially located when applying 'counted_by' in the first place.
+
+I think using the "uninitialized variable" example is, actually, a perfect mapping for this. After decades of trying to get uninit warnings working, it was never complete, and there continued to be endless uninit flaws in Linux. The introduction of -ftrivial-auto-var-init=zero finally solved it, allowing for reliable semantics in the face of bugs. I view this identically: the programmer _should_ be setting 'counter' manually, but because the allocation actually _contains_ the correct value to start with, better to help the human. We want to shift the burden of correctness into the toolchain as much as possible, especially for potential memory safety issues.> I'm pushing back so much for a couple of reasons:
+> 
+> 1. Updating current Linux to use 'counted_by' already forces you to fix the
+> bad code patterns, because of minimum compiler versions. So by the time
+> Linux's minimal compiler versions support the 'counted_by' feature, this
+> builtin won't have as much of an impact.We can't fix all of them correctly (as we've already seen in Linux). But having the builtin exactly maps to the cases where enforcing the new 'counted_by' would break a program that got the initialization wrong, and allows use to get the initialization correct "automatically" (via the updated allocator).
+
+Once the compiler minimum version is updated, the open-coded assignments of 'counter' will no longer be needed, and can be removed globally, leaving the centralized assignment in the allocator.> 2. I believe a good warning would be more effective. It forces the
+> programmer to get the initialization sequence "correct" and doesn't hide the
+> initialization of one of the fields.In GCC we have already encountered the uninit warning being thrown in simple cases. But we have evidence to show that a warning will never give complete coverage.> 3. Having the allocator initialize a field (beyond zeroing out memory) is
+> unexpected in C. I know this happens in C++, but initialing a class member
+> happens with non-default c'tors that are explicitly called by the
+> programmer. The initialization of the 'count' field will be "hidden" by
+> macros which eventually calls some kind of 'kmalloc' which before the
+> 'counted_by' feature didn't pre-set programmer-defined fields.It's certainly novel, but so is 'counted_by'. Having a fixed-sized array is very common, and C programmers already depend on `sizeof` and `__builtin_object_size` to get those array sizes, and allocations get sized correctly, etc. Adding 'counted_by' means we gain similar semantics for dynamically sized arrays, so it's not much of a stretch for C to have the size "preinitialized".
+
+And that said, the Linux kernel is very much a specialized C "dialect", that does all kinds of "unexpected" things. It has been gaining more and more "modern language features" over the years, so this is, again, not strange for Linux. Additionally, moving to a common allocator is actively under way in Linux too, as the other slab variants have been removed, and there is now a single heap allocator.> 4. The utility of this builtin seems very limited to this anti-pattern.
+> There aren't any savings to using '__builtin_get_counted_by(ptr->FAM) = val'
+> rather than 'ptr->count = val' in any other situation. (I understand *why*
+> you need the builtin, because of the difficulty finding the 'count' field
+> during parsing in a generic way.)I don't disagree there, but I can't find any other way to handle this in a clean way in Linux to have a common allocator method for all structs, whether or not they have 'counted_by' applied.> 5. I'm not sure if this builtin will be used outside of Linux, unless a
+> project has a similar allocation method as Linux.I can't say for sure either, but I do need it for Linux, and that is sufficient in my opinion. In the past, many other projects will follow Linux's lead, though. Many new compiler features added lately get picked up by systemd, for example.> Personally, I like having the programmer think about their code rather than
+> simply slapping on the 'counted_by' attribute and calling it done. Sure it's
+> more convenient to set this field in the allocator, but the attribute does
+> so much under the covers and the requirements placed on the 'count' value
+> are very strict. The programmer needs to audit their code to ensure it
+> follows those requirements.I get that, but I'd rather they _not_ have to think about it: they already provided an array size to the allocator and declared the 'counted_by' association. Why should they be forced to repeat redundant information?
+
+- User: N/A | Time: 2024-08-07 13:51:27 UTC
+  Text: I came up with the following draft for the documentation of the new __builtin_get_counted_by, let me know your comments and suggestions:
+
+Builtin-in Function: type __builtin_get_counted_by (ptr)
+
+The argument PTR to the built-in function __builtin_get_counted_by is a pointer to an array object, which should have a counted_by attribute associated with it. This function returns a pointer to the corresponding object that holds the number of elements in the array object through counted_by attribute.
+
+The TYPE of the returned value should be a pointer type pointing to an integral type.
+
+It's the user's responsibility to make sure that the PTR has a counted-by attribute associated with it.
+
+(GCC provides another built-in __builtin_has_attribute() to make sure this)
+
+For example:
+
+for the following:
+
+  struct foo {
+    int counter;
+    struct bar1 array[] __attribute__((counted_by(counter)));
+  } *p;
+
+  __builtin_get_counted_by (p->array)
+
+returns:
+
+  &p->counter
+
+- User: N/A | Time: 2024-08-07 17:50:33 UTC
+  Text: (In reply to qinzhao fromcomment #60)> I came up with the following draft for the documentation of the new
+> __builtin_get_counted_by, let me know your comments and suggestions:After discussing with Bill on the Clang side, I confirmed that Clang does not have the same builtin __builtin_has_attributes as in GCC. So, in order to keep the user interface consistent between these two compilers. the new __builtin_get_counted_by is defined as following:
+
+Builtin-in Function: type __builtin_get_counted_by (ptr) 
+
+The built-in function __builtin_get_counted_by checks whether the array object pointed by the pointer PTR has another object associated with it that represents the number of elements in the array object through counted_by attribute (i.e, the counted-by object). If so, returns a pointer to the corresponding counted-by object. If such counted-by object does not exist, return a NULL pointer.
+
+The argument PTR must be a pointer to an array.
+The TYPE of the returned value should be a pointer type pointing to an integral type.
+
+For example:
+
+for the following:
+
+  struct foo {
+    int counter;
+    struct bar1 array[] __attribute__((counted_by(counter)));
+  } *p;
+
+  __builtin_get_counted_by (p->array)
+
+returns:
+
+  &p->counter
+
+However, for the following:
+
+  struct foo2 {
+    int other;
+    struct bar2 array[];
+  } *q;
+
+  __builtin_get_counted_by (p->array)
+
+returns NULL.
+
+- User: Alejandro Colomar | Time: 2024-08-07 21:34:14 UTC
+  Text: (In reply to qinzhao fromcomment #61)> (In reply to qinzhao fromcomment #60)
+> > I came up with the following draft for the documentation of the new
+> > __builtin_get_counted_by, let me know your comments and suggestions:
+> 
+> After discussing with Bill on the Clang side, I confirmed that Clang does
+> not have the same builtin __builtin_has_attributes as in GCC. So, in order
+> to keep the user interface consistent between these two compilers. the new
+> __builtin_get_counted_by is defined as following:
+> 
+> Builtin-in Function: type __builtin_get_counted_by (ptr) 
+> 
+> The built-in function __builtin_get_counted_by checks whether the array
+> object pointed by the pointer PTR has another object associated with it that
+> represents the number of elements in the array object through counted_by
+> attribute (i.e, the counted-by object). If so, returns a pointer to the
+> corresponding counted-by object. If such counted-by object does not exist,
+> return a NULL pointer.What's the value of returning NULL instead of just failing the compilation with an error?
+
+I expect it will be easier to write safe code if it's impossible to misuse this API, by having a hard compiler error if it's misused.  Just like ARRAY_SIZE() (and a future __lengthof__) breaks compilation if you use it on a non-array.
+
+- User: Kees Cook | Time: 2024-08-07 22:14:22 UTC
+  Text: (In reply to Alejandro Colomar fromcomment #62)> What's the value of returning NULL instead of just failing the compilation
+> with an error?It's so that the same allocator macros can be used for FAM structs with or without a "counted_by" attribute. If "counted_by" is marked, the counter is updated. If it doesn't exist, it is not.
+
+Here's the expected usage fromcomment #1(adjusted for the new API):
+
+  #define alloc(P, FAM, COUNT, GFP) ({ \
+    typeof(P) __p; \
+    size_t __size = sizeof(*P) + sizeof(*P->FAM) * COUNT; \
+    __p = kmalloc(__size, GFP); \
+    if (__p && __builtin_get_counted_by(__p->FAM)) \
+      *__builtin_get_counted_by(__p->FAM) = COUNT; \
+    __p; \
+  })
+
+We can actually take this even further and sanity check "COUNT" against the counter type in addition to setting it:
+
+  #define alloc(P, FAM, COUNT, GFP) ({ \
+    size_t __count = (COUNT); \
+    typeof(P) __p; \
+    if (__builtin_get_counted_by(__p->FAM) && \
+        __count > type_max(typeof(*__builtin_get_counted_by(__p->FAM))) { \
+      __p = NULL; \
+    } else { \
+      size_t __size = struct_size(*__p, FAM, __count); \
+      __p = kmalloc(__size, GFP); \
+      if (__p && __builtin_get_counted_by(__p->FAM)) \
+        *__builtin_get_counted_by(__p->FAM) = __count; \
+    }
+    __p; \
+  })
+
+- User: Alejandro Colomar | Time: 2024-08-07 22:56:25 UTC
+  Text: (In reply to Kees Cook fromcomment #63)> (In reply to Alejandro Colomar fromcomment #62)
+> > What's the value of returning NULL instead of just failing the compilation
+> > with an error?
+> 
+> It's so that the same allocator macros can be used for FAM structs with or
+> without a "counted_by" attribute. If "counted_by" is marked, the counter is
+> updated. If it doesn't exist, it is not.
+> 
+> Here's the expected usage fromcomment #1(adjusted for the new API):
+> 
+>   #define alloc(P, FAM, COUNT, GFP) ({ \
+>     typeof(P) __p; \
+>     size_t __size = sizeof(*P) + sizeof(*P->FAM) * COUNT; \
+>     __p = kmalloc(__size, GFP); \
+>     if (__p && __builtin_get_counted_by(__p->FAM)) \
+>       *__builtin_get_counted_by(__p->FAM) = COUNT; \
+>     __p; \
+>   })How about having two macros?  One that works for non-attributed pointers, and other that works for attributed ones.  And use the appropriate one for each of them.
+
+If you accidentally use the one that uses the builtin, it'll cause a compiler error.
+
+#define alloc(P, FAM, COUNT, GFP) \
+({ \
+    typeof(P) __p; \
+    __p = alloc_not_counted_by(P, FAM, COUNT, GFP); \
+    *__builtin_get_counted_by(__p->FAM) = COUNT; \
+    __p; \
+})
+
+alloc_no_attribute() would work everywhere, and alloc() only where the attribute is used.> 
+> We can actually take this even further and sanity check "COUNT" against the
+> counter type in addition to setting it:
+> 
+>   #define alloc(P, FAM, COUNT, GFP) ({ \
+>     size_t __count = (COUNT); \
+>     typeof(P) __p; \
+>     if (__builtin_get_counted_by(__p->FAM) && \
+>         __count > type_max(typeof(*__builtin_get_counted_by(__p->FAM))) { \
+>       __p = NULL; \
+>     } else { \
+>       size_t __size = struct_size(*__p, FAM, __count); \
+>       __p = kmalloc(__size, GFP); \
+>       if (__p && __builtin_get_counted_by(__p->FAM)) \
+>         *__builtin_get_counted_by(__p->FAM) = __count; \
+>     }
+>     __p; \
+>   })You could still do this with my approach.  And there are less NULL pointers around, which would get messy.
+
+- User: Kees Cook | Time: 2024-08-07 23:08:23 UTC
+  Text: (In reply to Alejandro Colomar fromcomment #64)> How about having two macros?  One that works for non-attributed pointers,
+> and other that works for attributed ones.  And use the appropriate one for
+> each of them.
+> 
+> If you accidentally use the one that uses the builtin, it'll cause a
+> compiler error.No, that's exactly what I am trying avoid. There should be no additional work needed beyond adding "counted_by" to the struct.> alloc_no_attribute() would work everywhere, and alloc() only where the
+> attribute is used.We are actively trying to reduce the number of duplicate APIs. The compiler has everything it needs to do this without duplicating an API.> You could still do this with my approach.  And there are less NULL pointers
+> around, which would get messy.I disagree: all the NULL checks are constant and removed at compile time. There is literally no benefit at all to having 2 APIs. :)
+
+- User: Alejandro Colomar | Time: 2024-08-08 07:51:29 UTC
+  Text: (In reply to Kees Cook fromcomment #65)> (In reply to Alejandro Colomar fromcomment #64)
+> > How about having two macros?  One that works for non-attributed pointers,
+> > and other that works for attributed ones.  And use the appropriate one for
+> > each of them.
+> > 
+> > If you accidentally use the one that uses the builtin, it'll cause a
+> > compiler error.
+> 
+> No, that's exactly what I am trying avoid. There should be no additional
+> work needed beyond adding "counted_by" to the struct.Hmmm, I understand.> 
+> > alloc_no_attribute() would work everywhere, and alloc() only where the
+> > attribute is used.
+> 
+> We are actively trying to reduce the number of duplicate APIs. The compiler
+> has everything it needs to do this without duplicating an API.
+> 
+> > You could still do this with my approach.  And there are less NULL pointers
+> > around, which would get messy.
+> 
+> I disagree: all the NULL checks are constant and removed at compile time.I wasn't worried about the run-time performance.  I'm worried about the complexity it adds.  You're forcing all users of this builtin to do NULL checks before using it.
+
+However, if you have compile-time errors, a user that does not have the same needs as the kernel will be able to do the 2 APIs approach.  Or even say, one uses the attribute already everywhere (e.g., the kernel in a near future where all code has been adapted), so has a single API, which uses the builtin, and they want to make sure no new code is added that doesn't have the attribute.  A compiler error would easily show bugs like that, while NULL checks would just silence it.
+
+So, an alternative, which would support both my and your constraints would be to request Clang to implement __builtin_has_attribute() *and* have a compiler error if __builtin_set_counted_by is used on a pointer that doesn't have it, I think.> There is literally no benefit at all to having 2 APIs. :)
+
+- User: GCC Commits | Time: 2024-10-15 21:04:28 UTC
+  Text: The master branch has been updated by Qing Zhao <qinzhao@gcc.gnu.org>:https://gcc.gnu.org/g:e7380688fa5917011c3fb85b5e06fb00f776a95dcommitr15-4370-ge7380688fa5917011c3fb85b5e06fb00f776a95dAuthor: Qing Zhao <qing.zhao@oracle.com>
+Date:   Tue Oct 15 17:55:22 2024 +0000
+
+    Provide new GCC builtin __builtin_counted_by_ref [PR116016]
+    
+    With the addition of the 'counted_by' attribute and its wide roll-out
+    within the Linux kernel, a use case has been found that would be very
+    nice to have for object allocators: being able to set the counted_by
+    counter variable without knowing its name.
+    
+    For example, given:
+    
+      struct foo {
+        ...
+        int counter;
+        ...
+        struct bar array[] __attribute__((counted_by (counter)));
+      } *p;
+    
+    The existing Linux object allocators are roughly:
+    
+      #define MAX(A, B) (A > B) ? (A) : (B)
+      #define alloc(P, FAM, COUNT) ({ \
+        __auto_type __p = &(P); \
+        size_t __size = MAX (sizeof(*P),
+                             __builtin_offsetof (__typeof(*P), FAM)
+                             + sizeof (*(P->FAM)) * COUNT); \
+        *__p = kmalloc(__size); \
+      })
+    
+    Right now, any addition of a counted_by annotation must also
+    include an open-coded assignment of the counter variable after
+    the allocation:
+    
+      p = alloc(p, array, how_many);
+      p->counter = how_many;
+    
+    In order to avoid the tedious and error-prone work of manually adding
+    the open-coded counted-by intializations everywhere in the Linux
+    kernel, a new GCC builtin __builtin_counted_by_ref will be very useful
+    to be added to help the adoption of the counted-by attribute.
+    
+     -- Built-in Function: TYPE __builtin_counted_by_ref (PTR)
+         The built-in function '__builtin_counted_by_ref' checks whether the
+         array object pointed by the pointer PTR has another object
+         associated with it that represents the number of elements in the
+         array object through the 'counted_by' attribute (i.e.  the
+         counted-by object).  If so, returns a pointer to the corresponding
+         counted-by object.  If such counted-by object does not exist,
+         returns a null pointer.
+    
+         This built-in function is only available in C for now.
+    
+         The argument PTR must be a pointer to an array.  The TYPE of the
+         returned value is a pointer type pointing to the corresponding
+         type of the counted-by object or a void pointer type in case of a
+         null pointer being returned.
+    
+    With this new builtin, the central allocator could be updated to:
+    
+      #define MAX(A, B) (A > B) ? (A) : (B)
+      #define alloc(P, FAM, COUNT) ({ \
+        __auto_type __p = &(P); \
+        __auto_type __c = (COUNT); \
+        size_t __size = MAX (sizeof (*(*__p)),\
+                             __builtin_offsetof (__typeof(*(*__p)),FAM) \
+                             + sizeof (*((*__p)->FAM)) * __c); \
+        if ((*__p = kmalloc(__size))) { \
+          __auto_type ret = __builtin_counted_by_ref((*__p)->FAM); \
+          *_Generic(ret, void *: &(size_t){0}, default: ret) = __c; \
+        } \
+      })
+    
+    And then structs can gain the counted_by attribute without needing
+    additional open-coded counter assignments for each struct, and
+    unannotated structs could still use the same allocator.PR c/116016gcc/c-family/ChangeLog:
+    
+            * c-common.cc: Add new __builtin_counted_by_ref.
+            * c-common.h (enum rid): Add RID_BUILTIN_COUNTED_BY_REF.
+    
+    gcc/c/ChangeLog:
+    
+            * c-decl.cc (names_builtin_p): Add RID_BUILTIN_COUNTED_BY_REF.
+            * c-parser.cc (has_counted_by_object): New routine.
+            (get_counted_by_ref): New routine.
+            (c_parser_postfix_expression): Handle New RID_BUILTIN_COUNTED_BY_REF.
+            * c-tree.h: New routine handle_counted_by_for_component_ref.
+            * c-typeck.cc (handle_counted_by_for_component_ref): New routine.
+            (build_component_ref): Call the new routine.
+    
+    gcc/ChangeLog:
+    
+            * doc/extend.texi: Add documentation for __builtin_counted_by_ref.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/builtin-counted-by-ref-1.c: New test.
+            * gcc.dg/builtin-counted-by-ref.c: New test.
+
+- User: N/A | Time: 2024-10-15 21:35:08 UTC
+  Text: fixed in GCC15
+
+- User: Sam James | Time: 2024-10-15 21:56:15 UTC
+  Text: Thank you Qing and everyone else involved!
+

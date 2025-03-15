@@ -1,0 +1,119 @@
+Bug Summary: [14 Regression] ICE verify_ssa failed when building 500.perlbench_r since r14-6822-g01f4251b8775c8
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Martin Jambor | Time: 2024-01-04 17:49:59 UTC
+  Text: With a compiler configured with --enable-checking=yes and the following testcase derived from 500.perlbench_r with -O3 -march=x86-64-v3 I get a verify_ssa ICE:
+
+$ cat test.c 
+long Perl_pp_split_limit;
+int Perl_block_gimme();
+int Perl_pp_split() {
+  char strend;
+  long iters;
+  int gimme = Perl_block_gimme();
+  while (--Perl_pp_split_limit) {
+    if (gimme)
+      iters++;
+    if (strend)
+      break;
+  }
+  if (iters)
+    return 0;
+}
+
+$ $PREFIX/gcc -O3 -march=x86-64-v3  -S test.c 
+test.c: In function ‘Perl_pp_split’:
+test.c:3:5: error: definition in block 4 does not dominate use in block 6
+    3 | int Perl_pp_split() {
+      |     ^~~~~~~~~~~~~
+for SSA_NAME: vect_iters_12.12_110 in statement:
+vect_iters_12.12_111 = PHI <vect_iters_12.12_110(6)>
+PHI argument
+vect_iters_12.12_110
+for PHI node
+vect_iters_12.12_111 = PHI <vect_iters_12.12_110(6)>
+during GIMPLE pass: vect
+test.c:3:5: internal compiler error: verify_ssa failed
+0x129673f verify_ssa(bool, bool)
+        /home/mjambor/gcc/mine/src/gcc/tree-ssa.cc:1203
+0xf0bcd5 execute_function_todo
+        /home/mjambor/gcc/mine/src/gcc/passes.cc:2095
+0xf0c13e execute_todo
+        /home/mjambor/gcc/mine/src/gcc/passes.cc:2142
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+I have bisected the failure tor14-6822-g01f4251b8775c8(middle-end: Support vectorization of loops with multiple exits).  I have tried if the patch attached toPR 113137helps but unfortunately it does not.
+
+- User: Tamar Christina | Time: 2024-01-04 18:00:53 UTC
+  Text: > I have bisected the failure tor14-6822-g01f4251b8775c8(middle-end: Support
+> vectorization of loops with multiple exits).  I have tried if the patch
+> attached toPR 113137helps but unfortunately it does not.Indeed this should be fixed by the patch inPR 113136not 113137 :)
+
+- User: Tamar Christina | Time: 2024-01-04 18:02:20 UTC
+  Text: Ah wait, I see. Ok, taking a look.
+
+- User: Tamar Christina | Time: 2024-01-04 18:48:31 UTC
+  Text: Thanks,
+
+Indeed the patch forPR 113137won't fix this one as it looks like the peeling code has gotten confused about which exit is which when adjusting virtual_operands.
+
+It looks like it's swapped them, and this happens because non of the loop exits are counting one so it just picks a random one.
+
+Looks the one it picks is not the latch connected one:
+
+perl.c:10:8: note:   using as main loop exit: 11 -> 7 [AUX: (nil)]
+perl.c:10:8: note:    === get_loop_niters ===
+perl.c:10:8: note:    Loop has 2 exits.
+perl.c:10:8: note:    Analyzing exit 0...
+perl.c:10:8: note:    Analyzing exit 1...
+
+which then incorrectly peels:
+
+ # iters_46 = PHI <iters_12(21), iters_4(26)>
+
+which should be:
+
+ # iters_46 = PHI <iters_4(21), iters_12(26)>
+
+I started implemented a fix for this same situation earlier forPR 113178but didn't finish it because I didn't think we'd get this far with a legit loop.
+
+I'll finish that part.  Thanks for the testcase!
+
+- User: Tamar Christina | Time: 2024-01-07 17:27:42 UTC
+  Text: Createdattachment 57003[details]perlbench.patch
+
+submitted patch
+
+- User: GCC Commits | Time: 2024-01-12 15:32:45 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:99c0a540d6689ede068f9ba98af6f38c3cd71362commitr14-7196-g99c0a540d6689ede068f9ba98af6f38c3cd71362Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Fri Jan 12 15:25:58 2024 +0000
+
+    middle-end: thread through existing LCSSA variable for alternative exits too [PR113237]
+    
+    Builing on top of the previous patch, similar to when we have a single exit if
+    we have a case where all exits are considered early exits and there are existing
+    non virtual phi then in order to maintain LCSSA we have to use the existing PHI
+    variables.  We can't simply clear them and just rebuild them because the order
+    of the PHIs in the main exit must match the original exit for when we add the
+    skip_epilog guard.
+    
+    But the infrastructure is already in place to maintain them, we just have to use
+    the right value.
+    
+    gcc/ChangeLog:PR tree-optimization/113237* tree-vect-loop-manip.cc (slpeel_tree_duplicate_loop_to_edge_cfg): Use
+            existing LCSSA variable for exit when all exits are early break.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/113237* gcc.dg/vect/vect-early-break_98-pr113237.c: New test.
+
+- User: Tamar Christina | Time: 2024-01-12 15:36:04 UTC
+  Text: Fixed. Thanks for the report and let me know if there's something still broken.
+

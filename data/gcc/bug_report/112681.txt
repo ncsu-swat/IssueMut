@@ -1,0 +1,136 @@
+Bug Summary: [14 Regression] ICE: in extract_insn, at recog.cc:2804 (unrecognizable insn) with -O2 -mfma -mno-sse4.2 and memcmp() since r14-5747
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 13.2.1
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-11-23 13:47:28 UTC
+  Text: Createdattachment 56673[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O2 -mfma -mno-sse4.2 testcase.C 
+testcase.C: In function 'int foo()':
+testcase.C:11:1: error: unrecognizable insn:
+   11 | }
+      | ^
+(insn 8 7 9 2 (set (reg:V16QI 104)
+        (xor:V16QI (reg:V16QI 103)
+            (mem/c:V16QI (reg/f:DI 102) [0 MEM <char[1:16]> [(void *)&b + 8B]+0 S16 A64]))) "testcase.C":10:27 -1
+     (nil))
+during RTL pass: vregs
+testcase.C:11:1: internal compiler error: in extract_insn, at recog.cc:2804
+0x8d9b93 _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+        /repo/gcc-trunk/gcc/rtl-error.cc:108
+0x8d9c10 _fatal_insn_not_found(rtx_def const*, char const*, int, char const*)
+        /repo/gcc-trunk/gcc/rtl-error.cc:116
+0x8c8a7f extract_insn(rtx_insn*)
+        /repo/gcc-trunk/gcc/recog.cc:2804
+0x14032bd instantiate_virtual_regs_in_insn
+        /repo/gcc-trunk/gcc/function.cc:1610
+0x14032bd instantiate_virtual_regs
+        /repo/gcc-trunk/gcc/function.cc:1993
+0x14032bd execute
+        /repo/gcc-trunk/gcc/function.cc:2040
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-5779-20231123205631-g746344dd538-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-5779-20231123205631-g746344dd538-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20231123 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2023-11-23 19:04:11 UTC
+  Text: Started withr14-5747-g2e51fff7ce02a6105aa1acff57cbbdd8a767a33f
+
+- User: Jakub Jelinek | Time: 2023-11-23 19:32:43 UTC
+  Text: Doesn't need the virtual method nor C++:
+struct S { void *c; char d[16]; } a, b;
+
+int
+foo (void)
+{
+  return __builtin_memcmp (a.d, b.d, sizeof (a.d)) != 0;
+}
+
+- User: Andrew Pinski | Time: 2023-11-23 19:36:02 UTC
+  Text: ***Bug 112676has been marked as a duplicate of this bug. ***
+
+- User: Jakub Jelinek | Time: 2023-11-23 19:46:46 UTC
+  Text: Flags can be just -O2 -msse4.1 -mno-sse4.2 as well or even -O2 -msse4.2 -mno-avx.
+--- gcc/config/i386/i386-expand.cc.jj	2023-11-21 09:31:35.792395304 +0100
++++ gcc/config/i386/i386-expand.cc	2023-11-23 20:43:51.675586034 +0100
+@@ -2453,6 +2453,8 @@ ix86_expand_branch (enum rtx_code code,
+ 	  /* Generate XOR since we can't check that one operand is zero
+ 	     vector.  */
+ 	  tmp = gen_reg_rtx (mode);
++	  if (!vector_operand (op1, mode))
++	    op1 = force_reg (mode, op1);
+ 	  emit_insn (gen_rtx_SET (tmp, gen_rtx_XOR (mode, op0, op1)));
+ 	  tmp = gen_lowpart (p_mode, tmp);
+ 	  emit_insn (gen_rtx_SET (gen_rtx_REG (CCZmode, FLAGS_REG),
+seems to fix it.
+
+- User: Jakub Jelinek | Time: 2023-11-23 19:59:23 UTC
+  Text: Or maybe better
+--- gcc/config/i386/i386-expand.cc.jj	2023-11-21 09:31:35.792395304 +0100
++++ gcc/config/i386/i386-expand.cc	2023-11-23 20:57:57.128721762 +0100
+@@ -2453,7 +2453,8 @@ ix86_expand_branch (enum rtx_code code,
+ 	  /* Generate XOR since we can't check that one operand is zero
+ 	     vector.  */
+ 	  tmp = gen_reg_rtx (mode);
+-	  emit_insn (gen_rtx_SET (tmp, gen_rtx_XOR (mode, op0, op1)));
++	  rtx ops[3] = { tmp, op0, op1 };
++	  ix86_expand_vector_logical_operator (XOR, mode, ops);
+ 	  tmp = gen_lowpart (p_mode, tmp);
+ 	  emit_insn (gen_rtx_SET (gen_rtx_REG (CCZmode, FLAGS_REG),
+ 				  gen_rtx_UNSPEC (CCZmode,
+
+- User: Jakub Jelinek | Time: 2023-11-23 20:04:15 UTC
+  Text: Createdattachment 56676[details]gcc14-pr112681.patch
+
+Full untested patch.
+
+- User: Manuel Lauss | Time: 2023-11-23 20:28:34 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #6)> Createdattachment 56676[details]> gcc14-pr112681.patch
+> 
+> Full untested patch.Fixes all ICEs I've seen today.
+Thank you!
+
+- User: GCC Commits | Time: 2023-11-24 11:13:19 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:3eb9cae6d375d222787498b15ac87f383b3834fecommitr14-5822-g3eb9cae6d375d222787498b15ac87f383b3834feAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Nov 24 12:12:20 2023 +0100
+
+    i386: Fix ICE during cbranchv16qi4 expansion [PR112681]
+    
+    The following testcase ICEs, because cbranchv16qi4 expansion calls
+    ix86_expand_branch with op1 being a pre-AVX unaligned memory and
+    ix86_expand_branch emits a xorv16qi3 instruction without making sure
+    the operand predicates are satisfied.
+    While I could manually check if the argument (or both?) doesn't
+    match vector_operand predicate (apparently this one or bcst_vector_operand
+    is used in all integral 16+ bytes *xorv*3 instructions) force it into a
+    register, but as all gen_xorv*3 expanders call
+    ix86_expand_vector_logical_operator, it seems easier to just call that
+    function which ensures the right thing happens.  Calling the individual
+    gen_xorv*3 functions would mean ugly switch on the modes and using high
+    level expand_simple_binop here seems too high level to me.
+    
+    2023-11-24  Jakub Jelinek  <jakub@redhat.com>PR target/112681* config/i386/i386-expand.cc (ix86_expand_branch): Use
+            ix86_expand_vector_logical_operator to expand vector XOR rather than
+            gen_rtx_SET on gen_rtx_XOR.
+    
+            * gcc.target/i386/sse4-pr112681.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-11-24 11:13:46 UTC
+  Text: Fixed.
+

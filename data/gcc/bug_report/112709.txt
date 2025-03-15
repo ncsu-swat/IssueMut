@@ -1,0 +1,398 @@
+Bug Summary: [13 Regression] address sanitize and returns_twice causes an ICE
+Product: gcc
+Component: sanitizer
+
+  (show other bugs)
+Keywords: ice-checking, ice-on-valid-code
+Known to Work: 
+Known to Fail: 13.1.0
+
+Comments:
+- User: Anonymous | Time: 2023-11-25 05:43:57 UTC
+  Text: *******************************************************************************
+OS and Platform:
+$ uname -a:
+Linux ubuntu 4.15.0-213-generic #224-Ubuntu SMP Mon Jun 19 13:30:12 UTC 2023 x86_64 x86_64 x86_64 GNU/Linux
+*******************************************************************************
+gcc version:
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=/root/gcc_set/202311021000/bin/gcc
+COLLECT_LTO_WRAPPER=/root/gcc_set/202311021000/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc/configure --prefix=/root/gcc_set/202311021000 --with-gmp=/root/build_essential --with-mpfr=/root/build_essential --with-mpc=/root/build_essential --enable-languages=c,c++ --disable-multilib --with-sanitizer=address,undefined,thread,leak
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20231102 (experimental) (GCC)
+
+git version: d508a94167c186b2baacc679896e2809554c0b99
+*******************************************************************************
+Program:
+$ cat mutant.c
+struct S { char c[1024]; };
+void func(void);
+struct S s(void) __attribute__((returns_twice));
+struct S *p;
+
+void func1(void)
+{
+  func();
+  *p = s();
+}
+
+*******************************************************************************
+Command Lines:
+$ gcc -fsanitize=address -c mutant.c
+mutant.c: In function ‘func1’:
+mutant.c:6:6: error: returns_twice call is not first in basic block 4
+    6 | void func1(void)
+      |      ^~~~~
+*p.0_1(ab) = s ();
+during GIMPLE pass: asan0
+mutant.c:6:6: internal compiler error: verify_flow_info failed
+0xad0a0e verify_flow_info()
+        ../../gcc/gcc/cfghooks.cc:287
+0xed36d7 execute_function_todo
+        ../../gcc/gcc/passes.cc:2100
+0xed3c0e execute_todo
+        ../../gcc/gcc/passes.cc:2142
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: Andrew Pinski | Time: 2023-11-25 19:53:30 UTC
+  Text: Confirmed, the checking is new in GCC 13. Though it seems like GCC 5 produced IR that was ok.
+
+I am not 100% sure how we should handle this case either.
+
+- User: Jakub Jelinek | Time: 2023-11-27 12:46:55 UTC
+  Text: This isn't specific to asan, -fsanitize=undefined ICEs on it the same.
+In both cases, we want to add instrumentation for the store of the call lhs.
+So, either we move the instrumentation on the non-abnormal predecessor edge of the calls, but then we actually don't perform the checking when reaching the call through
+the abnormal edge (i.e. returning for second and following time from the call, in the caller perhaps the pointer might have changed).
+Or we stop doing such instrumentations on the call lhs and instead do such instrumentation in the callee (on <retval> = whatever; stores).
+
+- User: Jakub Jelinek | Time: 2023-11-27 13:00:22 UTC
+  Text: The .ASAN_CHECK call before the returns_twice fn call was added inr6-6758-g7db337c247a6f34708b502016d58c2ef9991b2a8and with .UBSAN_NULL call before it with -fsanitize=undefined sincer0-126632-gb9a55b135e5482e2484c27b6233ebf9132347ee5when -fsanitize=null support has been introduced.
+
+- User: Jakub Jelinek | Time: 2024-03-08 17:02:14 UTC
+  Text: Thinking about it, I'd say this should be instrumented differently between asan and ubsan.  ubsan, which ought to just check whether the pointer is non-NULL and properly aligned, should instrument it in the caller, so for returns_twice on all the edges but the abnormal from .ABNORMAL_DISPATCHER, if there is just one such edge, emit it on that edge, if there are multiple, split the block, add PHIs and move the .ABNORMAL_DISPATCHER edge.  Because the function isn't called for the second time actually, the argument where to store it to will be the same in both cases.
+For asan this is different, while the address to which the result is stored will be the same, the memory might be poisoned in between, so I think we want to instrument that on the callee side when storing into RESULT_DECL.
+
+- User: Jakub Jelinek | Time: 2024-03-08 17:19:55 UTC
+  Text: Adjusted testcase which shows more cases, like multiple edges into the returns_twice bb in addition to the edge from .ABNORMAL_DISPATCHER.
+
+- User: Jakub Jelinek | Time: 2024-03-08 17:20:01 UTC
+  Text: struct S { char c[1024]; };
+int foo (int);
+
+__attribute__((returns_twice, noipa)) struct S
+bar (int x)
+{
+  (void) x;
+  struct S s = {};
+  s.c[42] = 42;
+  return s;
+}
+
+void
+baz (struct S *p)
+{
+  foo (1);
+  *p = bar (0);
+}
+
+void
+qux (int x, struct S *p)
+{
+  if (x == 25)
+    x = foo (2);
+  else if (x == 42)
+    x = foo (foo (3));
+  *p = bar (x);
+}
+
+void
+corge (int x, struct S *p)
+{
+  void *q[] = { &&l1, &&l2, &&l3, &&l3 };
+  if (x == 25)
+    {
+    l1:
+      x = foo (2);
+    }
+  else if (x == 42)
+    {
+    l2:
+      x = foo (foo (3));
+    }
+l3:
+  *p = bar (x);
+  if (x < 4)
+    goto *q[x & 3];
+}
+
+- User: GCC Commits | Time: 2024-03-12 10:35:59 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:ad860cc27b3312f9119c7fecb8638a7c1f6d77c9commitr14-9438-gad860cc27b3312f9119c7fecb8638a7c1f6d77c9Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Mar 12 11:34:50 2024 +0100
+
+    asan: Instrument <retval> stores in callees rather than callers [PR112709]
+    
+    asan currently instruments sincePR69276r6-6758fix calls which store
+    the return value into memory on the caller side, before the call it
+    verifies the memory is writable.
+    NowPR112709where we ICE on trying to instrument such calls made me
+    think about whether that is what we want to do.
+    
+    There are 3 different cases.
+    
+    One is when a function returns an aggregate which is passed e.g. in
+    registers, say like struct S { int a[4]; }; returning on x86_64.
+    That would be ideally instrumented in between the actual call and
+    storing of the aggregate into memory, but asan currently mostly
+    works as a GIMPLE pass and arranging for the instrumentation to happen
+    at that spot would be really hard.  We could diagnose after the call
+    but generally asan attempts to diagnose stuff before something is
+    overwritten rather than after, or keep the current behavior (that is
+    what this patch does, which has the disadvantage that it can complain
+    about UB even for functions which never return and so never actually store,
+    and doesn't check whether the memory wasn't e.g. poisoned during the call)
+    or could e.g. instrument both before and after the call (that would have
+    the disadvantage the current state has but at least would check post-factum
+    the store again afterwards).
+    
+    Another case is when a function returns an aggregate through a hidden
+    reference, struct T { int a[128]; }; on x86_64 or even the above struct S
+    on ia32 as example.  In the actual program such stores happen when storing
+    something to <retval> or its parts in the callee, because <retval> there
+    expands to *hidden_retval.  So, IMHO we should instrument those in the
+    callee rather than caller, that is where the writes are and we can do that
+    easily.  This is what the patch below does.
+    
+    And the last case is for builtins/internal functions.  Usually those don't
+    return aggregates, but in case they'd do and can be expanded inline, it is
+    better to instrument them in the caller (as before) rather than not
+    instrumenting the return stores at all.
+    
+    I had to tweak the expected output on thePR69276testcase, because
+    with the patch it keeps previous behavior on x86_64 (structure returned
+    in registers, stored in the caller, so reported as UB in A::A()),
+    while on i686 it changed the behavior and is reported as UB in the
+    vnull::operator vec which stores the structure, A::A() is then a frame
+    above it in the backtrace.
+    
+    2024-03-12  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/112709* asan.cc (has_stmt_been_instrumented_p): Don't instrument call
+            stores on the caller side unless it is a call to a builtin or
+            internal function or function doesn't return by hidden reference.
+            (maybe_instrument_call): Likewise.
+            (instrument_derefs): Instrument stores to RESULT_DECL if
+            returning by hidden reference.
+    
+            * gcc.dg/asan/pr112709-1.c: New test.
+            * g++.dg/asan/pr69276.C: Adjust expected output for some targets.
+
+- User: Jakub Jelinek | Time: 2024-03-12 13:22:35 UTC
+  Text: GCC 13.{1,2} has been released with this bug, so P2.
+
+- User: GCC Commits | Time: 2024-03-13 08:18:23 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:364c684c474841e3c9c04e025a5c1bca49705c86commitr14-9444-g364c684c474841e3c9c04e025a5c1bca49705c86Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Mar 13 09:16:45 2024 +0100
+
+    gimple-iterator, ubsan: Fix ICE during instrumentation of returns_twice calls [PR112709]
+    
+    ubsan, asan (bothPR112709) and _BitInt lowering (PR113466) want to
+    insert some instrumentation or adjustment statements before some statement.
+    This unfortunately creates invalid IL if inserting before a returns_twice
+    call, because we require that such calls are the first statement in a basic
+    block and that we have an edge from the .ABNORMAL_DISPATCHER block to
+    the block containing the returns_twice call (in addition to other edge(s)).
+    
+    The following patch adds helper functions for such insertions and uses it
+    for now in ubsan (I'll post a follow up which uses it in asan and will
+    work later on the _BitInt lowering PR).
+    
+    In particular, if the bb with returns_twice call at the start has just
+    2 edges, one EDGE_ABNORMAL from .ABNORMAL_DISPATCHER and another
+    (non-EDGE_ABNORMAL/EDGE_EH) from some other bb, it just inserts the
+    statement or sequence on that other edge.
+    If the bb has more predecessor edges or the one not from
+    .ABNORMAL_DISPATCHER is e.g. an EH edge (this latter case likely shouldn't
+    happen, one would need labels or something like that), the patch splits the
+    block with returns_twice call such that there is just one edge next to
+    .ABNORMAL_DISPATCHER edge and adjusts PHIs as needed to make it happen.
+    The functions also replace uses of PHIs from the returns_twice bb with
+    the corresponding PHI arguments, because otherwise it would be invalid IL.
+    
+    E.g. in ubsan/pr112709-2.c (qux) we have before the ubsan pass
+      <bb 10> :
+      # .MEM_5(ab) = PHI <.MEM_4(9), .MEM_25(ab)(11)>
+      # _7(ab) = PHI <_20(9), _8(ab)(11)>
+      # .MEM_21(ab) = VDEF <.MEM_5(ab)>
+      _22 = bar (*_7(ab));
+    where bar is returns_twice call and bb 11 has .ABNORMAL_DISPATCHER call,
+    this patch instruments it like:
+      <bb 9> :
+      # .MEM_4 = PHI <.MEM_17(ab)(4), .MEM_10(D)(5), .MEM_14(ab)(8)>
+      # DEBUG BEGIN_STMT
+      # VUSE <.MEM_4>
+      _20 = p;
+      # .MEM_27 = VDEF <.MEM_4>
+      .UBSAN_NULL (_20, 0B, 0);
+      # VUSE <.MEM_27>
+      _2 = __builtin_dynamic_object_size (_20, 0);
+      # .MEM_28 = VDEF <.MEM_27>
+      .UBSAN_OBJECT_SIZE (_20, 1024, _2, 0);
+    
+      <bb 10> :
+      # .MEM_5(ab) = PHI <.MEM_28(9), .MEM_25(ab)(11)>
+      # _7(ab) = PHI <_20(9), _8(ab)(11)>
+      # .MEM_21(ab) = VDEF <.MEM_5(ab)>
+      _22 = bar (*_7(ab));
+    The edge from .ABNORMAL_DISPATCHER is there just to represent the
+    returning for 2nd and later times, the instrumentation can't be
+    done at that point as there is no code executed during that point.
+    The ubsan/pr112709-1.c testcase includes non-virtual PHIs to cover
+    the handling of those as well.
+    
+    2024-03-13  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/112709* gimple-iterator.h (gsi_safe_insert_before,
+            gsi_safe_insert_seq_before): Declare.
+            * gimple-iterator.cc: Include gimplify.h.
+            (edge_before_returns_twice_call, adjust_before_returns_twice_call,
+            gsi_safe_insert_before, gsi_safe_insert_seq_before): New functions.
+            * ubsan.cc (instrument_mem_ref, instrument_pointer_overflow,
+            instrument_nonnull_arg, instrument_nonnull_return): Use
+            gsi_safe_insert_before instead of gsi_insert_before.
+            (maybe_instrument_pointer_overflow): Use force_gimple_operand,
+            gimple_seq_add_seq_without_update and gsi_safe_insert_seq_before
+            instead of force_gimple_operand_gsi.
+            (instrument_object_size): Likewise.  Use gsi_safe_insert_before
+            instead of gsi_insert_before.
+    
+            * gcc.dg/ubsan/pr112709-1.c: New test.
+            * gcc.dg/ubsan/pr112709-2.c: New test.
+
+- User: GCC Commits | Time: 2024-03-13 08:20:02 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:6586359e8e4c611dd96129b5d4f24023949ac3fccommitr14-9445-g6586359e8e4c611dd96129b5d4f24023949ac3fcAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Mar 13 09:19:05 2024 +0100
+
+    asan: Fix ICE during instrumentation of returns_twice calls [PR112709]
+    
+    The following patch on top of the previously posted ubsan/gimple-iterator
+    one handles asan the same.  While the case of returning by hidden reference
+    is handled differently because of the first recently posted asan patch,
+    this deals with instrumentation of the aggregates returned in registers
+    case as well as instrumentation of loads from aggregate memory in the
+    function arguments of returns_twice calls.
+    
+    2024-03-13  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/112709* asan.cc (maybe_create_ssa_name, maybe_cast_to_ptrmode,
+            build_check_stmt, maybe_instrument_call, asan_expand_mark_ifn): Use
+            gsi_safe_insert_before instead of gsi_insert_before.
+    
+            * gcc.dg/asan/pr112709-2.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-03-15 14:15:57 UTC
+  Text: Fixed on the trunk.
+
+- User: GCC Commits | Time: 2024-03-15 23:29:48 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:3d231faed146352543794bf9e9afbee2e6c76889commitr13-8453-g3d231faed146352543794bf9e9afbee2e6c76889Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Mar 13 09:16:45 2024 +0100
+
+    gimple-iterator, ubsan: Fix ICE during instrumentation of returns_twice calls [PR112709]
+    
+    ubsan, asan (bothPR112709) and _BitInt lowering (PR113466) want to
+    insert some instrumentation or adjustment statements before some statement.
+    This unfortunately creates invalid IL if inserting before a returns_twice
+    call, because we require that such calls are the first statement in a basic
+    block and that we have an edge from the .ABNORMAL_DISPATCHER block to
+    the block containing the returns_twice call (in addition to other edge(s)).
+    
+    The following patch adds helper functions for such insertions and uses it
+    for now in ubsan (I'll post a follow up which uses it in asan and will
+    work later on the _BitInt lowering PR).
+    
+    In particular, if the bb with returns_twice call at the start has just
+    2 edges, one EDGE_ABNORMAL from .ABNORMAL_DISPATCHER and another
+    (non-EDGE_ABNORMAL/EDGE_EH) from some other bb, it just inserts the
+    statement or sequence on that other edge.
+    If the bb has more predecessor edges or the one not from
+    .ABNORMAL_DISPATCHER is e.g. an EH edge (this latter case likely shouldn't
+    happen, one would need labels or something like that), the patch splits the
+    block with returns_twice call such that there is just one edge next to
+    .ABNORMAL_DISPATCHER edge and adjusts PHIs as needed to make it happen.
+    The functions also replace uses of PHIs from the returns_twice bb with
+    the corresponding PHI arguments, because otherwise it would be invalid IL.
+    
+    E.g. in ubsan/pr112709-2.c (qux) we have before the ubsan pass
+      <bb 10> :
+      # .MEM_5(ab) = PHI <.MEM_4(9), .MEM_25(ab)(11)>
+      # _7(ab) = PHI <_20(9), _8(ab)(11)>
+      # .MEM_21(ab) = VDEF <.MEM_5(ab)>
+      _22 = bar (*_7(ab));
+    where bar is returns_twice call and bb 11 has .ABNORMAL_DISPATCHER call,
+    this patch instruments it like:
+      <bb 9> :
+      # .MEM_4 = PHI <.MEM_17(ab)(4), .MEM_10(D)(5), .MEM_14(ab)(8)>
+      # DEBUG BEGIN_STMT
+      # VUSE <.MEM_4>
+      _20 = p;
+      # .MEM_27 = VDEF <.MEM_4>
+      .UBSAN_NULL (_20, 0B, 0);
+      # VUSE <.MEM_27>
+      _2 = __builtin_dynamic_object_size (_20, 0);
+      # .MEM_28 = VDEF <.MEM_27>
+      .UBSAN_OBJECT_SIZE (_20, 1024, _2, 0);
+    
+      <bb 10> :
+      # .MEM_5(ab) = PHI <.MEM_28(9), .MEM_25(ab)(11)>
+      # _7(ab) = PHI <_20(9), _8(ab)(11)>
+      # .MEM_21(ab) = VDEF <.MEM_5(ab)>
+      _22 = bar (*_7(ab));
+    The edge from .ABNORMAL_DISPATCHER is there just to represent the
+    returning for 2nd and later times, the instrumentation can't be
+    done at that point as there is no code executed during that point.
+    The ubsan/pr112709-1.c testcase includes non-virtual PHIs to cover
+    the handling of those as well.
+    
+    2024-03-13  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/112709* gimple-iterator.h (gsi_safe_insert_before,
+            gsi_safe_insert_seq_before): Declare.
+            * gimple-iterator.cc: Include gimplify.h.
+            (edge_before_returns_twice_call, adjust_before_returns_twice_call,
+            gsi_safe_insert_before, gsi_safe_insert_seq_before): New functions.
+            * ubsan.cc (instrument_mem_ref, instrument_pointer_overflow,
+            instrument_nonnull_arg, instrument_nonnull_return): Use
+            gsi_safe_insert_before instead of gsi_insert_before.
+            (maybe_instrument_pointer_overflow): Use force_gimple_operand,
+            gimple_seq_add_seq_without_update and gsi_safe_insert_seq_before
+            instead of force_gimple_operand_gsi.
+            (instrument_object_size): Likewise.  Use gsi_safe_insert_before
+            instead of gsi_insert_before.
+    
+            * gcc.dg/ubsan/pr112709-1.c: New test.
+            * gcc.dg/ubsan/pr112709-2.c: New test.
+    
+    (cherry picked from commit 364c684c474841e3c9c04e025a5c1bca49705c86)
+
+- User: GCC Commits | Time: 2024-03-15 23:29:55 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:847391913443069358986b398c2f86dac906d742commitr13-8454-g847391913443069358986b398c2f86dac906d742Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Mar 13 09:19:05 2024 +0100
+
+    asan: Fix ICE during instrumentation of returns_twice calls [PR112709]
+    
+    The following patch on top of the previously posted ubsan/gimple-iterator
+    one handles asan the same.  While the case of returning by hidden reference
+    is handled differently because of the first recently posted asan patch,
+    this deals with instrumentation of the aggregates returned in registers
+    case as well as instrumentation of loads from aggregate memory in the
+    function arguments of returns_twice calls.
+    
+    2024-03-13  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/112709* asan.cc (maybe_create_ssa_name, maybe_cast_to_ptrmode,
+            build_check_stmt, maybe_instrument_call, asan_expand_mark_ifn): Use
+            gsi_safe_insert_before instead of gsi_insert_before.
+    
+            * gcc.dg/asan/pr112709-2.c: New test.
+    
+    (cherry picked from commit 6586359e8e4c611dd96129b5d4f24023949ac3fc)
+
+- User: Jakub Jelinek | Time: 2024-03-18 14:42:42 UTC
+  Text: Fixed for 13.3+ too.
+

@@ -1,0 +1,126 @@
+Bug Summary: [14 Regression] ICE in decide_candidate_validity since g:53dddbfeb213ac4ec39f550aa81eaa4264375d2c
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Peter Waller | Time: 2023-05-23 08:28:06 UTC
+  Text: The following reproducer crashes after 53dddbfeb213ac4ec39f550aa81eaa4264375d2c (Use correct CFG orders for DF worklist processing, 21 April 2023) and not on the parent commit, it is still broken up to at least a8900fe4812f6b77d1349308bb4de08f7c130225 (May 22, 1422 UTC):
+
+aarch64-unknown-gnu-gcc -O3 -S -o - -march=armv9-a -x c - <<EOF
+a;
+*b;
+c(int *d) { *d = a; }
+e(d, f) {
+  if (d <= 1)
+    return;
+  int g = d / 2;
+  for (int h = 0; h < g; h++)
+    if (f == b > b[h])
+      c(&b[h]);
+  e(g);
+  e(g, f);
+}
+EOF
+
+It produces the following output:
+
+during RTL pass: early_remat
+<stdin>:13:1: internal compiler error: in decide_candidate_validity, at early-remat.cc:1521
+0x1d87b47 diagnostic_impl(rich_location*, diagnostic_metadata const*, int, char const*, __va_list_tag (*) [1], diagnostic_t)
+        ???:0
+0x1d88997 internal_error(char const*, ...)
+        ???:0
+0x8f39f9 fancy_abort(char const*, int, char const*)
+        ???:0
+0x8b670d (anonymous namespace)::pass_early_remat::execute(function*) [clone .cold]
+        ???:0
+
+- User: N/A | Time: 2023-05-23 08:41:54 UTC
+  Text: Confirmed. A more cleaned up testcase:
+int a;
+int *b;
+void
+c (int *d) { *d = a; }
+
+int
+e(int d, int f) {
+  if (d <= 1)
+    return 1;
+  int g = d / 2;
+  for (int h = 0; h < g; h++)
+    if (f == (long int)b > b[h])
+      c(&b[h]);
+  e(g, f);
+  e(g, f);
+}
+
+- User: Tamar Christina | Time: 2023-05-23 08:44:15 UTC
+  Text: confirmed, started withg:53dddbfeb213ac4ec39f550aa81eaa4264375d2c
+
+- User: Richard Biener | Time: 2023-05-23 15:52:59 UTC
+  Text: If that makes a difference then it should be because the compute_rd () dataflow computes something different.  The CFG is quite regular as well so I guess we now hit a latent issue present before but not exposed with the other iteration order (but the dataflow solution shouldn't depend on the iteration order).
+
+Somebody familiar with the pass needs to sit down and analyze what goes wrong.
+
+- User: Richard Sandiford | Time: 2023-05-23 19:13:17 UTC
+  Text: Guess that makes it mine. :)  It's been a few years since I wrote
+this code, but I vaguely remember hitting the problem that the
+DF walk orders weren't the “natural” ones, and having to work
+around it.
+
+The code iterates backwards over what was the DF_BACKWARD postorder,
+which I think was the workaround.  Now that DF_BACKWARD (correctly)
+gives an RPO over a backward traversal, and DF_FORWARD is a true
+forward RPO, the fix will probably be to switch from using DF_BACKWARD
+to DF_FORWARD.
+
+- User: GCC Commits | Time: 2023-05-24 08:53:24 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:ee2a8b373a88bae4c533aa68bed56bf01afea0e2commitr14-1157-gee2a8b373a88bae4c533aa68bed56bf01afea0e2Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Wed May 24 09:53:12 2023 +0100
+
+    early-remat: Resync with new DF postorders [PR109940]
+    
+    When I wrote early-remat, the DF_FORWARD block order was a postorder
+    of a reverse/backward walk (i.e. of the inverted cfg), rather than a
+    reverse postorder of a forward walk.  A postorder of a backward walk
+    lacked the important property that dominators come before the blocks
+    they dominate; instead it ensures that postdominators come after
+    the blocks that they postdominate.
+    
+    The DF_BACKWARD block order was similarly a postorder of a forward
+    walk.  Since early-remat wanted a standard postorder and reverse
+    postorder with normal dominator properties, it used the DF_BACKWARD
+    order instead of the DF_FORWARD order.g:53dddbfeb213ac4ec39ffixed the DF orders so that DF_FORWARD was
+    an RPO of a forward walk and so that DF_BACKWARD was an RPO of a
+    backward walk.  This meant that iterating backwards over the
+    DF_BACKWARD order had the exact problem that the original DF_FORWARD
+    order had, triggering a flurry of ICEs for SVE.
+    
+    This fixes the build with SVE enabled.  It also fixes an ICE
+    in g++.target/aarch64/sve/pr99766.C with normal builds.  I've
+    included the test from the PR as well, for extra coverage.
+    
+    gcc/PR rtl-optimization/109940* early-remat.cc (postorder_index): Rename to...
+            (rpo_index): ...this.
+            (compare_candidates): Sort by decreasing rpo_index rather than
+            increasing postorder_index.
+            (early_remat::sort_candidates): Calculate the forward RPO from
+            DF_FORWARD.
+            (early_remat::local_phase): Follow forward RPO using DF_FORWARD,
+            rather than DF_BACKWARD in reverse.
+    
+    gcc/testsuite/
+            * gcc.dg/torture/pr109940.c: New test.
+
+- User: Richard Sandiford | Time: 2023-05-24 08:56:06 UTC
+  Text: Fixed
+
+- User: Peter Waller | Time: 2023-05-24 10:58:59 UTC
+  Text: I can confirm that the original (not reduced) program no longer hits an ICE with 
+ee2a8b373a88bae4c533aa68bed56bf01afea0e2 (but does with the parent commit). Thanks.
+

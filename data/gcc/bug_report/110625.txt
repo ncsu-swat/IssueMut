@@ -1,0 +1,444 @@
+Bug Summary: [14 Regression][AArch64] Vect: SLP fails to vectorize a loop as the reduction_latency calculated by new costs is too large
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Hao Liu | Time: 2023-07-11 09:15:52 UTC
+  Text: This problem causes a performance regression in SPEC2017 538.imagick.  For the following simple case (modified frompr96208):
+
+    typedef struct {
+        unsigned short m1, m2, m3, m4;
+    } the_struct_t;
+    typedef struct {
+        double m1, m2, m3, m4, m5;
+    } the_struct2_t;
+
+    double bar1 (the_struct2_t*);
+
+    double foo (double* k, unsigned int n, the_struct_t* the_struct) {
+        unsigned int u;
+        the_struct2_t result;
+        for (u=0; u < n; u++, k--) {
+            result.m1 += (*k)*the_struct[u].m1;
+            result.m2 += (*k)*the_struct[u].m2;
+            result.m3 += (*k)*the_struct[u].m3;
+            result.m4 += (*k)*the_struct[u].m4;
+        }
+        return bar1 (&result);
+    }
+
+
+Compile it with "-Ofast -S -mcpu=neoverse-n2 -fdump-tree-vect-details -fno-tree-slp-vectorize". SLP fails to vectorize the loop as the vector body cost is increased due to the too large "reduction latency".  See the dump of vect pass:
+
+    Original vector body cost = 51
+    Scalar issue estimate:
+      ...
+      reduction latency = 2
+      estimated min cycles per iteration = 2.000000
+      estimated cycles per vector iteration (for VF 2) = 4.000000
+    Vector issue estimate:
+      ...
+      reduction latency = 8      <-- Too large
+      estimated min cycles per iteration = 8.000000
+    Increasing body cost to 102 because scalar code would issue more quickly
+    Cost model analysis: 
+    Vector inside of loop cost: 102
+    ...
+    Scalar iteration cost: 44
+    ...
+    missed:  cost model: the vector iteration cost = 102 divided by the scalar iteration cost = 44 is greater or equal to the vectorization factor = 2.
+    missed:  not vectorized: vectorization not profitable.
+
+
+SLP will success with "-mcpu=neoverse-n1", as N1 doesn't use the new vector costs and vector body cost is not increased. The "reduction latency" is calculated in aarch64.cc count_ops():
+      /* ??? Ideally we'd do COUNT reductions in parallel, but unfortunately
+	 that's not yet the case.  */
+      ops->reduction_latency = MAX (ops->reduction_latency, base * count);
+
+For this case, the "base" is 2 and "count" is 4 .  To my understanding, the "count" of SLP means the number of scalar stmts (i.e. results.m1 +=, ...) in a permutation group to be merged into a vector stmt.  It seems not reasonable to multiply cost by "count" (maybe it doesn't consider about the SLP situation).  So, I'm thinking to calcualte it differently for SLP situation, e.g.
+
+      unsigned int latency = PURE_SLP_STMT(stmt_info) ? base : base * count;
+      ops->reduction_latency = MAX (ops->reduction_latency, latency);
+
+Is this reasonable?
+
+- User: Richard Biener | Time: 2023-07-11 10:41:44 UTC
+  Text: Well, I think count is handled correctly even for SLP.  Given we accumulate
+'short' to 'double' we likely perform 'count' adds to the m's here and those
+are chained in a simple way.  We specifically avoid creating more
+reduction variables because of register pressure issues with and without SLP
+if possible.  Note when you have for example three scalar reductions we will
+up the number of IVs to use with SLP, so using 'count' isn't always 100%
+accurate but it the case of the testcase it should be.
+
+But I'm not sure what "reduction-latency" tries to measure.
+
+- User: Hao Liu | Time: 2023-07-12 00:58:58 UTC
+  Text: To my understanding, "reduction latency" is the least number of cycles needed to do the reduction calculation for 1 iteration of loop.  It is calcualted by the extra instruction issue-info of the new cost models in AArch64 backend.
+
+Usually, the reduction latency of vectorized loop should be smaller than the scalar loop.  If the latency of vectorized loop is larger than the scalar loop, it thinks maybe not beneficial to do vectorization, so it increases the vect-body costs by the scale of vect_reduct_latency/scalar_reduct_latency in the above case.
+
+For the above case, it thinks the scalar loop needs 4 cycles (2*VF=4) to calculate "results.m += rhs", while the vectorized loop needs 8 cycles (2*count=8).  As a result, the vect-body costs are doubled from originial value of 51 to 102.  It seems not true for the vectorized loop, which should only need 2 cycles to calculate the SIMD version of "results.m += rhs".
+
+- User: Hao Liu | Time: 2023-07-14 08:58:33 UTC
+  Text: Sorry, it seems this case can not be fixed by only adjusting the calculation of "reduction latency".  Even it becomes smaller, the case still can not be vectorized as the "general operations" count is still too large:
+
+    Original vector body cost = 51
+    Scalar issue estimate:
+      ...
+      general operations = 8
+      reduction latency = 2
+      estimated min cycles per iteration = 2.000000
+      estimated cycles per vector iteration (for VF 2) = 4.000000
+    Vector issue estimate:
+      ...
+      general operations = 15   <-- Too large
+      reduction latency = 2     <-- from 8 to 2
+      estimated min cycles per iteration = 7.500000
+    Increasing body cost to 96 because scalar code would issue more quickly
+    ...
+    missed:  cost model: the vector iteration cost = 96 divided by the scalar iteration cost = 44 is greater or equal to the vectorization factor = 2.
+    missed:  not vectorized: vectorization not profitable.
+
+- User: Richard Sandiford | Time: 2023-07-18 10:41:11 UTC
+  Text: Sorry, didn't see this PR until now.
+
+On:>       general operations = 15   <-- Too largeAre you sure this is too large?  The vector code seems to be:
+
+        ldr     q31, [x3], 16
+        ldr     q29, [x4], -16
+        rev64   v31.8h, v31.8h
+        uxtl    v30.4s, v31.4h
+        uxtl2   v31.4s, v31.8h
+        sxtl    v27.2d, v30.2s
+        sxtl    v28.2d, v31.2s
+        sxtl2   v30.2d, v30.4s
+        sxtl2   v31.2d, v31.4s
+        scvtf   v27.2d, v27.2d
+        scvtf   v28.2d, v28.2d
+        scvtf   v30.2d, v30.2d
+        scvtf   v31.2d, v31.2d
+        fmla    v26.2d, v27.2d, v29.d[1]
+        fmla    v24.2d, v30.2d, v29.d[1]
+        fmla    v23.2d, v28.2d, v29.d[0]
+        fmla    v25.2d, v31.2d, v29.d[0]
+
+Discounting the loads, we do have 15 general operations.
+
+On the reduction latency, the:>      /* ??? Ideally we'd do COUNT reductions in parallel, but unfortunately
+>	 that's not yet the case.  */is referring to the single_defuse_cycle code in vectorizable_reduction.  That's always seemed like a misfeature to me, since it serialises a multi-vector reduction through a single accumulator.  I guess it's finally time to opt out of that for aarch64.
+
+If we did opt out, then removing the “* count” should be correct for all cases.
+
+- User: Richard Sandiford | Time: 2023-07-18 12:03:27 UTC
+  Text: Taking for the single_defuse_cycle part.
+
+- User: Hao Liu | Time: 2023-07-19 02:57:43 UTC
+  Text: Thanks for the confirmation about the reduction latency.  I'll create a simple patch to fix this.> Discounting the loads, we do have 15 general operations.That's true, and there are indeed 8 general operations for scalar loop.  As the count_ops() is accurate, it seems maybe the Cost of Vector Body is too large (Vector inside of loop cost: 51):
+
+    *k_48 4 times vec_perm costs 12 in body
+    *k_48 1 times unaligned_load (misalign -1) costs 4 in body
+    _5->m1 1 times vec_perm costs 3 in body
+    _5->m4 1 times unaligned_load (misalign -1) costs 4 in body
+    (int) _24 2 times vec_promote_demote costs 4 in body
+    (double) _25 4 times vec_promote_demote costs 8 in body
+    _2 * _26 4 times vector_stmt costs 8 in body
+
+If it is small enough, even the vect-body cost is increased according to the issue-info, SLP is still profitable.  I'm not quite familiar with this part and it may affect all aarch64 targets, so I think it's hard to fix by me.  It would be great if you will look at how to fix this.
+
+- User: Richard Sandiford | Time: 2023-07-19 08:55:51 UTC
+  Text: The current issue rate framework was originally written for Neoverse V1 and Neoverse V2.  For those cores, it wasn't necessary to make a distinction between scalar integer operations and scalar FP operations: the integer throughput and FP throughput were close enough for the difference not to matter.
+
+I think the problem is that the difference between integer throughput and FP throughput does matter for Neoverse N2.  E.g. integer additions have a throughput of 4 a cycle whereas FP additions have a throughput of 2 a cycle.
+
+Currently the Neoverse N2 model uses a throughput of 4 “general ops” for scalar code.  However, when the loop consists entirely of loads, stores and FP operations, the limit should instead be 2.
+
+- User: Hao Liu | Time: 2023-07-19 09:36:07 UTC
+  Text: Thanks for the explanation. Understood the root cause and that's reasonable.
+
+So, do you have plan to fix this (i.e. to separate the FP and integer types)?
+
+I want to enable the new costs for Ampere1, which is similar to N2's issue-info.  If this problem won't be fixed in the near future, I think a workaround is probably to adjust the general_ops in the issue_info.  E.g. set the general_ops of both scalar and vector to 3 instead of current values of "4 and 2".
+
+- User: Richard Sandiford | Time: 2023-07-28 16:50:48 UTC
+  Text: Createdattachment 55653[details]Candidate patch (part 1)
+
+- User: Richard Sandiford | Time: 2023-07-28 16:53:32 UTC
+  Text: Createdattachment 55654[details]Candidate patch (part 2)
+
+Sorry for the delay.  I'm testing the attached two patches to fix the scalar FP issue rate calculation.  It's enough to make us vectorise the testcase, but we (pointlessly) unroll two times without the fix for the latency calculation.  I'll review the latency patch soon.
+
+- User: Hao Liu | Time: 2023-07-31 02:45:22 UTC
+  Text: Hi Richard,
+
+That's great! Glad to hear the status. Waiting for the patches to be ready and upstreamed to trunk.
+
+- User: GCC Commits | Time: 2023-07-31 12:56:05 UTC
+  Text: The master branch has been updated by Hao Liu <hliu@gcc.gnu.org>:https://gcc.gnu.org/g:bf67bf4880ce5be0b6e48c7c35828528b7be12edcommitr14-2877-gbf67bf4880ce5be0b6e48c7c35828528b7be12edAuthor: Hao Liu <hliu@os.amperecomputing.com>
+Date:   Mon Jul 31 20:53:37 2023 +0800
+
+    AArch64: Do not increase the vect reduction latency by multiplying count [PR110625]
+    
+    The new costs should only count reduction latency by multiplying count for
+    single_defuse_cycle.  For other situations, this will increase the reduction
+    latency a lot and miss vectorization opportunities.
+    
+    Tested on aarch64-linux-gnu.
+    
+    gcc/ChangeLog:PR target/110625* config/aarch64/aarch64.cc (count_ops): Only '* count' for
+            single_defuse_cycle while counting reduction_latency.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/pr110625_1.c: New testcase.
+            * gcc.target/aarch64/pr110625_2.c: New testcase.
+
+- User: Tamar Christina | Time: 2023-08-01 09:09:33 UTC
+  Text: Hi,
+
+This patch is causing several ICEs:
+
+For instance in x264,
+
+during GIMPLE pass: vect
+x264_src/common/pixel.c: In function 'x264_pixel_satd_8x4.constprop':
+x264_src/common/pixel.c:234:21: internal compiler error: in info_for_reduction, at tree-vect-loop.cc:5473
+  234 | static NOINLINE int x264_pixel_satd_8x4( uint8_t *pix1, int i_pix1, uint8_t *pix2, int i_pix2 )
+      |                     ^
+0xe45e23 info_for_reduction(vec_info*, _stmt_vec_info*)
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-loop.cc:5473
+0xf1e317 aarch64_force_single_cycle
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/config/aarch64/aarch64.cc:16782
+0xf1e317 aarch64_vector_costs::count_ops(unsigned int, vect_cost_for_stmt, _stmt_vec_info*, aarch64_vec_op_count*)
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/config/aarch64/aarch64.cc:16807
+0xf31fbb aarch64_vector_costs::add_stmt_cost(int, vect_cost_for_stmt, _stmt_vec_info*, _slp_tree*, tree_node*, int, vect_cost_model_location)
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/config/aarch64/aarch64.cc:17074
+0xe59edb add_stmt_cost(vector_costs*, int, vect_cost_for_stmt, _stmt_vec_info*, _slp_tree*, tree_node*, int, vect_cost_model_location)
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vectorizer.h:1823
+0xe59edb add_stmt_costs(vector_costs*, vec<stmt_info_for_cost, va_heap, vl_ptr>*)
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vectorizer.h:1870
+0xe59edb vect_compute_single_scalar_iteration_cost
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-loop.cc:1624
+0xe59edb vect_analyze_loop_2
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-loop.cc:2710
+0xe5bb07 vect_analyze_loop_1
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-loop.cc:3329
+0xe5c1cb vect_analyze_loop(loop*, vec_info_shared*)
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-loop.cc:3483
+0xe90797 try_vectorize_loop_1
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vectorizer.cc:1064
+0xe90797 try_vectorize_loop
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vectorizer.cc:1180
+0xe90cb3 execute
+	/opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vectorizer.cc:1296
+
+This seems to be caused because in aarch64_force_single_cycle is unconditionally calling info_for_reduction without checking to see if this stmt is actually a reduction.
+
+You'll want to check STMT_VINFO_REDUC_DEF or STMT_VINFO_DEF_TYPE before calling this.
+
+- User: Tamar Christina | Time: 2023-08-01 09:19:16 UTC
+  Text: Or rather, info_for_reduction looks at the original statement if it's a pattern, whereas vect_is_reduction only looks at the direct statement.
+
+You'll probably want to check vect_orig_stmt if using info_for_reduction.
+
+- User: Hao Liu | Time: 2023-08-01 09:45:29 UTC
+  Text: Ah, I see.
+
+I've sent out a quick fix patch for code review.  I'll investigate more about this and find out the root cause.
+
+- User: Tamar Christina | Time: 2023-08-01 09:49:26 UTC
+  Text: (In reply to Hao Liu fromcomment #15)> Ah, I see.
+> 
+> I've sent out a quick fix patch for code review.  I'll investigate more
+> about this and find out the root cause.Thanks! I can reduce a testcase for you if you want :)
+
+- User: Hao Liu | Time: 2023-08-01 09:50:51 UTC
+  Text: > Thanks! I can reduce a testcase for you if you want :)That will be very helpful. Thanks.
+
+- User: Tamar Christina | Time: 2023-08-01 13:49:19 UTC
+  Text: Hi, here's the reduced case:
+
+----> cat analyse.idouble x264_weights_analyse___trans_tmp_1;
+float x264_weights_analyse_ref_mean;
+x264_weights_analyse() {
+  x264_weights_analyse___trans_tmp_1 = floor(x264_weights_analyse_ref_mean);
+}
+
+----> cat pixel.iunsigned x264_pixel_satd_8x4___trans_tmp_1;
+x264_pixel_satd_8x4_sum;
+x264_pixel_satd_8x4() {
+  for (int i; i; i++) {
+    x264_pixel_satd_8x4___trans_tmp_1 = i;
+    x264_pixel_satd_8x4_sum += x264_pixel_satd_8x4___trans_tmp_1;
+  }
+  return (unsigned)x264_pixel_satd_8x4_sum >> 1;
+}
+
+---
+
+reproduce with:
+
+gcc -c -o pixel.o pixel.i -mcpu=neoverse-v1 -flto=auto -Ofast -w
+gcc -c -o analyse.o analyse.i -mcpu=neoverse-v1 -flto=auto -Ofast -w
+gcc -flto=auto -Ofast pixel.o analyse.o -lm -o x264_r -r -w
+
+- User: Hao Liu | Time: 2023-08-02 03:49:02 UTC
+  Text: > Hi, here's the reduced caseHi Tarmar, thanks for the case.  I've modified it to reproduce the ICE without LTO and have updated the patch.
+
+- User: GCC Commits | Time: 2023-08-04 02:34:55 UTC
+  Text: The master branch has been updated by Hao Liu <hliu@gcc.gnu.org>:https://gcc.gnu.org/g:4d8b5563179f3a7ca268b64f71731a4878635497commitr14-2973-g4d8b5563179f3a7ca268b64f71731a4878635497Author: Hao Liu <hliu@os.amperecomputing.com>
+Date:   Fri Aug 4 10:32:52 2023 +0800
+
+    AArch64: Avoid the ICE on empty reduction definition in info_for_reduction [PR110625]
+    
+    Fix the assertion failure on empty reduction define in info_for_reduction.
+    Even a stmt is live, it may still have empty reduction define.  Check the
+    reduction definition instead of live info before calling info_for_reduction.
+    
+    gcc/ChangeLog:PR target/110625* config/aarch64/aarch64.cc (aarch64_force_single_cycle): check
+            STMT_VINFO_REDUC_DEF to avoid failures in info_for_reduction.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/pr110625_3.c: New testcase.
+
+- User: Tamar Christina | Time: 2023-12-08 10:20:56 UTC
+  Text: It looks like this is a GCC 14 regression, GCC 13 is 16% faster.
+
+- User: Tamar Christina | Time: 2023-12-12 16:26:06 UTC
+  Text: Bisected the remaining regression to:
+
+dd86a5a69cbda40cf76388a65d3317c91cb2b501 is the first bad commit
+commit dd86a5a69cbda40cf76388a65d3317c91cb2b501
+Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Jun 22 11:40:46 2023 +0200
+
+    tree-optimization/96208 - SLP of non-grouped loads
+
+    The following extends SLP discovery to handle non-grouped loads
+    in loop vectorization in the case the same load appears in all
+    lanes.
+
+It looks like our cost model doesn't handle this change correctly,
+so we over-vectorize MorphologyApply.constprop.0.  The resulting
+code is significantly slower due to all the lane shufflings to
+prepare the vector.
+
+Reducing a testcase...
+
+- User: Tamar Christina | Time: 2023-12-26 14:55:52 UTC
+  Text: Found the costing bug and have a patch undergoing testing.
+
+Will post tomorrow.  Sorry for the delay in fixing it.
+
+- User: GCC Commits | Time: 2023-12-29 15:59:38 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:984bdeaa39b6417b11736b2c167ef82119e272dccommitr14-6865-g984bdeaa39b6417b11736b2c167ef82119e272dcAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Fri Dec 29 15:58:29 2023 +0000
+
+    AArch64: Update costing for vector conversions [PR110625]
+    
+    In gimple the operation
+    
+    short _8;
+    double _9;
+    _9 = (double) _8;
+    
+    denotes two operations on AArch64.  First we have to widen from short to
+    long and then convert this integer to a double.
+    
+    Currently however we only count the widen/truncate operations:
+    
+    (double) _5 6 times vec_promote_demote costs 12 in body
+    (double) _5 12 times vec_promote_demote costs 24 in body
+    
+    but not the actual conversion operation, which needs an additional 12
+    instructions in the attached testcase.   Without this the attached testcase ends
+    up incorrectly thinking that it's beneficial to vectorize the loop at a very
+    high VF = 8 (4x unrolled).
+    
+    Because we can't change the mid-end to account for this the costing code in the
+    backend now keeps track of whether the previous operation was a
+    promotion/demotion and ajdusts the expected number of instructions to:
+    
+    1. If it's the first FLOAT_EXPR and the precision of the lhs and rhs are
+       different, double it, since we need to convert and promote.
+    2. If it's the previous operation was a demonition/promotion then reduce the
+       cost of the current operation by the amount we added extra in the last.
+    
+    with the patch we get:
+    
+    (double) _5 6 times vec_promote_demote costs 24 in body
+    (double) _5 12 times vec_promote_demote costs 36 in body
+    
+    which correctly accounts for 30 operations.
+    
+    This fixes the 16% regression in imagick in SPECCPU 2017 reported on Neoverse N2
+    and using the new generic Armv9-a cost model.
+    
+    gcc/ChangeLog:PR target/110625* config/aarch64/aarch64.cc (aarch64_vector_costs::add_stmt_cost):
+            Adjust throughput and latency calculations for vector conversions.
+            (class aarch64_vector_costs): Add m_num_last_promote_demote.
+    
+    gcc/testsuite/ChangeLog:PR target/110625* gcc.target/aarch64/pr110625_4.c: New test.
+            * gcc.target/aarch64/sve/unpack_fcvt_signed_1.c: Add
+            --param aarch64-sve-compare-costs=0.
+            * gcc.target/aarch64/sve/unpack_fcvt_unsigned_1.c: Likewise
+
+- User: Tamar Christina | Time: 2023-12-29 16:16:00 UTC
+  Text: (In reply to Hao Liu fromcomment #0)> This problem causes a performance regression in SPEC2017 538.imagick.  For
+> the following simple case (modified frompr96208):
+> 
+>     typedef struct {
+>         unsigned short m1, m2, m3, m4;
+>     } the_struct_t;
+>     typedef struct {
+>         double m1, m2, m3, m4, m5;
+>     } the_struct2_t;
+> 
+>     double bar1 (the_struct2_t*);
+> 
+>     double foo (double* k, unsigned int n, the_struct_t* the_struct) {
+>         unsigned int u;
+>         the_struct2_t result;
+>         for (u=0; u < n; u++, k--) {
+>             result.m1 += (*k)*the_struct[u].m1;
+>             result.m2 += (*k)*the_struct[u].m2;
+>             result.m3 += (*k)*the_struct[u].m3;
+>             result.m4 += (*k)*the_struct[u].m4;
+>         }
+>         return bar1 (&result);
+>     }
+>In the context of this report the regression should be fixed, however we still don't vectorize this loop.  We ran this and other cases comparing scalar and vector versions of this loop and it looks like specifically Neoverse N2 does much better using the scalar version here.  So it looks like the cost model is doing the right thing here for the current codegen of the function.
+
+Note that the vector version:
+
+        ldr     q31, [x3], 16
+        ldr     q29, [x4], -16
+        rev64   v31.8h, v31.8h
+        uxtl    v30.4s, v31.4h
+        uxtl2   v31.4s, v31.8h
+        sxtl    v27.2d, v30.2s
+        sxtl    v28.2d, v31.2s
+        sxtl2   v30.2d, v30.4s
+        sxtl2   v31.2d, v31.4s
+        scvtf   v27.2d, v27.2d
+        scvtf   v28.2d, v28.2d
+        scvtf   v30.2d, v30.2d
+        scvtf   v31.2d, v31.2d
+        fmla    v26.2d, v27.2d, v29.d[1]
+        fmla    v24.2d, v30.2d, v29.d[1]
+        fmla    v23.2d, v28.2d, v29.d[0]
+        fmla    v25.2d, v31.2d, v29.d[0]
+
+Is still pretty inefficient due to all the extends.  If we generate better code here this may tip the scale back to vector.  But for now, the patch should fix the regression.
+
+- User: Hao Liu | Time: 2023-12-30 08:34:11 UTC
+  Text: But for now, the patch should fix the regression.(In reply to Tamar Christina fromcomment #25)> Is still pretty inefficient due to all the extends.  If we generate better
+> code here this may tip the scale back to vector.  But for now, the patch
+> should fix the regression.That's great. Thanks a lot!
+

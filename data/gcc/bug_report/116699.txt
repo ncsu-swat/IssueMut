@@ -1,0 +1,106 @@
+Bug Summary: factor_out_conditional_operation does not ignore PREDICT/NOP sometimes
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2024-09-13 00:11:18 UTC
+  Text: Take:
+```
+short f(int a, int b, int c)
+{
+  if (b)  return (c > a ? c : a);
+  return 0;
+}
+```
+
+The factoring out the convert/cast happens only at phiopt2 because in phiopt1 we have:
+```
+  _1 = MAX_EXPR <a_5(D), c_6(D)>;
+  _7 = (short intD.17) _1;
+  // predicted unlikely by early return (on trees) predictor.
+;;    succ:       4 (FALLTHRU,EXECUTABLE) /app/example.cpp:3:29
+
+```
+
+The code right now does:
+	  gsi = gsi_for_stmt (arg0_def_stmt);
+	  gsi_next_nondebug (&gsi);
+	  if (!gsi_end_p (gsi))
+	    return NULL;
+
+Without considering GIMPLE_NOP/GIMPLE_PREDICT between the statement and the end.
+
+There needs to be a small loop added after the gsi_next_nondebug but before the gsi_end_p:
+  /* Skip nops and predicates. */
+  while (!gsi_end_p (gsi)
+	 && (gimple_code (gsi_stmt (gsi)) == GIMPLE_NOP
+	     || gimple_code (gsi_stmt (gsi)) == GIMPLE_PREDICT))
+    gsi_next_nondebug (&gsi);
+
+- User: Andrew Pinski | Time: 2024-09-13 00:12:32 UTC
+  Text: Mine.
+
+Noticed when moving this heurstic to a common location when adding support for multiple PHIs for factoring out (PR 112418).
+
+- User: Andrew Pinski | Time: 2024-09-13 04:36:37 UTC
+  Text: here is a better example where we have a secondary phiopt happening:
+```
+short f(int a, int b, int c)
+{
+  int t1 = 4;
+  if (c < t1)  return (c > -1 ? c : -1);
+  return t1;
+}
+
+
+short f1(int a, int b, int c)
+{
+  int t1 = 4;
+  short t = t1;
+  if (c < t1)  t = (c > -1 ? c : -1);
+  return t;
+}
+```
+
+f1 gets the factor while f does not because there is a GIMPLE_PREDICT there.
+
+- User: Andrew Pinski | Time: 2024-09-13 04:58:20 UTC
+  Text: .
+
+- User: Andrew Pinski | Time: 2024-09-13 18:08:54 UTC
+  Text: Createdattachment 59106[details]patch which I am testing
+
+- User: GCC Commits | Time: 2024-09-15 05:53:56 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:6e4244e8ceac939fe8a24470b4ff31c82e8bff21commitr15-3648-g6e4244e8ceac939fe8a24470b4ff31c82e8bff21Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Fri Sep 13 10:47:29 2024 -0700
+
+    phi-opt: Improve heuristics for factoring out with constant (again) [PR116699]
+    
+    The heuristics for factoring out with a constant checks that the assignment statement
+    is the last statement of the basic block but sometimes there is a predicate or a nop statement
+    after the assignment. Rejecting this case does not make sense since both predicates and nop
+    statements are removed and don't contribute any instructions. So we should skip over them
+    when checking if the assignment statement was the last statement in the basic block.
+    
+    phi-opt-factor-1.c's f0 is such an example where it should catch it at phiopt1 (before predicates are removed)
+    and should happen in a similar way as f1 (which uses a temporary variable rather than return).
+    
+    Bootstrapped and tested on x86_64-linux-gnu.PR tree-optimization/116699gcc/ChangeLog:
+    
+            * tree-ssa-phiopt.cc (factor_out_conditional_operation): Skip over nop/predicates
+            for seeing the assignment is the last statement.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/phi-opt-factor-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-09-15 05:54:14 UTC
+  Text: Fixed.
+

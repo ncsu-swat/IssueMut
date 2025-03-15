@@ -1,0 +1,104 @@
+Bug Summary: ICE: in min_value, at wide-int.cc:344 with _BitInt() bitfield arithmetics
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-03-20 12:06:43 UTC
+  Text: Createdattachment 57746[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O testcase.c 
+during GIMPLE pass: dom
+testcase.c: In function 'foo':
+testcase.c:6:1: internal compiler error: in min_value, at wide-int.cc:344
+    6 | foo ()
+      | ^~~
+0x8b5cef wi::min_value(unsigned int, signop)
+        /repo/gcc-trunk/gcc/wide-int.cc:344
+0xe905c0 irange::set_varying(tree_node*)
+        /repo/gcc-trunk/gcc/value-range.h:1084
+0x26a548d ranger_cache::get_global_range(vrange&, tree_node*) const
+        /repo/gcc-trunk/gcc/gimple-range-cache.cc:1019
+0x26a548d ranger_cache::get_global_range(vrange&, tree_node*) const
+        /repo/gcc-trunk/gcc/gimple-range-cache.cc:1015
+0x26a01eb gimple_ranger::range_of_expr(vrange&, tree_node*, gimple*)
+        /repo/gcc-trunk/gcc/gimple-range.cc:131
+0x164a000 cprop_operand
+        /repo/gcc-trunk/gcc/tree-ssa-dom.cc:2038
+0x164c402 cprop_into_stmt
+        /repo/gcc-trunk/gcc/tree-ssa-dom.cc:2115
+0x164c402 dom_opt_dom_walker::optimize_stmt(basic_block_def*, gimple_stmt_iterator*, bool*)
+        /repo/gcc-trunk/gcc/tree-ssa-dom.cc:2343
+0x164dc97 dom_opt_dom_walker::before_dom_children(basic_block_def*)
+        /repo/gcc-trunk/gcc/tree-ssa-dom.cc:1748
+0x263f7ae dom_walker::walk(basic_block_def*)
+        /repo/gcc-trunk/gcc/domwalk.cc:311
+0x164e728 execute
+        /repo/gcc-trunk/gcc/tree-ssa-dom.cc:939
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-9570-20240320105507-g456e10f28b3-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-9570-20240320105507-g456e10f28b3-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240320 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2024-03-20 13:24:43 UTC
+  Text: Createdattachment 57747[details]gcc14-pr114405.patch
+
+Untested fix.
+
+- User: Jakub Jelinek | Time: 2024-03-21 12:04:37 UTC
+  Text: Createdattachment 57754[details]gcc14-pr114405.patch
+
+The extended testcase below turned into runtime one shows further issues and the previous patch not being actually correct.
+
+- User: GCC Commits | Time: 2024-03-22 08:23:32 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:982250b230967776f0da708a1572b78a38561e08commitr14-9609-g982250b230967776f0da708a1572b78a38561e08Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Mar 22 09:22:04 2024 +0100
+
+    bitint: Some bitint store fixes [PR114405]
+    
+    The following patch fixes some bugs in the handling of stores to large/huge
+    _BitInt bitfields.
+    
+    In the first 2 hunks we are processing the most significant limb of the
+    actual type (not necessarily limb in the storage), and so we know it is
+    either partial or full limb, so [1, limb_prec] bits rather than
+    [0, limb_prec - 1] bits as the code actually assumed.  So, those 2
+    spots are fixed by making sure if tprec is a multiple of limb_prec we
+    actually use limb_prec bits rather than 0.  Otherwise, it e.g. happily
+    could create and use 0 precision INTEGER_TYPE even when it actually
+    should have processed 64 bits, or for non-zero bo_bit could handle just
+    say 1 bit rather than 64 bits plus 1 bit in the last hunk spot.
+    
+    In the last hunk we are dealing with the extra bits in the last storage
+    limb, and the code was e.g. happily creating 65 bit precision INTEGER_TYPE,
+    even when we really should use 1 bit precision in that case.  Also, it
+    used a wrong offset in that case.
+    
+    The large testcase covers all these cases.
+    
+    2024-03-22  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114405* gimple-lower-bitint.cc (bitint_large_huge::lower_mergeable_stmt):
+            Set rprec to limb_prec rather than 0 if tprec is divisible by
+            limb_prec.  In the last bf_cur handling, set rprec to (tprec + bo_bit)
+            % limb_prec rather than tprec % limb_prec and use just rprec instead
+            of rprec + bo_bit.  For build_bit_field_ref offset, divide
+            (tprec + bo_bit) by limb_prec rather than just tprec.
+    
+            * gcc.dg/torture/bitint-66.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-03-22 08:25:52 UTC
+  Text: Fixed.
+

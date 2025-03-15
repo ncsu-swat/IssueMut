@@ -1,0 +1,162 @@
+Issue Title: __FLT_EVAL_METHOD__ is set to -1 with Ofast.
+Original Post: On Linux, `math.h` includes this:
+```h
+/* Get __GLIBC_FLT_EVAL_METHOD.  */
+#include <bits/flt-eval-method.h>
+
+#ifdef __USE_ISOC99
+/* Define the following typedefs.
+
+    float_t	floating-point type at least as wide as `float' used
+		to evaluate `float' expressions
+    double_t	floating-point type at least as wide as `double' used
+		to evaluate `double' expressions
+*/
+# if __GLIBC_FLT_EVAL_METHOD == 0 || __GLIBC_FLT_EVAL_METHOD == 16
+typedef float float_t;
+typedef double double_t;
+# elif __GLIBC_FLT_EVAL_METHOD == 1
+typedef double float_t;
+typedef double double_t;
+# elif __GLIBC_FLT_EVAL_METHOD == 2
+typedef long double float_t;
+typedef long double double_t;
+# elif __GLIBC_FLT_EVAL_METHOD == 32
+typedef _Float32 float_t;
+typedef double double_t;
+# elif __GLIBC_FLT_EVAL_METHOD == 33
+typedef _Float32x float_t;
+typedef _Float32x double_t;
+# elif __GLIBC_FLT_EVAL_METHOD == 64
+typedef _Float64 float_t;
+typedef _Float64 double_t;
+# elif __GLIBC_FLT_EVAL_METHOD == 65
+typedef _Float64x float_t;
+typedef _Float64x double_t;
+# elif __GLIBC_FLT_EVAL_METHOD == 128
+typedef _Float128 float_t;
+typedef _Float128 double_t;
+# elif __GLIBC_FLT_EVAL_METHOD == 129
+typedef _Float128x float_t;
+typedef _Float128x double_t;
+# else
+#  error "Unknown __GLIBC_FLT_EVAL_METHOD"
+# endif
+#endif
+```
+
+`bits/flt-eval-method.h` is this:
+```h
+#ifdef __FLT_EVAL_METHOD__
+# if __FLT_EVAL_METHOD__ == -1
+#  define __GLIBC_FLT_EVAL_METHOD	2
+# else
+#  define __GLIBC_FLT_EVAL_METHOD	__FLT_EVAL_METHOD__
+# endif
+#elif defined __x86_64__
+# define __GLIBC_FLT_EVAL_METHOD	0
+#else
+# define __GLIBC_FLT_EVAL_METHOD	2
+#endif
+```
+
+After https://reviews.llvm.org/D109239 with Clang with `-Ofast`, `__FLT_EVAL_METHOD__` gets a value of -1, meaning it is set by that to 2 and we end up using long double for `float_t` and `double_t`. 
+https://godbolt.org/z/PqsxrxYqn
+
+From the comments in D109239 it doesn't appear it was expected to be used in this way. It created an ABI break for `float_t` and `double_t` types, along with using the very inefficient long double types on some architectures.
+
+Comment by llvmbot: @llvm/issue-subscribers-clang-driver
+Comment by llvmbot: @llvm/issue-subscribers-clang-frontend
+Comment by topperc: @davemgreen is this related to the discussion here https://sourceware.org/pipermail/libc-alpha/2023-February/145622.html or just a coincidence?
+Comment by davemgreen: @toppcerc It was Wilco that pointed me to it, yeah.
+Comment by kito-cheng: Just remind that you posted the x86's `bits/flt-eval-method.h`, the generic one has more comment about why it mapping -1 to 2.
+
+https://github.com/bminor/glibc/blob/master/bits/flt-eval-method.h#L23
+```c
+/* __GLIBC_FLT_EVAL_METHOD is the value of FLT_EVAL_METHOD used to
+   determine the evaluation method typedefs such as float_t and
+   double_t.  It must be a value from C11 or TS 18661-3:2015, and not
+   -1.  */
+
+/* In the default version of this header, follow __FLT_EVAL_METHOD__.
+   -1 is mapped to 2 (considering evaluation as long double to be a
+   conservatively safe assumption), and if __FLT_EVAL_METHOD__ is not
+   defined then assume there is no excess precision and use the value
+   0.  */
+
+#ifdef __FLT_EVAL_METHOD__
+# if __FLT_EVAL_METHOD__ == -1
+#  define __GLIBC_FLT_EVAL_METHOD	2
+# else
+#  define __GLIBC_FLT_EVAL_METHOD	__FLT_EVAL_METHOD__
+# endif
+#else
+# define __GLIBC_FLT_EVAL_METHOD	0
+#endif
+```
+Comment by erichkeane: I believe this is intentional?  Or I could be misremembering.  @zahiraam can likely comment.
+Comment by kito-cheng: I've send a patch to update the default mapping between `__FLT_EVAL_METHOD__` and `__GLIBC_FLT_EVAL_METHOD`, but X86 still mapping `__FLT_EVAL_METHOD__` == -1 to `__GLIBC_FLT_EVAL_METHOD` == 2 since X86 has it own porting for the header.
+
+https://sourceware.org/pipermail/libc-alpha/2023-February/145674.html
+Comment by zahiraam: > I believe this is intentional? Or I could be misremembering. @zahiraam can likely comment.
+
+Yes, it is intentional. Please see comment https://github.com/llvm/llvm-project/blob/main/clang/lib/Lex/Preprocessor.cpp#L210 .
+Comment by davemgreen: There are some comments in https://reviews.llvm.org/D109239 explaining the reasoning too. I think with hindsight that might have been the wrong way to go though.
+
+Please correct me if any of this is wrong but:
+ - In practice on linux systems out there in the wild, for better or worse, they use `__FLT_EVAL_METHOD__` to control the type of float_t and double_t. With `__FLT_EVAL_METHOD__==-1` they use `__FLT_EVAL_METHOD__=2`.
+ - `__FLT_EVAL_METHOD__` will be -1 on -Ofast, but 0 on other optimization levels.
+ - So we end up with -Ofast and -O3 causing float_t and double_t to have different types. This creates an abi incompatibility between code compiled with Ofast and O3. https://godbolt.org/z/b3c47aq15
+
+The code in math.h might want to be changed, but that doesn't fix the existing systems. I'm not sure how common it is to use float_t and double_t on an ABI boundary. It sounds like it would be a bad idea in any case. But if that is done then clang/llvm will currently be causing problems on any existing system.
+
+I am not strongly opinionated about it, and I've not heard reports from users even though clang-15 has been out for a while, but it would seem that with the uses in math.h that setting `__FLT_EVAL_METHOD__` to 0 by default might be the better option, even for Ofast.
+Comment by zahiraam: >> In practice on linux systems out there in the wild, for better or worse, they use __FLT_EVAL_METHOD__ to control the type of 
+
+float_t and double_t. With __FLT_EVAL_METHOD__==-1 they use __FLT_EVAL_METHOD__=2.
+With __FLT_EVAL_METHOD__==-1 they use __GLIBC_FLT_EVAL_METHOD = 2.
+
+>> __FLT_EVAL_METHOD__ will be -1 on -Ofast, but 0 on other optimization levels.
+
+It will be -1 on Ofast. If ffp-eval-method is set to source, double or extended it can be respectively 0, 1 or 2.
+
+>>So we end up with -Ofast and -O3 causing float_t and double_t to have different types. This creates an abi incompatibility between code compiled with Ofast and O3. https://godbolt.org/z/b3c47aq15
+
+Yes. https://godbolt.org/z/ofveGhbf5
+
+>> I am not strongly opinionated about it, and I've not heard reports from users even though clang-15 has been out for a while, but it would seem that with the uses in math.h that setting __FLT_EVAL_METHOD__ to 0 by default might be the better option, even for Ofast.
+
+The decision to come up with a reasonable value of __FLT_EVAL_METHOD was taken after many discussions and other attempts to set it (using a pragma, using TargetInfo, using command line … ) . Please refer to the conversations in D109239. 
+
+Comment by Wilco1: > The decision to come up with a reasonable value of __FLT_EVAL_METHOD was taken after many discussions and other attempts to set it (using a pragma, using TargetInfo, using command line … ) . Please refer to the conversations in D109239.
+
+I don't see anything saying that  __FLT_EVAL_METHOD__==-1 is a good idea in #https://reviews.llvm.org/D109239/new 
+
+It's not like evaluation with -Ofast will ever use undefined precision, and this will break various other C libraries even if GLIBC gets fixed.
+Comment by zahiraam: > > The decision to come up with a reasonable value of __FLT_EVAL_METHOD was taken after many discussions and other attempts to set it (using a pragma, using TargetInfo, using command line … ) . Please refer to the conversations in D109239.
+> 
+> I don't see anything saying that **FLT_EVAL_METHOD**==-1 is a good idea in #https://reviews.llvm.org/D109239/new
+> 
+> It's not like evaluation with -Ofast will ever use undefined precision, and this will break various other C libraries even if GLIBC gets fixed.
+
+Please see discussion here: https://reviews.llvm.org/D121122
+Comment by Wilco1: That review confuses optimization, precision and accuracy. Optimization changes the expressions evaluated. While that might give more or less accurate results, it still uses the same precision for the evaluation (ie. float or double operations on most targets). The C/C++ standards explicitly state the FMA optimization (which changes accuracy of the evaluation) as _not_ affecting FLT_EVAL_METHOD.
+
+So FLT_EVAL_METHOD is about the precision of evaluation, not about accuracy changes resulting from optimization.
+
+Given this change breaks several C libraries (as mentioned in D121122), it should really be reverted.
+Comment by andykaylor: I think glibc is taking an odd interpretation of this in the case of __FLT_EVAL_METHOD__==-1, but it is probably the most important user of this symbol, so I would agree that setting it to -1 with fast-math is bad.
+
+As a point of reference, the Intel ICC compiler has set __FLT_EVAL_METHOD__ to -1 when fast-math is used since at least version 13, but it exhibits the same problem reported here with float_t, so it's probably more of a cautionary tale than an example to follow.
+Comment by zahiraam: > That review confuses optimization, precision and accuracy. Optimization changes the expressions evaluated. While that might give more or less accurate results, it still uses the same precision for the evaluation (ie. float or double operations on most targets). The C/C++ standards explicitly state the FMA optimization (which changes accuracy of the evaluation) as _not_ affecting FLT_EVAL_METHOD.
+> 
+> So FLT_EVAL_METHOD is about the precision of evaluation, not about accuracy changes resulting from optimization.
+> 
+> Given this change breaks several C libraries (as mentioned in D121122), it should really be reverted.
+
+Reverting D121122.
+Comment by AaronBallman: Setting 16.0 as the milestone because it'd be good if we can land this in that release. Not only does that reduce the number of compilers with the bad ABI behavior in the wild, but it also resolves discomfort around making ABI changes between 16.0.0 and 16.0.1.
+Comment by tstellar: I agree.  We can hold the last RC for this since it looks like the fix is about to be committed.
+Comment by tstellar: /cherry-pick 2f1264260b37e9bd79737181e459ae20e10c5fea
+Comment by llvmbot: /branch llvm/llvm-project-release-prs/issue60781
+Comment by llvmbot: /pull-request llvm/llvm-project-release-prs#360

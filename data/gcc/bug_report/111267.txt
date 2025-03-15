@@ -1,0 +1,488 @@
+Bug Summary: [14 Regression] Codegen regression from i386 argument passing changes
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 13.2.1
+Known to Fail: 14.0
+
+Comments:
+- User: Manolis Tsamis | Time: 2023-09-01 12:55:45 UTC
+  Text: Code generation for the following testcase:
+
+typedef struct {
+  float minx, miny;
+  float maxx, maxy;
+} AABB;
+
+int TestOverlap(AABB a, AABB b) {
+  return a.minx <= b.maxx
+      && a.miny <= b.maxy
+      && a.maxx >= b.minx
+      && a.maxx >= b.minx;
+}
+
+int TestOverlap2(AABB a, AABB b) {
+  return a.miny <= b.maxy
+      && a.maxx >= b.minx;
+}
+
+has regressed due to commithttps://gcc.gnu.org/git/?p=gcc.git;a=commit;h=bdf2737cda53a83332db1a1a021653447b05a7e7GCC13.2:
+
+TestOverlap:
+        comiss  xmm3, xmm0
+        movq    rdx, xmm0
+        movq    rsi, xmm1
+        movq    rax, xmm3
+        jb      .L10
+        shr     rdx, 32
+        shr     rax, 32
+        movd    xmm0, eax
+        movd    xmm4, edx
+        comiss  xmm0, xmm4
+        jb      .L10
+        movd    xmm1, esi
+        xor     eax, eax
+        comiss  xmm1, xmm2
+        setnb   al
+        ret
+.L10:
+        xor     eax, eax
+        ret
+TestOverlap2:
+        shufps  xmm0, xmm0, 85
+        shufps  xmm3, xmm3, 85
+        comiss  xmm3, xmm0
+        jb      .L17
+        xor     eax, eax
+        comiss  xmm1, xmm2
+        setnb   al
+        ret
+.L17:
+        xor     eax, eax
+        ret
+
+GCC trunk:
+
+TestOverlap:
+        movq    rax, xmm1
+        movq    rdx, xmm2
+        movq    rsi, xmm0
+        mov     rdi, rax
+        movq    rax, xmm3
+        mov     rcx, rsi
+        xchg    rdx, rax
+        movd    xmm1, edx
+        mov     rsi, rax
+        mov     rax, rdx
+        comiss  xmm1, xmm0
+        jb      .L10
+        shr     rcx, 32
+        shr     rax, 32
+        movd    xmm0, eax
+        movd    xmm4, ecx
+        comiss  xmm0, xmm4
+        jb      .L10
+        movd    xmm0, esi
+        movd    xmm1, edi
+        xor     eax, eax
+        comiss  xmm1, xmm0
+        setnb   al
+        ret
+.L10:
+        xor     eax, eax
+        ret
+TestOverlap2:
+        movq    rdx, xmm2
+        movq    rax, xmm3
+        movq    rsi, xmm0
+        xchg    rdx, rax
+        mov     rcx, rsi
+        mov     rsi, rax
+        mov     rax, rdx
+        shr     rcx, 32
+        shr     rax, 32
+        movd    xmm4, ecx
+        movd    xmm0, eax
+        comiss  xmm0, xmm4
+        jb      .L17
+        movd    xmm0, esi
+        xor     eax, eax
+        comiss  xmm1, xmm0
+        setnb   al
+        ret
+.L17:
+        xor     eax, eax
+        ret
+
+(Can also be seen herehttps://godbolt.org/z/E4xrEn6KW)
+
+- User: Richard Biener | Time: 2023-10-17 12:34:03 UTC
+  Text: Confirmed.  We should at least understand what's going on.
+
+- User: Roger Sayle | Time: 2023-10-20 22:42:59 UTC
+  Text: Createdattachment 56162[details]proof-of-concept patch
+
+- User: Roger Sayle | Time: 2023-10-20 22:49:57 UTC
+  Text: This patch addresses the regression, but probably isn't the correct fix.
+
+The issue is that the backend now has a way of representing the concatenation of two registers (for example, TI is constructed for two DI mode registers):
+
+(set (reg:TI 111 [ bD.2764 ])
+    (ior:TI (ashift:TI (zero_extend:TI (reg:DI 142))
+            (const_int 64 [0x40]))
+        (zero_extend:TI (reg:DI 141))))
+
+But combine is unable to cleanly extract the (original) DI mode components back out of this using SUBREGs.  Currently combine gets confused and attempts to match things like:
+
+Trying 10 -> 74:
+   10: r111:TI=zero_extend(r142:DI)<<0x40|zero_extend(r141:DI)
+      REG_DEAD r141:DI
+      REG_DEAD r142:DI
+   74: r137:DI=r111:TI#0
+Failed to match this instruction:
+(parallel [
+        (set (reg:DI 137 [ bD.2764 ])
+            (reg:DI 141))
+        (set (reg:TI 111 [ bD.2764 ])
+            (ior:TI (ashift:TI (zero_extend:TI (reg:DI 142))
+                    (const_int 64 [0x40]))
+                (zero_extend:TI (reg:DI 141))))
+    ])
+
+which contains the simplification we want, "reg:DI 137 := reg:DI 141", but along with stuff that combine should really take care off (strip/duplicate).  I'll work on a more acceptable middle-end fix, but this patch demonstrates progress, and can be used if a more general solution can't be found.
+
+- User: Jakub Jelinek | Time: 2024-01-05 10:43:16 UTC
+  Text: (In reply to Roger Sayle fromcomment #3)> This patch addresses the regression, but probably isn't the correct fix.Why?  To me it looks like the correct fix.> The issue is that the backend now has a way of representing the
+> concatenation of two registers (for example, TI is constructed for two DI
+> mode registers):
+> 
+> (set (reg:TI 111 [ bD.2764 ])
+>     (ior:TI (ashift:TI (zero_extend:TI (reg:DI 142))
+>             (const_int 64 [0x40]))
+>         (zero_extend:TI (reg:DI 141))))
+> 
+> But combine is unable to cleanly extract the (original) DI mode components
+> back out of this using SUBREGs.  Currently combine gets confused and
+> attempts to match things like:
+> 
+> Trying 10 -> 74:
+>    10: r111:TI=zero_extend(r142:DI)<<0x40|zero_extend(r141:DI)
+>       REG_DEAD r141:DI
+>       REG_DEAD r142:DI
+>    74: r137:DI=r111:TI#0
+> Failed to match this instruction:
+> (parallel [
+>         (set (reg:DI 137 [ bD.2764 ])
+>             (reg:DI 141))
+>         (set (reg:TI 111 [ bD.2764 ])
+>             (ior:TI (ashift:TI (zero_extend:TI (reg:DI 142))
+>                     (const_int 64 [0x40]))
+>                 (zero_extend:TI (reg:DI 141))))
+>     ])
+> 
+> which contains the simplification we want, "reg:DI 137 := reg:DI 141", but
+> along with stuff that combine should really take care off (strip/duplicate).How it could do anything else?  It simplifies the computation of r137, but because r111 isn't dead but used later, it has to preserve the previous computation.  And, combine only considers the 2-4 instructions being simplified together, so doesn't know that the other use only extracts the highpart subreg and can be therefore also simplified.
+Combine simply never tries to simplify folding say 10 -> 74 + 75.
+
+Does your patch help with the testcase?
+
+- User: Jakub Jelinek | Time: 2024-01-12 15:49:58 UTC
+  Text: Slightly cleaned up testcase:
+struct S { float a, b, c, d; };
+
+int
+foo (struct S x, struct S y)
+{
+  return x.a <= y.c && x.b <= y.d && x.c >= y.a && x.c >= y.a;
+}
+
+int
+bar (struct S x, struct S y)
+{
+  return x.b <= y.d && x.c >= y.a;
+}
+
+I think the pattern be using reg_overlap_mentioned_p, register_operand doesn't really guarantee the operand is REG_P on which REGNO can be used.
+
+So something like:
+--- gcc/config/i386/i386.md.jj	2024-01-03 12:01:11.649644854 +0100
++++ gcc/config/i386/i386.md	2024-01-12 16:24:10.806783889 +0100
+@@ -13347,6 +13347,27 @@
+   DONE;
+ }
+   [(set_attr "isa" "*,nox64,x64,*")])
++
++;; Extract from concat
++
++(define_insn_and_split "*extv<dwi><mode>2_concat"
++  [(set (match_operand:DWIH 0 "register_operand")
++	(match_operand:DWIH 1 "register_operand"))
++   (set (match_operand:<DWI> 2 "register_operand")
++	(any_or_plus:<DWI>
++	  (ashift:<DWI>
++	    (zero_extend:<DWI> (match_operand:DWIH 3 "register_operand"))
++	    (match_operand:QI 4 "const_scalar_int_operand"))
++	  (zero_extend:<DWI> (match_operand:DWIH 5 "register_operand"))))]
++  "INTVAL (operands[4]) == <MODE_SIZE> * BITS_PER_UNIT
++   && !reg_overlap_mentioned_p (operands[0], operands[3])
++   && !reg_overlap_mentioned_p (operands[0], operands[5])"
++  "#"
++  "&& 1"
++  [(set (match_dup 0) (match_dup 1))
++   (set (match_dup 2) (ior:<DWI> (ashift:<DWI> (zero_extend:<DWI> (match_dup 3))
++					       (match_dup 4))
++				 (zero_extend:<DWI> (match_dup 5))))])
+ 
+
+ ;; Negation instructions
+
+Note, while that improves the generated code for the first function (almost but not 100% to what GCC 13 emitted), the second function still results in much larger code than before.
+Bet it would be even better if we could just define_split the pattern instead of define_insn_and_split, but unfortunately this is a 2 insn combination and that doesn't allow to be split into 2 new instructions.
+
+- User: Roger Sayle | Time: 2024-01-12 19:06:40 UTC
+  Text: Sorry for the delay in replying/answering Jakub's questions/comments.  Yes, using a define_insn_and_split in the backend fixes/works around the issue (and I agree your implementation/refinement incomment #5is better than mine incomment #2), but I've a feeling that this approach isn't the ideal solution.  Nothing about this split, is specific to these x86 instructions or even to the i386 backend.
+
+A more generic fix might be teach combine.cc that it can split parallels of two independent sets, with no inter dependencies, into two insns if the total cost of the two instructions is less than the original two, i.e. a 2 insn -> 2 insn combination.
+
+But then even this doesn't feel like the perfect approach... the reason combine doesn't already support 2->2 combinations is that they're not normally required, these types of problems are usually handled by GCSE or CSE or PRE (or ?).
+
+The pattern is insn1 defines REG1 to a complicated expression, that is live in several locations, so this instruction can't be eliminated.  However, if the definition of REG1 is provided to insn2 that sets REG2, this second instruction can be significantly simplified.  This feels like a classic (non-)constant propagation problem.  I'm thinking perhaps want_to_gcse_p (or somewhere similar) could be tweaked.
+
+For people just joining the discussion (hopefully Jeff or a Richard):
+
+(set (REG:DI 1) (concat:DI (REG:SI 2) (REG:SI 3))
+...
+(set (REG:SI 4) (low_part (REG:DI 1))
+
+can be simplified so that the second assignment becomes just:
+(set (REG:SI 4) (REG:SI 2))
+and similarly for high_part vs. low_part.  These don't even
+need to be in the same basic block.
+
+In actuality, "concat" is a large ugly expression, and high_part/low_part are actually SUBREGs (or could be TRUNCATE or SHIFT+TRUNCATE), but the theory should remain the same.
+
+I'm trying to figure out which pass (or cselib?) is normally responsible for handling this type of pseudo-reg propagation.
+
+But the define_insn_and_split certainly papers over the deficiency in the middle-end's RTL optimizers and fixes this (very) specific case/regression.
+
+- User: Roger Sayle | Time: 2024-01-14 00:09:08 UTC
+  Text: Very many thanks to Jeff Law for pointing me to fwprop.  The following simple
+patch also fixes this regression.
+
+diff --git a/gcc/fwprop.cc b/gcc/fwprop.cc
+index 0c588f8..cbba44e 100644
+--- a/gcc/fwprop.cc
++++ b/gcc/fwprop.cc
+@@ -449,15 +449,6 @@ try_fwprop_subst_pattern (obstack_watermark &attempt, insn_
+change &use_change,
+   if (prop.num_replacements == 0)
+     return false;
+
+-  if (!prop.profitable_p ())
+-    {
+-      if (dump_file && (dump_flags & TDF_DETAILS))
+-       fprintf (dump_file, "cannot propagate from insn %d into"
+-                " insn %d: %s\n", def_insn->uid (), use_insn->uid (),
+-                "would increase complexity of pattern");
+-      return false;
+-    }
+-
+   if (dump_file && (dump_flags & TDF_DETAILS))
+     {
+       fprintf (dump_file, "\npropagating insn %d into insn %d, replacing:\n",
+
+- User: Roger Sayle | Time: 2024-01-14 12:10:20 UTC
+  Text: Now we're in stage4, I'll take this.  I'm bootstrapping and regression testing a variant of my tweak to try_fwprop_subst_pattern.  The change incomment #7can hang loop indefinitely if the transformation results in the same cost as the original, so the logic on when to forward-propagate needed to be tweaked a little.
+
+- User: Richard Biener | Time: 2024-01-15 07:32:55 UTC
+  Text: Yes, this is basically "folding", and across multiple insns this requires
+fwprop or combine.
+
+    9: r111:TI=zero_extend(r112:DI)
+   10: r111:TI=r111:TI&<0,0xffffffffffffffff>|zero_extend(r113:DI)<<0x40
+   74: r137:DI=r111:TI#0
+   75: r138:DI=r111:TI#8
+
+I'm not sure fwprop even tries to do 9->10->74 though.
+
+The suggested change to drop the call to "profitable" seems to remove any
+cost checking done (and is also not consistent with the other call we do
+on notes?).
+
+Would ssa-combine have catched the above?
+
+- User: Roger Sayle | Time: 2024-01-16 01:15:18 UTC
+  Text: A revised and improved patch has been posted for review athttps://gcc.gnu.org/pipermail/gcc-patches/2024-January/643062.html
+
+- User: GCC Commits | Time: 2024-01-21 21:25:18 UTC
+  Text: The master branch has been updated by Roger Sayle <sayle@gcc.gnu.org>:https://gcc.gnu.org/g:86de9b66480b710202a2898cf513db105d8c432fcommitr14-8319-g86de9b66480b710202a2898cf513db105d8c432fAuthor: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Sun Jan 21 21:22:28 2024 +0000PR rtl-optimization/111267: Improved forward propagation.
+    
+    This patch resolvesPR rtl-optimization/111267by improving RTL-level
+    forward propagation.  This x86_64 code quality regression was caused
+    (exposed) by my changes to improve how x86's (TImode) argument passing
+    is represented at the RTL-level (reducing the use of SUBREGs to catch
+    more optimization opportunities in combine).  The pitfall is that the
+    more complex RTL representations expose a limitation in RTL's fwprop
+    pass.
+    
+    At the heart of fwprop, in try_fwprop_subst_pattern, the logic can
+    be summarized as three steps.  Step 1 is a heuristic that rejects the
+    propagation attempt if the expression is too complex, step 2 calls
+    the backend's recog to see if the propagated/simplified instruction
+    is recognizable/valid, and step 3 then calls set_src_cost to compare
+    the rtx costs of the replacement vs. the original, and accepts the
+    transformation if the final cost is the same of better.
+    
+    The logic error (or missed optimization opportunity) is that the
+    step 1 heuristic that attempts to predict (second guess) the
+    process is flawed.  Ultimately the decision on whether to fwprop
+    or not should depend solely on actual improvement, as measured
+    by RTX costs.  Hence the prototype fix in the bugzilla PR removes
+    the heuristic of calling prop.profitable_p entirely, relying
+    entirely on the cost comparison in step 3.
+    
+    Unfortunately, things are a tiny bit more complicated.  The cost
+    comparison in fwprop uses the older set_src_cost API and not the
+    newer (preffered) insn_cost API as currently used in combine.
+    This means that the cost improvement comparisons are only done
+    for single_set instructions (more complex PARALLELs etc. aren't
+    supported).  Hence we can only rely on skipping step 1 for that
+    subset of instructions actually evaluated by step 3.
+    
+    The other subtlety is that to avoid potential infinite loops
+    in fwprop we should only reply purely on rtx costs when the
+    transformation is obviously an improvement.  If the replacement
+    has the same cost as the original, we can use the prop.profitable_p
+    test to preserve the current behavior.
+    
+    Finally, to answer Richard Biener's remaining question about this
+    approach: yes, there is an asymmetry between how patterns are
+    handled and how REG_EQUAL notes are handled.  For example, at
+    the moment propagation into notes doesn't use rtx costs at all,
+    and ultimately when fwprop is updated to use insn_cost, this
+    (and recog) obviously isn't applicable to notes.  There's no reason
+    the logic need be identical between patterns and notes, and during
+    stage4 we only need update propagation into patterns to fix this
+    P1 regression (notes and use of cost_insn can be done for GCC 15).
+    
+    For Jakub's reduced testcase:
+    
+    struct S { float a, b, c, d; };
+    int bar (struct S x, struct S y) {
+      return x.b <= y.d && x.c >= y.a;
+    }
+    
+    On x86_64-pc-linux-gnu with -O2 gcc currently generates:
+    
+    bar:    movq    %xmm2, %rdx
+            movq    %xmm3, %rax
+            movq    %xmm0, %rsi
+            xchgq   %rdx, %rax
+            movq    %rsi, %rcx
+            movq    %rax, %rsi
+            movq    %rdx, %rax
+            shrq    $32, %rcx
+            shrq    $32, %rax
+            movd    %ecx, %xmm4
+            movd    %eax, %xmm0
+            comiss  %xmm4, %xmm0
+            jb      .L6
+            movd    %esi, %xmm0
+            xorl    %eax, %eax
+            comiss  %xmm0, %xmm1
+            setnb   %al
+            ret
+    .L6:    xorl    %eax, %eax
+            ret
+    
+    with this simple patch to fwprop, we now generate:
+    
+    bar:    shufps  $85, %xmm0, %xmm0
+            shufps  $85, %xmm3, %xmm3
+            comiss  %xmm0, %xmm3
+            jb      .L6
+            xorl    %eax, %eax
+            comiss  %xmm2, %xmm1
+            setnb   %al
+            ret
+    .L6:    xorl    %eax, %eax
+            ret
+    
+    2024-01-21  Roger Sayle  <roger@nextmovesoftware.com>
+                Richard Biener  <rguenther@suse.de>
+    
+    gcc/ChangeLogPR rtl-optimization/111267* fwprop.cc (fwprop_propagation::profitabe_p): Rename
+            profitable_p method to likely_profitable_p.
+            (try_fwprop_subst_node): Update call to likely_profitable_p.
+            Only bail-out early when !prop.likely_profitable_p for instructions
+            that are not single sets.  When comparing costs, bail-out if the
+            cost is unchanged and !prop.likely_profitable_p.
+    
+    gcc/testsuite/ChangeLogPR rtl-optimization/111267* gcc.target/i386/pr111267.c: New test case.
+
+- User: Richard Sandiford | Time: 2024-01-22 09:11:52 UTC
+  Text: I don't object to the patch, but for the record: the current heuristics go back a long way.  Although I reworked the pass to use rtl-ssa a few years ago, I tried as far as possible to preserve the old heuristics (tested by making sure that there were no unexplained differences over a large set of targets).
+
+I wouldn't characterise the old heuristics as a logic error.  Although I didn't write them, my understanding is that they were being deliberately conservative, in particular due to the risk of introducing excess register pressure.
+
+So this change seems potentially quite invasive for stage 4.  Perhaps it'll work out — if so, great!  But if there is some fallout, I think we should lean towards reverting the patch and revisiting in GCC 15.
+
+- User: Maxim Kuvyrkov | Time: 2024-01-25 07:51:50 UTC
+  Text: We are seeing scan-assembler failures in a single 32-bit arm test.  This affects both linux and bare-metal targets: arm-linux-gnueabihf and arm-none-eabi.
+
+		=== gcc tests ===
+
+Running gcc:gcc.target/arm/arm.exp ...
+FAIL: gcc.target/arm/bics_3.c scan-assembler-times bics\tr[0-9]+, r[0-9]+, r[0-9]+ 2
+FAIL: gcc.target/arm/bics_3.c scan-assembler-times bics\tr[0-9]+, r[0-9]+, r[0-9]+, .sl #2 1
+
+- User: Christophe Lyon | Time: 2024-01-25 07:55:59 UTC
+  Text: (In reply to Maxim Kuvyrkov fromcomment #13)> We are seeing scan-assembler failures in a single 32-bit arm test.  This
+> affects both linux and bare-metal targets: arm-linux-gnueabihf and
+> arm-none-eabi.
+> 
+> 		=== gcc tests ===
+> 
+> Running gcc:gcc.target/arm/arm.exp ...
+> FAIL: gcc.target/arm/bics_3.c scan-assembler-times bics\tr[0-9]+, r[0-9]+,
+> r[0-9]+ 2
+> FAIL: gcc.target/arm/bics_3.c scan-assembler-times bics\tr[0-9]+, r[0-9]+,
+> r[0-9]+, .sl #2 1I think this is reported as:https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113542
+
+- User: Maxim Kuvyrkov | Time: 2024-01-25 09:48:43 UTC
+  Text: (In reply to Maxim Kuvyrkov fromcomment #13)> We are seeing scan-assembler failures in a single 32-bit arm test.  This
+> affects both linux and bare-metal targets: arm-linux-gnueabihf and
+> arm-none-eabi.
+> 
+> 		=== gcc tests ===
+> 
+> Running gcc:gcc.target/arm/arm.exp ...
+> FAIL: gcc.target/arm/bics_3.c scan-assembler-times bics\tr[0-9]+, r[0-9]+,
+> r[0-9]+ 2
+> FAIL: gcc.target/arm/bics_3.c scan-assembler-times bics\tr[0-9]+, r[0-9]+,
+> r[0-9]+, .sl #2 1I've looked into the reason for the above failures, and it seems to be not an issue.
+
+After the patch fwprop1 decides to do an additional propagation, which was considered as "would increase complexity of pattern" before the patch.  This results in change from "bics; mov" to "bic; subs".  If I understand ARM assembler correctly, handling of sign was shifted from "bics" to "subs" instruction.
+
+This is the actual code: BEFORE:
+	bics	r0, r0, r1	@ 9	[c=4 l=4]  *andsi_notsi_si_compare0_scratch
+	mov	r0, #1	@ 23	[c=4 l=4]  *thumb2_movsi_vfp/1
+	it	eq
+	moveq	r0, #0	@ 26	[c=8 l=4]  *p *thumb2_movsi_vfp/2
+	bx	lr	@ 29	[c=8 l=4]  *thumb2_return
+
+and AFTER:
+	bic	r0, r0, r1	@ 8	[c=4 l=4]  andsi_notsi_si
+	subs	r0, r0, #0	@ 22	[c=4 l=4]  cmpsi2_addneg/0
+	it	ne
+	movne	r0, #1	@ 23	[c=8 l=4]  *p *thumb2_movsi_vfp/2
+	bx	lr	@ 26	[c=8 l=4]  *thumb2_return
+
+If I don't hear anything to the contrary, I'll update the testcase to accept both "bic" and "bics".
+
+- User: Roger Sayle | Time: 2024-02-16 09:12:46 UTC
+  Text: This should now be fixed on mainline.  The testsuite regressions (on non-x86 targets) are cosmetic, i.e. neither wrong code nor worse performance/size, just differences in expected code generation.
+

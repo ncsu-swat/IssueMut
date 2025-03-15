@@ -1,0 +1,363 @@
+Bug Summary: [debug, gsplit-dwarf, gdwarf-4, g3] DW_MACRO_define_strp used for debug_str_offsets index
+Product: gcc
+Component: debug
+
+  (show other bugs)
+Keywords: wrong-debug
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Tom de Vries | Time: 2024-05-13 08:40:34 UTC
+  Text: Consider a hello world, compiled with split dwarf and dwarf version 4, and -g3 for macro info:
+...
+$ gcc -gdwarf-4 -gsplit-dwarf /data/vries/hello.c -g3 -save-temps -dA
+...
+
+In section .debug_macro.dwo, we have:
+...
+.Ldebug_macro0:
+        .value  0x4     # DWARF macro version number
+        .byte   0x2     # Flags: 32-bit, lineptr present
+        .long   .Lskeleton_debug_line0
+        .byte   0x3     # Start new file
+        .uleb128 0      # Included from line number 0
+        .uleb128 0x1    # file /data/vries/hello.c
+        .byte   0x5     # Define macro strp
+        .uleb128 0      # At line number 0
+        .uleb128 0x1d0  # The macro: "__STDC__ 1"
+...
+
+So, given that we use a DW_MACRO_define_strp, we'd expect 0x1d0 to be an offset into a .debug_str section.
+
+However, in .debug_str.dwo we find:
+...
+  0x000001d0 455f584f 50454e32 4b385853 49005345 E_XOPEN2K8XSI.SE
+...
+
+In fact, 0x1d0 is an index into the string offset table in .debug_str_offsets.dwo:
+...
+        .long   0x34f0  # indexed string 0x1d0: __STDC__ 1
+...
+
+So, it looks like DW_MACRO_define_strx should have been used instead.
+
+- User: Tom de Vries | Time: 2024-05-13 08:42:07 UTC
+  Text: Looking at the source code, I wonder if this would fix it:
+...
+diff --git a/gcc/dwarf2out.cc b/gcc/dwarf2out.cc
+index eedb13bb069..045858bf638 100644
+--- a/gcc/dwarf2out.cc
++++ b/gcc/dwarf2out.cc
+@@ -29045,7 +29045,7 @@ output_macinfo_op (macinfo_entry *ref)
+ 	  && !DWARF2_INDIRECT_STRING_SUPPORT_MISSING_ON_TARGET
+ 	  && (debug_str_section->common.flags & SECTION_MERGE) != 0)
+ 	{
+-	  if (dwarf_split_debug_info && dwarf_version >= 5)
++	  if (dwarf_split_debug_info && (!dwarf_strict || dwarf_version >= 5))
+ 	    ref->code = ref->code == DW_MACINFO_define
+ 			? DW_MACRO_define_strx : DW_MACRO_undef_strx;
+ 	  else
+...
+
+- User: Tom de Vries | Time: 2024-05-13 09:12:32 UTC
+  Text: (In reply to Tom de Vries fromcomment #1)> Looking at the source code, I wonder if this would fix it:
+> ...
+> diff --git a/gcc/dwarf2out.cc b/gcc/dwarf2out.cc
+> index eedb13bb069..045858bf638 100644
+> --- a/gcc/dwarf2out.cc
+> +++ b/gcc/dwarf2out.cc
+> @@ -29045,7 +29045,7 @@ output_macinfo_op (macinfo_entry *ref)
+>  	  && !DWARF2_INDIRECT_STRING_SUPPORT_MISSING_ON_TARGET
+>  	  && (debug_str_section->common.flags & SECTION_MERGE) != 0)
+>  	{
+> -	  if (dwarf_split_debug_info && dwarf_version >= 5)
+> +	  if (dwarf_split_debug_info && (!dwarf_strict || dwarf_version >= 5))
+>  	    ref->code = ref->code == DW_MACINFO_define
+>  			? DW_MACRO_define_strx : DW_MACRO_undef_strx;
+>  	  else
+> ...With that change I get:
+...
+.Ldebug_macro0:
+        .value  0x4     # DWARF macro version number
+        .byte   0x2     # Flags: 32-bit, lineptr present
+        .long   .Lskeleton_debug_line0
+        .byte   0x3     # Start new file
+        .uleb128 0      # Included from line number 0
+        .uleb128 0x1    # file /data/vries/hello.c
+        .byte   0xb     # Define macro strx
+        .uleb128 0      # At line number 0
+        .uleb128 0x17b  # The macro: "__STDC__ 1"
+...
+
+- User: Richard Biener | Time: 2024-05-13 10:27:01 UTC
+  Text: And with -gstrict-dwarf -gdwarf-4?
+
+- User: Tom de Vries | Time: 2024-05-13 10:29:46 UTC
+  Text: (In reply to Richard Biener fromcomment #3)> And with -gstrict-dwarf -gdwarf-4?With:
+...
+$ gcc.sh -gdwarf-4 -gsplit-dwarf /data/vries/hello.c -g3 -gstrict-dwarf
+...
+we get:
+...
+        .section        .debug_macinfo.dwo,"e",@progbits
+.Ldebug_macinfo0:
+        .byte   0x3     # Start new file
+        .uleb128 0      # Included from line number 0
+        .uleb128 0x1    # file /data/vries/hello.c
+        .byte   0x1     # Define macro
+        .uleb128 0      # At line number 0
+        .ascii "__STDC__ 1\0"   # The macro
+...
+
+- User: Jakub Jelinek | Time: 2024-05-13 10:33:26 UTC
+  Text: (In reply to Tom de Vries fromcomment #1)> Looking at the source code, I wonder if this would fix it:
+> ...
+> diff --git a/gcc/dwarf2out.cc b/gcc/dwarf2out.cc
+> index eedb13bb069..045858bf638 100644
+> --- a/gcc/dwarf2out.cc
+> +++ b/gcc/dwarf2out.cc
+> @@ -29045,7 +29045,7 @@ output_macinfo_op (macinfo_entry *ref)
+>  	  && !DWARF2_INDIRECT_STRING_SUPPORT_MISSING_ON_TARGET
+>  	  && (debug_str_section->common.flags & SECTION_MERGE) != 0)
+>  	{
+> -	  if (dwarf_split_debug_info && dwarf_version >= 5)
+> +	  if (dwarf_split_debug_info && (!dwarf_strict || dwarf_version >= 5))
+>  	    ref->code = ref->code == DW_MACINFO_define
+>  			? DW_MACRO_define_strx : DW_MACRO_undef_strx;
+>  	  else
+> ...Just make it if (dwarf_split_debug_info) then?
+I mean, this whole code is guarded with
+      if ((!dwarf_strict || dwarf_version >= 5)
+          && ...)
+
+- User: Tom de Vries | Time: 2024-05-13 11:11:00 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #5)> Just make it if (dwarf_split_debug_info) then?That works as well indeed:
+...
+diff --git a/gcc/dwarf2out.cc b/gcc/dwarf2out.cc
+index eedb13bb069..70b7f5f42cd 100644
+--- a/gcc/dwarf2out.cc
++++ b/gcc/dwarf2out.cc
+@@ -29045,7 +29045,7 @@ output_macinfo_op (macinfo_entry *ref)
+ 	  && !DWARF2_INDIRECT_STRING_SUPPORT_MISSING_ON_TARGET
+ 	  && (debug_str_section->common.flags & SECTION_MERGE) != 0)
+ 	{
+-	  if (dwarf_split_debug_info && dwarf_version >= 5)
++	  if (dwarf_split_debug_info)
+ 	    ref->code = ref->code == DW_MACINFO_define
+ 			? DW_MACRO_define_strx : DW_MACRO_undef_strx;
+ 	  else
+@@ -29097,12 +29097,20 @@ output_macinfo_op (macinfo_entry *ref)
+ 				   HOST_WIDE_INT_PRINT_UNSIGNED,
+ 				   ref->lineno);
+       if (node->form == DW_FORM_strp)
+-        dw2_asm_output_offset (dwarf_offset_size, node->label,
+-                               debug_str_section, "The macro: \"%s\"",
+-                               ref->info);
++	{
++	  gcc_assert (ref->code == DW_MACRO_define_strp
++		      || ref->code == DW_MACRO_undef_strp);
++	  dw2_asm_output_offset (dwarf_offset_size, node->label,
++				 debug_str_section, "The macro: \"%s\"",
++				 ref->info);
++	}
+       else
+-        dw2_asm_output_data_uleb128 (node->index, "The macro: \"%s\"",
+-                                     ref->info);
++	{
++	  gcc_assert (ref->code == DW_MACRO_define_strx
++		      || ref->code == DW_MACRO_undef_strx);
++	  dw2_asm_output_data_uleb128 (node->index, "The macro: \"%s\"",
++				       ref->info);
++	}
+       break;
+     case DW_MACRO_import:
+       dw2_asm_output_data (1, ref->code, "Import");
+...
+
+I've also added asserts detecting this PR.
+
+- User: Tom de Vries | Time: 2024-05-14 11:35:57 UTC
+  Text: Submitted here (https://gcc.gnu.org/pipermail/gcc-patches/2024-May/651586.html).
+
+- User: GCC Commits | Time: 2024-05-14 12:00:54 UTC
+  Text: The master branch has been updated by Tom de Vries <vries@gcc.gnu.org>:https://gcc.gnu.org/g:b7003b4cc5e263343f047fe64ed1ae12f561b2d1commitr15-483-gb7003b4cc5e263343f047fe64ed1ae12f561b2d1Author: Tom de Vries <tdevries@suse.de>
+Date:   Mon May 13 18:10:15 2024 +0200
+
+    [debug] Fix dwarf v4 .debug_macro.dwo
+    
+    Consider a hello world, compiled with -gsplit-dwarf and dwarf version 4, and
+    -g3:
+    ...
+    $ gcc -gdwarf-4 -gsplit-dwarf /data/vries/hello.c -g3 -save-temps -dA
+    ...
+    
+    In section .debug_macro.dwo, we have:
+    ...
+    .Ldebug_macro0:
+            .value  0x4     # DWARF macro version number
+            .byte   0x2     # Flags: 32-bit, lineptr present
+            .long   .Lskeleton_debug_line0
+            .byte   0x3     # Start new file
+            .uleb128 0      # Included from line number 0
+            .uleb128 0x1    # file /data/vries/hello.c
+            .byte   0x5     # Define macro strp
+            .uleb128 0      # At line number 0
+            .uleb128 0x1d0  # The macro: "__STDC__ 1"
+    ...
+    
+    Given that we use a DW_MACRO_define_strp, we'd expect 0x1d0 to be an
+    offset into a .debug_str.dwo section.
+    
+    But in fact, 0x1d0 is an index into the string offset table in
+    section .debug_str_offsets.dwo:
+    ...
+            .long   0x34f0  # indexed string 0x1d0: __STDC__ 1
+    ...
+    
+    Add asserts that catch this inconsistency, and fix this by using
+    DW_MACRO_define_strx instead.
+    
+    Tested on x86_64.
+    
+    gcc/ChangeLog:
+    
+    2024-05-14  Tom de Vries  <tdevries@suse.de>PR debug/115066* dwarf2out.cc (output_macinfo_op): Fix DW_MACRO_define_strx/strp
+            choice for v4 .debug_macro.dwo.  Add asserts to check that choice.
+    
+    gcc/testsuite/ChangeLog:
+    
+    2024-05-14  Tom de Vries  <tdevries@suse.de>PR debug/115066* gcc.dg/pr115066.c: New test.
+
+- User: Tom de Vries | Time: 2024-05-14 12:04:51 UTC
+  Text: Fixed.
+
+- User: Rainer Orth | Time: 2024-05-16 08:35:49 UTC
+  Text: The new test currently FAILs on Solaris/SPARC with the native as:
+
+FAIL: gcc.dg/pr115066.c scan-assembler \\\\.byte\\\\t0xb\\\\t# Define macro strx
+
+The relevant snippet ofpr115066.s is
+
+        .section        ".debug_macro.dwo",#exclude,#progbits
+.LLdebug_macro0:
+        .uahalf 0x4     ! DWARF macro version number
+        .byte   0x2     ! Flags: 32-bit, lineptr present
+        .uaword .LLskeleton_debug_line0
+        .byte   0x1     ! Define macro
+
+while when using gas, I have
+
+        .section        .debug_macro.dwo,"e",@progbits
+.LLdebug_macro0: 
+        .uahalf 0x4     ! DWARF macro version number
+        .byte   0x2     ! Flags: 32-bit, lineptr present
+        .uaword .LLskeleton_debug_line0
+        .byte   0xb     ! Define macro strx
+
+AFAICS from dwarf2out.cc (output_macinfo_op), the requirements for using
+DW_MACRO_define_strx are (among others) !DWARF2_INDIRECT_STRING_SUPPORT_MISSING_ON_TARGET && SECTION_MERGE.
+
+However, with the native assembler, SHF_MERGE doesn't work (as emits something
+ld cannot link).
+
+I wonder how best to handle this: just skip the test on sparc*-sun-solaris2* && !gas?  Theoretically, there could be other targets with similar issues.
+
+- User: Tom de Vries | Time: 2024-05-16 09:06:42 UTC
+  Text: (In reply to Rainer Orth fromcomment #10)> The new test currently FAILs on Solaris/SPARC with the native as:
+> 
+> FAIL: gcc.dg/pr115066.c scan-assembler \\\\.byte\\\\t0xb\\\\t# Define macro
+> strx
+> 
+> The relevant snippet ofpr115066.s is
+> 
+>         .section        ".debug_macro.dwo",#exclude,#progbits
+> .LLdebug_macro0:
+>         .uahalf 0x4     ! DWARF macro version number
+>         .byte   0x2     ! Flags: 32-bit, lineptr present
+>         .uaword .LLskeleton_debug_line0
+>         .byte   0x1     ! Define macro
+> 
+> while when using gas, I have
+> 
+>         .section        .debug_macro.dwo,"e",@progbits
+> .LLdebug_macro0: 
+>         .uahalf 0x4     ! DWARF macro version number
+>         .byte   0x2     ! Flags: 32-bit, lineptr present
+>         .uaword .LLskeleton_debug_line0
+>         .byte   0xb     ! Define macro strx
+> 
+> AFAICS from dwarf2out.cc (output_macinfo_op), the requirements for using
+> DW_MACRO_define_strx are (among others)
+> !DWARF2_INDIRECT_STRING_SUPPORT_MISSING_ON_TARGET && SECTION_MERGE.
+> 
+> However, with the native assembler, SHF_MERGE doesn't work (as emits
+> something
+> ld cannot link).
+> 
+> I wonder how best to handle this: just skip the test on sparc*-sun-solaris2*
+> && !gas?  Theoretically, there could be other targets with similar issues.This looks like test-case issue, so re-closing the PR.
+
+How about:
+...
+-/* { dg-final { scan-assembler {\.byte\t0xb\t[^\n\r]* Define macro strx} } } */
++/* { dg-final { scan-assembler {\.byte\t0xb\t[^\n\r]* Define macro strx|\.byte\t0x1\t[^\n\r]* Define macro}
+...
+?
+
+- User: ro@CeBiTec.Uni-Bielefeld.DE | Time: 2024-05-16 09:22:26 UTC
+  Text: > ---Comment #11from Tom de Vries <vries at gcc dot gnu.org> ---
+> (In reply to Rainer Orth fromcomment #10)[...]>> I wonder how best to handle this: just skip the test on sparc*-sun-solaris2*
+>> && !gas?  Theoretically, there could be other targets with similar issues.>> This looks like test-case issue, so re-closing the PR.True, but it's often way simpler to discuss testcase issues in the
+original PR rather than open new PRs for every single issue with a
+testcase (and there's already been the comment character one here).> How about:
+> ...
+> -/* { dg-final { scan-assembler {\.byte\t0xb\t[^\n\r]* Define macro strx} } }
+> */
+> +/* { dg-final { scan-assembler {\.byte\t0xb\t[^\n\r]* Define macro
+> strx|\.byte\t0x1\t[^\n\r]* Define macro}
+> ...
+> ?Seems like an option, too (and would work on other affected targets
+should they appear).  Tested on sparc-sun-solaris2.11 with as and gas.
+
+Btw., I wonder which of the targets currently skipped with "split DWARF
+unsupported" are instances of this problem, too: Solaris doesn't support
+-gsplit-dwarf, still the test PASSes on Solaris/SPARC with gas and
+Solaris/x86 with either assembler.
+
+- User: GCC Commits | Time: 2024-05-22 08:06:54 UTC
+  Text: The master branch has been updated by Rainer Orth <ro@gcc.gnu.org>:https://gcc.gnu.org/g:6c97934fde7caf483ffc5079eb8ca4af04354a2ccommitr15-767-g6c97934fde7caf483ffc5079eb8ca4af04354a2cAuthor: Tom de Vries <tdevries@suse.de>
+Date:   Wed May 22 10:06:10 2024 +0200
+
+    testsuite: Allow for non-SECTION_MERGE systems in gcc.dg/pr115066.c [PR115066]
+    
+    gcc.dg/pr115066.c currently FAILs on Solaris/SPARC with the native as:
+    
+    FAIL: gcc.dg/pr115066.c scan-assembler \\\\.byte\\\\t0xb\\\\t# Define macro strx
+    
+    Instead of the expected
+    
+            .byte   0xb     ! Define macro strx
+    
+    the assembler output contains
+    
+            .byte   0x1     ! Define macro
+    
+    Apparently this happens because the Solaris as/ld combo doesn't support
+    SHF_MERGE.
+    
+    While I initially meant to just skip the test on sparc*-*-solaris2* && !gas,
+    Tom suggested to allow for both forms instead, which is what his patch
+    does.
+    
+    Tested on sparc-sun-solaris2.11 and i386-pc-solaris2.11 (as and gas
+    each) and x86_64-pc-linux-gnu.
+    
+    2024-05-21  Tom de Vries  <tdevries@suse.de>
+    
+            gcc/testsuite:PR debug/115066* gcc.dg/pr115066.c (scan-assembler): Allow for alternative form
+            of Define macro.
+
+- User: Christophe Lyon | Time: 2024-05-27 14:02:23 UTC
+  Text: The testcase was also updated by:https://gcc.gnu.org/git/?p=gcc.git;a=commit;h=c1356e8cc9a8c869ab936c927b1812b4691265b6
+

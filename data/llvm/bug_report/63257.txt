@@ -1,0 +1,74 @@
+Issue Title: Clang: ABI incompatibility with MSVC on i686-windows for `__declspec(align(N))`, with N <= 4
+Original Post: For the following three struct definitions
+```c
+struct NoRequestedAlign {
+  uint64_t x;
+  uint64_t y;
+  uint64_t z;
+};
+
+__declspec(align(1))
+struct RequestedAlign1 {
+  uint64_t x;
+  uint64_t y;
+  uint64_t z;
+};
+
+__declspec(align(8))
+struct RequestedAlign8 {
+  uint64_t x;
+  uint64_t y;
+  uint64_t z;
+};
+```
+
+when passed by value:
+
+MSVC passes `NoRequestedAlign` and `RequestedAlign1` on the stack (like `byval`), and passes `RequestedAlign8` indirectly.
+Clang passes `NoRequestedAlign` on the stack (with `byval`), and passes `RequestedAlign1` and `RequestedAlign8` indirectly.
+
+It seems that Clang passes a struct indirectly if there is any `__declspec(align)` requested alignment, but MSVC only does so if the requested alignment is > 4.
+
+Demo: https://clang.godbolt.org/z/fsn78PhxT
+
+Comment by nikic: cc @rnk who implemented https://reviews.llvm.org/D72114.
+Comment by rnk: The text from the commit message describes the correct behavior: "remaining arguments with required alignment greater than 4 bytes are passed indirectly", but I guess there must be a bug in implementation.
+Comment by rnk: This code doesn't look right:
+https://github.com/llvm/llvm-project/blob/main/clang/lib/AST/ASTContext.cpp#L2339
+
+It seems like we have a related bug if you move the alignment requirement from the RecordDecl to the FieldDecl:
+https://clang.godbolt.org/z/PTccrsd8j
+
+Clang passes directly, but MSVC passes indirectly. Ideally, we should pull the required alignment from the ASTRecordLayout, which has the RequiredAlign field and rolls up all the subobject alignment requirements, but I'm sure that will break something somewhere.
+Comment by rnk: I think MSVC is actually ignoring the requests to underalign the struct, see warning [C4359](https://learn.microsoft.com/en-us/cpp/error-messages/compiler-warnings/compiler-warning-level-3-c4359?view=msvc-170), which you get if you move the declspec between `struct` and the identifier.
+
+This is a janky patch, but I think it will fix things:
+```
+$ git diff
+diff --git a/clang/lib/CodeGen/TargetInfo.cpp b/clang/lib/CodeGen/TargetInfo.cpp
+index 3b9cce40b2fb..ce19c960353a 100644
+--- a/clang/lib/CodeGen/TargetInfo.cpp
++++ b/clang/lib/CodeGen/TargetInfo.cpp
+@@ -1894,8 +1894,16 @@ ABIArgInfo X86_32ABIInfo::classifyArgumentType(QualType Ty,
+ 
+     // Pass over-aligned aggregates on Windows indirectly. This behavior was
+     // added in MSVC 2015.
+-    if (IsWin32StructABI && TI.isAlignRequired() && TI.Align > 32)
+-      return getIndirectResult(Ty, /*ByVal=*/false, State);
++    if (IsWin32StructABI) {
++      if (RT) {
++        const ASTRecordLayout &Layout =
++            getContext().getASTRecordLayout(RT->getDecl());
++        if (Layout.getRequiredAlignment() > CharUnits::fromQuantity(4))
++          return getIndirectResult(Ty, /*ByVal=*/false, State);
++      } else if (TI.isAlignRequired() && TI.Align > 32) {
++        return getIndirectResult(Ty, /*ByVal=*/false, State);
++      }
++    }
+ 
+     // Expand small (<= 128-bit) record types when we know that the stack layout
+     // of those arguments will match the struct. This is important because the
+```
+
+The meaning of TypeInfo::AlignRequirement still seems underspecified.
+Comment by rnk: Should be fixed by 651e5ae62d29fdb07eb85f75ab7e686b98479f3a

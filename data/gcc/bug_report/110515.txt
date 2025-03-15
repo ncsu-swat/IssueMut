@@ -1,0 +1,394 @@
+Bug Summary: [12 Regression] llvm-15.0.7 possibly invalid code on -O3
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: alias, wrong-code
+Known to Work: 11.1.0, 12.3.1, 13.1.1, 14.0
+Known to Fail: 12.1.0, 12.3.0, 13.1.0
+
+Comments:
+- User: Sergei Trofimovich | Time: 2023-07-01 21:52:54 UTC
+  Text: Createdattachment 55447[details]DwarfCompileUnit.cpp
+
+Initially the failure is observed onr14-2233-gfca6d9c12f5bf0where llvm-15.0.7 test suite fails a single test:
+
+  Failed Tests (1):
+    LLVM :: DebugInfo/X86/vla-multi.ll
+
+I think I shrunk it down to DwarfCompileUnit.cpp:
+
+$ g++ -std=c++14 DwarfCompileUnit.cpp -O2 $cxxflags -o bug-O2 && ./bug-O2
+Illegal instruction (core dumped)
+$ g++ -std=c++14 DwarfCompileUnit.cpp -O1 $cxxflags -o bug-O1 && ./bug-O1
+<ok>
+
+It's a very fragile test:
+- any inlines I try seem to repair the test
+- -fno-strict-aliasing unbreaks it (I believe the code is strict-aliasing clean)
+- optimization option changes repair the test
+
+$ g++ -v
+Using built-in specs.
+COLLECT_GCC=/<<NIX>>/gcc-14.0.0/bin/g++
+COLLECT_LTO_WRAPPER=/<<NIX>>/gcc-14.0.0/libexec/gcc/x86_64-unknown-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-unknown-linux-gnu
+Configured with:
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 99999999 (experimental) (GCC)
+
+- User: Sergei Trofimovich | Time: 2023-07-01 21:56:25 UTC
+  Text: I tried revertingr14-1597-g64d90d06d2db43in hopes to sidestepPR110228. It did not help.
+
+- User: Andrew Pinski | Time: 2023-07-01 22:11:53 UTC
+  Text: It also fails in GCC 13.
+
+- User: Andrew Pinski | Time: 2023-07-01 22:12:17 UTC
+  Text: And GCC 12.
+
+- User: Andrew Pinski | Time: 2023-07-01 22:37:31 UTC
+  Text: Right away I can say it is not phiopt that is causing the issue:
+That is:
+doing `__attribute__((optimize(3, "no-ssa-phiopt")))` (instead of just 3) still fails.
+
+Turning off SRA allows it to work but I suspect SRA is just exposing it.
+
+- User: Andrew Pinski | Time: 2023-07-01 23:32:49 UTC
+  Text: I am not 100% sure but I think the problem is related to this code (note I added that asm comment there):
+```
+    V *P = u.i;
+    V *E = P + InlineSlots;
+    for (; P != E; ++P) {
+        if (P->v != EmptyKey) {
+            TmpEnd->v = P->v;
+            ++TmpEnd;
+        }
+    }
+
+    Small = false;
+    //asm("":"+m"(*this)::"memory");
+    u.o = LargeRep{new V[128], 128};
+```
+
+The problem is most likely the read from u.i is happening after the store to u.o.
+
+- User: Richard Biener | Time: 2023-07-03 07:12:22 UTC
+  Text: Turning off PRE also allows it to pass but I guess it's the same as with SRA.
+-fno-strict-aliasing also helps, -fno-ipa-modref doesn't.  I suspect bisection
+isn't going to help much, but maybe it points to a small set of changes on the testcase itself.
+
+- User: Sergei Trofimovich | Time: 2023-07-04 22:40:12 UTC
+  Text: (In reply to Richard Biener fromcomment #6)> Turning off PRE also allows it to pass but I guess it's the same as with SRA.
+> -fno-strict-aliasing also helps, -fno-ipa-modref doesn't.  I suspect
+> bisection
+> isn't going to help much, but maybe it points to a small set of changes on
+> the testcase itself.Bisect landed on ther12-4790-g4b3a325f07aceb:
+
+$ git bisect bad
+4b3a325f07acebf47e82de227ce1d5ba62f5bcae is the first bad commit
+commit 4b3a325f07acebf47e82de227ce1d5ba62f5bcae
+Author: Aldy Hernandez <aldyh@redhat.com>
+Date:   Thu Oct 28 15:35:21 2021 +0200
+
+    Remove VRP threader passes in exchange for better threading pre-VRP.
+
+- User: Richard Biener | Time: 2023-07-05 10:57:35 UTC
+  Text: (In reply to Sergei Trofimovich fromcomment #7)> (In reply to Richard Biener fromcomment #6)
+> > Turning off PRE also allows it to pass but I guess it's the same as with SRA.
+> > -fno-strict-aliasing also helps, -fno-ipa-modref doesn't.  I suspect
+> > bisection
+> > isn't going to help much, but maybe it points to a small set of changes on
+> > the testcase itself.
+> 
+> Bisect landed on ther12-4790-g4b3a325f07aceb:
+> 
+> $ git bisect bad
+> 4b3a325f07acebf47e82de227ce1d5ba62f5bcae is the first bad commit
+> commit 4b3a325f07acebf47e82de227ce1d5ba62f5bcae
+> Author: Aldy Hernandez <aldyh@redhat.com>
+> Date:   Thu Oct 28 15:35:21 2021 +0200
+> 
+>     Remove VRP threader passes in exchange for better threading pre-VRP.After this commit the bug still appears with -fdisable-tree-threadfull1 -fdisable-tree-threadfull2 and before the commit it appears with
+-fdisable-tree-vrp-thread1 -fdisable-tree-vrp-thread2 so it seems
+removing the threading passes after VRP exposes the issue.
+
+Looking at the source and the IL of grow() I think the issue is that
+loop invariant motion hoists _134 and _104 in
+
+  _31 = Visited.Small;
+  if (_31 != 0)
+    goto <bb 5>; [50.00%]
+  else
+    goto <bb 4>; [50.00%]
+  
+  <bb 4> [local count: 621159684]:
+  _145 = MEM[(struct LargeRep *)&Visited + 8B].Slots;
+  _34 = MEM[(struct LargeRep *)&Visited + 8B].Capacity;
+  if (_34 != 0)
+    goto <bb 5>; [0.00%]
+  else
+    goto <bb 9>; [0.00%]
+
+  <bb 5> [local count: 955630290]:
+  # _134 = PHI <_34(4), 2(3)>
+  # _104 = PHI <_145(4), &Visited.u.i(3)>
+
+  <bb 6> [local count: 8933211531]:
+
+out of the inner first loop which I think is OK even though it makes
+the _145 and _34 reads unconditional.  Then PRE hoists those further,
+but correctly identifying
+
+  Visited.Small = 0;
+  _94 = operator new [] (1024);
+  Visited.u.o.Slots = _94;
+  Visited.u.o.Capacity = 128;
+
+as where they change.
+
+Interestingly I can disable (almost) all passes after tree PRE and still
+get the failure.  One change PRE does is
+
+-  _18 = MEM[(struct V *)&Visited + 8B].v;
+-  if (_18 != 790526)
+-    goto <bb 26>; [66.00%]
++  _196 = (long unsigned int) prephitmp_173;
++  if (prephitmp_173 != 790526B)
++    goto <bb 22>; [66.00%]
+
+where it replaces the read with _94 (or EmptyKey as from entry).  That's
+phishy.  It's the != EmptyKey check in grow when copying inline slots into
+temporary storage.
+
+So on 4b3a325f07acebf47e82de227ce1d5ba62f5bcae^ (one before the bisected
+rev.) it fails with
+
+g++ t.C -O2 -fdisable-tree-vrp-thread1 -fdump-tree-pre-details -fdump-tree-all -fno-tree-tail-merge -fno-tree-vectorize -fno-tree-loop-optimize -fdisable-tree-sink1 -fdisable-tree-dse3 -fdisable-tree-dce4 -fdisable-tree-fre5 -fdisable-tree-dom3 -fdisable-tree-thread3 -fdisable-tree-thread4 -fdisable-tree-vrp2 -fdisable-tree-vrp-thread2 -fdisable-tree-dse5 -fdisable-tree-cddce3 -fdisable-tree-sink2 -fdisable-tree-store-merging -fdisable-tree-dce7 -fdisable-tree-modref2 -fdisable-tree-local-pure-const2 -fdisable-tree-split-paths -fdisable-tree-ccp4 -fdisable-tree-slsr -fdisable-tree-reassoc2 -fdisable-tree-switchlower1 -fdisable-tree-forwprop4 -fdisable-tree-phiopt4 -fno-gcse -fno-dse -fno-gcse-after-reload -fdbg-cnt=treepre_insert:1-3:16-21:24-24 -fno-tree-partial-pre
+
+So it goes that the above load is CSEd to the LIM inserted load plus
+a conversion from pointer to unsigned long:
+
+Value numbering stmt = _145 = MEM[(struct LargeRep *)&Visited + 8B].Slots;
+Setting value number of _145 to _145 (changed)
+...
+Value numbering stmt = _18 = MEM[(struct V *)&Visited + 8B].v;
+Inserting name _47 for expression (long unsigned int) _145
+Setting value number of _18 to _47 (changed)
+
+we seem to disregard TBAA when CSEing two loads without an intervening
+possibly aliasing stores.  But this then causes PRE (well, that's a
+long-long-standing issue...) to record the later load to EXP_GEN as
+
+exp_gen[25] := { {component_ref<Slots>,mem_ref<8B>,addr_expr<&Visited>}@.MEM_129 (0084), _18 (0031) }
+
+so to PRE it appears that we do
+
+  _18 = (long unsigned int) MEM[(struct LargeRep *)&Visited + 8B].Slots;
+
+and thus the wrong ref is used for disambiguation which means we
+disambiguate against
+
+  TheSlot_172->v = Item$f_20;
+
+which eventually stores to that slot.
+
+*sigh*
+
+- User: Richard Biener | Time: 2023-07-05 12:36:27 UTC
+  Text: So IMHO it's the fault of invariant motion moving
+
+_145 = MEM[(struct LargeRep *)&Visited + 8B].Slots;
+
+and
+
+_34 = MEM[(struct LargeRep *)&Visited + 8B].Capacity;
+
+out of loop 10 as these loads are executed conditional.  They are know
+to not trap and that's why LIM doesn't require them unconditionally
+executed but as we can see here CSE later takes advantage of undefinedness
+if there's a load using the wrong TBAA type not matching the dynamic type
+of the storage.
+
+For example
+
+char storage[4] __attribute__((aligned(4)));
+double foo (int n, int kind)
+{
+  double res;
+  for (int i = 0; i < n; ++i)
+    if (kind)
+      res = *(int *)storage;
+    else
+      res = *(float *)storage;
+  return res;
+}
+
+is transformed to
+
+  <bb 2> [local count: 118111600]:
+  if (n_7(D) > 0)
+    goto <bb 8>; [89.00%]
+  else
+    goto <bb 7>; [11.00%]
+
+  <bb 8> [local count: 105119324]:
+  _2 = MEM[(float *)&storage];
+  _1 = MEM[(int *)&storage];
+
+  <bb 3> [local count: 955630225]:
+  # i_16 = PHI <i_13(9), 0(8)>
+  if (kind_10(D) != 0)
+    goto <bb 4>; [50.00%]
+  else
+    goto <bb 5>; [50.00%]
+
+  <bb 4> [local count: 477815112]:
+  res_12 = (double) _1;
+  goto <bb 6>; [100.00%]
+
+  <bb 5> [local count: 477815112]:
+  res_11 = (double) _2;
+
+  <bb 6> [local count: 955630225]:
+  # res_3 = PHI <res_12(4), res_11(5)>
+  i_13 = i_16 + 1;
+  if (n_7(D) > i_13)
+    goto <bb 9>; [89.00%]
+  else
+    goto <bb 7>; [11.00%]
+
+  <bb 9> [local count: 850510901]:
+  goto <bb 3>; [100.00%]
+
+  <bb 7> [local count: 118111600]:
+  # res_15 = PHI <res_3(6), res_6(D)(2)>
+  return res_15;
+
+and then eventually to the following, unconditionally using float as alias set.
+
+  <bb 2> [local count: 118111600]:
+  if (n_7(D) > 0)
+    goto <bb 3>; [89.00%]
+  else
+    goto <bb 6>; [11.00%]
+
+  <bb 3> [local count: 105119324]:
+  _2 = MEM[(float *)&storage];
+  if (kind_10(D) != 0)
+    goto <bb 4>; [50.00%]
+  else
+    goto <bb 5>; [50.00%]
+
+  <bb 4> [local count: 52559662]:
+  _4 = VIEW_CONVERT_EXPR<int>(_2);
+  res_12 = (double) _4;
+  goto <bb 6>; [100.00%]
+
+  <bb 5> [local count: 52559662]:
+  res_11 = (double) _2;
+
+  <bb 6> [local count: 118111600]:
+  # res_15 = PHI <res_11(5), res_6(D)(2), res_12(4)>
+  return res_15;
+
+- User: Richard Biener | Time: 2023-07-05 13:55:40 UTC
+  Text: So compute_avail in PRE tries to detect this situation and it ends up modifying the alias set of the load to zero (and is successfully in doing that).  I'm testing a patch to plug a hole in that logic.
+
+- User: GCC Commits | Time: 2023-07-06 07:30:24 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:9f4f833455bb35c11d03e93f802604ac7cd8b740commitr14-2344-g9f4f833455bb35c11d03e93f802604ac7cd8b740Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Jul 5 15:57:49 2023 +0200
+
+    tree-optimization/110515 - wrong code with LIM + PRE
+    
+    In this PR we face the issue that LIM speculates a load when
+    hoisting it out of the loop (since it knows it cannot trap).
+    Unfortunately this exposes undefined behavior when the load
+    accesses memory with the wrong dynamic type.  This later
+    makes PRE use that representation instead of the original
+    which accesses the same memory location but using a different
+    dynamic type leading to a wrong disambiguation of that
+    original access against another and thus a wrong-code transform.
+    
+    Fortunately there already is code in PRE dealing with a similar
+    situation for code hoisting but that left a small gap which
+    when fixed also fixes the wrong-code transform in this bug even
+    if it doesn't address the underlying issue of LIM speculating
+    that load.
+    
+    The upside is this fix is trivially safe to backport and chances
+    of code generation regressions are very low.PR tree-optimization/110515* tree-ssa-pre.cc (compute_avail): Make code dealing
+            with hoisting loads with different alias-sets more
+            robust.
+    
+            * g++.dg/opt/pr110515.C: New testcase.
+
+- User: Richard Biener | Time: 2023-07-06 07:30:51 UTC
+  Text: Fixed on trunk sofar.
+
+- User: Sergei Trofimovich | Time: 2023-07-06 10:09:00 UTC
+  Text: I confirm the change fixed llvm-15.0.7 test suite. Thank you!
+
+- User: GCC Commits | Time: 2023-07-07 12:07:04 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:0d20f9dbbd69a9bf43a6324128d8c08175e6eab6commitr13-7545-g0d20f9dbbd69a9bf43a6324128d8c08175e6eab6Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Jul 5 15:57:49 2023 +0200
+
+    tree-optimization/110515 - wrong code with LIM + PRE
+    
+    In this PR we face the issue that LIM speculates a load when
+    hoisting it out of the loop (since it knows it cannot trap).
+    Unfortunately this exposes undefined behavior when the load
+    accesses memory with the wrong dynamic type.  This later
+    makes PRE use that representation instead of the original
+    which accesses the same memory location but using a different
+    dynamic type leading to a wrong disambiguation of that
+    original access against another and thus a wrong-code transform.
+    
+    Fortunately there already is code in PRE dealing with a similar
+    situation for code hoisting but that left a small gap which
+    when fixed also fixes the wrong-code transform in this bug even
+    if it doesn't address the underlying issue of LIM speculating
+    that load.
+    
+    The upside is this fix is trivially safe to backport and chances
+    of code generation regressions are very low.PR tree-optimization/110515* tree-ssa-pre.cc (compute_avail): Make code dealing
+            with hoisting loads with different alias-sets more
+            robust.
+    
+            * g++.dg/opt/pr110515.C: New testcase.
+    
+    (cherry picked from commit 9f4f833455bb35c11d03e93f802604ac7cd8b740)
+
+- User: GCC Commits | Time: 2023-11-27 11:34:57 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:fe39ced331e76a85bb57b71b8acd9de9122bd91ccommitr12-10007-gfe39ced331e76a85bb57b71b8acd9de9122bd91cAuthor: Richard Biener <rguenther@suse.de>
+Date:   Wed Jul 5 15:57:49 2023 +0200
+
+    tree-optimization/110515 - wrong code with LIM + PRE
+    
+    In this PR we face the issue that LIM speculates a load when
+    hoisting it out of the loop (since it knows it cannot trap).
+    Unfortunately this exposes undefined behavior when the load
+    accesses memory with the wrong dynamic type.  This later
+    makes PRE use that representation instead of the original
+    which accesses the same memory location but using a different
+    dynamic type leading to a wrong disambiguation of that
+    original access against another and thus a wrong-code transform.
+    
+    Fortunately there already is code in PRE dealing with a similar
+    situation for code hoisting but that left a small gap which
+    when fixed also fixes the wrong-code transform in this bug even
+    if it doesn't address the underlying issue of LIM speculating
+    that load.
+    
+    The upside is this fix is trivially safe to backport and chances
+    of code generation regressions are very low.PR tree-optimization/110515* tree-ssa-pre.cc (compute_avail): Make code dealing
+            with hoisting loads with different alias-sets more
+            robust.
+    
+            * g++.dg/opt/pr110515.C: New testcase.
+    
+    (cherry picked from commit 9f4f833455bb35c11d03e93f802604ac7cd8b740)
+
+- User: Richard Biener | Time: 2023-11-27 11:38:19 UTC
+  Text: Fixed.
+

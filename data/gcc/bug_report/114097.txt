@@ -1,0 +1,200 @@
+Bug Summary: Missed register optimization in _Noreturn functions
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Petr Skocik | Time: 2024-02-25 11:07:39 UTC
+  Text: Consider a never-returning functions such as this:
+
+#include<setjmp.h>
+#include<stdio.h>
+//_Noreturn
+void noret(unsigned A, unsigned B, unsigned C, unsigned D, unsigned E, jmp_buf Jb){
+
+    for(;A--;) puts("A");
+    for(;B--;) puts("B");
+    for(;C--;) puts("C");
+    for(;D--;) puts("D");
+    for(;E--;) puts("E");
+    
+    longjmp(Jb,1);
+}https://godbolt.org/z/35YjrhjYqIn its prologue, gcc saves the arguments in call-preserved registers to preserve them around the puts calls, and it does so the usual way: by (1) pushing the old values of the call-preserved registers to the stack and (2) actually moving the arguments into the call-preserved registers.
+
+        pushq   %r15
+        movq    %r9, %r15
+        pushq   %r14
+        movl    %edi, %r14d
+        pushq   %r13
+        movl    %esi, %r13d
+        pushq   %r12
+        movl    %edx, %r12d
+        pushq   %rbp
+        movl    %ecx, %ebp
+        pushq   %rbx
+        movl    %r8d, %ebx
+        pushq   %rax
+        //...
+
+Since this function demonstrably never returns, step 1 can be entirely elided as the old values of the call-preserved registers won't ever need to be restored
+(desirably, gcc does not generate the would-be-dead restoration code):
+
+
+        movq    %r9, %r15
+        movl    %edi, %r14d
+        movl    %esi, %r13d
+        movl    %edx, %r12d
+        movl    %ecx, %ebp
+        movl    %r8d, %ebx
+        pushq   %rax
+        //...
+
+(Also desirable would be the unrealized tailoptimization of the longjmp call in this case:https://gcc.gnu.org/bugzilla/show_bug.cgi?id=10837)
+
+- User: H.J. Lu | Time: 2024-02-25 13:12:29 UTC
+  Text: __attribute__((noreturn)) works in GCC 14:
+
+[hjl@gnu-cfl-3 tmp]$ cat y.c
+#include<setjmp.h>
+#include<stdio.h>
+//_Noreturn
+__attribute__((noreturn))
+void noret(unsigned A, unsigned B, unsigned C, unsigned D, unsigned E, jmp_buf Jb){
+
+    for(;A--;) puts("A");
+    for(;B--;) puts("B");
+    for(;C--;) puts("C");
+    for(;D--;) puts("D");
+    for(;E--;) puts("E");
+    
+    longjmp(Jb,1);
+}
+[hjl@gnu-cfl-3 tmp]$ /usr/gcc-14.0.1-x32/bin/gcc -S -O2 y.c
+[hjl@gnu-cfl-3 tmp]$ cat y.s
+	.file	"y.c"
+	.text
+	.section	.rodata.str1.1,"aMS",@progbits,1
+.LC0:
+	.string	"A"
+.LC1:
+	.string	"B"
+.LC2:
+	.string	"C"
+.LC3:
+	.string	"D"
+.LC4:
+	.string	"E"
+	.text
+	.p2align 4
+	.globl	noret
+	.type	noret, @function
+noret:
+.LFB11:
+	.cfi_startproc
+	subq	$8, %rsp
+	.cfi_def_cfa_offset 16
+	movl	%esi, %r15d
+	movl	%edx, %r14d
+	movl	%ecx, %r13d
+	movl	%r8d, %ebp
+	movq	%r9, %r12
+	testl	%edi, %edi
+	je	.L2
+	leal	-1(%rdi), %ebx
+	.p2align 4,,10
+	.p2align 3
+.L3:
+	movl	$.LC0, %edi
+	call	puts
+	subl	$1, %ebx
+	jnb	.L3
+.L2:
+	leal	-1(%r15), %ebx
+	testl	%r15d, %r15d
+	je	.L4
+	.p2align 4,,10
+	.p2align 3
+.L5:
+	movl	$.LC1, %edi
+	call	puts
+	subl	$1, %ebx
+	jnb	.L5
+.L4:
+	leal	-1(%r14), %ebx
+	testl	%r14d, %r14d
+	je	.L6
+	.p2align 4,,10
+	.p2align 3
+.L7:
+	movl	$.LC2, %edi
+	call	puts
+	subl	$1, %ebx
+	jnb	.L7
+.L6:
+	leal	-1(%r13), %ebx
+	testl	%r13d, %r13d
+	je	.L8
+	.p2align 4,,10
+	.p2align 3
+.L9:
+	movl	$.LC3, %edi
+	call	puts
+	subl	$1, %ebx
+	jnb	.L9
+.L8:
+	leal	-1(%rbp), %ebx
+	testl	%ebp, %ebp
+	je	.L10
+	.p2align 4,,10
+	.p2align 3
+.L11:
+	movl	$.LC4, %edi
+	call	puts
+	subl	$1, %ebx
+	jnb	.L11
+.L10:
+	movl	$1, %esi
+	movq	%r12, %rdi
+	call	longjmp
+	.cfi_endproc
+.LFE11:
+	.size	noret, .-noret
+	.ident	"GCC: (GNU) 14.0.1 20240223 (experimental)"
+	.section	.note.GNU-stack,"",@progbits
+[hjl@gnu-cfl-3 tmp]$
+
+- User: H.J. Lu | Time: 2024-02-25 13:23:56 UTC
+  Text: I couldn't find a way to access the _Noreturn info in backend.
+
+- User: H.J. Lu | Time: 2024-02-25 13:37:11 UTC
+  Text: Createdattachment 57524[details]A patch
+
+- User: Petr Skocik | Time: 2024-02-25 14:18:46 UTC
+  Text: Excellent! Thank you very much. Didn't realize the functionality was already there, but didn't work without an explicit __attribute((noreturn)). Now I can get rid of my most complex assembly function which I stupidly (back then I thought cleverly) wrote. :)
+
+- User: H.J. Lu | Time: 2024-02-25 16:09:11 UTC
+  Text: A patch is submitted:https://patchwork.sourceware.org/project/gcc/list/?series=31294
+
+- User: GCC Commits | Time: 2024-02-26 10:31:30 UTC
+  Text: The master branch has been updated by H.J. Lu <hjl@gcc.gnu.org>:https://gcc.gnu.org/g:bb98f71bac8aace4e685e648a81dfaf365123833commitr14-9178-gbb98f71bac8aace4e685e648a81dfaf365123833Author: H.J. Lu <hjl.tools@gmail.com>
+Date:   Sun Feb 25 13:14:39 2024 -0800
+
+    x86: Check interrupt instead of noreturn attribute
+    
+    ix86_set_func_type checks noreturn attribute to avoid incompatible
+    attribute error in LTO1 on interrupt functions.  Since TREE_THIS_VOLATILE
+    is set also for _Noreturn without noreturn attribute, check interrupt
+    attribute for interrupt functions instead.
+    
+    gcc/PR target/114097* config/i386/i386-options.cc (ix86_set_func_type): Check
+            interrupt instead of noreturn attribute.
+    
+    gcc/testsuite/PR target/114097* gcc.target/i386/pr114097-1.c: New test.
+
+- User: H.J. Lu | Time: 2024-02-26 11:10:08 UTC
+  Text: Fixed.
+

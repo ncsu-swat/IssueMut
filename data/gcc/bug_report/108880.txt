@@ -1,0 +1,258 @@
+Bug Summary: [11 Regression] slow compilation with "-fsanitize=undefined"
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: compile-time-hog
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Qirun Zhang | Time: 2023-02-22 06:41:52 UTC
+  Text: gcc-10 works fine.
+
+$ time gcc-10 -fsanitize=undefined  abc.c
+
+real    0m0.081s
+
+
+$ time gcc-11 -fsanitize=undefined  abc.c
+
+real    0m7.045s
+
+$ time gcc-trunk -fsanitize=undefined  abc.c
+
+real    0m10.346s
+
+$ gcc-trunk -v
+gcc version 13.0.1 20230218 (experimental) [masterr13-6132-g32b5875c911] (GCC)
+
+
+$ cat abc.c
+long a;
+short b, e;
+char c;
+int d, f, g;
+void h() {
+  int i;
+  f &= i ^= (((g &= 0 / d / d % 8 << 0 << 2) % a >> e) / c >> b) / 1 % 8 << 3;
+}
+void main() {}
+
+- User: Andrew Pinski | Time: 2023-02-22 06:53:50 UTC
+  Text: Note with -fdump-tree-all it times out too.
+
+- User: Andrew Pinski | Time: 2023-02-22 06:54:36 UTC
+  Text: phase parsing                      :   7.10 (100%)   0.02 (100%)   7.32 ( 99%)   216k ( 11%)
+
+- User: Andrew Pinski | Time: 2023-02-22 07:12:33 UTC
+  Text: It is still fast with the C++ front-end.
+
+It is also still fast with -std=gnu90 in GCC 11+.
+
+- User: Richard Biener | Time: 2023-02-22 10:25:43 UTC
+  Text: It's not only "slow", it also produces a gigantic executable, the .original dump was 7.1GB when I stopped the compilation ...
+
+The culprit is c_genericize calling c_genericize_control_r which must somehow do the ubsan instrumentation as well.
+
+- User: Marek Polacek | Time: 2023-02-22 15:41:06 UTC
+  Text: Started withr11-3299:
+
+commit cba079f354a55363916759f6f186f92c5616b98a
+Author: Sandra Loosemore <sandra@codesourcery.com>
+Date:   Sat Sep 19 07:32:35 2020 -0700
+
+    Move loop and switch tree data structures from cp/ to c-family/.
+    
+    This patch moves the definitions for DO_STMT, FOR_STMT, WHILE_STMT,
+    SWITCH_STMT, BREAK_STMT, and CONTINUE_STMT from the C++ front end to
+    c-family.  This includes the genericizers, pretty-printers, and dump
+    support as well as the tree definitions and accessors.  Some related
+    code for OMP_FOR and similar OMP constructs is also moved.
+
+- User: Marek Polacek | Time: 2023-02-22 15:51:45 UTC
+  Text: FWIW, -fsanitize=signed-integer-overflow,shift seems to be enough to trigger the runaway compilation.
+
+- User: Marek Polacek | Time: 2023-02-22 16:16:14 UTC
+  Text: The C90/C99 difference is due to ubsan_instrument_shift:
+
+193   /* For signed x << y, in C99 and later, the following:
+194      (unsigned) x >> (uprecm1 - y)
+195      if non-zero, is undefined.  */
+196   else if (code == LSHIFT_EXPR && flag_isoc99 && cxx_dialect < cxx11)
+197     {
+198       tree x = fold_build2 (MINUS_EXPR, op1_utype, uprecm1,
+199                             fold_convert (op1_utype, unshare_expr (op1)));
+
+- User: Marek Polacek | Time: 2023-02-22 18:24:45 UTC
+  Text: We generate HUGE trees for the div sanitization, but I notice that c_genericize_control_r doesn't use pset, like cp_genericize_r does.  So I think the fix would be to add a hash_set to c_genericize_control_r.
+
+Indeed, if I remove p_set->add (*stmt_p); in cp_genericize_r, the compilation with cc1plus also takes around 10s.
+
+- User: Jakub Jelinek | Time: 2023-02-22 19:48:29 UTC
+  Text: (In reply to Richard Biener fromcomment #4)> It's not only "slow", it also produces a gigantic executable, the .original
+> dump was 7.1GB when I stopped the compilation ...Well, original dump for deeply nested SAVE_EXPRs is pretty unusable, even when the actual trees are fairly small, because it prints each SAVE_EXPR in full.
+If we wanted to avoid that, we'd need to use during the printing some hash table on which SAVE_EXPRs we have printed already and print some id for them and print just that id rather than full content next time we see it.  Or perhaps trigger that behavior when we see deeper SAVE_EXPR nesting.> The culprit is c_genericize calling c_genericize_control_r which must
+> somehow do the ubsan instrumentation as well.As Marek said, on the C++ FE side this is handled by cp-gimplify.cc using a pset on its own and not trying to genericize a control stmt which has been handled already (e.g. when seeing it again in another SAVE_EXPR), or even SAVE_EXPRs that have been handled already.
+So, adding another pset that would be used also for C++ would be a waste.
+Now, the C FE in c-gimplify.cc has:
+      walk_tree_without_duplicates (&DECL_SAVED_TREE (fndecl),
+                                    c_genericize_control_r, NULL);
+so it effectively already creates a pset.
+Thus, I think we should replace this walk_tree_without_duplicates with a new pset + walk_tree, pass &pset twice - as pset and data and in c_genericize_control_r don't walk again what we've already walked.
+which
+
+- User: Marek Polacek | Time: 2023-02-22 19:50:19 UTC
+  Text: Another simple patch is
+
+--- a/gcc/c-family/c-gimplify.cc
++++ b/gcc/c-family/c-gimplify.cc
+@@ -516,7 +516,7 @@ c_genericize_control_stmt (tree *stmt_p, int *walk_subtrees, void *data,
+          tree t = tsi_stmt (i);
+          if (TREE_CODE (t) != DEBUG_BEGIN_STMT && nondebug_stmts < 2)
+        nondebug_stmts++;
+-         walk_tree_1 (tsi_stmt_ptr (i), func, data, NULL, lh);
++         walk_tree_without_duplicates_1 (tsi_stmt_ptr (i), func, data, lh);
+          if (TREE_CODE (t) != DEBUG_BEGIN_STMT
+          && (nondebug_stmts > 1 || TREE_SIDE_EFFECTS (tsi_stmt (i))))
+        clear_side_effects = false;
+
+- User: Jakub Jelinek | Time: 2023-02-22 20:06:20 UTC
+  Text: (In reply to Marek Polacek fromcomment #10)> Another simple patch is
+> 
+> --- a/gcc/c-family/c-gimplify.cc
+> +++ b/gcc/c-family/c-gimplify.cc
+> @@ -516,7 +516,7 @@ c_genericize_control_stmt (tree *stmt_p, int
+> *walk_subtrees, void *data,
+>           tree t = tsi_stmt (i);
+>           if (TREE_CODE (t) != DEBUG_BEGIN_STMT && nondebug_stmts < 2)
+>         nondebug_stmts++;
+> -         walk_tree_1 (tsi_stmt_ptr (i), func, data, NULL, lh);
+> +         walk_tree_without_duplicates_1 (tsi_stmt_ptr (i), func, data, lh);
+>           if (TREE_CODE (t) != DEBUG_BEGIN_STMT
+>           && (nondebug_stmts > 1 || TREE_SIDE_EFFECTS (tsi_stmt (i))))
+>         clear_side_effects = false;But that creates another pset, this time another one for each statement in each STATEMENT_LIST seen.  That would be terribly expensive.
+While the cp_genericize_r pset is just one for the whole function, the one used by
+walk_tree_without_duplicates for C is also one for the whole function.
+
+- User: Marek Polacek | Time: 2023-02-22 20:14:46 UTC
+  Text: Sure, it worked for the testcase because the STATEMENT_LIST only had two stmts.  I'm testing:
+
+--- a/gcc/c-family/c-gimplify.cc
++++ b/gcc/c-family/c-gimplify.cc
+@@ -516,7 +516,8 @@ c_genericize_control_stmt (tree *stmt_p, int *walk_subtrees, void *data,
+          tree t = tsi_stmt (i);
+          if (TREE_CODE (t) != DEBUG_BEGIN_STMT && nondebug_stmts < 2)
+        nondebug_stmts++;
+-         walk_tree_1 (tsi_stmt_ptr (i), func, data, NULL, lh);
++         walk_tree_1 (tsi_stmt_ptr (i), func, data,
++              static_cast<hash_set<tree> *>(data), lh);
+          if (TREE_CODE (t) != DEBUG_BEGIN_STMT
+          && (nondebug_stmts > 1 || TREE_SIDE_EFFECTS (tsi_stmt (i))))
+        clear_side_effects = false;
+@@ -572,8 +573,9 @@ c_genericize (tree fndecl)
+       bc_state_t save_state;
+       push_cfun (DECL_STRUCT_FUNCTION (fndecl));
+       save_bc_state (&save_state);
+-      walk_tree_without_duplicates (&DECL_SAVED_TREE (fndecl),
+-                   c_genericize_control_r, NULL);
++      hash_set<tree> pset;
++      walk_tree (&DECL_SAVED_TREE (fndecl), c_genericize_control_r, &pset,
++        &pset);
+       restore_bc_state (&save_state);
+       pop_cfun ();
+     }
+
+- User: Jakub Jelinek | Time: 2023-02-22 20:46:51 UTC
+  Text: (In reply to Marek Polacek fromcomment #12)> Sure, it worked for the testcase because the STATEMENT_LIST only had two
+> stmts.  I'm testing:
+> 
+> --- a/gcc/c-family/c-gimplify.cc
+> +++ b/gcc/c-family/c-gimplify.cc
+> @@ -516,7 +516,8 @@ c_genericize_control_stmt (tree *stmt_p, int
+> *walk_subtrees, void *data,
+>           tree t = tsi_stmt (i);
+>           if (TREE_CODE (t) != DEBUG_BEGIN_STMT && nondebug_stmts < 2)
+>         nondebug_stmts++;
+> -         walk_tree_1 (tsi_stmt_ptr (i), func, data, NULL, lh);
+> +         walk_tree_1 (tsi_stmt_ptr (i), func, data,
+> +              static_cast<hash_set<tree> *>(data), lh);I'd limit this change to !c_dialect_cxx () only, I'm afraid if it is done
+for C++ too, then cp_genericize_r won't then walk into those trees later on and could avoid replacing there something important.  While for C, there is walk_tree solely for the purposes of c_genericize_control* and nothing else.
+To avoid testing it in every iteration you could have a hash_set<tree> *pset temporary initialized based on c_dialect_cxx () to NULL or data and then just use it in the loop.>           if (TREE_CODE (t) != DEBUG_BEGIN_STMT
+>           && (nondebug_stmts > 1 || TREE_SIDE_EFFECTS (tsi_stmt (i))))
+>         clear_side_effects = false;
+
+- User: Marek Polacek | Time: 2023-02-22 20:51:42 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #13)> (In reply to Marek Polacek fromcomment #12)
+> > Sure, it worked for the testcase because the STATEMENT_LIST only had two
+> > stmts.  I'm testing:
+> > 
+> > --- a/gcc/c-family/c-gimplify.cc
+> > +++ b/gcc/c-family/c-gimplify.cc
+> > @@ -516,7 +516,8 @@ c_genericize_control_stmt (tree *stmt_p, int
+> > *walk_subtrees, void *data,
+> >           tree t = tsi_stmt (i);
+> >           if (TREE_CODE (t) != DEBUG_BEGIN_STMT && nondebug_stmts < 2)
+> >         nondebug_stmts++;
+> > -         walk_tree_1 (tsi_stmt_ptr (i), func, data, NULL, lh);
+> > +         walk_tree_1 (tsi_stmt_ptr (i), func, data,
+> > +              static_cast<hash_set<tree> *>(data), lh);
+> 
+> I'd limit this change to !c_dialect_cxx () only, I'm afraid if it is done
+> for C++ too, then cp_genericize_r won't then walk into those trees later on
+> and could avoid replacing there something important.  While for C, there is
+> walk_tree solely for the purposes of c_genericize_control* and nothing else.
+> To avoid testing it in every iteration you could have a hash_set<tree> *pset
+> temporary initialized based on c_dialect_cxx () to NULL or data and then
+> just use it in the loop.Yeah, in C++ I get a crash in check_complete_insertion anyway.  I don't really see why but best to limit it to C.
+
+- User: GCC Commits | Time: 2023-02-22 22:47:17 UTC
+  Text: The trunk branch has been updated by Marek Polacek <mpolacek@gcc.gnu.org>:https://gcc.gnu.org/g:1370014f2ea02ec185cf1199027575916f79fe63commitr13-6290-g1370014f2ea02ec185cf1199027575916f79fe63Author: Marek Polacek <polacek@redhat.com>
+Date:   Wed Feb 22 15:17:03 2023 -0500
+
+    c-family: avoid compile-time-hog in c_genericize [PR108880]
+    
+    This fixes a compile-time hog with UBSan.  This only happened in cc1 but
+    not cc1plus.  The problem is ultimately that c_genericize_control_stmt/
+    STATEMENT_LIST -> walk_tree_1 doesn't use a hash_set to remember visited
+    nodes, so it kept on recursing for a long time.  We should be able to
+    use the pset that c_genericize created.  We just need to use walk_tree
+    instead of walk_tree_w_d so that the pset is explicit.PR c/108880gcc/c-family/ChangeLog:
+    
+            * c-gimplify.cc (c_genericize_control_stmt) <case STATEMENT_LIST>: Pass
+            pset to walk_tree_1.
+            (c_genericize): Call walk_tree with an explicit pset.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/ubsan/pr108880.c: New test.
+
+- User: Marek Polacek | Time: 2023-02-22 22:48:17 UTC
+  Text: Fixed on trunk so far.
+
+- User: GCC Commits | Time: 2023-03-04 18:02:58 UTC
+  Text: The releases/gcc-12 branch has been updated by Marek Polacek <mpolacek@gcc.gnu.org>:https://gcc.gnu.org/g:6ab4c8759754f34f5285924652238c829960cd4ccommitr12-9218-g6ab4c8759754f34f5285924652238c829960cd4cAuthor: Marek Polacek <polacek@redhat.com>
+Date:   Wed Feb 22 15:17:03 2023 -0500
+
+    c-family: avoid compile-time-hog in c_genericize [PR108880]
+    
+    This fixes a compile-time hog with UBSan.  This only happened in cc1 but
+    not cc1plus.  The problem is ultimately that c_genericize_control_stmt/
+    STATEMENT_LIST -> walk_tree_1 doesn't use a hash_set to remember visited
+    nodes, so it kept on recursing for a long time.  We should be able to
+    use the pset that c_genericize created.  We just need to use walk_tree
+    instead of walk_tree_w_d so that the pset is explicit.PR c/108880gcc/c-family/ChangeLog:
+    
+            * c-gimplify.cc (c_genericize_control_stmt) <case STATEMENT_LIST>: Pass
+            pset to walk_tree_1.
+            (c_genericize): Call walk_tree with an explicit pset.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/ubsan/pr108880.c: New test.
+    
+    (cherry picked from commit 1370014f2ea02ec185cf1199027575916f79fe63)
+
+- User: Marek Polacek | Time: 2023-03-07 17:45:06 UTC
+  Text: Fixed.
+

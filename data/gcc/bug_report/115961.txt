@@ -1,0 +1,176 @@
+Bug Summary: [15 Regression] wrong code on llvm-18.1.8 since r15-1936-g80e446e829d818 with bitfields less than the type mode precision
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2024-07-16 22:14:05 UTC
+  Text: Initially observed the failure onr15-1936-g80e446e829d818compiler on llvm-18.1.8 testsuite as failures:
+
+Failed Tests (22):
+  LLVM :: CodeGen/AArch64/regalloc-last-chance-recolor-with-split.mir
+  LLVM :: CodeGen/AArch64/tail-dup-redundant-phi.mir
+  LLVM :: CodeGen/AMDGPU/GlobalISel/llvm.amdgcn.image.load.2darraymsaa.ll
+  LLVM :: CodeGen/AMDGPU/GlobalISel/llvm.amdgcn.image.load.3d.ll
+  LLVM :: CodeGen/AMDGPU/InlineAsmCrash.ll
+  LLVM :: CodeGen/AMDGPU/llvm.amdgcn.image.dim.ll
+  LLVM :: CodeGen/AMDGPU/llvm.amdgcn.image.gather4.dim.ll
+  LLVM :: CodeGen/AMDGPU/llvm.amdgcn.image.msaa.load.x.ll
+  LLVM :: CodeGen/AMDGPU/llvm.amdgcn.image.sample.d16.dim.ll
+  LLVM :: CodeGen/AMDGPU/llvm.amdgcn.image.sample.dim.ll
+  LLVM :: CodeGen/PowerPC/inlineasm-copy.ll
+  LLVM :: CodeGen/SystemZ/asm-18.ll
+  LLVM :: CodeGen/X86/callbr-asm-outputs.ll
+  LLVM :: CodeGen/X86/statepoint-fixup-invoke.mir
+  LLVM :: CodeGen/X86/statepoint-fixup-shared-ehpad.mir
+  LLVM :: CodeGen/X86/statepoint-fixup-undef-def.mir
+  LLVM :: CodeGen/X86/statepoint-invoke-ra-enter-at-end.mir
+  LLVM :: CodeGen/X86/statepoint-invoke-ra-inline-spiller.mir
+  LLVM :: CodeGen/X86/statepoint-invoke-ra.mir
+  LLVM :: CodeGen/X86/statepoint-vreg-folding.mir
+  LLVM :: CodeGen/X86/statepoint-vreg-twoaddr.mir
+  LLVM :: CodeGen/X86/statepoint-vreg.mir
+
+Bisected down tor15-1936-g80e446e829d818: "Match: Support form 2 for the .SAT_TRUNC".
+
+Here is the minimized example that exhibits the failure:
+
+Ok:
+
+$ g++ -O1 a.cc -o a && ./a
+
+Bad:
+
+$ g++ -O2 a.cc -o a && ./a
+Illegal instruction (core dumped)
+
+/nix/store/lr4n7v61gnijc5jnvrgjhqklcvqsds40-gcc-wrapper-15.0.0/bin/g++ -v |& unnix
+Using built-in specs.
+COLLECT_GCC=/<<NIX>>/gcc-15.0.0/bin/g++
+COLLECT_LTO_WRAPPER=/<<NIX>>/gcc-15.0.0/libexec/gcc/x86_64-unknown-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-unknown-linux-gnu
+Configured with: ../source/configure --prefix=/<<NIX>>/gcc-15.0.0 --with-gmp-include=/<<NIX>>/gmp-6.3.0-dev/include --with-gmp-lib=/<<NIX>>/gmp-6.3.0/lib --with-mpfr-include=/<<NIX>>/mpfr-4.2.1-dev/include --with-mpfr-lib=/<<NIX>>/mpfr-4.2.1/lib --with-mpc=/<<NIX>>/libmpc-1.3.1 --with-native-system-header-dir=/<<NIX>>/glibc-2.39-52-dev/include --with-build-sysroot=/ --with-gxx-include-dir=/<<NIX>>/gcc-15.0.0/include/c++/15.0.0/ --program-prefix= --enable-lto --disable-libstdcxx-pch --without-included-gettext --with-system-zlib --enable-checking=release --enable-static --enable-languages=c,c++ --disable-multilib --enable-plugin --disable-libcc1 --with-isl=/<<NIX>>/isl-0.20 --disable-bootstrap --build=x86_64-unknown-linux-gnu --host=x86_64-unknown-linux-gnu --target=x86_64-unknown-linux-gnu
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 99999999 (experimental) (GCC)
+
+- User: Sergei Trofimovich | Time: 2024-07-16 22:15:24 UTC
+  Text: Forgot to post minimized example:
+
+// $ cat a.cc
+struct e { unsigned pre : 12; unsigned a : 4; };
+
+static unsigned min_u(unsigned a, unsigned b) { return (b < a) ? b : a; }
+
+__attribute__((noipa))
+void bug(e * v, unsigned def, unsigned use) {
+    e & defE = *v;
+    defE.a = min_u(use + 1, 0xf);
+}
+
+__attribute__((noipa, optimize(0)))
+int main(void) {
+    e v = { 0xded, 3 };
+
+    bug(&v, 32, 33);
+    if (v.a != 0xf) __builtin_trap();
+}
+
+- User: Andrew Pinski | Time: 2024-07-16 22:23:53 UTC
+  Text: The gimple looks semi-correct:
+  _1 = use_4(D) + 1;
+  _2 = .SAT_TRUNC (_1);
+  v_3(D)->a = _2;
+
+
+From:
+    e & defE = *v;
+    defE.a = min_u(use + 1, 0xf);
+
+
+There is a missing check for type_has_mode_precision_p somewhere.
+
+Either in direct_optab_supported_p or somewhere else.
+
+- User: Li Pan | Time: 2024-07-17 02:17:00 UTC
+  Text: Only x86 implemented the .SAT_TRUNC for scalar, so I bet it is almost the same as thishttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=115863?
+
+- User: Andrew Pinski | Time: 2024-07-17 03:33:44 UTC
+  Text: (In reply to Li Pan fromcomment #3)> Only x86 implemented the .SAT_TRUNC for scalar, so I bet it is almost the
+> same as thishttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=115863?No it is a different issue.
+
+here we have a uint:4; an unsigned integer with 4 bit precision which is not the same precision as QImode (8bit).
+
+Since the optabs are only mode, we only check the mode of the type which is QImode but the type has a lower precision than the mode itself.
+So we get a SAT_TRUNC which is using the QImode sat_truncate opcode but we really need 4bit sat_truncate.
+
+This is why I mentioned there is a missing check for type_has_mode_precision_p here.
+
+type_has_mode_precision_p is defined as:
+```
+inline bool
+type_has_mode_precision_p (const_tree t)
+{
+  return known_eq (TYPE_PRECISION (t), GET_MODE_PRECISION (TYPE_MODE (t)));
+}
+```
+
+I wonder if we have the same issue with some other direct calls internal functions too. But I have not looked into others that is accessible except for __builtin_clzg which always does the right thing.
+
+- User: Li Pan | Time: 2024-07-17 04:05:14 UTC
+  Text: Thanks Andrew Pinski.
+
+That make much sense to me, and I can reproduce this from upstream now. Let me file a patch for it.
+
+- User: GCC Commits | Time: 2024-07-24 04:52:53 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:905973410957891fec8a3e42eeefa4618780e0cecommitr15-2241-g905973410957891fec8a3e42eeefa4618780e0ceAuthor: Pan Li <pan2.li@intel.com>
+Date:   Thu Jul 18 17:23:36 2024 +0800
+
+    Internal-fn: Only allow modes describe types for internal fn[PR115961]
+    
+    The direct_internal_fn_supported_p has no restrictions for the type
+    modes.  For example the bitfield like below will be recog as .SAT_TRUNC.
+    
+    struct e
+    {
+      unsigned pre : 12;
+      unsigned a : 4;
+    };
+    
+    __attribute__((noipa))
+    void bug (e * v, unsigned def, unsigned use) {
+      e & defE = *v;
+      defE.a = min_u (use + 1, 0xf);
+    }
+    
+    This patch would like to add checks for the direct_internal_fn_supported_p,
+    and only allows the tree types describled by modes.
+    
+    The below test suites are passed for this patch:
+    1. The rv64gcv fully regression tests.
+    2. The x86 bootstrap tests.
+    3. The x86 fully regression tests.PR target/115961gcc/ChangeLog:
+    
+            * internal-fn.cc (type_strictly_matches_mode_p): Add new func
+            impl to check type strictly matches mode or not.
+            (type_pair_strictly_matches_mode_p): Ditto but for tree type
+            pair.
+            (direct_internal_fn_supported_p): Add above check for the tree
+            type pair.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.dg/torture/pr115961-run-1.C: New test.
+    
+    Signed-off-by: Pan Li <pan2.li@intel.com>
+
+- User: Andrew Pinski | Time: 2024-07-24 15:06:32 UTC
+  Text: Fixed. The fortran failures from my patches forPR 115086are also fixed after this.
+
+- User: Sergei Trofimovich | Time: 2024-07-25 07:39:12 UTC
+  Text: The change also fixes all llvm-18.1.8 testsuite failures for me. Thank you!
+

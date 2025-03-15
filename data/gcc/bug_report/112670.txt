@@ -1,0 +1,129 @@
+Bug Summary: RISC-V: Run fail on pr65518.c with -flto
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: testsuite-fail
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2023-11-22 11:06:25 UTC
+  Text: Case:
+
+#include <assert.h>
+
+#if VECTOR_BITS > 256
+#define NINTS (VECTOR_BITS / 32)
+#else
+#define NINTS 8
+#endif
+
+#define N (NINTS * 2)
+#define RESULT (NINTS * (NINTS - 1) / 2 * N + NINTS)
+
+typedef struct giga
+{
+  unsigned int g[N];
+} giga;
+
+unsigned long __attribute__((noinline,noclone))
+addfst(giga const *gptr, int num)
+{
+  unsigned int retval = 0;
+  int i;
+  for (i = 0; i < num; i++)
+    retval += gptr[i].g[0];
+  return retval;
+}
+
+int main ()
+{
+  struct giga g[NINTS];
+  unsigned int n = 1;
+  int i, j;
+  for (i = 0; i < NINTS; ++i)
+    for (j = 0; j < N; ++j)
+      {
+	g[i].g[j] = n++;
+	__asm__ volatile ("");
+      }
+  assert (addfst (g, NINTS) == RESULT);
+  return 0;
+}
+
+with -march=rv64gcv_zvfh_zfh_zvl512b -mabi=lp64d -O3 -fno-vect-cost-model
+The run passed.
+
+However, with -march=rv64gcv_zvfh_zfh_zvl512b -mabi=lp64d -O3 -fno-vect-cost-model -flto.
+
+It execution failed:
+bbl loader
+assertion "addfst (g, NINTS) == RESULT" failed: file "bug.c", line 38, function: main
+
+I compare the codegen, they are totally the same.
+I can't figure out what's the problem ?
+
+- User: Robin Dapp | Time: 2023-11-22 20:14:53 UTC
+  Text: The problem is exposed with the ipa copy propagation pass.  I haven't narrowed it down yet but will continue tomorrow.
+
+- User: GCC Commits | Time: 2023-11-23 12:09:08 UTC
+  Text: The master branch has been updated by Robin Dapp <rdapp@gcc.gnu.org>:https://gcc.gnu.org/g:35a688f434159a923420310860c5bc721e29a741commitr14-5777-g35a688f434159a923420310860c5bc721e29a741Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Thu Nov 23 19:59:52 2023 +0800
+
+    RISC-V: Disable AVL propagation of vrgather instruction
+    
+    This patch fixes following FAILs in zvl1024b of both RV32/RV64:
+    
+    FAIL: gcc.c-torture/execute/990128-1.c   -O2  execution test
+    FAIL: gcc.c-torture/execute/990128-1.c   -O2 -flto -fno-use-linker-plugin -flto-partition=none  execution test
+    FAIL: gcc.c-torture/execute/990128-1.c   -O2 -flto -fuse-linker-plugin -fno-fat-lto-objects  execution test
+    FAIL: gcc.c-torture/execute/990128-1.c   -O3 -fomit-frame-pointer -funroll-loops -fpeel-loops -ftracer -finline-functions  execution test
+    FAIL: gcc.c-torture/execute/990128-1.c   -O3 -g  execution test
+    FAIL: gcc.dg/torture/pr58955-2.c   -O3 -fomit-frame-pointer -funroll-loops -fpeel-loops -ftracer -finline-functions  execution test
+    
+    The root case can be simpliy described in this following small case:https://godbolt.org/z/7GaxbEGzGtypedef int64_t v1024b __attribute__ ((vector_size (128)));
+    
+    void foo (void *out, void *in, int64_t a, int64_t b)
+    {
+      v1024b v = {a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a};
+      v1024b v2 = {b,b,b,b,b,b,b,b,b,b,b,b,b,b,b,b};
+      v1024b index = *(v1024b*)in;
+      v1024b v3 = __builtin_shuffle (v, v2, index);
+      __riscv_vse64_v_i64m1 (out, (vint64m1_t)v3, 10);
+    }
+    
+    Incorrect ASM:
+    
+    foo:
+            li      a5,31
+            vsetivli        zero,10,e64,m1,ta,mu
+            vmv.v.x v2,a5
+            vl1re64.v       v1,0(a1)
+            vmv.v.x v4,a2
+            vand.vv v1,v1,v2
+            vmv.v.x v3,a3
+            vmsgeu.vi       v0,v1,16
+            vrgather.vv     v2,v4,v1       --> AVL = VLMAX according to codes.
+            vadd.vi v1,v1,-16
+            vrgather.vv     v2,v3,v1,v0.t  --> AVL = VLMAX according to codes.
+            vse64.v v2,0(a0)               --> AVL = 10 according to codes.
+            ret
+    
+    For vrgather dest, source, index instruction, when index may has the value > the following store AVL
+    that is index value > 10.  In this situation, the codes above will end up with:
+    
+    The source vector of vrgather has undefined value on index >= AVL (which is 10 in this case).
+    
+    So disable AVL propagation for vrgather instruction.PR target/112599PR target/112670gcc/ChangeLog:
+    
+            * config/riscv/riscv-avlprop.cc (alv_can_be_propagated_p): New function.
+            (vlmax_ta_p): Disable vrgather AVL propagation.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/pr112599-1.c: New test.
+
+- User: JuzheZhong | Time: 2023-11-23 12:10:21 UTC
+  Text: Fixed
+

@@ -1,0 +1,145 @@
+Bug Summary: wrong code with _BitInt() __builtin_add_overflow_p() and __builtin_mul_overflow_p() at -O2
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-03-22 04:15:42 UTC
+  Text: Createdattachment 57764[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -O2 testcase.c
+$ ./a.out 
+Aborted
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-9595-20240321132344-ga2fe34e0b99-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-9595-20240321132344-ga2fe34e0b99-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240321 (experimental) (GCC)
+
+- User: Zdenek Sojka | Time: 2024-03-22 11:37:52 UTC
+  Text: Createdattachment 57771[details]another testcase, using __builtin_mul_overflow_p
+
+Output for second testcase:
+$ x86_64-pc-linux-gnu-gcc -O2 testcase2.c
+$ ./a.out 
+Aborted
+
+- User: Jakub Jelinek | Time: 2024-03-22 11:50:56 UTC
+  Text: Strangely it is dependent on the printf loop, without that it works fine.
+
+Slightly adjusted testcase:
+
+#if __BITINT_MAXWIDTH__ >= 2000
+_BitInt(8) a;
+_BitInt(300) b;
+_BitInt(2000) c;
+
+unsigned
+foo (_BitInt(2000) d)
+{
+  int o = __builtin_add_overflow_p (d, 0, b);
+  _BitInt(2000) m = c * a;
+  unsigned u = m;
+  return u + o;
+}
+
+__attribute__((noipa)) void
+bar (int x)
+{
+  (void) x;
+}
+#endif
+
+int
+main ()
+{
+#if __BITINT_MAXWIDTH__ >= 2000
+  unsigned x = foo (0xfa7ac16f2613255eeb217e871c1f02221e26ce11f82d6a33206ec0ad5d4414722019933c0e2wb);
+  for (unsigned i = 0; i < sizeof (x); i++)
+    bar (((volatile unsigned char *) &x)[i]);
+  if (x != 1)
+    __builtin_abort ();
+#endif
+}
+
+- User: Zdenek Sojka | Time: 2024-03-22 11:57:34 UTC
+  Text: Createdattachment 57772[details]unreduced testcase ; output differs between -O0 and -O2
+
+- User: Zdenek Sojka | Time: 2024-03-22 11:57:59 UTC
+  Text: Createdattachment 57773[details]another unreduced testcase ; output differs between -O0 and -O2
+
+- User: Jakub Jelinek | Time: 2024-03-22 14:02:26 UTC
+  Text: Createdattachment 57779[details]gcc14-pr114425.patch
+
+Untested fix.
+
+- User: Jakub Jelinek | Time: 2024-03-22 14:18:23 UTC
+  Text: Though, guess it would help if evrp avoided undesirable propagation here:
+It is changing:
+   <bb 2> :
+   # DEBUG BEGIN_STMT
+   _8 = .ADD_OVERFLOW (d_7(D), 0);
+   _1 = IMAGPART_EXPR <_8>;
+   _2 = (_Bool) _1;
+   # DEBUG o => (int) _2
+   # DEBUG BEGIN_STMT
+   a.0_3 = a;
+   _4 = (_BitInt(2000)) a.0_3;
+   c.1_5 = c;
+   m_11 = _4 * c.1_5;
+   # DEBUG m => m_11
+   # DEBUG BEGIN_STMT
+   u_12 = (unsigned int) m_11;
+   # DEBUG u => u_12
+   # DEBUG BEGIN_STMT
+-  o.2_6 = (unsigned int) _2;
++  o.2_6 = (unsigned int) _1;
+   _13 = o.2_6 + u_12;
+   return _13;
+ 
+ }
+which is surely possible because IMAGPART_EXPR of .{ADD,SUB,MUL}_OVERFLOW has [0, 1]
+range, but for such large/huge _BitInt IMAGPART_EXPR it extends the lifetime of an expensive large variable rather than just being a boolean.
+
+- User: GCC Commits | Time: 2024-03-23 10:19:39 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:f92cf8cbbe199bda70d0dd7893e8c8836777e2d0commitr14-9640-gf92cf8cbbe199bda70d0dd7893e8c8836777e2d0Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Sat Mar 23 11:19:09 2024 +0100
+
+    bitint: Handle complex types in build_bitint_stmt_ssa_conflicts [PR114425]
+    
+    The task of the build_bitint_stmt_ssa_conflicts hook for
+    tree-ssa-coalesce.cc next to special casing the
+    multiplication/division/modulo is to ignore statements with
+    large/huge _BitInt lhs which isn't in names bitmap and on the
+    other side pretend all uses of the stmt are used in a later stmt
+    (single user of that SSA_NAME or perhaps single user of lhs of
+    the single user etc.) where the lowering will actually emit the
+    code.
+    
+    Unfortunately the function wasn't handling COMPLEX_TYPE of the large/huge
+    BITINT_TYPE, while the FE doesn't really support such types, they are
+    used under the hood for __builtin_{add,sub,mul}_overflow{,_p}, they are
+    also present or absent from the names bitmap and should be treated the same.
+    
+    Without this patch, the operands of .ADD_OVERFLOW were incorrectly pretended
+    to be used right in that call statement rather than on the cast stmt from
+    IMAGPART_EXPR of .ADD_OVERFLOW return value to some integral type.
+    
+    2024-03-23  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114425* gimple-lower-bitint.cc (build_bitint_stmt_ssa_conflicts): Handle
+            _Complex large/huge _BitInt types like the large/huge _BitInt types.
+    
+            * gcc.dg/torture/bitint-67.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-03-23 10:21:33 UTC
+  Text: Fixed.
+

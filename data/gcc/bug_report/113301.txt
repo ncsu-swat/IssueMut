@@ -1,0 +1,170 @@
+Bug Summary: [12/13/14 Regression] Missed optimization: (1/(x+1))/2 => 0 since gcc-12
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Yi | Time: 2024-01-10 05:24:45 UTC
+  Text: Hello, we noticed that GCC seems to have missed optimizations as stated in the title, and it works as expected on gcc-11.4.
+
+After analysis, we found that they (gcc-trunk and gcc-11.4) are different in evrp(tree), and further, the difference is in the calculation of the value range.
+
+reduced code:https://godbolt.org/z/Y7v1jsTKfint c;
+void func(int x){
+    c=(1/(x+1))/2;
+}
+
+gcc(trunk) -O3 -fwrapv:
+func(int):
+        lea     edx, [rdi+1]
+        add     edi, 2
+        xor     eax, eax
+        cmp     edi, 2
+        cmova   edx, eax
+        mov     eax, edx
+        shr     eax, 31
+        add     eax, edx
+        sar     eax
+        mov     DWORD PTR c[rip], eax
+        ret
+
+evrp (tree):
+Folding statement: _7 = _6 <= 2;
+Not folded
+Folding statement: _2 = _7 ? _1 : 0;
+Possible COND_EXPR adjustment. Range op1 : [irange] int VARYING and Range op2: [irange] int [0, 0] NONZERO 0x0
+Not folded
+Folding statement: _3 = _2 / 2;
+Global Exported: _3 = [irange] int [-1073741824, 1073741823]
+Not folded
+Folding statement: c = _3;
+Not folded
+Folding statement: return;
+Not folded
+
+
+Expected code:
+gcc(11.4) -O3 -fwrapv:
+func(int):
+        mov     DWORD PTR c[rip], 0
+        ret
+
+evrp (tree):
+=========== BB 2 ============
+    <bb 2> :
+    # DEBUG BEGIN_STMT
+    _1 = x_4(D) + 1;
+    _2 = 1 / _1;
+    c = 0;
+    return;
+
+_2 : int [-1, 1]
+Non-varying global ranges:
+=========================:
+_2  : int [-1, 1]
+
+
+Also, the following code works as expected (gcc-trunk):
+void func1(int x){
+    c=(1/x)/2;
+}
+
+Thank you very much for your time and effort! We look forward to hearing from you.
+
+- User: Andrew Pinski | Time: 2024-01-10 05:50:33 UTC
+  Text: Confirmed.
+
+- User: Jakub Jelinek | Time: 2024-01-10 09:03:31 UTC
+  Text: Started withr12-6924-gc2b610e7c6c89fd422c5c31f01023bcddf3cf4a5
+
+- User: Andrew Pinski | Time: 2024-01-10 10:16:02 UTC
+  Text: Thinking about if 1/x or (x+1u) <= 2 ? x : 0 is more conconial for gimple. I suspect 1/x is . Which case this should be move to late gimple. I will look at that tomorrow.
+
+- User: Jakub Jelinek | Time: 2024-01-10 17:11:50 UTC
+  Text: Even then, I wonder why ranger doesn't figure this out.
+(x+1u) <= 2 ? x : 0
+must have a range [-1, 1] and [-1, 1] / [2, 2] range should be [0, 0], no?
+
+- User: Andrew Macleod | Time: 2024-01-10 20:37:14 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #4)> Even then, I wonder why ranger doesn't figure this out.
+> (x+1u) <= 2 ? x : 0
+> must have a range [-1, 1] and [-1, 1] / [2, 2] range should be [0, 0], no?its because there is no branch which is what drives ranger. At this point, we aren't quite smart enough to completely evaluate the 2 operands of a conditional as if they were actual  branches.
+ie
+    _1 = x_4(D) + 1;
+    _10 = (unsigned int) x_4(D);
+    _6 = _10 + 2;
+    _7 = _6 <= 2;
+    _2 = _7 ? _1 : 0;
+
+if that were:
+  if (_6 <= 2)
+    _2 = _1
+we'd recalculate _1 with the condition being (_6 <= 2) and we come upwith [-1, 1] for _1 instead of varying.
+
+I'll have to look at whats involved in enhancing the fold code to invoke GORI to reevaluate _1 if _7 is [1,1].   in theory is not too difficult... :-)
+
+- User: Andrew Macleod | Time: 2024-01-10 22:12:06 UTC
+  Text: (In reply to Andrew Macleod fromcomment #5)> (In reply to Jakub Jelinek fromcomment #4)
+> > Even then, I wonder why ranger doesn't figure this out.
+> > (x+1u) <= 2 ? x : 0
+> > must have a range [-1, 1] and [-1, 1] / [2, 2] range should be [0, 0], no?
+> 
+> its because there is no branch which is what drives ranger. At this point,
+> we aren't quite smart enough to completely evaluate the 2 operands of a
+> conditional as if they were actual  branches.
+> ie
+>     _1 = x_4(D) + 1;
+>     _10 = (unsigned int) x_4(D);
+>     _6 = _10 + 2;
+>     _7 = _6 <= 2;
+>     _2 = _7 ? _1 : 0;
+> 
+> if that were:
+>   if (_6 <= 2)
+>     _2 = _1
+> we'd recalculate _1 with the condition being (_6 <= 2) and we come upwith
+> [-1, 1] for _1 instead of varying.
+> 
+> I'll have to look at whats involved in enhancing the fold code to invoke
+> GORI to reevaluate _1 if _7 is [1,1].   in theory is not too difficult... :-)ah, its more complicated than that. we normally do this evaluation, but the cond_expr is using _1.. if you trace back from _6 in the condition, _1 is not in the dependency chain anywhere, so GORi cannot compute anything for it.  it can compute that x_4 is [-2, 0]  but it doesnt see any connection between _6 in the condition and _1.
+
+the remaining question is whether this can be cheaply identified as a recomputation.. in which case we could recompute _1 usin the [-2, 0] for x_4 and come up with [-1, 1] 
+
+I'll have a look if we can easily invoke hte recompuation code the edges evaluations use or nor
+
+- User: Andrew Pinski | Time: 2024-01-10 22:25:17 UTC
+  Text: I have a patch which disables the "simplification" of "1/x" for signed until late which solves this missed optimization. I will post it once it finishes testing.
+
+Note we already delayed the simplification of `bool * d` to `bool?A:0` until late for similar reasons, seePR 103257on that.
+
+- User: Andrew Pinski | Time: 2024-01-11 04:24:42 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2024-January/642582.html
+
+- User: GCC Commits | Time: 2024-01-11 18:01:50 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:7f56a90269b393fcc55ef08e0990fafb7b1c24b4commitr14-7148-g7f56a90269b393fcc55ef08e0990fafb7b1c24b4Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Wed Jan 10 14:25:37 2024 -0800
+
+    match: Delay folding of 1/x into `(x+1u)<2u?x:0` until late [PR113301]
+    
+    Since currently ranger does not work with the complexity of COND_EXPR in
+    some cases so delaying the simplification of `1/x` for signed types
+    help code generation.
+    tree-ssa/divide-8.c is a new testcase where this can help.
+    
+    Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/113301gcc/ChangeLog:
+    
+            * match.pd (`1/x`): Delay signed case until late.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/divide-8.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-01-11 18:03:08 UTC
+  Text: Fixed for GCC 14, not expecting to backport ...
+

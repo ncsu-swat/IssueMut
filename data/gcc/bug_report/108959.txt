@@ -1,0 +1,163 @@
+Bug Summary: [13 Regression] ice in modify_assignment, at ipa-param-manipulation.cc:1905 since r13-5681-ge8109bd87766be
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2023-02-27 22:37:35 UTC
+  Text: Createdattachment 54550[details]C source code
+
+The attached C code does this:
+
+$ ../results/bin/gcc -c -w -O1bug890.c
+$ ../results/bin/gcc -c -w -O2bug890.c
+during IPA pass: inline
+In function ‘func_43.constprop.isra’:
+cc1: internal compiler error: in modify_assignment, at ipa-param-manipulation.cc
+:1905
+0x76b001 ipa_param_body_adjustments::modify_assignment(gimple*, gimple**)
+	../../trunk.d1/gcc/ipa-param-manipulation.cc:1905
+
+I have a reduction running.
+
+- User: David Binderman | Time: 2023-02-27 22:40:53 UTC
+  Text: The bug first seems to occur sometime between git hashg:5c43f06c228d169c,
+dated 20230202 andg:f0065f207cf19cd9, dated 20230203.
+
+- User: David Binderman | Time: 2023-02-27 22:49:07 UTC
+  Text: Reduced code seems to be:
+
+union U2 {
+  long f0;
+  int f1
+};
+g_16;
+g_70[];
+static func_61(int) {
+  for (;;)
+    g_70[g_16] = 4;
+}
+static func_43(int *p_44) { func_61(*p_44); }
+main() {
+  union U2 l_38 = {9};
+  int *l_49 = &l_38;
+  func_43(l_49);
+}
+
+- User: David Binderman | Time: 2023-02-28 07:45:24 UTC
+  Text: I will have a go at a git bisection.
+
+- User: David Binderman | Time: 2023-02-28 08:09:07 UTC
+  Text: Only one pass at reduction, leaving 14 revisions, but  
+this commit looks to be a hot candidate:
+
+commit e8109bd87766be88e83fe88a44433dae16358a02
+Author: Martin Jambor <mjambor@suse.cz>
+Date:   Fri Feb 3 13:28:24 2023 +0100
+
+    ipa: Avoid invalid gimple when IPA-CP and IPA-SRA disagree on types (108384)
+
+- User: David Binderman | Time: 2023-02-28 08:27:52 UTC
+  Text: Three C++ changes and Martin's change.
+
+Adding Martin for their best advice.
+
+- User: David Binderman | Time: 2023-02-28 08:37:37 UTC
+  Text: As expected:
+
+$ git bisect bad e8109bd87766be88
+e8109bd87766be88e83fe88a44433dae16358a02 is the first bad commit
+commit e8109bd87766be88e83fe88a44433dae16358a02
+Author: Martin Jambor <mjambor@suse.cz>
+Date:   Fri Feb 3 13:28:24 2023 +0100
+
+    ipa: Avoid invalid gimple when IPA-CP and IPA-SRA disagree on types (108384)
+
+- User: Martin Jambor | Time: 2023-03-01 16:50:04 UTC
+  Text: The situation is that in func_61 we have an unused parameter which
+IPA-SRA wants to remove.  It's caller constructs the unused parameter
+with the following sequence (shortened):
+
+int func_43 (int * p_44)
+{
+  int _1;
+  _1 = *p_44_3(D);
+  func_61 (_1);
+}
+
+Caller of func_43 however stores a long at that address and this is
+what IPA-CP wants to pass down, while IPA-SRA knows that p_44 is used
+only to create an argument for an unused formal parameter and would
+like to remove both.
+
+This means that the code in ipa-param-manipulation.cc kicks in, trying
+to replace loads from the disappearing parameter with known constants
+because once the parameter is gone there this can no longer be done.
+But it attempts to create an invalid VIEW_CONVERT_EXPR in the process.
+
+The simplest way of avoiding it is to disable the removal of the
+parameter in these situations too extending the patch from e8109bd8776
+with:
+
+diff --git a/gcc/ipa-sra.cc b/gcc/ipa-sra.cc
+index 3de7d426b7e..e9c47c0d852 100644
+--- a/gcc/ipa-sra.cc
++++ b/gcc/ipa-sra.cc
+@@ -4235,6 +4235,7 @@ adjust_parameter_descriptions (cgraph_node *node, isra_func_summary *ifs)
+                          != pa->unit_size))
+                    {
+                      desc->split_candidate = false;
++                     desc->locally_unused = false;
+                      if (dump_file && (dump_flags & TDF_DETAILS))
+                        dump_dead_indices.safe_push (i);
+                      break;
+
+
+But since this is all code that will be eliminated anyway, perhaps we
+could be aggressive here and use force_value_to_type from
+tree-inline.cc?
+
+- User: Martin Jambor | Time: 2023-03-23 10:19:21 UTC
+  Text: I have proposed a fix on the mailing list:https://gcc.gnu.org/pipermail/gcc-patches/2023-March/614475.html
+
+- User: GCC Commits | Time: 2023-04-05 14:39:11 UTC
+  Text: The master branch has been updated by Martin Jambor <jamborm@gcc.gnu.org>:https://gcc.gnu.org/g:f0f372fab3e70622a4ea6fe4073991e1bb506e4ecommitr13-7011-gf0f372fab3e70622a4ea6fe4073991e1bb506e4eAuthor: Martin Jambor <mjambor@suse.cz>
+Date:   Wed Apr 5 16:36:49 2023 +0200
+
+    ipa: Avoid another ICE when dealing with type-incompatibilities (PR 108959)PR 108959shows one more example where undefined code with type
+    incompatible accesses to stuff passed in parameters can cause an ICE
+    because we try to create a VIEW_CONVERT_EXPR of mismatching sizes:
+    
+    1. IPA-CP tries to push one type from above,
+    
+    2. IPA-SRA (correctly) decides the parameter is useless because it is
+       only used to construct an argument to another function which does not
+       use it and so the formal parameter should be removed,
+    
+    3. but the code reconciling IPA-CP and IPA-SRA transformations still
+       wants to perform the IPA-CP and overrides the built-in DCE of
+       useless statements and tries to stuff constants into them
+       instead, constants of a type with mismatching type and size.
+    
+    This patch avoids the situation in IPA-SRA by purging the IPA-CP
+    results from any "aggregate" constants that are passed in parameters
+    which are detected to be useless.  It also removes IPA value range and
+    bits information associated with removed parameters stored in the same
+    structure so that the useless information is not streamed later on.
+    
+    gcc/ChangeLog:
+    
+    2023-03-22  Martin Jambor  <mjambor@suse.cz>PR ipa/108959* ipa-sra.cc (zap_useless_ipcp_results): New function.
+            (process_isra_node_results): Call it.
+    
+    gcc/testsuite/ChangeLog:
+    
+    2023-03-17  Martin Jambor  <mjambor@suse.cz>PR ipa/108959* gcc.dg/ipa/pr108959.c: New test.
+
+- User: Martin Jambor | Time: 2023-04-05 14:44:54 UTC
+  Text: Fixed.
+

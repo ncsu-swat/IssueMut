@@ -1,0 +1,198 @@
+Bug Summary: [14 Regression] ICE: in emit_move_insn, at expr.cc:4249 with -O -mavx512vl -mavx512fp16 on vector conversion since r14-1707
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 13.2.1
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-11-19 16:43:40 UTC
+  Text: Createdattachment 56643[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O -mavx512vl -mavx512fp16 testcase.c 
+during RTL pass: expand
+testcase.c: In function 'foo':
+testcase.c:7:10: internal compiler error: in emit_move_insn, at expr.cc:4249
+    7 |   return __builtin_convertvector (f, BF);
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+0x7583d8 emit_move_insn(rtx_def*, rtx_def*)
+        /repo/gcc-trunk/gcc/expr.cc:4249
+0xf591f9 expand_value_return
+        /repo/gcc-trunk/gcc/cfgexpand.cc:3739
+0xf63364 expand_return
+        /repo/gcc-trunk/gcc/cfgexpand.cc:3811
+0xf63364 expand_gimple_stmt_1
+        /repo/gcc-trunk/gcc/cfgexpand.cc:3918
+0xf63364 expand_gimple_stmt
+        /repo/gcc-trunk/gcc/cfgexpand.cc:4044
+0xf694ae expand_gimple_basic_block
+        /repo/gcc-trunk/gcc/cfgexpand.cc:6100
+0xf6b187 execute
+        /repo/gcc-trunk/gcc/cfgexpand.cc:6835
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-5593-20231119062640-g78d132d73ec-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-5593-20231119062640-g78d132d73ec-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20231119 (experimental) (GCC)
+
+- User: Richard Biener | Time: 2023-11-20 10:35:46 UTC
+  Text: Confirmed.
+
+- User: Jakub Jelinek | Time: 2023-11-21 10:29:34 UTC
+  Text: Started withr14-1707-ge52be6034fa0171c26f571f4ad1a5686594f32a9
+
+- User: Jakub Jelinek | Time: 2023-11-21 11:09:22 UTC
+  Text: I think the problem is that vec_pack_trunc_optab is a normal OPTAB_D and uses just the argument mode (V?SFmode in this case) and the result is some floating point type with half the size.  But that is V?HFmode as well as V?BFmode in this case, and the pattern can do only one of those.
+Doesn't vec_unpack*optab have similar issue when argument is V?DFmode and result can be say on powerpc* V?{IF,KF,TF}mode ?
+Either we should change it to be OPTAB_CD with $a$b modes specified, or need to manually check the result mode and verify it matches.
+
+- User: Richard Biener | Time: 2023-11-21 11:56:49 UTC
+  Text: The vectorizer usually checks the operand mode, like with
+
+      if (insn_data[icode1].operand[0].mode == TYPE_MODE (narrow_vectype))
+
+but yeah, ambiguities are bad here.  When designing these patterns no
+such ambiguities existed.  Can't the patterns work out both?  I guess
+in the testcases case the issue points to vector lowering failing to
+perform this kind of check.  Let me have a quick try.
+
+- User: Richard Biener | Time: 2023-11-21 12:02:42 UTC
+  Text: The incomplete patch below fixes it
+
+diff --git a/gcc/tree-ssa-forwprop.cc b/gcc/tree-ssa-forwprop.cc
+index d39dfc1065f..b9b6277de7b 100644
+--- a/gcc/tree-ssa-forwprop.cc
++++ b/gcc/tree-ssa-forwprop.cc
+@@ -47,6 +47,8 @@ along with GCC; see the file COPYING3.  If not see
+ #include "tree-cfgcleanup.h"
+ #include "cfganal.h"
+ #include "optabs-tree.h"
++#include "insn-config.h"
++#include "recog.h"
+ #include "tree-vector-builder.h"
+ #include "vec-perm-indices.h"
+ #include "internal-fn.h"
+@@ -2978,6 +2980,7 @@ simplify_vector_constructor (gimple_stmt_iterator *gsi)
+          /* Only few targets implement direct conversion patterns so try
+             some simple special cases via VEC_[UN]PACK[_FLOAT]_LO_EXPR.  */
+          optab optab;
++         insn_code icode;
+          tree halfvectype, dblvectype;
+          enum tree_code unpack_op;
+ 
+@@ -3054,8 +3057,10 @@ simplify_vector_constructor (gimple_stmt_iterator *gsi)
+                   && (optab = optab_for_tree_code (VEC_PACK_TRUNC_EXPR,
+                                                    halfvectype,
+                                                    optab_default))
+-                  && (optab_handler (optab, TYPE_MODE (halfvectype))
+-                      != CODE_FOR_nothing))
++                  && ((icode = optab_handler (optab, TYPE_MODE (halfvectype)))
++                      != CODE_FOR_nothing)
++                  && (insn_data[icode].operand[0].mode
++                      == TYPE_MODE (halfvectype)))
+            {
+              gimple_seq stmts = NULL;
+              tree low = gimple_build (&stmts, BIT_FIELD_REF, halfvectype,
+
+- User: Richard Biener | Time: 2023-11-21 12:13:29 UTC
+  Text: But the problem is of course that you then can't have both at the same time, vec_pack_trunk_v4sf from V8HF and V8BF unless we'd support "VOIDmode" there.
+
+Note there's the "better" {s,z}ext optabs which have two modes and could
+support V8HF to V8SF conversions, but it doesn't work to model the
+pack/unpack style of ISA with this.
+
+The ambiguities would support using a conversion optab for the various
+pack/unpack optabs but we have very many of those ... and the problem
+extends to even/odd and lo/hi widen ops as well.  I don't think
+mass-changing those at this point is desirable (that definitely looks like
+a stage1 problem).
+
+As long as we don't have both we can circumvent the ICE with patches like
+proposed.  Fixed patch, "complete":
+
+diff --git a/gcc/tree-ssa-forwprop.cc b/gcc/tree-ssa-forwprop.cc
+index d39dfc1065f..0fb21e58138 100644
+--- a/gcc/tree-ssa-forwprop.cc
++++ b/gcc/tree-ssa-forwprop.cc
+@@ -47,6 +47,8 @@ along with GCC; see the file COPYING3.  If not see
+ #include "tree-cfgcleanup.h"
+ #include "cfganal.h"
+ #include "optabs-tree.h"
++#include "insn-config.h"
++#include "recog.h"
+ #include "tree-vector-builder.h"
+ #include "vec-perm-indices.h"
+ #include "internal-fn.h"
+@@ -2978,6 +2980,7 @@ simplify_vector_constructor (gimple_stmt_iterator *gsi)
+          /* Only few targets implement direct conversion patterns so try
+             some simple special cases via VEC_[UN]PACK[_FLOAT]_LO_EXPR.  */
+          optab optab;
++         insn_code icode;
+          tree halfvectype, dblvectype;
+          enum tree_code unpack_op;
+ 
+@@ -3015,8 +3018,9 @@ simplify_vector_constructor (gimple_stmt_iterator *gsi)
+              && (optab = optab_for_tree_code (unpack_op,
+                                               dblvectype,
+                                               optab_default))
+-             && (optab_handler (optab, TYPE_MODE (dblvectype))
+-                 != CODE_FOR_nothing))
++             && ((icode = optab_handler (optab, TYPE_MODE (dblvectype)))
++                 != CODE_FOR_nothing)
++             && (insn_data[icode].operand[0].mode == TYPE_MODE (type)))
+            {
+              gimple_seq stmts = NULL;
+              tree dbl;
+@@ -3054,8 +3058,9 @@ simplify_vector_constructor (gimple_stmt_iterator *gsi)
+                   && (optab = optab_for_tree_code (VEC_PACK_TRUNC_EXPR,
+                                                    halfvectype,
+                                                    optab_default))
+-                  && (optab_handler (optab, TYPE_MODE (halfvectype))
+-                      != CODE_FOR_nothing))
++                  && ((icode = optab_handler (optab, TYPE_MODE (halfvectype)))
++                      != CODE_FOR_nothing)
++                  && (insn_data[icode].operand[0].mode == TYPE_MODE (type)))
+            {
+              gimple_seq stmts = NULL;
+              tree low = gimple_build (&stmts, BIT_FIELD_REF, halfvectype,
+
+- User: Jakub Jelinek | Time: 2023-11-21 13:41:39 UTC
+  Text: I think at least x86 doesn't currently have instructions which would support both, CCing Hongtao to verify that, but not sure if e.g. RISC-V won't have something eventually for both.  Don't we need to check the mode also somewhere in the vectorizer (so that we don't happily try to vectorize using it only to get it lowered later to scalar ops during generic vector lowering (or forwprop?)?
+
+- User: Richard Biener | Time: 2023-11-21 13:49:44 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #7)> I think at least x86 doesn't currently have instructions which would support
+> both, CCing Hongtao to verify that, but not sure if e.g. RISC-V won't have
+> something eventually for both.  Don't we need to check the mode also
+> somewhere in the vectorizer (so that we don't happily try to vectorize using
+> it only to get it lowered later to scalar ops during generic vector lowering
+> (or forwprop?)?As said I think the vectorizer checks this already.
+
+- User: GCC Commits | Time: 2023-11-21 14:47:57 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:aef1aaff41190d2f82cf49d8907682b6dff71c3ccommitr14-5681-gaef1aaff41190d2f82cf49d8907682b6dff71c3cAuthor: Richard Biener <rguenther@suse.de>
+Date:   Tue Nov 21 14:46:31 2023 +0100
+
+    tree-optimization/112623 - forwprop VEC_PACK_TRUNC generation
+    
+    For vec_pack_trunc patterns there can be an ambiguity for the
+    source mode for BFmode vs HFmode.  The vectorizer checks
+    the insns operand mode for this, the following makes forwprop
+    do the same.  That of course doesn't help if the target supports
+    both conversions.PR tree-optimization/112623* tree-ssa-forwprop.cc (simplify_vector_constructor):
+            Check the source mode of the insn for vector pack/unpacks.
+    
+            * gcc.target/i386/pr112623.c: New testcase.
+
+- User: Richard Biener | Time: 2023-11-21 14:48:07 UTC
+  Text: Fixed.
+

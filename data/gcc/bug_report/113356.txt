@@ -1,0 +1,173 @@
+Bug Summary: [14 Regression][aarch64] ICE in try_fuse_pair, at config/aarch64/aarch64-ldp-fusion.cc:2203 since r14-6947-g4b67ec7ff5b1aa
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Michal Jireš | Time: 2024-01-12 14:46:58 UTC
+  Text: Compiling reduced testcase g++.dg/ipa/pr71207.C fails the assert added inr14-6947-g4b67ec7ff5b1aa.
+
+$ catpr71207.C
+struct Class1 {
+  virtual ~Class1() {}
+  unsigned Field1;
+};
+struct Class4 : virtual Class1 {};
+int main() { Class4 var1; }
+
+
+$ aarch64-linux-gnu-g++pr71207.C -fnon-call-exceptions -mearly-ldp-fusion -fno-lifetime-dse -fno-forward-propagate -Os
+during RTL pass: ldp_fusionpr71207.C: In destructor ‘virtual Class4::~Class4()’:pr71207.C:5:8: internal compiler error: in try_fuse_pair, at config/aarch64/aarch64-ldp-fusion.cc:2265
+    5 | struct Class4 : virtual Class1 {};
+      |        ^~~~~~
+0x2264a33 ldp_bb_info::try_fuse_pair(bool, unsigned int, rtl_ssa::insn_info*, rtl_ssa::insn_info*)
+	/home/mjires/git/GCC/master/gcc/config/aarch64/aarch64-ldp-fusion.cc:2265
+0x2264eff ldp_bb_info::merge_pairs(std::__cxx11::list<rtl_ssa::insn_info*, std::allocator<rtl_ssa::insn_info*> >&, std::__cxx11::list<rtl_ssa::insn_info*, std::allocator<rtl_ssa::insn_info*> >&, bool, unsigned int)
+	/home/mjires/git/GCC/master/gcc/config/aarch64/aarch64-ldp-fusion.cc:2389
+0x2265124 ldp_bb_info::transform_for_base(int, access_group&)
+	/home/mjires/git/GCC/master/gcc/config/aarch64/aarch64-ldp-fusion.cc:2422
+0x226785e void ldp_bb_info::traverse_base_map<ordered_hash_map<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> >, access_group, simple_hashmap_traits<default_hash_traits<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> > >, access_group> > >(ordered_hash_map<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> >, access_group, simple_hashmap_traits<default_hash_traits<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> > >, access_group> >&)
+	/home/mjires/git/GCC/master/gcc/config/aarch64/aarch64-ldp-fusion.cc:2481
+0x2265383 ldp_bb_info::transform()
+	/home/mjires/git/GCC/master/gcc/config/aarch64/aarch64-ldp-fusion.cc:2489
+0x22604ca ldp_fusion_bb(rtl_ssa::bb_info*)
+	/home/mjires/git/GCC/master/gcc/config/aarch64/aarch64-ldp-fusion.cc:2717
+0x2260554 ldp_fusion()
+	/home/mjires/git/GCC/master/gcc/config/aarch64/aarch64-ldp-fusion.cc:2726
+0x2260666 execute
+	/home/mjires/git/GCC/master/gcc/config/aarch64/aarch64-ldp-fusion.cc:2776
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+
+$ aarch64-linux-gnu-g++ -v
+Using built-in specs.
+COLLECT_GCC=aarch64-linux-gnu-g++
+COLLECT_LTO_WRAPPER=/home/mjires/built/master/libexec/gcc/aarch64-linux-gnu/14.0.1/lto-wrapper
+Target: aarch64-linux-gnu
+Configured with: /home/mjires/git/GCC/master/configure --prefix=/home/mjires/built/master --target=aarch64-linux-gnu --disable-bootstrap --enable-languages=c,c++,fortran --disable-multilib --disable-libsanitizer --enable-checking : (reconfigured) /home/mjires/git/GCC/master/configure --prefix=/home/mjires/built/master --target=aarch64-linux-gnu --disable-bootstrap --enable-languages=c,c++,fortran --disable-multilib --disable-libsanitizer --enable-checking
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240112 (experimental) (GCC)
+
+- User: Alex Coplan | Time: 2024-01-12 14:55:06 UTC
+  Text: Sigh.  Confirmed, I'll take a look.
+
+- User: Alex Coplan | Time: 2024-01-12 15:07:27 UTC
+  Text: So we have this IR:
+
+    insn i8 in bb2 [ebb2] at point 18:
+      +----------------------------
+      |    8: [r104:DI++]=r101:DI
+      |      REG_DEAD r101:DI
+      |      REG_INC r104:DI
+      +----------------------------
+      has pre/post-modify operations
+      uses:
+        use of set r101:i7 (DI pseudo)
+        use of set r104:i17 (DI pseudo)
+          appears in a read/write context
+      defines:
+        set r104:i8 (DI pseudo)
+          set by a pre/post-modify
+          appears in a read/write context
+          used by insn i13 in bb2 [ebb2] at point 24
+        set mem:i8
+
+    insn i11 in bb2 [ebb2] at point 20:
+      +------------------------------------------------
+      |   11: r106:DI=high(const(`_ZTV6Class1'+0x10))
+      +------------------------------------------------
+      defines:
+        set r106:i11 (DI pseudo)
+          used by insn i12 in bb2 [ebb2] at point 22
+
+    insn i12 in bb2 [ebb2] at point 22:
+      +-------------------------------------------------------
+      |   12: r105:DI=r106:DI+low(const(`_ZTV6Class1'+0x10))
+      |      REG_DEAD r106:DI
+      |      REG_EQUAL const(`_ZTV6Class1'+0x10)
+      +-------------------------------------------------------
+      uses:
+        use of set r106:i11 (DI pseudo)
+      defines:
+        set r105:i12 (DI pseudo)
+          used by insn i13 in bb2 [ebb2] at point 24
+
+    insn i13 in bb2 [ebb2] at point 24:
+      +----------------------------------------
+      |   13: [r104:DI]=r105:DI
+      |      REG_DEAD r105:DI
+      |      REG_DEAD r104:DI
+      |      REG_EH_REGION 0xffffffffffffffff
+      +----------------------------------------
+      uses:
+        use of set r104:i8 (DI pseudo)
+          appears inside an address
+        use of set r105:i12 (DI pseudo)
+      defines:
+        set mem:i13
+          used by phi node mem:a7 in ebb1 at point 30
+
+and we're trying to form (8,13).  i8 has i13 as a hazard due to the writeback dataflow and i13 has i12 as a hazard (due to the initial fix for non-call exceptions introducing a hazard on the previous nondebug insn).  I wonder if it would be enough to get i
+
+- User: Alex Coplan | Time: 2024-01-12 15:09:17 UTC
+  Text: ... i13 to be a hazard w.r.t. itself, then we might not even need the clause in the follow-up fix.  I'll investigate.
+
+Alternatively the assert can probably be relaxed to include the previous nondebug insn, as we're inserting after the insn in the move_range, anyway.
+
+- User: Alex Coplan | Time: 2024-01-15 14:27:53 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2024-January/643011.html
+
+- User: GCC Commits | Time: 2024-01-23 16:50:49 UTC
+  Text: The master branch has been updated by Alex Coplan <acoplan@gcc.gnu.org>:https://gcc.gnu.org/g:639ae543449a8d6525303458497bd4b897660ec3commitr14-8367-g639ae543449a8d6525303458497bd4b897660ec3Author: Alex Coplan <alex.coplan@arm.com>
+Date:   Mon Jan 15 11:07:48 2024 +0000
+
+    aarch64: Don't record hazards against paired insns [PR113356]
+    
+    For the testcase in the PR, we try to pair insns where the first has
+    writeback and the second uses the updated base register.  This causes us
+    to record a hazard against the second insn, thus narrowing the move
+    range away from the end of the BB.
+    
+    However, it isn't meaningful to record hazards against the other insn
+    in the pair, as this doesn't change which pairs can be formed, and also
+    doesn't change where the pair is formed (from the perspective of
+    nondebug insns).
+    
+    To see why this is the case, consider the two cases:
+    
+     - Suppoe we are finding hazards for insns[0].  If we record a hazard
+       against insns[1], then range.last becomes
+       insns[1]->prev_nondebug_insn (), but note that this is equivalent to
+       inserting after insns[1] (since insns[1] is being changed).
+     - Now consider finding hazards for insns[1].  Suppose we record
+       insns[0] as a hazard.  Then we set range.first = insns[0], which is a
+       no-op.
+    
+    As such, it seems better to never record hazards against the other insn
+    in the pair, as we check whether the insns themselves are suitable for
+    combination separately (e.g. for ldp checking that they use distinct
+    transfer registers).  Avoiding unnecessarily narrowing the move range
+    avoids unnecessarily re-ordering over debug insns.
+    
+    This should also mean that we can only narrow the move range away from
+    the end of the BB in the case that we record a hazard for insns[0]
+    against insns[1]->prev_nondebug_insn () or earlier.  This means that for
+    the non-call-exceptions case, either the move range includes insns[1],
+    or we reject the pair (thus the assert tripped in the PR should always
+    hold).
+    
+    gcc/ChangeLog:PR target/113356* config/aarch64/aarch64-ldp-fusion.cc (ldp_bb_info::try_fuse_pair):
+            Don't record hazards against the opposite insn in the pair.
+    
+    gcc/testsuite/ChangeLog:PR target/113356* gcc.target/aarch64/pr113356.C: New test.
+
+- User: Alex Coplan | Time: 2024-01-23 16:55:01 UTC
+  Text: Fixed, thanks for the report.
+

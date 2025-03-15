@@ -1,0 +1,469 @@
+Bug Summary: [14] RISC-V vector: Variable clobbered at runtime
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Patrick O'Neill | Time: 2023-12-09 01:44:52 UTC
+  Text: Testcase:
+int printf(char *, ...);
+int a, b, l, i, p, q, t, n, o;
+int *volatile c;
+static int j;
+static struct pack_1_struct d;
+long e;
+char m = 5;
+short s;
+#pragma pack(1)
+struct pack_1_struct {
+  long c;
+  int d;
+  int e;
+  int f;
+  int g;
+  int h;
+  int i;
+} h, r = {1}, *f = &h, *volatile g;
+int main() {
+  int u;
+  j = 0;
+  for (; j < 9; ++j) {
+    u = ++t ? a : 0;
+    if (u) {
+      int *v = &d.d;
+      *v = g || e;
+      *c = 0;
+      *f = h;
+    }
+    s = l && c;
+    o = i;
+    d.f || (p = 0);
+    q |= n;
+  }
+  r = *f;
+  printf("b: %d\n", b);
+  printf("m: %d\n", m);
+}
+
+Commands:
+rv64gc:> /scratch/tc-testing/tc-dec-8-trunk/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gc -mabi=lp64d -O3 red.c -o rv64gc.out
+> QEMU_CPU=rv64,vlen=128,v=true,vext_spec=v1.0 /scratch/tc-testing/tc-dec-8-trunk/build-rv64gcv/bin/qemu-riscv64 rv64gc.outb: 0
+m: 5
+
+rv64gcv:> /scratch/tc-testing/tc-dec-8-trunk/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv -mabi=lp64d -O3 red.c -o rv64gcv.out
+> QEMU_CPU=rv64,vlen=128,v=true,vext_spec=v1.0 /scratch/tc-testing/tc-dec-8-trunk/build-rv64gcv/bin/qemu-riscv64 rv64gcv.outb: 0
+m: 0
+
+Nothing touches the m variable so at the end it should equal 5.
+
+Commenting out the preceding printf("b: %d\n", b); statement causes the
+testcase to pass successfully (and doesn't cause much change to the assembly):https://godbolt.org/z/Erzzqxo8q
+
+- User: Andrew Pinski | Time: 2023-12-09 02:01:06 UTC
+  Text: I am not seeing anything wrong with the difference even.
+
+What if you change printf for a different function which still takes a variable arguments but does nothing (in a different TU)? Does it still fail?
+
+I can only think printf is miscompiled somehow ...
+
+- User: Patrick O'Neill | Time: 2023-12-09 02:49:42 UTC
+  Text: I tried messing around with it - turns out passing the 'b' variable isn't required:https://godbolt.org/z/EKa15xqYPUsing a variadic function reproduces the problem:https://godbolt.org/z/n95sxY1Y8After recompiling with the new source the behavior persists with any variadic function:> QEMU_CPU=rv64,vlen=128,v=true,vext_spec=v1.0 /scratch/tc-testing/tc-dec-8-trunk/build-rv64gcv/bin/qemu-riscv64 rv64gc.outm: 5> QEMU_CPU=rv64,vlen=128,v=true,vext_spec=v1.0 /scratch/tc-testing/tc-dec-8-trunk/build-rv64gcv/bin/qemu-riscv64 rv64gcv.outm: 0
+
+- User: Patrick O'Neill | Time: 2023-12-09 03:03:57 UTC
+  Text: A slightly more reduced testcase without the extra printf:https://godbolt.org/z/1xjPzs9v5
+
+- User: Andrew Pinski | Time: 2023-12-09 03:34:07 UTC
+  Text: (In reply to Patrick O'Neill fromcomment #3)> A slightly more reduced testcase without the extra printf:
+>https://godbolt.org/z/1xjPzs9v5Note add_em_up should techincally have:
+  __builtin_va_end(ap);
+
+At the end of the function (though, the code generation for riscv is not different there with or without it).
+
+- User: Andrew Pinski | Time: 2023-12-09 03:38:53 UTC
+  Text: Could this be a linker relaxation issue? Does -Wl,--no-relax solve the issue?
+
+- User: Robin Dapp | Time: 2023-12-09 13:33:25 UTC
+  Text: This seems to be gone when simple vsetvl (instead of lazy) is used or with -fno-schedule-insns which might indicate a vsetvl pass problem.
+
+We might have a few more of those.  Maybe it would make sense to run the testsuite with an RVV-enabled valgrind.  But that might give more false negatives than real findings :/
+
+- User: Robin Dapp | Time: 2023-12-09 13:40:02 UTC
+  Text: Here
+
+0x105c6 <main+294>      vse8.v  v8,(a5)
+
+is where we overwrite m.  The vl is 128 but the preceding vsetvl gets a4 = 46912504507016 as AVL which seems already borken.
+
+- User: JuzheZhong | Time: 2023-12-09 14:04:22 UTC
+  Text: Li Pan will investigate it. He will note me if there is a bug in vsetvl pass.
+
+- User: Robin Dapp | Time: 2023-12-09 14:06:41 UTC
+  Text: In the good version the length is 32 here because directly before the vsetvl we have:
+
+li      a4,32
+
+That seems to get lost somehow.
+
+- User: JuzheZhong | Time: 2023-12-09 14:18:26 UTC
+  Text: OK. It seems it is VSETVL BUG. I will have look at it.
+
+- User: Li Pan | Time: 2023-12-10 12:41:42 UTC
+  Text: (In reply to JuzheZhong fromcomment #8)> Li Pan will investigate it. He will note me if there is a bug in vsetvl pass.The interesting thing is that I cannot fully reproduce this with build 20231210.
+
+PASS >> ../build-qemu/qemu-riscv64 -cpu rv64,vlen=128,v=true,vext_spec=v1.0 test.rv64gc.elf
+
+FAIL ../build-qemu/qemu-riscv64 -cpu rv64,vlen=128,v=true,vext_spec=v1.0 test.gcv.elf
+Segmentation fault (core dumped)
+
+It will be PASS if built with rv64gc but got a segment fault in printf when built with rv64gcv. Thus I did some adjusting for this case to bypass the segment, and then have the rv64gcv pass. Update the modified test case as below.
+
+qemu-riscv64 version 8.1.92 (v8.2.0-rc2-48-gd451e32ce8).
+newlib for gcc build.
+
+Modified test case:
+
+int a, b, l, i, p, q, t, n, o;
+int *volatile c;
+static int j;
+static struct pack_1_struct d;
+long e;
+char m = 5;
+short s;
+
+#pragma pack(1)
+struct pack_1_struct {
+  long c;
+  int d;
+  int e;
+  int f;
+  int g;
+  int h;
+  int i;
+} h, r = {1}, *f = &h, *volatile g;
+
+int main() {
+  int u;
+  j = 0;
+
+  for (; j < 9; ++j) {
+    u = ++t ? a : 0;
+    if (u) {
+      int *v = &d.d;
+      *v = g || e;
+      *c = 0;
+      *f = h;
+    }
+    s = l && c;
+    o = i;
+    d.f || (p = 0);
+    q |= n;
+  }
+
+  r = *f;
+
+  if (m == 5)        // Reference m like print
+    return 0;
+
+  return 1234;
+}
+
+- User: Li Pan | Time: 2023-12-11 02:27:52 UTC
+  Text: (In reply to Patrick O'Neill fromcomment #0)> Testcase:
+> int printf(char *, ...);
+> int a, b, l, i, p, q, t, n, o;
+> int *volatile c;
+> static int j;
+> static struct pack_1_struct d;
+> long e;
+> char m = 5;
+> short s;
+> #pragma pack(1)
+> struct pack_1_struct {
+>   long c;
+>   int d;
+>   int e;
+>   int f;
+>   int g;
+>   int h;
+>   int i;
+> } h, r = {1}, *f = &h, *volatile g;
+> int main() {
+>   int u;
+>   j = 0;
+>   for (; j < 9; ++j) {
+>     u = ++t ? a : 0;
+>     if (u) {
+>       int *v = &d.d;
+>       *v = g || e;
+>       *c = 0;
+>       *f = h;
+>     }
+>     s = l && c;
+>     o = i;
+>     d.f || (p = 0);
+>     q |= n;
+>   }
+>   r = *f;
+>   printf("b: %d\n", b);
+>   printf("m: %d\n", m);
+> }
+> 
+> Commands:
+> rv64gc:
+> > /scratch/tc-testing/tc-dec-8-trunk/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gc -mabi=lp64d -O3 red.c -o rv64gc.out
+> > QEMU_CPU=rv64,vlen=128,v=true,vext_spec=v1.0 /scratch/tc-testing/tc-dec-8-trunk/build-rv64gcv/bin/qemu-riscv64 rv64gc.out
+> b: 0
+> m: 5
+> 
+> rv64gcv:
+> > /scratch/tc-testing/tc-dec-8-trunk/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv -mabi=lp64d -O3 red.c -o rv64gcv.out
+> > QEMU_CPU=rv64,vlen=128,v=true,vext_spec=v1.0 /scratch/tc-testing/tc-dec-8-trunk/build-rv64gcv/bin/qemu-riscv64 rv64gcv.out
+> b: 0
+> m: 0
+> 
+> Nothing touches the m variable so at the end it should equal 5.
+> 
+> Commenting out the preceding printf("b: %d\n", b); statement causes the
+> testcase to pass successfully (and doesn't cause much change to the
+> assembly):
+>https://godbolt.org/z/Erzzqxo8qCould you please help to share the commit id of GCC for the above test? Would like to double check if the upstream still have this issue.
+
+- User: Robin Dapp | Time: 2023-12-11 08:03:23 UTC
+  Text: I just built from the most recent commit and it still fails for me.
+Could there be a difference in qemu?  I'm on qemu-riscv64 version 8.1.91 but yours is even newer so that might not explain it.
+
+You could step through until the last vsetvl before the printf and check the vl after it (or the avl in a4).
+As we overwrite the stack it might lead to different outcomes on different environments.
+
+- User: Patrick O'Neill | Time: 2023-12-11 17:35:08 UTC
+  Text: I've reproduced the same failure on tip-of-tree using an old QEMU but cannot reproduce with a freshly built QEMU:
+GCC hash: eea25179d8d1406685b8b0995ba841605f895283 (tip-of-tree)
+Qemu hash: 78385bc738108a9b5b20e639520dc60425ca2a5a (v8.1.2)
+Glibc hash: a704fd9a133bfb10510e18702f48a6a9c88dbbd5 (v2.37)
+
+My QEMU was built with GCC hash: 8b5cd6c4519cc120badd2b35a9e30d4deb82c012
+If I use the tip-of-tree to build QMEU the failure does not exist anymore.
+
+Your modified testcase does not produce the failure since it's missing the variadic function call. Here is a version that works for me and does not use printf:
+
+int a, l, i, p, q, t, n, o;
+int *volatile c;
+static int j;
+static struct pack_1_struct d;
+long e;
+char m = 5;
+short s;
+
+#pragma pack(1)
+struct pack_1_struct {
+  long c;
+  int d;
+  int e;
+  int f;
+  int g;
+  int h;
+  int i;
+} h, r = {1}, *f = &h, *volatile g;
+
+void add_em_up(int count, ...) {
+  __builtin_va_list ap;
+  __builtin_va_start(ap, count);
+  __builtin_va_end(ap);
+}
+
+int main() {
+  int u;
+  j = 0;
+
+  for (; j < 9; ++j) {
+    u = ++t ? a : 0;
+    if (u) {
+      int *v = &d.d;
+      *v = g || e;
+      *c = 0;
+      *f = h;
+    }
+    s = l && c;
+    o = i;
+    d.f || (p = 0);
+    q |= n;
+  }
+
+  r = *f;
+
+  add_em_up(1, 1);
+
+  if (m != 5)
+    return 1;
+
+  return 0;
+}
+
+Commands (Note that I used the old QEMU build):
+gcv:> /scratch/tc-testing/tc-dec-11-trunk/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv -mabi=lp64d -O3 red.c -o rv64gcv.out
+> QEMU_CPU=rv64,vlen=128,v=true,vext_spec=v1.0 /scratch/tc-testing/tc-dec-8-trunk/build-rv64gcv/bin/qemu-riscv64 rv64gcv.out
+> echo $?1
+
+gc:> /scratch/tc-testing/tc-dec-11-trunk/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gc -mabi=lp64d -O3 red.c -o rv64gc.out
+> QEMU_CPU=rv64,vlen=128,v=true,vext_spec=v1.0 /scratch/tc-testing/tc-dec-8-trunk/build-rv64gcv/bin/qemu-riscv64 rv64gc.out                                                                   
+> echo $?0
+
+I think you're right Robin - it has some interaction with QMEU. The QEMU with GCCr14-6339-g8b5cd6c4519produces the error but the QEMU with the tip-of-tree GCCr14-6417-geea25179d8ddoes not produce the error.
+
+- User: Robin Dapp | Time: 2023-12-11 19:16:51 UTC
+  Text: I think we need to make sure that we're not writing out of bounds.  In that case anything might happen and if we just don't happen to overwrite this variable we might hit another one but the test can still pass "by accident".
+
+If my analysis is correct (it was just done very quickly) the vl should be 32 at that point and we should not write past that size.
+We could have printf output a larger chunk of memory.  Maybe this way we could see whether something was clobbered even with the newer qemu.
+
+- User: Patrick O'Neill | Time: 2023-12-11 19:41:27 UTC
+  Text: This version with printf reproduces the problem on both the old and new versions of QEMU:
+
+int printf(char *, ...);
+int a, l, i, p, q, t, n, o;
+int *volatile c;
+static int j;
+static struct pack_1_struct d;
+long e;
+char m = 5;
+short s;
+
+#pragma pack(1)
+struct pack_1_struct {
+  long c;
+  int d;
+  int e;
+  int f;
+  int g;
+  int h;
+  int i;
+} h, r = {1}, *f = &h, *volatile g;
+
+void add_em_up(int count, ...) {
+  __builtin_va_list ap;
+  __builtin_va_start(ap, count);
+  __builtin_va_end(ap);
+}
+
+int main() {
+  int u;
+  j = 0;
+
+  for (; j < 9; ++j) {
+    u = ++t ? a : 0;
+    if (u) {
+      int *v = &d.d;
+      *v = g || e;
+      *c = 0;
+      *f = h;
+    }
+    s = l && c;
+    o = i;
+    d.f || (p = 0);
+    q |= n;
+  }
+
+  r = *f;
+
+  add_em_up(1, 1);
+
+  printf("%d\n", m);
+}
+
+- User: Patrick O'Neill | Time: 2023-12-11 19:42:53 UTC
+  Text: I also tried making m an array and printing every element to try to detect the overwriting that way. Once m gets too large (~10 elements) the issue disappears.
+
+- User: Li Pan | Time: 2023-12-12 05:51:53 UTC
+  Text: I see, thanks all, will have a try with variadic function call.
+
+- User: Li Pan | Time: 2023-12-12 08:52:34 UTC
+  Text: (In reply to Robin Dapp fromcomment #7)> Here
+> 
+> 0x105c6 <main+294>      vse8.v  v8,(a5)
+> 
+> is where we overwrite m.  The vl is 128 but the preceding vsetvl gets a4 =
+> 46912504507016 as AVL which seems already borken.I can reproduce this up to a point.
+
+0x10282 <main+326>      vsetvli zero,a4,e8,m8,ta,ma
+
+(gdb) p $a4
+$2 = 110736
+
+Looks like 110736 is not the correct vl here, will continue to investigate.
+
+- User: Kito Cheng | Time: 2023-12-12 09:06:08 UTC
+  Text: ```
+.L15:
+        li      a3,9
+        lui     a4,%hi(s)
+        sw      a3,%lo(j)(t2)
+        sh      a5,%lo(s)(a4) <--a4 is hold the address of s
+        beq     t0,zero,.L42
+        sw      t5,8(t4)
+        vsetvli zero,a4,e8,m8,ta,ma  <<--- a4 as avl
+```
+
+- User: GCC Commits | Time: 2023-12-13 12:01:50 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:ef21ae5c45f3b79a36fadc1cb5723c095e2965adcommitr14-6490-gef21ae5c45f3b79a36fadc1cb5723c095e2965adAuthor: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Wed Dec 13 13:48:11 2023 +0800
+
+    RISC-V: Postpone full available optimization [VSETVL PASS]
+    
+    Fix VSETVL BUG that AVL is polluted
+    
+    .L15:
+            li      a3,9
+            lui     a4,%hi(s)
+            sw      a3,%lo(j)(t2)
+            sh      a5,%lo(s)(a4) <--a4 is hold the address of s
+            beq     t0,zero,.L42
+            sw      t5,8(t4)
+            vsetvli zero,a4,e8,m8,ta,ma  <<--- a4 as avl
+    
+    Actually, this vsetvl is redundant.
+    The root cause we include full available optimization in LCM local data computation.
+    
+    full available optimization should be after LCM computation.PR target/112929PR target/112988gcc/ChangeLog:
+    
+            * config/riscv/riscv-vsetvl.cc
+            (pre_vsetvl::compute_lcm_local_properties): Remove full available.
+            (pre_vsetvl::pre_global_vsetvl_info): Add full available optimization.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/vsetvl/pr112929.c: New test.
+            * gcc.target/riscv/rvv/vsetvl/pr112988.c: New test.
+
+- User: GCC Commits | Time: 2023-12-13 14:08:07 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:d702387b1b765f85e19961a0b2a29df14df89bfdcommitr14-6497-gd702387b1b765f85e19961a0b2a29df14df89bfdAuthor: Pan Li <pan2.li@intel.com>
+Date:   Wed Dec 13 21:46:14 2023 +0800
+
+    RISC-V: Refine test cases for bothPR112929andPR112988Refine the test cases for:
+    
+    * Name convention.
+    * Add run case.
+    
+    These test cases used to cause out-of-bounds writes to the stack
+    and therefore showed unreliable behavior.  Depending on the
+    execution environment they can either pass or fail.  As of now,
+    with the latest QEMU version, they will pass even without the
+    underlying issue fixed.  As the test case is known to have
+    caused the problem before we keep it as a run test case for
+    future reference.PR target/112929PR target/112988gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/vsetvl/pr112929.c: Moved to...
+            * gcc.target/riscv/rvv/vsetvl/pr112929-1.c: ...here.
+            * gcc.target/riscv/rvv/vsetvl/pr112988.c: Moved to...
+            * gcc.target/riscv/rvv/vsetvl/pr112988-1.c: ...here.
+            * gcc.target/riscv/rvv/vsetvl/pr112929-2.c: New test.
+            * gcc.target/riscv/rvv/vsetvl/pr112988-2.c: New test.
+    
+    Signed-off-by: Pan Li <pan2.li@intel.com>
+
+- User: Patrick O'Neill | Time: 2023-12-13 16:23:01 UTC
+  Text: Confirmed to be fixed on tip-of-tree. Thank you!
+

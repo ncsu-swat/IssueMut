@@ -1,0 +1,654 @@
+Bug Summary: [14 Regression] ICE: in get_predictor_value, at predict.cc:2695 with -O -fno-tree-fre and __builtin_expect() since r14-2219-geab57b825bcc35
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 13.2.1
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-07-30 09:02:23 UTC
+  Text: Createdattachment 55659[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O -fno-tree-fre testcase.c
+during GIMPLE pass: profile_estimate
+testcase.c: In function 'foo':
+testcase.c:8:1: internal compiler error: in get_predictor_value, at predict.cc:2695
+    8 | }
+      | ^
+0x7c5847 get_predictor_value
+        /repo/gcc-trunk/gcc/predict.cc:2695
+0x7c5847 get_predictor_value
+        /repo/gcc-trunk/gcc/predict.cc:2686
+0x13687d0 tree_predict_by_opcode
+        /repo/gcc-trunk/gcc/predict.cc:2750
+0x13687d0 tree_estimate_probability_bb
+        /repo/gcc-trunk/gcc/predict.cc:3131
+0x1374a19 tree_estimate_probability(bool)
+        /repo/gcc-trunk/gcc/predict.cc:3161
+0x1374fb5 execute
+        /repo/gcc-trunk/gcc/predict.cc:4133
+0x1374fb5 execute
+        /repo/gcc-trunk/gcc/predict.cc:4118
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-2866-20230729170758-ge68a31549d9-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-2866-20230729170758-ge68a31549d9-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20230729 (experimental) (GCC)
+
+- User: Jan Hubicka | Time: 2023-08-01 13:57:58 UTC
+  Text: This is likelyg:eab57b825bcc350e9ff44eb2fa739a80199d9bb1which fixed prediction order and uncovered latent bug in combininig predictions with known probabilities.  I will take a look.
+
+- User: Richard Biener | Time: 2023-10-17 12:23:11 UTC
+  Text: Confirmed.
+
+#1  0x0000000001575f8c in get_predictor_value (predictor=PRED_UNCONDITIONAL, 
+    probability=9000) at /space/rguenther/src/gcc/gcc/predict.cc:2695
+2695       gcc_assert (probability == -1);
+
+- User: Sam James | Time: 2023-10-22 23:40:43 UTC
+  Text: yep:
+
+eab57b825bcc350e9ff44eb2fa739a80199d9bb1 is the first bad commit
+commit eab57b825bcc350e9ff44eb2fa739a80199d9bb1
+Author: Jan Hubicka <jh@suse.cz>
+Date:   Fri Jun 30 16:27:27 2023 +0200
+
+    Fix handling of __builtin_expect_with_probability and improve first-match heuristics
+
+- User: Andrew Pinski | Time: 2023-11-13 03:27:02 UTC
+  Text: ***Bug 112502has been marked as a duplicate of this bug. ***
+
+- User: Jakub Jelinek | Time: 2024-01-04 14:42:21 UTC
+  Text: So, what happens here is that expr_expected_value_1 is called on a binary operation (GT_EXPR in this case, but that is irrelevant) with 2 SSA_NAME operands, where one SSA_NAME is set to an INTEGER_CST (not propagated because of -fno-tree-fre) and the other one result of __builtin_expect.  For the INTEGER_CST, we get *predictor PRED_UNCONDITIONAL with *probability -1, for __builtin_expect predictor2 PRED_BUILTIN_EXPECT with probability2 9000.
+Next we try to merge the predictors.  As at least one of them has probability != -1,
+          /* Combine binary predictions.  */
+          if (*probability != -1 || probability2 != -1)
+            {
+              HOST_WIDE_INT p1 = get_predictor_value (*predictor, *probability);
+              HOST_WIDE_INT p2 = get_predictor_value (predictor2, probability2);
+              *probability = RDIV (p1 * p2, REG_BR_PROB_BASE);
+            }
+is done to combine the value and we get 9000 out of that in this case,
+but then pick the predictor with the smaller value which is PRED_UNCONDITIONAL in:
+          if (predictor2 < *predictor)
+            *predictor = predictor2;
+which causes the later ICE, because only PRED_BUILTIN_EXPECT* should have probability
+other than -1.
+Now, given the combination code I wrote:
+--- gcc/predict.cc.jj	2024-01-03 11:51:32.000000000 +0100
++++ gcc/predict.cc	2024-01-04 14:04:40.996639979 +0100
+@@ -2626,10 +2626,20 @@ expr_expected_value_1 (tree type, tree o
+ 	    {
+ 	      HOST_WIDE_INT p1 = get_predictor_value (*predictor, *probability);
+ 	      HOST_WIDE_INT p2 = get_predictor_value (predictor2, probability2);
++	      if (*probability != -1 && probability2 != -1)
++		{
++		  /* If both predictors are PRED_BUILTIN_EXPECT*, pick the
++		     smaller one from them.  */
++		  if (predictor2 < *predictor)
++		    *predictor = predictor2;
++		}
++	      /* Otherwise, if at least one predictor is PRED_BUILTIN_EXPECT*,
++		 use that one for the combination.  */
++	      else if (probability2 != -1)
++		*predictor = predictor2;
+ 	      *probability = RDIV (p1 * p2, REG_BR_PROB_BASE);
+ 	    }
+-
+-	  if (predictor2 < *predictor)
++	  else if (predictor2 < *predictor)
+ 	    *predictor = predictor2;
+ 
+ 	  return res;
+which fixes the ICE by preferring PRED_BUILTIN_EXPECT* over others.
+At least in this case when one operand is a constant and another one is __builtin_expect* result that seems like the right choice to me, the fact that one operand is constant doesn't mean the outcome of the binary operation is unconditionally constant when the other operand is __builtin_expect* based.
+But reading the
+"This incorrectly takes precedence over more reliable heuristics predicting that call
+to cold noreturn is likely not going to happen."
+in the description makes me wonder whether that is what we want always (though, I must say I don't understand the cold noreturn argument because PRED_COLD_FUNCTION is never returned from expr_expected_value_1.  But PRED_COMPARE_AND_SWAP (in between
+PRED_BUILTIN_EXPECT_WITH_PROBABILITY and PRED_BUILTIN_EXPECT), whatever the fortran IFN_BUILTIN_EXPECTs have (all above PRED_BUILTIN_EXPECT*), PRED_MALLOC_NONNULL (above PRED_BUILTIN_EXPECT*) can appear.
+So, shall we prefer PRED_BUILTIN_EXPECT* over PRED_UNCONDITIONAL for the binary operations, but prefer PRED_COMPARE_AND_SWAP over PRED_BUILTIN_EXPECT (and then set *probability to -1 obviously)?  The others don't matter because they have higher value and so aren't picked up.
+
+The reason this doesn't ICE with -fno-tree-fre is that if one of the binary operands is already INTEGER_CST, it just uses the predictor from the other operand (which is another argument in support of ignoring PRED_UNCONDITIONAL operand vs. other predictors when merging).
+
+Oh, another thing is that before the patch there were two spots that merged the predictors, one for the binary operands (which previously picked the weaker predictor and now picks stronger predictor), but also in the PHI handling (which still picks weaker predictor); shouldn't that be changed to match, including the != -1 handling?
+
+- User: Jan Hubicka | Time: 2024-01-04 15:24:25 UTC
+  Text: > which fixes the ICE by preferring PRED_BUILTIN_EXPECT* over others.
+> At least in this case when one operand is a constant and another one is
+> __builtin_expect* result that seems like the right choice to me, the fact that
+> one operand is constant doesn't mean the outcome of the binary operation is
+> unconditionally constant when the other operand is __builtin_expect* based.The code attempt to solve an problem with no good solution.  If you have two
+probabilities that certain thing happens, the combination of them is
+neither correct (since we do not know that the both probabilities are
+independent) nor the resulting value corresponds to one of the two
+predictors contributing to the outcome.
+
+One exception is when one value is 100% sure, which is the case of
+PRED_UNCDITIONAL.  So I would say we could simply special case 0% and
+100% probability and pick the other predictor in that case.> But reading the
+> "This incorrectly takes precedence over more reliable heuristics predicting
+> that call
+> to cold noreturn is likely not going to happen."
+> in the description makes me wonder whether that is what we want always (though,
+> I must say I don't understand the cold noreturn argument because
+> PRED_COLD_FUNCTION is never returned from expr_expected_value_1.  ButOnce expr_epeced_value finishes its job, it attaches precitor to an edge
+and later all predictions sitting on an edge are combined.  If you end
+up declaring prediction as BUILTIN_EXPECT_WITH_PROBABILITY, the logic
+combining precitions will believe that the value is very reliable and 
+will ignore other predictors.  This is the PRED_FLAG_FIRST_MATCH mode.
+
+So computing uncertain probability and declaring it to be
+BUILTIN_EXPECT_WITH_PROBABILITY is worse than declaring it to be a
+predictor with PRED_DS_THEORY merging mode
+(which assumes that the value is detrmined by possibly unreliable
+heuristics)
+
+So I would go with special casing 0% and 100% predictors (which can be
+simply stripped and forgotten). For the rest we could probably introduce
+PRED_COMBINED_VALUE which will be like BUILTIN_EXPECT_WITH_PROBABILITY
+but with DS_THEORY meging mode.  It is probably better than nothing, but
+certainly can not be trusted anymore.> 
+> Oh, another thing is that before the patch there were two spots that merged the
+> predictors, one for the binary operands (which previously picked the weaker
+> predictor and now picks stronger predictor), but also in the PHI handling
+> (which still picks weaker predictor); shouldn't that be changed to match,
+> including the != -1 handling?PHI is even more fishy, since we have no idea of probability of entering
+the basic block with a given edge.  We can probably ignore basic blocks
+that are already having profile_count of 0.
+
+Otherwise we may try to do DS theory combination of the incomming
+values.  I can cook up a patch.
+
+(also fixing other profile related issue is very high on my TODO now)
+
+- User: Jakub Jelinek | Time: 2024-01-04 15:30:41 UTC
+  Text: So, what about following patch (which also fixes the ICE, would of course need to add the testcase) and doesn't regress any predict-*.c tests)?
+
+--- gcc/predict.cc.jj	2024-01-03 11:51:32.000000000 +0100
++++ gcc/predict.cc	2024-01-04 16:28:55.041507010 +0100
+@@ -2583,44 +2583,36 @@ expr_expected_value_1 (tree type, tree o
+   if (get_gimple_rhs_class (code) == GIMPLE_BINARY_RHS)
+     {
+       tree res;
+-      tree nop0 = op0;
+-      tree nop1 = op1;
+-      if (TREE_CODE (op0) != INTEGER_CST)
+-	{
+-	  /* See if expected value of op0 is good enough to determine the result.  */
+-	  nop0 = expr_expected_value (op0, visited, predictor, probability);
+-	  if (nop0
+-	      && (res = fold_build2 (code, type, nop0, op1)) != NULL
+-	      && TREE_CODE (res) == INTEGER_CST)
+-	    return res;
+-	  if (!nop0)
+-	    nop0 = op0;
+-	 }
+       enum br_predictor predictor2;
+       HOST_WIDE_INT probability2;
+-      if (TREE_CODE (op1) != INTEGER_CST)
++      tree nop0 = expr_expected_value (op0, visited, predictor, probability);
++      if (!nop0)
++	{
++	  nop0 = op0;
++	  *predictor = PRED_UNCONDITIONAL;
++	  *probability = -1;
++	}
++      tree nop1 = expr_expected_value (op1, visited, &predictor2, &probability2);
++      if (!nop1)
++	{
++	  nop1 = op1;
++	  predictor2 = PRED_UNCONDITIONAL;
++	  probability2 = -1;
++	}
++      /* Finally see if we have two known values.  */
++      res = fold_build2 (code, type, nop0, nop1);
++      if (TREE_CODE (res) == INTEGER_CST)
+ 	{
+-	  /* See if expected value of op1 is good enough to determine the result.  */
+-	  nop1 = expr_expected_value (op1, visited, &predictor2, &probability2);
+-	  if (nop1
+-	      && (res = fold_build2 (code, type, op0, nop1)) != NULL
+-	      && TREE_CODE (res) == INTEGER_CST)
++	  /* If one operand is PRED_UNCONDITIONAL, aka directly or indirectly
++	     constant, prefer the other predictor.  */
++	  if (predictor2 == PRED_UNCONDITIONAL)
++	    return res;
++	  if (*predictor == PRED_UNCONDITIONAL)
+ 	    {
+ 	      *predictor = predictor2;
+ 	      *probability = probability2;
+ 	      return res;
+ 	    }
+-	  if (!nop1)
+-	    nop1 = op1;
+-	 }
+-      if (nop0 == op0 || nop1 == op1)
+-	return NULL;
+-      /* Finally see if we have two known values.  */
+-      res = fold_build2 (code, type, nop0, nop1);
+-      if (TREE_CODE (res) == INTEGER_CST
+-	  && TREE_CODE (nop0) == INTEGER_CST
+-	  && TREE_CODE (nop1) == INTEGER_CST)
+-	{
+ 	  /* Combine binary predictions.  */
+ 	  if (*probability != -1 || probability2 != -1)
+ 	    {
+@@ -2631,6 +2623,9 @@ expr_expected_value_1 (tree type, tree o
+ 
+ 	  if (predictor2 < *predictor)
+ 	    *predictor = predictor2;
++	  if (*predictor != PRED_BUILTIN_EXPECT
++	      && *predictor != PRED_BUILTIN_EXPECT_WITH_PROBABILITY)
++	    *probability = -1;
+ 
+ 	  return res;
+ 	}
+
+- User: Jakub Jelinek | Time: 2024-01-04 15:59:45 UTC
+  Text: Createdattachment 56989[details]gcc14-pr110852.patch
+
+Full untested patch.
+
+- User: Jan Hubicka | Time: 2024-01-04 16:06:33 UTC
+  Text: >https://gcc.gnu.org/bugzilla/show_bug.cgi?id=110852> 
+> ---Comment #7from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> So, what about following patch (which also fixes the ICE, would of course need
+> to add the testcase) and doesn't regress any predict-*.c tests)?
+> 
+> --- gcc/predict.cc.jj   2024-01-03 11:51:32.000000000 +0100
+> +++ gcc/predict.cc      2024-01-04 16:28:55.041507010 +0100
+> @@ -2583,44 +2583,36 @@ expr_expected_value_1 (tree type, tree o
+>    if (get_gimple_rhs_class (code) == GIMPLE_BINARY_RHS)
+>      {
+>        tree res;
+> -      tree nop0 = op0;
+> -      tree nop1 = op1;
+> -      if (TREE_CODE (op0) != INTEGER_CST)
+> -       {
+> -         /* See if expected value of op0 is good enough to determine the
+> result.  */
+> -         nop0 = expr_expected_value (op0, visited, predictor, probability);
+> -         if (nop0
+> -             && (res = fold_build2 (code, type, nop0, op1)) != NULL
+> -             && TREE_CODE (res) == INTEGER_CST)
+> -           return res;
+> -         if (!nop0)
+> -           nop0 = op0;
+> -        }By removing the logic we lose ability to optimize things like
+  a = b * c;
+where b is predicted to value 0 and c has no useful prediction on it.> @@ -2631,6 +2623,9 @@ expr_expected_value_1 (tree type, tree o
+> 
+>           if (predictor2 < *predictor)
+>             *predictor = predictor2;
+> +         if (*predictor != PRED_BUILTIN_EXPECT
+> +             && *predictor != PRED_BUILTIN_EXPECT_WITH_PROBABILITY)
+> +           *probability = -1;This still can "upgrade" prediction to a predictor of lower enm value
+but higher probability that is not conservative thing to do.> 
+>           return res;
+>         }I ended up with the folloing patch that also takes care of various cases
+of phi merging and downgrading the predictor to new
+PRED_COMBINED_VALUE_PREDICTION which can, like PRED_BUILTIN_EXPECT hold
+custom probability but it is not trued as FIRST_MATCH.
+What do you think?
+
+gcc/ChangeLog:
+
+	* predict.cc (expr_expected_value_1):
+	(get_predictor_value):
+	* predict.def (PRED_COMBINED_VALUE_PREDICTIONS):
+
+diff --git a/gcc/predict.cc b/gcc/predict.cc
+index 2e9b7dd07a7..cdfaea1e607 100644
+--- a/gcc/predict.cc
++++ b/gcc/predict.cc
+@@ -2404,16 +2404,29 @@ expr_expected_value_1 (tree type, tree op0, enum tree_code code,
+       if (!bitmap_set_bit (visited, SSA_NAME_VERSION (op0)))
+ 	return NULL;
+ 
+-      if (gimple_code (def) == GIMPLE_PHI)
++      if (gphi *phi = dyn_cast <gphi *> (def))
+ 	{
+ 	  /* All the arguments of the PHI node must have the same constant
+ 	     length.  */
+-	  int i, n = gimple_phi_num_args (def);
+-	  tree val = NULL, new_val;
++	  int i, n = gimple_phi_num_args (phi);
++	  tree val = NULL;
++	  bool has_nonzero_edge = false;
++
++	  /* If we already proved that given edge is unlikely, we do not need
++	     to handle merging of the probabilities.  */
++	  for (i = 0; i < n && !has_nonzero_edge; i++)
++	    {
++	      tree arg = PHI_ARG_DEF (phi, i);
++	      if (arg == PHI_RESULT (phi))
++		continue;
++	      profile_count cnt = gimple_phi_arg_edge (phi, i)->count ();
++	      if (!cnt.initialized_p () || cnt.nonzero_p ())
++		has_nonzero_edge = true;
++	    }
+ 
+ 	  for (i = 0; i < n; i++)
+ 	    {
+-	      tree arg = PHI_ARG_DEF (def, i);
++	      tree arg = PHI_ARG_DEF (phi, i);
+ 	      enum br_predictor predictor2;
+ 
+ 	      /* If this PHI has itself as an argument, we cannot
+@@ -2422,26 +2435,50 @@ expr_expected_value_1 (tree type, tree op0, enum tree_code code,
+ 		 PHI args then we can still be sure that this is
+ 		 likely a constant.  So be optimistic and just
+ 		 continue with the next argument.  */
+-	      if (arg == PHI_RESULT (def))
++	      if (arg == PHI_RESULT (phi))
+ 		continue;
+ 
++	      /* Skip edges which we already predicted as unlikely.  */
++	      if (has_nonzero_edge)
++		{
++		  profile_count cnt = gimple_phi_arg_edge (phi, i)->count ();
++		  if (cnt.initialized_p () && !cnt.nonzero_p ())
++		    continue;
++		}
+ 	      HOST_WIDE_INT probability2;
+-	      new_val = expr_expected_value (arg, visited, &predictor2,
+-					     &probability2);
++	      tree new_val = expr_expected_value (arg, visited, &predictor2,
++						  &probability2);
++	      /* If we know nothing about value, give up.  */
++	      if (!new_val)
++		return NULL;
+ 
+-	      /* It is difficult to combine value predictors.  Simply assume
+-		 that later predictor is weaker and take its prediction.  */
+-	      if (*predictor < predictor2)
++	      /* If this is a first edge, trust its prediction.  */
++	      if (!val)
+ 		{
++		  val = new_val;
+ 		  *predictor = predictor2;
+ 		  *probability = probability2;
++		  continue;
+ 		}
+-	      if (!new_val)
+-		return NULL;
+-	      if (!val)
+-		val = new_val;
+-	      else if (!operand_equal_p (val, new_val, false))
++	      /* If there are two different values, give up.  */
++	      if (!operand_equal_p (val, new_val, false))
+ 		return NULL;
++
++	      int p1 = get_predictor_value (*predictor, *probability);
++	      int p2 = get_predictor_value (predictor2, probability2);
++	      /* If both predictors agrees, it does not matter from which
++		 edge we enter the basic block.  */
++	      if (*predictor == predictor2 && p1 == p2)
++		continue;
++	      /* The general case has no precise solution, since we do not
++		 know probabilities of incomming edges, yet.
++		 Still if value is predicted over all incomming edges, we
++		 can hope it will be indeed the case.  Conservatively
++		 downgrade prediction quality (so first match merging is not
++		 performed) and take least successful prediction.  */
++
++	      *predictor = PRED_COMBINED_VALUE_PREDICTIONS;
++	      *probability = MIN (p1, p2);
+ 	    }
+ 	  return val;
+ 	}
+@@ -2596,8 +2633,8 @@ expr_expected_value_1 (tree type, tree op0, enum tree_code code,
+ 	  if (!nop0)
+ 	    nop0 = op0;
+ 	 }
+-      enum br_predictor predictor2;
+-      HOST_WIDE_INT probability2;
++      enum br_predictor predictor2 = PRED_UNCONDITIONAL;
++      HOST_WIDE_INT probability2 = -1;
+       if (TREE_CODE (op1) != INTEGER_CST)
+ 	{
+ 	  /* See if expected value of op1 is good enough to determine the result.  */
+@@ -2613,24 +2650,39 @@ expr_expected_value_1 (tree type, tree op0, enum tree_code code,
+ 	  if (!nop1)
+ 	    nop1 = op1;
+ 	 }
++      /* We already checked if folding one of arguments to constant is good enough.
++         Consequently failing to fold both means that we will not suceed determinging
++	 the value.  */
+       if (nop0 == op0 || nop1 == op1)
+ 	return NULL;
+       /* Finally see if we have two known values.  */
+       res = fold_build2 (code, type, nop0, nop1);
+-      if (TREE_CODE (res) == INTEGER_CST
+-	  && TREE_CODE (nop0) == INTEGER_CST
+-	  && TREE_CODE (nop1) == INTEGER_CST)
++      if (TREE_CODE (res) == INTEGER_CST)
+ 	{
+-	  /* Combine binary predictions.  */
+-	  if (*probability != -1 || probability2 != -1)
++	  HOST_WIDE_INT p1 = get_predictor_value (*predictor, *probability);
++	  HOST_WIDE_INT p2 = get_predictor_value (predictor2, probability2);
++
++	  /* If one of predictions is sure, such as PRED_UNCONDITIONAL, we
++	     can ignore it.  */
++	  if (p2 == PROB_ALWAYS)
++	    return res;
++	  if (p1 == PROB_ALWAYS)
+ 	    {
+-	      HOST_WIDE_INT p1 = get_predictor_value (*predictor, *probability);
+-	      HOST_WIDE_INT p2 = get_predictor_value (predictor2, probability2);
+-	      *probability = RDIV (p1 * p2, REG_BR_PROB_BASE);
++	      *predictor = predictor2;
++	      *probability = probability2;
++	      return res;
+ 	    }
+-
+-	  if (predictor2 < *predictor)
+-	    *predictor = predictor2;
++	  /* Combine binary predictions.
++	     Since we do not know about independence of predictors, we   */
++	  *probability = RDIV (p1 * p2, REG_BR_PROB_BASE);
++	  /* If we no longer track useful information, give up.  */
++	  if (!*probability)
++	    return NULL;
++	  /* Otherwise mark that prediction is a result of combining
++	     different heuristics, since we do not want it to participate
++	     in first match merging.  It is no longer reliable since
++	     we do not know if the probabilities are indpenendet.  */
++	  *predictor = PRED_COMBINED_VALUE_PREDICTIONS;
+ 
+ 	  return res;
+ 	}
+@@ -2690,6 +2742,7 @@ get_predictor_value (br_predictor predictor, HOST_WIDE_INT probability)
+     {
+     case PRED_BUILTIN_EXPECT:
+     case PRED_BUILTIN_EXPECT_WITH_PROBABILITY:
++    case PRED_COMBINED_VALUE_PREDICTIONS:
+       gcc_assert (probability != -1);
+       return probability;
+     default:
+diff --git a/gcc/predict.def b/gcc/predict.def
+index ae7dd8239c5..4f3e519356d 100644
+--- a/gcc/predict.def
++++ b/gcc/predict.def
+@@ -94,6 +94,10 @@ DEF_PREDICTOR (PRED_LOOP_ITERATIONS_GUESSED, "guessed loop iterations",
+ DEF_PREDICTOR (PRED_LOOP_ITERATIONS_MAX, "guessed loop iterations",
+ 	       PROB_UNINITIALIZED, PRED_FLAG_FIRST_MATCH)
+ 
++/* Prediction which is an outcome of combining multiple value predictions.  */
++DEF_PREDICTOR (PRED_COMBINED_VALUE_PREDICTIONS,
++	       "combined value predictions", PROB_UNINITIALIZED, 0)
++
+ /* Branch containing goto is probably not taken.  */
+ DEF_PREDICTOR (PRED_CONTINUE, "continue", HITRATE (67), 0)
+
+- User: Jakub Jelinek | Time: 2024-01-04 16:17:32 UTC
+  Text: (In reply to Jan Hubicka fromcomment #9)> By removing the logic we lose ability to optimize things like
+>   a = b * c;
+> where b is predicted to value 0 and c has no useful prediction on it.No, that is what my unposted WIP patch did, but predict-18.c test catched that.> > @@ -2631,6 +2623,9 @@ expr_expected_value_1 (tree type, tree o
+> > 
+> >           if (predictor2 < *predictor)
+> >             *predictor = predictor2;
+> > +         if (*predictor != PRED_BUILTIN_EXPECT
+> > +             && *predictor != PRED_BUILTIN_EXPECT_WITH_PROBABILITY)
+> > +           *probability = -1;
+> 
+> This still can "upgrade" prediction to a predictor of lower enm value
+> but higher probability that is not conservative thing to do.
+> > 
+> >           return res;
+> >         }
+> I ended up with the folloing patch that also takes care of various cases
+> of phi merging and downgrading the predictor to new
+> PRED_COMBINED_VALUE_PREDICTION which can, like PRED_BUILTIN_EXPECT hold
+> custom probability but it is not trued as FIRST_MATCH.
+> What do you think?> +	      int p1 = get_predictor_value (*predictor, *probability);
+> +	      int p2 = get_predictor_value (predictor2, probability2);
+> +	      /* If both predictors agrees, it does not matter from whichs/agrees/agree/> +         Consequently failing to fold both means that we will not suceed
+> determingings/suceed/succeed/;s/determinging/determining/
+
+Otherwise yes, but I think the code could be still simplified the way I had in my patch (i.e. drop parts of ther14-2219changes, and simply assume that failed recursion for one operand is PRED_UNCONDITIONAL instead of returning early, and not requiring the operands are INTEGER_CSTs, just that the result of the binop folds to INTEGER_CST.
+
+- User: Jan Hubicka | Time: 2024-01-04 16:26:23 UTC
+  Text: > > +	      int p1 = get_predictor_value (*predictor, *probability);
+> > +	      int p2 = get_predictor_value (predictor2, probability2);
+> > +	      /* If both predictors agrees, it does not matter from which
+> 
+> s/agrees/agree/
+> 
+> > +         Consequently failing to fold both means that we will not suceed
+> > determinging
+> 
+> s/suceed/succeed/;s/determinging/determining/Fixed that, thanks!> 
+> Otherwise yes, but I think the code could be still simplified the way I had in
+> my patch (i.e. drop parts of ther14-2219changes, and simply assume that
+> failed recursion for one operand is PRED_UNCONDITIONAL instead of returning
+> early, and not requiring the operands are INTEGER_CSTs, just that the result of
+> the binop folds to INTEGER_CST.I added the early exits to handle the following case.
+
+a = b * c
+
+If b is prediced to 0 with predictor1, while c is predicted to 1 with
+predictor2 your version will predict a to be 0, but will merge
+predictor1 and 2 leading to lower probability than predictor1 alone.
+So the early exit will give bit higher chance for not losing
+information.
+
+The code is still lax if both b and c are predicted to 0 in which case
+we can work out that combined probability is at least max of the two
+predictor probabilities, but I was not sure if that is work extra
+folding overhead.> 
+> -- 
+> You are receiving this mail because:
+> You are on the CC list for the bug.
+
+- User: Jakub Jelinek | Time: 2024-01-04 16:35:08 UTC
+  Text: (In reply to Jan Hubicka fromcomment #11)> I added the early exits to handle the following case.
+> 
+> a = b * c
+> 
+> If b is prediced to 0 with predictor1, while c is predicted to 1 with
+> predictor2 your version will predict a to be 0, but will merge
+> predictor1 and 2 leading to lower probability than predictor1 alone.
+> So the early exit will give bit higher chance for not losing
+> information.I thought the goal was to handle what is in predict-18.c, i.e.
+b * __builtin_expect (c, 0)
+or similar.  If it is about
+__builtin_expect_with_probability (b, 42, 0.25) * __builtin_expect_with_probability (c, 0, 0.42)
+sure, my version will merge the probabilities, while you'll pick the probability from
+the 0 case.
+
+- User: Jakub Jelinek | Time: 2024-01-04 16:37:16 UTC
+  Text: But, when you are touching the PHI case, I think
+              /* If this PHI has itself as an argument, we cannot
+                 determine the string length of this argument.  However,
+                 if we can find an expected constant value for the other
+                 PHI args then we can still be sure that this is
+                 likely a constant.  So be optimistic and just
+                 continue with the next argument.  */
+is a pasto from somewhere else (get_range_strlen), this function doesn't care about string lengths...
+
+- User: Jan Hubicka | Time: 2024-01-04 17:06:57 UTC
+  Text: > I thought the goal was to handle what is in predict-18.c, i.e.
+> b * __builtin_expect (c, 0)
+> or similar.  If it is about
+> __builtin_expect_with_probability (b, 42, 0.25) *
+> __builtin_expect_with_probability (c, 0, 0.42)
+> sure, my version will merge the probabilities, while you'll pick the
+> probability from
+> the 0 case.Probability from 0 case is better estimate, so I think it makes sense to
+handle it right.  I did not take that much stats on how often it
+happens, but on my TODO list is to turn this into value range predictor
+which may have better chance of success. We can also handle other
+constants than INTEGER_CST.
+
+I will see if I can clean up the code bit more or add a comment, since
+it is indeed bit confusing as written now.  Will also look into more
+testcases.
+
+Thanks a lot!
+Honza
+
+- User: GCC Commits | Time: 2024-01-17 14:20:06 UTC
+  Text: The master branch has been updated by Jan Hubicka <hubicka@gcc.gnu.org>:https://gcc.gnu.org/g:b00be6f1576993369522c16dba992bec9adab9b2commitr14-8187-gb00be6f1576993369522c16dba992bec9adab9b2Author: Jan Hubicka <jh@suse.cz>
+Date:   Wed Jan 17 15:19:32 2024 +0100
+
+    Fix merging of value predictors
+    
+    expr_expected_value is doing some guesswork when it is merging two or more
+    independent value predictions either in PHI node or in binary operation.
+    Since we do not know how the predictions interact with each other, we can
+    not really merge the values precisely.
+    
+    The previous logic merged the prediciton and picked the later predictor
+    (since predict.def is sorted by reliability). This however leads to troubles
+    with __builtin_expect_with_probability since it is special cased as a predictor
+    with custom probabilities.  If this predictor is downgraded to something else,
+    we ICE since we have prediction given by predictor that is not expected
+    to have customprobability.
+    
+    This patch fixies it by inventing new predictors PRED_COMBINED_VALUE_PREDICTIONS
+    and PRED_COMBINED_VALUE_PREDICTIONS_PHI which also allows custom values but
+    are considered less reliable then __builtin_expect_with_probability (they
+    are combined by ds theory rather then by first match).  This is less likely
+    going to lead to very stupid decisions if combining does not work as expected.
+    
+    I also updated the code to be bit more careful about merging values and do not
+    downgrade the precision when unnecesary (as tested by new testcases).
+    
+    Bootstrapped/regtested x86_64-linux, will commit it tomorrow if there are
+    no complains.
+    
+    2024-01-17  Jan Hubicka  <jh@suse.cz>
+                Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/110852gcc/ChangeLog:
+    
+            * predict.cc (expr_expected_value_1): Fix profile merging of PHI and
+            binary operations
+            (get_predictor_value): Handle PRED_COMBINED_VALUE_PREDICTIONS and
+            PRED_COMBINED_VALUE_PREDICTIONS_PHI
+            * predict.def (PRED_COMBINED_VALUE_PREDICTIONS): New predictor.
+            (PRED_COMBINED_VALUE_PREDICTIONS_PHI): New predictor.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/predict-18.c: Update template to expect combined value predictor.
+            * gcc.dg/predict-23.c: New test.
+            * gcc.dg/tree-ssa/predict-1.c: New test.
+            * gcc.dg/tree-ssa/predict-2.c: New test.
+            * gcc.dg/tree-ssa/predict-3.c: New test.
+
+- User: Jan Hubicka | Time: 2024-01-17 14:22:24 UTC
+  Text: Fixed.
+

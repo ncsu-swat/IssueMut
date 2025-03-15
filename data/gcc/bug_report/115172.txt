@@ -1,0 +1,222 @@
+Bug Summary: Invalid -fsanitize=bool sanitization of variable from named address space
+Product: gcc
+Component: sanitizer
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Uroš Bizjak | Time: 2024-05-21 09:33:26 UTC
+  Text: Createdattachment 58260[details]Preprocessed file
+
+Originally reported inPR 111736,comment 42.
+
+Compiling the attached preprocessed file with:
+
+gcc -O2 -fsanitize=kernel-address -fasan-shadow-offset=0xdffffc0000000000 --param asan-instrumentation-with-call-threshold=10000 -fsanitize=bool -S alternative.i
+
+results in:
+
+	movabsq	$-2305847407260205056, %rdx
+	movl	$cpu_tlbstate_shared, %eax
+	shrq	$3, %rax
+	movzbl	(%rax,%rdx), %eax
+	testb	%al, %al
+	je	.L399
+	jle	.L473
+.L399:
+	movzbl	%gs:cpu_tlbstate_shared(%rip), %r14d
+	cmpb	$1, %r14b
+
+which is wrong. %gs: prefixed addresses should not be sanitized.
+
+Omitting -fsanitize=bool from the above compiles the preprocessed file to:
+
+	movzbl	%gs:cpu_tlbstate_shared(%rip), %eax
+	testb	%al, %al
+
+where no sanitization is present with the above variable.
+
+- User: Jakub Jelinek | Time: 2024-05-21 10:05:20 UTC
+  Text: Reduced testcase for -O2 -fsanitize=address,bool --param asan-instrumentation-with-call-threshold=100:
+extern struct S { _Bool b; } s;
+void bar (void);
+
+void
+foo (void)
+{
+  if (*(volatile _Bool __seg_gs *) (__UINTPTR_TYPE__) &s.b)
+    bar ();
+}
+
+What the kernel does is terrible, why they just don't declare the extern with __seg_gs attribute?
+
+- User: Jakub Jelinek | Time: 2024-05-21 10:16:00 UTC
+  Text: That said,
+--- gcc/ubsan.cc.jj	2024-03-22 09:23:37.695296775 +0100
++++ gcc/ubsan.cc	2024-05-21 12:10:24.261454107 +0200
+@@ -1776,13 +1776,17 @@ instrument_bool_enum_load (gimple_stmt_i
+       || TREE_CODE (gimple_assign_lhs (stmt)) != SSA_NAME)
+     return;
+ 
++  addr_space_t as = TYPE_ADDR_SPACE (TREE_TYPE (rhs));
++  if (as != TYPE_ADDR_SPACE (utype))
++    utype = build_qualified_type (utype, TYPE_QUALS (utype)
++					 | ENCODE_QUAL_ADDR_SPACE (as));
+   bool ends_bb = stmt_ends_bb_p (stmt);
+   location_t loc = gimple_location (stmt);
+   tree lhs = gimple_assign_lhs (stmt);
+   tree ptype = build_pointer_type (TREE_TYPE (rhs));
+   tree atype = reference_alias_ptr_type (rhs);
+   gimple *g = gimple_build_assign (make_ssa_name (ptype),
+-				  build_fold_addr_expr (rhs));
++				   build_fold_addr_expr (rhs));
+   gimple_set_location (g, loc);
+   gsi_insert_before (gsi, g, GSI_SAME_STMT);
+   tree mem = build2 (MEM_REF, utype, gimple_assign_lhs (g),
+seems to fix that.  But wonder how many of the other ~180 spots that create MEM_REFs don't need similar fixes.
+
+- User: Uroš Bizjak | Time: 2024-05-21 10:20:25 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #1)> What the kernel does is terrible, why they just don't declare the extern
+> with __seg_gs attribute?This is how kernel currently handles percpu variables. They are redefined to a named address space just before use, because the percpu infrastructure can't handle AS qualified variables, mainly due to the extensive use of __typeof__, please see [1].
+
+The solution is to use __typeof_unqual__ with gcc-14. The prototype patch at [2] declares percpu variables as __seg_gs during decl time, as you proposed above.
+
+[1]https://lore.kernel.org/lkml/87bk7ux4e9.ffs@tglx/[2]https://lore.kernel.org/lkml/CAFULd4Z-stHtu2UWv02S+Nbx51QqytGUO8ZeW50Fc_PbsfF8BA@mail.gmail.com/
+
+- User: Jakub Jelinek | Time: 2024-05-21 10:35:50 UTC
+  Text: Createdattachment 58261[details]gcc15-pr115172.patch
+
+Full untested patch.
+
+- User: Uroš Bizjak | Time: 2024-05-21 14:21:05 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #4)> Createdattachment 58261[details]> gcc15-pr115172.patch
+> 
+> Full untested patch.I can confirm that this patch fixes boot for the kernel config fromPR115172#43.
+
+- User: Fedor Pchelkin | Time: 2024-05-21 17:19:55 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #5)> (In reply to Jakub Jelinek fromcomment #4)
+> > Createdattachment 58261[details]> > gcc15-pr115172.patch
+> > 
+> > Full untested patch.
+> 
+> I can confirm that this patch fixes boot for the kernel config from
+>PR115172#43.Yep. I may confirm, too. Thanks for the prompt fix!
+
+If all goes well, is it expected to land in 14.2 and 13.4?
+
+- User: Jakub Jelinek | Time: 2024-05-21 21:08:06 UTC
+  Text: (In reply to Fedor Pchelkin fromcomment #6)> (In reply to Uroš Bizjak fromcomment #5)
+> > (In reply to Jakub Jelinek fromcomment #4)
+> > > Createdattachment 58261[details]> > > gcc15-pr115172.patch
+> > > 
+> > > Full untested patch.
+> > 
+> > I can confirm that this patch fixes boot for the kernel config from
+> >PR115172#43.
+> 
+> Yep. I may confirm, too. Thanks for the prompt fix!
+> 
+> If all goes well, is it expected to land in 14.2 and 13.4?If it is approved yes.  14.2 is expected likely in July this year, but 13.4 roughly in a year from now, as it just missed 13.3 (released today).
+
+- User: GCC Commits | Time: 2024-05-22 07:13:10 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d3c506eff54fcbac389a529c2e98da108a410b7fcommitr15-765-gd3c506eff54fcbac389a529c2e98da108a410b7fAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 22 09:12:28 2024 +0200
+
+    ubsan: Use right address space for MEM_REF created for bool/enum sanitization [PR115172]
+    
+    The following testcase is miscompiled, because -fsanitize=bool,enum
+    creates a MEM_REF without propagating there address space qualifiers,
+    so what should be normally loaded using say %gs:/%fs: segment prefix
+    isn't.  Together with asan it then causes that load to be sanitized.
+    
+    2024-05-22  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/115172* ubsan.cc (instrument_bool_enum_load): If rhs is not in generic
+            address space, use qualified version of utype with the right
+            address space.  Formatting fix.
+    
+            * gcc.dg/asan/pr115172.c: New test.
+
+- User: GCC Commits | Time: 2024-05-22 07:19:53 UTC
+  Text: The releases/gcc-14 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d224c7d8d8b49daab54a977a4f2217423d3d12a0commitr14-10230-gd224c7d8d8b49daab54a977a4f2217423d3d12a0Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 22 09:12:28 2024 +0200
+
+    ubsan: Use right address space for MEM_REF created for bool/enum sanitization [PR115172]
+    
+    The following testcase is miscompiled, because -fsanitize=bool,enum
+    creates a MEM_REF without propagating there address space qualifiers,
+    so what should be normally loaded using say %gs:/%fs: segment prefix
+    isn't.  Together with asan it then causes that load to be sanitized.
+    
+    2024-05-22  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/115172* ubsan.cc (instrument_bool_enum_load): If rhs is not in generic
+            address space, use qualified version of utype with the right
+            address space.  Formatting fix.
+    
+            * gcc.dg/asan/pr115172.c: New test.
+    
+    (cherry picked from commit d3c506eff54fcbac389a529c2e98da108a410b7f)
+
+- User: GCC Commits | Time: 2024-05-22 07:35:15 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:35ac28b9c26debcc8ec8b247d75d4d271de72189commitr13-8791-g35ac28b9c26debcc8ec8b247d75d4d271de72189Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 22 09:12:28 2024 +0200
+
+    ubsan: Use right address space for MEM_REF created for bool/enum sanitization [PR115172]
+    
+    The following testcase is miscompiled, because -fsanitize=bool,enum
+    creates a MEM_REF without propagating there address space qualifiers,
+    so what should be normally loaded using say %gs:/%fs: segment prefix
+    isn't.  Together with asan it then causes that load to be sanitized.
+    
+    2024-05-22  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/115172* ubsan.cc (instrument_bool_enum_load): If rhs is not in generic
+            address space, use qualified version of utype with the right
+            address space.  Formatting fix.
+    
+            * gcc.dg/asan/pr115172.c: New test.
+    
+    (cherry picked from commit d3c506eff54fcbac389a529c2e98da108a410b7f)
+
+- User: Jakub Jelinek | Time: 2024-05-22 11:11:55 UTC
+  Text: Fixed for 13.4+/14.2+/15.1+ so far.
+
+- User: GCC Commits | Time: 2024-05-28 17:09:08 UTC
+  Text: The releases/gcc-12 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:da9b7a507ef38287cc16bc88e808293019f9f531commitr12-10477-gda9b7a507ef38287cc16bc88e808293019f9f531Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 22 09:12:28 2024 +0200
+
+    ubsan: Use right address space for MEM_REF created for bool/enum sanitization [PR115172]
+    
+    The following testcase is miscompiled, because -fsanitize=bool,enum
+    creates a MEM_REF without propagating there address space qualifiers,
+    so what should be normally loaded using say %gs:/%fs: segment prefix
+    isn't.  Together with asan it then causes that load to be sanitized.
+    
+    2024-05-22  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/115172* ubsan.cc (instrument_bool_enum_load): If rhs is not in generic
+            address space, use qualified version of utype with the right
+            address space.  Formatting fix.
+    
+            * gcc.dg/asan/pr115172.c: New test.
+    
+    (cherry picked from commit d3c506eff54fcbac389a529c2e98da108a410b7f)
+
+- User: GCC Commits | Time: 2024-05-28 17:09:23 UTC
+  Text: The releases/gcc-11 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:d8985ea10c911c994e00dbd6a08dcae907ebc1f7commitr11-11454-gd8985ea10c911c994e00dbd6a08dcae907ebc1f7Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 22 09:12:28 2024 +0200
+
+    ubsan: Use right address space for MEM_REF created for bool/enum sanitization [PR115172]
+    
+    The following testcase is miscompiled, because -fsanitize=bool,enum
+    creates a MEM_REF without propagating there address space qualifiers,
+    so what should be normally loaded using say %gs:/%fs: segment prefix
+    isn't.  Together with asan it then causes that load to be sanitized.
+    
+    2024-05-22  Jakub Jelinek  <jakub@redhat.com>PR sanitizer/115172* ubsan.c (instrument_bool_enum_load): If rhs is not in generic
+            address space, use qualified version of utype with the right
+            address space.  Formatting fix.
+    
+            * gcc.dg/asan/pr115172.c: New test.
+    
+    (cherry picked from commit d3c506eff54fcbac389a529c2e98da108a410b7f)
+
+- User: Uroš Bizjak | Time: 2024-05-28 17:11:29 UTC
+  Text: Also fixed for 11.5+ and 12.4+.
+

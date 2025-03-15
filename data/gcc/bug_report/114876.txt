@@ -1,0 +1,359 @@
+Bug Summary: [11 Regression] -fprintf-return-value  mishandles %lc with a '\0' argument.
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 6.4.0
+Known to Fail: 7.1.0
+
+Comments:
+- User: Collin Funk | Time: 2024-04-28 08:15:43 UTC
+  Text: I noticed some test failures in some Gnulib test cases earlier [1].
+
+I'm using Fedora 40's GCC 14.0 package.
+
+$ uname -a
+Linux fedora 6.8.7-300.fc40.x86_64 #1 SMP PREEMPT_DYNAMIC Wed Apr 17 19:21:08 UTC 2024 x86_64 GNU/Linux
+
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=gcc
+COLLECT_LTO_WRAPPER=/usr/libexec/gcc/x86_64-redhat-linux/14/lto-wrapper
+OFFLOAD_TARGET_NAMES=nvptx-none:amdgcn-amdhsa
+OFFLOAD_TARGET_DEFAULT=1
+Target: x86_64-redhat-linux
+Configured with: ../configure --enable-bootstrap --enable-languages=c,c++,fortran,objc,obj-c++,ada,go,d,m2,lto --prefix=/usr --mandir=/usr/share/man --infodir=/usr/share/info --with-bugurl=http://bugzilla.redhat.com/bugzilla--enable-shared --enable-threads=posix --enable-checking=release --enable-multilib --with-system-zlib --enable-__cxa_atexit --disable-libunwind-exceptions --enable-gnu-unique-object --enable-linker-build-id --with-gcc-major-version-only --enable-libstdcxx-backtrace --with-libstdcxx-zoneinfo=/usr/share/zoneinfo --with-linker-hash-style=gnu --enable-plugin --enable-initfini-array --with-isl=/builddir/build/BUILD/gcc-14.0.1-20240411/obj-x86_64-redhat-linux/isl-install --enable-offload-targets=nvptx-none,amdgcn-amdhsa --enable-offload-defaulted --without-cuda-driver --enable-gnu-indirect-function --enable-cet --with-tune=generic --with-arch_32=i686 --build=x86_64-redhat-linux --with-build-config=bootstrap-lto --enable-link-serialization=1
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240411 (Red Hat 14.0.1-0) (GCC) 
+
+$ ldd --version
+ldd (GNU libc) 2.39
+
+Here is a test program:
+
+===================================================
+int
+main (void)
+{
+  char buffer[5000];
+  wint_t ch = (wint_t) '\0';
+  int result = sprintf (buffer, "%lc%lc%lc%lc", ch, ch, ch, ch);
+  printf ("%d\n", result);
+  return 0;
+}
+===================================================
+
+I believe that this program should print 4. POSIX states "Upon successful completion, the sprintf() function shall return the number of bytes written to s, excluding the terminating null byte." So in total 5 '\0' characters written to the buffer and 4 returned because the extra terminating one is excluded.
+
+Here is some runs with different optimization settings:
+
+# -O0 passes.
+$ make
+gcc -Wall -Wextra -g -O0  -o a.out main.c
+./a.out
+4
+
+# -01 fails, likewise for -O2 and -O3.
+$ make
+gcc -Wall -Wextra -g -O1  -o a.out main.c
+./a.out
+0
+
+# -O0 -fprintf-return-value passes.
+$ make
+gcc -Wall -Wextra -g -O0 -fprintf-return-value -o a.out main.c
+./a.out
+4
+
+# -01 -fprintf-return-value fails.
+$ make
+gcc -Wall -Wextra -g -O1 -fprintf-return-value -o a.out main.c
+./a.out
+0
+
+# -O1 -fno-printf-return-value passes, likewise for -O2 and -O3 with -fno-printf-return-value.
+$ make
+gcc -Wall -Wextra -g -O1 -fno-printf-return-value -o a.out main.c
+./a.out
+4
+
+I also built a barebones gcc-13.2 compiler from the tarball on the GNU FTP server. It seems to behave in the same way.
+
+$ gcc-13.2 -v
+Using built-in specs.
+COLLECT_GCC=gcc-13.2
+COLLECT_LTO_WRAPPER=/home/collin/.local/libexec/gcc/x86_64-pc-linux-gnu/13.2.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ./configure --prefix=/home/collin/.local --program-suffix=-13.2 --enable-languages=c,c++ --enable-threads=posix --enable-linker-build-id --disable-multilib --disable-multiarch --with-tune=generic --disable-bootstrap
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 13.2.0 (GCC) 
+
+I've never submitted a GCC bug, so please let me know if you need any more information. Thanks!
+
+[1]https://lists.gnu.org/archive/html/bug-gnulib/2024-04/msg00453.html
+
+- User: Bruno Haible | Time: 2024-04-28 09:06:23 UTC
+  Text: What does *printf of %lc with a (wint_t) '\0' argument do?
+
+Note that the published POSIX:2018 still has a wrong description: Its description requires *printf to produce 0 characters.
+
+This was wrong in ISO C as well. It has been corrected in ISO C 23 § 7.23.6.1, in the meeting from 2023-06-20 to 2023-06-23. Seehttps://www.open-std.org/JTC1/sc22/wg14/www/docs/n3167.pdfsection GB-141 page 23, 24. The decision ("option 1") is detailed inhttps://www.open-std.org/JTC1/sc22/wg14/www/docs/n3148.docrow GB-141 page 34, 35:
+  "Option 1 (require a NUL) - change the text to:
+   If an l length modifier is present, the wint_t argument is converted
+   as if by a call to the wcrtomb function with a pointer to storage of
+   at least MB_CUR_MAX bytes, the wint_t argument converted to wchar_t,
+   and an initial shift state."
+This description requires *printf to produce 1 NUL character.
+
+Then, the Austin Group followed suit and, throughhttps://austingroupbugs.net/view.php?id=1647, decided that POSIX will use the same definition:
+  "If an l (ell) qualifier is present, the wint_t argument shall be converted
+   to a multi-byte sequence as if by a call to wcrtomb( ) with the wint_t
+   argument converted to wchar_t and an initial shift state, and the
+   resulting bytes written."
+
+This aligns the POSIX behaviour with what glibc was doing all the time, namely to produce 1 NUL character.
+
+- User: Andrew Pinski | Time: 2024-04-28 18:33:26 UTC
+  Text: From format_character in gimple-ssa-sprintf.cc:
+          if (min == 0 && max == 0)
+            {
+              /* The NUL wide character results in no bytes.  */
+              res.range.max = 0;
+              res.range.likely = 0;
+              res.range.unlikely = 0;
+            }
+
+
+Which indirectly was introduced withr7-3167-g88d0c3f0a1448e.
+
+- User: Jakub Jelinek | Time: 2024-04-29 10:56:31 UTC
+  Text: Createdattachment 58069[details]gcc15-pr114876.patch
+
+Untested fix.  Given that there are or at least were implementations which emitted no characters, I've chosen to use min 0 and all the other values 1,
+so it will basically deal with both implementations and make the glibc / ISO C23 / new POSIX behavior the likely one for warning etc. purposes.
+
+- User: Bruno Haible | Time: 2024-04-29 11:08:38 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #3)> Given that there are or at least were implementations which
+> emitted no charactersYes, musl libc emits/emitted 0 characters in this case.
+
+- User: GCC Commits | Time: 2024-04-30 09:23:32 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:6c6b70f07208ca14ba783933988c04c6fc2fff42commitr15-66-g6c6b70f07208ca14ba783933988c04c6fc2fff42Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Apr 30 11:22:32 2024 +0200
+
+    gimple-ssa-sprintf: Use [0, 1] range for %lc with (wint_t) 0 argument [PR114876]
+    
+    Seems when Martin S. implemented this, he coded there strict reading
+    of the standard, which said that %lc with (wint_t) 0 argument is handled
+    as wchar_t[2] temp = { arg, 0 }; %ls with temp arg and so shouldn't print
+    any values.  But, most of the libc implementations actually handled that
+    case like %c with '\0' argument, adding a single NUL character, the only
+    known exception is musl.
+    Recently, C23 changed this in response to GB-141 and POSIX inhttps://austingroupbugs.net/view.php?id=1647so that it should have the same behavior as %c with '\0'.
+    
+    Because there is implementation divergence, the following patch uses
+    a range rather than hardcoding it to all 1s (i.e. the %c behavior),
+    though the likely case is still 1 (forward looking plus most of
+    implementations).
+    The res.knownrange = true; assignment removed is redundant due to
+    the same assignment done unconditionally before the if statement,
+    rest is formatting fixes.
+    
+    I don't think the min >= 0 && min < 128 case is right either, I'd think
+    it should be min >= 0 && max < 128, otherwise it is just some possible
+    inputs are (maybe) ASCII and there can be others, but this code is a total
+    mess anyway, with the min, max, likely (somewhere in [min, max]?) and then
+    unlikely possibly larger than max, dunno, perhaps for at least some chars
+    in the ASCII range the likely case could be for the ascii case; so perhaps
+    just the one_2_one_ascii shouldn't set max to 1 and mayfail should be true
+    for max >= 128.  Anyway, didn't feel I should touch that right now.
+    
+    2024-04-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114876* gimple-ssa-sprintf.cc (format_character): For min == 0 && max == 0,
+            set max, likely and unlikely members to 1 rather than 0.  Remove
+            useless res.knownrange = true;.  Formatting fixes.
+    
+            * gcc.dg/pr114876.c: New test.
+            * gcc.dg/tree-ssa/builtin-sprintf-warn-1.c: Adjust expected
+            diagnostics.
+
+- User: Jakub Jelinek | Time: 2024-04-30 09:24:30 UTC
+  Text: Fixed for 15+ so far.
+
+- User: GCC Commits | Time: 2024-05-07 16:05:31 UTC
+  Text: The releases/gcc-14 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:a1c8ae15d9df0caa839b47c8631571a1ec27e367commitr14-10177-ga1c8ae15d9df0caa839b47c8631571a1ec27e367Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Apr 30 11:22:32 2024 +0200
+
+    gimple-ssa-sprintf: Use [0, 1] range for %lc with (wint_t) 0 argument [PR114876]
+    
+    Seems when Martin S. implemented this, he coded there strict reading
+    of the standard, which said that %lc with (wint_t) 0 argument is handled
+    as wchar_t[2] temp = { arg, 0 }; %ls with temp arg and so shouldn't print
+    any values.  But, most of the libc implementations actually handled that
+    case like %c with '\0' argument, adding a single NUL character, the only
+    known exception is musl.
+    Recently, C23 changed this in response to GB-141 and POSIX inhttps://austingroupbugs.net/view.php?id=1647so that it should have the same behavior as %c with '\0'.
+    
+    Because there is implementation divergence, the following patch uses
+    a range rather than hardcoding it to all 1s (i.e. the %c behavior),
+    though the likely case is still 1 (forward looking plus most of
+    implementations).
+    The res.knownrange = true; assignment removed is redundant due to
+    the same assignment done unconditionally before the if statement,
+    rest is formatting fixes.
+    
+    I don't think the min >= 0 && min < 128 case is right either, I'd think
+    it should be min >= 0 && max < 128, otherwise it is just some possible
+    inputs are (maybe) ASCII and there can be others, but this code is a total
+    mess anyway, with the min, max, likely (somewhere in [min, max]?) and then
+    unlikely possibly larger than max, dunno, perhaps for at least some chars
+    in the ASCII range the likely case could be for the ascii case; so perhaps
+    just the one_2_one_ascii shouldn't set max to 1 and mayfail should be true
+    for max >= 128.  Anyway, didn't feel I should touch that right now.
+    
+    2024-04-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114876* gimple-ssa-sprintf.cc (format_character): For min == 0 && max == 0,
+            set max, likely and unlikely members to 1 rather than 0.  Remove
+            useless res.knownrange = true;.  Formatting fixes.
+    
+            * gcc.dg/pr114876.c: New test.
+            * gcc.dg/tree-ssa/builtin-sprintf-warn-1.c: Adjust expected
+            diagnostics.
+    
+    (cherry picked from commit 6c6b70f07208ca14ba783933988c04c6fc2fff42)
+
+- User: Jakub Jelinek | Time: 2024-05-07 16:06:52 UTC
+  Text: Fixed for 14.2+ as well.
+
+- User: GCC Commits | Time: 2024-05-09 04:26:44 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:e07df053031e109c50387c92d689950de1d193abcommitr13-8732-ge07df053031e109c50387c92d689950de1d193abAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Apr 30 11:22:32 2024 +0200
+
+    gimple-ssa-sprintf: Use [0, 1] range for %lc with (wint_t) 0 argument [PR114876]
+    
+    Seems when Martin S. implemented this, he coded there strict reading
+    of the standard, which said that %lc with (wint_t) 0 argument is handled
+    as wchar_t[2] temp = { arg, 0 }; %ls with temp arg and so shouldn't print
+    any values.  But, most of the libc implementations actually handled that
+    case like %c with '\0' argument, adding a single NUL character, the only
+    known exception is musl.
+    Recently, C23 changed this in response to GB-141 and POSIX inhttps://austingroupbugs.net/view.php?id=1647so that it should have the same behavior as %c with '\0'.
+    
+    Because there is implementation divergence, the following patch uses
+    a range rather than hardcoding it to all 1s (i.e. the %c behavior),
+    though the likely case is still 1 (forward looking plus most of
+    implementations).
+    The res.knownrange = true; assignment removed is redundant due to
+    the same assignment done unconditionally before the if statement,
+    rest is formatting fixes.
+    
+    I don't think the min >= 0 && min < 128 case is right either, I'd think
+    it should be min >= 0 && max < 128, otherwise it is just some possible
+    inputs are (maybe) ASCII and there can be others, but this code is a total
+    mess anyway, with the min, max, likely (somewhere in [min, max]?) and then
+    unlikely possibly larger than max, dunno, perhaps for at least some chars
+    in the ASCII range the likely case could be for the ascii case; so perhaps
+    just the one_2_one_ascii shouldn't set max to 1 and mayfail should be true
+    for max >= 128.  Anyway, didn't feel I should touch that right now.
+    
+    2024-04-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114876* gimple-ssa-sprintf.cc (format_character): For min == 0 && max == 0,
+            set max, likely and unlikely members to 1 rather than 0.  Remove
+            useless res.knownrange = true;.  Formatting fixes.
+    
+            * gcc.dg/pr114876.c: New test.
+            * gcc.dg/tree-ssa/builtin-sprintf-warn-1.c: Adjust expected
+            diagnostics.
+    
+    (cherry picked from commit 6c6b70f07208ca14ba783933988c04c6fc2fff42)
+
+- User: Jakub Jelinek | Time: 2024-05-09 08:17:57 UTC
+  Text: Fixed also for 13.3.
+
+- User: GCC Commits | Time: 2024-06-11 10:38:40 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:bf134407b494bf79f66fc5048ff0ca409275089ccommitr12-10528-gbf134407b494bf79f66fc5048ff0ca409275089cAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Apr 30 11:22:32 2024 +0200
+
+    gimple-ssa-sprintf: Use [0, 1] range for %lc with (wint_t) 0 argument [PR114876]
+    
+    Seems when Martin S. implemented this, he coded there strict reading
+    of the standard, which said that %lc with (wint_t) 0 argument is handled
+    as wchar_t[2] temp = { arg, 0 }; %ls with temp arg and so shouldn't print
+    any values.  But, most of the libc implementations actually handled that
+    case like %c with '\0' argument, adding a single NUL character, the only
+    known exception is musl.
+    Recently, C23 changed this in response to GB-141 and POSIX inhttps://austingroupbugs.net/view.php?id=1647so that it should have the same behavior as %c with '\0'.
+    
+    Because there is implementation divergence, the following patch uses
+    a range rather than hardcoding it to all 1s (i.e. the %c behavior),
+    though the likely case is still 1 (forward looking plus most of
+    implementations).
+    The res.knownrange = true; assignment removed is redundant due to
+    the same assignment done unconditionally before the if statement,
+    rest is formatting fixes.
+    
+    I don't think the min >= 0 && min < 128 case is right either, I'd think
+    it should be min >= 0 && max < 128, otherwise it is just some possible
+    inputs are (maybe) ASCII and there can be others, but this code is a total
+    mess anyway, with the min, max, likely (somewhere in [min, max]?) and then
+    unlikely possibly larger than max, dunno, perhaps for at least some chars
+    in the ASCII range the likely case could be for the ascii case; so perhaps
+    just the one_2_one_ascii shouldn't set max to 1 and mayfail should be true
+    for max >= 128.  Anyway, didn't feel I should touch that right now.
+    
+    2024-04-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114876* gimple-ssa-sprintf.cc (format_character): For min == 0 && max == 0,
+            set max, likely and unlikely members to 1 rather than 0.  Remove
+            useless res.knownrange = true;.  Formatting fixes.
+    
+            * gcc.dg/pr114876.c: New test.
+            * gcc.dg/tree-ssa/builtin-sprintf-warn-1.c: Adjust expected
+            diagnostics.
+    
+    (cherry picked from commit 6c6b70f07208ca14ba783933988c04c6fc2fff42)
+
+- User: Jakub Jelinek | Time: 2024-06-11 10:55:07 UTC
+  Text: Should be fixed for 12.4+ too.
+
+- User: GCC Commits | Time: 2024-06-20 13:23:42 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:6bb5036635090b924519adde22e7be9c80f6e76acommitr11-11510-g6bb5036635090b924519adde22e7be9c80f6e76aAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Apr 30 11:22:32 2024 +0200
+
+    gimple-ssa-sprintf: Use [0, 1] range for %lc with (wint_t) 0 argument [PR114876]
+    
+    Seems when Martin S. implemented this, he coded there strict reading
+    of the standard, which said that %lc with (wint_t) 0 argument is handled
+    as wchar_t[2] temp = { arg, 0 }; %ls with temp arg and so shouldn't print
+    any values.  But, most of the libc implementations actually handled that
+    case like %c with '\0' argument, adding a single NUL character, the only
+    known exception is musl.
+    Recently, C23 changed this in response to GB-141 and POSIX inhttps://austingroupbugs.net/view.php?id=1647so that it should have the same behavior as %c with '\0'.
+    
+    Because there is implementation divergence, the following patch uses
+    a range rather than hardcoding it to all 1s (i.e. the %c behavior),
+    though the likely case is still 1 (forward looking plus most of
+    implementations).
+    The res.knownrange = true; assignment removed is redundant due to
+    the same assignment done unconditionally before the if statement,
+    rest is formatting fixes.
+    
+    I don't think the min >= 0 && min < 128 case is right either, I'd think
+    it should be min >= 0 && max < 128, otherwise it is just some possible
+    inputs are (maybe) ASCII and there can be others, but this code is a total
+    mess anyway, with the min, max, likely (somewhere in [min, max]?) and then
+    unlikely possibly larger than max, dunno, perhaps for at least some chars
+    in the ASCII range the likely case could be for the ascii case; so perhaps
+    just the one_2_one_ascii shouldn't set max to 1 and mayfail should be true
+    for max >= 128.  Anyway, didn't feel I should touch that right now.
+    
+    2024-04-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/114876* gimple-ssa-sprintf.c (format_character): For min == 0 && max == 0,
+            set max, likely and unlikely members to 1 rather than 0.  Remove
+            useless res.knownrange = true;.  Formatting fixes.
+    
+            * gcc.dg/pr114876.c: New test.
+            * gcc.dg/tree-ssa/builtin-sprintf-warn-1.c: Adjust expected
+            diagnostics.
+    
+    (cherry picked from commit 6c6b70f07208ca14ba783933988c04c6fc2fff42)
+
+- User: Jakub Jelinek | Time: 2024-06-20 13:43:54 UTC
+  Text: Fixed for 11.5 as well.
+

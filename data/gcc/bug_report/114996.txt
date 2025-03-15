@@ -1,0 +1,280 @@
+Bug Summary: [15 Regression] [RISC-V] 2->2 combination no longer occurring
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jeffrey A. Law | Time: 2024-05-08 20:26:38 UTC
+  Text: So this test has started failing on RISC-V after re-introduction of the change to avoid 2->2 combinations when i2 is unchanged:
+
+/* { dg-do compile } */
+/* { dg-require-effective-target rv64 } */
+/* { dg-skip-if "" { *-*-* } { "-O0" "-Og" "-Os" "-Oz" } } */
+/* { dg-options "-march=rv64gc_zba" } */
+
+typedef unsigned int uint32_t;
+typedef unsigned long uint64_t;
+
+void foo(uint32_t a, uint64_t *b_ptr, uint64_t b, uint64_t *c_ptr, uint64_t c)
+{
+  uint64_t x = a;
+  *b_ptr = b + x;
+  *c_ptr = c + x;
+}
+
+/* { dg-final { scan-assembler-not "\\szext.w\\s" } } */
+
+
+[ That's heavily reduced and twiddled a bit from a hot loop in xz IIRC. ]
+
+The key thing to note about the test is we have a zero extension of a 32 bit value to 64 bits.  The resulting 64 bit value is used in *two* subsequent instructions.
+
+As we start combine this looks like:
+
+(insn 10 7 11 2 (set (reg/v:DI 136 [ x ])
+        (zero_extend:DI (subreg/s/u:SI (reg/v:DI 137 [ a ]) 0))) "j.c":11:12 458 {*zero_extendsidi2_bitmanip}
+     (expr_list:REG_DEAD (reg/v:DI 137 [ a ])
+        (nil)))
+(insn 11 10 12 2 (set (reg:DI 142 [ _1 ])
+        (plus:DI (reg/v:DI 136 [ x ])
+            (reg/v:DI 139 [ b ]))) "j.c":12:14 5 {adddi3}
+     (expr_list:REG_DEAD (reg/v:DI 139 [ b ])
+        (nil)))
+(insn 12 11 13 2 (set (mem:DI (reg/v/f:DI 138 [ b_ptr ]) [1 *b_ptr_7(D)+0 S8 A64])
+        (reg:DI 142 [ _1 ])) "j.c":12:10 268 {*movdi_64bit}
+     (expr_list:REG_DEAD (reg:DI 142 [ _1 ])
+        (expr_list:REG_DEAD (reg/v/f:DI 138 [ b_ptr ])
+            (nil))))
+(insn 13 12 14 2 (set (reg:DI 143 [ _2 ])
+        (plus:DI (reg/v:DI 136 [ x ])
+            (reg/v:DI 141 [ c ]))) "j.c":13:14 5 {adddi3}
+     (expr_list:REG_DEAD (reg/v:DI 141 [ c ])
+        (expr_list:REG_DEAD (reg/v:DI 136 [ x ])
+            (nil))))
+(insn 14 13 0 2 (set (mem:DI (reg/v/f:DI 140 [ c_ptr ]) [1 *c_ptr_10(D)+0 S8 A64])
+        (reg:DI 143 [ _2 ])) "j.c":13:10 268 {*movdi_64bit}
+     (expr_list:REG_DEAD (reg:DI 143 [ _2 ])
+        (expr_list:REG_DEAD (reg/v/f:DI 140 [ c_ptr ])
+            (nil))))
+
+
+Without the problematical combine change we would first combine 10->11 as a 2->2 combination.  Insn 10 would remain unchanged, but insn 11 would incorporate the zero extension (RISC-V as an instruction for this).
+
+After combining 10->11 (reg:DI 136) will have a single use enabling a 2->1 combination 10->13.
+
+With the problematical combiner change the 10->11 combination fails because i2 hasn't changed and the 10->13 combination fails as well.  The net result is we have an unnecessary zero extension in that loop.  Proper code for that testcase is:
+        add.uw  a2,a0,a2
+        sd      a2,0(a1)
+        add.uw  a0,a0,a4
+        sd      a0,0(a3)
+
+With that combiner change instead we're getting:
+
+        zext.w  a0,a0
+        add     a2,a0,a2
+        sd      a2,0(a1)
+        add     a0,a0,a4
+        sd      a0,0(a3)
+
+- User: Segher Boessenkool | Time: 2024-05-09 09:45:29 UTC
+  Text: This is not a 2->2 combination.  It is a 1->1 combination, which we never have done,
+and still don't.  We incorrectly "combined" another instruction, which in fact we
+left in place, it isn't combined at all!
+
+- User: Jeffrey A. Law | Time: 2024-05-09 13:24:10 UTC
+  Text: I don't care about the terminology.  We have 3 insns in play.  A, B and C.
+
+We try to combine A -> B which succeeded before resulting in A, B' and C and which in turn allowed a subsequent A -> C combination resulting in a final B', C' sequence, eliminating A.  After the combiner patch in question no combinations are done.
+
+So, let's move past the argument on terminology and discuss the technical issue.  This is something that worked in gcc-14 without the combiner patch.  This is important for code generation.
+
+How do you propose we address the regression?
+
+- User: Segher Boessenkool | Time: 2024-06-16 18:38:26 UTC
+  Text: That makes no sense.  combine only ever results in 0, 1, or 2 insns, never 3.
+
+What you mean is that after 4 or more combinations you got what you wanter.  But
+combine (like most RTL optimisations!) is a totally local optimisation, it only
+looks at a single step at a time.
+
+It should never have done stap #1 that it did before.  It contradicts the
+principles of what combine does.
+
+The good news is that there are good ways to get the same effect (and much more).
+But restoring the previous behaviour is completely wrong.  There are more things
+in the instruction combiner that aren't so very lineair, but this takes the cake.
+
+- User: Jeffrey A. Law | Time: 2024-06-16 18:53:08 UTC
+  Text: Seger, please give some suggestions.  At least for the riscv case, I don't see a path forward.
+
+- User: Segher Boessenkool | Time: 2024-06-16 19:47:38 UTC
+  Text: (My name is Segher)
+
+I implemented unCSE.  It does exactly this.  It will still be a few days before
+you will see it, sorry!
+
+- User: Richard Sandiford | Time: 2024-06-18 10:15:28 UTC
+  Text: FWIW, late-combine also fixes this.  I'm in the process of getting the submission ready (still going through multi-target testing).
+
+- User: GCC Commits | Time: 2024-06-24 07:43:56 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:792f97b44ffc5e6a967292b3747fd835e99396e7commitr15-1579-g792f97b44ffc5e6a967292b3747fd835e99396e7Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Mon Jun 24 08:43:19 2024 +0100
+
+    Add a late-combine pass [PR106594]
+    
+    This patch adds a combine pass that runs late in the pipeline.
+    There are two instances: one between combine and split1, and one
+    after postreload.
+    
+    The pass currently has a single objective: remove definitions by
+    substituting into all uses.  The pre-RA version tries to restrict
+    itself to cases that are likely to have a neutral or beneficial
+    effect on register pressure.
+    
+    The patch fixesPR106594.  It also fixes a few FAILs and XFAILs
+    in the aarch64 test results, mostly due to making proper use of
+    MOVPRFX in cases where we didn't previously.
+    
+    This is just a first step.  I'm hoping that the pass could be
+    used for other combine-related optimisations in future.  In particular,
+    the post-RA version doesn't need to restrict itself to cases where all
+    uses are substitutable, since it doesn't have to worry about register
+    pressure.  If we did that, and if we extended it to handle multi-register
+    REGs, the pass might be a viable replacement for regcprop, which in
+    turn might reduce the cost of having a post-RA instance of the new pass.
+    
+    On most targets, the pass is enabled by default at -O2 and above.
+    However, it has a tendency to undo x86's STV and RPAD passes,
+    by folding the more complex post-STV/RPAD form back into the
+    simpler pre-pass form.
+    
+    Also, running a pass after register allocation means that we can
+    now match define_insn_and_splits that were previously only matched
+    before register allocation.  This trips things like:
+    
+      (define_insn_and_split "..."
+        [...pattern...]
+        "...cond..."
+        "#"
+        "&& 1"
+        [...pattern...]
+        {
+          ...unconditional use of gen_reg_rtx ()...;
+        }
+    
+    because matching and splitting after RA will call gen_reg_rtx when
+    pseudos are no longer allowed.  rs6000 has several instances of this.
+    
+    xtensa has a variation in which the split condition is:
+    
+        "&& can_create_pseudo_p ()"
+    
+    The failure then is that, if we match after RA, we'll never be
+    able to split the instruction.
+    
+    The patch therefore disables the pass by default on i386, rs6000
+    and xtensa.  Hopefully we can fix those ports later (if their
+    maintainers want).  It seems better to add the pass first, though,
+    to make it easier to test any such fixes.
+    
+    gcc.target/aarch64/bitfield-bitint-abi-align{16,8}.c would need
+    quite a few updates for the late-combine output.  That might be
+    worth doing, but it seems too complex to do as part of this patch.
+    
+    I tried compiling at least one target per CPU directory and comparing
+    the assembly output for parts of the GCC testsuite.  This is just a way
+    of getting a flavour of how the pass performs; it obviously isn't a
+    meaningful benchmark.  All targets seemed to improve on average:
+    
+    Target                 Tests   Good    Bad   %Good   Delta  Median
+    ======                 =====   ====    ===   =====   =====  ======
+    aarch64-linux-gnu       2215   1975    240  89.16%   -4159      -1
+    aarch64_be-linux-gnu    1569   1483     86  94.52%  -10117      -1
+    alpha-linux-gnu         1454   1370     84  94.22%   -9502      -1
+    amdgcn-amdhsa           5122   4671    451  91.19%  -35737      -1
+    arc-elf                 2166   1932    234  89.20%  -37742      -1
+    arm-linux-gnueabi       1953   1661    292  85.05%  -12415      -1
+    arm-linux-gnueabihf     1834   1549    285  84.46%  -11137      -1
+    avr-elf                 4789   4330    459  90.42% -441276      -4
+    bfin-elf                2795   2394    401  85.65%  -19252      -1
+    bpf-elf                 3122   2928    194  93.79%   -8785      -1
+    c6x-elf                 2227   1929    298  86.62%  -17339      -1
+    cris-elf                3464   3270    194  94.40%  -23263      -2
+    csky-elf                2915   2591    324  88.89%  -22146      -1
+    epiphany-elf            2399   2304     95  96.04%  -28698      -2
+    fr30-elf                7712   7299    413  94.64%  -99830      -2
+    frv-linux-gnu           3332   2877    455  86.34%  -25108      -1
+    ft32-elf                2775   2667    108  96.11%  -25029      -1
+    h8300-elf               3176   2862    314  90.11%  -29305      -2
+    hppa64-hp-hpux11.23     4287   4247     40  99.07%  -45963      -2
+    ia64-linux-gnu          2343   1946    397  83.06%   -9907      -2
+    iq2000-elf              9684   9637     47  99.51% -126557      -2
+    lm32-elf                2681   2608     73  97.28%  -59884      -3
+    loongarch64-linux-gnu   1303   1218     85  93.48%  -13375      -2
+    m32r-elf                1626   1517    109  93.30%   -9323      -2
+    m68k-linux-gnu          3022   2620    402  86.70%  -21531      -1
+    mcore-elf               2315   2085    230  90.06%  -24160      -1
+    microblaze-elf          2782   2585    197  92.92%  -16530      -1
+    mipsel-linux-gnu        1958   1827    131  93.31%  -15462      -1
+    mipsisa64-linux-gnu     1655   1488    167  89.91%  -16592      -2
+    mmix                    4914   4814    100  97.96%  -63021      -1
+    mn10300-elf             3639   3320    319  91.23%  -34752      -2
+    moxie-rtems             3497   3252    245  92.99%  -87305      -3
+    msp430-elf              4353   3876    477  89.04%  -23780      -1
+    nds32le-elf             3042   2780    262  91.39%  -27320      -1
+    nios2-linux-gnu         1683   1355    328  80.51%   -8065      -1
+    nvptx-none              2114   1781    333  84.25%  -12589      -2
+    or1k-elf                3045   2699    346  88.64%  -14328      -2
+    pdp11                   4515   4146    369  91.83%  -26047      -2
+    pru-elf                 1585   1245    340  78.55%   -5225      -1
+    riscv32-elf             2122   2000    122  94.25% -101162      -2
+    riscv64-elf             1841   1726    115  93.75%  -49997      -2
+    rl78-elf                2823   2530    293  89.62%  -40742      -4
+    rx-elf                  2614   2480    134  94.87%  -18863      -1
+    s390-linux-gnu          1591   1393    198  87.55%  -16696      -1
+    s390x-linux-gnu         2015   1879    136  93.25%  -21134      -1
+    sh-linux-gnu            1870   1507    363  80.59%   -9491      -1
+    sparc-linux-gnu         1123   1075     48  95.73%  -14503      -1
+    sparc-wrs-vxworks       1121   1073     48  95.72%  -14578      -1
+    sparc64-linux-gnu       1096   1021     75  93.16%  -15003      -1
+    v850-elf                1897   1728    169  91.09%  -11078      -1
+    vax-netbsdelf           3035   2995     40  98.68%  -27642      -1
+    visium-elf              1392   1106    286  79.45%   -7984      -2
+    xstormy16-elf           2577   2071    506  80.36%  -13061      -1
+    
+    gcc/PR rtl-optimization/106594PR rtl-optimization/114515PR rtl-optimization/114575PR rtl-optimization/114996PR rtl-optimization/115104* Makefile.in (OBJS): Add late-combine.o.
+            * common.opt (flate-combine-instructions): New option.
+            * doc/invoke.texi: Document it.
+            * opts.cc (default_options_table): Enable it by default at -O2
+            and above.
+            * tree-pass.h (make_pass_late_combine): Declare.
+            * late-combine.cc: New file.
+            * passes.def: Add two instances of late_combine.
+            * doc/passes.texi: Document the new passes.
+            * config/i386/i386-options.cc (ix86_override_options_after_change):
+            Disable late-combine by default.
+            * config/rs6000/rs6000.cc (rs6000_option_override_internal): Likewise.
+            * config/xtensa/xtensa.cc (xtensa_option_override): Likewise.
+    
+    gcc/testsuite/PR rtl-optimization/106594* gcc.dg/ira-shrinkwrap-prep-1.c: Restrict XFAIL to non-aarch64
+            targets.
+            * gcc.dg/ira-shrinkwrap-prep-2.c: Likewise.
+            * gcc.dg/stack-check-4.c: Add -fno-shrink-wrap.
+            * gcc.target/aarch64/bitfield-bitint-abi-align16.c: Add
+            -fno-late-combine-instructions.
+            * gcc.target/aarch64/bitfield-bitint-abi-align8.c: Likewise.
+            * gcc.target/aarch64/sve/cond_asrd_3.c: Remove XFAILs.
+            * gcc.target/aarch64/sve/cond_convert_3.c: Likewise.
+            * gcc.target/aarch64/sve/cond_fabd_5.c: Likewise.
+            * gcc.target/aarch64/sve/cond_convert_6.c: Expect the MOVPRFX /Zs
+            described in the comment.
+            * gcc.target/aarch64/sve/cond_unary_4.c: Likewise.
+            * gcc.target/aarch64/pr106594_1.c: New test.
+
+- User: Jeffrey A. Law | Time: 2024-07-02 17:08:06 UTC
+  Text: Fixed on the trunk.
+

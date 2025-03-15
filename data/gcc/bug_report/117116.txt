@@ -1,0 +1,407 @@
+Bug Summary: [15 regression] error: unrecognizable insn: with -march=znver3
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2024-10-13 13:13:16 UTC
+  Text: This C code:
+
+typedef int (*StmFct)();
+typedef struct {
+  StmFct fct_getc;
+  StmFct fct_putc;
+  StmFct fct_flush;
+  StmFct fct_close
+} StmInf;
+StmInf TTY_Getc_pstm;
+int TTY_Getc() {
+  TTY_Getc_pstm.fct_getc = TTY_Getc;
+  TTY_Getc_pstm.fct_putc = TTY_Getc_pstm.fct_flush = TTY_Getc_pstm.fct_close =
+      (StmFct)1;
+}
+
+when compiled by recent gcc trunk, does this:
+
+cvise $ /home/dcb40b/gcc/results.20241009.asan.ubsan/bin/gcc -c -w -O2 -march=znver3bug1053.c
+cvise $ /home/dcb40b/gcc/results.20241010.asan.ubsan/bin/gcc -c -w -O2 -march=znver3bug1053.cbug1053.c: In function ‘TTY_Getc’:bug1053.c:13:1: error: unrecognizable insn:
+   13 | }
+      | ^
+(insn 8 7 9 2 (set (reg:V2DI 103)
+        (vec_merge:V2DI (vec_duplicate:V2DI (symbol_ref:DI ("TTY_Getc") [flags 0x3] <function_decl 0x7f33ff5f6f00 TTY_Getc>))
+            (reg:V2DI 103)
+            (const_int 1 [0x1]))) "bug1053.c":10:26 -1
+     (nil))
+during RTL pass: vregsbug1053.c:13:1: internal compiler error: in extract_insn, at recog.cc:2882
+0x22f36ad internal_error(char const*, ...)
+
+Git hashes areg:4f97411c0d45dc3dandg:a17a9bdcb3f749b8.
+
+- User: David Binderman | Time: 2024-10-13 19:44:47 UTC
+  Text: trunk $ git bisect bad bcccc3221b838ee7
+bcccc3221b838ee7ae7848e7194603acb18294b3 is the first bad commit
+commit bcccc3221b838ee7ae7848e7194603acb18294b3 (HEAD)
+Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Oct 9 15:31:59 2024 +0200
+
+    Allow SLP store of mixed external and constant
+
+Adding Richard for their best advice.
+
+- User: Hongtao Liu | Time: 2024-10-14 02:58:19 UTC
+  Text: Looks like it just expose an backend bug, I'll take a look.
+
+- User: Hongtao Liu | Time: 2024-10-14 05:28:55 UTC
+  Text: A simple testcase
+
+typedef long long v4di __attribute__((vector_size(32)));
+
+v4di
+foo (long long a)
+{
+    return __extension__(v4di){(long long)foo, 1, 1, 1};
+}
+
+reproduced with -O2 -mavx2, failed at least since gcc4.8.1
+
+- User: Hongtao Liu | Time: 2024-10-14 05:40:41 UTC
+  Text: (In reply to Hongtao Liu fromcomment #3)> A simple testcase
+> 
+> typedef long long v4di __attribute__((vector_size(32)));
+> 
+> v4di
+> foo (long long a)
+> {
+>     return __extension__(v4di){(long long)foo, 1, 1, 1};
+> }
+> 
+> reproduced with -O2 -mavx2, failed at least since gcc4.8.119843;; sse4_1_pinsrd must come before sse2_loadld since it is preferred.                                                     
+19844(define_insn "<sse2p4_1>_pinsr<ssemodesuffix>"                                                                           
+19845  [(set (match_operand:PINSR_MODE 0 "register_operand" "=x,x,x,x,v,v,&x")                                                
+19846        (vec_merge:PINSR_MODE                                                                                            
+19847          (vec_duplicate:PINSR_MODE                                                                                      
+19848            (match_operand:<ssescalarmode> 2 "nonimmediate_operand" "jr,jm,r,m,r,m,x"))                                  
+19849          (match_operand:PINSR_MODE 1 "register_operand" "0,0,x,x,v,v,x")                                                
+19850          (match_operand:SI 3 "const_int_operand")))]                                                                    
+19851  "TARGET_SSE2                                                                                                           
+19852   && ((unsigned) exact_log2 (INTVAL (operands[3]))                                                                      
+19853       < GET_MODE_NUNITS (<MODE>mode))"  
+
+Doesn't support V2DI, we're using.
+
+21622(define_insn "vec_concatv2di"                                                                                            
+21623  [(set (match_operand:V2DI 0 "register_operand"                                                                         
+21624          "=Yr,*x,x ,v ,x,v ,x,x,v")                                                                                     
+21625        (vec_concat:V2DI                                                                                                 
+21626          (match_operand:DI 1 "register_operand"                                                                         
+21627          "  0, 0,x ,Yv,0,Yv,0,0,v")                                                                                     
+21628          (match_operand:DI 2 "nonimmediate_operand"                                                                     
+21629          " jrjm,jrjm,rm,rm,x,Yv,x,m,m")))]                                                                              
+21630  "TARGET_SSE"
+
+- User: Hongtao Liu | Time: 2024-10-14 09:03:12 UTC
+  Text: I'm testing the patch
+
+diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
+index 2b774ff7c4e..f8473d365ef 100644
+--- a/gcc/config/i386/i386-expand.cc
++++ b/gcc/config/i386/i386-expand.cc
+@@ -17898,11 +17898,8 @@ ix86_expand_vector_set (bool mmx_ok, rtx target, rtx val, int elt)
+       break;
+ 
+     case E_V2DImode:
+-      use_vec_merge = TARGET_SSE4_1 && TARGET_64BIT;
+-      if (use_vec_merge)
+-       break;
+-
+       tmp = gen_reg_rtx (GET_MODE_INNER (mode));
++      val = force_reg (GET_MODE_INNER (mode), val);
+       ix86_expand_vector_extract (false, tmp, target, 1 - elt);
+       if (elt == 0)
+        tmp = gen_rtx_VEC_CONCAT (mode, val, tmp);
+
+- User: Andrew Pinski | Time: 2024-10-14 10:36:49 UTC
+  Text: ***Bug 117134has been marked as a duplicate of this bug. ***
+
+- User: Uroš Bizjak | Time: 2024-10-14 15:23:52 UTC
+  Text: (In reply to Hongtao Liu fromcomment #4)> (In reply to Hongtao Liu fromcomment #3)
+> > A simple testcase
+> > 
+> > typedef long long v4di __attribute__((vector_size(32)));
+> > 
+> > v4di
+> > foo (long long a)
+> > {
+> >     return __extension__(v4di){(long long)foo, 1, 1, 1};
+> > }
+> > 
+> > reproduced with -O2 -mavx2, failed at least since gcc4.8.1
+> 
+> 19843;; sse4_1_pinsrd must come before sse2_loadld since it is preferred.   
+> 
+> 19844(define_insn "<sse2p4_1>_pinsr<ssemodesuffix>"[...]> Doesn't support V2DI, we're using.It's not a problem with the above pattern, which *does* support V2DI:
+
+;; Modes handled by pinsr patterns.
+(define_mode_iterator PINSR_MODE
+  [(V16QI "TARGET_SSE4_1") V8HI V8HF V8BF
+   (V4SI "TARGET_SSE4_1")
+   (V2DI "TARGET_SSE4_1 && TARGET_64BIT")])
+
+but with operand 2 that doesn't satisfy DImode nonimmediate_operand predicate in:
+
+;; sse4_1_pinsrd must come before sse2_loadld since it is preferred.
+(define_insn "<sse2p4_1>_pinsr<ssemodesuffix>"
+  [(set (match_operand:PINSR_MODE 0 "register_operand" "=x,x,x,x,v,v,&x")
+	(vec_merge:PINSR_MODE
+	  (vec_duplicate:PINSR_MODE
+	    (match_operand:<ssescalarmode> 2 "nonimmediate_operand" "jr,jm,r,m,r,m,x"))
+	  (match_operand:PINSR_MODE 1 "register_operand" "0,0,x,x,v,v,x")
+	  (match_operand:SI 3 "const_int_operand")))]
+  "TARGET_SSE2
+   && ((unsigned) exact_log2 (INTVAL (operands[3]))
+       < GET_MODE_NUNITS (<MODE>mode))"
+
+(insn 8 7 9 2 (set (reg:V2DI 103)
+        (vec_merge:V2DI (vec_duplicate:V2DI (symbol_ref:DI ("foo") [flags 0x3] <function_decl 0x7f412dfec200 foo>))
+            (reg:V2DI 103)
+            (const_int 1 [0x1]))) "pr117116.c":6:12 -1
+     (nil))
+
+Please note that:
+
+(symbol_ref:DI ("foo") [flags 0x3] <function_decl 0x7f412dfec200 foo>)
+
+does *not* represent a memory operand. A mem(...) is missing around.
+
+So, the problem is, where immediate operand leaks into RTX.
+
+- User: Uroš Bizjak | Time: 2024-10-14 15:40:14 UTC
+  Text: diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
+index 2b774ff7c4e..03a20aaca49 100644
+--- a/gcc/config/i386/i386-expand.cc
++++ b/gcc/config/i386/i386-expand.cc
+@@ -17642,9 +17642,7 @@ ix86_expand_vector_init (bool mmx_ok, rtx target, rtx vals)
+   for (i = 0; i < n_elts; ++i)
+     {
+       x = XVECEXP (vals, 0, i);
+-      if (!(CONST_SCALAR_INT_P (x)
+-           || CONST_DOUBLE_P (x)
+-           || CONST_FIXED_P (x)))
++      if (immediate_operand (x, inner_mode))
+        n_var++, one_var = i;
+       else if (x != CONST0_RTX (inner_mode))
+        all_const_zero = false;
+
+- User: Uroš Bizjak | Time: 2024-10-14 15:49:12 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #8)> +      if (immediate_operand (x, inner_mode))if (nonimmediate_operand (x, inner_mode))
+
+- User: Uroš Bizjak | Time: 2024-10-14 15:55:20 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #9)> (In reply to Uroš Bizjak fromcomment #8)
+> > +      if (immediate_operand (x, inner_mode))
+> 
+> if (nonimmediate_operand (x, inner_mode))This fix results in:
+
+foo:
+        vmovdqa .LC0(%rip), %ymm0       # 11    [c=17 l=8]  movv4di_internal/3
+        ret             # 19    [c=0 l=1]  simple_return_internal
+
+.LC0:
+        .quad   foo
+        .quad   1
+        .quad   1
+        .quad   1
+
+- User: Uroš Bizjak | Time: 2024-10-14 19:07:56 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #9)> (In reply to Uroš Bizjak fromcomment #8)
+> > +      if (immediate_operand (x, inner_mode))
+> 
+> if (nonimmediate_operand (x, inner_mode))Fails bootstrap for x86_32, ICEs in ix86_split_to_parts, at config/i386/i386-expand.cc:6213, trying to split:
+
+(const_vector:V2SI [
+        (const:SI (plus:SI (symbol_ref/i:SI ("_ZTCSd8_So") [flags 0x2] <var_decl 0x7f3812210cf0 _ZTCSd8_So>)
+                (const_int 12 [0xc])))
+        (const:SI (plus:SI (symbol_ref:SI ("_ZTVSt9basic_iosIcSt11char_traitsIcEE") [flags 0x40] <var_decl 0x7f381274e360 _ZTVSt9basic_iosIcSt11char_traitsIcEE>)
+                (const_int 8 [0x8])))
+    ])
+
+The handling of CONST_VECTOR RTX is not adequate in ix86_split_to_parts, as the code assumes only CONST_INTs as vector elements. However, the above could easily be split and copied to a register pair.
+
+- User: Uroš Bizjak | Time: 2024-10-14 21:20:51 UTC
+  Text: Createdattachment 59348[details]Proposed patch
+
+Patch in testing.
+
+Just leave CONST_VECTOR RTXes that won't simplify to integer in memory. The follow-up code that handles (offsettable_memref_p (operand)) handles CONST_VECTOR RTXes in memory just fine.
+
+I tried to split V2SImode CONST_VECTOR to two SImode CONST elements, but there were some further ICEs generated, and it is getting a bit late here...
+
+- User: Hongtao Liu | Time: 2024-10-15 02:21:40 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #12)>It's not a problem with the above pattern, which *does* support V2DI:Oh, yes, I must have been blind not to see that v2di.> Createdattachment 59348[details]> Proposed patch
+> 
+> Patch in testing.
+> 
+> Just leave CONST_VECTOR RTXes that won't simplify to integer in memory. The
+> follow-up code that handles (offsettable_memref_p (operand)) handles
+> CONST_VECTOR RTXes in memory just fine.
+> 
+> I tried to split V2SImode CONST_VECTOR to two SImode CONST elements, but
+> there were some further ICEs generated, and it is getting a bit late here...?The codegen looks much better, please go ahead with the patch.
+
+- User: Uroš Bizjak | Time: 2024-10-15 09:35:16 UTC
+  Text: (In reply to Hongtao Liu fromcomment #13)> > I tried to split V2SImode CONST_VECTOR to two SImode CONST elements, but
+> > there were some further ICEs generated, and it is getting a bit late here...?
+> 
+> The codegen looks much better, please go ahead with the patch.Hm, the problem is when -fpic is active. Some "constants" are not legitimate and cannot be forced into the constant pool (see ix86_cannot_force_const_mem). Unfortunately, we only have symbol_ref here in ix86_expand_vector_set, so we are not able to choose if we can push it to constant pool or not.
+
+Play it safe and simply do:
+
+diff --git a/gcc/config/i386/i386-expand.cc b/gcc/config/i386/i386-expand.cc
+index 2b774ff7c4e..63f5e348d64 100644
+--- a/gcc/config/i386/i386-expand.cc
++++ b/gcc/config/i386/i386-expand.cc
+@@ -18263,6 +18263,8 @@ quarter:
+   else if (use_vec_merge)
+     {
+ do_vec_merge:
++      if (!nonimmediate_operand (val, inner_mode))
++       val = force_reg (inner_mode, val);
+       tmp = gen_rtx_VEC_DUPLICATE (mode, val);
+       tmp = gen_rtx_VEC_MERGE (mode, tmp, target,
+                               GEN_INT (HOST_WIDE_INT_1U << elt));
+
+For the original testcase, this results (-O2 -mavx2 -fpic) in:
+
+TTY_Getc:
+        vmovdqa .LC0(%rip), %ymm0
+        movq    TTY_Getc_pstm@GOTPCREL(%rip), %rax
+        vpinsrq $0, TTY_Getc@GOTPCREL(%rip), %xmm0, %xmm1
+        vinserti128     $0x0, %xmm1, %ymm0, %ymm0
+        vmovdqu %ymm0, (%rax)
+        vzeroupper
+        ret
+.LC0:
+        .quad   0
+        .quad   1
+        .quad   1
+        .quad   1
+
+and w/o -fpic:
+
+TTY_Getc:
+        vmovdqa .LC0(%rip), %ymm0
+        movl    $TTY_Getc, %eax
+        vpinsrq $0, %rax, %xmm0, %xmm1
+        vinserti128     $0x0, %xmm1, %ymm0, %ymm0
+        vmovdqa %ymm0, TTY_Getc_pstm(%rip)
+        vzeroupper
+        ret
+.LC0:
+        .quad   0
+        .quad   1
+        .quad   1
+        .quad   1
+
+- User: GCC Commits | Time: 2024-10-15 14:53:19 UTC
+  Text: The master branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:80d7032067a3a5b76aecd657d9b35b0a8f5a941dcommitr15-4359-g80d7032067a3a5b76aecd657d9b35b0a8f5a941dAuthor: Uros Bizjak <ubizjak@gmail.com>
+Date:   Tue Oct 15 16:51:33 2024 +0200
+
+    i386: Fix expand_vector_set for VEC_MERGE/VEC_DUPLICATE RTX [PR117116]
+    
+    Middle end can generate SYMBOL_REF RTX as a value "val" in the call
+    to expand_vector_set, but SYMBOL_REF RTX is not accepted in
+    <sse2p4_1>_pinsr<ssemodesuffix> insn pattern, generated via
+    VEC_MERGE/VEC_DUPLICATE RTX path.
+    
+    Force the value into a register before VEC_MERGE/VEC_DUPLICATE RTX
+    is generated if it doesn't satisfy nonimmediate_operand predicate.PR target/117116gcc/ChangeLog:
+    
+            * config/i386/i386-expand.cc (expand_vector_set): Force "val"
+            into a register before VEC_MERGE/VEC_DUPLICATE RTX is generated
+            if it doesn't satisfy nonimmediate_operand predicate.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr117116.c: New test.
+
+- User: Uroš Bizjak | Time: 2024-10-15 15:05:15 UTC
+  Text: Fixed on mainline, will be backported to other release branches.
+
+- User: GCC Commits | Time: 2024-10-16 14:15:52 UTC
+  Text: The releases/gcc-14 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:8be94d5643176ecd2dcdceaf4448c3b89318037ccommitr14-10797-g8be94d5643176ecd2dcdceaf4448c3b89318037cAuthor: Uros Bizjak <ubizjak@gmail.com>
+Date:   Tue Oct 15 16:51:33 2024 +0200
+
+    i386: Fix expand_vector_set for VEC_MERGE/VEC_DUPLICATE RTX [PR117116]
+    
+    Middle end can generate SYMBOL_REF RTX as a value "val" in the call
+    to expand_vector_set, but SYMBOL_REF RTX is not accepted in
+    <sse2p4_1>_pinsr<ssemodesuffix> insn pattern, generated via
+    VEC_MERGE/VEC_DUPLICATE RTX path.
+    
+    Force the value into a register before VEC_MERGE/VEC_DUPLICATE RTX
+    is generated if it doesn't satisfy nonimmediate_operand predicate.PR target/117116gcc/ChangeLog:
+    
+            * config/i386/i386-expand.cc (expand_vector_set): Force "val"
+            into a register before VEC_MERGE/VEC_DUPLICATE RTX is generated
+            if it doesn't satisfy nonimmediate_operand predicate.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr117116.c: New test.
+    
+    (cherry picked from commit 80d7032067a3a5b76aecd657d9b35b0a8f5a941d)
+
+- User: GCC Commits | Time: 2024-10-16 14:16:08 UTC
+  Text: The releases/gcc-13 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:dc295054c4ba28e44d4856bb68d148e9ac272d05commitr13-9119-gdc295054c4ba28e44d4856bb68d148e9ac272d05Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Tue Oct 15 16:51:33 2024 +0200
+
+    i386: Fix expand_vector_set for VEC_MERGE/VEC_DUPLICATE RTX [PR117116]
+    
+    Middle end can generate SYMBOL_REF RTX as a value "val" in the call
+    to expand_vector_set, but SYMBOL_REF RTX is not accepted in
+    <sse2p4_1>_pinsr<ssemodesuffix> insn pattern, generated via
+    VEC_MERGE/VEC_DUPLICATE RTX path.
+    
+    Force the value into a register before VEC_MERGE/VEC_DUPLICATE RTX
+    is generated if it doesn't satisfy nonimmediate_operand predicate.PR target/117116gcc/ChangeLog:
+    
+            * config/i386/i386-expand.cc (expand_vector_set): Force "val"
+            into a register before VEC_MERGE/VEC_DUPLICATE RTX is generated
+            if it doesn't satisfy nonimmediate_operand predicate.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr117116.c: New test.
+    
+    (cherry picked from commit 80d7032067a3a5b76aecd657d9b35b0a8f5a941d)
+
+- User: GCC Commits | Time: 2024-10-16 14:16:22 UTC
+  Text: The releases/gcc-12 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:a8bd38de88715fdbf0d064ff0d50e2b8734de939commitr12-10774-ga8bd38de88715fdbf0d064ff0d50e2b8734de939Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Tue Oct 15 16:51:33 2024 +0200
+
+    i386: Fix expand_vector_set for VEC_MERGE/VEC_DUPLICATE RTX [PR117116]
+    
+    Middle end can generate SYMBOL_REF RTX as a value "val" in the call
+    to expand_vector_set, but SYMBOL_REF RTX is not accepted in
+    <sse2p4_1>_pinsr<ssemodesuffix> insn pattern, generated via
+    VEC_MERGE/VEC_DUPLICATE RTX path.
+    
+    Force the value into a register before VEC_MERGE/VEC_DUPLICATE RTX
+    is generated if it doesn't satisfy nonimmediate_operand predicate.PR target/117116gcc/ChangeLog:
+    
+            * config/i386/i386-expand.cc (expand_vector_set): Force "val"
+            into a register before VEC_MERGE/VEC_DUPLICATE RTX is generated
+            if it doesn't satisfy nonimmediate_operand predicate.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr117116.c: New test.
+    
+    (cherry picked from commit 80d7032067a3a5b76aecd657d9b35b0a8f5a941d)
+
+- User: Uroš Bizjak | Time: 2024-10-16 14:17:25 UTC
+  Text: Fixed everywhere.
+

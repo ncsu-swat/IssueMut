@@ -1,0 +1,242 @@
+Bug Summary: [13/14/15 Regression] wrong code at optimization levels -O2, -O3, -Os since r13-7434-g682bbd364708fe
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: patch, wrong-code
+Known to Work: 13.1.0, 13.3.1, 14.1.1, 15.0
+Known to Fail: 13.2.0, 14.1.0
+
+Comments:
+- User: Bi6c | Time: 2024-05-19 02:46:48 UTC
+  Text: Createdattachment 58242[details]testcase
+
+OS: Ubuntu 22.04.3 LTS
+
+We found that there are discrepancies when compiling with gcc-13.2.0, gcc-14.1.0 at optimization levels -O2, -O3, and -Os.
+
+$ ../compiler-builds/gcc-13.2.0_build/bin/gcc -fsanitize=undefined -g -lgcc_s -I/home/csmith/include/csmith-2.3.0 -O2 testcase.c -o exec
+
+$ timeout 1s ./exec 2>exec.err
+f.b=0
+
+$ ../compiler-builds/gcc-12.3.0_build/bin/gcc -fsanitize=undefined -g -lgcc_s -I/home/csmith/include/csmith-2.3.0 -O2 testcase.c -o exec
+
+$ timeout 1s ./exec 2>exec.err
+f.b=-1
+
+- User: Andrew Pinski | Time: 2024-05-19 02:55:20 UTC
+  Text: This is fixed in GCC 14. I think it was one of my match.pd patches and it might be backported already to the GCC 13 branch. Let me look.
+
+- User: Andrew Pinski | Time: 2024-05-19 03:04:47 UTC
+  Text: It was caused by something that was backported to GCC 13 for GCC 13.2.0 too.
+It works in GCC 14.1.0 and the trunk for me.
+
+- User: Andrew Pinski | Time: 2024-05-19 03:08:20 UTC
+  Text: I wonder if myr13-7434-g682bbd364708feexposed the issue.
+And thenr14-3432-gddd64a6ec3b38e"fixed" it (on accident).
+
+- User: Sam James | Time: 2024-05-19 07:23:39 UTC
+  Text: I'm bisecting.
+
+- User: Sam James | Time: 2024-05-19 14:05:43 UTC
+  Text: (In reply to Andrew Pinski fromcomment #3)> I wonder if myr13-7434-g682bbd364708feexposed the issue.
+> And thenr14-3432-gddd64a6ec3b38e"fixed" it (on accident).Yeah,r13-7434-g682bbd364708feis the first bad commit on releases/gcc-13.
+
+I'll bisect for the "fix" now.
+
+- User: Sam James | Time: 2024-05-19 22:09:25 UTC
+  Text: yep,r14-3432-gddd64a6ec3b38efixed it on trunk
+
+- User: Andrew Pinski | Time: 2024-05-19 22:17:49 UTC
+  Text: (In reply to Sam James fromcomment #6)> yep,r14-3432-gddd64a6ec3b38efixed it on trunkSo that is not the correct fix really. It just works around the bad ir/bug. Tomorrow I will look into the correct fix. -a is not well defined for signed:1 and something created it which was wrong. There was a few other fixes in this area that fixed stuff like this too which was done due to detection of lowering vectors.
+
+- User: Andrew Pinski | Time: 2024-05-19 22:41:31 UTC
+  Text: ```
+Optimizing statement _5 = (<unnamed-signed:1>) _2;
+LKUP STMT _5 = nop_expr _2
+2>>> STMT _5 = nop_expr _2
+Optimizing statement _3 = -_5;
+LKUP STMT _3 = negate_expr _5
+2>>> STMT _3 = negate_expr _5
+Optimizing statement f.b = _3;
+  Replaced '_3' with constant '0'
+```
+
+So Dom decided it was always 0 as -signed:1 is undefined otherwise. 
+
+The IR is fine in .ccp:
+```
+  _27 = (int) si1_34;
+  _36 = _27 * 5;
+  _29 = (<unnamed-signed:1>) _36;
+  f.b = _29;
+```
+
+Then in forwprop it is broken:
+```
+  _32 = (<unnamed-signed:1>) _2;
+  _29 = -_32;
+  f.b = _29;
+```
+
+- User: Andrew Pinski | Time: 2024-05-19 22:47:52 UTC
+  Text: Matching expression match.pd:2310, gimple-match-3.cc:90
+Matching expression match.pd:2310, gimple-match-3.cc:90
+Applying pattern match.pd:4890, gimple-match-2.cc:4798
+Matching expression match.pd:160, gimple-match-10.cc:33
+Matching expression match.pd:2243, gimple-match-5.cc:20
+Matching expression match.pd:160, gimple-match-10.cc:33
+Applying pattern match.pd:5024, gimple-match-7.cc:13241
+Applying pattern match.pd:2404, gimple-match-2.cc:4387
+gimple_simplified to _32 = (<unnamed-signed:1>) _2;
+_29 = -_32;
+
+The problem match pattern (r13-1162-g9991d84d2a8435) is:
+```
+/* Narrow integer multiplication by a zero_one_valued_p operand.
+   Multiplication by [0,1] is guaranteed not to overflow.  */
+(simplify
+ (convert (mult@0 zero_one_valued_p@1 INTEGER_CST@2))
+ (if (INTEGRAL_TYPE_P (type)
+      && INTEGRAL_TYPE_P (TREE_TYPE (@0))
+      && TYPE_PRECISION (type) < TYPE_PRECISION (TREE_TYPE (@0)))
+  (mult (convert @1) (convert @2))))
+```
+
+  _36 = _27 * 5;
+  _29 = (<unnamed-signed:1>) _36;
+
+We go from `(<unnamed-signed:1>)(_27 *5)` to `((<unnamed-signed:1>)_27) * -1` which does overflow.
+
+The only case where is an overflow is `signed:1` so we should reject that I think.
+
+- User: Andrew Pinski | Time: 2024-05-19 22:57:51 UTC
+  Text: This works and might be the best for GCC 13/14 but maybe I think we can do better.
+
+```
+diff --git a/gcc/match.pd b/gcc/match.pd
+index 0f9c34fa897..6bc512cabdf 100644
+--- a/gcc/match.pd
++++ b/gcc/match.pd
+@@ -2400,7 +2400,8 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+  (convert (mult@0 zero_one_valued_p@1 INTEGER_CST@2))
+  (if (INTEGRAL_TYPE_P (type)
+       && INTEGRAL_TYPE_P (TREE_TYPE (@0))
+-      && TYPE_PRECISION (type) < TYPE_PRECISION (TREE_TYPE (@0)))
++      && TYPE_PRECISION (type) < TYPE_PRECISION (TREE_TYPE (@0))
++      && (TYPE_UNSIGNED (type) || TYPE_PRECISION (type) > 1))
+   (mult (convert @1) (convert @2))))
+
+ /* (X << C) != 0 can be simplified to X, when C is zero_one_valued_p.
+
+```
+
+For bit 1 precision, look at the lower bit of the INTEGER_CST and decide if it should be @1 or `0` and that would avoid the overflow too.
+
+Note you can reproduce the failure on the trunk and GCC 14 by using -fsanitize=undefined which I missed in the original bug report and that is becauser14-3432-gddd64a6ec3b38eis disable for undefined sanitizers case.
+
+- User: Andrew Pinski | Time: 2024-05-19 22:59:56 UTC
+  Text: (In reply to Sam James fromcomment #5)> (In reply to Andrew Pinski fromcomment #3)
+> > I wonder if myr13-7434-g682bbd364708feexposed the issue.
+> > And thenr14-3432-gddd64a6ec3b38e"fixed" it (on accident).
+> 
+> Yeah,r13-7434-g682bbd364708feis the first bad commit on releases/gcc-13.
+> 
+> I'll bisect for the "fix" now.
+
+- User: Andrew Pinski | Time: 2024-05-19 23:09:59 UTC
+  Text: Createdattachment 58247[details]Easier to (reduced) understand testcase
+
+- User: Andrew Pinski | Time: 2024-05-20 07:29:35 UTC
+  Text: Createdattachment 58249[details]Patch which I am testing
+
+- User: Andrew Pinski | Time: 2024-05-20 22:03:10 UTC
+  Text: Patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2024-May/652209.html
+
+- User: Jakub Jelinek | Time: 2024-05-21 09:20:42 UTC
+  Text: GCC 13.3 is being released, retargeting bugs to GCC 13.4.
+
+- User: GCC Commits | Time: 2024-05-21 14:24:57 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:49c87d22535ac4f8aacf088b3f462861c26cacb4commitr15-755-g49c87d22535ac4f8aacf088b3f462861c26cacb4Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Mon May 20 00:16:40 2024 -0700
+
+    match: Disable `(type)zero_one_valuep*CST` for 1bit signed types [PR115154]
+    
+    The problem here is the pattern added inr13-1162-g9991d84d2a8435assumes that it is well defined to multiply zero_one_valuep by the truncated
+    converted integer constant. It is well defined for all types except for signed 1bit types.
+    Where `a * -1` is produced which is undefined/
+    So disable this pattern for 1bit signed types.
+    
+    Note the pattern added inr14-3432-gddd64a6ec3b38eis able to workaround the undefinedness except when
+    `-fsanitize=undefined` is turned on, this is why I added a testcase for that.
+    
+    Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/115154gcc/ChangeLog:
+    
+            * match.pd (convert (mult zero_one_valued_p@1 INTEGER_CST@2)): Disable
+            for 1bit signed types.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/ubsan/signed1bitfield-1.c: New test.
+            * gcc.c-torture/execute/signed1bitfield-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: GCC Commits | Time: 2024-05-21 14:25:58 UTC
+  Text: The releases/gcc-14 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:b2bb49d6a77e4568c0b91db17b2599f5929fb85bcommitr14-10224-gb2bb49d6a77e4568c0b91db17b2599f5929fb85bAuthor: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Mon May 20 00:16:40 2024 -0700
+
+    match: Disable `(type)zero_one_valuep*CST` for 1bit signed types [PR115154]
+    
+    The problem here is the pattern added inr13-1162-g9991d84d2a8435assumes that it is well defined to multiply zero_one_valuep by the truncated
+    converted integer constant. It is well defined for all types except for signed 1bit types.
+    Where `a * -1` is produced which is undefined/
+    So disable this pattern for 1bit signed types.
+    
+    Note the pattern added inr14-3432-gddd64a6ec3b38eis able to workaround the undefinedness except when
+    `-fsanitize=undefined` is turned on, this is why I added a testcase for that.
+    
+    Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/115154gcc/ChangeLog:
+    
+            * match.pd (convert (mult zero_one_valued_p@1 INTEGER_CST@2)): Disable
+            for 1bit signed types.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/ubsan/signed1bitfield-1.c: New test.
+            * gcc.c-torture/execute/signed1bitfield-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+    (cherry picked from commit 49c87d22535ac4f8aacf088b3f462861c26cacb4)
+
+- User: GCC Commits | Time: 2024-05-21 14:29:12 UTC
+  Text: The releases/gcc-13 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:d6cf49eaf5ac237c57785dce42c89deac911affacommitr13-8783-gd6cf49eaf5ac237c57785dce42c89deac911affaAuthor: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Mon May 20 00:16:40 2024 -0700
+
+    match: Disable `(type)zero_one_valuep*CST` for 1bit signed types [PR115154]
+    
+    The problem here is the pattern added inr13-1162-g9991d84d2a8435assumes that it is well defined to multiply zero_one_valuep by the truncated
+    converted integer constant. It is well defined for all types except for signed 1bit types.
+    Where `a * -1` is produced which is undefined/
+    So disable this pattern for 1bit signed types.
+    
+    Note the pattern added inr14-3432-gddd64a6ec3b38eis able to workaround the undefinedness except when
+    `-fsanitize=undefined` is turned on, this is why I added a testcase for that.
+    
+    Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/115154gcc/ChangeLog:
+    
+            * match.pd (convert (mult zero_one_valued_p@1 INTEGER_CST@2)): Disable
+            for 1bit signed types.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * c-c++-common/ubsan/signed1bitfield-1.c: New test.
+            * gcc.c-torture/execute/signed1bitfield-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+    (cherry picked from commit 49c87d22535ac4f8aacf088b3f462861c26cacb4)
+
+- User: Andrew Pinski | Time: 2024-05-21 14:31:12 UTC
+  Text: Fixed on all branches, sadly it barely didn't make it for the just released GCC 13.3.0.
+

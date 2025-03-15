@@ -1,0 +1,77 @@
+Issue Title: [clang] incorrect code generation when building gawk 5.2.1 using -O2/-O3
+Original Post: It was found that when building gawk 5.2.1 with `-O2` or `-O3`, incorrect machine code is generated which is causing differing runtime behavior than expected.
+
+# Background
+Originally I ran into this when upgrading gawk on my personal Gentoo systems to 5.2.1. There is a particular regex[1] used in plymouth which was suddenly erroring that did not previously. Downgrading to gawk 5.1.1, building it with gcc, or disabling compiler optimizations would work around the issue.
+
+This issue is being submitted after some discussion[2] on the gawk-bug mailing list, particularly because of these findings[3].
+
+A simple test case is this command:
+```shell
+head /dev/zero | awk 'BEGIN { RS="[[][:blank:]]" }'
+```
+When running this command, the expected behavior is no output and a clean exit. However, when building gawk 5.2.1 with clang and `-O2` or `-O3`, we see this error (and a non-zero exit code):
+```console
+awk: cmd. line:1: fatal: invalid character class
+```
+
+[1] https://gitlab.freedesktop.org/plymouth/plymouth/-/blob/main/scripts/plymouth-set-default-theme.in#L50
+[2] https://lists.gnu.org/archive/html/bug-gawk/2022-12/msg00010.html
+[3] https://lists.gnu.org/archive/html/bug-gnulib/2023-01/msg00002.html
+
+Comment by thesamesam: cc @eggert
+Comment by llvmbot: @llvm/issue-subscribers-clang-codegen
+Comment by MaskRay: As noticed, `gawk/support/dfa.c` lines 1141-1143 confuses Clang. Clang thinks the `ConditionalOperator` (`... ? dfaerror : dfawarn`) is `noreturn` as `dfaerror` is `noreturn` (while it shouldn't since `dfawarn` isn't `noreturn`).
+
+```c
+    ((dfa->syntax.dfaopts & DFA_CONFUSING_BRACKETS_ERROR
+      ? dfaerror : dfawarn)
+     (_("character class syntax is [[:space:]], not [:space:]")));
+```
+
+This problem has been known since 2010 (https://github.com/llvm/llvm-project/commit/8c6b56f39d967347f28dd9c93f1cffddf6d7e4cd)
+
+```c
+QualType ASTContext::mergeFunctionTypes(QualType lhs, QualType rhs, ...
+...
+  // It's noreturn if either type is.
+  // FIXME: some uses, e.g. conditional exprs, really want this to be 'both'.
+  bool NoReturn = lbaseInfo.getNoReturn() || rbaseInfo.getNoReturn();
+```
+
+In some contexts (merging two declarations), we do want to use the logical OR result. But here for the `ConditionalOperator`, we want to use the logical AND result.
+Comment by MaskRay: Patch: https://reviews.llvm.org/D140868
+Comment by llvmbot: @llvm/issue-subscribers-clang-frontend
+Comment by tru: @tstellar not sure this really should go into a hotfix. If I read the history here correctly this has been known since at least 2010 and in my mind, it doesn't qualify as a regression that should be fixed at this point.
+
+But maybe it's harmless enough to warrant to pick over.
+Comment by thesamesam: "Known" in the sense of a FIXME, but not known that it miscompiles a core part of Linux userland until 2 days ago.
+
+If it was well-known, we wouldn't be in the situation we are wrt the standard (see the phab review).
+
+Part of my interest here is in, if possible, making LLVM 15 as solid as possible given it'll be a while before we can use Clang 16 due to the large disruption we're working on. So even if it doesn't go into 15.0.7, people who want to keep using Clang as a system compiler will have to cherry-pick it anyway.
+Comment by tru: I have read up on the issue and I still hold the same position: I don't think this is a regression in LLVM 15.x. Since we are rolling 15.0.7 because of #59242 I don't object to it being included as long as the risk of this is low, but I wouldn't suggest a new patch for this issue alone.
+
+This sounds maybe a bit like a lawyer discussion because the end result is probably the same (that we ship this fix in 15.0.7), but I think it's important that we figure out exactly what kind of fixes we are putting into releases this late in the cycle and set the right expectations for users and testers.
+Comment by tstellar: @tru I added this one to the milestone, just so we don't lose track of it.  We don't have to pull it into the release.  
+That being said, miscompiling of a project like gawk, seems like a bad bug, and I wouldn't object to pulling it into 15.0.7 since we are planning the release.  My biggest concern with this one is that it's still not committed yet, and it won't have spent much time in main by the time of the release.
+
+@thesamesam Do you know if previous versions of clang/llvm can gompile gawk 5.2.1 correctly?
+Comment by MaskRay: If llvm-project or a Linux distribution wants to cherry pick the fix, the commits are: 
+b58927ec0c4e57e24d5868802bd3ee119e552454 (test update) and cf8fd210a35c8e93136cb8edc5c6a2e818dc1b1d (with a `clang/docs/ReleaseNotes.rst` change which needs to resolve conflicts).
+Comment by thesamesam: > @thesamesam Do you know if previous versions of clang/llvm can gompile gawk 5.2.1 correctly?
+
+Clang 14 miscompiles it as well at least. I can try 13 if needed.
+Comment by tstellar: /cherry-pick b58927ec0c4e57e24d5868802bd3ee119e552454 cf8fd210a35c8e93136cb8edc5c6a2e818dc1b1d
+Comment by llvmbot: <!--IGNORE-->
+Failed to cherry-pick: cf8fd210a35c8e93136cb8edc5c6a2e818dc1b1d
+
+https://github.com/llvm/llvm-project/actions/runs/3877397004
+
+Please manually backport the fix and push it to your github fork.  Once this is done, please add a comment like this:
+
+`/branch <user>/<repo>/<branch>`
+Comment by tstellar: /branch tstellar/llvm-project/issue-59792
+Comment by llvmbot: /pull-request llvm/llvm-project-release-prs#227
+Comment by tstellar: This patch introduces an ABI change in libclang-cpp.so.  It needs to be rewritten so the old signatures of mergeFunctionTypes ( ) and mergeTypes ( ) are added back in.
+Comment by nikic: This was not included in the 15.0.7 release, so closing this issue.

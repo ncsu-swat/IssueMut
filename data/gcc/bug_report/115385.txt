@@ -1,0 +1,117 @@
+Bug Summary: Peeling for gaps can be optimized more or needs to peel more than one iteration
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Richard Biener | Time: 2024-06-07 11:44:05 UTC
+  Text: Consider
+
+void __attribute__((noipa)) foo(unsigned char * __restrict x,
+                                unsigned char *y, int n)
+{
+  for (int i = 0; i < n; ++i)
+    {
+      x[16*i+0] = y[3*i+0];
+      x[16*i+1] = y[3*i+1];
+      x[16*i+2] = y[3*i+2];
+      x[16*i+3] = y[3*i+0];
+      x[16*i+4] = y[3*i+1];
+      x[16*i+5] = y[3*i+2];
+      x[16*i+6] = y[3*i+0];
+      x[16*i+7] = y[3*i+1];
+      x[16*i+8] = y[3*i+2];
+      x[16*i+9] = y[3*i+0];
+      x[16*i+10] = y[3*i+1];
+      x[16*i+11] = y[3*i+2];
+      x[16*i+12] = y[3*i+0];
+      x[16*i+13] = y[3*i+1];
+      x[16*i+14] = y[3*i+2];
+      x[16*i+15] = y[3*i+0];
+    }
+}
+
+and
+
+void __attribute__((noipa)) bar(unsigned char * __restrict x,
+                                unsigned char *y, int n)
+{
+  for (int i = 0; i < n; ++i)
+    {
+      x[16*i+0] = y[5*i+0];
+      x[16*i+1] = y[5*i+1];
+      x[16*i+2] = y[5*i+2];
+      x[16*i+3] = y[5*i+3];
+      x[16*i+4] = y[5*i+4];
+      x[16*i+5] = y[5*i+0];
+      x[16*i+6] = y[5*i+1];
+      x[16*i+7] = y[5*i+2];
+      x[16*i+8] = y[5*i+3];
+      x[16*i+9] = y[5*i+4];
+      x[16*i+10] = y[5*i+0];
+      x[16*i+11] = y[5*i+1];
+      x[16*i+12] = y[5*i+2];
+      x[16*i+13] = y[5*i+3];
+      x[16*i+14] = y[5*i+4];
+      x[16*i+15] = y[5*i+0];
+    }
+}
+
+for both loops we currently cannot reduce the access for the load from 'y' to
+not touch extra elements so we force peeling for gaps.  But in both cases
+peeling a single scalar iteration is not sufficient and we get
+
+t.c:5:21: note:   ==> examining statement: _3 = y[_1];
+t.c:5:21: missed:   peeling for gaps insufficient for access
+t.c:7:20: missed:   not vectorized: relevant stmt not supported: _3 = y[_1];
+
+we can avoid this excessive peeling for gaps if we narrow the load from 'y'
+to the next power-of-two size where then it's always sufficient to just
+peel a single scalar iteration.  When the target cannot construct a vector
+with those elements we'd have to peel more than one iteration.
+
+- User: Richard Biener | Time: 2024-06-07 11:59:32 UTC
+  Text: Mine.
+
+- User: GCC Commits | Time: 2024-06-13 06:22:51 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:6669dc51515313dd1e60c493596dbc90429fc362commitr15-1239-g6669dc51515313dd1e60c493596dbc90429fc362Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Jun 7 14:47:12 2024 +0200
+
+    tree-optimization/115385 - handle more gaps with peeling of a single iteration
+    
+    The following makes peeling of a single scalar iteration handle more
+    gaps, including non-power-of-two cases.  This can be done by rounding
+    up the remaining access to the next power-of-two which ensures that
+    the next scalar iteration will pick at least the number of excess
+    elements we access.
+    
+    I've added a correctness testcase and one x86 specific scanning for
+    the optimization.PR tree-optimization/115385* tree-vect-stmts.cc (get_group_load_store_type): Peeling
+            of a single scalar iteration is sufficient if we can narrow
+            the access to the next power of two of the bits in the last
+            access.
+            (vectorizable_load): Ensure that the last access is narrowed.
+    
+            * gcc.dg/vect/pr115385.c: New testcase.
+            * gcc.target/i386/vect-pr115385.c: Likewise.
+
+- User: Richard Biener | Time: 2024-06-13 07:15:41 UTC
+  Text: Fixed.  Note targets might need to extend their vec_init/vec_extract coverage.
+
+- User: Carlos Eduardo Seo | Time: 2024-06-14 16:09:57 UTC
+  Text: This patch seems to be breaking aarch64:
+
+# 00:20:58 /home/tcwg-buildslave/workspace/tcwg_gnu_5/abe/snapshots/gcc.git~master/gcc/hwint.h:266:17: error: ‘remain.poly_int<2, long unsigned int>::coeffs[0]’ may be used uninitialized [-Werror=maybe-uninitialized]
+# 00:20:58 /home/tcwg-buildslave/workspace/tcwg_gnu_5/abe/snapshots/gcc.git~master/gcc/poly-int.h:557:7: error: ‘remain.poly_int<2, long unsigned int>::coeffs[1]’ may be used uninitialized [-Werror=maybe-uninitialized]
+# 00:21:48 make[3]: *** [Makefile:1199: tree-vect-stmts.o] Error 1
+# 00:21:48 make[2]: *** [Makefile:5100: all-stage2-gcc] Error 2
+# 00:21:48 make[1]: *** [Makefile:25572: stage2-bubble] Error 2
+# 00:21:48 make: *** [Makefile:1103: all] Error 2
+
+- User: Sam James | Time: 2024-06-14 17:31:19 UTC
+  Text: r15-1309-ge575b5c56137b1should fix that...
+

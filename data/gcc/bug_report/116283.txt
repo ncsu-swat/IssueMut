@@ -1,0 +1,140 @@
+Bug Summary: [15 Regression] RISC-V rv64id_zbs ICE: unrecognizable insn
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 14.1.0
+Known to Fail: 15.0
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-08-08 06:47:45 UTC
+  Text: Testcase:
+char c;
+#define d(a, b)                                                                \
+  {                                                                            \
+    __typeof__(a) e = a;                                                       \
+    e;                                                                         \
+  }
+long f;
+void g(signed h[][9][9][9][9]) {
+  for (unsigned i = f; i; i += 3)
+    c = (d(1 << (3629 & h[i][i][1][5][i]), ));
+}
+
+Command/backtrace:> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -O2 -march=rv64id_zbs -c -o /dev/null func.cfunc.c: In function 'g':
+func.c:11:1: error: unrecognizable insn:
+   11 | }
+      | ^
+(insn 47 26 48 3 (set (reg:DI 161)
+        (and:DI (reg:DI 154 [ MEM[(int[9][9][9][9] *)h_12(D) + 112717121637492B][4294967293][1][5][4294967293] ])
+            (const_int 3629 [0xe2d]))) "func.c":10:10 -1
+     (expr_list:REG_DEAD (reg:DI 154 [ MEM[(int[9][9][9][9] *)h_12(D) + 112717121637492B][4294967293][1][5][4294967293] ])
+        (nil)))
+during RTL pass: sched1
+func.c:11:1: internal compiler error: in extract_insn, at recog.cc:2869
+0x2de6365 internal_error(char const*, ...)
+        ../../../gcc/gcc/diagnostic-global-context.cc:491
+0xc50982 fancy_abort(char const*, int, char const*)
+        ../../../gcc/gcc/diagnostic.cc:1772
+0xae39b5 _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+        ../../../gcc/gcc/rtl-error.cc:108
+0xae39d7 _fatal_insn_not_found(rtx_def const*, char const*, int, char const*)
+        ../../../gcc/gcc/rtl-error.cc:116
+0xae228b extract_insn(rtx_insn*)
+        ../../../gcc/gcc/recog.cc:2869
+0x114c8c7 scan_one_insn
+        ../../../gcc/gcc/ira-costs.cc:1546
+0x114c8c7 process_bb_for_costs
+        ../../../gcc/gcc/ira-costs.cc:1748
+0x114ea8f find_costs_and_classes
+        ../../../gcc/gcc/ira-costs.cc:2032
+0x114f446 ira_set_pseudo_classes(bool, _IO_FILE*)
+        ../../../gcc/gcc/ira-costs.cc:2618
+0x2791c97 alloc_global_sched_pressure_data
+        ../../../gcc/gcc/haifa-sched.cc:7205
+0x2791c97 sched_init()
+        ../../../gcc/gcc/haifa-sched.cc:7360
+0x279345e haifa_sched_init()
+        ../../../gcc/gcc/haifa-sched.cc:7372
+0x132517a schedule_insns()
+        ../../../gcc/gcc/sched-rgn.cc:3517
+0x1325840 schedule_insns()
+        ../../../gcc/gcc/sched-rgn.cc:3511
+0x1325840 rest_of_handle_sched
+        ../../../gcc/gcc/sched-rgn.cc:3729
+0x1325840 execute
+        ../../../gcc/gcc/sched-rgn.cc:3839
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+Godbolt:https://godbolt.org/z/Eq5MoTqEoFound via fuzzer.
+
+- User: Jeffrey A. Law | Time: 2024-08-08 15:02:12 UTC
+  Text: Code is a bit nonsensical in that it masks a shift by a crazy value (3629), but the underlying bug is real.  Ultimately we're going to rely on the fact that hardware truncates the count (mask with 0x3f) and since we're shifting a SImode value, we really just care about 0x1f.  So we can just mask off undesirable bits.
+
+Initial testing in flight.
+
+- User: GCC Commits | Time: 2024-08-09 23:47:15 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:d4e1290e5d603984e9b410c7d4cf21a9ffbd68fdcommitr15-2860-gd4e1290e5d603984e9b410c7d4cf21a9ffbd68fdAuthor: Jeff Law <jlaw@ventanamicro.com>
+Date:   Fri Aug 9 17:46:01 2024 -0600
+
+    [RISC-V][PR target/116283] Fix split code for recent Zbs improvements with masked bit positions
+    
+    So Patrick's fuzzer found an interesting little buglet in the Zbs improvements
+    I added a couple months back.
+    
+    Specifically when we have masked bit position for a Zbs instruction.  If the
+    mask has extraneous bits set we'll generate an unrecognizable insn due to an
+    invalid constant.
+    
+    More concretely, let's take this pattern:
+    
+    > (define_insn_and_split ""
+    >   [(set (match_operand:DI 0 "register_operand" "=r")
+    >         (any_extend:DI
+    >          (ashift:SI (const_int 1)
+    >                     (subreg:QI                        (and:DI (match_operand:DI 1 "register_operand" "r")
+    >                               (match_operand 2 "const_int_operand")) 0))))]
+    What we need to know to transform this into bset for rv64.
+    
+    After masking the shift count we want to know the low 5 bits aren't 0x1f.  If
+    they were 0x1f, then the constant generated would be 0x80000000 which would
+    then need sign extension out to 64bits, which the bset instruction will not do
+    for us.
+    
+    We can ignore anything outside the low 5 bits.  The mode of the shift is SI, so
+    shifting by 32+ bits is undefined behavior.
+    
+    It's also worth explicitly mentioning that the hardware is going to mask the
+    count against 0x3f.
+    
+    The net is if (operands[2] & 0x1f) != 0x1f, then this transformation is safe.
+    So onto the generated split code...
+    
+    >   [(set (match_dup 0) (and:DI (match_dup 1) (match_dup 2)))
+    >    (set (match_dup 0) (zero_extend:DI (ashift:SI
+    >                                      (const_int 1)
+    >                                      (subreg:QI (match_dup 0) 0))))]
+    
+    Which would seemingly do exactly what we want.   The problem is the first split
+    insn.  If the constant does not fit into a simm12, that insn won't be
+    recognized resulting in the ICE.
+    
+    The fix is simple, we just need to mask the constant before generating RTL.  We
+    can just mask it against 0x1f since we only care about the low 5 bits.
+    
+    This affects multiple patterns.  I've added the appropriate fix to all of them.
+    
+    Tested in my tester.  Waiting for the pre-commit bits to run before pushing.PR target/116283gcc/
+            * config/riscv/bitmanip.md (Zbs combiner patterns/splitters): Mask the
+            bit position in the split code appropriately.
+    
+    gcc/testsuite/
+    
+            * gcc.target/riscv/pr116283.c: New test
+
+- User: Jeffrey A. Law | Time: 2024-08-09 23:47:54 UTC
+  Text: Fixed on the trunk.
+

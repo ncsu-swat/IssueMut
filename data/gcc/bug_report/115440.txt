@@ -1,0 +1,405 @@
+Bug Summary: unrecognized command-line option '--c++17'; did you mean '--stdc++17'?
+Product: gcc
+Component: driver
+
+  (show other bugs)
+Keywords: diagnostic
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Arthur O'Dwyer | Time: 2024-06-11 17:33:24 UTC
+  Text: This is merely a very minor glitch in an error message. But I keep noticing it when I accidentally use an EDG-style "--c++11, --c++14, ..." option with GCC instead of the correct "-std=c++11, -std=c++14, ...".
+
+% g++ --c++17 test.cpp
+g++: error: unrecognized command-line option '--c++17'; did you mean '--stdc++17'?
+% g++ --stdc++17 test.cpp
+g++: error: unrecognized command-line option '--stdc++17'
+
+Instead of "--stdc++XX" it should be suggesting "-std=c++17" (one dash, equals sign).  (Two dashes "--std=c++XX" does also work, but ~nobody writes that in real life, so I don't think the driver should suggest that anybody start.)
+
+- User: Andrew Pinski | Time: 2024-06-11 17:42:30 UTC
+  Text: Confirmed.
+
+- User: Jonathan Wakely | Time: 2024-06-11 19:04:06 UTC
+  Text: People certainly do write --std, I see it all the time. I don't like it though.
+
+- User: Jakub Jelinek | Time: 2024-06-11 21:23:24 UTC
+  Text: Untested fix:
+--- gcc/opts-common.cc.jj	2024-05-21 10:19:35.694512065 +0200
++++ gcc/opts-common.cc	2024-06-11 23:10:43.428656210 +0200
+@@ -524,6 +524,7 @@ add_misspelling_candidates (auto_vec<cha
+   for (unsigned i = 0; i < ARRAY_SIZE (option_map); i++)
+     {
+       const char *opt0 = option_map[i].opt0;
++      const char *opt1 = option_map[i].opt1;
+       const char *new_prefix = option_map[i].new_prefix;
+       size_t new_prefix_len = strlen (new_prefix);
+ 
+@@ -532,8 +533,9 @@ add_misspelling_candidates (auto_vec<cha
+ 
+       if (strncmp (opt_text, new_prefix, new_prefix_len) == 0)
+ 	{
+-	  char *alternative = concat (opt0 + 1, opt_text + new_prefix_len,
+-				      NULL);
++	  char *alternative
++	    = concat (opt0 + 1, opt1 ? " " : "", opt1 ? opt1 : "",
++		      opt_text + new_prefix_len, NULL);
+ 	  candidates->safe_push (alternative);
+ 	}
+     }
+In my limited understanding, if opt1 is non-NULL in option_map, so the
+    { "--machine", "", "-m", false, false },
+    { "--machine", "no-", "-m", false, true },
+...
+    { "--std", "", "-std=", false, false },
+entries, I think that is about mapping --machine foobar to -mfoobar or
+--machine no-foobar to -mfoobar or --std foobar to -std=foobar
+We do accept --std c++17 with the same meaning as -std=c++17 but just don't add the space in between because opt1 is for the case where the option is present as two separate options.
+
+- User: GCC Commits | Time: 2024-06-17 20:04:12 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:96db57948b50f45235ae4af3b46db66cae7ea859commitr15-1384-g96db57948b50f45235ae4af3b46db66cae7ea859Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Jun 17 22:02:46 2024 +0200
+
+    diagnostics: Fix add_misspelling_candidates [PR115440]
+    
+    The option_map array for most entries contains just non-NULL opt0
+        { "-Wno-", NULL, "-W", false, true },
+        { "-fno-", NULL, "-f", false, true },
+        { "-gno-", NULL, "-g", false, true },
+        { "-mno-", NULL, "-m", false, true },
+        { "--debug=", NULL, "-g", false, false },
+        { "--machine-", NULL, "-m", true, false },
+        { "--machine-no-", NULL, "-m", false, true },
+        { "--machine=", NULL, "-m", false, false },
+        { "--machine=no-", NULL, "-m", false, true },
+        { "--machine", "", "-m", false, false },
+        { "--machine", "no-", "-m", false, true },
+        { "--optimize=", NULL, "-O", false, false },
+        { "--std=", NULL, "-std=", false, false },
+        { "--std", "", "-std=", false, false },
+        { "--warn-", NULL, "-W", true, false },
+        { "--warn-no-", NULL, "-W", false, true },
+        { "--", NULL, "-f", true, false },
+        { "--no-", NULL, "-f", false, true }
+    and so add_misspelling_candidates works correctly for it, but 3 out of
+    these,
+        { "--machine", "", "-m", false, false },
+        { "--machine", "no-", "-m", false, true },
+    and
+        { "--std", "", "-std=", false, false },
+    use non-NULL opt1.  That says that
+    --machine foo
+    should map to
+    -mfoo
+    and
+    --machine no-foo
+    should map to
+    -mno-foo
+    and
+    --std c++17
+    should map to
+    -std=c++17
+    add_misspelling_canidates was not handling this, so it hapilly
+    registered say
+    --stdc++17
+    or
+    --machineavx512
+    (twice) as spelling alternatives, when those options aren't recognized.
+    Instead we support
+    --std c++17
+    or
+    --machine avx512
+    --machine no-avx512
+    
+    The following patch fixes that.  On this particular testcase, we no longer
+    suggest anything, even when among the suggestion is say that
+    --std c++17
+    or
+    -std=c++17
+    etc.
+    
+    2024-06-17  Jakub Jelinek  <jakub@redhat.com>PR driver/115440* opts-common.cc (add_misspelling_candidates): If opt1 is non-NULL,
+            add a space and opt1 to the alternative suggestion text.
+    
+            * g++.dg/cpp1z/pr115440.C: New test.
+
+- User: GCC Commits | Time: 2024-06-20 08:27:30 UTC
+  Text: The releases/gcc-14 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:74a58c39c701b3bce884d4fb71cd59b9da145f1ccommitr14-10326-g74a58c39c701b3bce884d4fb71cd59b9da145f1cAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Jun 17 22:02:46 2024 +0200
+
+    diagnostics: Fix add_misspelling_candidates [PR115440]
+    
+    The option_map array for most entries contains just non-NULL opt0
+        { "-Wno-", NULL, "-W", false, true },
+        { "-fno-", NULL, "-f", false, true },
+        { "-gno-", NULL, "-g", false, true },
+        { "-mno-", NULL, "-m", false, true },
+        { "--debug=", NULL, "-g", false, false },
+        { "--machine-", NULL, "-m", true, false },
+        { "--machine-no-", NULL, "-m", false, true },
+        { "--machine=", NULL, "-m", false, false },
+        { "--machine=no-", NULL, "-m", false, true },
+        { "--machine", "", "-m", false, false },
+        { "--machine", "no-", "-m", false, true },
+        { "--optimize=", NULL, "-O", false, false },
+        { "--std=", NULL, "-std=", false, false },
+        { "--std", "", "-std=", false, false },
+        { "--warn-", NULL, "-W", true, false },
+        { "--warn-no-", NULL, "-W", false, true },
+        { "--", NULL, "-f", true, false },
+        { "--no-", NULL, "-f", false, true }
+    and so add_misspelling_candidates works correctly for it, but 3 out of
+    these,
+        { "--machine", "", "-m", false, false },
+        { "--machine", "no-", "-m", false, true },
+    and
+        { "--std", "", "-std=", false, false },
+    use non-NULL opt1.  That says that
+    --machine foo
+    should map to
+    -mfoo
+    and
+    --machine no-foo
+    should map to
+    -mno-foo
+    and
+    --std c++17
+    should map to
+    -std=c++17
+    add_misspelling_canidates was not handling this, so it hapilly
+    registered say
+    --stdc++17
+    or
+    --machineavx512
+    (twice) as spelling alternatives, when those options aren't recognized.
+    Instead we support
+    --std c++17
+    or
+    --machine avx512
+    --machine no-avx512
+    
+    The following patch fixes that.  On this particular testcase, we no longer
+    suggest anything, even when among the suggestion is say that
+    --std c++17
+    or
+    -std=c++17
+    etc.
+    
+    2024-06-17  Jakub Jelinek  <jakub@redhat.com>PR driver/115440* opts-common.cc (add_misspelling_candidates): If opt1 is non-NULL,
+            add a space and opt1 to the alternative suggestion text.
+    
+            * g++.dg/cpp1z/pr115440.C: New test.
+    
+    (cherry picked from commit 96db57948b50f45235ae4af3b46db66cae7ea859)
+
+- User: GCC Commits | Time: 2024-06-20 08:32:58 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:e216eb16ef740c4e820a24c73e7d7e97a12d93c3commitr13-8859-ge216eb16ef740c4e820a24c73e7d7e97a12d93c3Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Jun 17 22:02:46 2024 +0200
+
+    diagnostics: Fix add_misspelling_candidates [PR115440]
+    
+    The option_map array for most entries contains just non-NULL opt0
+        { "-Wno-", NULL, "-W", false, true },
+        { "-fno-", NULL, "-f", false, true },
+        { "-gno-", NULL, "-g", false, true },
+        { "-mno-", NULL, "-m", false, true },
+        { "--debug=", NULL, "-g", false, false },
+        { "--machine-", NULL, "-m", true, false },
+        { "--machine-no-", NULL, "-m", false, true },
+        { "--machine=", NULL, "-m", false, false },
+        { "--machine=no-", NULL, "-m", false, true },
+        { "--machine", "", "-m", false, false },
+        { "--machine", "no-", "-m", false, true },
+        { "--optimize=", NULL, "-O", false, false },
+        { "--std=", NULL, "-std=", false, false },
+        { "--std", "", "-std=", false, false },
+        { "--warn-", NULL, "-W", true, false },
+        { "--warn-no-", NULL, "-W", false, true },
+        { "--", NULL, "-f", true, false },
+        { "--no-", NULL, "-f", false, true }
+    and so add_misspelling_candidates works correctly for it, but 3 out of
+    these,
+        { "--machine", "", "-m", false, false },
+        { "--machine", "no-", "-m", false, true },
+    and
+        { "--std", "", "-std=", false, false },
+    use non-NULL opt1.  That says that
+    --machine foo
+    should map to
+    -mfoo
+    and
+    --machine no-foo
+    should map to
+    -mno-foo
+    and
+    --std c++17
+    should map to
+    -std=c++17
+    add_misspelling_canidates was not handling this, so it hapilly
+    registered say
+    --stdc++17
+    or
+    --machineavx512
+    (twice) as spelling alternatives, when those options aren't recognized.
+    Instead we support
+    --std c++17
+    or
+    --machine avx512
+    --machine no-avx512
+    
+    The following patch fixes that.  On this particular testcase, we no longer
+    suggest anything, even when among the suggestion is say that
+    --std c++17
+    or
+    -std=c++17
+    etc.
+    
+    2024-06-17  Jakub Jelinek  <jakub@redhat.com>PR driver/115440* opts-common.cc (add_misspelling_candidates): If opt1 is non-NULL,
+            add a space and opt1 to the alternative suggestion text.
+    
+            * g++.dg/cpp1z/pr115440.C: New test.
+    
+    (cherry picked from commit 96db57948b50f45235ae4af3b46db66cae7ea859)
+
+- User: GCC Commits | Time: 2024-06-20 08:54:53 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:c60dd0eb28eff3deaa389b0aafa689d423fc12f1commitr12-10569-gc60dd0eb28eff3deaa389b0aafa689d423fc12f1Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Jun 17 22:02:46 2024 +0200
+
+    diagnostics: Fix add_misspelling_candidates [PR115440]
+    
+    The option_map array for most entries contains just non-NULL opt0
+        { "-Wno-", NULL, "-W", false, true },
+        { "-fno-", NULL, "-f", false, true },
+        { "-gno-", NULL, "-g", false, true },
+        { "-mno-", NULL, "-m", false, true },
+        { "--debug=", NULL, "-g", false, false },
+        { "--machine-", NULL, "-m", true, false },
+        { "--machine-no-", NULL, "-m", false, true },
+        { "--machine=", NULL, "-m", false, false },
+        { "--machine=no-", NULL, "-m", false, true },
+        { "--machine", "", "-m", false, false },
+        { "--machine", "no-", "-m", false, true },
+        { "--optimize=", NULL, "-O", false, false },
+        { "--std=", NULL, "-std=", false, false },
+        { "--std", "", "-std=", false, false },
+        { "--warn-", NULL, "-W", true, false },
+        { "--warn-no-", NULL, "-W", false, true },
+        { "--", NULL, "-f", true, false },
+        { "--no-", NULL, "-f", false, true }
+    and so add_misspelling_candidates works correctly for it, but 3 out of
+    these,
+        { "--machine", "", "-m", false, false },
+        { "--machine", "no-", "-m", false, true },
+    and
+        { "--std", "", "-std=", false, false },
+    use non-NULL opt1.  That says that
+    --machine foo
+    should map to
+    -mfoo
+    and
+    --machine no-foo
+    should map to
+    -mno-foo
+    and
+    --std c++17
+    should map to
+    -std=c++17
+    add_misspelling_canidates was not handling this, so it hapilly
+    registered say
+    --stdc++17
+    or
+    --machineavx512
+    (twice) as spelling alternatives, when those options aren't recognized.
+    Instead we support
+    --std c++17
+    or
+    --machine avx512
+    --machine no-avx512
+    
+    The following patch fixes that.  On this particular testcase, we no longer
+    suggest anything, even when among the suggestion is say that
+    --std c++17
+    or
+    -std=c++17
+    etc.
+    
+    2024-06-17  Jakub Jelinek  <jakub@redhat.com>PR driver/115440* opts-common.cc (add_misspelling_candidates): If opt1 is non-NULL,
+            add a space and opt1 to the alternative suggestion text.
+    
+            * g++.dg/cpp1z/pr115440.C: New test.
+    
+    (cherry picked from commit 96db57948b50f45235ae4af3b46db66cae7ea859)
+
+- User: GCC Commits | Time: 2024-06-20 13:24:17 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:a0dac8fdf477f0ee7fa4f54bbfc4cafec944b042commitr11-11516-ga0dac8fdf477f0ee7fa4f54bbfc4cafec944b042Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Jun 17 22:02:46 2024 +0200
+
+    diagnostics: Fix add_misspelling_candidates [PR115440]
+    
+    The option_map array for most entries contains just non-NULL opt0
+        { "-Wno-", NULL, "-W", false, true },
+        { "-fno-", NULL, "-f", false, true },
+        { "-gno-", NULL, "-g", false, true },
+        { "-mno-", NULL, "-m", false, true },
+        { "--debug=", NULL, "-g", false, false },
+        { "--machine-", NULL, "-m", true, false },
+        { "--machine-no-", NULL, "-m", false, true },
+        { "--machine=", NULL, "-m", false, false },
+        { "--machine=no-", NULL, "-m", false, true },
+        { "--machine", "", "-m", false, false },
+        { "--machine", "no-", "-m", false, true },
+        { "--optimize=", NULL, "-O", false, false },
+        { "--std=", NULL, "-std=", false, false },
+        { "--std", "", "-std=", false, false },
+        { "--warn-", NULL, "-W", true, false },
+        { "--warn-no-", NULL, "-W", false, true },
+        { "--", NULL, "-f", true, false },
+        { "--no-", NULL, "-f", false, true }
+    and so add_misspelling_candidates works correctly for it, but 3 out of
+    these,
+        { "--machine", "", "-m", false, false },
+        { "--machine", "no-", "-m", false, true },
+    and
+        { "--std", "", "-std=", false, false },
+    use non-NULL opt1.  That says that
+    --machine foo
+    should map to
+    -mfoo
+    and
+    --machine no-foo
+    should map to
+    -mno-foo
+    and
+    --std c++17
+    should map to
+    -std=c++17
+    add_misspelling_canidates was not handling this, so it hapilly
+    registered say
+    --stdc++17
+    or
+    --machineavx512
+    (twice) as spelling alternatives, when those options aren't recognized.
+    Instead we support
+    --std c++17
+    or
+    --machine avx512
+    --machine no-avx512
+    
+    The following patch fixes that.  On this particular testcase, we no longer
+    suggest anything, even when among the suggestion is say that
+    --std c++17
+    or
+    -std=c++17
+    etc.
+    
+    2024-06-17  Jakub Jelinek  <jakub@redhat.com>PR driver/115440* opts-common.c (add_misspelling_candidates): If opt1 is non-NULL,
+            add a space and opt1 to the alternative suggestion text.
+    
+            * g++.dg/cpp1z/pr115440.C: New test.
+    
+    (cherry picked from commit 96db57948b50f45235ae4af3b46db66cae7ea859)
+
+- User: Jakub Jelinek | Time: 2024-06-20 13:44:14 UTC
+  Text: Fixed for 11.5 as well.
+

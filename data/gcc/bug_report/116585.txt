@@ -1,0 +1,205 @@
+Bug Summary: [12/13/14 Regression] SSA corruption with -O3
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, needs-bisection
+Known to Work: 10.5.0, 12.4.1, 13.3.1, 14.2.1, 15.0
+Known to Fail: 11.1.0
+
+Comments:
+- User: N/A | Time: 2024-09-03 14:47:32 UTC
+  Text: This is bug we found with GCC8 for our very large application. and it can be repeated till the trunk GCC. (I can reproduce it with GCC15 on both x86 and aarch64).
+
+the reduced testing case is:
+char *s1, *s2;
+extern int* my_alloc (int);
+extern int _setjmp ();
+extern void bar();
+void foo(int s1len, int s2len) {
+  int e;
+  e = _setjmp ();
+  {
+    int l, i;
+    int *md = my_alloc(((sizeof(int)) * (s1len + 1) * (s2len )));
+    s1len++;
+    {
+      for (; s1len; l) {
+        for (; s2len; l) {
+          for (; s1len; i) {
+            int j;
+            {
+              j = 1;
+              for (; j < s2len; j++) {
+                int cost;
+                if (s1[1] == s2[1])
+                  cost = 0;
+                else
+                  cost = 1;
+                md[j * s1len ] = ((cost));
+              }
+            }
+          }
+        }
+      }
+    }
+    bar();
+  }
+}
+/home/opc/Install/latest-d/bin/gcc -O3 t.c
+
+Unable to coalesce ssa_names 16 and 30 which are marked as MUST COALESCE.
+s1len_16(ab) and  s1len_30(ab)
+during RTL pass: expand
+t.c: In function ‘foo’:
+t.c:5:6: internal compiler error: SSA corruption
+    5 | void foo(int s1len, int s2len) {
+      |      ^~~
+0x342551c internal_error(char const*, ...)
+	../../latest-gcc/gcc/diagnostic-global-context.cc:491
+0x18f966c fail_abnormal_edge_coalesce
+	../../latest-gcc/gcc/tree-ssa-coalesce.cc:1012
+0x18fb01f coalesce_partitions
+	../../latest-gcc/gcc/tree-ssa-coalesce.cc:1444
+0x18fd11d coalesce_ssa_name(_var_map*)
+	../../latest-gcc/gcc/tree-ssa-coalesce.cc:1898
+0x1866853 remove_ssa_form
+	../../latest-gcc/gcc/tree-outof-ssa.cc:1065
+0x186750b rewrite_out_of_ssa(ssaexpand*)
+	../../latest-gcc/gcc/tree-outof-ssa.cc:1353
+0x100c5e5 execute
+	../../latest-gcc/gcc/cfgexpand.cc:6678
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+Adding -fvect-cost-model=very-cheap cures the failure on both x86 and aarch64.
+/home/opc/Install/latest-d/bin/gcc -O3 -fvect-cost-model=very-cheap t.c
+/home/opc/Install/latest/bin/ld: /lib/../lib64/crt1.o: in function `_start':
+(.text+0x24): undefined reference to `main'
+/home/opc/Install/latest/bin/ld: /tmp/cceYCJoo.o: in function `foo':
+t.c:(.text+0x2c): undefined reference to `my_alloc'
+/home/opc/Install/latest/bin/ld: t.c:(.text+0x37): undefined reference to `bar'
+collect2: error: ld returned 1 exit status
+
+- User: Andrew Pinski | Time: 2024-09-03 17:18:54 UTC
+  Text: Confirmed.
+
+- User: Richard Biener | Time: 2024-09-06 06:17:23 UTC
+  Text: Something in SCEV or data-ref analysis looks through
+
+  <bb 4> [local count: 2407868]:
+  _1 = s1len_15(ab) + 1;
+
+
+<bb 25>
+...
+  _21 = (sizetype) s1len_15(ab);
+  _18 = _21 + 1; 
+
+increasing the lifetime of s1len_15(ab)
+
+I'll eventually see to suppress this.
+
+- User: GCC Commits | Time: 2024-09-18 09:11:53 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:1d0cb3b5fca69b81e69cfdb4aea0eebc1ac04750commitr15-3680-g1d0cb3b5fca69b81e69cfdb4aea0eebc1ac04750Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Sep 18 09:52:55 2024 +0200
+
+    tree-optimization/116585 - SSA corruption with split_constant_offset
+    
+    split_constant_offset when looking through SSA defs can end up
+    picking SSA leafs that are subject to abnormal coalescing.  This
+    can lead to downstream consumers to insert code based on the
+    result (like from dataref analysis) in places that violate constraints
+    for abnormal coalescing.  It's best to not expand defs whose operands
+    are subject to abnormal coalescing - and not either do something when
+    a subexpression has operands like that already.PR tree-optimization/116585* tree-data-ref.cc (split_constant_offset_1): When either
+            operand is subject to abnormal coalescing do no further
+            processing.
+    
+            * gcc.dg/torture/pr116585.c: New testcase.
+
+- User: Richard Biener | Time: 2024-09-18 09:12:41 UTC
+  Text: Fixed on trunk sofar.
+
+- User: N/A | Time: 2024-09-25 15:59:25 UTC
+  Text: (In reply to Richard Biener fromcomment #4)> Fixed on trunk sofar.thanks a lot for fixing this so quick. 
+Will this patch be backported to older releases?
+
+- User: Richard Biener | Time: 2024-09-26 07:10:20 UTC
+  Text: (In reply to qinzhao fromcomment #5)> (In reply to Richard Biener fromcomment #4)
+> > Fixed on trunk sofar.
+> 
+> thanks a lot for fixing this so quick. 
+> Will this patch be backported to older releases?Yes, I'll pick it up after some soaking on trunk during my next backporting round.  If you want to do the work of cherry-picking and regtesting feel free to do this earlier - it's been a week on trunk and a quite safe change.
+
+- User: Qing Zhao | Time: 2024-09-26 12:29:21 UTC
+  Text: > 
+> Yes, I'll pick it up after some soaking on trunk during my next backporting
+> round.  If you want to do the work of cherry-picking and regtesting feel free
+> to do this earlier - it's been a week on trunk and a quite safe change.
+>Sure, I can do the backporting to GCC12, 13,and 14.
+
+- User: GCC Commits | Time: 2024-10-02 14:16:31 UTC
+  Text: The releases/gcc-12 branch has been updated by Qing Zhao <qinzhao@gcc.gnu.org>:https://gcc.gnu.org/g:8e5bd9b4b38f5b4fbd2a95d8f61168d9eeea97d3commitr12-10739-g8e5bd9b4b38f5b4fbd2a95d8f61168d9eeea97d3Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Sep 18 09:52:55 2024 +0200
+
+    tree-optimization/116585 - SSA corruption with split_constant_offset
+    
+    split_constant_offset when looking through SSA defs can end up
+    picking SSA leafs that are subject to abnormal coalescing.  This
+    can lead to downstream consumers to insert code based on the
+    result (like from dataref analysis) in places that violate constraints
+    for abnormal coalescing.  It's best to not expand defs whose operands
+    are subject to abnormal coalescing - and not either do something when
+    a subexpression has operands like that already.PR tree-optimization/116585* tree-data-ref.cc (split_constant_offset_1): When either
+            operand is subject to abnormal coalescing do no further
+            processing.
+    
+            * gcc.dg/torture/pr116585.c: New testcase.
+    
+    (cherry picked from commit 1d0cb3b5fca69b81e69cfdb4aea0eebc1ac04750)
+
+- User: GCC Commits | Time: 2024-10-02 15:22:36 UTC
+  Text: The releases/gcc-13 branch has been updated by Qing Zhao <qinzhao@gcc.gnu.org>:https://gcc.gnu.org/g:a344ba9e42224220a7279a4051a08662435b1c60commitr13-9072-ga344ba9e42224220a7279a4051a08662435b1c60Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Sep 18 09:52:55 2024 +0200
+
+    tree-optimization/116585 - SSA corruption with split_constant_offset
+    
+    split_constant_offset when looking through SSA defs can end up
+    picking SSA leafs that are subject to abnormal coalescing.  This
+    can lead to downstream consumers to insert code based on the
+    result (like from dataref analysis) in places that violate constraints
+    for abnormal coalescing.  It's best to not expand defs whose operands
+    are subject to abnormal coalescing - and not either do something when
+    a subexpression has operands like that already.PR tree-optimization/116585* tree-data-ref.cc (split_constant_offset_1): When either
+            operand is subject to abnormal coalescing do no further
+            processing.
+    
+            * gcc.dg/torture/pr116585.c: New testcase.
+    
+    (cherry picked from commit 1d0cb3b5fca69b81e69cfdb4aea0eebc1ac04750)
+
+- User: GCC Commits | Time: 2024-10-02 16:54:23 UTC
+  Text: The releases/gcc-14 branch has been updated by Qing Zhao <qinzhao@gcc.gnu.org>:https://gcc.gnu.org/g:e69c03971aa50fda96b3382bfded54da3d087c32commitr14-10730-ge69c03971aa50fda96b3382bfded54da3d087c32Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Sep 18 09:52:55 2024 +0200
+
+    tree-optimization/116585 - SSA corruption with split_constant_offset
+    
+    split_constant_offset when looking through SSA defs can end up
+    picking SSA leafs that are subject to abnormal coalescing.  This
+    can lead to downstream consumers to insert code based on the
+    result (like from dataref analysis) in places that violate constraints
+    for abnormal coalescing.  It's best to not expand defs whose operands
+    are subject to abnormal coalescing - and not either do something when
+    a subexpression has operands like that already.PR tree-optimization/116585* tree-data-ref.cc (split_constant_offset_1): When either
+            operand is subject to abnormal coalescing do no further
+            processing.
+    
+            * gcc.dg/torture/pr116585.c: New testcase.
+    
+    (cherry picked from commit 1d0cb3b5fca69b81e69cfdb4aea0eebc1ac04750)
+
+- User: Richard Biener | Time: 2024-10-13 09:17:55 UTC
+  Text: Fixed.
+

@@ -1,0 +1,263 @@
+Bug Summary: [12/13/14 Regression][PPC64LE] atomics wrongly use vector instructions in DWCAS.
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 11.0, 15.0
+Known to Fail: 12.0, 13.0, 14.0
+
+Comments:
+- User: Torsten Mandel | Time: 2024-08-19 08:58:58 UTC
+  Text: Using g++ 13.2.1 the subsequently following code produces this output:
+
+2 1
+
+instead of g++ 11.3.0:
+
+1 2
+
+on a Power 64 LE machine.
+
+
+CODE:
+
+#include <iostream>
+#include <atomic>
+
+using ::std::memory_order_seq_cst;
+using ::std::memory_order_acquire;
+
+struct DblCnt {
+        union Value {
+                struct {
+                        uint64_t a;
+                        uint64_t b;
+                } t;
+                __uint128_t raw_data;
+        } value;
+
+        inline void atomic_inc(const uint64_t delta1, const uint64_t &delta2) noexcept {
+                Value cur;
+                cur.raw_data = const_cast<__uint128_t&>(value.raw_data);
+                for (;;) {
+                        Value next;
+                        next.t.a = cur.t.a+delta1;
+                        next.t.b = cur.t.b+delta2;
+                        if (__atomic_compare_exchange(&value.raw_data, &cur.raw_data, &next.raw_data, false, __ATOMIC_SEQ_CST, __ATOMIC_ACQUIRE)) break;
+                }
+
+        }
+        DblCnt() : value() {}
+};
+
+int main() {
+        uint64_t i(1),j(2);
+        DblCnt c;
+        c.atomic_inc(i,j);
+        std::cout << c.value.t.a << " " << c.value.t.b << std::endl;
+}
+
+
+Compile with: g++ -O2 -Werror -Wall -o dwcas -latomic ./test.cpp
+
+- User: Peter Bergner | Time: 2024-08-19 12:48:20 UTC
+  Text: Confirmed.  I see this working on gcc11 and fails for gcc12 and later.  This also requires -mcpu=power8.  It passes with -mcpu={power9,10}.
+
+I suspect that this related to our Power8 swap optimization pass.
+
+- User: Peter Bergner | Time: 2024-08-19 13:04:06 UTC
+  Text: (In reply to Peter Bergner fromcomment #1)> I suspect that this related to our Power8 swap optimization pass.Also confirmed.  Adding -mno-optimize-swaps to the options gives us correct results.
+
+- User: Peter Bergner | Time: 2024-08-19 14:42:36 UTC
+  Text: I'm having a look.
+
+- User: Peter Bergner | Time: 2024-08-19 20:35:49 UTC
+  Text: Here's a C testcase that shows the same problem:
+
+bergner@ltcden2-lp1:BUG$ cat bug.c 
+#include <stdio.h>
+#include <stdint.h>
+
+typedef union {
+  struct {
+    uint64_t a;
+    uint64_t b;
+  } t;
+  __uint128_t raw_data;
+} Value;
+Value value;
+
+static inline void
+foo (const uint64_t delta1, const uint64_t delta2)
+{
+  Value cur;
+  cur.raw_data = value.raw_data;
+  for (;;) {
+    Value next;
+    next.t.a = cur.t.a+delta1;
+    next.t.b = cur.t.b+delta2;
+    if (__atomic_compare_exchange(&value.raw_data, &cur.raw_data, &next.raw_data, 0, __ATOMIC_SEQ_CST, __ATOMIC_ACQUIRE)) break;
+  }
+}
+
+int
+main (void)
+{
+  foo (1, 2);
+  printf ("%lu %lu\n", value.t.a, value.t.b);
+  return 0;
+}
+bergner@ltcden2-lp1:BUG$ gcc -O2 -mcpu=power8 -mno-optimize-swaps bug.c 
+bergner@ltcden2-lp1:BUG$ ./a.out 
+1 2
+bergner@ltcden2-lp1:BUG$ gcc -O2 -mcpu=power8 -moptimize-swaps bug.c 
+bergner@ltcden2-lp1:BUG$ ./a.out 
+2 1
+
+- User: Peter Bergner | Time: 2024-08-21 00:17:32 UTC
+  Text: (In reply to Peter Bergner fromcomment #1)> I suspect that this related to our Power8 swap optimization pass.I'm testing a fix.
+
+Our P8 swap optimization has some special handling for TImode usage.  The __atomic_compare_exchange call introduces a PTImode use and that should have the same special handling that TImode has, but doesn't.  The simple fix fixes the attached test case for me and PASSes all of the swap-p8-*.c testsuite test cases.  My full bootstrap and regtesting is running.
+
+- User: Peter Bergner | Time: 2024-08-21 12:35:31 UTC
+  Text: (In reply to Peter Bergner fromcomment #5)> I'm testing a fix.
+> 
+> Our P8 swap optimization has some special handling for TImode usage.  The
+> __atomic_compare_exchange call introduces a PTImode use and that should have
+> the same special handling that TImode has, but doesn't.  The simple fix
+> fixes the attached test case for me and PASSes all of the swap-p8-*.c
+> testsuite test cases.  My full bootstrap and regtesting is running.FYI, here is the fix that survived bootstrap and regtesting with no regressions which I'll submit.
+
+
+diff --git a/gcc/config/rs6000/rs6000-p8swap.cc b/gcc/config/rs6000/rs6000-p8swap.cc
+index 639f477d782..15e44bb63a6 100644
+--- a/gcc/config/rs6000/rs6000-p8swap.cc
++++ b/gcc/config/rs6000/rs6000-p8swap.cc
+@@ -2469,10 +2469,11 @@ rs6000_analyze_swaps (function *fun)
+                    mode = V4SImode;
+                }
+ 
+-             if (ALTIVEC_OR_VSX_VECTOR_MODE (mode) || mode == TImode)
++             if (ALTIVEC_OR_VSX_VECTOR_MODE (mode) || mode == TImode
++                 || mode == PTImode)
+                {
+                  insn_entry[uid].is_relevant = 1;
+-                 if (mode == TImode || mode == V1TImode
++                 if (mode == TImode || mode == PTImode || mode == V1TImode
+                      || FLOAT128_VECTOR_P (mode))
+                    insn_entry[uid].is_128_int = 1;
+                  if (DF_REF_INSN_INFO (mention))
+@@ -2497,10 +2498,11 @@ rs6000_analyze_swaps (function *fun)
+                  && ALTIVEC_OR_VSX_VECTOR_MODE (GET_MODE (SET_DEST (insn))))
+                mode = GET_MODE (SET_DEST (insn));
+ 
+-             if (ALTIVEC_OR_VSX_VECTOR_MODE (mode) || mode == TImode)
++             if (ALTIVEC_OR_VSX_VECTOR_MODE (mode) || mode == TImode
++                 || mode == PTImode)
+                {
+                  insn_entry[uid].is_relevant = 1;
+-                 if (mode == TImode || mode == V1TImode
++                 if (mode == TImode || mode == PTImode || mode == V1TImode
+                      || FLOAT128_VECTOR_P (mode))
+                    insn_entry[uid].is_128_int = 1;
+                  if (DF_REF_INSN_INFO (mention))
+
+- User: Peter Bergner | Time: 2024-08-21 13:19:53 UTC
+  Text: Patch submitted.
+
+- User: Kewen Lin | Time: 2024-08-22 06:29:59 UTC
+  Text: Some more information: bisection showed it started to fail fromr12-4240-g2b8453c401b699which enabled vectorization at -O2. But by further checking, I confirmed that commit just exposed this latent issue, if we escalated the optimization to -O3 which enables vectorization by default, it fails at least from AT14.0 (GCC-10). So this is a latent bug.
+
+- User: GCC Commits | Time: 2024-08-23 16:46:31 UTC
+  Text: The master branch has been updated by Peter Bergner <bergner@gcc.gnu.org>:https://gcc.gnu.org/g:6e68c3df1540c5bafbb47343698bf4e270333fdbcommitr15-3136-g6e68c3df1540c5bafbb47343698bf4e270333fdbAuthor: Peter Bergner <bergner@linux.ibm.com>
+Date:   Fri Aug 23 11:45:40 2024 -0500
+
+    rs6000: Fix PTImode handling in power8 swap optimization pass [PR116415]
+    
+    Our power8 swap optimization pass has some special handling for optimizing
+    swaps of TImode variables.  The test case reported in bugzilla uses a call
+    to  __atomic_compare_exchange, which introduces a variable of PTImode and
+    that does not get the same treatment as TImode leading to wrong code
+    generation.  The simple fix is to treat PTImode identically to TImode.
+    
+    2024-08-23  Peter Bergner  <bergner@linux.ibm.com>
+    
+    gcc/PR target/116415* config/rs6000/rs6000.h (TI_OR_PTI_MODE): New define.
+            * config/rs6000/rs6000-p8swap.cc (rs6000_analyze_swaps): Use it to
+            handle PTImode identically to TImode.
+    
+    gcc/testsuite/PR target/116415* gcc.target/powerpc/pr116415.c: New test.
+
+- User: Peter Bergner | Time: 2024-08-23 16:55:13 UTC
+  Text: Fixed on trunk with a slightly different (but functionally identical) patch than posted above.  I'll let it sit there for a few days to ensure we didn't expose any other issues with the patch before backporting it to the release branches.
+
+- User: GCC Commits | Time: 2024-10-29 01:56:40 UTC
+  Text: The releases/gcc-14 branch has been updated by Peter Bergner <bergner@gcc.gnu.org>:https://gcc.gnu.org/g:ab74b2d86471cdb5b8a327e734630f1288125d9ecommitr14-10849-gab74b2d86471cdb5b8a327e734630f1288125d9eAuthor: Peter Bergner <bergner@linux.ibm.com>
+Date:   Fri Aug 23 11:45:40 2024 -0500
+
+    rs6000: Fix PTImode handling in power8 swap optimization pass [PR116415]
+    
+    Our power8 swap optimization pass has some special handling for optimizing
+    swaps of TImode variables.  The test case reported in bugzilla uses a call
+    to  __atomic_compare_exchange, which introduces a variable of PTImode and
+    that does not get the same treatment as TImode leading to wrong code
+    generation.  The simple fix is to treat PTImode identically to TImode.
+    
+    2024-08-23  Peter Bergner  <bergner@linux.ibm.com>
+    
+    gcc/PR target/116415* config/rs6000/rs6000.h (TI_OR_PTI_MODE): New define.
+            * config/rs6000/rs6000-p8swap.cc (rs6000_analyze_swaps): Use it to
+            handle PTImode identically to TImode.
+    
+    gcc/testsuite/PR target/116415* gcc.target/powerpc/pr116415.c: New test.
+    
+    (cherry picked from commit 6e68c3df1540c5bafbb47343698bf4e270333fdb)
+
+- User: GCC Commits | Time: 2024-10-29 03:38:01 UTC
+  Text: The releases/gcc-13 branch has been updated by Peter Bergner <bergner@gcc.gnu.org>:https://gcc.gnu.org/g:507ed9118b29d7a5a2b751876bec9a1f5009de01commitr13-9154-g507ed9118b29d7a5a2b751876bec9a1f5009de01Author: Peter Bergner <bergner@linux.ibm.com>
+Date:   Fri Aug 23 11:45:40 2024 -0500
+
+    rs6000: Fix PTImode handling in power8 swap optimization pass [PR116415]
+    
+    Our power8 swap optimization pass has some special handling for optimizing
+    swaps of TImode variables.  The test case reported in bugzilla uses a call
+    to  __atomic_compare_exchange, which introduces a variable of PTImode and
+    that does not get the same treatment as TImode leading to wrong code
+    generation.  The simple fix is to treat PTImode identically to TImode.
+    
+    2024-08-23  Peter Bergner  <bergner@linux.ibm.com>
+    
+    gcc/PR target/116415* config/rs6000/rs6000.h (TI_OR_PTI_MODE): New define.
+            * config/rs6000/rs6000-p8swap.cc (rs6000_analyze_swaps): Use it to
+            handle PTImode identically to TImode.
+    
+    gcc/testsuite/PR target/116415* gcc.target/powerpc/pr116415.c: New test.
+    
+    (cherry picked from commit 6e68c3df1540c5bafbb47343698bf4e270333fdb)
+
+- User: GCC Commits | Time: 2024-10-29 12:51:22 UTC
+  Text: The releases/gcc-12 branch has been updated by Peter Bergner <bergner@gcc.gnu.org>:https://gcc.gnu.org/g:eeb72f26ea7e70baadf2e3b9e89e8f7055fec0a9commitr12-10790-geeb72f26ea7e70baadf2e3b9e89e8f7055fec0a9Author: Peter Bergner <bergner@linux.ibm.com>
+Date:   Fri Aug 23 11:45:40 2024 -0500
+
+    rs6000: Fix PTImode handling in power8 swap optimization pass [PR116415]
+    
+    Our power8 swap optimization pass has some special handling for optimizing
+    swaps of TImode variables.  The test case reported in bugzilla uses a call
+    to  __atomic_compare_exchange, which introduces a variable of PTImode and
+    that does not get the same treatment as TImode leading to wrong code
+    generation.  The simple fix is to treat PTImode identically to TImode.
+    
+    2024-08-23  Peter Bergner  <bergner@linux.ibm.com>
+    
+    gcc/PR target/116415* config/rs6000/rs6000.h (TI_OR_PTI_MODE): New define.
+            * config/rs6000/rs6000-p8swap.cc (rs6000_analyze_swaps): Use it to
+            handle PTImode identically to TImode.
+    
+    gcc/testsuite/PR target/116415* gcc.target/powerpc/pr116415.c: New test.
+    
+    (cherry picked from commit 6e68c3df1540c5bafbb47343698bf4e270333fdb)
+
+- User: Peter Bergner | Time: 2024-10-29 12:53:13 UTC
+  Text: Fixed everywhere.
+

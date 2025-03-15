@@ -1,0 +1,76 @@
+Issue Title: arm64: illegal asm generated for NEON `vfmlalq_laneq_*_f16` intrinsics, 3rd operand must be among v0..v15, cannot be v16..v31
+Original Post: The `vfmlalq_laneq_low_f16` and `vfmlalq_laneq_high_f16` intrinsics are meant to lower to `FMLAL`, `FMLAL2` instructions:
+https://developer.arm.com/architectures/instruction-sets/intrinsics/vfmlalq_laneq_low_f16
+
+These  `FMLAL`, `FMLAL2` instruction have 3 NEON register operands, the 3rd of which is encoded on only 4 bits instead of the usual 5 bits, restricting it to be a register among `v0`, ... , `v15`:
+
+https://developer.arm.com/documentation/ddi0596/2021-03/SIMD-FP-Instructions/FMLAL--FMLAL2--vector---Floating-point-fused-Multiply-Add-Long-to-accumulator--vector--?lang=en
+
+This is more explicitly stated in the Arm Architecture Reference Manual, C7.2.123 FMLAL, FMLAL2 (by element):
+
+```
+Decode for this encoding
+ if !HaveFP16MulNoRoundingToFP32Ext() then UNDEFINED;
+ integer d = UInt(Rd);
+ integer n = UInt(Rn);
+ integer m = UInt('0':Rm); // Vm can only be in bottom 16 registers. 
+```
+
+**(EDITED with fixes pointed out by @davemgreen and @efriedma-quic )**
+
+This testcase shows Clang illegally generating assembly with these instructions trying to use registers outside of the allowed range for this 3rd operand:
+https://godbolt.org/z/bEn658x3M
+
+**(ORIGINAL content preserved below --- I had not noticed that it wasn't actually generating by-element form).**
+
+This testcase shows Clang illegally generating assembly with these instructions trying to use registers outside of the allowed range for this 3rd operand:
+https://godbolt.org/z/bEn658x3M
+
+
+Comment by llvmbot: @llvm/issue-subscribers-backend-aarch64
+Comment by efriedma-quic: I think you're misreading the assembly... the "by element" form of fmlal has a restriction on register usage, but clang isn't using that instruction.  (Which is arguably a bug because LLVM isn't using the instruction you requested, but it's not the bug you described.)
+Comment by bjacob: Oh, sorry.  You're right that the repro that I pasted, against "normal" trunk, isn't using the by-element form. I didn't notice.
+
+My actual problem is with the flavor of Clang 14 that is in the Android NDK (r25c, current stable). That does generate the incorrect by-element form that I am complaining about here.   Putting together this Issue, I had only visually checked that it was still using `v24` and had not paid attention to the fact that it wasn't by-element anymore.  Closing this, filing an issue against the Clang NDK.
+Comment by davemgreen: Hello
+
+I think there is still a problem according to https://godbolt.org/z/bEn658x3M.
+Comment by davemgreen: (We should also be sinking the splats in the first case, but it looks like VMLAL via BaseSIMDThreeSameVectorFMLIndex doesn't use                                       V128_lo. It would be worth fixing that before we addressing the sinking (which is hopefully fairly simple).
+Comment by bjacob: Thanks very much @davemgreen for noticing it still reproduces --- updated the issue description to avoid further confusion.
+
+FWIW, this is my work-around.
+
+```c
+#ifdef __clang__
+// Work around https://github.com/llvm/llvm-project/issues/64104
+// Notes:
+// 1. The key to this work-around is the "x" constraint on the C operand,
+//    which restricts it to registers v0 .. v15, as opposed to the "w"
+//    constraint used here for the A and B operands, allowing v0 .. v31. See:
+//      https://llvm.org/docs/LangRef.html#supported-constraint-code-list
+// 2. The ({...}) syntax is GCC-compatible "statement expressions". See:
+//      https://gcc.gnu.org/onlinedocs/gcc/Statement-Exprs.html
+#define iree_workaround_vfmlalq_laneq_x_f16(INSTR, A, B, C, L) \
+  ({                                                           \
+    asm(INSTR " %[a].4s, %[b].4h, %[c].h[%[l]]"                \
+        : [a] "+w"(A)                                          \
+        : [b] "w"(B), [c] "x"(C), [l] "i"(L)                   \
+        :);                                                    \
+    A;                                                         \
+  })
+#define iree_workaround_vfmlalq_laneq_low_f16(A, B, C, L) \
+  iree_workaround_vfmlalq_laneq_x_f16("fmlal", A, B, C, L)
+#define iree_workaround_vfmlalq_laneq_high_f16(A, B, C, L) \
+  iree_workaround_vfmlalq_laneq_x_f16("fmlal2", A, B, C, L)
+#else
+#define iree_workaround_vfmlalq_laneq_low_f16(A, X, Y, L) \
+  vfmlalq_laneq_low_f16(A, X, Y, L)
+#define iree_workaround_vfmlalq_laneq_high_f16(A, X, Y, L) \
+  vfmlalq_laneq_high_f16(A, X, Y, L)
+#endif
+```
+Comment by davemgreen: There is a fix in https://reviews.llvm.org/D156296
+Comment by davemgreen: /cherry-pick e012c5cfac8542eb8164bab9891ea9b355e73517 509cb334699a2360f2d87f184bc0f56f742c6fc3
+Comment by llvmbot: /branch llvm/llvm-project-release-prs/issue64104
+Comment by llvmbot: /pull-request llvm/llvm-project-release-prs#488
+Comment by bjacob: Thank you!!

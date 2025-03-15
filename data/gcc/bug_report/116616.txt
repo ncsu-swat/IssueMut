@@ -1,0 +1,90 @@
+Bug Summary: [15 Regression] Linux kernel fails to build on aarch64 due to r15-3256-g1c4b9826bd0d5a
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: link-failure
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Filip Kastl | Time: 2024-09-05 14:34:12 UTC
+  Text: Linux stable kernel (commit 88fac17500f4ea49c7bac136cf1b27e7b9980075) currently fails linking when built with trunk GCC aarch64 crosscompiler.
+
+linux/drivers/regulator/core.c:4637:(.text+0x5cd0): undefined reference to `__popcountdi2'
+
+This is probably because the exponential index transform in the switch conversion pass inserts a call to __builtin_popcount which eventually becomes a call to the __popcountdi2 libgcc function.
+
+Exp index transform counts on the widening_mul pass to notice this pattern
+
+tmp1 = __builtin_popcount (var)
+tmp2 = tmp1 == 1
+
+and either convert the builtin into an internal function call or convert the whole pattern into (var ^ (var - 1)) > (var - 1). In case of drivers/regulator/core.c, this doesn't happen. Other optimizations move the tmp1 == 1 statement farther from the __builtin_popcount call before widening_mul is run.
+
+I'm currently working on a fix in which I modify exponential index transform to generate (var ^ (var - 1)) > (var - 1) instead of __builtin_popcount (var) == 1.
+
+- User: Filip Kastl | Time: 2024-09-05 14:40:32 UTC
+  Text: Createdattachment 59053[details]Preprocessed source file in question
+
+In case it is of interest, I attach the preprocessed source file in question. It is compiled with
+
+-nostdinc -mlittle-endian -std=gnu11 -fshort-wchar -funsigned-char -fno-common -fno-PIE -fno-strict-aliasing -mgeneral-regs-only -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-delete-null-pointer-checks -O2 -fstack-protector-strong -fno-omit-frame-pointer -fno-optimize-sibling-calls -ftrivial-auto-var-init=zero -fmin-function-alignment=4 -fno-strict-overflow -fno-stack-check -fconserve-stack -g -fno-var-tracking -femit-struct-debug-baseonly -c
+
+- User: Andrew Pinski | Time: 2024-09-05 17:45:47 UTC
+  Text: .
+
+- User: Andrew Pinski | Time: 2024-09-05 17:49:06 UTC
+  Text: I had mentioned before we maybe should inling popcount for targets which don't implement the optab.
+Seehttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=83171#c3(and I know there is another reference too).
+
+- User: GCC Commits | Time: 2024-10-02 12:18:22 UTC
+  Text: The master branch has been updated by Filip Kastl <pheeck@gcc.gnu.org>:https://gcc.gnu.org/g:ffc389cb11a2a61fb89b6034d3f3fe0896b29064commitr15-4024-gffc389cb11a2a61fb89b6034d3f3fe0896b29064Author: Filip Kastl <fkastl@suse.cz>
+Date:   Wed Oct 2 14:14:44 2024 +0200
+
+    gimple ssa: Don't use __builtin_popcount in switch exp transform [PR116616]
+    
+    Switch exponential transformation in the switch conversion pass
+    currently generates
+    
+    tmp1 = __builtin_popcount (var);
+    tmp2 = tmp1 == 1;
+    
+    when inserting code to determine if var is power of two.  If the target
+    doesn't support expanding the builtin as special instructions switch
+    conversion relies on this whole pattern being expanded as bitmagic.
+    However, it is possible that other GIMPLE optimizations move the two
+    statements of the pattern apart.  In that case the builtin becomes a
+    libgcc call in the final binary.  The call is slow and in case of
+    freestanding programs can result in linking error (this bug was
+    originally found while compiling Linux kernel).
+    
+    This patch modifies switch conversion to insert the bitmagic
+    (var ^ (var - 1)) > (var - 1) instead of the builtin.
+    
+    gcc/ChangeLog:PR tree-optimization/116616* tree-switch-conversion.cc (can_pow2p): Remove this function.
+            (gen_pow2p): Generate bitmagic instead of a builtin.  Remove the
+            TYPE parameter.
+            (switch_conversion::is_exp_index_transform_viable): Don't call
+            can_pow2p.
+            (switch_conversion::exp_index_transform): Call gen_pow2p without
+            the TYPE parameter.
+            * tree-switch-conversion.h: Remove
+            m_exp_index_transform_pow2p_type.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/116616* gcc.target/i386/switch-exp-transform-1.c: Don't test for
+            presence of the POPCOUNT internal fn call.
+    
+    Signed-off-by: Filip Kastl <fkastl@suse.cz>
+
+- User: Filip Kastl | Time: 2024-10-02 12:26:39 UTC
+  Text: The patch I pushed to trunk should fix this issue.  I will wait a bit and then close this PR.
+
+Btw, as a follow-up to this, one could modify some RTL pass to pattern match (var ^ (var - 1)) > (var - 1) to some sort of popcount instruction (I think the RTL pass for this is combine but I don't have any experience with RTL).  This way we would get the fast popcount instruction but wouldn't run into problems such as this PR.  I intend to look into that.
+
+- User: Sam James | Time: 2024-10-03 02:29:48 UTC
+  Text: ***Bug 116878has been marked as a duplicate of this bug. ***
+
+- User: Sam James | Time: 2024-10-03 02:30:21 UTC
+  Text: It's indeed fixed for me.
+

@@ -1,0 +1,153 @@
+Bug Summary: ICE in bitintlower0 while compiling bitint-42.c
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Filip Kastl | Time: 2023-11-22 09:44:27 UTC
+  Text: Compiling the bitint-42.c file from testsuite:
+
+gcc -fnon-call-exceptions src/gcc/testsuite/gcc.dg/torture/bitint-42.c
+
+results in:
+       
+during GIMPLE pass: bitintlower0       
+/home/fkastl/gcc/src/gcc/testsuite/gcc.dg/torture/bitint-42.c: In function ‘main’:       
+/home/fkastl/gcc/src/gcc/testsuite/gcc.dg/torture/bitint-42.c:50:1: internal compiler error: Segmentation fault       
+   50 | main ()       
+      | ^~~~       
+0x100d5bf crash_signal       
+        ../../src/gcc/toplev.cc:316    
+0x10d607e add_phi_arg(gphi*, tree_node*, edge_def*, unsigned int)       
+        ../../src/gcc/tree-phinodes.cc:358    
+0x1e22438 prepare_data_in_out       
+        ../../src/gcc/gimple-lower-bitint.cc:1036    
+0x1e323c6 handle_load       
+        ../../src/gcc/gimple-lower-bitint.cc:1695    
+0x1e323c6 handle_stmt       
+        ../../src/gcc/gimple-lower-bitint.cc:1876    
+0x1e33bc4 lower_mergeable_stmt       
+        ../../src/gcc/gimple-lower-bitint.cc:2406    
+0x1e3811d lower_stmt       
+        ../../src/gcc/gimple-lower-bitint.cc:5216    
+0x1e39dbd gimple_lower_bitint       
+        ../../src/gcc/gimple-lower-bitint.cc:6296    
+Please submit a full bug report, with preprocessed source.       
+Please include the complete backtrace with any bug report.       
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+Compiler configuration (nothing non-standard):
+
+Target: x86_64-pc-linux-gnu       
+Configured with: ../src/configure --enable-checking --disable-bootstrap --disable-libsanitizer : (reconfigured) ../src/configure --enable-checking --disable-bootstrap --disable-libsanitizer : (reconfigured) ../src/configure --enable-checking --disable-bootstrap --disable-libsanitizer --enable-languages=c,c++,fortran,lto,objc --no-create --no-recursion   
+Thread model: posix       
+Supported LTO compression algorithms: zlib zstd       
+gcc version 14.0.0 20231122 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2023-11-22 11:31:03 UTC
+  Text: Reduced:
+/*PR middle-end/112668*/
+/* { dg-do compile { target bitint } } */
+/* { dg-options "-std=c23 -fnon-call-exceptions" } */
+
+#if __BITINT_MAXWIDTH__ >= 495
+struct T495 { _BitInt(495) a : 2; unsigned _BitInt(495) b : 471; _BitInt(495) c : 2; };
+extern void foo (struct T495 *r495);
+
+int
+bar (void)
+{
+  struct T495 r495[12];
+  foo (r495);
+  for (int i = 0; i < 12; ++i)
+    if (r495[i].b != 0uwb)
+      return 1;
+  return 0;
+}
+#endif
+
+- User: Jakub Jelinek | Time: 2023-11-22 12:27:02 UTC
+  Text: No loop is needed:
+/*PR middle-end/112668*/
+/* { dg-do compile { target bitint } } */
+/* { dg-options "-std=c23 -fnon-call-exceptions" } */
+
+#if __BITINT_MAXWIDTH__ >= 495
+struct T495 { _BitInt(495) a : 2; unsigned _BitInt(495) b : 471; _BitInt(495) c : 2; };
+extern void foo (struct T495 *r495);
+
+unsigned _BitInt(495)
+bar (int i)
+{
+  struct T495 r495[12];
+  foo (r495);
+  return r495[i].b;
+}
+#endif
+
+- User: Jakub Jelinek | Time: 2023-11-22 13:58:35 UTC
+  Text: Createdattachment 56665[details]gcc14-pr112668.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2023-11-24 08:02:03 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:9a96a9e45b421436ca93efadba0f1901f12fb6c0commitr14-5815-g9a96a9e45b421436ca93efadba0f1901f12fb6c0Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Nov 24 08:54:40 2023 +0100
+
+    lower-bitint: Fix up -fnon-call-exceptions bit-field load lowering [PR112668]
+    
+    As the following testcase shows, there are some bugs in the
+    -fnon-call-exceptions bit-field load lowering.  In particular, there
+    is a case where we want to emit a load early in the initialization
+    (before m_init_gsi) and because that load might throw exception, need
+    to split block after the load so that it has an EH edge.
+    Now, across this splitting, we have m_init_gsi, save_gsi (something
+    we put back into m_gsi afterwards) statement iterators and m_preheader_bb
+    which is used to determine the pre-header edge of a loop (if any).
+    As the testcase shows, both of these statement iterators and m_preheader_bb
+    as well need adjustments if the block was split.  If the stmt iterators
+    refer to a statement, they need to be updated so that if the statement is
+    in the bb after the split gsi_bb and gsi_seq is updated, otherwise they
+    ought to be the start of the new (second) bb.
+    Similarly, m_preheader_bb should be updated to the second bb if it was
+    the first before.  Other spots where we insert something before m_init_gsi
+    don't split blocks in there and are fine.
+    
+    The m_gsi iterator is normal iterator to insert statements before it,
+    so gsi_end_p means insert statements at the end of basic block.
+    m_init_gsi is on the other side an iterator after which statements should be
+    inserted (so gsi_end_p means insert statements at the start of basic block
+    after labels), but the whole pass is written for insertion of statements before
+    iterators, so when in 3 spots it wants to insert something after m_init_gsi,
+    it saves current iterator to save_gsi and sets m_gsi to gsi_after_labels
+    if m_init_gsi was gsi_end_p, or to the next statement.  But it actually wasn't
+    updating m_init_gsi back when switching to normal iterator, this patch changes
+    that such that further statements after m_init_gsi will appear after the
+    set of statements inserted before m_init_gsi.
+    
+    Finally, the pass had a couple of places where it wanted to create a gsi_end_p
+    iterator for a particular basic block, instead of doing
+    m_gsi = gsi_last_bb (bb); if (!gsi_end_p (m_gsi)) gsi_next (&m_gsi);
+    the pass now uses new m_gsi = gsi_end_bb (bb) function.
+    
+    2023-11-24  Jakub Jelinek  <jakub@redhat.com>PR middle-end/112668* gimple-iterator.h (gsi_end, gsi_end_bb): New inline functions.
+            * gimple-lower-bitint.cc (bitint_large_huge::handle_cast): After
+            temporarily adding statements after m_init_gsi, update m_init_gsi
+            such that later additions after it will be after the added statements.
+            (bitint_large_huge::handle_load): Likewise.  When splitting
+            gsi_bb (m_init_gsi) basic block, update m_preheader_bb if needed
+            and update saved m_gsi as well if needed.
+            (bitint_large_huge::lower_mergeable_stmt,
+            bitint_large_huge::lower_comparison_stmt,
+            bitint_large_huge::lower_mul_overflow,
+            bitint_large_huge::lower_bit_query): Use gsi_end_bb.
+    
+            * gcc.dg/bitint-40.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-11-24 08:45:01 UTC
+  Text: Should be fixed now.
+

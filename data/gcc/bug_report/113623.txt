@@ -1,0 +1,123 @@
+Bug Summary: [14 Regression] ICE in aarch64_pair_mem_from_base since r14-6605
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 14.0
+
+Comments:
+- User: Jakub Jelinek | Time: 2024-01-26 20:58:01 UTC
+  Text: Createdattachment 57234[details]rh2260560.i
+
+The following testcase ICEs at -O3:
+./cc1 -quiet -nostdinc -O3 rh2260560.i -W -Wall
+during RTL pass: ldp_fusion
+rh2260560.i: In function ‘qux’:
+rh2260560.i:137:1: internal compiler error: in aarch64_pair_mem_from_base, at config/aarch64/aarch64.cc:8257
+  137 | }
+      | ^
+0x1bc8c3e aarch64_pair_mem_from_base
+	../../gcc/config/aarch64/aarch64.cc:8257
+0x1bc8cee aarch64_gen_load_pair(rtx_def*, rtx_def*, rtx_def*, rtx_code)
+	../../gcc/config/aarch64/aarch64.cc:8285
+0x1dc2d50 ldp_bb_info::fuse_pair(bool, unsigned int, int, rtl_ssa::insn_info*, rtl_ssa::insn_info*, base_cand&, rtl_ssa::insn_range_info const&)
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:1883
+0x1dc539e ldp_bb_info::try_fuse_pair(bool, unsigned int, rtl_ssa::insn_info*, rtl_ssa::insn_info*)
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:2782
+0x1dc5627 ldp_bb_info::merge_pairs(std::__cxx11::list<rtl_ssa::insn_info*, std::allocator<rtl_ssa::insn_info*> >&, std::__cxx11::list<rtl_ssa::insn_info*, std::allocator<rtl_ssa::insn_info*> >&, bool, unsigned int)
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:2871
+0x1dc5816 ldp_bb_info::transform_for_base(int, access_group&)
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:2904
+0x1dc801c void ldp_bb_info::traverse_base_map<ordered_hash_map<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> >, access_group, simple_hashmap_traits<default_hash_traits<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> > >, access_group> > >(ordered_hash_map<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> >, access_group, simple_hashmap_traits<default_hash_traits<pair_hash<nofree_ptr_hash<rtl_ssa::def_info>, int_hash<int, -1, -2> > >, access_group> >&)
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:2963
+0x1dc5a75 ldp_bb_info::transform()
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:2971
+0x1dc01fb ldp_fusion_bb(rtl_ssa::bb_info*)
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:3209
+0x1dc0285 ldp_fusion()
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:3218
+0x1dc0398 execute
+	../../gcc/config/aarch64/aarch64-ldp-fusion.cc:3268
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: Jakub Jelinek | Time: 2024-01-26 21:04:57 UTC
+  Text: Started withr14-6605-gc0911c6b357ba916ae24926b7d8b9ca35234f33c-O3 -mno-early-ldp-fusion fixes it.
+Obviously in the range when these options were disabled by default it needs -O3 -mearly-ldp-fusion to reproduce.
+
+- User: Alex Coplan | Time: 2024-01-26 21:42:54 UTC
+  Text: Confirmed, mine.
+
+- User: Alex Coplan | Time: 2024-01-29 10:22:07 UTC
+  Text: I think ldp_fusion is exposing a latent issue here.  We trip the assert:
+
+gcc_assert (aarch64_mem_pair_lanes_operand (mem, pair_mode));
+
+on the RTL:
+
+(rr) pr mem
+(mem/f:V2x8QI (reg:DI 63 v31) [0 +0 S16 A64])
+
+because v31 isn't a valid base register according to aarch64_regno_ok_for_base_p.  This comes from the following RTL in sched1, where we already have:
+
+   30: x0:DI=[v31:DI]
+   29: x1:DI=[v31:DI+0x8]
+
+but again these mems look invalid as per aarch64_regno_ok_for_base_p.
+
+- User: Alex Coplan | Time: 2024-01-29 10:29:21 UTC
+  Text: I think this is an early RA problem.  In asmcons (in function qux), we have:
+
+   29: x1:DI=[r122:DI+0x8]
+   30: x0:DI=[r122:DI]
+
+and then in early_ra, we get:
+
+   29: x1:DI=[v31:DI+0x8]
+   30: x0:DI=[v31:DI]
+
+CCing Richard S for an opinion.
+
+- User: Alex Coplan | Time: 2024-01-29 10:57:08 UTC
+  Text: Indeed passing -mearly-ra=none makes the ICE go away as well.
+
+- User: Richard Sandiford | Time: 2024-01-29 14:42:51 UTC
+  Text: Mine.
+
+- User: GCC Commits | Time: 2024-01-30 09:30:55 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:fa2739ac1b74769d97fba34db9b9a8aa8786539ecommitr14-8519-gfa2739ac1b74769d97fba34db9b9a8aa8786539eAuthor: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Tue Jan 30 09:30:35 2024 +0000
+
+    aarch64: Avoid allocating FPRs to address registers [PR113623]
+    
+    For something like:
+    
+    void
+    foo (void)
+    {
+      int *ptr;
+      asm volatile ("%0" : "=w" (ptr));
+      asm volatile ("%0" :: "m" (*ptr));
+    }
+    
+    early-ra would allocate ptr to an FPR for the first asm, thus
+    leaving an FPR address in the second asm.  The address was then
+    reloaded by LRA to make it valid.
+    
+    But early-ra shouldn't be allocating at all in that kind of
+    situation.  Doing so caused the ICE in the PR (with LDP fusion).
+    
+    Fixed by making sure that we record address references as
+    GPR references.
+    
+    gcc/PR target/113623* config/aarch64/aarch64-early-ra.cc (early_ra::preprocess_insns):
+            Mark all registers that occur in addresses as needing a GPR.
+    
+    gcc/testsuite/PR target/113623* gcc.c-torture/compile/pr113623.c: New test.
+
+- User: Richard Sandiford | Time: 2024-01-30 09:36:08 UTC
+  Text: Fixed.
+

@@ -1,0 +1,208 @@
+Bug Summary: [12/13/14/15 regression] ICE in fab pass (error: missing definition with -g & -O3)
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-checking, ice-on-valid-code, wrong-debug
+Known to Work: 11.4.0
+Known to Fail: 12.1.0
+
+Comments:
+- User: David Binderman | Time: 2024-07-11 09:30:54 UTC
+  Text: This C code:
+
+long set_work_pending_p;
+_Bool set_work_pending() {
+  _Bool __trans_tmp_1;
+  long mask = 1, old = __atomic_fetch_or(&set_work_pending_p, mask, 0);
+  __trans_tmp_1 = old & mask;
+  return !__trans_tmp_1;
+}
+void __queue_work() {
+  _Bool ret = set_work_pending();
+  if (ret)
+    __queue_work();
+}
+
+does this with recent gcc:
+
+cvise $ ~/gcc/results/bin/gcc -c -g -O3bug1040.cbug1040.c: In function ‘__queue_work’:bug1040.c:8:6: error: missing definition
+    8 | void __queue_work() {
+      |      ^~~~~~~~~~~~
+for SSA_NAME: _6 in statement:
+# DEBUG ret => (_Bool) _6
+during GIMPLE pass: fabbug1040.c:8:6: internal compiler error: verify_ssa failed
+
+The bug first seems to appear sometime beforeg:66d6b1861ec57ba2,
+dated 20240611.
+
+- User: Richard Biener | Time: 2024-07-11 12:39:13 UTC
+  Text: -  _5 = __atomic_fetch_or_8 (&set_work_pending_p, 1, 0);
+-  # DEBUG old => (long int) _5
++  _6 = .ATOMIC_BIT_TEST_AND_SET (&set_work_pending_p, 0, 1, 0, __atomic_fetch_or_8);
++  # DEBUG old => NULL
+   # DEBUG BEGIN_STMT
+-  # DEBUG D#2 => _5 & 1
++  # DEBUG D#2 => NULL
+...
+-  _10 = ~_5;
+-  _8 = (_Bool) _10;
+-  # DEBUG ret => _8
++  _8 = _6 == 0;
++  # DEBUG ret => (_Bool) _10
+
+confirmed.  convert_atomic_bit_not does this, it checks for single_use
+and removes the def, failing to release the name (which would fix this up
+IIRC).
+
+Note the function removes stmts in "wrong" order (before uses of LHS
+are removed), so it requires larger surgery.  And it leaks SSA names.
+
+- User: Hongtao Liu | Time: 2024-07-12 02:19:54 UTC
+  Text: Mine.
+
+- User: GCC Commits | Time: 2024-07-15 04:52:35 UTC
+  Text: The releases/gcc-12 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:e1427b39d28f382d21e7a0ea1714b3250e0a6e5dcommitr12-10617-ge1427b39d28f382d21e7a0ea1714b3250e0a6e5dAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Fri Jul 12 09:39:23 2024 +0800
+
+    Fix SSA_NAME leak due to def_stmt is removed before use_stmt.
+    
+    -  _5 = __atomic_fetch_or_8 (&set_work_pending_p, 1, 0);
+    -  # DEBUG old => (long int) _5
+    +  _6 = .ATOMIC_BIT_TEST_AND_SET (&set_work_pending_p, 0, 1, 0, __atomic_fetch_or_8);
+    +  # DEBUG old => NULL
+       # DEBUG BEGIN_STMT
+    -  # DEBUG D#2 => _5 & 1
+    +  # DEBUG D#2 => NULL
+    ...
+    -  _10 = ~_5;
+    -  _8 = (_Bool) _10;
+    -  # DEBUG ret => _8
+    +  _8 = _6 == 0;
+    +  # DEBUG ret => (_Bool) _10
+    
+    confirmed.  convert_atomic_bit_not does this, it checks for single_use
+    and removes the def, failing to release the name (which would fix this up
+    IIRC).
+    
+    Note the function removes stmts in "wrong" order (before uses of LHS
+    are removed), so it requires larger surgery.  And it leaks SSA names.
+    
+    gcc/ChangeLog:PR target/115872* tree-ssa-ccp.cc (convert_atomic_bit_not): Remove use_stmt after use_nop_stmt is removed.
+            (optimize_atomic_bit_test_and): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr115872.c: New test.
+    
+    (cherry picked from commit a8209237dc46dc4db7d9d8e3807e6c93734c64b5)
+
+- User: GCC Commits | Time: 2024-07-15 04:53:47 UTC
+  Text: The releases/gcc-13 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:9a1cdaa5e8441394d613f5f3401e7aab21efe8f0commitr13-8913-g9a1cdaa5e8441394d613f5f3401e7aab21efe8f0Author: liuhongt <hongtao.liu@intel.com>
+Date:   Fri Jul 12 09:39:23 2024 +0800
+
+    Fix SSA_NAME leak due to def_stmt is removed before use_stmt.
+    
+    -  _5 = __atomic_fetch_or_8 (&set_work_pending_p, 1, 0);
+    -  # DEBUG old => (long int) _5
+    +  _6 = .ATOMIC_BIT_TEST_AND_SET (&set_work_pending_p, 0, 1, 0, __atomic_fetch_or_8);
+    +  # DEBUG old => NULL
+       # DEBUG BEGIN_STMT
+    -  # DEBUG D#2 => _5 & 1
+    +  # DEBUG D#2 => NULL
+    ...
+    -  _10 = ~_5;
+    -  _8 = (_Bool) _10;
+    -  # DEBUG ret => _8
+    +  _8 = _6 == 0;
+    +  # DEBUG ret => (_Bool) _10
+    
+    confirmed.  convert_atomic_bit_not does this, it checks for single_use
+    and removes the def, failing to release the name (which would fix this up
+    IIRC).
+    
+    Note the function removes stmts in "wrong" order (before uses of LHS
+    are removed), so it requires larger surgery.  And it leaks SSA names.
+    
+    gcc/ChangeLog:PR target/115872* tree-ssa-ccp.cc (convert_atomic_bit_not): Remove use_stmt after use_nop_stmt is removed.
+            (optimize_atomic_bit_test_and): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr115872.c: New test.
+    
+    (cherry picked from commit a8209237dc46dc4db7d9d8e3807e6c93734c64b5)
+
+- User: GCC Commits | Time: 2024-07-15 06:20:20 UTC
+  Text: The releases/gcc-14 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:13bfc385b0baebd22aeabb0d90915f2e9b18febecommitr14-10422-g13bfc385b0baebd22aeabb0d90915f2e9b18febeAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Fri Jul 12 09:39:23 2024 +0800
+
+    Fix SSA_NAME leak due to def_stmt is removed before use_stmt.
+    
+    -  _5 = __atomic_fetch_or_8 (&set_work_pending_p, 1, 0);
+    -  # DEBUG old => (long int) _5
+    +  _6 = .ATOMIC_BIT_TEST_AND_SET (&set_work_pending_p, 0, 1, 0, __atomic_fetch_or_8);
+    +  # DEBUG old => NULL
+       # DEBUG BEGIN_STMT
+    -  # DEBUG D#2 => _5 & 1
+    +  # DEBUG D#2 => NULL
+    ...
+    -  _10 = ~_5;
+    -  _8 = (_Bool) _10;
+    -  # DEBUG ret => _8
+    +  _8 = _6 == 0;
+    +  # DEBUG ret => (_Bool) _10
+    
+    confirmed.  convert_atomic_bit_not does this, it checks for single_use
+    and removes the def, failing to release the name (which would fix this up
+    IIRC).
+    
+    Note the function removes stmts in "wrong" order (before uses of LHS
+    are removed), so it requires larger surgery.  And it leaks SSA names.
+    
+    gcc/ChangeLog:PR target/115872* tree-ssa-ccp.cc (convert_atomic_bit_not): Remove use_stmt after use_nop_stmt is removed.
+            (optimize_atomic_bit_test_and): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr115872.c: New test.
+    
+    (cherry picked from commit a8209237dc46dc4db7d9d8e3807e6c93734c64b5)
+
+- User: Hongtao Liu | Time: 2024-07-15 06:21:49 UTC
+  Text: Fixed in GCC12.5, GCC13.4, GCC14.2 and main trunk.
+
+- User: GCC Commits | Time: 2024-07-15 07:20:24 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:f27bf48e0204524ead795fe618cd8b1224f72fd4commitr15-2038-gf27bf48e0204524ead795fe618cd8b1224f72fd4Author: liuhongt <hongtao.liu@intel.com>
+Date:   Fri Jul 12 09:39:23 2024 +0800
+
+    Fix SSA_NAME leak due to def_stmt is removed before use_stmt.
+    
+    -  _5 = __atomic_fetch_or_8 (&set_work_pending_p, 1, 0);
+    -  # DEBUG old => (long int) _5
+    +  _6 = .ATOMIC_BIT_TEST_AND_SET (&set_work_pending_p, 0, 1, 0, __atomic_fetch_or_8);
+    +  # DEBUG old => NULL
+       # DEBUG BEGIN_STMT
+    -  # DEBUG D#2 => _5 & 1
+    +  # DEBUG D#2 => NULL
+    ...
+    -  _10 = ~_5;
+    -  _8 = (_Bool) _10;
+    -  # DEBUG ret => _8
+    +  _8 = _6 == 0;
+    +  # DEBUG ret => (_Bool) _10
+    
+    confirmed.  convert_atomic_bit_not does this, it checks for single_use
+    and removes the def, failing to release the name (which would fix this up
+    IIRC).
+    
+    Note the function removes stmts in "wrong" order (before uses of LHS
+    are removed), so it requires larger surgery.  And it leaks SSA names.
+    
+    gcc/ChangeLog:PR target/115872* tree-ssa-ccp.cc (convert_atomic_bit_not): Remove use_stmt after use_nop_stmt is removed.
+            (optimize_atomic_bit_test_and): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr115872.c: New test.
+

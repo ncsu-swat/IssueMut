@@ -1,0 +1,119 @@
+Bug Summary: RISC-V: Mis code gen for the RVV intrinsic VSETVL
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Li Pan | Time: 2023-05-05 12:40:21 UTC
+  Text: Createdattachment 55007[details]Test file for reproducing
+
+Given we have bellow code.
+
+#include <riscv_vector.h>
+
+int byte_mac_vec(unsigned char *a, unsigned char *b, int len) {
+  size_t vlmax = __riscv_vsetvlmax_e8m1();
+  vint32m4_t vec_s = __riscv_vmv_v_x_i32m4(0, vlmax);
+  vint32m1_t vec_zero = __riscv_vmv_v_x_i32m1(0, vlmax);
+  int k = len;
+
+  for (size_t vl; k > 0; k -= vl, a += vl, b += vl) {
+      vl = __riscv_vsetvl_e8m1(k);
+
+      vuint8m1_t a8s = __riscv_vle8_v_u8m1(a, vl);
+      vuint8m1_t b8s = __riscv_vle8_v_u8m1(b, vl);
+      vuint32m4_t a8s_extended = __riscv_vzext_vf4_u32m4(a8s, vl);
+      vuint32m4_t b8s_extended = __riscv_vzext_vf4_u32m4(a8s, vl);
+
+      vint32m4_t a8s_as_i32 = __riscv_vreinterpret_v_u32m4_i32m4(a8s_extended);
+      vint32m4_t b8s_as_i32 = __riscv_vreinterpret_v_u32m4_i32m4(b8s_extended);
+
+      vec_s = __riscv_vmacc_vv_i32m4_tu(vec_s, a8s_as_i32, b8s_as_i32, vl);
+  }
+
+  vint32m1_t vec_sum = __riscv_vredsum_vs_i32m4_i32m1(vec_s, vec_zero, __riscv_vsetvl_e32m4(len));
+  int sum = __riscv_vmv_x_s_i32m1_i32(vec_sum);
+
+  return sum;
+}
+
+It will generate the below assembly code with build option '-march=rv64gcv -mabi=lp64 -O3 -c -S test.c -o -'.
+
+byte_mac_vec:
+        vsetvli a5,zero,e32,m4,ta,ma
+        vmv.v.i v4,0
+        vsetvli zero,a5,e32,m1,ta,ma
+        vmv.v.i v2,0
+        ble     a2,zero,.L2
+        mv      a4,a2
+.L3:
+        vsetvli a5,a4,e8,m1,ta,ma   <- should be e32m4
+        subw    a4,a4,a5
+        vle8.v  v1,0(a0)
+        add     a0,a0,a5
+        vzext.vf4       v8,v1
+        vmacc.vv        v4,v8,v8
+        bgt     a4,zero,.L3
+.L2:
+        vsetvli zero,a2,e32,m4,ta,ma
+        vredsum.vs      v4,v4,v2
+        vmv.x.s a0,v4
+        sext.w  a0,a0
+        ret
+
+- User: Kito Cheng | Time: 2023-05-05 12:49:51 UTC
+  Text: Is this also happened in GCC 13 branch?
+
+- User: Li Pan | Time: 2023-05-05 13:29:15 UTC
+  Text: No, should be introduced by one optimization of Juzhe in GCC 14. Juzhe is working on fixing this, just open a bug on behalf of Juzhe for tracking.
+
+- User: GCC Commits | Time: 2023-05-06 02:22:56 UTC
+  Text: The master branch has been updated by Kito Cheng <kito@gcc.gnu.org>:https://gcc.gnu.org/g:8421f279e9eb00a2342ee3630dcdaf735b734fe8commitr14-538-g8421f279e9eb00a2342ee3630dcdaf735b734fe8Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Fri May 5 22:12:39 2023 +0800
+
+    RISC-V: Fix incorrect demand info merge in local vsetvli optimization [PR109748]
+    
+    This patch is fixing my recent optimization patch:https://github.com/gcc-mirror/gcc/commit/d51f2456ee51bd59a79b4725ca0e488c25260bbfIn that patch, the new_info = parse_insn (i) is not correct.
+    Since consider the following case:
+    
+    vsetvli a5,a4, e8,m1
+    ..
+    vsetvli zero,a5, e32, m4
+    vle8.v
+    vmacc.vv
+    ...
+    
+    Since we have backward demand fusion in Phase 1, so the real demand of "vle8.v" is e32, m4.
+    However, if we use parse_insn (vle8.v) = e8, m1 which is not correct.
+    
+    So this patch we change new_info = new_info.parse_insn (i)
+    into:
+    
+    vector_insn_info new_info = m_vector_manager->vector_insn_infos[i->uid ()];
+    
+    So that, we can correctly optimize codes into:
+    
+    vsetvli a5,a4, e32, m4
+    ..
+    .. (vsetvli zero,a5, e32, m4 is removed)
+    vle8.v
+    vmacc.vv
+    
+    Since m_vector_manager->vector_insn_infos is the member variable of pass_vsetvl class.
+    We remove static void function "local_eliminate_vsetvl_insn", and make it as the member function
+    of pass_vsetvl class.PR target/109748gcc/ChangeLog:
+    
+            * config/riscv/riscv-vsetvl.cc (local_eliminate_vsetvl_insn): Remove it.
+            (pass_vsetvl::local_eliminate_vsetvl_insn): New function.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/vsetvl/pr109748.c: New test.
+
+- User: Kito Cheng | Time: 2023-05-06 02:29:41 UTC
+  Text: Should be resolved at trunk.
+

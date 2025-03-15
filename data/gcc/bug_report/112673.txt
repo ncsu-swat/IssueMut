@@ -1,0 +1,123 @@
+Bug Summary: [14 Regression] ICE verify_gimple failed since r14-5557-g6dd4c703be17fa
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Michal Jireš | Time: 2023-11-22 21:01:43 UTC
+  Text: Compilingpr112566-2.c from testsuite.
+Bisection points tor14-5557-g6dd4c703be17fa, which also introduced this test.
+
+$ gccpr112566-2.c -Ofast -mf16cpr112566-2.c: In function ‘corge’:pr112566-2.c:10:5: error: ‘bit_field_ref’ of non-mode-precision operand
+   10 | int corge (_BitInt(256) x) { return __builtin_ctzg ((unsigned _BitInt(512)) x); }
+      |     ^~~~~
+_18 = BIT_FIELD_REF <x_35(D), 64, 64>;pr112566-2.c:10:5: error: ‘bit_field_ref’ of non-mode-precision operand
+_1 = BIT_FIELD_REF <x_35(D), 64, 128>;pr112566-2.c:10:5: error: ‘bit_field_ref’ of non-mode-precision operand
+_38 = BIT_FIELD_REF <x_35(D), 64, 192>;
+during GIMPLE pass: forwproppr112566-2.c:10:5: internal compiler error: verify_gimple failed
+0x105854d verify_gimple_in_cfg(function*, bool, bool)
+	/home/mjires/git/GCC/master/gcc/tree-cfg.cc:5662
+0xee86b4 execute_function_todo
+	/home/mjires/git/GCC/master/gcc/passes.cc:2088
+0xee8c0e execute_todo
+	/home/mjires/git/GCC/master/gcc/passes.cc:2142
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=/home/mjires/built/master/bin/gcc
+COLLECT_LTO_WRAPPER=/home/mjires/built/master/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /home/mjires/git/GCC/master/configure --prefix=/home/mjires/built/master --disable-bootstrap --enable-checking --enable-languages=c,c++,fortran,lto
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20231122 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2023-11-23 17:11:17 UTC
+  Text: I think this is a match.pd problem.
+First vectorizer vectorizes the
+  _18 = VIEW_CONVERT_EXPR<unsigned long[4]>(x)[_16];
+  bitint.2[_16] = _18;
+...
+copying loop, before forwprop4 we have
+  vect__18.6_34 = VIEW_CONVERT_EXPR<vector(4) unsigned long>(x_35(D));
+  _8 = BIT_FIELD_REF <vect__18.6_34, 64, 0>;
+...
+  _18 = BIT_FIELD_REF <vect__18.6_34, 64, 64>;
+...
+etc., which I think is valid, but during forwprop4 the
+(simplify
+ (BIT_FIELD_REF (view_convert @0) @1 @2)
+ (BIT_FIELD_REF @0 @1 @2))
+simplification kicks in and we create invalid
+  _18 = BIT_FIELD_REF <x_35(D), 64, 64>;
+out of it, because x has _BitInt(256) type and so doesn't have mode precision.
+tree-cfg.cc checking for BIT_FIELD_REF diagnoses:
+          if (INTEGRAL_TYPE_P (TREE_TYPE (op))
+              && !type_has_mode_precision_p (TREE_TYPE (op)))
+            {
+              error ("%qs of non-mode-precision operand", code_name);
+              return true;
+            }
+so maybe
+--- gcc/match.pd.jj	2023-11-17 15:10:43.306043972 +0100
++++ gcc/match.pd	2023-11-23 18:09:22.538414897 +0100
+@@ -8285,7 +8285,9 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+ 
+ (simplify
+  (BIT_FIELD_REF (view_convert @0) @1 @2)
+- (BIT_FIELD_REF @0 @1 @2))
++ (if (! INTEGRAL_TYPE_P (TREE_TYPE (@0))
++      || type_has_mode_precision_p (TREE_TYPE (@0)))
++  (BIT_FIELD_REF @0 @1 @2)))
+ 
+ (simplify
+  (BIT_FIELD_REF @0 @1 integer_zerop)
+
+- User: Jakub Jelinek | Time: 2023-11-23 17:35:00 UTC
+  Text: Createdattachment 56675[details]gcc14-pr112673.patch
+
+Full untested patch.
+
+- User: GCC Commits | Time: 2023-11-24 10:36:56 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:eebcad0ac22010fc59de9d856bb02017fccab282commitr14-5819-geebcad0ac22010fc59de9d856bb02017fccab282Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Nov 24 11:32:28 2023 +0100
+
+    match.pd: Avoid simplification into invalid BIT_FIELD_REFs [PR112673]
+    
+    The following testcase is lowered by the bitint lowering pass, then
+    vectorizer vectorizes one of the loops in it, so we have
+      vect__18.6_34 = VIEW_CONVERT_EXPR<vector(4) unsigned long>(x_35(D));
+      _8 = BIT_FIELD_REF <vect__18.6_34, 64, 0>;
+    ...
+      _18 = BIT_FIELD_REF <vect__18.6_34, 64, 64>;
+    etc. where x_35(D) is _BitInt(256) argument.  That is valid BIT_FIELD_REF,
+    the first argument is a vector and it extracts the vector elements from it.
+    Then comes forwprop4 and simplifies that using match.pd into
+      _8 = (unsigned long) x_35(D);
+    ...
+      _18 = BIT_FIELD_REF <x_35(D), 64, 64>;
+    and tree-cfg verification ICEs on the latter (though, even the first cast
+    is kind of undesirable after bitint lowering, we want large/huge bitints
+    lowered).  The ICE is because if BIT_FIELD_REFs first argument has
+    INTEGRAL_TYPE_P, we require type_has_mode_precision_p, but that is not the
+    case of _BitInt(256), it has BLKmode.
+    
+    The following patch fixes it by doing the BIT_FIELD_REF with VCE to
+    BIT_FIELD_REF simplification only if the result is valid.
+    
+    2023-11-24  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/112673* match.pd (bit_field_ref (vce @0) -> bit_field_ref @0): Only simplify
+            if either @0 doesn't have scalar integral type or if it has mode
+            precision.
+    
+            * gcc.dg/pr112673.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-11-24 10:44:04 UTC
+  Text: Should be fixed now.
+

@@ -1,0 +1,239 @@
+Bug Summary: [14 Regression] ICE: in curr_insn_transform, at lra-constraints.cc:4231 unable to generate reloads for {aarch64_mlav4hi_vec_concatz_le} at -O1
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 13.1.1
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-05-14 15:30:55 UTC
+  Text: Createdattachment 55082[details]reduced testcase
+
+Compiler output:
+$ aarch64-unknown-linux-gnu-gcc -O testcase.c 
+testcase.c: In function 'foo':
+testcase.c:8:1: error: unable to generate reloads for:
+    8 | }
+      | ^
+(insn 9 8 10 2 (set (reg:V8HI 102)
+        (vec_concat:V8HI (plus:V4HI (mult:V4HI (reg:V4HI 103)
+                    (reg:V4HI 103))
+                (reg:V4HI 103))
+            (const_vector:V4HI [
+                    (const_int 0 [0]) repeated x4
+                ]))) "testcase.c":7:10 2022 {aarch64_mlav4hi_vec_concatz_le}
+     (expr_list:REG_DEAD (reg:V4HI 103)
+        (nil)))
+during RTL pass: reload
+testcase.c:8:1: internal compiler error: in curr_insn_transform, at lra-constraints.cc:4231
+0x8098df _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+        /repo/gcc-trunk/gcc/rtl-error.cc:108
+0x7c6f0a curr_insn_transform
+        /repo/gcc-trunk/gcc/lra-constraints.cc:4231
+0x101b67f lra_constraints(bool)
+        /repo/gcc-trunk/gcc/lra-constraints.cc:5396
+0x1002c44 lra(_IO_FILE*)
+        /repo/gcc-trunk/gcc/lra.cc:2375
+0xfb22a9 do_reload
+        /repo/gcc-trunk/gcc/ira.cc:5967
+0xfb22a9 execute
+        /repo/gcc-trunk/gcc/ira.cc:6153
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ aarch64-unknown-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-aarch64/bin/aarch64-unknown-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-810-20230514170325-g1871740c780-checking-yes-rtl-df-extra-aarch64/bin/../libexec/gcc/aarch64-unknown-linux-gnu/14.0.0/lto-wrapper
+Target: aarch64-unknown-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --with-cloog --with-ppl --with-isl --with-sysroot=/usr/aarch64-unknown-linux-gnu --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=aarch64-unknown-linux-gnu --with-ld=/usr/bin/aarch64-unknown-linux-gnu-ld --with-as=/usr/bin/aarch64-unknown-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-810-20230514170325-g1871740c780-checking-yes-rtl-df-extra-aarch64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20230514 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2023-05-14 16:55:36 UTC
+  Text: Most likely caused byr14-473-g93c26deab98fc8.
+
+- User: N/A | Time: 2023-05-22 12:41:06 UTC
+  Text: Confirmed.
+The ICE in LRA happens very early on:
+********** Local #1: **********
+
+           Spilling non-eliminable hard regs: 31
+            alt=0: Bad operand -- refuse
+
+
+The pattern matches:
+ [(set (match_operand:VDQ_BHSI 0 "register_operand" "=w")
+       (plus:VDQ_BHSI (mult:VDQ_BHSI
+                        (match_operand:VDQ_BHSI 2 "register_operand" "w")
+                        (match_operand:VDQ_BHSI 3 "register_operand" "w"))
+                      (match_operand:VDQ_BHSI 1 "register_operand" "0")))]
+
+I wonder whether the substitution breaks something on the constraint in operand 1, which is tied to 0. The define_subst rule adds another operand to the pattern to match the zero vector, but I would have expected the substitution machinery to handle it all transparently...
+
+- User: Richard Sandiford | Time: 2023-05-22 13:01:52 UTC
+  Text: Looking at the mddump file, the output predicate and constraint
+seem to have gone AWOL:
+
+;; /home/ricsan01/gnu/src/gcc/gcc/config/aarch64/aarch64-simd.md: 1554
+(define_insn ("aarch64_mlav4hi_vec_concatz_le")
+     [
+        (set (match_operand:V8HI 0 ("") (""))
+            (vec_concat:V8HI (plus:V4HI (mult:V4HI (match_operand:V4HI 2 ("register_operand") ("w"))
+                        (match_operand:V4HI 3 ("register_operand") ("w")))
+                    (match_operand:V4HI 1 ("register_operand") ("0")))
+                (match_operand:V4HI 4 ("aarch64_simd_or_scalar_imm_zero") (""))))
+    ] ("(!BYTES_BIG_ENDIAN) && (TARGET_SIMD)") ("mla\t%0.4h, %2.4h, %3.4h")
+     [
+        (set_attr ("type") ("neon_mla_h"))
+        (set_attr ("add_vec_concat_subst_le") ("no"))
+    ])
+
+- User: Richard Sandiford | Time: 2023-05-22 13:09:31 UTC
+  Text: I guess the problem is that the define_subst output template has:
+
+  (match_operand:<VDBL> 0)
+
+which creates a new operand 0 with an empty predicate and constraint,
+as opposed to a (match_dup 0), which would be substituted with the
+original operand 0.  Unfortunately
+
+  (match_dup:<VDBL> 0)
+
+doesn't work as a way of inserting the original destination with
+a different mode, since the :<VDBL> is ignored.  Perhaps we should
+“fix” that.  Alternatively:
+
+  (match_operand:<VDBL> 0 "register_operand" "=w")
+
+should work, but probably locks us into using patterns that have one
+alternative only.
+
+- User: N/A | Time: 2023-05-22 13:15:49 UTC
+  Text: (In reply torsandifo@gcc.gnu.orgfromcomment #4)> I guess the problem is that the define_subst output template has:
+> 
+>   (match_operand:<VDBL> 0)
+> 
+> which creates a new operand 0 with an empty predicate and constraint,
+> as opposed to a (match_dup 0), which would be substituted with the
+> original operand 0.  Unfortunately
+> 
+>   (match_dup:<VDBL> 0)
+> 
+> doesn't work as a way of inserting the original destination with
+> a different mode, since the :<VDBL> is ignored.  Perhaps we should
+> “fix” that.  Alternatively:
+> 
+>   (match_operand:<VDBL> 0 "register_operand" "=w")
+> 
+> should work, but probably locks us into using patterns that have one
+> alternative only.I think this approach is the most promising and probably okay for the vast majority of cases we want to handle with these substs.
+
+- User: N/A | Time: 2023-05-22 15:11:32 UTC
+  Text: (In reply to ktkachov fromcomment #5)> (In reply torsandifo@gcc.gnu.orgfromcomment #4)
+> > I guess the problem is that the define_subst output template has:
+> > 
+> >   (match_operand:<VDBL> 0)
+> > 
+> > which creates a new operand 0 with an empty predicate and constraint,
+> > as opposed to a (match_dup 0), which would be substituted with the
+> > original operand 0.  Unfortunately
+> > 
+> >   (match_dup:<VDBL> 0)
+> > 
+> > doesn't work as a way of inserting the original destination with
+> > a different mode, since the :<VDBL> is ignored.  Perhaps we should
+> > “fix” that.  Alternatively:
+> > 
+> >   (match_operand:<VDBL> 0 "register_operand" "=w")
+> > 
+> > should work, but probably locks us into using patterns that have one
+> > alternative only.
+> 
+> I think this approach is the most promising and probably okay for the vast
+> majority of cases we want to handle with these substs.Interestingly, it does seem to do the right thing for multi-alternative patterns too. For example:
+(define_insn ("aarch64_cmltv4hf_vec_concatz_le")
+     [
+        (set (match_operand:V8HI 0 ("register_operand") ("=w,w"))
+            (vec_concat:V8HI (neg:V4HI (lt:V4HI (match_operand:V4HF 1 ("register_operand") ("w,w"))
+                        (match_operand:V4HF 2 ("aarch64_simd_reg_or_zero") ("w,YDz"))))
+                (match_operand:V4HI 3 ("aarch64_simd_or_scalar_imm_zero") (""))))
+    ] ("(!BYTES_BIG_ENDIAN) && ((TARGET_SIMD) && (TARGET_SIMD_F16INST))") ("@
+  fcmgt\t%0.4h, %2.4h, %1.4h
+  fcmlt\t%0.4h, %1.4h, 0")
+     [
+        (set_attr ("type") ("neon_fp_compare_s"))
+        (set_attr ("add_vec_concat_subst_le") ("no"))
+    ])
+
+- User: N/A | Time: 2023-05-22 15:15:27 UTC
+  Text: I'll take it.
+
+- User: GCC Commits | Time: 2023-05-23 10:09:58 UTC
+  Text: The master branch has been updated by Kyrylo Tkachov <ktkachov@gcc.gnu.org>:https://gcc.gnu.org/g:75d1eff5933fc0d853af730627218f182612b561commitr14-1128-g75d1eff5933fc0d853af730627218f182612b561Author: Kyrylo Tkachov <kyrylo.tkachov@arm.com>
+Date:   Tue May 23 11:09:08 2023 +0100
+
+    aarch64:PR target/109855Add predicate and constraints to define_subst in aarch64-simd.md
+    
+    In this PR we ICE because the substituted pattern for mla "lost" its predicate and constraint for operand 0
+    because the define_subst template:
+      [(set (match_operand:<VDBL> 0)
+            (vec_concat:<VDBL>
+             (match_dup 1)
+             (match_operand:VDZ 2 "aarch64_simd_or_scalar_imm_zero")))])
+    
+    Uses match_operand instead of match_dup for operand 0. We can't use match_dup 0 for it because we need to specify the widened mode.
+    The problem is fixed by adding a "register_operand" predicate and "=w" constraint to the match_operand.
+    This makes sense conceptually too as the transformation we're targeting only applies to instructions that write a "w" register.
+    With this change the mddump pattern that ICEs goes from:
+    (define_insn ("aarch64_mlav4hi_vec_concatz_le")
+         [
+            (set (match_operand:V8HI 0 ("") ("")) <<------ Missing constraint!
+                (vec_concat:V8HI (plus:V4HI (mult:V4HI (match_operand:V4HI 2 ("register_operand") ("w"))
+                            (match_operand:V4HI 3 ("register_operand") ("w")))
+                        (match_operand:V4HI 1 ("register_operand") ("0")))
+                    (match_operand:V4HI 4 ("aarch64_simd_or_scalar_imm_zero") (""))))
+        ] ("(!BYTES_BIG_ENDIAN) && (TARGET_SIMD)") ("mla\t%0.4h, %2.4h, %3.4h")
+    
+    to the proper:
+    (define_insn ("aarch64_mlav4hi_vec_concatz_le")
+         [
+            (set (match_operand:V8HI 0 ("register_operand") ("=w")) <<-------- Constraint in the right place
+                (vec_concat:V8HI (plus:V4HI (mult:V4HI (match_operand:V4HI 2 ("register_operand") ("w"))
+                            (match_operand:V4HI 3 ("register_operand") ("w")))
+                        (match_operand:V4HI 1 ("register_operand") ("0")))
+                    (match_operand:V4HI 4 ("aarch64_simd_or_scalar_imm_zero") (""))))
+        ] ("(!BYTES_BIG_ENDIAN) && (TARGET_SIMD)") ("mla\t%0.4h, %2.4h, %3.4h")
+    
+    This seems to do the right thing for multi-alternative patterns as well, the annotated pattern for aarch64_cmltv8qi is:
+    (define_insn ("aarch64_cmltv8qi")
+         [
+            (set (match_operand:V8QI 0 ("register_operand") ("=w,w"))
+                (neg:V8QI (lt:V8QI (match_operand:V8QI 1 ("register_operand") ("w,w"))
+                        (match_operand:V8QI 2 ("aarch64_simd_reg_or_zero") ("w,ZDz")))))
+        ]
+    
+    whereas the substituted version now looks like:
+    (define_insn ("aarch64_cmltv8qi_vec_concatz_le")
+         [
+            (set (match_operand:V16QI 0 ("register_operand") ("=w,w"))
+                (vec_concat:V16QI (neg:V8QI (lt:V8QI (match_operand:V8QI 1 ("register_operand") ("w,w"))
+                            (match_operand:V8QI 2 ("aarch64_simd_reg_or_zero") ("w,ZDz"))))
+                    (match_operand:V8QI 3 ("aarch64_simd_or_scalar_imm_zero") (""))))
+        ]
+    
+    Bootstrapped and tested on aarch64-none-linux-gnu.
+    
+    gcc/ChangeLog:PR target/109855* config/aarch64/aarch64-simd.md (add_vec_concat_subst_le): Add predicate
+            and constraint for operand 0.
+            (add_vec_concat_subst_be): Likewise.
+    
+    gcc/testsuite/ChangeLog:PR target/109855* gcc.target/aarch64/pr109855.c: New test.
+
+- User: N/A | Time: 2023-05-23 10:10:54 UTC
+  Text: Fixed, thanks for the report.
+

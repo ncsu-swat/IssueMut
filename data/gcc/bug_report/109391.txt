@@ -1,0 +1,186 @@
+Bug Summary: Inefficient codegen on AArch64 when structure types are returned
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: missed-optimization, ra
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Tamar Christina | Time: 2023-04-03 12:38:36 UTC
+  Text: This examplehttps://godbolt.org/z/Pe3f3ozGf---
+
+#include <arm_neon.h>
+
+int16x8x3_t bsl(const uint16x8x3_t *check, const int16x8x3_t *in1,
+                              const int16x8x3_t *in2) {
+  int16x8x3_t out;
+  for (uint32_t j = 0; j < 3; j++) {
+    out.val[j] = vbslq_s16(check->val[j], in1->val[j], in2->val[j]);
+  }
+  return out;
+}
+
+
+---
+
+Generates:
+
+bsl:
+        ldp     q6, q16, [x1]
+        ldp     q0, q4, [x2]
+        ldp     q5, q7, [x0]
+        bsl     v5.16b, v6.16b, v0.16b
+        ldr     q0, [x2, 32]
+        bsl     v7.16b, v16.16b, v4.16b
+        ldr     q6, [x1, 32]
+        mov     v1.16b, v5.16b
+        ldr     q5, [x0, 32]
+        bsl     v5.16b, v6.16b, v0.16b
+        mov     v0.16b, v1.16b
+        mov     v1.16b, v7.16b
+        mov     v2.16b, v5.16b
+        ret
+
+with 3 superfluous moves.  It looks like reload is having trouble dealing
+with the new compound types as return arguments.
+
+So in RTL We have:
+
+(insn 17 20 22 2 (set (subreg:V8HI (reg/v:V3x8HI 105 [ out ]) 16)
+        (xor:V8HI (and:V8HI (xor:V8HI (reg:V8HI 115 [ in2_11(D)->val[1] ])
+                    (reg:V8HI 114 [ in1_10(D)->val[1] ]))
+                (reg:V8HI 113 [ check_9(D)->val[1] ]))
+            (reg:V8HI 115 [ in2_11(D)->val[1] ]))) "/app/example.c":7:16 discrim 1 2558 {aarch64_simd_bslv8hi_internal}
+     (expr_list:REG_DEAD (reg:V8HI 115 [ in2_11(D)->val[1] ])
+        (expr_list:REG_DEAD (reg:V8HI 114 [ in1_10(D)->val[1] ])
+            (expr_list:REG_DEAD (reg:V8HI 113 [ check_9(D)->val[1] ])
+                (nil)))))
+(insn 22 17 29 2 (set (subreg:V8HI (reg/v:V3x8HI 105 [ out ]) 32)
+        (xor:V8HI (and:V8HI (xor:V8HI (reg:V8HI 118 [ in2_11(D)->val[2] ])
+                    (reg:V8HI 117 [ in1_10(D)->val[2] ]))
+                (reg:V8HI 116 [ check_9(D)->val[2] ]))
+            (reg:V8HI 118 [ in2_11(D)->val[2] ]))) "/app/example.c":7:16 discrim 1 2558 {aarch64_simd_bslv8hi_internal}
+     (expr_list:REG_DEAD (reg:V8HI 118 [ in2_11(D)->val[2] ])
+        (expr_list:REG_DEAD (reg:V8HI 117 [ in1_10(D)->val[2] ])
+            (expr_list:REG_DEAD (reg:V8HI 116 [ check_9(D)->val[2] ])
+                (nil)))))
+(insn 29 22 30 2 (set (reg/i:V3x8HI 32 v0)
+        (reg/v:V3x8HI 105 [ out ])) "/app/example.c":10:1 3964 {*aarch64_movv3x8hi}
+     (expr_list:REG_DEAD (reg/v:V3x8HI 105 [ out ])
+        (nil)))
+(insn 30 29 37 2 (use (reg/i:V3x8HI 32 v0)) "/app/example.c":10:1 -1
+     (nil))
+
+Reload then decides to insert a bunch of reloads:
+
+	 Choosing alt 0 in insn 17:  (0) =w  (1) 0  (2) w  (3) w {aarch64_simd_bslv8hi_internal}
+      Creating newreg=126 from oldreg=113, assigning class FP_REGS to r126
+   17: r126:V8HI=r115:V8HI^r114:V8HI&r126:V8HI^r115:V8HI
+      REG_DEAD r115:V8HI
+      REG_DEAD r114:V8HI
+      REG_DEAD r113:V8HI
+    Inserting insn reload before:
+   43: r126:V8HI=r113:V8HI
+    Inserting insn reload after:
+   44: r105:V3x8HI#16=r126:V8HI
+
+which introduces these moves.  The problem existed with the previous structure types as well (OImode etc) so it's not new but costs us lots of perf.
+
+I don't think I can fix this with the same pass ashttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=106106can I? It looks like in this case the RTL looks fine.
+
+- User: Richard Sandiford | Time: 2023-11-07 19:53:10 UTC
+  Text: Some of the SME changes I'm working on fix this, but I'm not sure how widely we'll be able to use them on non-SME code.  Assigning myself just in case.
+
+- User: GCC Commits | Time: 2023-12-07 19:41:34 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:9f0f7d802482a8958d6cdc72f1fe0c8549db2182commitr14-6290-g9f0f7d802482a8958d6cdc72f1fe0c8549db2182Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Thu Dec 7 19:41:19 2023 +0000
+
+    aarch64: Add an early RA for strided registers
+    
+    This pass adds a simple register allocator for FP & SIMD registers.
+    Its main purpose is to make use of SME2's strided LD1, ST1 and LUTI2/4
+    instructions, which require a very specific grouping structure,
+    and so would be difficult to exploit with general allocation.
+    
+    The allocator is very simple.  It gives up on anything that would
+    require spilling, or that it might not handle well for other reasons.
+    
+    The allocator needs to track liveness at the level of individual FPRs.
+    Doing that fixes a lot of the PRs relating to redundant moves caused by
+    structure loads and stores.  That particular problem is going to be
+    fixed more generally for GCC 15 by Lehua's RA patches.
+    
+    However, the early-RA pass runs before scheduling, so it has a chance
+    to bag a spill-free allocation of vector code before the scheduler moves
+    things around.  It could therefore still be useful for non-SME code
+    (e.g. for hand-scheduled ACLE code) even after Lehua's patches are in.
+    
+    The pass is controlled by a tristate switch:
+    
+    - -mearly-ra=all: run on all functions
+    - -mearly-ra=strided: run on functions that have access to strided registers
+    - -mearly-ra=none: don't run on any function
+    
+    The patch makes -mearly-ra=all the default at -O2 and above for now.
+    We can revisit this for GCC 15 once Lehua's patches are in;
+    -mearly-ra=strided might then be more appropriate.
+    
+    As said previously, the pass is very naive.  There's much more that we
+    could do, such as handling invariants better.  The main focus is on not
+    committing to a bad allocation, rather than on handling as much as
+    possible.
+    
+    gcc/PR rtl-optimization/106694PR rtl-optimization/109078PR rtl-optimization/109391* config.gcc: Add aarch64-early-ra.o for AArch64 targets.
+            * config/aarch64/t-aarch64 (aarch64-early-ra.o): New rule.
+            * config/aarch64/aarch64-opts.h (aarch64_early_ra_scope): New enum.
+            * config/aarch64/aarch64.opt (mearly_ra): New option.
+            * doc/invoke.texi: Document it.
+            * common/config/aarch64/aarch64-common.cc
+            (aarch_option_optimization_table): Use -mearly-ra=strided by
+            default for -O2 and above.
+            * config/aarch64/aarch64-passes.def (pass_aarch64_early_ra): New pass.
+            * config/aarch64/aarch64-protos.h (aarch64_strided_registers_p)
+            (make_pass_aarch64_early_ra): Declare.
+            * config/aarch64/aarch64-sme.md (@aarch64_sme_lut<LUTI_BITS><mode>):
+            Add a stride_type attribute.
+            (@aarch64_sme_lut<LUTI_BITS><mode>_strided2): New pattern.
+            (@aarch64_sme_lut<LUTI_BITS><mode>_strided4): Likewise.
+            * config/aarch64/aarch64-sve-builtins-base.cc (svld1_impl::expand)
+            (svldnt1_impl::expand, svst1_impl::expand, svstn1_impl::expand): Handle
+            new way of defining multi-register loads and stores.
+            * config/aarch64/aarch64-sve.md (@aarch64_ld1<SVE_FULLx24:mode>)
+            (@aarch64_ldnt1<SVE_FULLx24:mode>, @aarch64_st1<SVE_FULLx24:mode>)
+            (@aarch64_stnt1<SVE_FULLx24:mode>): Delete.
+            * config/aarch64/aarch64-sve2.md (@aarch64_<LD1_COUNT:optab><mode>)
+            (@aarch64_<LD1_COUNT:optab><mode>_strided2): New patterns.
+            (@aarch64_<LD1_COUNT:optab><mode>_strided4): Likewise.
+            (@aarch64_<ST1_COUNT:optab><mode>): Likewise.
+            (@aarch64_<ST1_COUNT:optab><mode>_strided2): Likewise.
+            (@aarch64_<ST1_COUNT:optab><mode>_strided4): Likewise.
+            * config/aarch64/aarch64.cc (aarch64_strided_registers_p): New
+            function.
+            * config/aarch64/aarch64.md (UNSPEC_LD1_SVE_COUNT): Delete.
+            (UNSPEC_ST1_SVE_COUNT, UNSPEC_LDNT1_SVE_COUNT): Likewise.
+            (UNSPEC_STNT1_SVE_COUNT): Likewise.
+            (stride_type): New attribute.
+            * config/aarch64/constraints.md (Uwd, Uwt): New constraints.
+            * config/aarch64/iterators.md (UNSPEC_LD1_COUNT, UNSPEC_LDNT1_COUNT)
+            (UNSPEC_ST1_COUNT, UNSPEC_STNT1_COUNT): New unspecs.
+            (optab): Handle them.
+            (LD1_COUNT, ST1_COUNT): New iterators.
+            * config/aarch64/aarch64-early-ra.cc: New file.
+    
+    gcc/testsuite/PR rtl-optimization/106694PR rtl-optimization/109078PR rtl-optimization/109391* gcc.target/aarch64/ldp_stp_16.c (cons4_4_float): Tighten expected
+            output test.
+            * gcc.target/aarch64/sve/shift_1.c: Allow reversed shifts for .s
+            as well as .d.
+            * gcc.target/aarch64/sme/strided_1.c: New test.
+            * gcc.target/aarch64/pr109078.c: Likewise.
+            * gcc.target/aarch64/pr109391.c: Likewise.
+            * gcc.target/aarch64/sve/pr106694.c: Likewise.
+
+- User: Richard Sandiford | Time: 2023-12-07 19:53:24 UTC
+  Text: Fix for this case.  The patch only deals with cases that can be allocated without spilling, but Lehua has a more general fix that should go into GCC 15.
+

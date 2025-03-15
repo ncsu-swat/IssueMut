@@ -1,0 +1,158 @@
+Bug Summary: ICE: in deref_rvalue, at analyzer/region-model.cc:2762 with _Atomic _BitInt() and -fanalyzer
+Product: gcc
+Component: analyzer
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-03-08 14:51:00 UTC
+  Text: Createdattachment 57656[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -fanalyzer testcase.c
+during IPA pass: analyzer
+testcase.c: In function 'foo':
+testcase.c:5:3: internal compiler error: in deref_rvalue, at analyzer/region-model.cc:2762
+    5 |   b;
+      |   ^
+0x8c81ff ana::region_model::deref_rvalue(ana::svalue const*, tree_node*, ana::region_model_context*, bool) const
+        /repo/gcc-trunk/gcc/analyzer/region-model.cc:2762
+0x192a209 ana::kf_atomic_load::impl_call_pre(ana::call_details const&) const
+        /repo/gcc-trunk/gcc/analyzer/kf.cc:289
+0x19464f7 ana::region_model::on_call_pre(gcall const*, ana::region_model_context*)
+        /repo/gcc-trunk/gcc/analyzer/region-model.cc:1700
+0x194a31a ana::region_model::on_stmt_pre(gimple const*, bool*, ana::region_model_context*)
+        /repo/gcc-trunk/gcc/analyzer/region-model.cc:1337
+0x1912190 ana::exploded_node::on_stmt(ana::exploded_graph&, ana::supernode const*, gimple const*, ana::program_state*, ana::uncertainty_t*, bool*, ana::path_context*)
+        /repo/gcc-trunk/gcc/analyzer/engine.cc:1515
+0x1914f2a ana::exploded_graph::process_node(ana::exploded_node*)
+        /repo/gcc-trunk/gcc/analyzer/engine.cc:4125
+0x1915e9a ana::exploded_graph::process_worklist()
+        /repo/gcc-trunk/gcc/analyzer/engine.cc:3516
+0x19185f5 ana::impl_run_checkers(ana::logger*)
+        /repo/gcc-trunk/gcc/analyzer/engine.cc:6210
+0x1919506 ana::run_checkers()
+        /repo/gcc-trunk/gcc/analyzer/engine.cc:6301
+0x1908158 execute
+        /repo/gcc-trunk/gcc/analyzer/analyzer-pass.cc:87
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-9382-20240308082802-g0bd04d9ae2d-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-9382-20240308082802-g0bd04d9ae2d-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240308 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2024-03-15 12:35:29 UTC
+  Text: Doesn't seem to be _BitInt related,
+struct S { long long a[16]; } s;
+
+struct S
+foo (void)
+{
+  struct S r;
+  __atomic_load (&s, &r, __ATOMIC_RELAXED);
+  return r;
+}
+ICEs the same way.  Guess analyzer doesn't handle properly atomic_load which can't be optimized into the 1/2/4/8/16 byte variants and is handled by libatomic.
+Makes me wonder about other __atomic operations on such types, __atomic_store, __atomic_exchange and __atomic_compare_exchange on such types.
+
+And to answer my question,
+void
+bar (struct S x)
+{
+  __atomic_store (&s, &x, __ATOMIC_RELAXED);
+}
+doesn't ICE,
+struct S
+baz (struct S x)
+{
+  struct S r;
+  __atomic_exchange (&s, &x, &r, __ATOMIC_RELAXED);
+}
+does and
+int
+qux (struct S *e, struct S *d)
+{
+  return __atomic_compare_exchange (&s, e, d, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+doesn't.
+
+- User: David Malcolm | Time: 2024-03-18 16:54:01 UTC
+  Text: Thanks; taking a look.
+
+- User: David Malcolm | Time: 2024-03-18 18:20:32 UTC
+  Text: Looking athttps://gcc.gnu.org/onlinedocs/gcc/_005f_005fatomic-Builtins.html#index-_005f_005fatomic_005floadI see this signature for __atomic_load with 3 arguments:
+
+Built-in Function: void __atomic_load (type *ptr, type *ret, int memorder)
+
+and that's what I tried to implement inr14-1497-gef768035ae8090in kf.cc's class kf_atomic_load.
+
+However, looking at the gimple, I see this call:
+
+  __atomic_load (128, &s, &r, 0);
+
+and sync-builtins.def has this:
+
+DEF_SYNC_BUILTIN (BUILT_IN_ATOMIC_LOAD,
+		  "__atomic_load",
+		  BT_FN_VOID_SIZE_CONST_VPTR_PTR_INT,
+		  ATTR_NOTHROWCALL_LEAF_LIST)
+
+so presumably the documentation for __atomic_load is wrong.
+
+Presumably the signature should be:
+
+void __atomic_load (size_t sz, const void *src, void *dst, int memorder);
+
+- User: Jakub Jelinek | Time: 2024-03-18 18:26:44 UTC
+  Text: No, the documentation is correct.
+It describes all that the user cares about, what arguments should be passed to it when it is called.
+Under the hood, it is then either optimized into __atomic_load_{1,2,4,8,16} (or similarly for other atomic APIs), or to the generic one, based on the type.  And, for the generic one the size argument is added because the type is irrelevant after the lowering.
+See c-family/c-common.cc (resolve_overloaded_builtin) for details.
+
+- User: David Malcolm | Time: 2024-03-18 18:34:31 UTC
+  Text: Aha - thanks!  Am working on a fix.
+
+- User: GCC Commits | Time: 2024-03-19 13:07:54 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:c7a774edbf802d79b95871ede5b80f6e9adf8e88commitr14-9544-gc7a774edbf802d79b95871ede5b80f6e9adf8e88Author: David Malcolm <dmalcolm@redhat.com>
+Date:   Tue Mar 19 09:06:45 2024 -0400
+
+    analyzer: fixes to __atomic_{exchange,load,store} [PR114286]
+    
+    Inr14-1497-gef768035ae8090I added some support to the analyzer for
+    __atomic_ builtins (enough to fix false positives I was seeing in
+    my integration tests).
+    
+    Unfortunately I messed up the implementation of
+    __atomic_{exchange,load,store}, leading to ICEs seen inPR analyzer/114286.
+    
+    Fixed thusly, fixing the ICEs.  Given that we're in stage 4, the patch
+    doesn't add support for any of the various __atomic_compare_exchange
+    builtins, so that these continue to fall back to the analyzer's
+    "anything could happen" handling of unknown functions.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+    
+    gcc/analyzer/ChangeLog:PR analyzer/114286* kf.cc (class kf_atomic_exchange): Reimplement based on signature
+            seen in gimple, rather than user-facing signature.
+            (class kf_atomic_load): Likewise.
+            (class kf_atomic_store): New.
+            (register_atomic_builtins): Register kf_atomic_store.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/114286* c-c++-common/analyzer/atomic-builtins-pr114286.c: New test.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2024-03-19 13:12:16 UTC
+  Text: Should be fixed by the above patch.
+

@@ -1,0 +1,228 @@
+Bug Summary: -Wanalyzer-tainted-allocation-size false positive seen in Linux kernel's sound/core/rawmidi.c
+Product: gcc
+Component: analyzer
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Malcolm | Time: 2023-12-04 22:06:22 UTC
+  Text: False positive at -O1 and above with:
+
+/* { dg-do compile } */
+/* { dg-options "-fanalyzer -O2" } */
+/* { dg-require-effective-target analyzer } */
+
+typedef unsigned long __kernel_ulong_t;
+typedef __kernel_ulong_t __kernel_size_t;
+typedef __kernel_size_t size_t;
+typedef unsigned int gfp_t;
+
+extern unsigned long copy_from_user(void* to, const void* from, unsigned long n);
+
+extern
+__attribute__((__alloc_size__(1)))
+__attribute__((__malloc__)) void*
+kvzalloc(size_t size, gfp_t flags);
+
+struct snd_rawmidi_params
+{
+  int stream;
+  size_t buffer_size;
+};
+
+char *newbuf;
+
+static int
+resize_runtime_buffer(struct snd_rawmidi_params* params)
+{
+  if (params->buffer_size < 32 || params->buffer_size > 1024L * 1024L)
+    return -22;
+  newbuf = kvzalloc(params->buffer_size, /* { dg-bogus "use of attacker-controlled value '\\*params.buffer_size' as allocation size without upper-bounds checking" } */
+		    (((gfp_t)(0x400u | 0x800u)) | ((gfp_t)0x40u) | ((gfp_t)0x80u)));
+  if (!newbuf)
+    return -12;
+  return 0;
+}
+
+long
+snd_rawmidi_ioctl(unsigned long arg)
+{
+  void* argp = (void*)arg;
+  struct snd_rawmidi_params params;
+  if (copy_from_user(&params, argp, sizeof(struct snd_rawmidi_params)))
+    return -14;
+  return resize_runtime_buffer(&params);
+}
+
+with the analyzer_kernel_plugin.so:
+
+gcc/testsuite/gcc.dg/plugin/taint-sound-core-rawmidi.c:30:12: warning: use of attacker-controlled value ‘*params.buffer_size’ as allocation size without upper-bounds checking [CWE-789] [-Wanalyzer-tainted-allocation-size]
+   30 |   newbuf = kvzalloc(params->buffer_size, /* { dg-bogus "use of attacker-controlled value '\\*params.buffer_size' as allocation size without upper-bounds checking" } */
+      |            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   31 |                     (((gfp_t)(0x400u | 0x800u)) | ((gfp_t)0x40u) | ((gfp_t)0x80u)));
+      |                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  ‘snd_rawmidi_ioctl’: events 1-4
+    |
+    |   38 | snd_rawmidi_ioctl(unsigned long arg)
+    |      | ^~~~~~~~~~~~~~~~~
+    |      | |
+    |      | (1) entry to ‘snd_rawmidi_ioctl’
+    |......
+    |   42 |   if (copy_from_user(&params, argp, sizeof(struct snd_rawmidi_params)))
+    |      |      ~
+    |      |      |
+    |      |      (2) following ‘false’ branch...
+    |   43 |     return -14;
+    |   44 |   return resize_runtime_buffer(&params);
+    |      |          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    |      |          |
+    |      |          (3) ...to here
+    |      |          (4) calling ‘resize_runtime_buffer’ from ‘snd_rawmidi_ioctl’
+    |
+    +--> ‘resize_runtime_buffer’: events 5-8
+           |
+           |   26 | resize_runtime_buffer(struct snd_rawmidi_params* params)
+           |      | ^~~~~~~~~~~~~~~~~~~~~
+           |      | |
+           |      | (5) entry to ‘resize_runtime_buffer’
+           |   27 | {
+           |   28 |   if (params->buffer_size < 32 || params->buffer_size > 1024L * 1024L)
+           |      |      ~
+           |      |      |
+           |      |      (6) following ‘false’ branch...
+           |   29 |     return -22;
+           |   30 |   newbuf = kvzalloc(params->buffer_size, /* { dg-bogus "use of attacker-controlled value '\\*params.buffer_size' as allocation size without upper-bounds checking" } */
+           |      |            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+           |      |            |
+           |      |            (7) ...to here
+           |      |            (8) use of attacker-controlled value ‘*params.buffer_size’ as allocation size without upper-bounds checking
+           |   31 |                     (((gfp_t)(0x400u | 0x800u)) | ((gfp_t)0x40u) | ((gfp_t)0x80u)));
+           |      |                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+           |
+
+Reduced from sound/core/rawmidi.c in Linux kernel
+
+- User: GCC Commits | Time: 2023-12-07 00:26:50 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:08b7462d3ad8e5acd941b7c777c5b26b4064d686commitr14-6239-g08b7462d3ad8e5acd941b7c777c5b26b4064d686Author: David Malcolm <dmalcolm@redhat.com>
+Date:   Wed Dec 6 19:25:26 2023 -0500
+
+    analyzer: fix taint false positives with UNKNOWN [PR112850]PR analyzer/112850reports a false positive from
+    -Wanalyzer-tainted-allocation-size on the Linux kernel [1] where
+    -fanalyzer complains that an allocation size is attacker-controlled
+    despite the value being correctly sanitized against upper and lower
+    limits.
+    
+    The root cause is that the expression is sufficiently complex
+    to exceed the -param=analyzer-max-svalue-depth= threshold,
+    currently at 12, with depth 13, and so it is treated as UNKNOWN.
+    Hence the sanitizations are seen as comparisons of an UNKNOWN
+    symbolic value against constants, and these were being ignored
+    by the taint state machine.
+    
+    The expression in question is relatively typical for those seen in
+    Linux kernel ioctl handlers, and I was surprised that it had exceeded
+    the analyzer's default expression complexity limit.
+    
+    This patch addresses this problem in three ways:
+    (a) the default value of the threshold parameter is increased, from 12
+    to 18, so that such expressions are precisely handled
+    (b) adding a new -Wanalyzer-symbol-too-complex to warn when the symbol
+    complexity limit is reached.  This is off by default for users, and
+    on by default in the test suite.
+    (c) the taint state machine handles comparisons against UNKNOWN svalues
+    by dropping all taint information on that execution path, so that if
+    the complexity limit has been exceeded we don't generate false positives
+    
+    As well as fixing the taint false positive (PR analyzer/112850), the
+    patch also fixes a couple of leak false positives seen on flex-generated
+    scanners (PR analyzer/103546).
+    
+    [1] specifically, in sound/core/rawmidi.c's handler for
+    SNDRV_RAWMIDI_STREAM_OUTPUT.
+    
+    gcc/ChangeLog:PR analyzer/103546PR analyzer/112850* doc/invoke.texi: Add -Wanalyzer-symbol-too-complex.
+    
+    gcc/analyzer/ChangeLog:PR analyzer/103546PR analyzer/112850* analyzer.opt (-param=analyzer-max-svalue-depth=): Increase from
+            12 to 18.
+            (Wanalyzer-symbol-too-complex): New.
+            * diagnostic-manager.cc
+            (null_assignment_sm_context::clear_all_per_svalue_state): New.
+            * engine.cc (impl_sm_context::clear_all_per_svalue_state): New.
+            * program-state.cc (sm_state_map::clear_all_per_svalue_state):
+            New.
+            * program-state.h (sm_state_map::clear_all_per_svalue_state): New
+            decl.
+            * region-model-manager.cc
+            (region_model_manager::reject_if_too_complex): Add
+            -Wanalyzer-symbol-too-complex.
+            * sm-taint.cc (taint_state_machine::on_condition): Handle
+            comparisons against UNKNOWN.
+            * sm.h (sm_context::clear_all_per_svalue_state): New.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/103546PR analyzer/112850* c-c++-common/analyzer/call-summaries-pr107158-2.c: Add
+            -Wno-analyzer-symbol-too-complex.
+            * c-c++-common/analyzer/call-summaries-pr107158.c: Likewise.
+            * c-c++-common/analyzer/deref-before-check-pr109060-haproxy-cfgparse.c:
+            Likewise.
+            * c-c++-common/analyzer/feasibility-3.c: Add
+            -Wno-analyzer-too-complex and -Wno-analyzer-symbol-too-complex.
+            * c-c++-common/analyzer/flex-with-call-summaries.c: Add
+            -Wno-analyzer-symbol-too-complex.  Remove fail forPR analyzer/103546leak false positive.
+            * c-c++-common/analyzer/flex-without-call-summaries.c: Remove
+            xfail forPR analyzer/103546leak false positive.
+            * c-c++-common/analyzer/infinite-recursion-3.c: Add
+            -Wno-analyzer-symbol-too-complex.
+            * c-c++-common/analyzer/null-deref-pr108251-smp_fetch_ssl_fc_has_early-O2.c:
+            Likewise.
+            * c-c++-common/analyzer/null-deref-pr108251-smp_fetch_ssl_fc_has_early.c:
+            Likewise.
+            * c-c++-common/analyzer/null-deref-pr108400-SoftEtherVPN-WebUi.c:
+            Likewise.
+            * c-c++-common/analyzer/null-deref-pr108806-qemu.c: Likewise.
+            * c-c++-common/analyzer/null-deref-pr108830.c: Likewise.
+            * c-c++-common/analyzer/pr94596.c: Likewise.
+            * c-c++-common/analyzer/strtok-2.c: Likewise.
+            * c-c++-common/analyzer/strtok-4.c: Add -Wno-analyzer-too-complex
+            and -Wno-analyzer-symbol-too-complex.
+            * c-c++-common/analyzer/strtok-cppreference.c: Likewise.
+            * gcc.dg/analyzer/analyzer.exp: Add -Wanalyzer-symbol-too-complex
+            to DEFAULT_CFLAGS.
+            * gcc.dg/analyzer/attr-const-3.c: Add
+            -Wno-analyzer-symbol-too-complex.
+            * gcc.dg/analyzer/call-summaries-pr107072.c: Likewise.
+            * gcc.dg/analyzer/doom-s_sound-pr108867.c: Likewise.
+            * gcc.dg/analyzer/explode-4.c: Likewise.
+            * gcc.dg/analyzer/null-deref-pr102671-1.c: Likewise.
+            * gcc.dg/analyzer/null-deref-pr105755.c: Likewise.
+            * gcc.dg/analyzer/out-of-bounds-curl.c: Likewise.
+            * gcc.dg/analyzer/pr101503.c: Likewise.
+            * gcc.dg/analyzer/pr103892.c: Add -Wno-analyzer-too-complex and
+            -Wno-analyzer-symbol-too-complex.
+            * gcc.dg/analyzer/pr94851-4.c: Add
+            -Wno-analyzer-symbol-too-complex.
+            * gcc.dg/analyzer/pr96860-1.c: Likewise.
+            * gcc.dg/analyzer/pr96860-2.c: Likewise.
+            * gcc.dg/analyzer/pr98918.c: Likewise.
+            * gcc.dg/analyzer/pr99044-2.c: Likewise.
+            * gcc.dg/analyzer/uninit-pr108806-qemu.c: Likewise.
+            * gcc.dg/analyzer/use-after-free.c: Add -Wno-analyzer-too-complex
+            and -Wno-analyzer-symbol-too-complex.
+            * gcc.dg/plugin/plugin.exp: Add new tests for
+            analyzer_kernel_plugin.c.
+            * gcc.dg/plugin/taint-CVE-2011-0521-4.c: Update expected results.
+            * gcc.dg/plugin/taint-CVE-2011-0521-5.c: Likewise.
+            * gcc.dg/plugin/taint-CVE-2011-0521-6.c: Likewise.
+            * gcc.dg/plugin/taint-CVE-2011-0521-5-fixed.c: Remove xfail.
+            * gcc.dg/plugin/taint-pr112850-precise.c: New test.
+            * gcc.dg/plugin/taint-pr112850-too-complex.c: New test.
+            * gcc.dg/plugin/taint-pr112850-unsanitized.c: New test.
+            * gcc.dg/plugin/taint-pr112850.c: New test.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2023-12-07 00:33:07 UTC
+  Text: Should be fixed on trunk (for gcc 14) by the above commit.
+

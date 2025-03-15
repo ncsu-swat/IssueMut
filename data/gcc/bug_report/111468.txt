@@ -1,0 +1,203 @@
+Bug Summary: cannot express unordered equal in gimple FE
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Aldy Hernandez | Time: 2023-09-19 03:15:29 UTC
+  Text: Createdattachment 55930[details]Failing testcase
+
+It looks like you can't express an UNEQ_EXPR in the GIMPLE FE.
+
+Am I missing something?  The snippet below compiles fine with:
+
+  if (x_1 == a_5(D))
+
+but not with:
+
+  if (x_1 u== a_5(D))
+
+And at least tree-pretty-print.cc has:
+
+    case UNEQ_EXPR:
+      return "u==";
+
+I'm trying to come up with a threading test for some unordered stuff, and I'm getting:
+
+$ ./cc1 c.c -O2 -fgimple -quiet
+c.c: In function ‘foo’:
+c.c:19:10: error: expected ‘)’ before ‘u’
+   19 |   if (x_1 u== a_5(D))
+      |          ^~
+      |          )
+
+[snip snip]
+
+Is there a blessed way of expressing unordered comparisons in the GIMPLE FE?
+
+- User: Andrew Pinski | Time: 2023-09-19 03:27:26 UTC
+  Text: I was going to suggest to use __builtin_islessgreater but it does not exactly work the same way.
+
+That is:
+```
+void stuff();
+
+void __GIMPLE (ssa,startwith("threadfull1"))
+foo (float a, float b, int cond)
+{
+  float x;
+  int _7;
+
+ __BB(2):
+  if (cond_3(D) != 0)
+    goto __BB4;
+  else
+    goto __BB3;
+
+ __BB(3):
+  goto __BB4;
+
+ __BB(4):
+  x_1 = __PHI (__BB2: a_5(D), __BB3: b_4(D));
+  _7 = __builtin_islessgreater (x_1 , a_5(D));
+  if (_7 != 0)
+    goto __BB5;
+  else
+    goto __BB6;
+
+ __BB(5):
+  stuff ();
+  goto __BB6;
+
+ __BB(6):
+  return;
+
+}
+```
+
+But we don't get UNEQ_EXPR right away, instead we have to wait until vrp1 to get the UNEQ_EXPR ...
+
+- User: Richard Biener | Time: 2023-09-19 09:30:53 UTC
+  Text: Hmm.  The "closest" we have is
+
+static c_expr
+c_parser_gimple_binary_expression (gimple_parser &parser)
+{
+...
+    case CPP_NAME:
+        {
+          tree id = c_parser_peek_token (parser)->value;
+          if (strcmp (IDENTIFIER_POINTER (id), "__MULT_HIGHPART") == 0)
+            {
+              code = MULT_HIGHPART_EXPR;
+
+we can support the u== syntax or lean on the above and go with __UNEQ and
+friends.  I'd probably go with __UNEQ.
+
+diff --git a/gcc/c/gimple-parser.cc b/gcc/c/gimple-parser.cc
+index cc3a8899d97..faf2def599f 100644
+--- a/gcc/c/gimple-parser.cc
++++ b/gcc/c/gimple-parser.cc
+@@ -1013,6 +1013,12 @@ c_parser_gimple_binary_expression (gimple_parser &parser)
+              code = MULT_HIGHPART_EXPR;
+              break;
+            }
++         else if (strcmp (IDENTIFIER_POINTER (id), "__UNEQ") == 0)
++           {
++             code = UNEQ_EXPR;
++             ret_type = truth_type_for (TREE_TYPE (lhs.value));
++             break;
++           }
+        }
+       /* Fallthru.  */
+     default:
+
+and
+
+void stuff();
+
+void __GIMPLE (ssa,startwith("threadfull1"))
+foo (float a, float b, int cond)
+{
+  float x;
+  _Bool _7;
+
+ __BB(2):
+  if (cond_3(D) != 0)
+    goto __BB4;
+  else
+    goto __BB3;
+
+ __BB(3):
+  goto __BB4;
+
+ __BB(4):
+  x_1 = __PHI (__BB2: a_5(D), __BB3: b_4(D));
+  _7 = x_1 __UNEQ a_5(D);
+  if (_7 != _Literal (_Bool) 0)
+    goto __BB5;
+  else
+    goto __BB6;
+
+ __BB(5):
+  stuff ();
+  goto __BB6;
+
+ __BB(6):
+  return;
+
+}
+
+- User: GCC Commits | Time: 2023-09-19 11:01:23 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:836e2cff7d9e4c06bf8ffd7e2df5dd134d8a22c2commitr14-4127-g836e2cff7d9e4c06bf8ffd7e2df5dd134d8a22c2Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Sep 19 11:49:54 2023 +0200
+
+    c/111468 - add unordered compare and pointer diff to GIMPLE FE parsing
+    
+    The following adds __UN{LT,LE,GT,GE,EQ}, __UNORDERED and __ORDERED
+    operator parsing support and support for parsing - as POINTER_DIFF_EXPR.PR c/111468gcc/c/
+            * gimple-parser.cc (c_parser_gimple_binary_expression): Add
+            return type argument.
+            (c_parser_gimple_statement): Adjust.
+            (c_parser_gimple_paren_condition): Likewise.
+            (c_parser_gimple_binary_expression): Use passed in return type,
+            add support for - as POINTER_DIFF_EXPR, __UN{LT,LE,GT,GE,EQ},
+            __UNORDERED and __ORDERED.
+    
+    gcc/testsuite/
+            * gcc.dg/gimplefe-50.c: New testcase.
+            * gcc.dg/gimplefe-51.c: Likewise.
+
+- User: Richard Biener | Time: 2023-09-19 11:01:42 UTC
+  Text: Fixed on trunk.
+
+- User: GCC Commits | Time: 2023-09-19 12:44:06 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:f25960b03834712f312d46fed9a021df36f89f22commitr14-4139-gf25960b03834712f312d46fed9a021df36f89f22Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Sep 19 13:18:51 2023 +0200
+
+    c/111468 - dump unordered compare operators in their GIMPLE form with -gimple
+    
+    The following adjusts -gimple dumping to dump the unordered compare ops
+    and *h in their GIMPLE form.  It also adds parsing for __LTGT which I
+    missed before.PR c/111468gcc/c/
+            * gimple-parser.cc (c_parser_gimple_binary_expression): Handle __LTGT.
+    
+    gcc/
+            * tree-pretty-print.h (op_symbol_code): Add defaulted flags
+            argument.
+            * tree-pretty-print.cc (op_symbol): Likewise.
+            (op_symbol_code): Print TDF_GIMPLE variant if requested.
+            * gimple-pretty-print.cc (dump_binary_rhs): Pass flags to
+            op_symbol_code.
+            (dump_gimple_cond): Likewise.
+    
+    gcc/testsuite/
+            * gcc.dg/gimplefe-50.c: Amend.
+
+- User: Aldy Hernandez | Time: 2023-09-19 13:37:25 UTC
+  Text: (In reply to Richard Biener fromcomment #4)> Fixed on trunk.Sweet.  Thanks so much.  This really helps.
+

@@ -1,0 +1,227 @@
+Bug Summary: [14 Regression] Missing ldp/stp optimization since r14-6290-g9f0f7d802482a8
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2024-01-26 06:04:26 UTC
+  Text: Take:
+```
+typedef float __attribute__((vector_size(8))) v2sf;
+v2sf a[4];
+v2sf b[4];
+void f()
+{
+  b[0] += a[0];
+  b[1] += a[1];
+}
+
+```
+
+With -O3 on the trunk we get:
+```
+f:
+        adrp    x1, .LANCHOR0
+        add     x0, x1, :lo12:.LANCHOR0
+        ldr     d31, [x1, #:lo12:.LANCHOR0]
+        ldr     d30, [x0, 32]
+        fadd    v30.2s, v31.2s, v30.2s
+        ldr     d31, [x0, 8]
+        str     d30, [x1, #:lo12:.LANCHOR0]
+        ldr     d30, [x0, 40]
+        fadd    v30.2s, v31.2s, v30.2s
+        str     d30, [x0, 8]
+        ret
+```
+
+But in GCC 13 we got:
+```
+f:
+        adrp    x1, .LANCHOR0
+        add     x0, x1, :lo12:.LANCHOR0
+        ldp     d1, d0, [x0]
+        ldp     d3, d2, [x0, 32]
+        fadd    v1.2s, v1.2s, v3.2s
+        fadd    v0.2s, v0.2s, v2.2s
+        stp     d1, d0, [x0]
+        ret
+```
+
+- User: Andrew Pinski | Time: 2024-01-26 06:05:14 UTC
+  Text: Note we should really get v4sf but that isPR 95960.
+
+- User: Andrew Pinski | Time: 2024-01-26 06:39:03 UTC
+  Text: Note I don't know if this shows up in real programs but it might point to something missing that might happen in real programs.
+
+Another testcase this time without vectors:
+```
+double a[4];
+double b[4];
+void f()
+{
+  b[0] += a[0];
+  b[1] *= a[1];
+}
+
+```
+
+For some reason it works with the GPRs though:
+```
+int a[4];
+int b[4];
+void f()
+{
+  b[0] += a[0];
+  b[1] *= a[1];
+}
+
+```
+
+- User: Alex Coplan | Time: 2024-01-26 08:34:40 UTC
+  Text: Confirmed, I'll take a look.
+
+- User: Alex Coplan | Time: 2024-01-26 08:58:55 UTC
+  Text: Interestingly we started to miss this with the introduction of aarch64
+early RA i.e.r14-6290-g9f0f7d802482a8958d6cdc72f1fe0c8549db2182.
+
+My ldp/stp pattern rewrite was:r14-6604-gd7ee988c491cde43d04fe25f2b3dbad9d85ded45so we started to miss this before any of my ldp/stp patches.
+
+Looking at what happens with the ldp/stp pass, I can see that in sched1 we've already allocated hard regs to the vector load destinations:
+
+    3: NOTE_INSN_BASIC_BLOCK 2
+    2: NOTE_INSN_FUNCTION_BEG
+   13: NOTE_INSN_DELETED
+    5: debug begin stmt marker
+    6: r107:DI=high(`*.LANCHOR0')
+    7: r106:DI=r107:DI+low(`*.LANCHOR0')
+      REG_EQUAL `*.LANCHOR0'
+   14: v31:V2SF=[r107:DI+low(`*.LANCHOR0')]
+   15: v30:V2SF=[r106:DI+0x20]
+   16: v30:V2SF=v31:V2SF+v30:V2SF
+      REG_DEAD v31:V2SF
+   27: v31:V2SF=[r106:DI+0x8]
+   17: [r107:DI+low(`*.LANCHOR0')]=v30:V2SF
+      REG_DEAD r107:DI
+      REG_DEAD v30:V2SF
+   18: debug begin stmt marker
+   28: v30:V2SF=[r106:DI+0x28]
+   29: v30:V2SF=v31:V2SF+v30:V2SF
+      REG_DEAD v31:V2SF
+   30: [r106:DI+0x8]=v30:V2SF
+      REG_DEAD r106:DI
+      REG_DEAD v30:V2SF
+   33: NOTE_INSN_DELETED
+
+and then there's nothing that the early ldp/stp pass can do because the would-be load pair candidates already use the same (hard) transfer register due to early RA:
+
+merge_pairs [L=1], cand vecs (14) x (27)
+analyzing pair (load=1): (14,27)
+punting on ldp due to reg conflcits (14,27)
+merge_pairs [L=1], cand vecs (15) x (28)
+analyzing pair (load=1): (15,28)
+punting on ldp due to reg conflcits (15,28)
+merge_pairs [L=0], cand vecs (17) x (30)
+analyzing pair (load=0): (17,30)
+pair (17,30): rejecting base 106 due to dataflow hazards (28,29)
+can't form pair (17,30) due to dataflow hazards
+starting the processing of deferred insns
+ending the processing of deferred insns
+
+CCing Richard S for an opinion.
+
+- User: Alex Coplan | Time: 2024-01-26 09:05:15 UTC
+  Text: It looks like the current ordering of passes is:
+
+early_ra
+sched1
+ldp_fusion1
+early_remat
+
+ISTM that ldp_fusion1 should probably be running before early_ra, but we found that running ldp_fusion1 before sched1 could lead to increased register pressure. Hmm.
+
+- User: Alex Coplan | Time: 2024-01-26 09:33:00 UTC
+  Text: FWIW, if I move ldp_fusion1 before early_ra, with:
+
+diff --git a/gcc/config/aarch64/aarch64-passes.def b/gcc/config/aarch64/aarch64-passes.def
+index 769d48f4faa..3853f6bf7a4 100644
+--- a/gcc/config/aarch64/aarch64-passes.def
++++ b/gcc/config/aarch64/aarch64-passes.def
+@@ -18,6 +18,7 @@
+    along with GCC; see the file COPYING3.  If not see
+    <http://www.gnu.org/licenses/>.  */
+
++INSERT_PASS_BEFORE (pass_sched, 1, pass_ldp_fusion);
+ INSERT_PASS_BEFORE (pass_sched, 1, pass_aarch64_early_ra);
+ INSERT_PASS_AFTER (pass_regrename, 1, pass_fma_steering);
+ INSERT_PASS_BEFORE (pass_reorder_blocks, 1, pass_track_speculation);
+@@ -25,5 +26,4 @@ INSERT_PASS_BEFORE (pass_late_thread_prologue_and_epilogue, 1, pass_switch_pstat
+ INSERT_PASS_AFTER (pass_machine_reorg, 1, pass_tag_collision_avoidance);
+ INSERT_PASS_BEFORE (pass_shorten_branches, 1, pass_insert_bti);
+ INSERT_PASS_AFTER (pass_if_after_combine, 1, pass_cc_fusion);
+-INSERT_PASS_BEFORE (pass_early_remat, 1, pass_ldp_fusion);
+ INSERT_PASS_BEFORE (pass_peephole2, 1, pass_ldp_fusion);
+
+we get:
+
+f:
+.LFB0:
+        .cfi_startproc
+        adrp    x0, .LANCHOR0
+        add     x0, x0, :lo12:.LANCHOR0
+        ldp     d31, d30, [x0]
+        ldp     d29, d28, [x0, 32]
+        fadd    v29.2s, v31.2s, v29.2s
+        fadd    v28.2s, v30.2s, v28.2s
+        stp     d29, d28, [x0]
+        ret
+
+note that this does use more registers, though, so it's not necessarily a clear win in the general case (particularly if register pressure is already high).
+
+- User: Richard Sandiford | Time: 2024-01-26 10:20:32 UTC
+  Text: early-ra does try to avoid reusing registers too soon, to increase scheduling freedom.  But in this case I imagine it handles the two statements as separate regions.  Should be fixable by carrying across a round-robin counter.
+
+- User: GCC Commits | Time: 2024-02-23 14:13:35 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:ff442719cdb64c9df9d069af88e90d51bee6fb56commitr14-9157-gff442719cdb64c9df9d069af88e90d51bee6fb56Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Fri Feb 23 14:12:55 2024 +0000
+
+    aarch64: Spread out FPR usage between RA regions [PR113613]
+    
+    early-ra already had code to do regrename-style "broadening"
+    of the allocation, to promote scheduling freedom.  However,
+    the pass divides the function into allocation regions
+    and this broadening only worked within a single region.
+    This meant that if a basic block contained one subblock
+    of FPR use, followed by a point at which no FPRs were live,
+    followed by another subblock of FPR use, the two subblocks
+    would tend to reuse the same registers.  This in turn meant
+    that it wasn't possible to form LDP/STP pairs between them.
+    
+    The failure to form LDPs and STPs in the testcase was a
+    regression from GCC 13.
+    
+    The patch adds a simple heuristic to prefer less recently
+    used registers in the event of a tie.
+    
+    gcc/PR target/113613* config/aarch64/aarch64-early-ra.cc
+            (early_ra::m_current_region): New member variable.
+            (early_ra::m_fpr_recency): Likewise.
+            (early_ra::start_new_region): Bump m_current_region.
+            (early_ra::allocate_colors): Prefer less recently used registers
+            in the event of a tie.  Add a comment to explain why we prefer(ed)
+            higher-numbered registers.
+            (early_ra::find_oldest_color): Prefer less recently used registers
+            here too.
+            (early_ra::finalize_allocation): Update recency information for
+            allocated registers.
+            (early_ra::process_blocks): Initialize m_current_region and
+            m_fpr_recency.
+    
+    gcc/testsuite/PR target/113613* gcc.target/aarch64/pr113613.c: New test.
+
+- User: Richard Sandiford | Time: 2024-02-23 14:16:30 UTC
+  Text: Fixed.
+

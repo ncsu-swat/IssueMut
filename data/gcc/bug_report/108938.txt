@@ -1,0 +1,239 @@
+Bug Summary: Missing bswap detection
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Hongtao.liu | Time: 2023-02-27 02:51:23 UTC
+  Text: This is the x86 version of this bug.
+
+
++++ This bug was initially created as a clone ofBug #108874+++
+
+
+If we look at the arm testcases in gcc.target/arm/rev16.c
+typedef unsigned int __u32;
+
+__u32
+__rev16_32_alt (__u32 x)
+{
+  return (((__u32)(x) & (__u32)0xff00ff00UL) >> 8)
+         | (((__u32)(x) & (__u32)0x00ff00ffUL) << 8);
+}
+
+__u32
+__rev16_32 (__u32 x)
+{
+  return (((__u32)(x) & (__u32)0x00ff00ffUL) << 8)
+         | (((__u32)(x) & (__u32)0xff00ff00UL) >> 8);
+}
+
+we should be able to generate bswap instructions for x86
+
+GCC fails to do so and generates:
+__rev16_32_alt(unsigned int):
+        mov     eax, edi
+        sal     edi, 8
+        shr     eax, 8
+        and     edi, -16711936
+        and     eax, 16711935
+        or      eax, edi
+        ret
+__rev16_32(unsigned int):
+        mov     eax, edi
+        shr     edi, 8
+        sal     eax, 8
+        and     edi, 16711935
+        and     eax, -16711936
+        or      eax, edi
+        ret
+
+whereas clang manages to recognise it all into:
+
+__rev16_32_alt(unsigned int):                    # @__rev16_32_alt(unsigned int)
+        mov     eax, edi
+        bswap   eax
+        ror     eax, 16
+        ret
+__rev16_32(unsigned int):                        # @__rev16_32(unsigned int)
+        mov     eax, edi
+        bswap   eax
+        ror     eax, 16
+        ret
+
+- User: Jakub Jelinek | Time: 2023-02-27 08:11:46 UTC
+  Text: That then feels like a fairly standard sequence that the bswap should handle generically if 32-bit bswap and rotate is supported.
+Right now it has the CMPNOP (0x0807060504030201) and CMPXCHG (0x0102030405060708)
+patterns it groks, so this would add for 32-bit only 0x03040102 (or, does it make sense
+for 64-bit too, then we'd need to do 3 rotates?).
+And then ARM/AArch64 could just combine this bswap + rotate into whatever it needs.
+
+- User: Hongtao.liu | Time: 2023-02-27 08:39:12 UTC
+  Text: > patterns it groks, so this would add for 32-bit only 0x03040102 (or, does it
+> make senseIt can be even more flexible, .i.e 0x04010203, 0x02030401, rotate count can be any multiple of 8.
+
+- User: Jakub Jelinek | Time: 2023-02-27 09:01:52 UTC
+  Text: You're right.  Then we should handle it more generically, basically check if either the
+CMPNOP or CMPXCHG patterns (well, their narrowed counterparts based on size) would match if rotated by a multiple of 8 and rotate optab is present for that mode.
+Then it would handle even cases like 64-bit bswap followed by a single rotate.  It needs to be done after comparison of CMPNOP and CMPXCHG non-rotated though, because we want to preserve current behavior for 16-bit nop/bswap candidates.
+
+- User: Jakub Jelinek | Time: 2023-02-27 09:40:38 UTC
+  Text: And perhaps next to rotate it could try some left or right (logical) shift too.
+
+- User: Hongtao.liu | Time: 2023-03-06 09:52:02 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #4)> And perhaps next to rotate it could try some left or right (logical) shift
+> too.Yes, we have bit mask in bswap detection, left or right (logical) shift can be reprensented as special bit mask + rotate.
+
+I'm cooking a patch, for shift cases, it looks like gimple doesn't simplify bit mask + rotate to shift. .i.e.
+
+unsigned
+foo (unsigned int a)
+{
+  unsigned int b = a & 0x00FFFFFF;
+  unsigned int c = ((b & 0x000000FF) << 8
+		    | (b & 0x0000FF00) << 8
+		    | (b & 0x00FF0000) << 8
+		    | (b & 0xFF000000) >> 24);
+  return c;
+}
+
+gcc generates
+
+foo:
+        mov     eax, edi
+        and     eax, 16777215
+        rol     eax, 8
+        ret
+
+But it can be optimized as below
+
+foo:                                    # @foo
+        mov     eax, edi
+        shl     eax, 8
+        ret
+
+- User: Jakub Jelinek | Time: 2023-03-06 09:56:37 UTC
+  Text: Can be just shift.  The bswap descriptions are zero byte means the byte is zero,
+1-8 copy of some byte and 0xff unknown.  So no need to mask anything, just look at the
+symbolic n.
+
+- User: Hongtao.liu | Time: 2023-03-06 09:57:08 UTC
+  Text: > I'm cooking a patch, for shift cases, it looks like gimple doesn't simplify
+> bit mask + rotate to shift. .i.e.
+>Create a separatePR109038for it.
+
+- User: Hongtao.liu | Time: 2023-03-06 10:05:19 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #6)> Can be just shift.  The bswap descriptions are zero byte means the byte is
+> zero,Yes, I'm also supporting byte permutation as 0x0801020004050607 which is bswap + bit_and + rotate. Shift is just one form of that(with lower/higher part masked with 0), and I hope gimple can simplify bit_and + rotate to shift that so I don't need to specially handle that in the pass.
+
+- User: Jakub Jelinek | Time: 2023-03-06 10:09:36 UTC
+  Text: Though, if more than one replacement operation is emitted, one needs to be careful not to emit more expensive replacement than the original sequence (especially if some subexpressions aren't single use).
+
+- User: Richard Biener | Time: 2023-03-06 10:41:09 UTC
+  Text: One original idea was to leverage VEC_PERM as well but then at least on x86
+a vec_perm can expand to many instructions so costing will be difficult
+(and there's obviously cross register file movements)
+
+- User: Hongtao.liu | Time: 2023-03-07 02:52:41 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #9)> Though, if more than one replacement operation is emitted, one needs to be
+> careful not to emit more expensive replacement than the original sequence
+> (especially if some subexpressions aren't single use).The patch(support swap + bit_and + rotate) doesn't show much impact on SPEC2017, is there any other benchmark that I can try to find some performance regressiones with bswap + bit_and + rotate?
+So that I'll restrict the patch to only bswp + rotate/shift.
+
+- User: Jakub Jelinek | Time: 2023-03-07 08:40:18 UTC
+  Text: (In reply to Hongtao.liu fromcomment #11)> (In reply to Jakub Jelinek fromcomment #9)
+> > Though, if more than one replacement operation is emitted, one needs to be
+> > careful not to emit more expensive replacement than the original sequence
+> > (especially if some subexpressions aren't single use).
+> 
+> The patch(support swap + bit_and + rotate) doesn't show much impact on
+> SPEC2017, is there any other benchmark that I can try to find some
+> performance regressiones with bswap + bit_and + rotate?
+> So that I'll restrict the patch to only bswp + rotate/shift.I didn't mean to look at SPEC numbers, I meant count number of statements that could be DCEd.  The code currently computes n_ops as it walks the statements that compute the value.  So, the idea would be to have another counter next to it, initialized
+very similarly, except on a statement that !has_single_use it would be reset to zero (essentially not counting that statement or any of its defining statements (transitively)).
+So it would count solely the statements that could be DCEd.
+
+- User: Hongtao.liu | Time: 2023-03-07 08:53:45 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #12)> (In reply to Hongtao.liu fromcomment #11)
+> > (In reply to Jakub Jelinek fromcomment #9)
+> > > Though, if more than one replacement operation is emitted, one needs to be
+> > > careful not to emit more expensive replacement than the original sequence
+> > > (especially if some subexpressions aren't single use).
+> > 
+> > The patch(support swap + bit_and + rotate) doesn't show much impact on
+> > SPEC2017, is there any other benchmark that I can try to find some
+> > performance regressiones with bswap + bit_and + rotate?
+> > So that I'll restrict the patch to only bswp + rotate/shift.
+> 
+> I didn't mean to look at SPEC numbers, I meant count number of statements
+> that could be DCEd.  The code currently computes n_ops as it walks the
+> statements that compute the value.  So, the idea would be to have another
+> counter next to it, initialized
+> very similarly, except on a statement that !has_single_use it would be reset
+> to zero (essentially not counting that statement or any of its defining
+> statements (transitively)).
+> So it would count solely the statements that could be DCEd.Make sense.
+
+- User: Hongtao.liu | Time: 2023-03-09 02:21:28 UTC
+  Text: Got 1 performance opportunity in GCC itself with bswap + bit_and + rotate, the Intermediate value are all single-use which can be DCEd.
+
+Got 4 performance opportunity in SPEC2017.
+bswap + bit_and + rotate + single_use: 1 
+bswap + rotate + single_use: 1
+bswap + rotate + not single_use: 2.
+
+For 2 not single use, the tectase is like
+
+foo1 (char* a, unsigned int* __restrict b)
+{
+  a[0] = b[0] >> 24;
+  a[1] = b[0] >> 16;
+  a[2] = b[0] >> 8;
+  a[3] = b[0];
+  a[4] = b[1] >> 24;
+  a[5] = b[1] >> 16;
+  a[6] = b[1] >> 8;
+  a[7] = b[1];
+}
+
+b[0] is used by multi stmt for shift, but no other places, so it actually can be DECd. So for GCC itself and SPEC2017 with -O2, bswap + bit_and + rotate optimization won't cause extra stmts.
+
+- User: Hongtao.liu | Time: 2023-03-09 05:50:38 UTC
+  Text: Createdattachment 54612[details]Patch pending for GCC14
+
+- User: GCC Commits | Time: 2023-05-30 09:54:39 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:d8545fb2c71683f407bfd96706103297d4d6e27bcommitr14-1402-gd8545fb2c71683f407bfd96706103297d4d6e27bAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Mon Mar 6 15:35:37 2023 +0800
+
+    Detect bswap + rotate for byte permutation in pass_bswap.
+    
+    The patch doesn't handle:
+      1. cast64_to_32,
+      2. memory source with rsize < range.
+    
+    gcc/ChangeLog:PR middle-end/108938* gimple-ssa-store-merging.cc (is_bswap_or_nop_p): New
+            function, cut from original find_bswap_or_nop function.
+            (find_bswap_or_nop): Add a new parameter, detect bswap +
+            rotate and save rotate result in the new parameter.
+            (bswap_replace): Add a new parameter to indicate rotate and
+            generate rotate stmt if needed.
+            (maybe_optimize_vector_constructor): Adjust for new rotate
+            parameter in the upper 2 functions.
+            (pass_optimize_bswap::execute): Ditto.
+            (imm_store_chain_info::output_merged_store): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr108938-1.c: New test.
+            * gcc.target/i386/pr108938-2.c: New test.
+            * gcc.target/i386/pr108938-3.c: New test.
+            * gcc.target/i386/pr108938-load-1.c: New test.
+            * gcc.target/i386/pr108938-load-2.c: New test.
+
+- User: Hongtao.liu | Time: 2023-05-30 23:19:13 UTC
+  Text: Fixed for GCC14.
+

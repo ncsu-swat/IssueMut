@@ -1,0 +1,92 @@
+Bug Summary: [14 Regression] FAIL: gcc.dg/vect/slp-46.c with AVX2
+Product: gcc
+Component: testsuite
+
+  (show other bugs)
+Keywords: missed-optimization, testsuite-fail
+Known to Work: 15.0
+Known to Fail: 
+
+Comments:
+- User: Richard Biener | Time: 2023-06-28 06:53:25 UTC
+  Text: With AVX2 we fail to SLP
+
+double x[1024], y[1024];
+
+void __attribute__((noipa)) foo()
+{
+  for (int i = 0; i < 512; ++i)
+    {
+      x[2*i] = y[i];
+      x[2*i+1] = y[i];
+    }
+}
+
+because we hit the following:
+
+/space/rguenther/src/gcc11queue/gcc/testsuite/gcc.dg/vect/slp-46.c:10:21: note:   ==> examining statement: _2 = y[i_12];
+/space/rguenther/src/gcc11queue/gcc/testsuite/gcc.dg/vect/slp-46.c:10:21: missed:   peeling for gaps insufficient for access
+/space/rguenther/src/gcc11queue/gcc/testsuite/gcc.dg/vect/slp-46.c:12:17: missed:   not vectorized: relevant stmt not supported: _2 = y[i_12];
+/space/rguenther/src/gcc11queue/gcc/testsuite/gcc.dg/vect/slp-46.c:10:21: note:   removing SLP instance operations starting from: x[_1] = _2;
+/space/rguenther/src/gcc11queue/gcc/testsuite/gcc.dg/vect/slp-46.c:10:21: missed:  unsupported SLP instances
+/space/rguenther/src/gcc11queue/gcc/testsuite/gcc.dg/vect/slp-46.c:10:21: note:  re-trying with SLP disabled
+
+the issue is that in the last vector iteration with VF=2 we are accessing
+{ i, i+1, i+2, i+3 }, if we're peeling at least a single scalar iteration
+we still access possibly one too much elements.
+
+The simplest solution would be to access { i, i+1 } only which I think
+we already can do.  The other solution is to peel N scalar
+iterations or apply masking to not access elements in the gap if the ISA
+supports that.
+
+- User: Richard Biener | Time: 2023-10-17 12:09:12 UTC
+  Text: Confirmed now.
+
+- User: Richard Biener | Time: 2024-05-07 07:40:54 UTC
+  Text: GCC 14.1 is being released, retargeting bugs to GCC 14.2.
+
+- User: GCC Commits | Time: 2024-06-13 06:22:45 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:1fe55a1794863b5ad9eeca5062782834716016b2commitr15-1238-g1fe55a1794863b5ad9eeca5062782834716016b2Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Jun 7 11:29:05 2024 +0200
+
+    tree-optimization/114107 - avoid peeling for gaps in more cases
+    
+    The following refactors the code to detect necessary peeling for
+    gaps, in particular thePR103116case when there is no gap but
+    the group size is smaller than the vector size.  The testcase inPR114107shows we fail to SLP
+    
+      for (int i=0; i<n; i++)
+        for (int k=0; k<4; k++)
+          data[4*i+k] *= factor[i];
+    
+    because peeling one scalar iteration isn't enough to cover a gap
+    of 3 elements of factor[i].  But the code detecting this is placed
+    after the logic that detects cases we handle properly already as
+    we'd code generate { factor[i], 0., 0., 0. } for V4DFmode vectorization
+    already.  In fact the check to detect when peeling a single iteration
+    isn't enough seems improperly guarded as it should apply to all cases.
+    
+    I'm not sure we correctly handle VMAT_CONTIGUOUS_REVERSE but I
+    checked that VMAT_STRIDED_SLP and VMAT_ELEMENTWISE correctly avoid
+    touching excess elements.
+    
+    With this change we can use SLP for the above testcase and thePR103116testcases no longer require an epilogue on x86-64.  It
+    might be different on other targets so I made those testcases
+    runtime FAIL only instead of relying on dump scanning there's
+    currently no easy way to properly constrain.PR tree-optimization/114107PR tree-optimization/110445* tree-vect-stmts.cc (get_group_load_store_type): Refactor
+            contiguous access case.  Make sure peeling for gap constraints
+            are always tested and consistently relax when we know we can
+            avoid touching excess elements during code generation.  But
+            rewrite the check poly-int aware.
+    
+            * gcc.dg/vect/pr114107.c: New testcase.
+            * gcc.dg/vect/pr103116-1.c: Adjust.
+            * gcc.dg/vect/pr103116-2.c: Likewise.
+
+- User: Richard Biener | Time: 2024-06-13 07:11:52 UTC
+  Text: We now SLP this on trunk, the testsuite fail when using -mavx2 is gone.
+
+- User: Richard Biener | Time: 2024-07-17 08:45:22 UTC
+  Text: So fixed.  I'm not planning to backport.
+

@@ -1,0 +1,133 @@
+Bug Summary: [13 Regression] middle-end Missed vectorization: failed to vectorize simple reduction max since GCC-13
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization, needs-bisection
+Known to Work: 13.2.1, 14.0
+Known to Fail: 13.2.0
+
+Comments:
+- User: JuzheZhong | Time: 2023-12-11 14:44:00 UTC
+  Text: #include <algorithm>
+
+int foo(int *a, int n) {
+  int max = -987654321;
+  for (int i = 0; i < n; ++i)
+    max = std::max(max, a[i]);
+
+  return max;
+}
+
+This is a simple loop reduction max.
+
+Reference:https://godbolt.org/z/WMvfobK4bFrom the reference, we can know GCC-12 can vectorize it but failed to vectorize
+it on both GCC-13 and GCC-14.
+
+- User: Andrew Pinski | Time: 2023-12-11 15:33:53 UTC
+  Text: _29 = MAX_EXPR <_16, prephitmp_18>;
+  prephitmp_23 = _29;
+
+- User: Andrew Pinski | Time: 2023-12-11 15:34:50 UTC
+  Text: Confirmed.
+
+The difference in IR is minor but causes the confusion:
+
+  _29 = MAX_EXPR <_16, prephitmp_18>;
+  prephitmp_23 = _29;
+
+vs:
+  prephitmp_23 = MAX_EXPR <_16, prephitmp_18>;
+
+- User: Richard Biener | Time: 2023-12-12 07:21:15 UTC
+  Text: Yup, unpropagated copies can confuse the vectorizer.  Let me look into it.
+
+- User: Richard Biener | Time: 2023-12-12 12:49:49 UTC
+  Text: So in this case VN doesn't "fix" it because
+
+Value numbering stmt = _29 = MAX_EXPR <_16, prephitmp_18>;
+Setting value number of _29 to _29 (changed)
+Making available beyond BB3 _29 for value _29
+Value numbering stmt = prephitmp_23 = _29;
+Setting value number of prephitmp_23 to _29 (changed)
+...
+Keeping eliminated stmt live as copy because of out-of-region uses
+
+as the loop header is using this on the backedge and we are explicitly
+excluding the latch block from processing to avoid CSE of PHIs(?).
+I think including the latch block should be fine, butPR90402is what
+I added this special case for (the testcase still passes after reverting).
+
+- User: GCC Commits | Time: 2023-12-12 14:14:44 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:878cb5acf0c499702ffd315e273f55e8bd0970b8commitr14-6457-g878cb5acf0c499702ffd315e273f55e8bd0970b8Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Dec 12 14:01:47 2023 +0100
+
+    tree-optimization/112961 - include latch in if-conversion CSE
+    
+    The following makes sure to also process the (empty) latch when
+    performing CSE on the if-converted loop body.  That's important
+    to get all uses of copies propagated out on the backedge as well.
+    To avoid CSE on the PHI nodes itself which is prohibitive
+    (seePR90402) this temporarily adds a fake entry edge to the loop.PR tree-optimization/112961* tree-if-conv.cc (tree_if_conversion): Instead of excluding
+            the latch block from VN, add a fake entry edge.
+    
+            * g++.dg/vect/pr112961.cc: New testcase.
+
+- User: Richard Biener | Time: 2023-12-12 14:15:05 UTC
+  Text: Fixed on trunk sofar.
+
+- User: JuzheZhong | Time: 2023-12-12 22:50:34 UTC
+  Text: Thanks Richard.
+
+Fixed.
+
+- User: Richard Biener | Time: 2023-12-13 07:33:27 UTC
+  Text: Still eventually for backporting.
+
+- User: JuzheZhong | Time: 2023-12-13 07:35:19 UTC
+  Text: (In reply to Richard Biener fromcomment #8)> Still eventually for backporting.Oh. I am sorry for closing it (I didn't notice it needs to be backport).
+
+- User: GCC Commits | Time: 2023-12-13 08:44:24 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:93db32a4146afd2a6d90410691351a56768167c9commitr14-6483-g93db32a4146afd2a6d90410691351a56768167c9Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Dec 13 08:45:58 2023 +0100
+
+    tree-optimization/112991 - re-doPR112961fix
+    
+    The following does away with the fake edge adding as in the originalPR112961fix and instead exposes handling of entry PHIs as additional
+    parameter of the region VN run.PR tree-optimization/112991PR tree-optimization/112961* tree-ssa-sccvn.h (do_rpo_vn): Add skip_entry_phis argument.
+            * tree-ssa-sccvn.cc (do_rpo_vn): Likewise.
+            (do_rpo_vn_1): Likewise, merge with auto-processing.
+            (run_rpo_vn): Adjust.
+            (pass_fre::execute): Likewise.
+            * tree-if-conv.cc (tree_if_conversion): Revert last change.
+            Value-number latch block but disable value-numbering of
+            entry PHIs.
+            * tree-ssa-uninit.cc (execute_early_warn_uninitialized): Adjust.
+    
+            * gcc.dg/torture/pr112991.c: New testcase.
+
+- User: GCC Commits | Time: 2024-05-08 11:50:01 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:25add4b65a3bac262685d290a4dc93884a022576commitr13-8719-g25add4b65a3bac262685d290a4dc93884a022576Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Dec 13 08:45:58 2023 +0100
+
+    tree-optimization/112991 - re-doPR112961fix
+    
+    The following does away with the fake edge adding as in the originalPR112961fix and instead exposes handling of entry PHIs as additional
+    parameter of the region VN run.PR tree-optimization/112991PR tree-optimization/112961* tree-ssa-sccvn.h (do_rpo_vn): Add skip_entry_phis argument.
+            * tree-ssa-sccvn.cc (do_rpo_vn): Likewise.
+            (do_rpo_vn_1): Likewise, merge with auto-processing.
+            (run_rpo_vn): Adjust.
+            (pass_fre::execute): Likewise.
+            * tree-if-conv.cc (tree_if_conversion): Revert last change.
+            Value-number latch block but disable value-numbering of
+            entry PHIs.
+            * tree-ssa-uninit.cc (execute_early_warn_uninitialized): Adjust.
+    
+            * gcc.dg/torture/pr112991.c: New testcase.
+            * g++.dg/vect/pr112961.cc: Likewise.
+    
+    (cherry picked from commit 93db32a4146afd2a6d90410691351a56768167c9)
+
+- User: Richard Biener | Time: 2024-05-08 11:51:07 UTC
+  Text: Fixed.
+

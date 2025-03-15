@@ -1,0 +1,244 @@
+Bug Summary: [15 Regression] wrong code at -O3 with "-fno-unswitch-loops" on x86_64-linux-gnu since r15-4397-g70f59d2a1c51bd
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2024-10-17 17:15:18 UTC
+  Text: It appears to be a very recent regression as it doesn't reproduce with the GCC build from Compiler Explorer.
+
+[522] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20241016 (experimental) (GCC) 
+[523] % 
+[523] % gcctk -O3 -fno-unswitch-loops small.c
+[524] % ./a.out
+Aborted
+[525] % 
+[525] % cat small.c
+int a, b, c, d;
+int main() {
+  int e[6];
+  for (d = 0; d < 6; d++)
+    if (!c)
+      e[d] = 0;
+  for (; b < 6; b++)
+    a = e[b];
+  if (a != 0)
+    __builtin_abort();
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2024-10-17 17:41:54 UTC
+  Text: I am thinkingr15-4397-g70f59d2a1c51bd.
+
+- User: Andrew Pinski | Time: 2024-10-17 19:51:12 UTC
+  Text: Confirmed. Works on  aarch64 with `-O3 -fno-unswitch-loops -fno-vect-cost-model` which produces the same gimple IR .
+
+- User: Andrew Pinski | Time: 2024-10-17 20:21:54 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> I am thinkingr15-4397-g70f59d2a1c51bd.Confirmed it is that. Note since aarch64 produces the same IR even with the andn, I am thinking some latent bug in the andn handling. 
+
+But looking at the .optimized we have:
+  vect__ifc__49.29_73 = MEM <vector(2) int> [(int *)&e + 16B];
+
+
+But e is not initialized ....
+
+- User: Andrew Pinski | Time: 2024-10-17 20:28:57 UTC
+  Text: The bug I think is ifcvt:
+
+  _ifc__30 = e[d.3_23];
+  _ifc__37 = _24 ? 0 : _ifc__30;
+  e[d.3_23] = _ifc__37;
+
+It was a bug beforer15-4397-g70f59d2a1c51bdbut it didn't get exposed beforehand in the instructions; even though it was there.
+
+- User: Andrew Pinski | Time: 2024-10-17 20:39:51 UTC
+  Text: So in .optimize we have:
+
+  _24 = c.0_1 == 0; // 1 because c is 0
+  _27 = (unsigned int) _24;
+  patt_36 = -_27; // -1
+  _68 = {patt_36, patt_36}; // {-1, -1}
+  mask_patt_42.26_69 = _68 != { 0, 0 }; // {-1,-1}
+  _22 = VIEW_CONVERT_EXPR<vector(2) int>(mask_patt_42.26_69);
+  vect_patt_43.30_74 = .BIT_ANDN (vect__ifc__49.29_73, _22); //
+  _79 = BIT_FIELD_REF <vect_patt_43.30_74, 32, 32>; // 0
+
+
+
+        cmpl    $1, %eax
+        pxor    %xmm2, %xmm2 // 0
+        movl    $6, b(%rip)
+        sbbl    %eax, %eax // 0
+        movd    %eax, %xmm0 // 0
+        pshufd  $0xe0, %xmm0, %xmm0 // {0,0}
+        pcmpeqd %xmm2, %xmm0 // xmm0 = {-1,-1}
+        pcmpeqd %xmm2, %xmm0 // xmm0 = {0,0}
+        pandn   %xmm0, %xmm1 // xmm1 = xmm0 & ~xmm1 -> 0 & ??? -> 0
+        pshufd  $0xe5, %xmm1, %xmm3 //extract 0
+        movd    %xmm3, %eax 
+        movd    %xmm3, a(%rip)
+
+But we are getting -1 ...
+
+- User: Andrew Pinski | Time: 2024-10-17 20:48:24 UTC
+  Text: before is beforer15-4397-g70f59d2a1c51bd--- before.s    2024-10-17 20:17:06.172435278 +0000
++++ after.s     2024-10-17 20:15:24.703424849 +0000
+@@ -15,21 +15,21 @@ main:
+        movl    c(%rip), %eax
+        movl    a(%rip), %esi
+        movl    $6, d(%rip)
+-       movq    16(%rsp), %xmm2
++       movq    16(%rsp), %xmm1
+        testl   %eax, %eax
+        sete    %dl
+        cmpl    $5, b(%rip)
+        jg      .L3
+        movzbl  %dl, %eax
+-       pxor    %xmm1, %xmm1
++       pxor    %xmm2, %xmm2
+        movl    $6, b(%rip)
+        negl    %eax
+        movd    %eax, %xmm3
+        pshufd  $0xe0, %xmm3, %xmm0
+-       pcmpeqd %xmm1, %xmm0
+-       pcmpeqd %xmm1, %xmm0
+-       pandn   %xmm2, %xmm0
+-       pshufd  $0xe5, %xmm0, %xmm4
++       pcmpeqd %xmm2, %xmm0
++       pcmpeqd %xmm2, %xmm0
++       pandn   %xmm0, %xmm1
++       pshufd  $0xe5, %xmm1, %xmm4
+        movd    %xmm4, %esi
+        movd    %xmm4, a(%rip)
+ .L3:
+
+
+The andn is swapped.
+
+- User: Uroš Bizjak | Time: 2024-10-17 20:53:37 UTC
+  Text: (In reply to Andrew Pinski fromcomment #6)> before is beforer15-4397-g70f59d2a1c51bd> -       movq    16(%rsp), %xmm2
+> +       movq    16(%rsp), %xmm1Isn't this reading from uninitialized stack slot?
+
+movq    16(%rsp), %xmm2 # MEM <vector(2) int> [(int *)&e + 16B], vect__ifc__49.29
+
+- User: Andrew Pinski | Time: 2024-10-17 20:56:10 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #7)> (In reply to Andrew Pinski fromcomment #6)
+> > before is beforer15-4397-g70f59d2a1c51bd> > -       movq    16(%rsp), %xmm2
+> > +       movq    16(%rsp), %xmm1
+> 
+> Isn't this reading from uninitialized stack slot?
+> 
+> movq    16(%rsp), %xmm2 # MEM <vector(2) int> [(int *)&e + 16B],
+> vect__ifc__49.29Yes but in this case the mask will 0 forcing it all to 0 . But the mask is swapping around to -1 for some reason.
+
+- User: Uroš Bizjak | Time: 2024-10-17 20:57:28 UTC
+  Text: (In reply to Andrew Pinski fromcomment #6)> The andn is swapped.Indeed:
+
++(define_expand "andn<mode>3"
++  [(set (match_operand:MMXMODEI 0 "register_operand")
++        (and:MMXMODEI
++          (not:MMXMODEI (match_operand:MMXMODEI 1 "register_operand"))
++          (match_operand:MMXMODEI 2 "register_operand")))]
++  "TARGET_SSE2")
+
++(define_expand "andn<mode>3"
++  [(set (match_operand:VI 0 "register_operand")
++       (and:VI
++         (not:VI (match_operand:VI 2 "register_operand"))
++         (match_operand:VI 1 "register_operand")))]
++  "TARGET_SSE2")
+
+Which operand order is correct?
+
+- User: Andrew Pinski | Time: 2024-10-17 20:59:28 UTC
+  Text: (In reply to Andrew Pinski fromcomment #8)> Yes but in this case the mask will 0 forcing it all to 0 . But the mask is
+> swapping around to -1 for some reason.Also if you are worried about that, you can do:
+```
+int a, b, c, d;
+static int e[6]={0,0,0,0,0,0};
+int main() {
+  for (d = 0; d < 6; d++)
+    if (!c)
+      e[d] = 0;
+  for (; b < 6; b++)
+    a = e[b];
+  if (a != 0)
+    __builtin_abort();
+  return 0;
+}
+
+```
+And compile with `-O3 -fno-unswitch-loops -fallow-store-data-races` to have the same issue.
+
+- User: Andrew Pinski | Time: 2024-10-17 21:01:51 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #9)> (In reply to Andrew Pinski fromcomment #6)
+> 
+> > The andn is swapped.
+> Indeed:
+> 
+> +(define_expand "andn<mode>3"
+> +  [(set (match_operand:MMXMODEI 0 "register_operand")
+> +        (and:MMXMODEI
+> +          (not:MMXMODEI (match_operand:MMXMODEI 1 "register_operand"))
+> +          (match_operand:MMXMODEI 2 "register_operand")))]
+> +  "TARGET_SSE2")
+> 
+> +(define_expand "andn<mode>3"
+> +  [(set (match_operand:VI 0 "register_operand")
+> +       (and:VI
+> +         (not:VI (match_operand:VI 2 "register_operand"))
+> +         (match_operand:VI 1 "register_operand")))]
+> +  "TARGET_SSE2")
+> 
+> Which operand order is correct?The correct one is operand 2 with the not.
+Fromhttps://gcc.gnu.org/onlinedocs/gccint/Standard-Names.html:
+‘andnm3’
+Like andm3, but it uses bitwise-complement of operand 2 rather than operand 2 itself.
+
+- User: Uroš Bizjak | Time: 2024-10-17 21:19:37 UTC
+  Text: Createdattachment 59373[details]Proposed patch
+
+Patch in testing.
+
+- User: Andrew Pinski | Time: 2024-10-17 22:06:29 UTC
+  Text: ***Bug 117194has been marked as a duplicate of this bug. ***
+
+- User: cuilili | Time: 2024-10-18 02:08:33 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #12)> Createdattachment 59373[details]> Proposed patch
+> 
+> Patch in testing.Sorry, I made a mistake here, thanks!
+
+- User: Andrew Pinski | Time: 2024-10-18 04:14:52 UTC
+  Text: ***Bug 117200has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2024-10-18 14:05:09 UTC
+  Text: The master branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:3a12ac403251e0a1542609d7a4d8a464a5e1dc86commitr15-4479-g3a12ac403251e0a1542609d7a4d8a464a5e1dc86Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Fri Oct 18 16:04:12 2024 +0200
+
+    i386: Fix the order of operands in andn<MMXMODEI:mode>3 [PR117192]
+    
+    Fix the order of operands in andn<MMXMODEI:mode>3 expander to comply
+    with the specification, where bitwise-complement applies to operand 2.PR target/117192gcc/ChangeLog:
+    
+            * config/i386/mmx.md (andn<MMXMODEI:mode>3): Swap operand
+            indexes 1 and 2 to comply with andn specification.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr117192.c: New test.
+
+- User: Uroš Bizjak | Time: 2024-10-18 14:07:42 UTC
+  Text: Fixed.
+

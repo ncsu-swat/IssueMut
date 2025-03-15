@@ -1,0 +1,177 @@
+Bug Summary: [14 Regression] ICE avx512 with -ftrapv since r14-5076
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Michal Jireš | Time: 2023-11-09 16:51:02 UTC
+  Text: Following reduction of testcase avx-vandpd-1.c causes ICE with -mavx512dq -ftrapv
+Bisection points tor14-5076$ cat included.c
+long *e;
+int n, i, err;
+void fn() {
+  for (; i < n; i++)
+    if (e[i])
+      err++;
+}
+
+$ gcc included.c -Ofast -mavx512dq -ftrapv
+during GIMPLE pass: vect
+included.c: In function ‘fn’:
+included.c:3:6: internal compiler error: in vect_finish_replace_stmt, at tree-vect-stmts.cc:1353
+    3 | void fn() {
+      |      ^~
+0x91fc95 vect_finish_replace_stmt(vec_info*, _stmt_vec_info*, gimple*)
+	/home/mjires/git/GCC/master/gcc/tree-vect-stmts.cc:1353
+0x1296bd6 vectorize_fold_left_reduction
+	/home/mjires/git/GCC/master/gcc/tree-vect-loop.cc:7191
+0x1296bd6 vect_transform_reduction(_loop_vec_info*, _stmt_vec_info*, gimple_stmt_iterator*, gimple**, _slp_tree*)
+	/home/mjires/git/GCC/master/gcc/tree-vect-loop.cc:8456
+0x1fac0f5 vect_transform_stmt(vec_info*, _stmt_vec_info*, gimple_stmt_iterator*, _slp_tree*, _slp_instance*)
+	/home/mjires/git/GCC/master/gcc/tree-vect-stmts.cc:13069
+0x1287d1f vect_transform_loop_stmt
+	/home/mjires/git/GCC/master/gcc/tree-vect-loop.cc:11325
+0x12acf13 vect_transform_loop(_loop_vec_info*, gimple*)
+	/home/mjires/git/GCC/master/gcc/tree-vect-loop.cc:11770
+0x12ee5a1 vect_transform_loops
+	/home/mjires/git/GCC/master/gcc/tree-vectorizer.cc:1006
+0x12eebac try_vectorize_loop_1
+	/home/mjires/git/GCC/master/gcc/tree-vectorizer.cc:1152
+0x12eebac try_vectorize_loop
+	/home/mjires/git/GCC/master/gcc/tree-vectorizer.cc:1182
+0x12eef34 execute
+	/home/mjires/git/GCC/master/gcc/tree-vectorizer.cc:1298
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+
+
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=/home/mjires/built/master/bin/gcc
+COLLECT_LTO_WRAPPER=/home/mjires/built/master/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /home/mjires/git/GCC/master/configure --prefix=/home/mjires/built/master --disable-bootstrap --enable-languages=c,c++,fortran,lto --disable-multilib --disable-libsanitizer --enable-checking
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20231109 (experimental) (GCC)
+
+- User: Robin Dapp | Time: 2023-11-09 17:42:06 UTC
+  Text: We fail at:
+
+void
+vect_finish_replace_stmt (vec_info *vinfo,
+			  stmt_vec_info stmt_info, gimple *vec_stmt)
+{
+  gimple *scalar_stmt = vect_orig_stmt (stmt_info)->stmt;
+  gcc_assert (gimple_get_lhs (scalar_stmt) == gimple_get_lhs (vec_stmt));
+
+where
+
+scalar_stmt = _ifc__40 = .COND_ADD (_22, err_lsm.9_10, 1, err_lsm.9_10);
+and
+patt_7 = stmp_patt_7.23_123 + stmp_patt_7.23_124;
+
+It happens when we expand the reduction into separate unconditional statements.
+
+- User: Robin Dapp | Time: 2023-11-10 07:54:32 UTC
+  Text: I tested
+
+diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
+index a544bc9b059..257fd40793e 100644
+--- a/gcc/tree-vect-loop.cc
++++ b/gcc/tree-vect-loop.cc
+@@ -7084,7 +7084,7 @@ vectorize_fold_left_reduction (loop_vec_info loop_vinfo,
+                                         opmask, &vec_opmask);
+     }
+ 
+-  gimple *sdef = scalar_dest_def_info->stmt;
++  gimple *sdef = vect_orig_stmt (scalar_dest_def_info)->stmt;
+
+overnight on x86 and aarch64.  This seems to help for the reduced testcase.
+
+It appears as if we "look through" a statement pattern in vect_finish_replace_stmt but not before when we replace the newly created vector statement's lhs.  Then the lhs is the statement pattern's lhs while in vect_finish_replace_stmt we assert that it's from the statement the pattern replaced.
+
+- User: Richard Biener | Time: 2023-11-10 08:24:58 UTC
+  Text: (In reply to Robin Dapp fromcomment #2)> I tested
+> 
+> diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
+> index a544bc9b059..257fd40793e 100644
+> --- a/gcc/tree-vect-loop.cc
+> +++ b/gcc/tree-vect-loop.cc
+> @@ -7084,7 +7084,7 @@ vectorize_fold_left_reduction (loop_vec_info
+> loop_vinfo,
+>                                          opmask, &vec_opmask);
+>      }
+>  
+> -  gimple *sdef = scalar_dest_def_info->stmt;
+> +  gimple *sdef = vect_orig_stmt (scalar_dest_def_info)->stmt;
+> 
+> overnight on x86 and aarch64.  This seems to help for the reduced testcase.
+> 
+> It appears as if we "look through" a statement pattern in
+> vect_finish_replace_stmt but not before when we replace the newly created
+> vector statement's lhs.  Then the lhs is the statement pattern's lhs while
+> in vect_finish_replace_stmt we assert that it's from the statement the
+> pattern replaced.Hmm, that will only work if the orig stmt is the root of the pattern
+sequence.  But otherwise it looks correct to me.
+
+- User: Robin Dapp | Time: 2023-11-10 08:30:08 UTC
+  Text: Is there another way to make it more robust?
+
+Or does the existing
+
+void
+vect_finish_replace_stmt (vec_info *vinfo,
+			  stmt_vec_info stmt_info, gimple *vec_stmt)
+{
+  gimple *scalar_stmt = vect_orig_stmt (stmt_info)->stmt;
+
+have the same problem?
+
+- User: Richard Biener | Time: 2023-11-10 09:01:34 UTC
+  Text: (In reply to Robin Dapp fromcomment #4)> Is there another way to make it more robust?
+> 
+> Or does the existing
+> 
+> void
+> vect_finish_replace_stmt (vec_info *vinfo,
+> 			  stmt_vec_info stmt_info, gimple *vec_stmt)
+> {
+>   gimple *scalar_stmt = vect_orig_stmt (stmt_info)->stmt;
+> 
+> have the same problem?Well, yeah, it also implicitly assumes that.  I couldn't come up with
+the "correct" assert quickly, so I didn't suggest any.  That is, just
+go with your patch.
+
+- User: GCC Commits | Time: 2023-11-10 13:55:45 UTC
+  Text: The master branch has been updated by Robin Dapp <rdapp@gcc.gnu.org>:https://gcc.gnu.org/g:d7b971cf61ae0091dbc777c9aa056e6f1293da2fcommitr14-5322-gd7b971cf61ae0091dbc777c9aa056e6f1293da2fAuthor: Robin Dapp <rdapp@ventanamicro.com>
+Date:   Fri Nov 10 08:56:18 2023 +0100
+
+    vect: Look through pattern stmt in fold_left_reduction.
+    
+    It appears as if we "look through" a statement pattern in
+    vect_finish_replace_stmt but not before when we replace the newly
+    created vector statement's lhs.  Then the lhs is the statement pattern's
+    lhs while in vect_finish_replace_stmt we assert that it's from the
+    statement the pattern replaced.
+    
+    This patch uses vect_orig_stmt on the scalar destination's definition so
+    the replaced statement is used everywhere.
+    
+    gcc/ChangeLog:PR tree-optimization/112464* tree-vect-loop.cc (vectorize_fold_left_reduction): Use
+            vect_orig_stmt on scalar_dest_def_info.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr112464.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-11-22 18:52:13 UTC
+  Text: So, can this be closed as fixed?
+
+- User: Robin Dapp | Time: 2023-11-22 19:33:25 UTC
+  Text: Fixed.
+

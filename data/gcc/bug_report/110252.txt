@@ -1,0 +1,245 @@
+Bug Summary: [14 Regression] Wrong code at -O2/3/s on x86_64-linux-gnu
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Shaohua Li | Time: 2023-06-14 14:52:29 UTC
+  Text: This seems to be a recent regression. 
+
+Compiler explorer:https://godbolt.org/z/TW97cdYxv$ cat a.c
+int printf(const char *, ...);
+int d, f;
+const char a = 239;
+short e, b, h = 2;
+long g;
+short *c = &e;
+int *i = &f;
+int(j)(int k, int l) { return k < 0 ? k : k >> l; }
+int main() {
+  for (;;) {
+    g = (char)d + a;
+    b = h && j(g, 6);
+    *c = b;
+    *i = e;
+    break;
+  }
+  printf("%d\n", f);
+}
+$
+$ gcc-tk -O0 a.c && ./a.out
+1
+$ gcc-tk -O1 a.c && ./a.out
+1
+$ gcc-tk -O2 a.c && ./a.out
+-1
+$ gcc-tk -O3 a.c && ./a.out
+-1
+$ gcc-tk -Os a.c && ./a.out
+-1
+$
+$ gcc-tk -v
+Using built-in specs.
+COLLECT_GCC=gcc-tk
+COLLECT_LTO_WRAPPER=/zdata/shaoli/compilers/ccbuilder-compilers/gcc-bf470895905e9152424076d1630a9d2c60de023b/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../configure --disable-multilib --disable-bootstrap --enable-languages=c,c++ --prefix=/zdata/shaoli/compilers/ccbuilder-compilers/gcc-bf470895905e9152424076d1630a9d2c60de023b
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20230612 (experimental) (GCC) 
+$
+
+- User: Andrew Pinski | Time: 2023-06-14 16:13:44 UTC
+  Text: So phiopt does this:
+phiopt match-simplify trying:
+	_4 >= 0 ? iftmp.0_16 : 1
+Matching expression match.pd:1990, gimple-match-5.cc:23
+Matching expression match.pd:1990, gimple-match-5.cc:23
+Applying pattern match.pd:5283, gimple-match-2.cc:942
+Applying pattern match.pd:1378, gimple-match-2.cc:7699
+Applying pattern match.pd:1885, gimple-match-3.cc:2770
+Applying pattern match.pd:4745, gimple-match-7.cc:15371
+Folded into the sequence:
+_22 = _4 >= 0;
+_21 = (int) _22;
+_23 = _4 < 0;
+_24 = (int) _23;
+_25 = iftmp.0_16 | _24;
+statement un-sinked:
+iftmp.0_16 = _4 >> 6;
+
+The problem is `_4 >> 6` only has a [0,1] range iff `_4 < 0`.
+I have to think of a way of fixing this without too much trouble. Maybe reverting the patch might be the best for now. But there could be other issues dealing with phiopt and match-and-simplify later on for a similar reasons ...
+
+- User: Andrew Pinski | Time: 2023-06-14 21:09:35 UTC
+  Text: Createdattachment 55323[details]Patch which fixes this issue
+
+This patch fixes the issue by temporary removing the flow sensitive information on the statement that will be moved while trying out match-and-simplify.
+
+We don't want to remove the flow sensitive information always because if we don't decide to move it in the end, we just lost it.
+I am not the best at naming things so the name of the class will most likely change before I submit the patch. But I wanted to give a preview here.
+Note this is a latent bug in phiopt since the match-and-simplify usage was added really; just only recently has been noticed due to range information being used more in match.
+
+- User: Andrew Pinski | Time: 2023-06-15 02:13:03 UTC
+  Text: smallest testcase:
+```
+signed char f() __attribute__((__noipa__));
+signed char f() { return 0; }
+int main()
+{
+  int g = f() - 1;
+  int e = g < 0 ? 1 : ((g >> (8-2))!=0);
+  asm("":"+r"(e));
+  if (e != 1)
+    __builtin_abort();
+}
+```
+
+Note I changed 6 to 8-2 as it better explains what is going on and why 6 is the one needed here.
+Second the 239 is just changed over to -1 as it just needs any subtraction.
+third is j is inlined and the != is moved over to the conditional expression.
+4th and not least, removed all of the pointers and just changed over to using inline-asm to hide the range of e at the if statement.
+
+- User: Andrew Pinski | Time: 2023-06-15 03:11:09 UTC
+  Text: here is another testcase which is reduced from sel-sched.cc which we currently miscompile:
+```
+[[gnu::noipa]]
+int g(int min_need_stall)
+{
+  return  min_need_stall < 0 ? 1 : ((min_need_stall) < (1) ? (min_need_stall) : (1));
+}
+int main(void)
+{
+  for(int i = -100; i <= 100; i++)
+    {
+      int t = g(i);
+      if (t != (i!=0))
+        __builtin_abort();
+    }
+}
+```
+
+Note g really could be reduced down to (min_need_stall != 0) but we don't do that currently (nor does clang).
+
+- User: Richard Biener | Time: 2023-06-15 06:22:47 UTC
+  Text: You can probably follow what maybe_fold_comparisons_from_match_pd does,
+possibly exactly the same thing (or even use a similar helper extended to
+maybe_fold_cond_expr_from_match_pd?!)
+
+- User: Andrew Pinski | Time: 2023-06-21 22:51:46 UTC
+  Text: ***Bug 110337has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-06-22 15:36:04 UTC
+  Text: ***Bug 110365has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-06-28 20:31:39 UTC
+  Text: ***Bug 110446has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-06-28 20:35:10 UTC
+  Text: Another testcase (fromPR 110446):
+```
+unsigned int a = 1387579096U;
+void sinkandcheck(unsigned b) __attribute__((noipa));
+void sinkandcheck(unsigned b)
+{
+        if (a != b)
+        __builtin_abort();
+}
+int main() {
+    a = 1 < (~a) ? 1 : (~a);
+    sinkandcheck(1);
+    return 0;
+}
+```
+
+- User: Zhendong Su | Time: 2023-06-29 09:22:10 UTC
+  Text: Another very likely related test.
+
+Compiler Explorer:https://godbolt.org/z/1n5nsefWx[557] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/home/suz/suz-local/software/local/gcc-trunk/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --disable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20230629 (experimental) [masterr14-924-gd709841ae0f] (GCC) 
+[558] % 
+[558] % gcctk -O2 small.c
+[559] % ./a.out
+Aborted
+[560] % gcctk -O1 small.c; ./a.out
+[561] % 
+[561] % cat small.c
+int a, b = 2, c = 2;
+int main() {
+  b = ~(1 % (a ^ (b - (1 && c) || c & b)));
+  if (b < -1)
+    __builtin_abort();
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2023-06-29 15:42:16 UTC
+  Text: ***Bug 110475has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-06-30 05:18:07 UTC
+  Text: ***Bug 110494has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-07-03 11:31:53 UTC
+  Text: ***Bug 110532has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-07-06 06:12:12 UTC
+  Text: ***Bug 110569has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-07-08 17:16:07 UTC
+  Text: ***Bug 110599has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-07-15 03:21:38 UTC
+  Text: Updated patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2023-July/624563.html(depends on:https://gcc.gnu.org/pipermail/gcc-patches/2023-July/624562.html)
+
+- User: Andrew Pinski | Time: 2023-07-19 07:41:14 UTC
+  Text: ***Bug 110732has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2023-07-19 16:19:34 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:8c79b49cd4fa742f7be739dd21fd2aa040cc1ba3commitr14-2650-g8c79b49cd4fa742f7be739dd21fd2aa040cc1ba3Author: Andrew Pinski <apinski@marvell.com>
+Date:   Fri Jul 14 15:55:34 2023 -0700
+
+    [PATCH] Fix tree-opt/110252: wrong code due to phiopt using flow sensitive info during match
+    
+    Match will query ranger via tree_nonzero_bits/get_nonzero_bits for 2 and 3rd
+    operand of the COND_EXPR and phiopt tries to do create the COND_EXPR even if we moving
+    one statement. That one statement could have some flow sensitive information on it
+    based on the condition that is for the COND_EXPR but that might create wrong code
+    if the statement was moved out.
+    
+    This is similar to the previous version of the patch except now we use
+    flow_sensitive_info_storage instead of manually doing the save/restore
+    and also handle all defs on a gimple statement rather than just for lhs
+    of the gimple statement. Oh and a few more testcases were added that
+    was failing before.
+    
+    OK? Bootsrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/110252gcc/ChangeLog:
+    
+            * tree-ssa-phiopt.cc (class auto_flow_sensitive): New class.
+            (auto_flow_sensitive::auto_flow_sensitive): New constructor.
+            (auto_flow_sensitive::~auto_flow_sensitive): New deconstructor.
+            (match_simplify_replacement): Temporarily
+            remove the flow sensitive info on the two statements that might
+            be moved.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/phi-opt-25b.c: Updated as
+            __builtin_parity loses the nonzerobits info.
+            * gcc.c-torture/execute/pr110252-1.c: New test.
+            * gcc.c-torture/execute/pr110252-2.c: New test.
+            * gcc.c-torture/execute/pr110252-3.c: New test.
+            * gcc.c-torture/execute/pr110252-4.c: New test.
+
+- User: Andrew Pinski | Time: 2023-07-19 16:19:57 UTC
+  Text: Fixed finally.
+

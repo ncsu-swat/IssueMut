@@ -1,0 +1,195 @@
+Bug Summary: `(a > 1) ? 0 : (a == 1)` is not optimized when spelled out at -O2+
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2023-05-24 22:10:02 UTC
+  Text: Take:
+```
+_Bool f(unsigned a)
+{
+        if (a > 1)
+          return 0;
+        return a == 1;
+}
+
+
+_Bool f0(unsigned a)
+{
+  return (a > 1) ? 0 : (a == 1);
+}
+```
+Both of these should just optimize to:
+`return a == 1`, f0 is currently.
+
+- User: Andrew Pinski | Time: 2023-05-24 22:16:28 UTC
+  Text: I should say this at -O2.
+
+part of the reason is VRP changes `a == 1` to be `(bool)a` and then phiopt comes along and decides to factor out the conversion (phiopt did that even before my recent changes).
+
+at -O1, it is actually optimized during reassoc1 (because the above is not done) since GCC 7.
+
+- User: Andrew Pinski | Time: 2023-05-24 22:17:20 UTC
+  Text: I should note I found this while looking at code generation of bitmap_single_bit_set_p after a match pattern addition.
+
+- User: Andrew Pinski | Time: 2023-05-24 22:21:38 UTC
+  Text: here is another related testcase but this was the exactly reduced one from bitmap_single_bit_set_p :
+
+```
+_Bool f(unsigned a, int t)
+{
+  void g(void);
+  if (t)
+    return 0;
+  g();
+  if (a > 1)
+    return 0;
+  return a == 1;
+}
+```
+
+this should be optimized down to:
+```
+_Bool f(unsigned a, int t)
+{
+  void g(void);
+  if (t)
+    return 0;
+  g();
+  return a == 1;
+}
+```
+
+- User: Andrew Pinski | Time: 2023-05-25 03:39:51 UTC
+  Text: Note the underlaying issue with VRP is similar toPR 109959but it is about a slightly different optimization though.
+
+- User: Andrew Pinski | Time: 2023-06-07 22:36:45 UTC
+  Text: This is basicallyPR 102138.
+
+- User: Andrew Pinski | Time: 2023-06-07 22:48:37 UTC
+  Text: (In reply to Andrew Pinski fromcomment #5)> This is basicallyPR 102138.Except it works at -O1 because the cast is pushed out of the phi by phiopt but the cast is the same as a & 1 here :(.
+
+Forcomment #0we could just match this for unsigned type
+a_2(D) > 1 ? 0 : a_2(D) == a_2(D) <= 1 ? a_2(D) : 0 -> (unsigned)(a == 1)
+
+Forcomment #3we need to pattern match this now:
+  _7 = (_Bool) a_6(D);
+  _9 = a_6(D) <= 1;
+  _10 = _7 & _9;
+
+- User: Andrew Pinski | Time: 2023-08-06 18:19:20 UTC
+  Text: For the bothone:
+`(a > 1) ? 0 : a` could just be simplified to:
+`(cast)(a == 1)` For unsigned types.
+
+So:
+(simplify
+ (cond (gt @0 integer_onep@1) integer_zerop (convert? @0))
+ (if (TYPE_UNSIGNED (TREE_TYPE (@0)))
+  (convert (eq @0 @1))
+ )
+)
+
+Turns out the optional convert in the above will catch both cases.
+
+- User: Andrew Pinski | Time: 2023-08-06 21:12:53 UTC
+  Text: Createdattachment 55696[details]Patch which I am testing
+
+- User: Andrew Pinski | Time: 2023-08-07 00:26:39 UTC
+  Text: +FAIL: c-c++-common/Wrestrict.c  -Wc++-compat  (test for excess errors)
+Excess errors:
+/home/apinski/src/upstream-gcc-git/gcc/gcc/testsuite/c-c++-common/Wrestrict.c:684:3: warning: 'strcpy' accessing 2 bytes at offsets [0, 1] and 0 overlaps between 1 and 2 bytes at offset [0, 1] [-Wrestrict]
+  T (8, "0", a + r, a);   /* { dg-warning "accessing between 1 and 2 bytes at offsets \\\[0, 1] and 0 overlaps up to 2 bytes at offset \\\[0, 1]" "strcpy" { xfail *-*-*} } */
+
+Looks like the dg-warning needs to be updated and the xfail removed.
+we have:
+```
+strcpy (a+[0,1], a);
+```
+
+
+
+/home/apinski/src/upstream-gcc-git/gcc/gcc/testsuite/c-c++-common/Wrestrict.c:863:3: warning: 'strncpy' accessing 1 byte at offsets 0 and [0, 1] may overlap 1 byte at offset 0 [-Wrestrict]
+
+  T ("0123", a, a + i, 1);
+
+In this case a and a+[0,1] can overlap for strncpy even for size of 1.
+
+/home/apinski/src/upstream-gcc-git/gcc/gcc/testsuite/c-c++-common/Wrestrict.c:866:3: warning: 'strncpy' accessing 2 bytes at offsets 0 and [0, 1] overlaps between 1 and 2 bytes at offset [0, 1] [-Wrestrict]
+  T ("0123", a, a + i, 2);   /* { dg-warning "accessing 2 bytes at offsets 0 and \\\[0, 1] may overlap 1 byte at offset 1" "strncpy" { xfail *-*-* } } */
+
+Just like the first case.
+
+- User: Andrew Pinski | Time: 2023-08-07 01:52:14 UTC
+  Text: (In reply to Andrew Pinski fromcomment #9)> +FAIL: c-c++-common/Wrestrict.c  -Wc++-compat  (test for excess errors)
+> Excess errors:This is just like the builtin-sprintf-warn-23.c xfail; well except there the warning message was already correct.
+
+
+Note if we change signed_range in gcc.dg/range.h to:
+static inline ptrdiff_t signed_range (ptrdiff_t min, ptrdiff_t max)
+{
+  ptrdiff_t val = signed_value ();
+  if (val < min || max < val)
+    __builtin_unreachable();
+  return val;
+}
+
+We get the same warning as we get with this patch. So I am definitely going to add/change the dg-warning here because that will be the correct fix.
+
+- User: Andrew Pinski | Time: 2023-08-07 05:09:12 UTC
+  Text: Patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2023-August/626435.html
+
+- User: GCC Commits | Time: 2023-08-07 14:47:38 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:b57bd27cb68fdbe5d9dcd571b1cb66f72b841290commitr14-3036-gb57bd27cb68fdbe5d9dcd571b1cb66f72b841290Author: Andrew Pinski <apinski@marvell.com>
+Date:   Sun Aug 6 13:57:35 2023 -0700
+
+    MATCH: [PR109959] `(uns <= 1) & uns` could be optimized to `uns == 1`
+    
+    I noticed while looking into some code generation of bitmap_single_bit_set_p,
+    that sometimes:
+    ```
+      if (uns > 1)
+        return 0;
+      return uns == 1;
+    ```
+    Would not optimize down to just:
+    ```
+    return uns == 1;
+    ```
+    
+    In this case, VRP likes to change `a == 1` into `(bool)a` if
+    a has a range of [0,1] due to `a <= 1` side of the branch.
+    We might end up with this similar code even without VRP,
+    in the case of builtin-sprintf-warn-23.c (and Wrestrict.c), we had:
+    ```
+    if (s < 0 || 1 < s)
+      s = 0;
+    ```
+    Which is the same as `s = ((unsigned)s) <= 1 ? s : 0`;
+    So we should be able to catch that also.
+    
+    This adds 2 patterns to catch `(uns <= 1) & uns` and
+    `(uns > 1) ? 0 : uns` and convert those into:
+    `(convert) uns == 1`.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/109959gcc/ChangeLog:
+    
+            * match.pd (`(a > 1) ? 0 : (cast)a`, `(a <= 1) & (cast)a`):
+            New patterns.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/builtin-sprintf-warn-23.c: Remove xfail.
+            * c-c++-common/Wrestrict.c: Update test and remove some xfail.
+            * gcc.dg/tree-ssa/cmpeq-1.c: New test.
+            * gcc.dg/tree-ssa/cmpeq-2.c: New test.
+            * gcc.dg/tree-ssa/cmpeq-3.c: New test.
+
+- User: Andrew Pinski | Time: 2023-08-07 14:48:02 UTC
+  Text: Fixed.
+

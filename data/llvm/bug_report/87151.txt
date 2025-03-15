@@ -1,0 +1,250 @@
+Issue Title: Potential regression in AST printing
+Original Post: https://github.com/llvm/llvm-project/commit/46f3ade5083b8bfce55c78a21086a487eaac6f99 intends to fix the printing of attributes attached to variable declarations. The implementation choice is to print the attributes on the left hand side. However, that forces that change drifts away the produced output from the output as written in the code. This is also evident from the tests the commit had to change.
+
+Consider,
+```cpp
+void f() __attribute__((always_inline)) {}
+```
+
+`clang-17 -Xclang -ast-print` produces `void f() __attribute__((always_inline)) {}` which matches very closely the original code. However, `clang-18 -Xclang -ast-print` produces `__attribute__((always_inline)) void f() {}`
+
+Both compile but I think the second one violates a principle which I believe we have been following where we try to produce output close as much as possible to the user code.
+
+@giulianobelinassi, @erichkeane  do you think we can bring the old behavior back before freezing 18 by limiting that feature to variable declarations only? This was the original intent of the patch IIUC.
+
+@alexander-penev, @AaronBallman.
+
+Comment by vgvassilev: Here is a more concerning example. The commit before https://github.com/llvm/llvm-project/commit/46f3ade5083b8bfce55c78a21086a487eaac6f99 gives:
+```
+echo "struct A{ virtual void f() {} }; struct B : public A { virtual void f() override{} };" | bin/clang -Xclang -ast-print -xc++ -fsyntax-only -
+struct A {
+    virtual void f() {
+    }
+};
+struct B : public A {
+    virtual void f() override {
+    }
+};
+
+```
+
+Whereas with https://github.com/llvm/llvm-project/commit/46f3ade5083b8bfce55c78a21086a487eaac6f99
+
+```
+echo "struct A{ virtual void f() {} }; struct B : public A { virtual void f() override{} };" | bin/clang -Xclang -ast-print -xc++ -fsyntax-only -
+struct A {
+    virtual void f() {
+    }
+};
+struct B : public A {
+    override virtual void f() {
+    }
+};
+```
+
+That's severe regression for our use cases because it leads to code that cannot compile. I'd propose to revert this patch.
+
+@hahnjo, @devajithvs that will probably block our llvm18 efforts when we scale to experiments workflows...
+
+cc: @dpiparo.
+Comment by Sirraide: > Both compile but I think the second one violates a principle which I believe we have been following where we try to produce output close as much as possible to the user code.
+
+For what it’s worth, I happened to talk to Aaron about this recently, and what he told me is that AST printing is 1. best-effort only and 2. attributes are kind of complicated to print, so support for that may be wonky. E.g. you’ll also notice that `[[]]` function attributes are printed in the wrong place at the moment. 
+
+I’m not sure this whether this is really a regression or just a breaking change.
+CC @AaronBallman
+Comment by vgvassilev: > > Both compile but I think the second one violates a principle which I believe we have been following where we try to produce output close as much as possible to the user code.
+> 
+> For what it’s worth, I happened to talk to Aaron about this recently, and what he told me is that AST printing is 1. best-effort only and 2. attributes are kind of complicated to print, so support for that may be wonky. E.g. you’ll also notice that `[[]]` function attributes are printed in the wrong place at the moment.
+> 
+> I’m not sure this whether this is really a regression or just a breaking change. CC @AaronBallman
+
+We have had that discussion [here](https://github.com/root-project/root/pull/10830#issuecomment-1168933294) and for us is absolutely critical to be able to produce compiling code. I do understand the challenges and we have invested lots of efforts into maintaining this in a relatively good state. @mizvekov's work on template resugaring is with similar goals.
+
+Not being able to print properly the `override` keyword is pretty huge regression in my opinion. Correct me if I am wrong but this patch fixes more of a corner case at the expense of breaking quite significant case. I am pretty sure that the "must print on the left" strategy has other implications for other attributes that we will be discovering with llvm18.
+Comment by Sirraide: > Not being able to print properly the `override` keyword is pretty huge regression in my opinion.
+
+Ok, yeah, that one seems pretty atrocious. It makes sense to me that we should fix that.
+
+
+
+
+Comment by giulianobelinassi: The reason why this attribute is printed on the left side is because for us it is critical that the functions are also compilable with `gcc`, and it rejects attributes on the right side of a function that is declared with its body. The reason for that is a potential ambiguity when handling K&R C functions.
+```
+f(i) __attribute__((unused)) int i; {}
+```
+In this case it is not clear where the attribute should be applied and therefore GCC rejects all declarations of this kind. This is used when generating a Kernel Livepatch thus I'd like this behaviour to be maintained while fixing the `override` keyword.
+
+
+Comment by vgvassilev: Can you give a few code examples of the input code and how it needs to be printed out? Does your patch intend to teach the ast printer to change the code that was written in the input file?
+
+> The reason for that is a potential ambiguity when handling K&R C functions.
+
+Can we "just" resolve that ambiguity when the functions are K&R C functions?
+
+> In this case it is not clear where the attribute should be applied and therefore GCC rejects all declarations of this kind.
+
+Yes, but do you intend the AST printer to "fix" GCC-incompatible users code?
+
+> This is used when generating a Kernel Livepatch thus I'd like this behaviour to be maintained while fixing the override keyword.
+
+Not opposed here, just trying to understand and maybe offer a way forward that we can agree on.
+Comment by giulianobelinassi: > Can you give a few code examples of the input code and how it needs to be printed out? Does your patch intend to teach the ast printer to change the code that was written in the input file?
+
+No, it doesn´t. The point is that before the patch all attributes -- regardless if it was originally written on left or right side -- 
+it always printed on the right side, which made GCC reject them.
+> 
+> > The reason for that is a potential ambiguity when handling K&R C functions.
+> 
+> Can we "just" resolve that ambiguity when the functions are K&R C functions?
+> 
+
+This was just an explanation of why GCC rejects attributes on the right side of functions with body. GCC will also reject:
+```
+int f(void) __attribute__((unused)) {}
+```
+Clearly this function has no ambiguity but gcc rejects this as well.
+
+> > In this case it is not clear where the attribute should be applied and therefore GCC rejects all declarations of this kind.
+> 
+> Yes, but do you intend the AST printer to "fix" GCC-incompatible users code?
+> 
+No. If it was already broken then we don't intend fixing that. Basically what we intend is that if the original code is compilable with GCC, then the code we generate with [clang-extract](https://github.com/suse/clang-extract) is also GCC compatible. If the original code had those attributes on the right side then it is not GCC-compilable and therefore we don't care.
+
+> > This is used when generating a Kernel Livepatch thus I'd like this behaviour to be maintained while fixing the override keyword.
+> 
+> Not opposed here, just trying to understand and maybe offer a way forward that we can agree on.
+
+Thanks!
+Comment by vgvassilev: Would it make sense to take a different approach here and set a bit in the attribute class telling us where the attribute occurred? In that the printer would not have to deal with ambiguities as it does not have enough information to do so. The advantage of that approach is that in case you wanted to "fix" GCC-incompatible code, the tool can flip that bit of the attribute and be done with it...
+Comment by giulianobelinassi: > Would it make sense to take a different approach here and set a bit in the attribute class telling us where the attribute occurred? In that the printer would not have to deal with ambiguities as it does not have enough information to do so. The advantage of that approach is that in case you wanted to "fix" GCC-incompatible code, the tool can flip that bit of the attribute and be done with it...
+
+I'd say it would be the ideal approach to the issue. But again: we don't need to "fix" non-gcc compatible code.
+Comment by vgvassilev: > > Would it make sense to take a different approach here and set a bit in the attribute class telling us where the attribute occurred? In that the printer would not have to deal with ambiguities as it does not have enough information to do so. The advantage of that approach is that in case you wanted to "fix" GCC-incompatible code, the tool can flip that bit of the attribute and be done with it...
+> 
+> I'd say it would be the ideal approach to the issue. But again: we don't need to "fix" non-gcc compatible code.
+
+If you can provide an reverting patch to this one and a bunch of test cases that need to work, I can try to provide an initial implementation...
+Comment by AaronBallman: > I’m not sure this whether this is really a regression or just a breaking change. CC @AaronBallman
+
+It's a bit of both. We intentionally changed where we print attributes and that could break code relying on previous printing locations, but the intent was to get attributes to print in a more regular location (previous behavior would lead to broken code as well, but in more circumstances). That said, the goal of `-ast-print` is to get back to the user's original source code as close as we can, so it's also a bit of a regression.
+
+> Would it make sense to take a different approach here and set a bit in the attribute class telling us where the attribute occurred? In that the printer would not have to deal with ambiguities as it does not have enough information to do so. The advantage of that approach is that in case you wanted to "fix" GCC-incompatible code, the tool can flip that bit of the attribute and be done with it...
+
+I think that still leads to issues, but hopefully we could work around them. Consider something like:
+```
+[[clang::foo]] __declspec(something) __attribute__((baz)) int x [[clang::bar]] () [[clang::quux]] __attribute__((another_one));
+```
+A bit in the attribute class doesn't really tell you enough, because that's a valid declaration (https://godbolt.org/z/oPTE4c89a) while reordering the attributes a bit causes it to be an invalid declaration (https://godbolt.org/z/jMn78dhnh).
+
+We'd need to track locations like: start of line, after identifier, after parameter list, after lambda introducer, etc as well as tracking attribute order within each location.
+
+> But again: we don't need to "fix" non-gcc compatible code.
+
+The request is also to fix standards conforming code: https://godbolt.org/z/hYnWTz5nn
+Comment by giulianobelinassi: I am sorry I couldn't check this in detail before, but on DeclPrinter.cpp I introduced `mustPrintOnLeftSide` and `canPrintOnLeftSide`. If the `override` keyword is handled as an attribute we could check it on those functions, which would result in clang printing then on the right side. This would circumvent changes to the parser. I will try to craft a patch for this.
+Comment by giulianobelinassi: @vgvassilev Can you test if this quick fix works for your cases?
+```
+diff --git a/clang/include/clang/Basic/Attr.td b/clang/include/clang/Basic/Attr.td
+index 80e607525a0a..a39288464040 100644
+--- a/clang/include/clang/Basic/Attr.td
++++ b/clang/include/clang/Basic/Attr.td
+@@ -2511,6 +2511,7 @@ def Overloadable : Attr {
+ }
+ 
+ def Override : InheritableAttr {
++  let CanPrintOnLeft = 0;
+   let Spellings = [CustomKeyword<"override">];
+   let SemaHandler = 0;
+   // Omitted from docs, since this is language syntax, not an attribute, as far
+```
+Comment by vgvassilev: > I think that still leads to issues, but hopefully we could work around them. Consider something like:
+
+> [[clang::foo]] __declspec(something) __attribute__((baz)) int x [[clang::bar]] () [[clang::quux]] __attribute__((another_one));
+
+IIUC, we store a vector of attributes which is filled by the parser. Naturally we will get the ordering as spelled and having that bit flipped from if the attribute appears on the left hand side. We will need to do some more work in mergeDecl (or similar) when we have multiple attributes on the redeclaration chain.
+
+> I am sorry I couldn't check this in detail before, but on DeclPrinter.cpp I introduced mustPrintOnLeftSide and canPrintOnLeftSide. If the override keyword is handled as an attribute we could check it on those functions, which would result in clang printing then on the right side. This would circumvent changes to the parser. I will try to craft a patch for this.
+
+My point is that we should not delegate to the decl printer the responsibility to take a decision where to print the attributes. It's neither its responsibility nor it has enough information to make that choice. In a similar vain, the decl printer does not decide on its own if it should print `class` or `struct` before a CXXRecordDecl...
+
+> @vgvassilev Can you test if this quick fix works for your cases?
+
+Thank you for the patch. However, I do not think it addresses my fundamental concern and that is changing the location where we print things to be inconsistent to how it was actually spelled. I am sure that will probably fix my immediate issue but we are not quite sure what else is broken by the overall approach we took
+Comment by giulianobelinassi: > > I think that still leads to issues, but hopefully we could work around them. Consider something like:
+> 
+> > [[clang::foo]] __declspec(something) **attribute**((baz)) int x [[clang::bar]] () [[clang::quux]] **attribute**((another_one));
+> 
+> IIUC, we store a vector of attributes which is filled by the parser. Naturally we will get the ordering as spelled and having that bit flipped from if the attribute appears on the left hand side. We will need to do some more work in mergeDecl (or similar) when we have multiple attributes on the redeclaration chain.
+> 
+> > I am sorry I couldn't check this in detail before, but on DeclPrinter.cpp I introduced mustPrintOnLeftSide and canPrintOnLeftSide. If the override keyword is handled as an attribute we could check it on those functions, which would result in clang printing then on the right side. This would circumvent changes to the parser. I will try to craft a patch for this.
+> 
+> My point is that we should not delegate to the decl printer the responsibility to take a decision where to print the attributes. It's neither its responsibility nor it has enough information to make that choice. In a similar vain, the decl printer does not decide on its own if it should print `class` or `struct` before a CXXRecordDecl...
+> 
+> > @vgvassilev Can you test if this quick fix works for your cases?
+> 
+> Thank you for the patch. However, I do not think it addresses my fundamental concern and that is changing the location where we print things to be inconsistent to how it was actually spelled. I am sure that will probably fix my immediate issue but we are not quite sure what else is broken by the overall approach we took
+
+It does not address it. If we want it to actually reflect what was written there we will have to patch the parser to mark on the Attr its location in the source code, which is something not being done ATM.
+
+When I sent that patch there was a concern about keywords and attributes that simply could not being placed in the left side of the function, like the `asm` and `DiagnoseIf`. That is why I introduced this flag.
+
+As a partial fix we could merge this little patch and keep incrementally forcing attributes that can't be print on the left side to be print on the right side. Of course once we have a proper way of tracking those things from the parser this won't be necessary anymore. 
+
+What do you think?
+Comment by erichkeane: AST Printing, particularly with attributes, is just 'best effort'.  That said, we DO store a `SourceLocation` for most attributes.  
+
+I think the only 'real' way to get this is to try to better reflect what is happening in the source code.  The way to do THAT is to use the `SourceLocation` information that we have, and perhaps 'sort' based on it (though some work needs to be done to maintain the macro locations/etc).  This way we could at least print them where they first appeared.
+
+
+Comment by vgvassilev: > What do you think?
+
+Can you give me a day or two to try out the idea I was proposing?
+
+> I think the only 'real' way to get this is to try to better reflect what is happening in the source code. The way to do THAT is to use the SourceLocation information that we have, and perhaps 'sort' based on it (though some work needs to be done to maintain the macro locations/etc). This way we could at least print them where they first appeared.
+
+Yes, exactly. That's what I am currently implementing. In particular, in the DeclPrinter.cpp we can check if the attribute was spelled after the declaration or before based on the source location information. In that case we might be able to solve the issue we are discussing. Unfortunately, that won't address generated code which does not have valid source locations but in that case we might want to print them at the place where we have better odds it will compile...
+Comment by erichkeane: > Yes, exactly. That's what I am currently implementing. In particular, in the DeclPrinter.cpp we can check if the attribute was spelled after the declaration or before based on the source location information. In that case we might be able to solve the issue we are discussing.
+
+I think it at least has a chance of solving A LOT of the problems here.  Some of the issues that Aaron mentions probably still exist, but this at least might minimize some of them.
+
+
+
+> Unfortunately, that won't address generated code which does not have valid source locations but in that case we might want to print them at the place where we have better odds it will compile...
+
+Right, my thought here is that we can use the existing logic (based on 'can print on left' or whatever) for those.  WE will be imperfect, but at least improved.
+Comment by giulianobelinassi: > > What do you think?
+> 
+> Can you give me a day or two to try out the idea I was proposing?
+
+Oh, sorry. Please take your time. I thought you wanted a quick fix for the issue :)
+
+Comment by vgvassilev: @erichkeane I've submitted a PR which intends to solve the original problem in a slightly more localized and encapsulated way.
+
+@giulianobelinassi, apologies for having to undo your work. I have no problem transferring the authorship of this PR to you. The PR probably will need polishing a little. I need to find who's printing a leading space and get rid of it ;)
+Comment by erichkeane: > @erichkeane I've submitted a PR which intends to solve the original problem in a slightly more localized and encapsulated way.
+> 
+> @giulianobelinassi, apologies for having to undo your work. I have no problem transferring the authorship of this PR to you. It probably will need polishing a little. I need to find who's printing a leading space and get rid of it ;)
+
+Thanks!  I'm horribly behind on reviews thanks to not working on Clang the last two weeks for the WG21 meeting, so it might be a little while before I can get to it.
+Comment by llvmbot: 
+@llvm/issue-subscribers-clang-frontend
+
+Author: Vassil Vassilev (vgvassilev)
+
+<details>
+https://github.com/llvm/llvm-project/commit/46f3ade5083b8bfce55c78a21086a487eaac6f99 intends to fix the printing of attributes attached to variable declarations. The implementation choice is to print the attributes on the left hand side. However, that forces that change drifts away the produced output from the output as written in the code. This is also evident from the tests the commit had to change.
+
+Consider,
+```cpp
+void f() __attribute__((always_inline)) {}
+```
+
+`clang-17 -Xclang -ast-print` produces `void f() __attribute__((always_inline)) {}` which matches very closely the original code. However, `clang-18 -Xclang -ast-print` produces `__attribute__((always_inline)) void f() {}`
+
+Both compile but I think the second one violates a principle which I believe we have been following where we try to produce output close as much as possible to the user code.
+
+@<!-- -->giulianobelinassi, @<!-- -->erichkeane  do you think we can bring the old behavior back before freezing 18 by limiting that feature to variable declarations only? This was the original intent of the patch IIUC.
+
+@<!-- -->alexander-penev, @<!-- -->AaronBallman.
+</details>

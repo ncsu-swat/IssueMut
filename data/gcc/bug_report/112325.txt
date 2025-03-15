@@ -1,0 +1,637 @@
+Bug Summary: Missed vectorization of reduction after unrolling
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Hongyu Wang | Time: 2023-11-01 02:41:20 UTC
+  Text: testcase:
+
+#include <stdint.h>
+#include <string.h>
+
+typedef struct {
+    float s;
+    int8_t qs[32];
+} block;
+
+void foo (const int n, float * restrict s, const int8_t q[4], const block * restrict y) {
+    const int qk = 32;
+    const int nb = n / qk;
+
+    float sumf = 0.0;
+    int sumi = 0;
+
+    for (int i = 0; i < nb; i++) {
+        uint32_t qh;
+        memcpy(&qh, q, 4);
+
+        for (int j = 0; j < qk/2; ++j) {
+            sumi += (qh >> j) * y[i].qs[j];
+        }
+        sumf += (y[i].s * (float) sumi);
+    }
+    *s = sumf;
+}
+
+This can be vectorized under -O2 -mavx512vl but not -O3 -mavx512vl, seehttps://godbolt.org/z/csPr4cPenUnder -O3 -mavx512vl -fdisable-tree-cunrolli the loop can also be vectorized.
+
+- User: Andrew Pinski | Time: 2023-11-01 02:46:13 UTC
+  Text: Seems like there is a missing SLP ...
+
+Confirmed.
+
+- User: Richard Biener | Time: 2023-11-02 09:51:34 UTC
+  Text: We're detecting the integer reduction:
+
+t.c:21:18: note:   Starting SLP discovery for
+t.c:21:18: note:     _236 = _230 * _235;
+t.c:21:18: note:     _223 = _217 * _222;
+t.c:21:18: note:     _210 = _204 * _209;
+t.c:21:18: note:     _197 = _191 * _196;
+t.c:21:18: note:     _184 = _178 * _183;
+t.c:21:18: note:     _171 = _165 * _170;
+t.c:21:18: note:     _158 = _152 * _157;
+t.c:21:18: note:     _145 = _139 * _144;
+t.c:21:18: note:     _132 = _126 * _131;
+t.c:21:18: note:     _119 = _113 * _118;
+t.c:21:18: note:     _106 = _100 * _105;
+t.c:21:18: note:     _93 = _87 * _92;
+t.c:21:18: note:     _80 = _74 * _79;
+t.c:21:18: note:     _67 = _61 * _66;
+t.c:21:18: note:     sumi.1_42 = (unsigned int) sumi_96;
+t.c:21:18: note:     _41 = _27 * _40;
+t.c:21:18: note:     _54 = _48 * _53;
+
+but we're not clever enough to split out
+
+t.c:21:18: note:     sumi.1_42 = (unsigned int) sumi_96;
+
+it's possibly easy enough to do.
+
+- User: Hongtao Liu | Time: 2023-11-16 08:03:56 UTC
+  Text: BB vectorizer relies on the backend support of .REDUC_PLUS for reduction, but loop vectorizer can manually do reduction. That's why it's not vectorized after cunrolli.
+
+After adding reduc_plus_scal_v4si, it's vectorized.
+Looks like we need to support reduc_plus_scal_{v4si,v8si,v16si,v8hi,v16hi,v32hi}
+Similar for reduc_{and,ior,xor}_scal_m.
+
+- User: Hongtao Liu | Time: 2023-11-16 08:15:21 UTC
+  Text: (In reply to liuhongt fromcomment #3)> BB vectorizer relies on the backend support of .REDUC_PLUS for reduction,
+> but loop vectorizer can manually do reduction. That's why it's not
+> vectorized after cunrolli.
+> 
+> After adding reduc_plus_scal_v4si, it's vectorized.
+> Looks like we need to support
+> reduc_plus_scal_{v4si,v8si,v16si,v8hi,v16hi,v32hi}
+> Similar for reduc_{and,ior,xor}_scal_m.This one can be vectorized after support reduc_plus_scal_v4si, but the original loop is still not vectorized, should be other issues.
+
+int
+foo (int* a)
+{
+  int sum = 0;
+  sum += a[0];
+  sum += a[1];
+  sum += a[2];
+  sum += a[3];
+  return sum;
+}
+
+- User: Richard Biener | Time: 2023-11-16 09:15:06 UTC
+  Text: Yes, as I said incomment#2.  Note I specifically ended up not open-coding the reduction because of concerns of efficiency.  So a target should only provide
+reduc_*_scal patterns when they are more efficient than open-coding with
+the obvious sequence.
+
+That possibly means fixing the issue I mentioned incomment#2will not be
+enough to get this BB vectorized on x86.
+
+- User: Andrew Pinski | Time: 2023-11-17 06:21:44 UTC
+  Text: The `>> 0` issue is the NOP case which is recorded inPR 106343too.
+
+- User: GCC Commits | Time: 2023-11-20 02:52:09 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:2b59e2b4dff42118fe3a505f07b9a6aa4cf53bdfcommitr14-5603-g2b59e2b4dff42118fe3a505f07b9a6aa4cf53bdfAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Nov 16 18:38:39 2023 +0800
+
+    Support reduc_{plus,xor,and,ior}_scal_m for vector integer mode.
+    
+    BB vectorizer relies on the backend support of
+    .REDUC_{PLUS,IOR,XOR,AND} to vectorize reduction.
+    
+    gcc/ChangeLog:PR target/112325* config/i386/sse.md (reduc_<code>_scal_<mode>): New expander.
+            (REDUC_ANY_LOGIC_MODE): New iterator.
+            (REDUC_PLUS_MODE): Extend to VxHI/SI/DImode.
+            (REDUC_SSE_PLUS_MODE): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr112325-1.c: New test.
+            * gcc.target/i386/pr112325-2.c: New test.
+
+- User: GCC Commits | Time: 2023-11-21 00:34:52 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:e5e305e6048c042139037378fe6abfad5735b54fcommitr14-5632-ge5e305e6048c042139037378fe6abfad5735b54fAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Fri Nov 17 08:45:47 2023 +0800
+
+    Support reduc_{and,ior,xor}_scal_m for V4HI/V8QI/V4QImode
+    
+    gcc/ChangeLog:PR target/112325* config/i386/i386-expand.cc (emit_reduc_half): Hanlde
+            V8QImode.
+            * config/i386/mmx.md (reduc_<code>_scal_<mode>): New expander.
+            (reduc_<code>_scal_v4qi): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr112325-mmx-1.c: New test.
+
+- User: Hongtao Liu | Time: 2024-02-27 06:02:56 UTC
+  Text: The original case is a little different from the one in PR.
+It comes from ggml
+
+#include <stdint.h>
+#include <string.h>
+
+typedef uint16_t ggml_fp16_t;
+static float table_f32_f16[1 << 16];
+
+inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
+    uint16_t s;
+    memcpy(&s, &f, sizeof(uint16_t));
+    return table_f32_f16[s];
+}
+
+typedef struct {
+    ggml_fp16_t d;
+    ggml_fp16_t m;
+    uint8_t qh[4];
+    uint8_t qs[32 / 2];
+} block_q5_1;
+
+typedef struct {
+    float d;
+    float s;
+    int8_t qs[32];
+} block_q8_1;
+
+void ggml_vec_dot_q5_1_q8_1(const int n, float * restrict s, const void * restrict vx, const void * restrict vy) {
+    const int qk = 32;
+    const int nb = n / qk;
+    
+    const block_q5_1 * restrict x = vx;
+    const block_q8_1 * restrict y = vy;
+
+    float sumf = 0.0;
+
+    for (int i = 0; i < nb; i++) {
+        uint32_t qh;
+        memcpy(&qh, x[i].qh, sizeof(qh));
+
+        int sumi = 0;
+
+        for (int j = 0; j < qk/2; ++j) {
+            const uint8_t xh_0 = ((qh >> (j + 0)) << 4) & 0x10;
+            const uint8_t xh_1 = ((qh >> (j + 12)) ) & 0x10;
+
+            const int32_t x0 = (x[i].qs[j] & 0xF) | xh_0;
+            const int32_t x1 = (x[i].qs[j] >> 4) | xh_1;
+
+            sumi += (x0 * y[i].qs[j]) + (x1 * y[i].qs[j + qk/2]);
+        }
+
+        sumf += (ggml_lookup_fp16_to_fp32(x[i].d)*y[i].d)*sumi + ggml_lookup_fp16_to_fp32(x[i].m)*y[i].s;
+    }
+
+    *s = sumf;
+}
+
+- User: Hongtao Liu | Time: 2024-02-27 06:13:09 UTC
+  Text: (In reply to Hongtao Liu fromcomment #9)> The original case is a little different from the one in PR.But the issue is similar, after cunrolli, GCC failed to vectorize the outer loop.
+
+The interesting thing is in estimated_unrolled_size, the original unr_insns is 288 which is bigger than param_max_completely_peeled_insns(200), but unr_insn is decreased by 1/3 due to
+
+   Loop body is likely going to simplify further, this is difficult
+   to guess, we just decrease the result by 1/3.  */
+
+In practice, this loop body is not simplied for 1/3 of the instructions.
+
+Considering the unroll factor is 16, the unr_insn is large(192), I was wondering if we could add some heuristic algorithm to avoid complete loop unroll, because usually for such a big loop, both loop and BB vectorizer may not perform well.
+
+- User: Hongtao Liu | Time: 2024-02-27 07:26:07 UTC
+  Text: >    Loop body is likely going to simplify further, this is difficult
+>    to guess, we just decrease the result by 1/3.  */
+>This is introduced byr0-68074-g91a01f21abfe19/* Estimate number of insns of completely unrolled loop.  We assume
++   that the size of the unrolled loop is decreased in the
++   following way (the numbers of insns are based on what
++   estimate_num_insns returns for appropriate statements):
++
++   1) exit condition gets removed (2 insns)
++   2) increment of the control variable gets removed (2 insns)
++   3) All remaining statements are likely to get simplified
++      due to constant propagation.  Hard to estimate; just
++      as a heuristics we decrease the rest by 1/3.
++
++   NINSNS is the number of insns in the loop before unrolling.
++   NUNROLL is the number of times the loop is unrolled.  */
++
++static unsigned HOST_WIDE_INT
++estimated_unrolled_size (unsigned HOST_WIDE_INT ninsns,
++                        unsigned HOST_WIDE_INT nunroll)
++{
++  HOST_WIDE_INT unr_insns = 2 * ((HOST_WIDE_INT) ninsns - 4) / 3;
++  if (unr_insns <= 0)
++    unr_insns = 1;
++  unr_insns *= (nunroll + 1);
++
++  return unr_insns;
++}
+
+Andr0-93444-g08f1af2ed022e0try do it more accurately by marking likely_eliminated stmt and minus that from total insns, But 2 / 3 is still keeped.
+
++/* Estimate number of insns of completely unrolled loop.
++   It is (NUNROLL + 1) * size of loop body with taking into account
++   the fact that in last copy everything after exit conditional
++   is dead and that some instructions will be eliminated after
++   peeling.
+ 
+-   NINSNS is the number of insns in the loop before unrolling.
+-   NUNROLL is the number of times the loop is unrolled.  */
++   Loop body is likely going to simplify futher, this is difficult
++   to guess, we just decrease the result by 1/3.  */
+ 
+ static unsigned HOST_WIDE_INT
+-estimated_unrolled_size (unsigned HOST_WIDE_INT ninsns,
++estimated_unrolled_size (struct loop_size *size,
+                         unsigned HOST_WIDE_INT nunroll)
+ {
+-  HOST_WIDE_INT unr_insns = 2 * ((HOST_WIDE_INT) ninsns - 4) / 3;
++  HOST_WIDE_INT unr_insns = ((nunroll)
++                            * (HOST_WIDE_INT) (size->overall
++                                               - size->eliminated_by_peeling));
++  if (!nunroll)
++    unr_insns = 0;
++  unr_insns += size->last_iteration - size->last_iteration_eliminated_by_peeling;
++
++  unr_insns = unr_insns * 2 / 3;
+   if (unr_insns <= 0)
+     unr_insns = 1;
+-  unr_insns *= (nunroll + 1);
+ 
+It looks to me 1 / 3 overestimates the instructions that can be optimised away, especially if we've subtracted eliminated_by_peeling
+
+- User: rguenther@suse.de | Time: 2024-02-27 07:53:18 UTC
+  Text: On Tue, 27 Feb 2024, liuhongt at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=112325> 
+> ---Comment #10from Hongtao Liu <liuhongt at gcc dot gnu.org> ---
+> (In reply to Hongtao Liu fromcomment #9)
+> > The original case is a little different from the one in PR.
+> But the issue is similar, after cunrolli, GCC failed to vectorize the outer
+> loop.
+> 
+> The interesting thing is in estimated_unrolled_size, the original unr_insns is
+> 288 which is bigger than param_max_completely_peeled_insns(200), but unr_insn
+> is decreased by 1/3 due to
+> 
+>    Loop body is likely going to simplify further, this is difficult
+>    to guess, we just decrease the result by 1/3.  */
+> 
+> In practice, this loop body is not simplied for 1/3 of the instructions.
+> 
+> Considering the unroll factor is 16, the unr_insn is large(192), I was
+> wondering if we could add some heuristic algorithm to avoid complete loop
+> unroll, because usually for such a big loop, both loop and BB vectorizer may
+> not perform well.There were several attempts at making the unroller guess less (that 1/3
+reduction) but work out what actually will be simplified to be able to
+shrink those numbers.
+
+My favorite (but never implemented) idea was to code-generate 
+optimistically but while running value-numbering on-the-fly on the
+code and cost the so simplified unrolled code, stopping when we
+reach a limit (and scrap the sofar accumulated code).  While
+reasonably "easy" for unrolled code that ends up without branches
+it gets complicated for branches.
+
+My most recent attempt at improving was only for tracking what
+unrolling estimates as ending up constant.
+
+I think what might be the least controversical thing to do is to split
+the instruction limit between the early cunrolli and the late cunroll
+passes and lower the ones for cunrolli a lot.
+
+- User: rguenther@suse.de | Time: 2024-02-27 07:58:30 UTC
+  Text: On Tue, 27 Feb 2024, liuhongt at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=112325> 
+> ---Comment #11from Hongtao Liu <liuhongt at gcc dot gnu.org> ---
+> 
+> >    Loop body is likely going to simplify further, this is difficult
+> >    to guess, we just decrease the result by 1/3.  */
+> > 
+> 
+> This is introduced byr0-68074-g91a01f21abfe19> 
+> /* Estimate number of insns of completely unrolled loop.  We assume
+> +   that the size of the unrolled loop is decreased in the
+> +   following way (the numbers of insns are based on what
+> +   estimate_num_insns returns for appropriate statements):
+> +
+> +   1) exit condition gets removed (2 insns)
+> +   2) increment of the control variable gets removed (2 insns)
+> +   3) All remaining statements are likely to get simplified
+> +      due to constant propagation.  Hard to estimate; just
+> +      as a heuristics we decrease the rest by 1/3.
+> +
+> +   NINSNS is the number of insns in the loop before unrolling.
+> +   NUNROLL is the number of times the loop is unrolled.  */
+> +
+> +static unsigned HOST_WIDE_INT
+> +estimated_unrolled_size (unsigned HOST_WIDE_INT ninsns,
+> +                        unsigned HOST_WIDE_INT nunroll)
+> +{
+> +  HOST_WIDE_INT unr_insns = 2 * ((HOST_WIDE_INT) ninsns - 4) / 3;
+> +  if (unr_insns <= 0)
+> +    unr_insns = 1;
+> +  unr_insns *= (nunroll + 1);
+> +
+> +  return unr_insns;
+> +}
+> 
+> Andr0-93444-g08f1af2ed022e0try do it more accurately by marking
+> likely_eliminated stmt and minus that from total insns, But 2 / 3 is still
+> keeped.
+> 
+> +/* Estimate number of insns of completely unrolled loop.
+> +   It is (NUNROLL + 1) * size of loop body with taking into account
+> +   the fact that in last copy everything after exit conditional
+> +   is dead and that some instructions will be eliminated after
+> +   peeling.
+> 
+> -   NINSNS is the number of insns in the loop before unrolling.
+> -   NUNROLL is the number of times the loop is unrolled.  */
+> +   Loop body is likely going to simplify futher, this is difficult
+> +   to guess, we just decrease the result by 1/3.  */
+> 
+>  static unsigned HOST_WIDE_INT
+> -estimated_unrolled_size (unsigned HOST_WIDE_INT ninsns,
+> +estimated_unrolled_size (struct loop_size *size,
+>                          unsigned HOST_WIDE_INT nunroll)
+>  {
+> -  HOST_WIDE_INT unr_insns = 2 * ((HOST_WIDE_INT) ninsns - 4) / 3;
+> +  HOST_WIDE_INT unr_insns = ((nunroll)
+> +                            * (HOST_WIDE_INT) (size->overall
+> +                                               -
+> size->eliminated_by_peeling));
+> +  if (!nunroll)
+> +    unr_insns = 0;
+> +  unr_insns += size->last_iteration -
+> size->last_iteration_eliminated_by_peeling;
+> +
+> +  unr_insns = unr_insns * 2 / 3;
+>    if (unr_insns <= 0)
+>      unr_insns = 1;
+> -  unr_insns *= (nunroll + 1);
+> 
+> It looks to me 1 / 3 overestimates the instructions that can be optimised away,
+> especially if we've subtracted eliminated_by_peelingYes, that 1/3 reduction is a bit odd - you could have the same effect
+by increasing the instruction limit by 1/3, but that means it doesn't
+really matter, does it?  It would be interesting to see if increasing
+the limit by 1/3 and removing the above is neutral on SPEC?
+
+Note this kind of "simplification guessing" is most important for
+the 2nd stage unrolling an outer loop with an unrolled inner loop
+as there are 2nd level recurrences to be optimized the "elmiminated by
+peeling" heuristics do not get (but value-numbering would).  So another
+thing to do would be not do the 1/3 reduction for innermost loops
+but only for loops up from that.
+
+- User: Hongtao Liu | Time: 2024-02-28 07:26:28 UTC
+  Text: (In reply torguenther@suse.defromcomment #13)> On Tue, 27 Feb 2024, liuhongt at gcc dot gnu.org wrote:
+> 
+> >https://gcc.gnu.org/bugzilla/show_bug.cgi?id=112325> > 
+> > ---Comment #11from Hongtao Liu <liuhongt at gcc dot gnu.org> ---
+> > 
+> > >    Loop body is likely going to simplify further, this is difficult
+> > >    to guess, we just decrease the result by 1/3.  */
+> > > 
+> > 
+> > This is introduced byr0-68074-g91a01f21abfe19> > 
+> > /* Estimate number of insns of completely unrolled loop.  We assume
+> > +   that the size of the unrolled loop is decreased in the
+> > +   following way (the numbers of insns are based on what
+> > +   estimate_num_insns returns for appropriate statements):
+> > +
+> > +   1) exit condition gets removed (2 insns)
+> > +   2) increment of the control variable gets removed (2 insns)
+> > +   3) All remaining statements are likely to get simplified
+> > +      due to constant propagation.  Hard to estimate; just
+> > +      as a heuristics we decrease the rest by 1/3.
+> > +
+> > +   NINSNS is the number of insns in the loop before unrolling.
+> > +   NUNROLL is the number of times the loop is unrolled.  */
+> > +
+> > +static unsigned HOST_WIDE_INT
+> > +estimated_unrolled_size (unsigned HOST_WIDE_INT ninsns,
+> > +                        unsigned HOST_WIDE_INT nunroll)
+> > +{
+> > +  HOST_WIDE_INT unr_insns = 2 * ((HOST_WIDE_INT) ninsns - 4) / 3;
+> > +  if (unr_insns <= 0)
+> > +    unr_insns = 1;
+> > +  unr_insns *= (nunroll + 1);
+> > +
+> > +  return unr_insns;
+> > +}
+> > 
+> > Andr0-93444-g08f1af2ed022e0try do it more accurately by marking
+> > likely_eliminated stmt and minus that from total insns, But 2 / 3 is still
+> > keeped.
+> > 
+> > +/* Estimate number of insns of completely unrolled loop.
+> > +   It is (NUNROLL + 1) * size of loop body with taking into account
+> > +   the fact that in last copy everything after exit conditional
+> > +   is dead and that some instructions will be eliminated after
+> > +   peeling.
+> > 
+> > -   NINSNS is the number of insns in the loop before unrolling.
+> > -   NUNROLL is the number of times the loop is unrolled.  */
+> > +   Loop body is likely going to simplify futher, this is difficult
+> > +   to guess, we just decrease the result by 1/3.  */
+> > 
+> >  static unsigned HOST_WIDE_INT
+> > -estimated_unrolled_size (unsigned HOST_WIDE_INT ninsns,
+> > +estimated_unrolled_size (struct loop_size *size,
+> >                          unsigned HOST_WIDE_INT nunroll)
+> >  {
+> > -  HOST_WIDE_INT unr_insns = 2 * ((HOST_WIDE_INT) ninsns - 4) / 3;
+> > +  HOST_WIDE_INT unr_insns = ((nunroll)
+> > +                            * (HOST_WIDE_INT) (size->overall
+> > +                                               -
+> > size->eliminated_by_peeling));
+> > +  if (!nunroll)
+> > +    unr_insns = 0;
+> > +  unr_insns += size->last_iteration -
+> > size->last_iteration_eliminated_by_peeling;
+> > +
+> > +  unr_insns = unr_insns * 2 / 3;
+> >    if (unr_insns <= 0)
+> >      unr_insns = 1;
+> > -  unr_insns *= (nunroll + 1);
+> > 
+> > It looks to me 1 / 3 overestimates the instructions that can be optimised away,
+> > especially if we've subtracted eliminated_by_peeling
+> 
+> Yes, that 1/3 reduction is a bit odd - you could have the same effect
+> by increasing the instruction limit by 1/3, but that means it doesn't
+> really matter, does it?  It would be interesting to see if increasing
+> the limit by 1/3 and removing the above is neutral on SPEC?Remove 1/3 reduction get ~2% improvement for 525.x264_r on SPR with -march=native -O3, no big impact on other integer benchmark.
+
+The regression comes from below function, cunrolli unrolls the inner loop, cunroll unrolls the outer loop, and causes lots of spills.
+
+typedef unsigned long long uint64_t;
+typedef unsigned char uint8_t;
+typedef unsigned int uint32_t;
+uint64_t x264_pixel_var_8x8(uint8_t *pix, int i_stride )
+{
+    uint32_t sum = 0, sqr = 0;
+    for( int y = 0; y < 8; y++ )
+    {
+        for( int x = 0; x < 8; x++ ) 
+        {
+            sum += pix[x]; 
+            sqr += pix[x] * pix[x]; 
+        }                                                              
+        pix += i_stride;                                                       
+    }                                                                               
+    return sum + ((uint64_t)sqr << 32);    
+}
+
+- User: rguenther@suse.de | Time: 2024-02-28 08:23:47 UTC
+  Text: On Wed, 28 Feb 2024, liuhongt at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=112325> 
+> ---Comment #14from Hongtao Liu <liuhongt at gcc dot gnu.org> ---
+> (In reply torguenther@suse.defromcomment #13)
+> > On Tue, 27 Feb 2024, liuhongt at gcc dot gnu.org wrote:
+> > 
+> > >https://gcc.gnu.org/bugzilla/show_bug.cgi?id=112325> > > 
+> > > ---Comment #11from Hongtao Liu <liuhongt at gcc dot gnu.org> ---
+> > > 
+> > > >    Loop body is likely going to simplify further, this is difficult
+> > > >    to guess, we just decrease the result by 1/3.  */
+> > > > 
+> > > 
+> > > This is introduced byr0-68074-g91a01f21abfe19> > > 
+> > > /* Estimate number of insns of completely unrolled loop.  We assume
+> > > +   that the size of the unrolled loop is decreased in the
+> > > +   following way (the numbers of insns are based on what
+> > > +   estimate_num_insns returns for appropriate statements):
+> > > +
+> > > +   1) exit condition gets removed (2 insns)
+> > > +   2) increment of the control variable gets removed (2 insns)
+> > > +   3) All remaining statements are likely to get simplified
+> > > +      due to constant propagation.  Hard to estimate; just
+> > > +      as a heuristics we decrease the rest by 1/3.
+> > > +
+> > > +   NINSNS is the number of insns in the loop before unrolling.
+> > > +   NUNROLL is the number of times the loop is unrolled.  */
+> > > +
+> > > +static unsigned HOST_WIDE_INT
+> > > +estimated_unrolled_size (unsigned HOST_WIDE_INT ninsns,
+> > > +                        unsigned HOST_WIDE_INT nunroll)
+> > > +{
+> > > +  HOST_WIDE_INT unr_insns = 2 * ((HOST_WIDE_INT) ninsns - 4) / 3;
+> > > +  if (unr_insns <= 0)
+> > > +    unr_insns = 1;
+> > > +  unr_insns *= (nunroll + 1);
+> > > +
+> > > +  return unr_insns;
+> > > +}
+> > > 
+> > > Andr0-93444-g08f1af2ed022e0try do it more accurately by marking
+> > > likely_eliminated stmt and minus that from total insns, But 2 / 3 is still
+> > > keeped.
+> > > 
+> > > +/* Estimate number of insns of completely unrolled loop.
+> > > +   It is (NUNROLL + 1) * size of loop body with taking into account
+> > > +   the fact that in last copy everything after exit conditional
+> > > +   is dead and that some instructions will be eliminated after
+> > > +   peeling.
+> > > 
+> > > -   NINSNS is the number of insns in the loop before unrolling.
+> > > -   NUNROLL is the number of times the loop is unrolled.  */
+> > > +   Loop body is likely going to simplify futher, this is difficult
+> > > +   to guess, we just decrease the result by 1/3.  */
+> > > 
+> > >  static unsigned HOST_WIDE_INT
+> > > -estimated_unrolled_size (unsigned HOST_WIDE_INT ninsns,
+> > > +estimated_unrolled_size (struct loop_size *size,
+> > >                          unsigned HOST_WIDE_INT nunroll)
+> > >  {
+> > > -  HOST_WIDE_INT unr_insns = 2 * ((HOST_WIDE_INT) ninsns - 4) / 3;
+> > > +  HOST_WIDE_INT unr_insns = ((nunroll)
+> > > +                            * (HOST_WIDE_INT) (size->overall
+> > > +                                               -
+> > > size->eliminated_by_peeling));
+> > > +  if (!nunroll)
+> > > +    unr_insns = 0;
+> > > +  unr_insns += size->last_iteration -
+> > > size->last_iteration_eliminated_by_peeling;
+> > > +
+> > > +  unr_insns = unr_insns * 2 / 3;
+> > >    if (unr_insns <= 0)
+> > >      unr_insns = 1;
+> > > -  unr_insns *= (nunroll + 1);
+> > > 
+> > > It looks to me 1 / 3 overestimates the instructions that can be optimised away,
+> > > especially if we've subtracted eliminated_by_peeling
+> > 
+> > Yes, that 1/3 reduction is a bit odd - you could have the same effect
+> > by increasing the instruction limit by 1/3, but that means it doesn't
+> > really matter, does it?  It would be interesting to see if increasing
+> > the limit by 1/3 and removing the above is neutral on SPEC?
+> 
+> Remove 1/3 reduction get ~2% improvement for 525.x264_r on SPR with
+> -march=native -O3, no big impact on other integer benchmark.454.calculix was always the benchmark to cross check as that benefits
+from much unrolling.
+
+I'm all for removing the 1/3 for innermost loop handling (in cunroll
+the unrolled loop is then innermost).  I'm more concerned about
+unrolling more than one level which is exactly what's required for
+454.calculix.
+
+- User: Hongtao Liu | Time: 2024-02-28 08:26:24 UTC
+  Text: > I'm all for removing the 1/3 for innermost loop handling (in cunroll
+> the unrolled loop is then innermost).  I'm more concerned about
+> unrolling more than one level which is exactly what's required for
+> 454.calculix.Removing 1/3 for the innermost loop would be sufficient to solve both the issue in the PR and x264_pixel_var_8x8 from 525.x264_r. I'll try to benchmark that.
+
+- User: GCC Commits | Time: 2024-05-30 05:39:51 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:ef27b91b62c3aa8841c02665dffa8914c742fd37commitr15-919-gef27b91b62c3aa8841c02665dffa8914c742fd37Author: liuhongt <hongtao.liu@intel.com>
+Date:   Tue Feb 27 15:34:57 2024 +0800
+
+    Don't reduce estimated unrolled size for innermost loop.
+    
+    For the innermost loop, after completely loop unroll, it will most likely
+    not be able to reduce the body size to 2/3. The current 2/3 reduction
+    will make some of the larger loops completely unrolled during
+    cunrolli, which will then result in them not being able to be
+    vectorized. It also increases the register pressure.
+    
+    The patch move the 2/3 reduction from estimated_unrolled_size to
+    tree_unroll_loops_completely.
+    
+    gcc/ChangeLog:PR tree-optimization/112325* tree-ssa-loop-ivcanon.cc (estimated_unrolled_size): Move the
+            2 / 3 loop body size reduction to ..
+            (try_unroll_loop_completely): .. here, add it for the check of
+            body size shrink, and the check of comparison against
+            param_max_completely_peeled_insns when
+            (!cunrolli ||loop->inner).
+            (canonicalize_loop_induction_variables): Add new parameter
+            cunrolli and pass down.
+            (tree_unroll_loops_completely_1): Ditto.
+            (canonicalize_induction_variables): Pass cunrolli as false to
+            canonicalize_loop_induction_variables.
+            (tree_unroll_loops_completely): Set cunrolli to true at
+            beginning and set it to false after CHANGED is true.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/vect/pr112325.c: New test.
+
+- User: Hongtao Liu | Time: 2024-05-30 05:40:27 UTC
+  Text: Fixed in GCC15.
+

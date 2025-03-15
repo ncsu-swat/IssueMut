@@ -1,0 +1,115 @@
+Bug Summary: [x86] psrad xmm, xmm, 16 and pand xmm, const_vector (0xffff x4) can be optimized to psrld
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Hongtao Liu | Time: 2024-03-22 05:33:26 UTC
+  Text: typedef unsigned short uint16_t;
+typedef short int16_t;
+
+#define QUANT_ONE( coef, mf, f )                \
+{ \
+    if( (coef) > 0 ) \
+        (coef) = (f + (coef)) * (mf) >> 16; \
+    else \
+        (coef) = - ((f - (coef)) * (mf) >> 16); \
+    nz |= (coef); \
+}
+
+int quant_4x4( int16_t dct[16], uint16_t mf[16], uint16_t bias[16] )
+{
+    int nz = 0;
+    for( int i = 0; i < 16; i++ )
+        QUANT_ONE( dct[i], mf[i], bias[i] );
+    return !!nz;
+}
+
+
+gcc -O2 -march=x86-64-v3 -S
+
+        mov     edx, 65535
+        vmovd   xmm4, edx
+        vpbroadcastd    ymm4, xmm4
+        ...
+        vpsrad  ymm2, ymm2, 16
+        vpsrad  ymm6, ymm6, 16
+        vpsrad  ymm0, ymm0, 16
+        vpand   ymm2, ymm4, ymm2
+        vpsrad  ymm1, ymm1, 16
+        vpand   ymm6, ymm4, ymm6
+        vpand   ymm0, ymm4, ymm0
+        vpand   ymm4, ymm4, ymm1
+        vpackusdw       ymm2, ymm2, ymm6
+        vpackusdw       ymm0, ymm0, ymm4
+        vpermq  ymm2, ymm2, 216
+        vpermq  ymm0, ymm0, 216
+        ...
+
+it can be optimized to below.
+
+        vpsrld  ymm2, ymm2, 16
+        vpsrld  ymm6, ymm6, 16
+        vpsrld  ymm0, ymm0, 16
+        vpsrld  ymm1, ymm1, 16
+        vpackusdw       ymm2, ymm2, ymm6
+        vpackusdw       ymm0, ymm0, ymm4
+        vpermq  ymm2, ymm2, 216
+        vpermq  ymm0, ymm0, 216
+
+The optimization opportunity is exposed after vec_pack_trunk_expr is expanded to vpand + vpackusdw.
+
+- User: GCC Commits | Time: 2024-06-06 00:36:41 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:7876cde25cbd2f026a0ae488e5263e72f8e9bfa0commitr15-1047-g7876cde25cbd2f026a0ae488e5263e72f8e9bfa0Author: liuhongt <hongtao.liu@intel.com>
+Date:   Fri Apr 19 10:29:34 2024 +0800
+
+    Simplify (AND (ASHIFTRT A imm) mask) to (LSHIFTRT A imm) for vector mode.
+    
+    When mask is (1 << (prec - imm) - 1) which is used to clear upper bits
+    of A, then it can be simplified to LSHIFTRT.
+    
+    i.e Simplify
+    (and:v8hi
+      (ashifrt:v8hi A 8)
+      (const_vector 0xff x8))
+    to
+    (lshifrt:v8hi A 8)
+    
+    gcc/ChangeLog:PR target/114428* simplify-rtx.cc
+            (simplify_context::simplify_binary_operation_1):
+            Simplify (AND (ASHIFTRT A imm) mask) to (LSHIFTRT A imm) for
+            specific mask.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr114428-1.c: New test.
+
+- User: GCC Commits | Time: 2024-06-06 00:36:47 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:961dd0d635217c703a38c48903981e0d60962546commitr15-1048-g961dd0d635217c703a38c48903981e0d60962546Author: liuhongt <hongtao.liu@intel.com>
+Date:   Fri Apr 19 10:39:53 2024 +0800
+
+    Adjust rtx_cost for MEM to enable more simplication
+    
+    For CONST_VECTOR_DUPLICATE_P in constant_pool, it is just broadcast or
+    variants in ix86_vector_duplicate_simode_const.
+    Adjust the cost to COSTS_N_INSNS (2) + speed which should be a little
+    bit larger than broadcast.
+    
+    gcc/ChangeLog:PR target/114428* config/i386/i386.cc (ix86_rtx_costs): Adjust cost for
+            CONST_VECTOR_DUPLICATE_P in constant_pool.
+            * config/i386/i386-expand.cc (ix86_broadcast_from_constant):
+            Remove static.
+            * config/i386/i386-protos.h (ix86_broadcast_from_constant):
+            Declare.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr114428.c: New test.
+
+- User: Hongtao Liu | Time: 2024-06-06 00:49:20 UTC
+  Text: Fixed in GCC15.
+

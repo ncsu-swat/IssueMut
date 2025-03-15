@@ -1,0 +1,132 @@
+Bug Summary: [14 Regression] SRA seems to ignore writes when using __builtin_assume_aligned since r14-5831-gaae723d360ca26
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: alias, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2023-11-25 19:44:41 UTC
+  Text: Initially noticed possibly wrong code on llvm-16.0.6 test suite when building with gcc-master fromr14-5844-g9c26c91b94eb72:
+
+  Failed Tests (2):
+    LLVM-Unit :: Support/./SupportTests/Endian/Write
+    LLVM-Unit :: Support/./SupportTests/Endian/WriteBitAligned
+
+I extracted the following self-contained example:
+
+// $ cat EndianTest.cpp
+typedef          int i32;
+typedef unsigned int u32;
+
+static inline void write_i32(void *memory, i32 value) {
+  // swap i32 bytes as if it was u32:
+  u32 u_value = value;
+  value = __builtin_bswap32(u_value);
+
+  // llvm infers '1' alignment from destination type
+  __builtin_memcpy(__builtin_assume_aligned(memory, 1), &value, sizeof(value));
+}
+
+__attribute__((noipa))
+static void bug (void) {
+  #define assert_eq(lhs, rhs) if (lhs != rhs) __builtin_trap()
+
+  unsigned char data[5];
+  write_i32(data, -1362446643);
+  assert_eq(data[0], 0xAE);
+  assert_eq(data[1], 0xCA);
+  write_i32(data + 1, -1362446643);
+  assert_eq(data[1], 0xAE);
+}
+
+int main() {
+    bug();
+}
+
+Fails as:
+
+$ gcc/xg++ -Bgcc EndianTest.cpp -o bug -O0 && ./bug
+$ gcc/xg++ -Bgcc EndianTest.cpp -o bug -O2 && ./bug
+Illegal instruction (core dumped)
+
+$ gcc/xg++ -Bgcc -v
+Reading specs from gcc/specs
+COLLECT_GCC=gcc/xg++
+COLLECT_LTO_WRAPPER=gcc/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /home/slyfox/dev/git/gcc/configure --disable-multilib --disable-bootstrap --disable-lto --disable-libsanitizer --disable-libstdcxx-pch --enable-languages=c,c++ --disable-libgomp --disable-libquadmath --disable-libvtv CFLAGS='-O1 -g0' CXXFLAGS='-O1 -g0' LDFLAGS='-O1 -g0'
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20231125 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2023-11-25 20:04:16 UTC
+  Text: It has nothing to do with __builtin_bswap32 really but rather __builtin_assume_aligned and the memcpy.
+
+SRA does not detect:
+  _9 = __builtin_assume_aligned (&data, 1);
+  MEM <unsigned int> [(char * {ref-all})_9] = 3451308718;
+  _1 = data[0];
+
+
+The store to _9 as touching data ...
+
+- User: Andrew Pinski | Time: 2023-11-25 20:05:19 UTC
+  Text: I am 90% sure it was introduced byr14-5831-gaae723d360ca26.
+
+- User: Sergei Trofimovich | Time: 2023-11-25 20:35:20 UTC
+  Text: I confirm bisect landed onr14-5831-gaae723d360ca26as well.
+
+- User: Richard Biener | Time: 2023-11-27 08:07:18 UTC
+  Text: Possibly fails to handle RETURNS_ARG_*?
+
+- User: Martin Jambor | Time: 2023-11-27 08:16:14 UTC
+  Text: (In reply to Richard Biener fromcomment #4)> Possibly fails to handle RETURNS_ARG_*?Most likely.  Mine.
+
+- User: Martin Jambor | Time: 2023-11-27 18:17:31 UTC
+  Text: I have proposed a fix on the mailing list:https://gcc.gnu.org/pipermail/gcc-patches/2023-November/638318.html
+
+- User: GCC Commits | Time: 2023-11-29 15:25:55 UTC
+  Text: The master branch has been updated by Martin Jambor <jamborm@gcc.gnu.org>:https://gcc.gnu.org/g:302461ad9a04d82fee904bddac69811d13d5bb6acommitr14-5971-g302461ad9a04d82fee904bddac69811d13d5bb6aAuthor: Martin Jambor <mjambor@suse.cz>
+Date:   Wed Nov 29 16:24:33 2023 +0100
+
+    tree-sra: Avoid returns of references to SRA candidates
+    
+    The enhancement to addressPR 109849contained an importsnt thinko,
+    and that any reference that is passed to a function and does not
+    escape, must also not happen to be aliased by the return value of the
+    function.  This has quickly transpired as bugsPR 112711andPR
+    112721.
+    
+    Just as IPA-modref does a good enough job to allow us to rely on the
+    escaped set of variables, it sems to be doing well also on updating
+    EAF_NOT_RETURNED_DIRECTLY call argument flag which happens to address
+    exactly the situation we need to avoid.  Of course, if a call
+    statement ignores any returned value, we also do not need to check the
+    flag.
+    
+    Hopefully this does not pessimize things too much, I have verified
+    that thePR 109849testcae remains quick and so should also the
+    benchmark it is derived from.
+    
+    gcc/ChangeLog:
+    
+    2023-11-27  Martin Jambor  <mjambor@suse.cz>PR tree-optimization/112711PR tree-optimization/112721* tree-sra.cc (build_access_from_call_arg): New parameter
+            CAN_BE_RETURNED, disqualify any candidate passed by reference if it is
+            true.  Adjust leading comment.
+            (scan_function): Pass appropriate value to CAN_BE_RETURNED of
+            build_access_from_call_arg.
+    
+    gcc/testsuite/ChangeLog:
+    
+    2023-11-29  Martin Jambor  <mjambor@suse.cz>PR tree-optimization/112711PR tree-optimization/112721* g++.dg/tree-ssa/pr112711.C: New test.
+            * gcc.dg/tree-ssa/pr112721.c: Likewise.
+
+- User: Martin Jambor | Time: 2023-11-29 15:27:25 UTC
+  Text: Fixed.
+
+- User: Sergei Trofimovich | Time: 2023-11-29 16:03:21 UTC
+  Text: The change also fixes llvm-16.0.6 testsuite for me. Thank you!
+

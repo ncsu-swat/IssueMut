@@ -1,0 +1,153 @@
+Bug Summary: [15 regression] New test case gcc.dg/vect/vect-mod-var.c from r15-3082-g9bbad3685131ec fails
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: N/A | Time: 2024-08-22 17:34:44 UTC
+  Text: g:9bbad3685131ec95d970f81bf75f9556d4d92742,r15-3082-g9bbad3685131ecmake  -k check-gcc RUNTESTFLAGS="vect.exp=gcc.dg/vect/vect-mod-var.c"
+FAIL: gcc.dg/vect/vect-mod-var.c execution test
+FAIL: gcc.dg/vect/vect-mod-var.c -flto -ffat-lto-objects execution test
+
+
+Program received signal SIGABRT, Aborted.
+__pthread_kill_implementation (threadid=<optimized out>, signo=<optimized out>, no_tid=no_tid@entry=0) at pthread_kill.c:44
+44	      return INTERNAL_SYSCALL_ERROR_P (ret) ? INTERNAL_SYSCALL_ERRNO (ret) : 0;
+(gdb) where
+#0  __pthread_kill_implementation (threadid=<optimized out>, signo=<optimized out>, no_tid=no_tid@entry=0) at pthread_kill.c:44
+#1  0x00007ffff7ca5814 in __pthread_kill_internal (signo=<optimized out>, threadid=<optimized out>) at pthread_kill.c:78
+#2  0x00007ffff7c47f20 in __GI_raise (sig=sig@entry=6) at ../sysdeps/posix/raise.c:26
+#3  0x00007ffff7c2a574 in __GI_abort () at abort.c:79
+#4  0x00000000100006e4 in main () at /home/seurer/gcc/git/gcc-test/gcc/testsuite/gcc.dg/vect/vect-mod-var.c:34
+
+
+  for (int i = 0; i < N; ++i)
+    if (c[i] != a[i] % b[i])
+      __builtin_abort ();  // line 34
+
+
+commit 9bbad3685131ec95d970f81bf75f9556d4d92742 (HEAD)
+Author: Jennifer Schmitz <jschmitz@nvidia.com>
+Date:   Wed Aug 7 08:56:45 2024 -0700PR tree-optimization/101390: Vectorize modulo operator
+
+- User: Kewen Lin | Time: 2024-08-23 02:12:06 UTC
+  Text: Confirmed, this is a test case issue:
+
+When i = 29, a[i] is 19, b[i] is 0, a[i]%b[i] is performing "% 0".
+
+vmodsw (Vector Modulo Signed Word) says:
+
+If an attempt is made to perform any of the modulo operations
+  ...
+  <anything> % 0
+then the remainder is undefined.
+
+Similarly for scalar side, which adopts divw/mullw/subf, divw has:
+
+If an attempt is made to perform any of the divisions
+  ...
+  <anything> / 0
+then the contents of register RT are undefined.
+
+Here we unfortunately gets 0 from vmodsw while 19 from the scalar sequence, so the abortion occurs.
+
+- User: Andrew Pinski | Time: 2024-08-23 02:52:00 UTC
+  Text: The easiest fix is todo:
+```
+  for (int i = 0; i < N; ++i)
+    {
+      a[i] = BASE1 + i * 5;
+      b[i] = BASE2 - i * 4;
+      /* b[i] cannot be 0 as that is undefined for `% b[i]`. */
+      b[i] = b[i] ? b[i] : 1;
+      __asm__ volatile ("");
+    }
+```
+
+On x86_64, I suspect we are getting a trap on the `% b[i]` rather than a comparison difference too. Which is why the fix should be on the initialization rather than the checking.
+
+- User: Kewen Lin | Time: 2024-08-23 03:27:46 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> The easiest fix is todo:
+> ```
+>   for (int i = 0; i < N; ++i)
+>     {
+>       a[i] = BASE1 + i * 5;
+>       b[i] = BASE2 - i * 4;
+>       /* b[i] cannot be 0 as that is undefined for `% b[i]`. */
+>       b[i] = b[i] ? b[i] : 1;
+>       __asm__ volatile ("");
+>     }
+> ```
+> 
+> On x86_64, I suspect we are getting a trap on the `% b[i]` rather than a
+> comparison difference too. Which is why the fix should be on the
+> initialization rather than the checking.I made/tested a patch like:
+
+diff --git a/gcc/testsuite/gcc.dg/vect/vect-mod-var.c b/gcc/testsuite/gcc.dg/vect/vect-mod-var.c
+index eeed318c62b..112048bd84c 100644
+--- a/gcc/testsuite/gcc.dg/vect/vect-mod-var.c
++++ b/gcc/testsuite/gcc.dg/vect/vect-mod-var.c
+@@ -22,7 +22,10 @@ main (void)
+   for (int i = 0; i < N; ++i)
+     {
+       a[i] = BASE1 + i * 5;
+-      b[i] = BASE2 - i * 4;
++      b[i] = BASE2 - i * 3;
++      /* There can be undefined remainder for zero b[i].  */
++      if (!b[i])
++	__builtin_abort ();
+       __asm__ volatile ("");
+     }
+
+but your proposed fix is more straightforward, will you post it?
+
+- User: Andrew Pinski | Time: 2024-08-23 03:30:12 UTC
+  Text: (In reply to Kewen Lin fromcomment #3)> (In reply to Andrew Pinski fromcomment #2)
+> > The easiest fix is todo:
+> > ```
+> >   for (int i = 0; i < N; ++i)
+> >     {
+> >       a[i] = BASE1 + i * 5;
+> >       b[i] = BASE2 - i * 4;
+> >       /* b[i] cannot be 0 as that is undefined for `% b[i]`. */
+> >       b[i] = b[i] ? b[i] : 1;
+> >       __asm__ volatile ("");
+> >     }
+> > ```
+> > 
+> > On x86_64, I suspect we are getting a trap on the `% b[i]` rather than a
+> > comparison difference too. Which is why the fix should be on the
+> > initialization rather than the checking.
+> 
+> 
+> but your proposed fix is more straightforward, will you post it?Yes I can. I will do it in the next few hours.
+
+- User: GCC Commits | Time: 2024-08-23 04:20:04 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:f6b10fe45b9b704fd6a7124ab02c6e6cbd8efce4commitr15-3098-gf6b10fe45b9b704fd6a7124ab02c6e6cbd8efce4Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Thu Aug 22 21:15:21 2024 -0700
+
+    testsuite: Fix vect-mod-var.c for division by 0 [PR116461]
+    
+    The testcase cc.dg/vect/vect-mod-var.c has an division by 0
+    which is undefined. On some targets (aarch64), the scalar and
+    the vectorized version, the result of division by 0 is the same.
+    While on other targets (x86), we get a SIGFAULT. On other targets (powerpc),
+    the results are different.
+    
+    The fix is to make sure the testcase does not test division by 0 (or really mod by 0).
+    
+    Pushed as obvious after testing on x86_64-linux-gnu to make sure the testcase passes
+    now.PR testsuite/116461gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/vect/vect-mod-var.c: Change the initialization loop so that
+            `b[i]` is never 0. Use 1 in those places.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-08-23 04:20:25 UTC
+  Text: Fixed.
+

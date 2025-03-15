@@ -1,0 +1,190 @@
+Bug Summary: [14 Regression] SCEV analysis failed for bases like A[(i+x)*stride] since r14-9193-ga0b1798042d033
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Hao Liu | Time: 2024-03-13 10:19:59 UTC
+  Text: Compile the following case with: gcc simp.c -Ofast -mcpu=neoverse-n1 -S \
+         -fdump-tree-ifcvt -fdump-tree-vect-details-scev
+
+int
+foo (short *A, int x, int stride)
+{
+  int sum = 0;
+
+  if (stride > 1)
+    {
+      #pragma GCC unroll 1
+      for (int i = 0; i < 1024; ++i)
+        sum += A[(i + x) * stride];
+    }
+
+  return sum;
+}
+
+The gimple in the loop is:
+
+  <bb 3>:
+  # sum_19 = PHI <sum_15(6), 0(5)>
+  # i_20 = PHI <i_16(6), 0(5)>
+  # ivtmp_37 = PHI <ivtmp_36(6), 1024(5)>
+  _1 = x_12(D) + i_20;
+  _2 = _1 * stride_11(D);
+  _3 = (long unsigned int) _2;
+  _4 = _3 * 2;
+  _5 = A_13(D) + _4;
+  _6 = *_5;
+  _7 = (int) _6;
+  sum_15 = _7 + sum_19;
+
+
+Before the commit (i.e., frompr114074bug fix), it can be vectorized:
+
+Creating dr for *_5
+analyze_innermost: (analyze_scalar_evolution 
+  (loop_nb = 1)
+  (scalar = _5)
+(get_scalar_evolution 
+  (scalar = _5)
+  (scalar_evolution = {A_13(D) + (long unsigned int) (stride_11(D) * x_12(D)) * 2, +, (long unsigned int) stride_11(D) * 2}_1))
+)
+success.
+(analyze_scalar_evolution 
+  (loop_nb = 1)
+  (scalar = _5)
+(get_scalar_evolution 
+  (scalar = _5)
+  (scalar_evolution = {A_13(D) + (long unsigned int) (stride_11(D) * x_12(D)) * 2, +, (long unsigned int) stride_11(D) * 2}_1))
+)
+(instantiate_scev 
+  (instantiate_below = 5 -> 3)
+  (evolution_loop = 1)
+  (chrec = {A_13(D) + (long unsigned int) (stride_11(D) * x_12(D)) * 2, +, (long unsigned int) stride_11(D) * 2}_1)
+  (res = {A_13(D) + (long unsigned int) (stride_11(D) * x_12(D)) * 2, +, (long unsigned int) stride_11(D) * 2}_1))
+	base_address: A_13(D) + (sizetype) (stride_11(D) * x_12(D)) * 2
+	offset from base address: 0
+	constant offset from base address: 0
+	step: (ssizetype) ((long unsigned int) stride_11(D) * 2)
+	base alignment: 2
+	base misalignment: 0
+	offset alignment: 128
+	step alignment: 2
+	base_object: *A_13(D) + (sizetype) (stride_11(D) * x_12(D)) * 2
+	Access function 0: {0B, +, (long unsigned int) stride_11(D) * 2}_1
+
+
+After the commit, loop vectorized failed due to SCEV failure with *_5:
+
+Creating dr for *_5
+analyze_innermost: (analyze_scalar_evolution 
+  (loop_nb = 1)
+  (scalar = _5)
+(get_scalar_evolution 
+  (scalar = _5)
+  (scalar_evolution = _5))
+)
+(analyze_scalar_evolution 
+  (loop_nb = 1)
+  (scalar = _5)
+(get_scalar_evolution 
+  (scalar = _5)
+  (scalar_evolution = _5))
+)
+simp.c:11:10: missed:  failed: evolution of base is not affine.
+..
+  (res = scev_not_known))
+
+
+To my understanding, '(i + x) * stride' is signed integer calculation, in which overflow is undefined behavior and the case should be vectorized.
+
+- User: Richard Biener | Time: 2024-03-13 10:47:59 UTC
+  Text: Confirmed.  The issue is we have
+
+ { x_12(D), +, 1 } * stride_11(D)
+
+which doesn't behave the same with respect to overflow as
+
+ { x_12(D) * stride_11(D), +, stride_11(D) }
+
+and because of that we analyze it as
+
+
+ (int) {(unsigned) x_12(D) * (unsigned) stride_11(D), +, (unsigned) stride_11(D) }
+
+as it might wrap.  But then then sign-extension to long unsigned int is
+no longer affine.
+
+  _1 = x_12(D) + i_20;
+  _2 = _1 * stride_11(D);
+  _3 = (long unsigned int) _2;
+  _4 = _3 * 2;
+  _5 = A_13(D) + _4;
+  _6 = *_5;
+
+The problematical case is x == N < 0 where the last - N might now
+overflow with the new SCEV.
+
+The correctness means that we'll now more often run into these issues
+for IVs smaller than pointer width.  With -m32 we can analyze the DR to
+
+Creating dr for *_5
+        offset from base address: 0
+        constant offset from base address: 0
+        step: (ssizetype) ((unsigned int) stride_11(D) * 2)
+        base alignment: 2
+        base misalignment: 0
+        offset alignment: 256
+        step alignment: 2
+        base_object: *A_13(D) + (sizetype) ((unsigned int) stride_11(D) * (unsigned int) x_12(D)) * 2
+        Access function 0: {0B, +, (unsigned int) stride_11(D) * 2}_1
+
+If you had written
+
+   sum += A[i*stride + x*stride];
+
+it might have worked but unfortunately EVRP transforms this back to
+(i+x)*stride because it knows stride isn't zero.
+
+In the end this means it's our failure that we fail to handle
+
+  2 * (unsigned long)({ x_12(D), +, 1 } * stride_11(D))
+
+as valid evolution for further analysis - of course the multiplication
+by two in an unsigned type might overflow as well.
+
+- User: GCC Commits | Time: 2024-03-19 12:12:08 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:e0e9499aeffdaca88f0f29334384aa5f710a81a4commitr14-9540-ge0e9499aeffdaca88f0f29334384aa5f710a81a4Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Mar 19 12:24:08 2024 +0100
+
+    tree-optimization/114151 - revertPR114074fix
+    
+    The following reverts the chrec_fold_multiply fix and only keeps
+    handling of constant overflow which keeps the original testcase
+    fixed.  A better solution might involve ranger improvements or
+    tracking of assumptions during SCEV analysis similar to what niter
+    analysis does.PR tree-optimization/114151PR tree-optimization/114269PR tree-optimization/114322PR tree-optimization/114074* tree-chrec.cc (chrec_fold_multiply): Restrict the use of
+            unsigned arithmetic when actual overflow on constant operands
+            is observed.
+    
+            * gcc.dg/pr68317.c: Revert last change.
+
+- User: Richard Biener | Time: 2024-03-19 12:15:31 UTC
+  Text: Fixed by reverting the offending change.  Feel free to submit a testcase for the 
+testsuite covering your case.
+
+- User: GCC Commits | Time: 2024-03-20 09:39:36 UTC
+  Text: The master branch has been updated by Hao Liu <hliu@gcc.gnu.org>:https://gcc.gnu.org/g:4c276896d646c2dbc8047fd81d6e65f8c5ecf01dcommitr14-9569-g4c276896d646c2dbc8047fd81d6e65f8c5ecf01dAuthor: Hao Liu <hliu@os.amperecomputing.com>
+Date:   Wed Mar 20 17:37:01 2024 +0800
+
+    testsuite: add the case to cover the vectorization of A[(i+x)*stride] [PR114322]
+    
+    This issues has been fixed byr14-9540-ge0e9499ainPR114151. Tested on
+    aarch64-linux-gnu.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/114322* gcc.dg/vect/pr114322.c: New testcase.
+

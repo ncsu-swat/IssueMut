@@ -1,0 +1,108 @@
+Bug Summary: [14 regression] ICE in verify_dominators
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Edwin Lu | Time: 2024-03-01 21:44:15 UTC
+  Text: Tested with riscv and x86_64
+
+godbolt:https://godbolt.org/z/EvWj99d4b#pragma pack(push)
+struct a {
+  volatile signed b : 8;
+};
+#pragma pack(pop)
+int c;
+static struct a d = {5};
+void e() {
+f:
+  for (c = 8; c < 55; ++c)
+    if (!d.b)
+      goto f;
+}
+
+testcase.c: In function 'e':
+testcase.c:8:6: error: dominator of 7 should be 3, not 9
+    8 | void e() {
+      |      ^
+during GIMPLE pass: vect
+dump file: testcase.c.179t.vect
+testcase.c:8:6: internal compiler error: in verify_dominators, at dominance.cc:1194
+0xa0954c verify_dominators(cdi_direction)
+        ../../../gcc/gcc/dominance.cc:1194
+0x15e7ed1 checking_verify_dominators(cdi_direction)
+        ../../../gcc/gcc/dominance.h:76
+0x15e7ed1 slpeel_tree_duplicate_loop_to_edge_cfg(loop*, edge_def*, loop*, edge_def*, edge_def*, edge_def**, bool, vec<basic_block_def*, va_heap, vl_ptr>*)
+        ../../../gcc/gcc/tree-vect-loop-manip.cc:1945
+0x15ea20a vect_do_peeling(_loop_vec_info*, tree_node*, tree_node*, tree_node**, tree_node**, tree_node**, int, bool, bool, tree_node**)
+        ../../../gcc/gcc/tree-vect-loop-manip.cc:3426
+0x15d982e vect_transform_loop(_loop_vec_info*, gimple*)
+        ../../../gcc/gcc/tree-vect-loop.cc:11935
+0x161f981 vect_transform_loops
+        ../../../gcc/gcc/tree-vectorizer.cc:1006
+0x16200f3 try_vectorize_loop_1
+        ../../../gcc/gcc/tree-vectorizer.cc:1152
+0x16200f3 try_vectorize_loop
+        ../../../gcc/gcc/tree-vectorizer.cc:1182
+0x162077c execute
+        ../../../gcc/gcc/tree-vectorizer.cc:1298
+
+- User: Edwin Lu | Time: 2024-03-01 21:45:38 UTC
+  Text: Found an issue where the dominators in duplicated loops were not properly updated. Will be sending a fix soon
+
+- User: Patrick O'Neill | Time: 2024-03-01 21:47:00 UTC
+  Text: found via fuzzer
+
+- User: Edwin Lu | Time: 2024-03-01 22:16:17 UTC
+  Text: Patch:https://gcc.gnu.org/pipermail/gcc-patches/2024-March/647031.html
+
+- User: Richard Biener | Time: 2024-03-04 10:47:37 UTC
+  Text: I will have a look.
+
+- User: Richard Biener | Time: 2024-03-04 12:27:37 UTC
+  Text: The issue is really unexpected if-conversion which ends up putting the
+vector copy of an innner loop outside of the enclosing loop of a scalar
+loop.  Such mishap usually happens because of simplifications.
+
+In this case we see bitfield lowering touching a volatile access which
+it shouldn't do, even removing the volatile marking and then value-numbering
+concluding the lowered d.b is 5:
+
+Value numbering stmt = _ifc__21 = d.D.2770;
+RHS d.D.2770 simplified to 5
+Setting value number of _ifc__21 to 5 (changed)
+Replaced d.D.2770 with 5 in all uses of _ifc__21 = d.D.2770;
+Value numbering stmt = _ifc__22 = BIT_FIELD_REF <_ifc__21, 8, 0>;
+Match-and-simplified BIT_FIELD_REF <_ifc__21, 8, 0> to 5
+RHS BIT_FIELD_REF <_ifc__21, 8, 0> simplified to 5
+Setting value number of _ifc__22 to 5 (changed)
+Replaced BIT_FIELD_REF <_ifc__21, 8, 0> with 5 in all uses of _ifc__22 = BIT_FIELD_REF <_ifc__21, 8, 0>;
+Value numbering stmt = _1 = _ifc__22;
+Setting value number of _1 to 5 (changed)
+Value numbering stmt = if (_1 == 0)
+marking known outgoing edge 4 -> 5 executable
+gimple_simplified to if (0 != 0)
+
+- User: GCC Commits | Time: 2024-03-04 13:56:06 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:8fdac08b4d5f65973164a476bd255533ed97a766commitr14-9296-g8fdac08b4d5f65973164a476bd255533ed97a766Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Mar 4 13:28:34 2024 +0100
+
+    tree-optimization/114197 - unexpected if-conversion for vectorization
+    
+    The following avoids lowering a volatile bitfiled access and in case
+    the if-converted and original loops end up in different outer loops
+    because of simplifcations enabled scrap the result since that is not
+    how the vectorizer expects the loops to be laid out.PR tree-optimization/114197* tree-if-conv.cc (bitfields_to_lower_p): Do not lower if
+            there are volatile bitfield accesses.
+            (pass_if_conversion::execute): Throw away result if the
+            if-converted and original loops are not nested as expected.
+    
+            * gcc.dg/torture/pr114197.c: New testcase.
+
+- User: Richard Biener | Time: 2024-03-04 13:56:39 UTC
+  Text: Fixed both issues.
+

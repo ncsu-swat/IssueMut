@@ -1,0 +1,146 @@
+Bug Summary: [14/15 Regression] ICE when including a PCH via compiler option -include since r14-5836
+Product: gcc
+Component: pch
+
+  (show other bugs)
+Keywords: patch
+Known to Work: 13.3.0
+Known to Fail: 14.1.0
+
+Comments:
+- User: John Simon | Time: 2024-06-01 03:37:20 UTC
+  Text: An internal compiler error is triggered in GCC 14.1.0 when including a precompiled header via compiler option -include. A testcase is provided below:
+
+```
+touch test.cpp
+touch test.h
+
+g++ test.h
+g++ -include test.h -c test.cpp -save-temps
+test.cpp:1: internal compiler error: in c_init_preprocess, at cp/parser.cc:790
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+See <https://gcc.gnu.org/bugs/> for instructions.
+```
+
+This issue shows up on (i686|x86_64)-w64-mingw32 platforms. GCC 14.1.0 releases from MSYS2 and WinLibs projects are affected.
+
+I have done some tests with prebuilt GCC 14 pre-releases from WinLibs project.
+
+- Last working GCC 14 pre-release is from snapshot gcc-14-20231119.
+- First GCC 14 pre-release with this issue is from snapshot gcc-14-20231217.
+
+- User: Lewis Hyatt | Time: 2024-06-02 01:26:26 UTC
+  Text: Hmm that is odd. It works fine on x86-64/Linux so I think this is something target-specific with PCH? If this assert is firing:
+
+void
+c_init_preprocess ()
+{
+  gcc_assert (!the_parser);
+...
+
+It means that the_parser was not NULL after reading in the PCH. But it should be, because the_parser is explicitly set to NULL prior to writing the PCH (at the end of c_parse_file() in cp/parse.cc) and so that's what it should get set to after reading the PCH back in. Are you able to confirm whether the_parser stored in the PCH is indeed NULL, maybe? I don't have anywhere to test this platform myself at the moment. Thanks...
+
+That assert could be simply removed too, but it does seem worth understanding how it can trigger here...
+
+- User: Brecht Sanders | Time: 2024-06-11 04:28:15 UTC
+  Text: I have made a native Windows MinGW-w64 build where the lines "gcc_assert (!the_parser);" were commented out in file gcc/cp/parser.cc and got confirmation this successfully works around the issue.
+
+See:https://github.com/brechtsanders/winlibs_mingw/issues/199
+
+- User: Lewis Hyatt | Time: 2024-06-11 21:37:45 UTC
+  Text: (In reply to Brecht Sanders fromcomment #2)> I have made a native Windows MinGW-w64 build where the lines "gcc_assert
+> (!the_parser);" were commented out in file gcc/cp/parser.cc and got
+> confirmation this successfully works around the issue.Thanks! Do you mind please confirming, are you building it with the following downstream patch in place (which is not part of GCC itself as of now):https://github.com/msys2/MINGW-packages/blob/master/mingw-w64-gcc/0021-PR14940-Allow-a-PCH-to-be-mapped-to-a-different-addr.patch? If so, it would be interesting if possible to confirm whether the assert still triggers without that patch.
+
+- User: Brecht Sanders | Time: 2024-06-15 13:14:34 UTC
+  Text: No, that patch wasn't added for my build, see my build recipe here:https://github.com/brechtsanders/winlibs_recipes/blob/main/recipes/gcc.winlib
+
+- User: Lewis Hyatt | Time: 2024-06-15 15:30:46 UTC
+  Text: (In reply to Brecht Sanders fromcomment #4)> No, that patch wasn't added for my build, see my build recipe here:
+>https://github.com/brechtsanders/winlibs_recipes/blob/main/recipes/gcc.winlibThanks, this script is useful. FWIW I think the patch is there, line 778? Unless I am missing something.
+
+I see you also commented out the assert in your recipe. I am still not sure if that is just masking some deeper issue, but I am getting close to being able to reproduce it myself and will let you know.
+
+- User: Brecht Sanders | Time: 2024-06-15 19:41:37 UTC
+  Text: You're right. Sorry I missed that.
+
+- User: Lewis Hyatt | Time: 2024-06-17 16:33:45 UTC
+  Text: OK I see now. For the case of a PCH combined with -include it is a regression in GCC 14 caused byr14-5836. I think any platform that does not make use of the stdc-predef.h preinclude will be affected (including MinGW). 
+
+The assert added inr14-5836should not be failing, but it is failing due to an oversight inr14-2893. This was a new feature for GCC 14 that made #pragma work during preprocessing, which required the creation of a parser object in preprocess-only mode.
+
+I will test this patch that should fix it:
+
+=====
+
+diff --git a/gcc/c-family/c-opts.cc b/gcc/c-family/c-opts.cc
+index faaf9ee6350..a09a0518c52 100644
+--- a/gcc/c-family/c-opts.cc
++++ b/gcc/c-family/c-opts.cc
+@@ -1296,8 +1296,8 @@ c_common_init (void)
+
+   if (flag_preprocess_only)
+     {
+-      c_finish_options ();
+       c_init_preprocess ();
++      c_finish_options ();
+       preprocess_file (parse_in);
+       return false;
+     }
+
+=====
+
+The problem is that c_finish_options() will also include the first command-line- specified include file. On glibc platforms, this is always the stdc-predef.h preinclude and then things work. In the absence of a preinclude, it will include the first file requested with -include. If that file triggers a PCH load, then we hit the code path introduced inr14-5836; after the PCH is loaded, we reinitialize the parser. But in this case we have not called c_init_preprocess() yet, so when we do call it afterward, the parser already exists and so the assert fails. 
+
+The above patch should make things right, I am testing it now and it should get into GCC 14.2. You could add it to the list of MinGW-specific patches for WinLibs and MSYS2 in the meantime too. It's preferable to commenting out the assert, although that workaround probably does work fine at the moment as well.
+
+- User: Lewis Hyatt | Time: 2024-06-27 21:07:08 UTC
+  Text: Patch submitted for review.https://gcc.gnu.org/pipermail/gcc-patches/2024-June/655900.html
+
+- User: GCC Commits | Time: 2024-07-03 02:34:38 UTC
+  Text: The master branch has been updated by Lewis Hyatt <lhyatt@gcc.gnu.org>:https://gcc.gnu.org/g:038d64f62271ddc62aa35d0a5dfd3843fdb9e6d7commitr15-1803-g038d64f62271ddc62aa35d0a5dfd3843fdb9e6d7Author: Lewis Hyatt <lhyatt@gmail.com>
+Date:   Sat Jun 15 21:09:01 2024 -0400
+
+    preprocessor: Create the parser before handling command-line includes [PR115312]
+    
+    Sincer14-2893, we create a parser object in preprocess-only mode for the
+    purpose of parsing #pragma while preprocessing. The parser object was
+    formerly created after calling c_finish_options(), which leads to problems
+    on platforms that don't use stdc-predef.h (such as MinGW, as reported in
+    the PR). On such platforms, the call to c_finish_options() will process
+    the first command-line-specified include file. If that includes a PCH, then
+    c-ppoutput.cc will encounter a state it did not anticipate. Fix it by
+    creating the parser prior to calling c_finish_options().
+    
+    gcc/c-family/ChangeLog:PR pch/115312* c-opts.cc (c_common_init): Call c_init_preprocess() before
+            c_finish_options() so that a parser is available to process any
+            includes specified on the command line.
+    
+    gcc/testsuite/ChangeLog:PR pch/115312* g++.dg/pch/pr115312.C: New test.
+            * g++.dg/pch/pr115312.Hs: New test.
+
+- User: GCC Commits | Time: 2024-07-03 11:14:12 UTC
+  Text: The releases/gcc-14 branch has been updated by Lewis Hyatt <lhyatt@gcc.gnu.org>:https://gcc.gnu.org/g:3389a23fd492b7920a62de6af298251b3cdab617commitr14-10374-g3389a23fd492b7920a62de6af298251b3cdab617Author: Lewis Hyatt <lhyatt@gmail.com>
+Date:   Sat Jun 15 21:09:01 2024 -0400
+
+    preprocessor: Create the parser before handling command-line includes [PR115312]
+    
+    Sincer14-2893, we create a parser object in preprocess-only mode for the
+    purpose of parsing #pragma while preprocessing. The parser object was
+    formerly created after calling c_finish_options(), which leads to problems
+    on platforms that don't use stdc-predef.h (such as MinGW, as reported in
+    the PR). On such platforms, the call to c_finish_options() will process
+    the first command-line-specified include file. If that includes a PCH, then
+    c-ppoutput.cc will encounter a state it did not anticipate. Fix it by
+    creating the parser prior to calling c_finish_options().
+    
+    gcc/c-family/ChangeLog:PR pch/115312* c-opts.cc (c_common_init): Call c_init_preprocess() before
+            c_finish_options() so that a parser is available to process any
+            includes specified on the command line.
+    
+    gcc/testsuite/ChangeLog:PR pch/115312* g++.dg/pch/pr115312.C: New test.
+            * g++.dg/pch/pr115312.Hs: New test.
+
+- User: Lewis Hyatt | Time: 2024-07-03 11:15:28 UTC
+  Text: Fixed for 14.2.
+

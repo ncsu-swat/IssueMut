@@ -1,0 +1,182 @@
+Bug Summary: [13 Regression] Wrong code with -O3 -march=rv64gcv on riscv or `-O3 -march=armv9-a` for aarch64
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 12.3.0, 13.2.1, 14.0
+Known to Fail: 13.2.0
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-03-26 14:54:35 UTC
+  Text: Testcase:
+int b, c = 8, d;
+int e[23];
+int main() {
+  int *h = e;
+  for (int i = 1; i < b + 21; i += 2) {
+    c *= -1;
+    d = h[i] ? i : 0;
+  }
+  __builtin_printf("%u\n", c);
+}
+
+Commands> /scratch/tc-testing/tc-mar-25/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv -O3 red.c -o red.out
+> /scratch/tc-testing/tc-mar-25/build-rv64gcv/bin/qemu-riscv64 red.out4294967288> /scratch/tc-testing/tc-mar-25/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv -O2 red.c -o red.out
+> /scratch/tc-testing/tc-mar-25/build-rv64gcv/bin/qemu-riscv64 red.out8
+
+This is likely a duplicate ofpr114476(but this testcase does not require -fwrapv).
+
+Found via fuzzer
+
+- User: Andrew Pinski | Time: 2024-03-26 20:35:26 UTC
+  Text: [apinski@xeond2 upstream-cross-aarch64]$ ./install/bin/aarch64-linux-gnu-gcc -O3 t67.c -static
+.[apinski@xeond2 upstream-cross-aarch64]$ ./install-qemu/bin/qemu-aarch64 a.out
+8
+[apinski@xeond2 upstream-cross-aarch64]$ ./install/bin/aarch64-linux-gnu-gcc -O3 t67.c -static -march=armv9-a+sve2
+[apinski@xeond2 upstream-cross-aarch64]$ ./install-qemu/bin/qemu-aarch64 a.out
+4294967288
+
+- User: Andrew Pinski | Time: 2024-03-26 20:39:07 UTC
+  Text: Confirmed. Yes it does look very similar if not the same.
+This one does not even need -fno-vect-cost-model nor -fwrapv for aarch64 even.
+
+- User: Richard Biener | Time: 2024-03-27 08:19:52 UTC
+  Text: Huh.
+
+  _75 = [vec_duplicate_expr] pretmp_34;
+  _76 = -_75;
+  _77 = VEC_PERM_EXPR <_75, _76, { 0, POLY_INT_CST [4, 4], 1, POLY_INT_CST [5, 4], 2, POLY_INT_CST [6, 4], ... }>;
+
+  # c_lsm.7_8 = PHI <_2(9), pretmp_34(19)>
+  vect__2.17_79 = -_77;
+  _2 = -c_lsm.7_8;
+
+  <bb 28> [local count: 94607391]:
+  # i_101 = PHI <i_17(3)>
+  # vect__2.17_102 = PHI <vect__2.17_79(3)>
+  # loop_mask_103 = PHI <loop_mask_81(3)>
+  # vect_iftmp.24_104 = PHI <vect_iftmp.24_91(3)>
+  _68 = ni_gap.12_67;
+  _93 = .EXTRACT_LAST (loop_mask_103, vect_iftmp.24_104);
+  iftmp.1_59 = _93;
+  _82 = .EXTRACT_LAST (loop_mask_103, vect__2.17_102);
+
+it looks OK to me?  But maybe the poly-int-cst permute is wrong?  Should
+be an interleave.
+
+- User: Robin Dapp | Time: 2024-03-27 14:06:19 UTC
+  Text: Yes, the vectorization looks ok.  The extracted live values are not used afterwards and therefore the whole vectorized loop is being thrown away.
+Then we do one iteration of the epilogue loop, inverting the original c and end up with -8 instead of 8.  This is pretty similar to what's happening in the related PR.
+
+We properly populate the phi in question in slpeel_update_phi_nodes_for_guard1:
+
+c_lsm.7_64 = PHI <_56(23), pretmp_34(17)>
+
+but vect_update_ivs_after_vectorizer changes that into
+
+c_lsm.7_64 = PHI <pretmp_34(17), pretmp_34(17)>.
+
+Just as a test, commenting out
+
+      if (!LOOP_VINFO_EARLY_BREAKS_VECT_PEELED (loop_vinfo))
+	vect_update_ivs_after_vectorizer (loop_vinfo, niters_vector_mult_vf,
+					  update_e);
+
+at least makes us keep the VEC_EXTRACT and not fail anymore.
+
+- User: Andrew Pinski | Time: 2024-03-27 21:03:15 UTC
+  Text: ***Bug 114476has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2024-03-27 21:04:08 UTC
+  Text: Note the missed SCCP is filed asPR 114502(and another bug for the non-constant loop bounds case; I don't have the # right now).
+
+- User: Andrew Pinski | Time: 2024-03-27 21:06:08 UTC
+  Text: (In reply to Andrew Pinski fromcomment #6)> Note the missed SCCP is filed asPR 114502(and another bug for the
+> non-constant loop bounds case; I don't have the # right now).PR 112104for the non-constant loop bounds case.
+
+- User: Richard Biener | Time: 2024-04-03 13:13:06 UTC
+  Text: (In reply to Robin Dapp fromcomment #4)> Yes, the vectorization looks ok.  The extracted live values are not used
+> afterwards and therefore the whole vectorized loop is being thrown away.
+> Then we do one iteration of the epilogue loop, inverting the original c and
+> end up with -8 instead of 8.  This is pretty similar to what's happening in
+> the related PR.
+> 
+> We properly populate the phi in question in
+> slpeel_update_phi_nodes_for_guard1:
+> 
+> c_lsm.7_64 = PHI <_56(23), pretmp_34(17)>
+> 
+> but vect_update_ivs_after_vectorizer changes that into
+> 
+> c_lsm.7_64 = PHI <pretmp_34(17), pretmp_34(17)>.
+> 
+> Just as a test, commenting out
+> 
+>       if (!LOOP_VINFO_EARLY_BREAKS_VECT_PEELED (loop_vinfo))
+> 	vect_update_ivs_after_vectorizer (loop_vinfo, niters_vector_mult_vf,
+> 					  update_e);
+> 
+> at least makes us keep the VEC_EXTRACT and not fail anymore.I'll note that on x86_64 we do the same and not fail the testcase.  x86
+cannot use partial vectors because we don't implement EXTRACT_LAST,
+so that might be the "key" to the failure (partial vectors). And we
+might need to "fail" vectorization of the special inductions when
+using them?
+
+This might be also out-of-sync handling of which ones we handle with
+vect_update_ivs_after_vectorizer and which ones with
+vectorizable_live_operation - as indeed we do generate the EXTRACT_LAST here.
+
+- User: Richard Biener | Time: 2024-04-04 07:52:10 UTC
+  Text: I think vect_update_ivs_after_vectorizer cannot deal at all with a masked loop.
+
+- User: Richard Biener | Time: 2024-04-04 07:59:06 UTC
+  Text: /* Init_expr will be update by vect_update_ivs_after_vectorizer,
+     if niters or vf is unkown:
+     For shift, when shift mount >= precision, there would be UD.
+     For mult, don't known how to generate
+     init_expr * pow (step, niters) for variable niters.
+     For neg, it should be ok, since niters of vectorized main loop
+     will always be multiple of 2.
+
+well, for partial vectors that's of course not true.
+
+- User: Richard Biener | Time: 2024-04-04 08:04:30 UTC
+  Text: Createdattachment 57871[details]patch
+
+I'm testing this (on x86_64-linux).
+
+- User: GCC Commits | Time: 2024-04-04 11:09:33 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:85621f98d245004a6c9787dde21e0acc17ab2c50commitr14-9786-g85621f98d245004a6c9787dde21e0acc17ab2c50Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Apr 4 10:00:51 2024 +0200
+
+    tree-optimization/114485 - neg induction with partial vectors
+    
+    We can't use vect_update_ivs_after_vectorizer for partial vectors,
+    the following fixes vect_can_peel_nonlinear_iv_p accordingly.PR tree-optimization/114485* tree-vect-loop-manip.cc (vect_can_peel_nonlinear_iv_p):
+            vect_step_op_neg isn't OK for partial vectors but only
+            for unknown niter.
+    
+            * gcc.dg/vect/pr114485.c: New testcase.
+
+- User: Richard Biener | Time: 2024-04-04 11:10:03 UTC
+  Text: This should be fixed on trunk now.
+
+- User: GCC Commits | Time: 2024-05-03 13:55:05 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:a676581ddc49a6ead8edced7bb4b92aeceebde56commitr13-8679-ga676581ddc49a6ead8edced7bb4b92aeceebde56Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Apr 4 10:00:51 2024 +0200
+
+    tree-optimization/114485 - neg induction with partial vectors
+    
+    We can't use vect_update_ivs_after_vectorizer for partial vectors,
+    the following fixes vect_can_peel_nonlinear_iv_p accordingly.PR tree-optimization/114485* tree-vect-loop-manip.cc (vect_can_peel_nonlinear_iv_p):
+            vect_step_op_neg isn't OK for partial vectors but only
+            for unknown niter.
+    
+            * gcc.dg/vect/pr114485.c: New testcase.
+    
+    (cherry picked from commit 85621f98d245004a6c9787dde21e0acc17ab2c50)
+
+- User: Richard Biener | Time: 2024-05-03 13:58:12 UTC
+  Text: Fixed.
+

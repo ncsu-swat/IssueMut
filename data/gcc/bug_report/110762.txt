@@ -1,0 +1,459 @@
+Bug Summary: [11/12/13 Regression] inappropriate use of SSE (or AVX) insns for v2sf mode operations
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 10.5.0, 14.0
+Known to Fail: 
+
+Comments:
+- User: N/A | Time: 2023-07-21 08:43:23 UTC
+  Text: Perhaps related to work done forbug 95046, this code
+
+typedef float __attribute__((vector_size(8))) v2sf_t;
+typedef float __attribute__((vector_size(16))) v4sf_t;
+
+v2sf_t test(v4sf_t x, v4sf_t y) {
+	v2sf_t x2, y2;
+
+	__builtin_ia32_storelps(&x2, x);
+	__builtin_ia32_storelps(&y2, y);
+
+	return x2 + y2;
+}
+
+compiled for a 64-bit target with -O2 translates to a single addps (besides the ret instruction of course), coming from *mmx_addv2sf3. This cannot be right: The contents of the upper halves of both registers aren't known at this point, so the extra care mentioned in 95046 does not look to be applied here.
+
+- User: Richard Biener | Time: 2023-07-21 09:13:50 UTC
+  Text: So what's the issue?  That this is wrong for -ftrapping-math?  Or that the
+return value has undefined contents in the upper half?  (I don't think the
+ABI specifies how V2SF is returned)
+
+- User: Richard Biener | Time: 2023-07-21 09:19:34 UTC
+  Text: The
+
+   (insn 13 4 14 2 (set (reg:V2SF 20 xmm0 [orig:91 x2 ] [91])
+        (vec_select:V2SF (reg:V4SF 20 xmm0 [94])
+            (parallel [
+                    (const_int 0 [0])
+                    (const_int 1 [0x1])
+                ]))) "t.c":10:12 4394 {sse_storelps}
+     (nil))
+
+insns are gone in split after reload.
+
+- User: Uroš Bizjak | Time: 2023-07-21 09:36:24 UTC
+  Text: (In reply to Richard Biener fromcomment #1)> So what's the issue?  That this is wrong for -ftrapping-math?  Or that the
+> return value has undefined contents in the upper half?  (I don't think the
+> ABI specifies how V2SF is returned)__m64 is classified as SSE class, returned in XMM register.
+
+- User: Alexander Monakov | Time: 2023-07-21 09:40:37 UTC
+  Text: In addition to FPU exception issue, it's also a performance trap due to handling of accidental denormals in upper halves.
+
+- User: Segher Boessenkool | Time: 2023-07-21 10:22:38 UTC
+  Text: (In reply to Richard Biener fromcomment #2)> The
+> 
+>    (insn 13 4 14 2 (set (reg:V2SF 20 xmm0 [orig:91 x2 ] [91])
+>         (vec_select:V2SF (reg:V4SF 20 xmm0 [94])
+>             (parallel [
+>                     (const_int 0 [0])
+>                     (const_int 1 [0x1])
+>                 ]))) "t.c":10:12 4394 {sse_storelps}
+>      (nil))
+> 
+> insns are gone in split after reload.Insns 13 and 14 are deleted by split2, yes.  Although the very next insn
+(15) obviously uses the regs (20 and 21) those insns set?!
+
+- User: Richard Biener | Time: 2023-07-21 10:46:09 UTC
+  Text: (In reply to Segher Boessenkool fromcomment #5)> (In reply to Richard Biener fromcomment #2)
+> > The
+> > 
+> >    (insn 13 4 14 2 (set (reg:V2SF 20 xmm0 [orig:91 x2 ] [91])
+> >         (vec_select:V2SF (reg:V4SF 20 xmm0 [94])
+> >             (parallel [
+> >                     (const_int 0 [0])
+> >                     (const_int 1 [0x1])
+> >                 ]))) "t.c":10:12 4394 {sse_storelps}
+> >      (nil))
+> > 
+> > insns are gone in split after reload.
+> 
+> Insns 13 and 14 are deleted by split2, yes.  Although the very next insn
+> (15) obviously uses the regs (20 and 21) those insns set?!set_noop_p returns true for it ...
+
+- User: Richard Biener | Time: 2023-07-21 10:47:34 UTC
+  Text: I guess for the specific usage we need to wrap this in an UNSPEC?
+
+- User: Richard Biener | Time: 2023-07-21 10:49:07 UTC
+  Text: OTOH the set isn't noop for the xmm0 hardreg (it zeros the upper parts)
+
+- User: N/A | Time: 2023-07-21 10:53:52 UTC
+  Text: (In reply to Richard Biener fromcomment #1)> So what's the issue?  That this is wrong for -ftrapping-math?Even without that option MXCSR may be modified for reasons contained to just the upper halves of the registers.>  Or that the
+> return value has undefined contents in the upper half?  (I don't think the
+> ABI specifies how V2SF is returned)This part is fine, aiui.
+
+- User: Uroš Bizjak | Time: 2023-07-21 11:09:25 UTC
+  Text: (In reply to Richard Biener fromcomment #7)> I guess for the specific usage we need to wrap this in an UNSPEC?Probably, so a MOVQ xmm, xmm insn should be emitted for __builtin_ia32_storelps (AKA _mm_storel_pi), so the top 64bits will be cleared. There is already *vec_concatv4sf_0 that looks appropriate to implement the move.
+
+- User: Richard Biener | Time: 2023-07-21 11:16:46 UTC
+  Text: (In reply to Richard Biener fromcomment #2)> The
+> 
+>    (insn 13 4 14 2 (set (reg:V2SF 20 xmm0 [orig:91 x2 ] [91])
+>         (vec_select:V2SF (reg:V4SF 20 xmm0 [94])
+>             (parallel [
+>                     (const_int 0 [0])
+>                     (const_int 1 [0x1])
+>                 ]))) "t.c":10:12 4394 {sse_storelps}
+>      (nil))
+> 
+> insns are gone in split after reload.The opinion is that the above insn leaves the upper half of xmm0 undefined.
+
+- User: Richard Biener | Time: 2023-07-21 11:25:45 UTC
+  Text: _mm_storel_pi could be implemented using __builtin_shufflevector these days.
+Which shows exactly the same issue:
+
+typedef float __attribute__((vector_size(8))) v2sf_t;
+typedef float __attribute__((vector_size(16))) v4sf_t;
+
+v2sf_t test(v4sf_t x, v4sf_t y) {
+        v2sf_t x2, y2;
+
+        x2 = __builtin_shufflevector (x, x, 0, 1);
+        y2 = __builtin_shufflevector (y, x, 0, 1);
+
+        return x2 + y2;
+}
+
+expands to
+
+(insn 7 4 8 2 (set (reg:DI 88)
+        (vec_select:DI (subreg:V2DI (reg/v:V4SF 85 [ x ]) 0)
+            (parallel [
+                    (const_int 0 [0])
+                ]))) "t.c":7:5 -1
+     (nil))
+(insn 8 7 9 2 (set (reg:DI 89)
+        (vec_select:DI (subreg:V2DI (reg/v:V4SF 86 [ y ]) 0)
+            (parallel [
+                    (const_int 0 [0])
+                ]))) "t.c":8:5 -1
+     (nil))
+(insn 9 8 10 2 (set (reg:V2SF 87)
+        (plus:V2SF (subreg:V2SF (reg:DI 88) 0)
+            (subreg:V2SF (reg:DI 89) 0))) "t.c":12:12 -1
+     (nil))
+
+and is recognized by the same set_noop_p code.  On GIMPLE we have
+
+  x2_2 = BIT_FIELD_REF <x_1(D), 64, 0>;
+  y2_4 = BIT_FIELD_REF <y_3(D), 64, 0>;
+  _5 = x2_2 + y2_4;
+
+- User: Uroš Bizjak | Time: 2023-07-21 12:42:39 UTC
+  Text: I think we should put all partial vector V2SF operations under !flag_trapping_math.
+
+- User: Alexander Monakov | Time: 2023-07-21 12:47:40 UTC
+  Text: That seems undesirable in light ofcomment #4, you'd risk creating a situation when -fno-trapping-math is unpredictably slower when denormals appear in dirty upper halves.
+
+- User: N/A | Time: 2023-07-21 13:18:34 UTC
+  Text: (In reply to Richard Biener fromcomment #12)> _mm_storel_pi could be implemented using __builtin_shufflevector these days.
+> Which shows exactly the same issue:(also related tocomment 10) I don't think the problem is how the registers are filled (and in my example I simply used the first approach that came to mind and worked). The problem is that the arithmetic insn assumes the upper parts to not hold certain special values (or pairs thereof). Aiui one could create the exact same situation with inline assembly instead of any of the builtins.
+
+This isn't any different from using 512-bit operations for more narrow vectors when AVX512VL isn't enabled. Afaict such uses are carefully avoided for floating point vectors, and are used only in a limited number of cases on integer vectors (Hongtao recently asked me to not go any further in that direction either).
+
+- User: Uroš Bizjak | Time: 2023-07-26 07:30:31 UTC
+  Text: Createdattachment 55636[details]Proposed patch
+
+Proposed patch clears the upper half of a V4SFmode operand register before all potentially trapping instructions. The testcase fromcomment #12now compiles to:
+
+        movq    %xmm1, %xmm1    # 9     [c=4 l=4]  *vec_concatv4sf_0
+        movq    %xmm0, %xmm0    # 10    [c=4 l=4]  *vec_concatv4sf_0
+        addps   %xmm1, %xmm0    # 11    [c=12 l=3]  *addv4sf3/0
+
+This approach addresses issues with traps (Comment #0), as well as with denormal/invalid values (Comment #14). An obvious exception to the rule is a division, where the value != 0.0 should be loaded into the upper half of the denominator.
+
+The patch effectively tightens the solution fromPR95046by clearing upper halves of all operand registers before every potentially trapping instruction. The testcase:
+
+--cut here--
+typedef float __attribute__((vector_size(8))) v2sf;
+
+v2sf test (v2sf a, v2sf b, v2sf c)
+{
+  return a * b - c;
+}
+--cut here--
+
+compiles to:
+
+        movq    %xmm1, %xmm1    # 8     [c=4 l=4]  *vec_concatv4sf_0
+        movq    %xmm0, %xmm0    # 9     [c=4 l=4]  *vec_concatv4sf_0
+        movq    %xmm2, %xmm2    # 12    [c=4 l=4]  *vec_concatv4sf_0
+        mulps   %xmm1, %xmm0    # 10    [c=16 l=3]  *mulv4sf3/0
+        movq    %xmm0, %xmm0    # 13    [c=4 l=4]  *vec_concatv4sf_0
+        subps   %xmm2, %xmm0    # 14    [c=12 l=3]  *subv4sf3/0
+
+The implementation simply calls V4SFmode operation, so we can remove all "emulated" SSE2 V2SFmode instructions and SSE2 V2SFmode alternatives from 3dNOW! insn patterns.
+
+- User: Richard Biener | Time: 2023-07-26 07:53:28 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #16)> Createdattachment 55636[details]> Proposed patch
+> 
+> Proposed patch clears the upper half of a V4SFmode operand register before
+> all potentially trapping instructions. The testcase fromcomment #12now
+> compiles to:
+> 
+>         movq    %xmm1, %xmm1    # 9     [c=4 l=4]  *vec_concatv4sf_0
+>         movq    %xmm0, %xmm0    # 10    [c=4 l=4]  *vec_concatv4sf_0
+>         addps   %xmm1, %xmm0    # 11    [c=12 l=3]  *addv4sf3/0
+> 
+> This approach addresses issues with traps (Comment #0), as well as with
+> denormal/invalid values (Comment #14). An obvious exception to the rule is a
+> division, where the value != 0.0 should be loaded into the upper half of the
+> denominator.
+> 
+> The patch effectively tightens the solution fromPR95046by clearing upper
+> halves of all operand registers before every potentially trapping
+> instruction. The testcase:
+> 
+> --cut here--
+> typedef float __attribute__((vector_size(8))) v2sf;
+> 
+> v2sf test (v2sf a, v2sf b, v2sf c)
+> {
+>   return a * b - c;
+> }
+> --cut here--
+> 
+> compiles to:
+> 
+>         movq    %xmm1, %xmm1    # 8     [c=4 l=4]  *vec_concatv4sf_0
+>         movq    %xmm0, %xmm0    # 9     [c=4 l=4]  *vec_concatv4sf_0
+>         movq    %xmm2, %xmm2    # 12    [c=4 l=4]  *vec_concatv4sf_0
+>         mulps   %xmm1, %xmm0    # 10    [c=16 l=3]  *mulv4sf3/0
+>         movq    %xmm0, %xmm0    # 13    [c=4 l=4]  *vec_concatv4sf_0so this one is obviously redundant - I suppose at the RTL level we have
+no chance of noticing this.  I hope for integer vector operations we
+avoid these ops?  I think this will make epilog vectorization with V2SFmode
+a bad idea, we'd need to appropriately disqualify this in the costing
+hooks.
+
+I wonder if combine could for example combine a v2sf load with the
+upper half zeroing for the next use?  Likewise for arithmetics.>         subps   %xmm2, %xmm0    # 14    [c=12 l=3]  *subv4sf3/0
+> 
+> The implementation simply calls V4SFmode operation, so we can remove all
+> "emulated" SSE2 V2SFmode instructions and SSE2 V2SFmode alternatives from
+> 3dNOW! insn patterns.
+
+- User: Uroš Bizjak | Time: 2023-07-26 09:34:43 UTC
+  Text: (In reply to Richard Biener fromcomment #17)> > compiles to:
+> > 
+> >         movq    %xmm1, %xmm1    # 8     [c=4 l=4]  *vec_concatv4sf_0
+> >         movq    %xmm0, %xmm0    # 9     [c=4 l=4]  *vec_concatv4sf_0
+> >         movq    %xmm2, %xmm2    # 12    [c=4 l=4]  *vec_concatv4sf_0
+> >         mulps   %xmm1, %xmm0    # 10    [c=16 l=3]  *mulv4sf3/0
+> >         movq    %xmm0, %xmm0    # 13    [c=4 l=4]  *vec_concatv4sf_0
+> 
+> so this one is obviously redundant - I suppose at the RTL level we have
+> no chance of noticing this.  I hope for integer vector operations we
+> avoid these ops?  I think this will make epilog vectorization with V2SFmode
+> a bad idea, we'd need to appropriately disqualify this in the costing
+> hooks.Yes, the redundant movq is emitted only in front of V2SFmode trapping operations. So, all integer, V2SF logic and swizzling operations are still implemented directly with "emulated" instructions.> 
+> I wonder if combine could for example combine a v2sf load with the
+> upper half zeroing for the next use?  Likewise for arithmetics.The patch already does that. We know that V2SF load zeroes the upper half, so there is no additional MOVQ emitted. To illustrate, the testcase:
+
+--cut here--
+typedef float __attribute__((vector_size(8))) v2sf;
+
+v2sf m;
+
+v2sf test (v2sf a)
+{
+  return a - m;
+}
+--cut here--
+
+compiles to:
+
+        movq    m(%rip), %xmm1  # 6     [c=4 l=8]  *vec_concatv4sf_0
+        movq    %xmm0, %xmm0    # 7     [c=4 l=4]  *vec_concatv4sf_0
+        subps   %xmm1, %xmm0    # 8     [c=12 l=3]  *subv4sf3/0
+
+As far as arithmetic is concerned, perhaps some back-walking RTL optimization pass can figure out that the preceding trapping V2SFmode operation guarantees zeros in the upper half and remove clearing insn. However, MOVQ xmm,xmm is an extremely fast instruction with latency of 1 and reciprocal throughput of 0.33, so I guess it is not of much concern.
+
+- User: GCC Commits | Time: 2023-07-26 10:18:38 UTC
+  Text: The master branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:ade30fad6669e5f34ca4c587c724d74ecc953175commitr14-2786-gade30fad6669e5f34ca4c587c724d74ecc953175Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Wed Jul 26 11:10:46 2023 +0200
+
+    i386: Clear upper half of XMM register for V2SFmode operations [PR110762]
+    
+    Clear the upper half of a V4SFmode operand register in front of all
+    potentially trapping instructions. The testcase:
+    
+    --cut here--
+    typedef float v2sf __attribute__((vector_size(8)));
+    typedef float v4sf __attribute__((vector_size(16)));
+    
+    v2sf test(v4sf x, v4sf y)
+    {
+      v2sf x2, y2;
+    
+      x2 = __builtin_shufflevector (x, x, 0, 1);
+      y2 = __builtin_shufflevector (y, y, 0, 1);
+    
+      return x2 + y2;
+    }
+    --cut here--
+    
+    now compiles to:
+    
+            movq    %xmm1, %xmm1    # 9     [c=4 l=4]  *vec_concatv4sf_0
+            movq    %xmm0, %xmm0    # 10    [c=4 l=4]  *vec_concatv4sf_0
+            addps   %xmm1, %xmm0    # 11    [c=12 l=3]  *addv4sf3/0
+    
+    This approach addresses issues with exceptions, as well as issues with
+    denormal/invalid values. An obvious exception to the rule is a division,
+    where the value != 0.0 should be loaded into the upper half of the
+    denominator to avoid division by zero exception.
+    
+    The patch effectively tightens the solution fromPR95046by clearing upper
+    halves of all operand registers before every potentially trapping instruction.
+    The testcase:
+    
+    --cut here--
+    typedef float __attribute__((vector_size(8))) v2sf;
+    
+    v2sf test (v2sf a, v2sf b, v2sf c)
+    {
+      return a * b - c;
+    }
+    --cut here--
+    
+    compiles to:
+    
+            movq    %xmm1, %xmm1    # 8     [c=4 l=4]  *vec_concatv4sf_0
+            movq    %xmm0, %xmm0    # 9     [c=4 l=4]  *vec_concatv4sf_0
+            movq    %xmm2, %xmm2    # 12    [c=4 l=4]  *vec_concatv4sf_0
+            mulps   %xmm1, %xmm0    # 10    [c=16 l=3]  *mulv4sf3/0
+            movq    %xmm0, %xmm0    # 13    [c=4 l=4]  *vec_concatv4sf_0
+            subps   %xmm2, %xmm0    # 14    [c=12 l=3]  *subv4sf3/0
+    
+    The implementation emits V4SFmode operation, so we can remove all "emulated"
+    SSE2 V2SFmode trapping instructions and remove "emulated" SSE2 V2SFmode
+    alternatives from 3dNOW! insn patterns.PR target/110762gcc/ChangeLog:
+    
+            * config/i386/i386.md (plusminusmult): New code iterator.
+            * config/i386/mmx.md (mmxdoublevecmode): New mode attribute.
+            (movq_<mode>_to_sse): New expander.
+            (<plusminusmult:insn>v2sf3): Macroize expander from addv2sf3,
+            subv2sf3 and mulv2sf3 using plusminusmult code iterator.  Rewrite
+            as a wrapper around V4SFmode operation.
+            (mmx_addv2sf3): Change operand 1 and operand 2 predicates to
+            nonimmediate_operand.
+            (*mmx_addv2sf3): Remove SSE alternatives.  Change operand 1 and
+            operand 2 predicates to nonimmediate_operand.
+            (mmx_subv2sf3): Change operand 2 predicate to nonimmediate_operand.
+            (mmx_subrv2sf3): Change operand 1 predicate to nonimmediate_operand.
+            (*mmx_subv2sf3): Remove SSE alternatives.  Change operand 1 and
+            operand 2 predicates to nonimmediate_operand.
+            (mmx_mulv2sf3): Change operand 1 and operand 2 predicates to
+            nonimmediate_operand.
+            (*mmx_mulv2sf3): Remove SSE alternatives.  Change operand 1 and
+            operand 2 predicates to nonimmediate_operand.
+            (divv2sf3): Rewrite as a wrapper around V4SFmode operation.
+            (<smaxmin:code>v2sf3): Ditto.
+            (mmx_<smaxmin:code>v2sf3): Change operand 1 and operand 2
+            predicates to nonimmediate_operand.
+            (*mmx_<smaxmin:code>v2sf3): Remove SSE alternatives.  Change
+            operand 1 and operand 2 predicates to nonimmediate_operand.
+            (mmx_ieee_<ieee_maxmin>v2sf3): Ditto.
+            (sqrtv2sf2): Rewrite as a wrapper around V4SFmode operation.
+            (*mmx_haddv2sf3_low): Ditto.
+            (*mmx_hsubv2sf3_low): Ditto.
+            (vec_addsubv2sf3): Ditto.
+            (*mmx_maskcmpv2sf3_comm): Remove.
+            (*mmx_maskcmpv2sf3): Remove.
+            (vec_cmpv2sfv2si): Rewrite as a wrapper around V4SFmode operation.
+            (vcond<V2FI:mode>v2sf): Ditto.
+            (fmav2sf4): Ditto.
+            (fmsv2sf4): Ditto.
+            (fnmav2sf4): Ditto.
+            (fnmsv2sf4): Ditto.
+            (fix_truncv2sfv2si2): Ditto.
+            (fixuns_truncv2sfv2si2): Ditto.
+            (mmx_fix_truncv2sfv2si2): Remove SSE alternatives.
+            Change operand 1 predicate to nonimmediate_operand.
+            (floatv2siv2sf2): Rewrite as a wrapper around V4SFmode operation.
+            (floatunsv2siv2sf2): Ditto.
+            (mmx_floatv2siv2sf2): Remove SSE alternatives.
+            Change operand 1 predicate to nonimmediate_operand.
+            (nearbyintv2sf2): Rewrite as a wrapper around V4SFmode operation.
+            (rintv2sf2): Ditto.
+            (lrintv2sfv2si2): Ditto.
+            (ceilv2sf2): Ditto.
+            (lceilv2sfv2si2): Ditto.
+            (floorv2sf2): Ditto.
+            (lfloorv2sfv2si2): Ditto.
+            (btruncv2sf2): Ditto.
+            (roundv2sf2): Ditto.
+            (lroundv2sfv2si2): Ditto.
+            (*mmx_roundv2sf2): Remove.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110762.c: New test.
+
+- User: Richard Biener | Time: 2023-07-28 06:28:51 UTC
+  Text: Thanks a lot.  So this should now be fully fixed in GCC 14.  The original testcase is also broken in GCC 11, 12 and 13 but not 10, but I'm not sure
+how far we'd want to backport this change - I'd consider the 13 branch but
+that's probably it.  After some time soaking, that is.
+
+- User: Uroš Bizjak | Time: 2023-07-28 08:15:22 UTC
+  Text: (In reply to Richard Biener fromcomment #20)> Thanks a lot.  So this should now be fully fixed in GCC 14.  The original
+> testcase is also broken in GCC 11, 12 and 13 but not 10, but I'm not sure
+> how far we'd want to backport this change - I'd consider the 13 branch but
+> that's probably it.  After some time soaking, that is.The issue can be triggered only with a specially crafted code (such as the one inComment #0/Comment #12) that deliberatelly exposes the problem. Otherwise, the approach fromPR 95046is quite robust, and there have been no PRs in this area reported, although V2SF is auto-vectorized by default.
+
+The patch is written in such a way to minimize exposure to subregs (the temporary V4SFmode output register is used and later copied via subreg to target V2SFmode operand) to avoid eventual problems in RA. GCC 13.2 was just released, so I think the patch could be backported to gcc-13 branch in the first week of august, but as you propose, only to gcc-13 branch, and not any further.
+
+- User: Uroš Bizjak | Time: 2023-07-31 08:04:24 UTC
+  Text: It looks to me that partial vector half-float instructions have the same issue.
+
+- User: Hongtao.liu | Time: 2023-07-31 08:10:31 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #22)> It looks to me that partial vector half-float instructions have the same
+> issue.Yes, I'll take a look.
+
+- User: GCC Commits | Time: 2023-08-07 11:52:10 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:831017d5e72173f2c58e5475b7fcd35ee07a601fcommitr14-3032-g831017d5e72173f2c58e5475b7fcd35ee07a601fAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Fri Aug 4 15:35:54 2023 +0800
+
+    i386: Clear upper bits of XMM register for V4HFmode/V2HFmode operations [PR110762]
+    
+    Similar liker14-2786-gade30fad6669e5, the patch is for V4HF/V2HFmode.
+    
+    gcc/ChangeLog:PR target/110762* config/i386/mmx.md (<insn><mode>3): Changed from define_insn
+            to define_expand and break into ..
+            (<insn>v4hf3): .. this.
+            (divv4hf3): .. this.
+            (<insn>v2hf3): .. this.
+            (divv2hf3): .. this.
+            (movd_v2hf_to_sse): New define_expand.
+            (movq_<mode>_to_sse): Extend to V4HFmode.
+            (mmxdoublevecmode): Ditto.
+            (V2FI_V4HF): New mode iterator.
+            * config/i386/sse.md (*vec_concatv4sf): Extend to hanlde V8HF
+            by using mode iterator V4SF_V8HF, renamed to ..
+            (*vec_concat<mode>): .. this.
+            (*vec_concatv4sf_0): Extend to handle V8HF by using mode
+            iterator V4SF_V8HF, renamed to ..
+            (*vec_concat<mode>_0): .. this.
+            (*vec_concatv8hf_movss): New define_insn.
+            (V4SF_V8HF): New mode iterator.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110762-v4hf.c: New test.
+
+- User: Uroš Bizjak | Time: 2023-08-25 09:04:26 UTC
+  Text: Let's keep this patch to gcc-14+. The compiler now sanitizes every partial vector input to potentially trapping instructions. OTOH, the patch introduced noticeable runtime regression, so in a follow-up patch (PR110832) -fno-trapping-math removes sanitization fixups (and the documentation documents possible issues with assembler and builtins passing non-conformat FP values), and -m[no-]partial-vector-fp-math option is introduced to completely disable potentially traping instructions for partial vectors.
+
+So, fixed for gcc-14+.
+

@@ -1,0 +1,263 @@
+Bug Summary: [14 Regression] ICE on valid code at -O{s,2,3} on x86_64-linux-gnu: verify_ssa failed
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2023-08-06 23:20:20 UTC
+  Text: It appears to be a recent regression.
+
+Compiler Explorer:https://godbolt.org/z/z9oPe5bnx[608] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/home/suz/suz-local/software/local/gcc-trunk/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20230805 (experimental) (GCC)
+[609] %
+[609] % gcctk -O2 small.c
+small.c: In function ‘main’:
+small.c:8:5: error: stmt with wrong VUSE
+    8 | int main() {
+      |     ^~~~
+# VUSE <.MEM_11>
+e.3_2 = e;
+expected .MEM_12
+during GIMPLE pass: sink
+small.c:8:5: internal compiler error: verify_ssa failed
+0x124c54d verify_ssa(bool, bool)
+        ../../gcc-trunk/gcc/tree-ssa.cc:1203
+0xed05e5 execute_function_todo
+        ../../gcc-trunk/gcc/passes.cc:2095
+0xed0a3b execute_todo
+        ../../gcc-trunk/gcc/passes.cc:2142
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+[610] %
+[610] % cat small.c
+int a[1], b, c, d, e, f, g;
+void h(int i, int j) {
+  int *k = 0;
+  if (*k)
+    h(0, 0);
+  g = i && d;
+}
+int main() {
+  if (c)
+    goto l;
+  if (!a)
+    while (1) {
+      f = 1;
+      while (f)
+        h(b && main(), e);
+      while (1)
+        ;
+    l:;
+    }
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2023-08-07 00:31:38 UTC
+  Text: Here is a testcase without calling main:
+```
+
+int a[1], b, c, d, e, f, g;
+[[gnu::noinline]]
+void h(int i, int j) {
+  int *k = 0;
+  if (*k)
+    h(0, 0);
+  g = i && d;
+}
+int jj() {
+  if (c)
+    goto l;
+  if (!a)
+    while (1) {
+      f = 1;
+      while (f)
+        h(b && jj(), e);
+      while (1)
+        ;
+    l:;
+    }
+  return 0;
+}
+```
+
+- User: Andrew Pinski | Time: 2023-08-07 00:44:00 UTC
+  Text: Confirmed, though this is undefined code unless a is always 0.
+
+- User: David Binderman | Time: 2023-08-07 07:07:04 UTC
+  Text: I see this one also. It first goes wrong betweeng:0460c1221627938bandg:4a0633d4d499cf97, some 38 commits.
+
+- User: Andrew Pinski | Time: 2023-08-07 07:15:49 UTC
+  Text: Confirmed.
+
+I am 99% sure it wasr14-2946-g46c8c225455273
+
+- User: Andrew Pinski | Time: 2023-08-07 07:27:54 UTC
+  Text: ***Bug 110929has been marked as a duplicate of this bug. ***
+
+- User: David Binderman | Time: 2023-08-07 07:37:33 UTC
+  Text: Reduced C code is
+
+func_4_p_7, func_4_l_3204;
+func_15() __attribute__((cold));
+func_15() {
+  for (;;)
+    ;
+}
+func_15_alias() __attribute__((alias("func_15")));
+func_4() {
+  func_15_alias(func_4_p_7 && safe_sub_func_uint64_t_u_u(), func_4_l_3204);
+}
+
+-O1 is enough to show the bug.
+
+cvise $ /home/dcb38/gcc/results/bin/gcc -c -w -O1bug946.cbug946.c: In function ‘func_4’:bug946.c:8:1: error: stmt with wrong VUSE
+    8 | func_4() {
+      | ^~~~~~
+# VUSE <.MEM_5(D)>
+func_4_l_3204.0_1 = func_4_l_3204;
+expected .MEM_6
+during GIMPLE pass: sinkbug946.c:8:1: internal compiler error: verify_ssa failed
+0x10c63cb verify_ssa(bool, bool)
+	../../trunk.year/gcc/tree-ssa.cc:1203
+0xd2ccdf execute_function_todo(function*, void*)
+	../../trunk.year/gcc/passes.cc:2095
+0xd2b6c1 execute_todo(unsigned int)
+	../../trunk.year/gcc/passes.cc:2142
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+cvise $
+
+- User: David Binderman | Time: 2023-08-08 07:19:32 UTC
+  Text: (In reply to Andrew Pinski fromcomment #4)> Confirmed.
+> 
+> I am 99% sure it wasr14-2946-g46c8c225455273Perhaps it would be worthwhile to ask Richard to have a look.
+
+- User: Richard Biener | Time: 2023-08-08 08:49:11 UTC
+  Text: I will have a look.
+
+- User: Richard Biener | Time: 2023-08-08 09:36:38 UTC
+  Text: Hm, OK.  So I actually thought of this issue.  It's basically a hole in the
+requirement of all function "exits" having a virtual use and thus virtual
+PHIs being created along the paths to it.  I was aware of GIMPLE_RESX and
+thought about const noreturn (but that attribute combination is rejected).
+
+IPA pure-const detects func_15 as looping 'const' and noreturn:
+
+Function is locally const.
+Function found to be noreturn: func_15
+Function found to be looping const: func_15/2
+Declaration updated to be looping const: func_15/2
+
+so there's two ways to "fix" this, one - drop the assumption we have
+PHIs on the paths to function exit (including in not returning regions).
+That makes
+
+virtual_operand_live::get_live_in (basic_block bb)
+{
+...
+  /* Since we don't have a virtual PHI we can now pick any of the
+     incoming edges liveout value.  All returns from the function have
+     a virtual use forcing generation of virtual PHIs.  */
+  edge_iterator ei;
+  edge e;
+  FOR_EACH_EDGE (e, ei, bb->preds)
+    if (liveout[e->src->index])
+      {
+        if (EDGE_PRED (bb, 0) != e)
+          liveout[EDGE_PRED (bb, 0)->src->index] = liveout[e->src->index];
+        return liveout[e->src->index];
+      }
+
+instead required to check each edge and we can't simply take the value
+from the immediate dominator as fallback.  When we discover divergence
+we need to return NULL (unknown - nobody created the actually live VOP).
+
+The other alternative is to make sure we _do_ have the virtual operand.
+Either by making sure the "invalid" combination of const + noreturn
+isn't detected or by creating a virtual use in that case anyway
+(and fixup code because of that inconsistency).
+
+- User: Richard Biener | Time: 2023-08-08 09:38:25 UTC
+  Text: Createdattachment 55705[details]prototype
+
+This implements option two - Honza, I think the pure-const hunk is sound but I didn't find a proper "lattice" for modref so had to modify the pure/const setting places (three, ugh) - is there a better way to tell modref the
+"base" lattice value is pure and not const?
+
+- User: Richard Biener | Time: 2023-08-08 09:42:58 UTC
+  Text: Variant (1) is just the following, but I'm unsure as to the possible effects of that ... (test coverage will be very low anyway)
+
+diff --git a/gcc/tree-ssa-operands.cc b/gcc/tree-ssa-operands.cc
+index 57e393ae164..c8ac98b4e06 100644
+--- a/gcc/tree-ssa-operands.cc
++++ b/gcc/tree-ssa-operands.cc
+@@ -696,7 +696,8 @@ operands_scanner::maybe_add_call_vops (gcall *stmt)
+       /* A 'pure' or a 'const' function never call-clobbers anything.  */
+       if (!(call_flags & (ECF_PURE | ECF_CONST)))
+        add_virtual_operand (opf_def);
+-      else if (!(call_flags & ECF_CONST))
++      else if (!(call_flags & ECF_CONST)
++              || (call_flags & ECF_NORETURN))
+        add_virtual_operand (opf_use);
+     }
+ }
+
+- User: Richard Biener | Time: 2023-08-08 10:26:33 UTC
+  Text: (In reply to Richard Biener fromcomment #11)> Variant (1) is just the following, but I'm unsure as to the possible effects
+> of that ... (test coverage will be very low anyway)
+> 
+> diff --git a/gcc/tree-ssa-operands.cc b//gcc/tree-ssa-operands.cc
+> index 57e393ae164..c8ac98b4e06 100644
+> --- a/gcc/tree-ssa-operands.cc
+> +++ b/gcc/tree-ssa-operands.cc
+> @@ -696,7 +696,8 @@ operands_scanner::maybe_add_call_vops (gcall *stmt)
+>        /* A 'pure' or a 'const' function never call-clobbers anything.  */
+>        if (!(call_flags & (ECF_PURE | ECF_CONST)))
+>         add_virtual_operand (opf_def);
+> -      else if (!(call_flags & ECF_CONST))
+> +      else if (!(call_flags & ECF_CONST)
+> +              || (call_flags & ECF_NORETURN))
+>         add_virtual_operand (opf_use);
+>      }
+>  }That ICEs for example tree-ssa/cunroll-4.c because that inserts
+__builtin_unreachable () calls and this function is explicitly
+marked const noreturn (if you use that combo manually you get a diagnostic).
+The ICE is because cunroll doesn't add virtual operands or updates SSA.
+
+But it also shows that sinking into __builtin_unreachable () ending regions
+will have the same issue and the ipa pure-const/modref fix won't fix that.
+
+I'm going to try fixing the live problem :/
+
+- User: GCC Commits | Time: 2023-08-08 12:24:34 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:31ec413098bd334115aff73fc755e49afd3ac371commitr14-3076-g31ec413098bd334115aff73fc755e49afd3ac371Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Aug 8 12:46:42 2023 +0200
+
+    tree-optimization/110924 - fix vop liveness for noreturn const CFG parts
+    
+    The virtual operand live problem used by sinking assumes we have
+    virtual uses at each end point of the CFG but as shown in the PR
+    this isn't true for parts for example ending in __builtin_unreachable.
+    The following removes the optimization made possible by this and
+    now requires marking backedges.PR tree-optimization/110924* tree-ssa-live.h (virtual_operand_live): Update comment.
+            * tree-ssa-live.cc (virtual_operand_live::get_live_in): Remove
+            optimization, look at each predecessor.
+            * tree-ssa-sink.cc (pass_sink_code::execute): Mark backedges.
+    
+            * gcc.dg/torture/pr110924.c: New testcase.
+
+- User: Richard Biener | Time: 2023-08-08 12:24:46 UTC
+  Text: Fixed.
+

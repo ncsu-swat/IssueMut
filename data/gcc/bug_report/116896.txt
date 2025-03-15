@@ -1,0 +1,771 @@
+Bug Summary: codegen for <=> compared to hand-written equivalent
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Barry Revzin | Time: 2024-09-30 03:13:44 UTC
+  Text: Consider this example (https://godbolt.org/z/66sjx78ej):
+
+#include <compare>
+
+std::strong_ordering wat(int const& lhs, int const& rhs) {
+    #ifdef MANUAL
+    if (lhs < rhs) {
+        return std::strong_ordering::less;
+    } else if (lhs > rhs) {
+        return std::strong_ordering::greater;
+    } else {
+        return std::strong_ordering::equal;
+    }
+    #else
+    return lhs <=> rhs;
+    #endif    
+}
+
+With -DMANUAL -O3 (i.e. manually writing out the three-way comparison), we get:
+
+wat(int const&, int const&):
+        mov     eax, DWORD PTR [rsi]
+        cmp     DWORD PTR [rdi], eax
+        mov     edx, -1
+        setg    al
+        cmovl   eax, edx
+        ret
+
+But lhs <=> rhs, which means the same thing, gives us:
+
+wat(int const&, int const&):
+        mov     edx, DWORD PTR [rsi]
+        xor     eax, eax
+        cmp     DWORD PTR [rdi], edx
+        je      .L2
+        setge   al
+        lea     eax, [rax-1+rax]
+.L2:
+        ret
+
+The explicit three-way comparison should generate at least as good code as the implicit one.
+
+- User: Jakub Jelinek | Time: 2024-09-30 08:05:33 UTC
+  Text: Why do you think the conditional move is a win?  On x86 that heavily depends on how well predicted the different cases are, if they can be predicted, then jumps are better, if they can't, sometimes conditional move can be a win.
+
+- User: Andrew Pinski | Time: 2024-09-30 08:33:32 UTC
+  Text: aarch64 code gen:
+-UMANUAL:
+```
+_Z3watRKiS0_:
+        ldr     w3, [x0]
+        mov     w2, 1
+        ldr     w0, [x1]
+        cmp     w3, w0
+        csinv   w0, w2, wzr, ge
+        csel    w0, w0, wzr, ne
+        ret
+```
+
+vs:
+```
+_Z3watRKiS0_:
+        .cfi_startproc
+        ldr     w2, [x0]
+        ldr     w0, [x1]
+        cmp     w2, w0
+        cset    w0, gt
+        csinv   w0, w0, wzr, ge
+        ret
+```
+
+Which is only slightly worse. It comes from rotation of the compares.
+Manual uses </> while the other side uses !=/< .
+
+- User: Jakub Jelinek | Time: 2024-09-30 08:40:52 UTC
+  Text: Note, we have a pattern matcher for floating point spaceship (that has without -ffast-math 4 cases), but not for integer.  And the code we emit for lhs <=> rhs matches
+what we emit for
+    if (lhs == rhs) {
+        return std::strong_ordering::equal;
+    } else if (lhs < rhs) {
+        return std::strong_ordering::less;
+    } else {
+        return std::strong_ordering::greater;
+    }
+Seems clang 19 also emitted different sequences for the two different manual cases but used cmov nevertheless instead of the conditional jump (as I said, that can be a win or can be bad pessimization, depending on the exact compared values).
+That said, clang trunk seems to emit
+  movl (%rdi), %eax
+  cmpl (%rsi), %eax
+  setl %al
+  setg %cl
+  subb %al, %cl
+  movsbl %cl, %eax
+for both, so something without jumps and without conditional moves.  I guess we should check out how does that work for latency and throughput on different CPUs.
+
+- User: Jakub Jelinek | Time: 2024-09-30 08:47:16 UTC
+  Text: I think it wouldn't be that hard to change optimize_spaceship to also handle integer comparisons, just change that !SCALAR_FLOAT_TYPE_P (TREE_TYPE (arg1)) to that || INTEGRAL_TYPE_P (TREE_TYPE (arg1)) and add the optab to targets where it is a win.
+The important question is what is the optimal sequence...
+
+- User: Uroš Bizjak | Time: 2024-09-30 08:54:34 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #4)> I think it wouldn't be that hard to change optimize_spaceship to also handle
+> integer comparisons, just change that !SCALAR_FLOAT_TYPE_P (TREE_TYPE
+> (arg1)) to that || INTEGRAL_TYPE_P (TREE_TYPE (arg1)) and add the optab to
+> targets where it is a win.
+> The important question is what is the optimal sequence...setl %al
+  setg %cl
+  subb %al, %cl
+
+The one above (note also CF processing in SUBB) should be close to optimal, considering that no predication is involved here.
+
+- User: Jakub Jelinek | Time: 2024-09-30 08:56:06 UTC
+  Text: Though, that setg %cl without xorl %ecx, %ecx first is unlikely to perform well, the clearing would be needed.
+
+- User: Uroš Bizjak | Time: 2024-09-30 09:03:20 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #6)> Though, that setg %cl without xorl %ecx, %ecx first is unlikely to perform
+> well, the clearing would be needed.No, because subb (sbbb) opreates on bytes and no zext to full word is needed.
+
+- User: Jakub Jelinek | Time: 2024-09-30 09:05:52 UTC
+  Text: Though, maybe the integral SPACESHIP pattern matching wouldn't help.  Even for
+std::partial_ordering
+w4 (float const& lhs, float const& rhs) {
+  return lhs <=> rhs;
+}
+we pattern recognize it into
+  _11 = .SPACESHIP (_1, _2);
+  if (_11 != 0)
+    goto <bb 3>; [50.00%]
+  else
+    goto <bb 5>; [50.00%]
+
+  <bb 3> [local count: 536870912]:
+  if (_11 == 1)
+    goto <bb 5>; [50.00%]
+  else
+    goto <bb 4>; [50.00%]
+
+  <bb 4> [local count: 268435456]:
+
+  <bb 5> [local count: 1073741824]:
+  # _10 = PHI <0(2), -1(4), 1(3)>
+and then expand
+	movss	(%rdi), %xmm0
+	comiss	(%rsi), %xmm0
+	je	.L2
+	seta	%al
+	leal	-1(%rax,%rax), %eax
+	ret
+	.p2align 4,,10
+	.p2align 3
+.L2:
+	xorl	%eax, %eax
+	ret
+so we are there back to what would be ideally turned into 2 setX and sbb.
+
+- User: Jakub Jelinek | Time: 2024-09-30 13:34:52 UTC
+  Text: So, I think this boils down on which one from
+
+int
+foo (int x, int y)
+{
+  if (x < y)
+    return -1;
+  else if (x > y)
+    return 1;
+  else
+    return 0;
+}
+
+int
+bar (int x, int y)
+{
+  if (x == y)
+    return 0;
+  else if (x < y)
+    return -1;
+  else
+    return 1;
+}
+
+int
+baz (int x, int y)
+{
+  return (x > y) - (x < y);
+}
+
+generates best code on which architecture (and better in terms of -Os and/or performance).  Looking at godbolt on various arches, the last is beneficial on various arches, including x86 (32-bit and 64-bit) and mips, the first maybe on aarch64 and powerpc*, etc.
+
+- User: Uroš Bizjak | Time: 2024-09-30 15:36:11 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #5)> (In reply to Jakub Jelinek fromcomment #4)
+> > I think it wouldn't be that hard to change optimize_spaceship to also handle
+> > integer comparisons, just change that !SCALAR_FLOAT_TYPE_P (TREE_TYPE
+> > (arg1)) to that || INTEGRAL_TYPE_P (TREE_TYPE (arg1)) and add the optab to
+> > targets where it is a win.
+> > The important question is what is the optimal sequence...
+> 
+>   setl %al
+>   setg %cl
+>   subb %al, %cl
+> 
+> The one above (note also CF processing in SUBB) should be close to optimal,
+> considering that no predication is involved here.Oh, I misread the instruction. It is a normal SUB, not SBB. :(
+
+- User: Jakub Jelinek | Time: 2024-09-30 15:48:16 UTC
+  Text: I'll try to tweak the .SPACESHIP discovery, so that it will also check for the common case where the .SPACESHIP result is solely used in comparisons leading to -1, 0, 1, 2
+(or -1, 0, 1) PHI and in that case pass another argument to .SPACESHIP to tell the expander that it wants to produce integer value rather than wants to compare based on that (and remove the PHI and just use the .SPACESHIP result).  And add .SPACESHIP integer discovery, but in that case only if it is used as integer in PHI.
+That way targets can emit whatever is beneficial.
+
+- User: Uroš Bizjak | Time: 2024-10-01 08:53:54 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #11)> That way targets can emit whatever is beneficial.x86 already has an implementation of tri-state integer from conditional codes:
+
+--cut here--
+;; Produce a tri-state integer (-1, 0, 1) from condition codes.
+
+(define_expand "cmpintqi"
+  [(set (match_dup 1)
+	(gtu:QI (reg:CC FLAGS_REG) (const_int 0)))
+   (set (match_dup 2)
+	(ltu:QI (reg:CC FLAGS_REG) (const_int 0)))
+   (parallel [(set (match_operand:QI 0 "register_operand")
+		   (minus:QI (match_dup 1)
+			     (match_dup 2)))
+	      (clobber (reg:CC FLAGS_REG))])]
+  ""
+{
+  operands[1] = gen_reg_rtx (QImode);
+  operands[2] = gen_reg_rtx (QImode);
+})
+--cut here--
+
+The above could be generalized to also handle integer .SPACESHIP operator.
+
+- User: Jakub Jelinek | Time: 2024-10-02 18:26:29 UTC
+  Text: Createdattachment 59267[details]gcc15-pr116896-wip.patch
+
+Untested WIP patch.
+Compared to unpatched compiler, float <=> without -ffast-math changes from:
+        comiss  %xmm1, %xmm0
+        jp      .L4
+        seta    %al
+        movl    $0, %edx
+        leal    -1(%rax,%rax), %eax
+        cmove   %edx, %eax
+        ret
+.L4:
+        movl    $2, %eax
+        ret
+to
+        comiss  %xmm1, %xmm0
+        jp      .L2
+        seta    %al
+        movzbl  %al, %eax
+        sbbl    $0, %eax
+        ret
+.L2:
+        movl    $2, %eax
+        ret
+, float -ffast-math <=> from
+        comiss  %xmm1, %xmm0
+        movl    $0, %edx
+        seta    %al
+        leal    -1(%rax,%rax), %eax
+        cmove   %edx, %eax
+        ret
+to
+        xorl    %eax, %eax
+        comiss  %xmm1, %xmm0
+        seta    %al
+        sbbb    $0, %al
+        ret
+int <=> from
+        cmpl    %esi, %edi
+        movl    $0, %edx
+        setge   %al
+        leal    -1(%rax,%rax), %eax
+        cmove   %edx, %eax
+        ret
+to
+        xorl    %edx, %edx
+        cmpl    %esi, %edi
+        setg    %al
+        setl    %dl
+        movzbl  %al, %eax
+        subl    %edx, %eax
+        ret
+and unsigned <=> from
+        xorl    %eax, %eax
+        cmpl    %esi, %edi
+        je      .L7
+        sbbl    %eax, %eax
+        orl     $1, %eax
+.L7:
+        ret
+to
+        xorl    %eax, %eax
+        cmpl    %edi, %esi
+        setg    %al
+        sbbb    $0, %al
+        ret
+
+Wonder if it is better to zero extend the setcc results to wider mode before the subtraction or do the sub/sbb in QImode and sign extend afterwards.
+My testcases were just doing auto foo (float x, float y) { return x <=> y; } auto bar (int x, int y) { return x <=> y; } auto baz (unsigned x, unsigned y) { return x <=> y; } and so actually need just 8-bit result and combine is able to tweak it in all but one case (signed int).
+
+- User: Uroš Bizjak | Time: 2024-10-03 07:04:02 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #13)> Wonder if it is better to zero extend the setcc results to wider mode before
+> the subtraction or do the sub/sbb in QImode and sign extend afterwards.
+> My testcases were just doing auto foo (float x, float y) { return x <=> y; }
+> auto bar (int x, int y) { return x <=> y; } auto baz (unsigned x, unsigned
+> y) { return x <=> y; } and so actually need just 8-bit result and combine is
+> able to tweak it in all but one case (signed int).>         seta    %al
+>         movzbl  %al, %eaxThis sequence is what we would like to avoid. Since spaceship operator returns SImode, IMO the best way is to emit SImode clearing XORs before the comparison and emit SUB/SBB in SImode. In case of non-fastmath compare, use mov $0 after jp to not clobber flags (this is also what Intel optimization guide recommends).
+
+You will need to emit setcc_qi_slp variant of setcc if you want to preserve register clearing instrution through optimization passes. Please also note that mov $0 -> xor conversion should be done automatically by the peephole2 pass when flags reg can be clobbered.
+
+- User: Jakub Jelinek | Time: 2024-10-03 09:41:01 UTC
+  Text: Createdattachment 59272[details]gcc15-pr116896-inc.patch
+
+Incremental patch which performs the subtraction in QImode and then sign-extends.
+Though, not sure if that results in better code.
+float case:
+        comiss  %xmm1, %xmm0
+        jp      .L2
+        seta    %al
+        sbbb    $0, %al
+        ret
+.L2:
+        movl    $2, %eax
+        ret
+float -ffast-math
+        comiss  %xmm1, %xmm0
+        seta    %al
+        sbbb    $0, %al
+        ret
+int case
+        cmpl    %esi, %edi
+        setl    %dl
+        setg    %al
+        subl    %edx, %eax
+        ret
+unsigned case
+        cmpl    %edi, %esi
+        setg    %al
+        sbbb    $0, %al
+        ret
+Note, std::partial_ordering or std::strong_ordering are classes with signed char member.
+
+Another option might be to just emit the code we'd like to see after the optimizations right away if that is possible, so emit the clearing instructions before the actual comparison, and emit whatever combine etc. will turn those into.
+
+- User: Uroš Bizjak | Time: 2024-10-03 09:54:39 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #15)> Createdattachment 59272[details]> gcc15-pr116896-inc.patch
+> 
+> Incremental patch which performs the subtraction in QImode and then
+> sign-extends.
+> Though, not sure if that results in better code.
+> float case:
+>         comiss  %xmm1, %xmm0
+>         jp      .L2
+>         seta    %al
+>         sbbb    $0, %al
+>         ret
+> .L2:
+>         movl    $2, %eax
+>         ret
+> float -ffast-math
+>         comiss  %xmm1, %xmm0
+>         seta    %al
+>         sbbb    $0, %al
+>         ret
+> int case
+>         cmpl    %esi, %edi
+>         setl    %dl
+>         setg    %al
+>         subl    %edx, %eax
+>         ret
+> unsigned case
+>         cmpl    %edi, %esi
+>         setg    %al
+>         sbbb    $0, %al
+>         ret
+> Note, std::partial_ordering or std::strong_ordering are classes with signed
+> char member.
+> 
+> Another option might be to just emit the code we'd like to see after the
+> optimizations right away if that is possible, so emit the clearing
+> instructions before the actual comparison, and emit whatever combine etc.
+> will turn those into.This looks pretty optimal to me, but I don't know about:>         setl    %dl
+>         setg    %al
+>         subl    %edx, %eaxThe mode change of the register access (QImode -> SImode) can create problems. Please note that SETc insns (and MOVB, FWIW) on x86 insert LSB into wide SImode register, so there could be some sync uops emitted to handle the transition. We are spared of this detail with clearing XORs and using SImode instructions.
+
+- User: Uroš Bizjak | Time: 2024-10-03 09:59:57 UTC
+  Text: e.g.:
+
+float case:
+        xorl    %eax,%eax
+        comiss  %xmm1, %xmm0
+        jp      .L2
+        seta    %al
+        sbbl    $0, %eax
+        ret
+.L2:
+        movl    $2, %eax
+        ret
+
+This is *really* good sequence!
+
+- User: Uroš Bizjak | Time: 2024-10-03 10:03:28 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #17)> e.g.:
+> 
+> float case:
+>         xorl    %eax,%eax
+>         comiss  %xmm1, %xmm0
+>         jp      .L2
+>         seta    %al
+>         sbbl    $0, %eax
+>         ret
+> .L2:
+>         movl    $2, %eax
+>         ret
+> 
+> This is *really* good sequence!And if we don't want to burden non-jp path (but IIRC, XORLs are "free"):
+
+float case:
+        comiss  %xmm1, %xmm0
+        jp      .L2
+        mov     $0, %eax
+        seta    %al
+        sbbl    $0, %eax
+        ret
+.L2:
+        movl    $2, %eax
+        ret
+
+- User: Jakub Jelinek | Time: 2024-10-03 10:35:37 UTC
+  Text: Createdattachment 59273[details]gcc15-pr116896-inc2.patch
+
+I've tried to improve the signed int <=> case (the only one which doesn't use sbb and so needs two xors first), but unfortunately that doesn't seem to work at all, the IL is how I'd like to see it at the end, but then combine happily turns those *setcc_qi_slp back into *setcc_si_1_movzbl and removes the clear instructions.
+So, I think all we can do is some extra peephole2 to deal with it (though in the jp case it will have to use to movl $0, %reg).
+
+Thus, the important question is, do we want to perform the subtraction generally in SImode (i.e. the original patch without incremental ones plus some peephole2s) or QImode?  While auto x = y <=> z; return x; will return QImode, one can always also turn it into int/long through int ret; if (x < 0) ret = -1; else if (x > 0) ret = 1; else ret = 0; or similar and then there would be sbbb or subb followed by movsbl.
+
+- User: Jakub Jelinek | Time: 2024-10-03 10:48:13 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #17)> e.g.:
+> 
+> float case:
+>         xorl    %eax,%eax
+>         comiss  %xmm1, %xmm0
+>         jp      .L2
+>         seta    %al
+>         sbbl    $0, %eax
+>         ret
+> .L2:
+>         movl    $2, %eax
+>         ret
+> 
+> This is *really* good sequence!But peephole2 can't do this (I think it works on bbs, not ebbs).  And see my above attempt, combine screws stuff up if done during expand.
+
+- User: Uroš Bizjak | Time: 2024-10-03 11:28:06 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #19)> Createdattachment 59273[details]> gcc15-pr116896-inc2.patch
+> 
+> I've tried to improve the signed int <=> case (the only one which doesn't
+> use sbb and so needs two xors first), but unfortunately that doesn't seem to
+> work at all, the IL is how I'd like to see it at the end, but then combine
+> happily turns those *setcc_qi_slp back into *setcc_si_1_movzbl and removes
+> the clear instructions.
+> So, I think all we can do is some extra peephole2 to deal with it (though in
+> the jp case it will have to use to movl $0, %reg).:( The case of overoptimization...> Thus, the important question is, do we want to perform the subtraction
+> generally in SImode (i.e. the original patch without incremental ones plus
+> some peephole2s) or QImode?  While auto x = y <=> z; return x; will return
+> QImode, one can always also turn it into int/long through int ret; if (x <
+> 0) ret = -1; else if (x > 0) ret = 1; else ret = 0; or similar and then
+> there would be sbbb or subb followed by movsbl.Let's do subtraction in QImode then.
+
+- User: Uroš Bizjak | Time: 2024-10-03 11:33:16 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #21)> (In reply to Jakub Jelinek fromcomment #19)
+> > Createdattachment 59273[details]> > gcc15-pr116896-inc2.patch
+> > 
+> > I've tried to improve the signed int <=> case (the only one which doesn't
+> > use sbb and so needs two xors first), but unfortunately that doesn't seem to
+> > work at all, the IL is how I'd like to see it at the end, but then combine
+> > happily turns those *setcc_qi_slp back into *setcc_si_1_movzbl and removes
+> > the clear instructions.
+> > So, I think all we can do is some extra peephole2 to deal with it (though in
+> > the jp case it will have to use to movl $0, %reg).Huh, another idea is to add a variant of *setcc_qi_slp, perhaps implemented with unspec or (better?) add some unspec tag to it. If we already emit optimal code at the expand time, then there is not a lot of work left for optimization passes anyway.
+
+- User: Jakub Jelinek | Time: 2024-10-03 11:43:04 UTC
+  Text: Createdattachment 59274[details]gcc15-pr116896-peep2.patch
+
+Peephole2 for the signed int <=> case (if the comparison is done in SImode).
+With this I get:
+        xorl    %edx, %edx
+        xorl    %eax, %eax
+        cmpl    %esi, %edi
+        setl    %dl
+        setg    %al
+        subl    %edx, %eax
+        ret
+for the signed int case when inc/inc2 patches aren't applied.
+
+- User: Jakub Jelinek | Time: 2024-10-03 11:45:25 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #22)> (In reply to Uroš Bizjak fromcomment #21)
+> > (In reply to Jakub Jelinek fromcomment #19)
+> > > Createdattachment 59273[details]> > > gcc15-pr116896-inc2.patch
+> > > 
+> > > I've tried to improve the signed int <=> case (the only one which doesn't
+> > > use sbb and so needs two xors first), but unfortunately that doesn't seem to
+> > > work at all, the IL is how I'd like to see it at the end, but then combine
+> > > happily turns those *setcc_qi_slp back into *setcc_si_1_movzbl and removes
+> > > the clear instructions.
+> > > So, I think all we can do is some extra peephole2 to deal with it (though in
+> > > the jp case it will have to use to movl $0, %reg).
+> 
+> Huh, another idea is to add a variant of *setcc_qi_slp, perhaps implemented
+> with unspec or (better?) add some unspec tag to it. If we already emit
+> optimal code at the expand time, then there is not a lot of work left for
+> optimization passes anyway.That might be best for the float non-fast-math case, and split it after combine into the strict_low_part.
+
+- User: Uroš Bizjak | Time: 2024-10-03 11:45:49 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #22)> (In reply to Uroš Bizjak fromcomment #21)
+> > (In reply to Jakub Jelinek fromcomment #19)
+> > > Createdattachment 59273[details]> > > gcc15-pr116896-inc2.patch
+> > > 
+> > > I've tried to improve the signed int <=> case (the only one which doesn't
+> > > use sbb and so needs two xors first), but unfortunately that doesn't seem to
+> > > work at all, the IL is how I'd like to see it at the end, but then combine
+> > > happily turns those *setcc_qi_slp back into *setcc_si_1_movzbl and removes
+> > > the clear instructions.
+> > > So, I think all we can do is some extra peephole2 to deal with it (though in
+> > > the jp case it will have to use to movl $0, %reg).
+> 
+> Huh, another idea is to add a variant of *setcc_qi_slp, perhaps implemented
+> with unspec or (better?) add some unspec tag to it. If we already emit
+> optimal code at the expand time, then there is not a lot of work left for
+> optimization passes anyway.If it is combine pass that performs problematic optimization, then perhaps tagged setcc_qi_slp can be split before reload back to setcc_qi_slp. Assuming we expand to already optimal sequence, this would IMO be the best approach.
+
+- User: Uroš Bizjak | Time: 2024-10-03 11:50:11 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #24)> (In reply to Uroš Bizjak fromcomment #22)
+> > (In reply to Uroš Bizjak fromcomment #21)
+> > > (In reply to Jakub Jelinek fromcomment #19)
+> > > > Createdattachment 59273[details]> > > > gcc15-pr116896-inc2.patch
+> > > > 
+> > > > I've tried to improve the signed int <=> case (the only one which doesn't
+> > > > use sbb and so needs two xors first), but unfortunately that doesn't seem to
+> > > > work at all, the IL is how I'd like to see it at the end, but then combine
+> > > > happily turns those *setcc_qi_slp back into *setcc_si_1_movzbl and removes
+> > > > the clear instructions.
+> > > > So, I think all we can do is some extra peephole2 to deal with it (though in
+> > > > the jp case it will have to use to movl $0, %reg).
+> > 
+> > Huh, another idea is to add a variant of *setcc_qi_slp, perhaps implemented
+> > with unspec or (better?) add some unspec tag to it. If we already emit
+> > optimal code at the expand time, then there is not a lot of work left for
+> > optimization passes anyway.
+> 
+> That might be best for the float non-fast-math case, and split it after
+> combine into the strict_low_part.You beat me by the second ;)
+
+Yes, for the cases where non-QI mode result is needed. Also, I think this pattern would be universally useful, ix86_expand_clear that is used in combination with SLP SETcc works only after reload.
+
+- User: Jakub Jelinek | Time: 2024-10-03 14:05:57 UTC
+  Text: Createdattachment 59275[details]gcc15-pr116896.patch
+
+Full new untested patch.
+
+- User: Uroš Bizjak | Time: 2024-10-03 14:50:53 UTC
+  Text: Comment onattachment 59275[details]gcc15-pr116896.patch>+  rtx zero = NULL_RTX;
+>+  if (op2 != const0_rtx && TARGET_IEEE_FP && GET_MODE (dest) == SImode)
+>+    {
+>+      zero = gen_reg_rtx (SImode);
+>+      emit_move_insn (zero, const0_rtx);
+>+    }zero = force_reg (SImode, const0_rtx);
+
+- User: GCC Commits | Time: 2024-10-07 08:52:16 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:37554bacfd38b1466278b529d9e70a44d7b1b909commitr15-4105-g37554bacfd38b1466278b529d9e70a44d7b1b909Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Oct 7 10:50:39 2024 +0200
+
+    ssa-math-opts, i386: Improve spaceship expansion [PR116896]
+    
+    The PR notes that we don't emit optimal code for C++ spaceship
+    operator if the result is returned as an integer rather than the
+    result just being compared against different values and different
+    code executed based on that.
+    So e.g. for
+    template <typename T>
+    auto foo (T x, T y) { return x <=> y; }
+    for both floating point types, signed integer types and unsigned integer
+    types.  auto in that case is std::strong_ordering or std::partial_ordering,
+    which are fancy C++ abstractions around struct with signed char member
+    which is -1, 0, 1 for the strong ordering and -1, 0, 1, 2 for the partial
+    ordering (but for -ffast-math 2 is never the case).
+    I'm afraid functions like that are fairly common and unless they are
+    inlined, we really need to map the comparison to those -1, 0, 1 or
+    -1, 0, 1, 2 values.
+    
+    Now, for floating point spaceship I've in the past already added an
+    optimization (with tree-ssa-math-opts.cc discovery and named optab, the
+    optab only defined on x86 though right now), which ensures there is just
+    a single comparison instruction and then just tests based on flags.
+    Now, if we have code like:
+      auto a = x <=> y;
+      if (a == std::partial_ordering::less)
+        bar ();
+      else if (a == std::partial_ordering::greater)
+        baz ();
+      else if (a == std::partial_ordering::equivalent)
+        qux ();
+      else if (a == std::partial_ordering::unordered)
+        corge ();
+    etc., that results in decent code generation, the spaceship named pattern
+    on x86 optimizes for the jumps, so emits comparisons on the flags, followed
+    by setting the result to -1, 0, 1, 2 and subsequent jump pass optimizes that
+    well.  But if the result needs to be stored into an integer and just
+    returned that way or there are no immediate jumps based on it (or turned
+    into some non-standard integer values like -42, 0, 36, 75 etc.), then CE
+    doesn't do a good job for that, we end up with say
+            comiss  %xmm1, %xmm0
+            jp      .L4
+            seta    %al
+            movl    $0, %edx
+            leal    -1(%rax,%rax), %eax
+            cmove   %edx, %eax
+            ret
+    .L4:
+            movl    $2, %eax
+            ret
+    The jp is good, that is the unlikely case and can't be easily handled in
+    straight line code due to the layout of the flags, but the rest uses cmov
+    which often isn't a win and a weird math.
+    With the patch below we can get instead
+            xorl    %eax, %eax
+            comiss  %xmm1, %xmm0
+            jp      .L2
+            seta    %al
+            sbbl    $0, %eax
+            ret
+    .L2:
+            movl    $2, %eax
+            ret
+    
+    The patch changes the discovery in the generic code, by detecting if
+    the future .SPACESHIP result is just used in a PHI with -1, 0, 1 or
+    -1, 0, 1, 2 values (the latter for HONOR_NANS) and passes that as a flag in
+    a new argument to .SPACESHIP ifn, so that the named pattern is told whether
+    it should optimize for branches or for loading the result into a -1, 0, 1
+    (, 2) integer.  Additionally, it doesn't detect just floating point <=>
+    anymore, but also integer and unsigned integer, but in those cases only
+    if an integer -1, 0, 1 is wanted (otherwise == and > or similar comparisons
+    result in good code).
+    The backend then can for those integer or unsigned integer <=>s return
+    effectively (x > y) - (x < y) in a way that is efficient on the target
+    (so for x86 with ensuring zero initialization first when needed before
+    setcc; one for floating point and unsigned, where there is just one setcc
+    and the second one optimized into sbb instruction, two for the signed int
+    case).  So e.g. for signed int we now emit
+            xorl    %edx, %edx
+            xorl    %eax, %eax
+            cmpl    %esi, %edi
+            setl    %dl
+            setg    %al
+            subl    %edx, %eax
+            ret
+    and for unsigned
+            xorl    %eax, %eax
+            cmpl    %esi, %edi
+            seta    %al
+            sbbb    $0, %al
+            ret
+    
+    Note, I wonder if other targets wouldn't benefit from defining the
+    named optab too...
+    
+    2024-10-07  Jakub Jelinek  <jakub@redhat.com>PR middle-end/116896* optabs.def (spaceship_optab): Use spaceship$a4 rather than
+            spaceship$a3.
+            * internal-fn.cc (expand_SPACESHIP): Expect 3 call arguments
+            rather than 2, expand the last one, expect 4 operands of
+            spaceship_optab.
+            * tree-ssa-math-opts.cc: Include cfghooks.h.
+            (optimize_spaceship): Check if a single PHI is initialized to
+            -1, 0, 1, 2 or -1, 0, 1 values, in that case pass 1 as last (new)
+            argument to .SPACESHIP and optimize away the comparisons,
+            otherwise pass 0.  Also check for integer comparisons rather than
+            floating point, in that case do it only if there is a single PHI
+            with -1, 0, 1 values and pass 1 to last argument of .SPACESHIP
+            if the <=> is signed, 2 if unsigned.
+            * config/i386/i386-protos.h (ix86_expand_fp_spaceship): Add
+            another rtx argument.
+            (ix86_expand_int_spaceship): Declare.
+            * config/i386/i386-expand.cc (ix86_expand_fp_spaceship): Add
+            arg3 argument, if it is const0_rtx, expand like before, otherwise
+            emit optimized sequence for setting the result into a GPR.
+            (ix86_expand_int_spaceship): New function.
+            * config/i386/i386.md (UNSPEC_SETCC_SI_SLP): New UNSPEC code.
+            (setcc_si_slp): New define_expand.
+            (*setcc_si_slp): New define_insn_and_split.
+            (setcc + setcc + movzbl): New define_peephole2.
+            (spaceship<mode>3): Renamed to ...
+            (spaceship<mode>4): ... this.  Add an extra operand, pass it
+            to ix86_expand_fp_spaceship.
+            (spaceshipxf3): Renamed to ...
+            (spaceshipxf4): ... this.  Add an extra operand, pass it
+            to ix86_expand_fp_spaceship.
+            (spaceship<mode>4): New define_expand for SWI modes.
+            * doc/md.texi (spaceship@var{m}3): Renamed to ...
+            (spaceship@var{m}4): ... this.  Document the meaning of last
+            operand.
+    
+            * g++.target/i386/pr116896-1.C: New test.
+            * g++.target/i386/pr116896-2.C: New test.
+
+- User: GCC Commits | Time: 2024-10-08 08:44:40 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:ff889b35935d5e796cf308fb2368d4e319c60ececommitr15-4167-gff889b35935d5e796cf308fb2368d4e319c60eceAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Oct 8 10:40:29 2024 +0200
+
+    ssa-math-opts, i386: Handle most unordered values rather than just 2 [PR116896]
+    
+    On Mon, Oct 07, 2024 at 10:32:57AM +0200, Richard Biener wrote:
+    > > They are implementation defined, -1, 0, 1, 2 is defined by libstdc++:
+    > >     using type = signed char;
+    > >     enum class _Ord : type { equivalent = 0, less = -1, greater = 1 };
+    > >     enum class _Ncmp : type { _Unordered = 2 };
+    > >https://eel.is/c++draft/cmp#categories.pre-1documents them as
+    > > enum class ord { equal = 0, equivalent = equal, less = -1, greater = 1 }; // exposition only
+    > > enum class ncmp { unordered = -127 };                                     // exposition only
+    > > and now looking at it, LLVM's libc++ takes that literally and uses
+    > > -1, 0, 1, -127.  One can't use <=> operator without including <compare>
+    > > which provides the enums, so I think if all we care about is libstdc++,
+    > > then just hardcoding -1, 0, 1, 2 is fine, if we want to also optimize
+    > > libc++ when used with gcc, we could support -1, 0, 1, -127 as another
+    > > option.
+    > > Supporting arbitrary 4 values doesn't make sense, at least on x86 the
+    > > only reason to do the conversion to int in an optab is a good sequence
+    > > to turn the flag comparisons to -1, 0, 1.  So, either we do nothing
+    > > more than the patch, or add handle both 2 and -127 for unordered,
+    > > or add support for arbitrary value for the unordered case except
+    > > -1, 0, 1 (then -1 could mean signed int, 1 unsigned int, 0 do the jumps
+    > > and any other value what should be returned for unordered.
+    
+    Here is an incremental patch which adds support for (almost) arbitrary
+    unordered constant value.  It changes the .SPACESHIP and spaceship<mode>4
+    optab conventions, so 0 means use branches, floating point, -1, 0, 1, 2
+    results consumed by tree-ssa-math-opts.cc emitted comparisons, -1
+    means signed int comparisons, -1, 0, 1 results, 1 means unsigned int
+    comparisons, -1, 0, 1 results, and for constant other than -1, 0, 1
+    which fit into [-128, 127] converted to the PHI type are otherwise
+    specified as the last argument (then it is -1, 0, 1, C results).
+    
+    2024-10-08  Jakub Jelinek  <jakub@redhat.com>PR middle-end/116896* tree-ssa-math-opts.cc (optimize_spaceship): Handle unordered values
+            other than 2, but they still need to be signed char range possibly
+            converted to the PHI result and can't be in [-1, 1] range.  Use
+            last .SPACESHIP argument of 1 for unsigned int comparisons, -1 for
+            signed int, 0 for floating point branches and any other for floating
+            point with that value as unordered.
+            * config/i386/i386-expand.cc (ix86_expand_fp_spaceship): Use op2 rather
+            const2_rtx if op2 is not const0_rtx for unordered result.
+            (ix86_expand_int_spaceship): Change INTVAL (op2) == 1 tests to
+            INTVAL (op2) != -1.
+            * doc/md.texi (spaceship@var{m}4): Document the above changes.
+    
+            * gcc.target/i386/pr116896.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-10-08 08:48:48 UTC
+  Text: Fixed.
+

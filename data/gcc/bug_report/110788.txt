@@ -1,0 +1,140 @@
+Bug Summary: Spilling to mask register for GPR vec_duplicate
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Richard Biener | Time: 2023-07-24 08:40:29 UTC
+  Text: double a[1024], b[1024];
+
+void foo (int n)
+{
+  for (int i = 0; i < n; ++i)
+    a[i] = b[i] * 3.;
+}
+
+compiled with -O3 -march=cascadelake --param vect-partial-vector-usage=2
+
+produces the inner loop
+
+.L3:
+        vmovapd b(%rax), %ymm0{%k1}
+        movl    %edx, %ecx
+        subl    $4, %edx
+        kmovw   %edx, %k0
+        vmulpd  %ymm3, %ymm0, %ymm1{%k1}{z}
+        vmovapd %ymm1, a(%rax){%k1}
+        vpbroadcastmw2d %k0, %xmm1
+        addq    $32, %rax
+        vpcmpud $6, %xmm2, %xmm1, %k1
+        cmpw    $4, %cx
+        ja      .L3
+
+where we implement the splat of %edx as
+
+        kmovw   %edx, %k0
+        vpbroadcastmw2d %k0, %xmm1
+
+instead of
+
+        vpbroadcastw    %edx, %xmm1
+
+we expand to
+
+(insn 14 13 15 (set (reg:V4SI 96)
+        (vec_duplicate:V4SI (reg:SI 93 [ _27 ]))) 8167 {*avx512vl_vec_dup_gprv4si}
+     (nil))
+
+but at IRA time we instead match that do
+
+(insn 14 13 15 3 (set (reg:V4SI 96)
+        (vec_duplicate:V4SI (zero_extend:SI (subreg:HI (reg/v:SI 95 [ n ]) 0)))) 8247 {avx512cd_maskw_vec_dupv4si}
+     (expr_list:REG_DEAD (reg/v:SI 95 [ n ]) 
+        (nil)))
+
+where combine created this via
+
+Trying 13 -> 14:
+   13: r93:SI=zero_extend(r95:SI#0)
+      REG_DEAD r95:SI
+   14: r96:V4SI=vec_duplicate(r93:SI)
+      REG_DEAD r93:SI
+Successfully matched this instruction:
+(set (reg:V4SI 96)
+    (vec_duplicate:V4SI (zero_extend:SI (subreg:HI (reg/v:SI 95 [ n ]) 0))))
+allowing combination of insns 13 and 14
+original costs 4 + 4 = 8
+replacement cost 4
+
+but it didn't anticipate that reg 95 could be allocated to a GPR?  The
+vectorizer uses an unsigned short IV for the loop, that's possibly
+sub-optimal in this case but important in others.
+
+I suppose it could also be a missed optimization in REE since I think
+the HImode regs should already be zero-extended?
+
+- User: Hongtao.liu | Time: 2023-07-27 07:02:50 UTC
+  Text: I prefer to add an UNSPEC to vpbroadcastm, don't want to mix gpr and kmask too much for vec_duplicate:zero_extend pattern.
+
+- User: Hongtao.liu | Time: 2023-07-27 07:09:48 UTC
+  Text: (In reply to Hongtao.liu fromcomment #1)> I prefer to add an UNSPEC to vpbroadcastm, don't want to mix gpr and kmask
+> too much for vec_duplicate:zero_extend pattern.And got this:
+
+.L3:
+        vmovapd b(%rax), %ymm1{%k1}
+        movl    %edx, %esi
+        subl    $4, %edx
+        movzwl  %dx, %ecx
+        vmulpd  %ymm3, %ymm1, %ymm0{%k1}{z}
+        vmovapd %ymm0, a(%rax){%k1}
+        vpbroadcastd    %ecx, %xmm0
+        addq    $32, %rax
+        vpcmpud $6, %xmm2, %xmm0, %k1
+        cmpw    $4, %si
+        ja      .L3
+        vzeroupper
+
+- User: Uroš Bizjak | Time: 2023-07-27 11:29:42 UTC
+  Text: (In reply to Richard Biener fromcomment #0)> I suppose it could also be a missed optimization in REE since I think
+> the HImode regs should already be zero-extended?No, only SImode moves have implicit zero extensions. Plain HImode and QImode moves behave as inserts into the lowpart of the wide register.
+
+- User: Hongtao.liu | Time: 2023-07-27 13:55:36 UTC
+  Text: >         kmovw   %edx, %k0
+>         vpbroadcastmw2d %k0, %xmm1
+> 
+> instead of
+> 
+>         vpbroadcastw    %edx, %xmm1
+>It's not vpbroadcastw, it's
+   movzwl  %dx, %ecx
+   vpbroadcastd    %ecx, %xmm0.
+
+And non-kmask version should be better.
+
+- User: GCC Commits | Time: 2023-07-28 02:07:11 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:54e54f77c1012ab53126314181c51eaee146ad5dcommitr14-2833-g54e54f77c1012ab53126314181c51eaee146ad5dAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Jul 27 15:14:39 2023 +0800
+
+    Add UNSPEC_MASKOP to vpbroadcastm pattern.
+    
+    Prevent rtl optimization of vec_duplicate + zero_extend to
+    vpbroadcastm since there could be an extra kmov after RA.
+    
+    gcc/ChangeLog:PR target/110788* config/i386/sse.md (avx512cd_maskb_vec_dup<mode>): Add
+            UNSPEC_MASKOP.
+            (avx512cd_maskw_vec_dup<mode>): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110788.c: New test.
+
+- User: Hongtao.liu | Time: 2023-07-28 02:30:00 UTC
+  Text: Fixed in trunk.
+
+- User: Hongtao Liu | Time: 2023-11-30 10:51:46 UTC
+  Text: .
+

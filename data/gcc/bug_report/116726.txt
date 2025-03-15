@@ -1,0 +1,177 @@
+Bug Summary: [14/15 Regression] compiler segfault when using certain struct redefinitions
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Hime Haieto | Time: 2024-09-15 18:42:12 UTC
+  Text: Createdattachment 59116[details]listtest.i
+
+I am seeing an ICE segfault with certain uses of C23 struct redefinitions.  See the attached for reproducer code and below for additional information.
+
+`uname -a`:
+Linux votocon 4.19.0-21-amd64 #1 SMP Debian 4.19.249-2 (2022-06-30) x86_64 GNU/Linux
+
+`lsb_release -a`:
+Distributor ID:	Devuan
+Description:	Devuan GNU/Linux 5 (daedalus)
+Release:	5
+Codename:	daedalus
+
+gcc configure options:
+../../configure --prefix=/opt/gcc/14.2.0 --enable-lto
+
+compiler command/options:
+gcc --std=c23 list_test.c
+
+- User: Peter Damianov | Time: 2024-09-15 18:46:10 UTC
+  Text: Confirmed.
+
+Weirdly, I cannot reproduce this on mingw hosts.
+I am not sure why.
+
+- User: Hime Haieto | Time: 2024-09-15 18:50:59 UTC
+  Text: Actually, I had also tried using the -freport-bug option like the ICE had advised, but it failed with the message:
+
+"The bug is not reproducible, so it is likely a hardware or OS problem."
+
+It seems to fail for all current versions on godbolt.
+
+- User: Andrew Pinski | Time: 2024-09-15 18:51:49 UTC
+  Text: Confirmed. Reduced slightly:
+```
+struct s1 {
+  int f1;
+};
+struct s2 {
+  int f2;
+};
+struct s1 f(struct s2 *);
+struct s1 {
+  int f1;
+};
+struct s2 {
+  int f2;
+};
+struct s1 f(struct s2 *);
+```
+
+I think this is valid due to change in C23 tag compability.https://www.open-std.org/jtc1/sc22/wg14/www/docs/n3003.pdf.
+
+Clang does not implement the C23 tag compatibility rules yet.
+
+- User: Martin Uecker | Time: 2024-09-15 20:12:03 UTC
+  Text: I will look at this.
+
+- User: Martin Uecker | Time: 2024-09-17 10:13:41 UTC
+  Text: Fix being tested.
+
+diff --git a/gcc/c/c-typeck.cc b/gcc/c/c-typeck.cc
+index 58b2724b39e..ba6d96d26b2 100644
+--- a/gcc/c/c-typeck.cc
++++ b/gcc/c/c-typeck.cc
+@@ -1686,8 +1686,11 @@ tagged_types_tu_compatible_p (const_tree t1, const_tree t2,
+ 	    data->anon_field = !DECL_NAME (s1);
+ 	    data->pointedto = false;
+ 
++	    const struct tagged_tu_seen_cache *cache = data->cache;
+ 	    data->cache = &entry;
+-	    if (!comptypes_internal (TREE_TYPE (s1), TREE_TYPE (s2), data))
++	    bool ret = comptypes_internal (TREE_TYPE (s1), TREE_TYPE (s2), data);
++	    data->cache = cache;
++	    if (!ret)
+ 	      return false;
+ 
+ 	    tree st1 = TYPE_SIZE (TREE_TYPE (s1));
+
+- User: Peter Damianov | Time: 2024-09-17 14:03:05 UTC
+  Text: Another testcase:
+not an ICE, but I think rejects-valid
+```
+typedef void f(struct s1);
+struct s1 {
+  int f1;
+};
+typedef void f(struct s1);
+```
+
+<source>:5:14: error: conflicting types for 'f'; have 'void(struct s1)'
+    5 | typedef void f(struct s1);
+      |              ^
+<source>:1:14: note: previous declaration of 'f' with type 'f' {aka 'void(struct s1)'}
+    1 | typedef void f(struct s1);
+      |              ^
+
+- User: Martin Uecker | Time: 2024-09-17 14:33:02 UTC
+  Text: (In reply to Peter Damianov fromcomment #6)> Another testcase:
+> not an ICE, but I think rejects-valid
+> ```
+> typedef void f(struct s1);
+> struct s1 {
+>   int f1;
+> };
+> typedef void f(struct s1);
+> ```
+> 
+> <source>:5:14: error: conflicting types for 'f'; have 'void(struct s1)'
+>     5 | typedef void f(struct s1);
+>       |              ^
+> <source>:1:14: note: previous declaration of 'f' with type 'f' {aka
+> 'void(struct s1)'}
+>     1 | typedef void f(struct s1);
+>       |              ^This is the same as:https://gcc.gnu.org/bugzilla/show_bug.cgi?id=116728But I think the behavior is correct. See the discussion there.
+
+- User: Martin Uecker | Time: 2024-09-17 14:34:23 UTC
+  Text: PATCH:https://gcc.gnu.org/pipermail/gcc-patches/2024-September/663123.html
+
+- User: GCC Commits | Time: 2024-09-20 20:54:56 UTC
+  Text: The master branch has been updated by Martin Uecker <uecker@gcc.gnu.org>:https://gcc.gnu.org/g:9227a64495d5594613604573b72422e8e3722fc5commitr15-3745-g9227a64495d5594613604573b72422e8e3722fc5Author: Martin Uecker <uecker@tugraz.at>
+Date:   Tue Sep 17 11:37:29 2024 +0200
+
+    c: fix crash when checking for compatibility of structures [PR116726]
+    
+    When checking for compatibility of structure or union types in
+    tagged_types_tu_compatible_p, restore the old value of the pointer to
+    the top of the temporary cache after recursively calling comptypes_internal
+    when looping over the members of a structure of union.  While the next
+    iteration of the loop overwrites the pointer, I missed the fact that it can
+    be accessed again when types of function arguments are compared as part
+    of recursive type checking and the function is entered again.PR c/116726gcc/c/ChangeLog:
+    
+            * c-typeck.cc (tagged_types_tu_compatible_p): Restore value
+            of the cache after recursing into comptypes_internal.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr116726.c: New test.
+
+- User: GCC Commits | Time: 2024-10-09 07:19:43 UTC
+  Text: The releases/gcc-14 branch has been updated by Martin Uecker <uecker@gcc.gnu.org>:https://gcc.gnu.org/g:4123f546d77c42287d2fcae6fb04df7b87193454commitr14-10761-g4123f546d77c42287d2fcae6fb04df7b87193454Author: Martin Uecker <uecker@tugraz.at>
+Date:   Tue Sep 17 11:37:29 2024 +0200
+
+    c: fix crash when checking for compatibility of structures [PR116726]
+    
+    When checking for compatibility of structure or union types in
+    tagged_types_tu_compatible_p, restore the old value of the pointer to
+    the top of the temporary cache after recursively calling comptypes_internal
+    when looping over the members of a structure of union.  While the next
+    iteration of the loop overwrites the pointer, I missed the fact that it can
+    be accessed again when types of function arguments are compared as part
+    of recursive type checking and the function is entered again.PR c/116726gcc/c/ChangeLog:
+    
+            * c-typeck.cc (tagged_types_tu_compatible_p): Restore value
+            of the cache after recursing into comptypes_internal.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr116726.c: New test.
+    
+    (cherry picked from commit 9227a64495d5594613604573b72422e8e3722fc5)
+
+- User: Richard Biener | Time: 2024-10-13 11:54:48 UTC
+  Text: I assume fixed.
+

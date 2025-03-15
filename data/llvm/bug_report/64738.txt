@@ -1,0 +1,80 @@
+Issue Title: [OMPT] Target callbacks use wrong device number due to late initialization
+Original Post: **Note:** The issue was initially discussed in the ROCm-Developer-Tools/aomp repository. You can find the issue [here](https://github.com/ROCm-Developer-Tools/aomp/issues/527).
+
+There's also a Phabricator review by @mhalk already: https://reviews.llvm.org/D157605
+
+**Description**
+
+In the recently upstreamed implementation of the OpenMP target callbacks of the OMPT interface, it was discovered that the device numbers might not get set in some cases. This seems to affect the `ompt_callback_target` and `ompt_callback_target_data_op` callbacks in particular.
+
+This is bad for tool developers, since we require the correct device number to know which regions were executed on which device.
+
+At the same time, the order of the callbacks seems to be messed up as well. We do see the first target event before the device gets initialized. 
+
+**Reproducer**
+
+One can use the following test to reproduce the issue:
+
+```c
+#include <omp.h>
+#include <stdio.h>
+#include "callbacks.h"
+
+int main( void )
+{
+    int M[10];
+#pragma omp target enter data map(to: M[:10]) 
+#pragma omp target 
+    {
+#pragma omp teams distribute parallel for simd
+        for(int i = 0; i < 10; ++i)
+        {
+            M[i] = i;
+        }
+    }
+#pragma omp target exit data map(from: M[:10])
+    return 0;
+}
+```
+
+I've used the callback interface from one of the aomp tests to get the callback information. It can be found [here](https://raw.githubusercontent.com/ROCm-Developer-Tools/aomp/aomp-dev/test/smoke/veccopy-ompt-target-emi/callbacks.h).
+Running the tool, we see the following results:
+
+```console
+$ clang --version
+clang version 18.0.0 (https://github.com/llvm/llvm-project.git 5816d2ab287ab9d2e1624852946973ed43a0e3f2)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/software/software/LLVM/git/bin
+$ wget https://raw.githubusercontent.com/ROCm-Developer-Tools/aomp/aomp-dev/test/smoke/veccopy-ompt-target-emi/callbacks.h
+$ clang -fopenmp -fopenmp-targets=nvptx64 reproducer.c
+$ ./a.out
+Callback Target EMI: kind=2 endpoint=1 device_num=-1 task_data=0x55ff20a4aa00 (0x0) target_task_data=0x55ff20a74158 (0x0) target_data=0x7fd23d6287a8 (0x8000000000000001) code=0x55ff1f5497f1
+Callback Init: device_num=0 type=sm_75 device=0x55ff20a8d120 lookup=0x7fd23d8730d0 doc=(nil)
+Callback Load: device_num:0 filename:(null) host_adddr:0x55ff1f54a668 device_addr:(nil) bytes:613024
+  Callback DataOp EMI: endpoint=1 optype=1 target_task_data=0x55ff20a74158 (0x0) target_data=0x7fd23d6287a8 (0x8000000000000001) host_op_id=0x7fd23d6287c0 (0x8000000000000002) src=0x7ffc7782efa0 src_device_num=1 dest=(nil) dest_device_num=0 bytes=40 code=0x7fd23d77e393
+  Callback DataOp EMI: endpoint=2 optype=1 target_task_data=0x55ff20a74158 (0x0) target_data=0x7fd23d6287a8 (0x8000000000000001) host_op_id=0x7fd23d6287c0 (0x8000000000000002) src=0x7ffc7782efa0 src_device_num=1 dest=0x7fd206600000 dest_device_num=0 bytes=40 code=0x7fd23d77e393
+  Callback DataOp EMI: endpoint=1 optype=2 target_task_data=0x55ff20a74158 (0x0) target_data=0x7fd23d6287a8 (0x8000000000000001) host_op_id=0x7fd23d6287c0 (0x8000000000000003) src=0x7ffc7782efa0 src_device_num=1 dest=0x7fd206600000 dest_device_num=0 bytes=40 code=0x7fd23d77e30e
+  Callback DataOp EMI: endpoint=2 optype=2 target_task_data=0x55ff20a74158 (0x0) target_data=0x7fd23d6287a8 (0x8000000000000001) host_op_id=0x7fd23d6287c0 (0x8000000000000003) src=0x7ffc7782efa0 src_device_num=1 dest=0x7fd206600000 dest_device_num=0 bytes=40 code=0x7fd23d77e30e
+Callback Target EMI: kind=2 endpoint=2 device_num=-1 task_data=0x55ff20a4aa00 (0x0) target_task_data=0x55ff20a74158 (0x0) target_data=0x7fd23d6287a8 (0x8000000000000001) code=0x55ff1f5497f1
+Callback Target EMI: kind=1 endpoint=1 device_num=0 task_data=0x55ff20a4aa00 (0x0) target_task_data=0x55ff20a74158 (0x0) target_data=0x7fd23d6287a8 (0x8000000000000004) code=0x55ff1f5498d6
+  Callback Submit EMI: endpoint=1  req_num_teams=0 target_data=0x7fd23d6287a8 (0x8000000000000004) host_op_id=0x7fd23d6287a0 (0x0)
+  Callback Submit EMI: endpoint=2  req_num_teams=0 target_data=0x7fd23d6287a8 (0x8000000000000004) host_op_id=0x7fd23d6287a0 (0x0)
+Callback Target EMI: kind=1 endpoint=2 device_num=0 task_data=0x55ff20a4aa00 (0x0) target_task_data=0x55ff20a74158 (0x0) target_data=0x7fd23d6287a8 (0x8000000000000004) code=0x55ff1f5498d6
+Callback Target EMI: kind=3 endpoint=1 device_num=-1 task_data=0x55ff20a4aa00 (0x0) target_task_data=0x55ff20a74158 (0x0) target_data=0x7fd23d6287a8 (0x8000000000000005) code=0x55ff1f549956
+  Callback DataOp EMI: endpoint=1 optype=3 target_task_data=0x55ff20a74158 (0x0) target_data=0x7fd23d6287a8 (0x8000000000000005) host_op_id=0x7fd23d6287c0 (0x8000000000000006) src=0x7fd206600000 src_device_num=0 dest=0x7ffc7782efa0 dest_device_num=1 bytes=40 code=0x7fd23d787d7f
+  Callback DataOp EMI: endpoint=2 optype=3 target_task_data=0x55ff20a74158 (0x0) target_data=0x7fd23d6287a8 (0x8000000000000005) host_op_id=0x7fd23d6287c0 (0x8000000000000006) src=0x7fd206600000 src_device_num=0 dest=0x7ffc7782efa0 dest_device_num=1 bytes=40 code=0x7fd23d787d7f
+  Callback DataOp EMI: endpoint=1 optype=4 target_task_data=0x55ff20a74158 (0x0) target_data=0x7fd23d6287a8 (0x8000000000000005) host_op_id=0x7fd23d6287c0 (0x8000000000000007) src=0x7fd206600000 src_device_num=0 dest=(nil) dest_device_num=-1 bytes=0 code=0x7fd23d77f75a
+  Callback DataOp EMI: endpoint=2 optype=4 target_task_data=0x55ff20a74158 (0x0) target_data=0x7fd23d6287a8 (0x8000000000000005) host_op_id=0x7fd23d6287c0 (0x8000000000000007) src=0x7fd206600000 src_device_num=0 dest=(nil) dest_device_num=-1 bytes=0 code=0x7fd23d77f75a
+Callback Target EMI: kind=3 endpoint=2 device_num=-1 task_data=0x55ff20a4aa00 (0x0) target_task_data=0x55ff20a74158 (0x0) target_data=0x7fd23d6287a8 (0x8000000000000005) code=0x55ff1f549956
+Callback Fini: device_num=0
+```
+
+Comment by llvmbot: @llvm/issue-subscribers-openmp
+Comment by mhalk: @Thyre Thanks for putting this up.
+BTW if you find the time, could you please confirm that the segfault issue we discussed earlier is also resolved by the patch?
+
+I just checked that I did not introduce this with my previous fix today; that problem was already there.
+Hence, I will change the test to use EMI callbacks, so we additionally check for this behavior in the future.
+Comment by Thyre: Your patch should also resolve this issue. I was able to reproduce the fix on my machine :+1: 
+Comment by mhalk: Great, thanks for your time and effort!

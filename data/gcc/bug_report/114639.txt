@@ -1,0 +1,478 @@
+Bug Summary: [riscv] ICE in create_pre_exit, at mode-switching.cc:451
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andreas Schwab | Time: 2024-04-08 12:29:20 UTC
+  Text: Createdattachment 57901[details]minmax_test.ii
+
+$ c++ -O2 -std=c++17 -march=rv64gcv1p0 -c minmax_test.ii                                
+during RTL pass: mode_sw
+In file included from ../hwy/highway.h:441,
+                 from ../hwy/tests/minmax_test.cc:19:
+../hwy/ops/rvv-inl.h: In function 'hwy::N_RVV::MFromD<D> hwy::N_RVV::Lt128Upper(D, VFromD<D>, VFromD<D>) [with D = Simd<long unsigned int, 2, 0>]':
+../hwy/ops/rvv-inl.h:5639:1: internal compiler error: in create_pre_exit, at mode-switching.cc:451
+ 5639 | }
+      | ^
+0x2aaaab700667 __libc_start_call_main
+        ../sysdeps/nptl/libc_start_call_main.h:58
+0x2aaaab70070f __libc_start_main_impl
+        /usr/src/debug/glibc-2.39/csu/libc-start.c:360
+
+- User: Kito Cheng | Time: 2024-04-08 14:08:55 UTC
+  Text: Confirmed, and try to reducing the testcase.
+
+- User: Andrew Pinski | Time: 2024-04-08 18:13:56 UTC
+  Text: /* If we didn't see a full return value copy, verify that there
+               is a plausible reason for this.  If some, but not all of the
+               return register is likely spilled, we can expect that there
+               is a copy for the likely spilled part.  */
+            gcc_assert (!nregs
+                        || forced_late_switch
+                        || short_block
+                        || !(targetm.class_likely_spilled_p
+                             (REGNO_REG_CLASS (ret_start)))
+                        || nregs != REG_NREGS (ret_reg)
+                        /* For multi-hard-register floating point
+                           values, sometimes the likely-spilled part
+                           is ordinarily copied first, then the other
+                           part is set with an arithmetic operation.
+                           This doesn't actually cause reload
+                           failures, so let it pass.  */
+                        || (GET_MODE_CLASS (GET_MODE (ret_reg)) != MODE_INT
+                            && nregs != 1));
+
+- User: Li Pan | Time: 2024-04-09 01:26:28 UTC
+  Text: Reproduced from my side too.
+
+- User: Kito Cheng | Time: 2024-04-09 01:28:41 UTC
+  Text: Reduced case:
+```c
+typedef long c;
+#pragma riscv intrinsic "vector"
+template <unsigned long> struct d {};
+struct e {
+  using f = d<0>;
+};
+struct g {
+  using f = e::f;
+};
+template <typename, int> using h = g::f;
+template <unsigned long i> long k(d<i>);
+vbool16_t j(vuint64m4_t a) {
+  c b;
+  return __riscv_vmsne_vx_u64m4_b16(a, b, k(h<c, 2>()));
+}
+
+```
+
+- User: Li Pan | Time: 2024-04-09 01:33:15 UTC
+  Text: (In reply to Kito Cheng fromcomment #4)> Reduced case:
+> ```c
+> typedef long c;
+> #pragma riscv intrinsic "vector"
+> template <unsigned long> struct d {};
+> struct e {
+>   using f = d<0>;
+> };
+> struct g {
+>   using f = e::f;
+> };
+> template <typename, int> using h = g::f;
+> template <unsigned long i> long k(d<i>);
+> vbool16_t j(vuint64m4_t a) {
+>   c b;
+>   return __riscv_vmsne_vx_u64m4_b16(a, b, k(h<c, 2>()));
+> }
+> 
+> ```Thanks Kito, reproduced on reduced case with option "riscv64-unknown-elf-g++ -O2 -march=rv64gcv". will take a look into it.
+
+
+during RTL pass: mode_sw
+test.c: In function ‘vbool16_t j(vuint64m4_t)’:
+test.c:15:1: internal compiler error: in create_pre_exit, at mode-switching.cc:451
+   15 | }
+      | ^
+0x3978f12 create_pre_exit                                                                                                                                                                                                /home/pli/gcc/555/riscv-gnu-toolchain/gcc/__RISCV_BUILD__/../gcc/mode-switching.cc:451
+0x3979e9e optimize_mode_switching
+        /home/pli/gcc/555/riscv-gnu-toolchain/gcc/__RISCV_BUILD__/../gcc/mode-switching.cc:849
+0x397b9bc execute
+        /home/pli/gcc/555/riscv-gnu-toolchain/gcc/__RISCV_BUILD__/../gcc/mode-switching.cc:1324
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: JuzheZhong | Time: 2024-04-09 01:37:58 UTC
+  Text: Definitely it is a regression:https://compiler-explorer.com/z/e68x5sT9hGCC 13.2 is ok, but GCC 14 ICE.
+
+I think you should bisect first.
+
+- User: Li Pan | Time: 2024-04-09 03:45:52 UTC
+  Text: Looks this commit from bisect acc22d56e140220e7dc6c138918cb6754b6d1c0b, will take a look into it.
+
+- User: Li Pan | Time: 2024-04-09 07:22:47 UTC
+  Text: Find an even simpler code for reproduction.
+
+#include <riscv_vector.h>
+
+extern unsigned long get_vl ();
+
+vbool16_t test (vuint64m4_t a)
+{
+  unsigned long b;
+  return __riscv_vmsne_vx_u64m4_b16 (a, b, get_vl ());
+}
+
+../__RISC-V_INSTALL___RV64/bin/riscv64-unknown-elf-g++ -O3 -march=rv64gcv -c ref.c -S -o -
+
+acc22d56e140220e7dc6c138918cb6754b6d1c0b enabled the vector abi by default, and trigger this assert in create_pre_exit. Replace get_vl () with a local variable could bypass this issue. will continue to investigate.
+
+- User: Uroš Bizjak | Time: 2024-04-09 08:05:10 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)>             /* If we didn't see a full return value copy, verify that there
+>                is a plausible reason for this.  If some, but not all of the
+>                return register is likely spilled, we can expect that there
+>                is a copy for the likely spilled part.  */This part of the mode-switching pass is a real PITA. The trick here is with the calculation of forced_late_switch (but please see N.b. comment at the beginning of the function where some failed assumptions are described).
+
+- User: Li Pan | Time: 2024-04-09 08:32:46 UTC
+  Text: The #define FUNCTION_VALUE_REGNO_P(N) ((N) == GP_RETURN || (N) == FP_RETURN) of the riscv backend doesn't honor vector mode.  Then the below part
+
+ 370 ................    if (!targetm.calls.function_value_regno_p (copy_start))                                                                                                                                  
+ 371 ................      copy_num = 0;                                                                                                                                                                          
+ 372 ................    else
+ 373 ................      copy_num = hard_regno_nregs (copy_start,
+ 374 ................................................   GET_MODE (copy_reg));
+
+will have copy_num == 0 and then went to a different code path.
+
+Let me run fully riscv regression test for this fix first.
+
+- User: Li Pan | Time: 2024-04-09 11:55:46 UTC
+  Text: (In reply to Li Pan fromcomment #10)> The #define FUNCTION_VALUE_REGNO_P(N) ((N) == GP_RETURN || (N) == FP_RETURN)
+> of the riscv backend doesn't honor vector mode.  Then the below part
+> 
+>  370 ................    if (!targetm.calls.function_value_regno_p
+> (copy_start))                                                               
+> 
+>  371 ................      copy_num = 0;                                    
+> 
+>  372 ................    else
+>  373 ................      copy_num = hard_regno_nregs (copy_start,
+>  374 ................................................   GET_MODE (copy_reg));
+> 
+> will have copy_num == 0 and then went to a different code path.
+> 
+> Let me run fully riscv regression test for this fix first.Maybe misunderstand here, need to double-check the vector ABI for return values.
+
+- User: Li Pan | Time: 2024-04-09 15:30:41 UTC
+  Text: #include <riscv_vector.h>
+
+extern unsigned long get_vl ();
+
+#if 0
+
+#else
+
+vint32m1_t test (vint32m1_t a)
+{
+  unsigned b;
+  return __riscv_vadd_vx_i32m1 (a, b, get_vl ()); // No ICE
+}
+
+vbool16_t test (vuint64m4_t a)
+{
+  unsigned long b;
+  return __riscv_vmsne_vx_u64m4_b16 (a, b, get_vl ()); // ICE
+}
+
+#endif
+
+This is comes from the below parts:
+
+!(targetm.class_likely_spilled_p (REGNO_REG_CLASS (ret_start)));
+
+For RVV, the reg_class values are listed as below. Because the Vector Mask has only one reg, then it will be considered as likely spilled as the hook TARGET_CLASS_LIKELY_SPILLED_P default returns true if reg_class_size[class] == 1.
+
+Not very sure if overriding TARGET_CLASS_LIKELY_SPILLED_P hook for riscv is a reasonable fix, trying to understand TARGET_CLASS_LIKELY_SPILLED_P...
+
+
+--------panli-----reg_class_size[0]=0
+--------panli-----reg_class_size[1]=14                                                                                                                                                                           --------panli-----reg_class_size[2]=26
+--------panli-----reg_class_size[3]=32                                                                                                                                                                           --------panli-----reg_class_size[4]=32
+--------panli-----reg_class_size[5]=2                                                                                                                                                                            --------panli-----reg_class_size[6]=1  <= VM
+--------panli-----reg_class_size[7]=31 <= VD                                                                                                                                                                     --------panli-----reg_class_size[8]=32 <= V
+--------panli-----reg_class_size[9]=98
+
+- User: Li Pan | Time: 2024-04-10 03:20:54 UTC
+  Text: overriding TARGET_CLASS_LIKELY_SPILLED_P hook may not be a fix as it will generate sorts of spill for the below sample code.
+
+vbool2_t test_vmfge_vf_f16m8_b2(vfloat16m8_t op1, float16_t op2, size_t vl) {
+  return __riscv_vmfge_vf_f16m8_b2(op1, op2, vl);                                                                                                                                                                }
+
+need to re-think from the mode-switch side.
+
+- User: GCC Commits | Time: 2024-04-11 03:02:50 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:e40a3d86511efcea71e9eadde8fb9f96be52f790commitr14-9908-ge40a3d86511efcea71e9eadde8fb9f96be52f790Author: Pan Li <pan2.li@intel.com>
+Date:   Thu Apr 11 09:39:44 2024 +0800
+
+    RISC-V: Bugfix ICE for the vector return arg in mode switch
+    
+    This patch would like to fix a ICE in mode sw for below example code.
+    
+    during RTL pass: mode_sw
+    test.c: In function âvbool16_t j(vuint64m4_t)â:
+    test.c:15:1: internal compiler error: in create_pre_exit, at
+    mode-switching.cc:451
+       15 | }
+          | ^
+    0x3978f12 create_pre_exit
+            __RISCV_BUILD__/../gcc/mode-switching.cc:451
+    0x3979e9e optimize_mode_switching
+            __RISCV_BUILD__/../gcc/mode-switching.cc:849
+    0x397b9bc execute
+            __RISCV_BUILD__/../gcc/mode-switching.cc:1324
+    
+    extern size_t get_vl ();
+    
+    vbool16_t
+    test (vuint64m4_t a)
+    {
+      unsigned long b;
+      return __riscv_vmsne_vx_u64m4_b16 (a, b, get_vl ());
+    }
+    
+    The create_pre_exit would like to find a return value copy.  If
+    not, there will be a reason in assert but not available for above
+    sample code when vector calling convension is enabled by default.
+    This patch would like to override the TARGET_FUNCTION_VALUE_REGNO_P
+    for vector register and then we will have hard_regno_nregs for copy_num,
+    aka there is a return value copy.
+    
+    As a side-effect of allow vector in TARGET_FUNCTION_VALUE_REGNO_P, the
+    TARGET_GET_RAW_RESULT_MODE will have vector mode and which is sizeless
+    cannot be converted to fixed_size_mode.  Thus override the hook
+    TARGET_GET_RAW_RESULT_MODE and return VOIDmode when the regno is-not-a
+    fixed_size_mode.
+    
+    The below tests are passed for this patch.
+    * The fully riscv regression tests.
+    * The reproducing test in bugzillaPR114639.PR target/114639gcc/ChangeLog:
+    
+            * config/riscv/riscv.cc (riscv_function_value_regno_p): New func
+            impl for hook TARGET_FUNCTION_VALUE_REGNO_P.
+            (riscv_get_raw_result_mode): New func imple for hook
+            TARGET_GET_RAW_RESULT_MODE.
+            (TARGET_FUNCTION_VALUE_REGNO_P): Impl the hook.
+            (TARGET_GET_RAW_RESULT_MODE): Ditto.
+            * config/riscv/riscv.h (V_RETURN): New macro for vector return.
+            (GP_RETURN_FIRST): New macro for the first GPR in return.
+            (GP_RETURN_LAST): New macro for the last GPR in return.
+            (FP_RETURN_FIRST): Diito but for FPR.
+            (FP_RETURN_LAST): Ditto.
+            (FUNCTION_VALUE_REGNO_P): Remove as deprecated and replace by
+            TARGET_FUNCTION_VALUE_REGNO_P.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/riscv/rvv/base/pr114639-1.C: New test.
+            * gcc.target/riscv/rvv/base/pr114639-1.c: New test.
+    
+    Signed-off-by: Pan Li <pan2.li@intel.com>
+
+- User: Andreas Schwab | Time: 2024-04-16 08:47:39 UTC
+  Text: Fixed.
+
+- User: JuzheZhong | Time: 2024-04-22 22:53:54 UTC
+  Text: This issue is not fully fixed since the fixed patch only fixes ICE but there is
+a regression in codegen:https://godbolt.org/z/4nvxeqb6KTerrible codege:
+
+test(__rvv_uint64m4_t):
+        addi    sp,sp,-16
+        csrr    t0,vlenb
+        sd      ra,8(sp)
+        sub     sp,sp,t0
+        vs1r.v  v1,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v2,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v3,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v4,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v5,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v6,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v7,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v24,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v25,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v26,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v27,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v28,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v29,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v30,0(sp)
+        sub     sp,sp,t0
+        csrr    t0,vlenb
+        slli    t1,t0,2
+        vs1r.v  v31,0(sp)
+        sub     sp,sp,t1
+        vs4r.v  v8,0(sp)
+        call    get_vl()
+        csrr    t0,vlenb
+        slli    t1,t0,2
+        vl4re64.v       v8,0(sp)
+        csrr    t0,vlenb
+        add     sp,sp,t1
+        vl1re64.v       v31,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v30,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v29,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v28,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v27,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v26,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v25,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v24,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v7,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v6,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v5,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v4,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v3,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v2,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v1,0(sp)
+        add     sp,sp,t0
+        ld      ra,8(sp)
+        vsetvli zero,a0,e64,m4,ta,ma
+        vmsne.vi        v0,v8,0
+        addi    sp,sp,16
+        jr      ra
+
+- User: Li Pan | Time: 2024-04-28 06:02:23 UTC
+  Text: According to the V abi, looks like the asm code tries to save/restore the callee-saved registers when there is a call in function body.
+
+| Name    | ABI Mnemonic | Meaning                      | Preserved across calls?
+=================================================================================
+| v0      |              | Argument register            | No
+| v1-v7   |              | Callee-saved registers       | Yes
+| v8-v23  |              | Argument registers           | No
+| v24-v31 |              | Callee-saved registers       | Yes
+
+- User: JuzheZhong | Time: 2024-04-28 06:22:02 UTC
+  Text: (In reply to Li Pan fromcomment #17)> According to the V abi, looks like the asm code tries to save/restore the
+> callee-saved registers when there is a call in function body.
+> 
+> | Name    | ABI Mnemonic | Meaning                      | Preserved across
+> calls?
+> =============================================================================
+> ====
+> | v0      |              | Argument register            | No
+> | v1-v7   |              | Callee-saved registers       | Yes
+> | v8-v23  |              | Argument registers           | No
+> | v24-v31 |              | Callee-saved registers       | YesI see,https://godbolt.org/z/7bx1EEdGnWhen we use 44 instead of get_vl (), the load/store instructions are gone.
+
+- User: Li Pan | Time: 2024-04-28 06:51:13 UTC
+  Text: Thanks Juzhe.  Here is another example
+
+---------------------------------
+#include <riscv_vector.h>
+
+extern size_t get_new_vl ();
+
+size_t
+__attribute__((noinline))
+get_vl (size_t *c)
+{
+  size_t vl = c[0] + c[1];
+
+  return vl;
+}
+
+vbool64_t
+test_fail_2 (vuint64m1_t a, unsigned long b, size_t *c)
+{
+  return __riscv_vmsne_vx_u64m1_b64 (a, b, get_vl (c));
+}
+-------------------------------------------------------
+
+test_fail_2:                                                                                                                                                                                           [30/37834]
+        addi    sp,sp,-16
+        sd      ra,8(sp)
+        sd      s0,0(sp)
+        csrr    t0,vlenb
+        sub     sp,sp,t0
+        vs1r.v  v1,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v2,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v3,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v4,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v5,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v6,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v7,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v24,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v25,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v26,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v27,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v28,0(sp)
+        sub     sp,sp,t0                                                                                                                                                                                                 vs1r.v  v29,0(sp)                                                                                                                                                                                                sub     sp,sp,t0
+        vs1r.v  v30,0(sp)
+        sub     sp,sp,t0
+        vs1r.v  v31,0(sp)
+        csrr    t0,vlenb
+        sub     sp,sp,t0
+        vs1r.v  v8,0(sp)
+        mv      s0,a0
+        mv      a0,a1
+        call    get_vl
+        vl1re64.v       v8,0(sp)
+        vsetvli zero,a0,e64,m1,ta,ma
+        vmsne.vx        v0,v8,s0
+        csrr    t0,vlenb
+        add     sp,sp,t0
+        csrr    t0,vlenb
+        vl1re64.v       v31,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v30,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v29,0(sp)
+        add     sp,sp,t0
+        vl1re64.v       v28,0(sp)
+        ...
+
+As I understand, these callee saved vector registers are not required if the function body doesn't pollute these registers.  Only the polluted registers need to go in/out stack.
+
+However, it is somehow one optimization here, we can consider to improve this
+in GCC-15 if my understanding is correct.
+

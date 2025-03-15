@@ -1,0 +1,339 @@
+Bug Summary: [14 Regression] RISC-V ICE: in force_align_down_and_div, at poly-int.h:1828 on rv32gcv_zvl256b
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Patrick O'Neill | Time: 2023-11-30 03:10:56 UTC
+  Text: Createdattachment 56724[details]-freport-bug output
+
+during RTL pass: expand
+red.c: In function 'e':
+red.c:4:6: internal compiler error: in force_align_down_and_div, at poly-int.h:1828
+    4 | void e(unsigned f) {
+      |      ^
+0x9b006c poly_int<2u, unsigned long> force_align_down_and_div<2u, unsigned long, int>(poly_int<2u, unsigned long> const&, int)
+        ../../../gcc/gcc/poly-int.h:1828
+0x9b006c poly_int<2u, unsigned long> force_align_down_and_div<2u, unsigned long, int>(poly_int<2u, unsigned long> const&, int)
+        ../../../gcc/gcc/poly-int.h:1826
+0x9b006c extract_bit_field_1
+        ../../../gcc/gcc/expmed.cc:1861
+0xe42532 extract_bit_field(rtx_def*, poly_int<2u, unsigned long>, poly_int<2u, unsigned long>, int, rtx_def*, machine_mode, machine_mode, bool, rtx_def**)
+        ../../../gcc/gcc/expmed.cc:2149
+0xe607a9 expand_expr_real_1(tree_node*, rtx_def*, machine_mode, expand_modifier, rtx_def**, bool)
+        ../../../gcc/gcc/expr.cc:11804
+0xe6dddf expand_expr_real(tree_node*, rtx_def*, machine_mode, expand_modifier, rtx_def**, bool)
+        ../../../gcc/gcc/expr.cc:9046
+0xe6dddf expand_expr(tree_node*, rtx_def*, machine_mode, expand_modifier)
+        ../../../gcc/gcc/expr.h:310
+0xe6dddf store_expr(tree_node*, rtx_def*, int, bool, bool)
+        ../../../gcc/gcc/expr.cc:6232
+0xe6e679 expand_assignment(tree_node*, tree_node*, bool)
+        ../../../gcc/gcc/expr.cc:6070
+0xd29577 expand_gimple_stmt_1
+        ../../../gcc/gcc/cfgexpand.cc:3947
+0xd29577 expand_gimple_stmt
+        ../../../gcc/gcc/cfgexpand.cc:4045
+0xd2e6c0 expand_gimple_basic_block
+        ../../../gcc/gcc/cfgexpand.cc:6101
+0xd30656 execute
+        ../../../gcc/gcc/cfgexpand.cc:6836
+Please submit a full bug report, with preprocessed source.
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+Preprocessed source stored into /scratch/tmp/ccSDQZzq.out file, please attach this to your bugreport.
+
+
+Reduced testcase:
+long long a;
+int b, c;
+int *d;
+void e(unsigned f) {
+  for (;; ++c)
+    if (f) {
+      a = 0;
+      for (; a <= 3; a++) {
+        f = 0;
+        for (; f <= 0; f++)
+          if ((long)a)
+            break;
+      }
+      if (b)
+        *d = f;
+    }
+}
+
+- User: JuzheZhong | Time: 2023-11-30 09:06:40 UTC
+  Text: I don't have such issue with.
+
+You need to try trunk GCC.
+
+- User: Patrick O'Neill | Time: 2023-11-30 17:10:54 UTC
+  Text: Createdattachment 56734[details]-freport-bug output
+
+I'm still seeing this on the most recent trunk:r14-6020-g18d8a50a042> ./bin/riscv64-unknown-linux-gnu-gcc -march=rv32gcv_zvl256b -mabi=ilp32d -O3 -S red.cduring RTL pass: expand
+red.c: In function 'e':
+red.c:4:6: internal compiler error: in force_align_down_and_div, at poly-int.h:1828
+    4 | void e(unsigned f) {
+... (trimmed)
+
+I've updated the -freport-bug-output with the most recent run.
+
+- User: JuzheZhong | Time: 2023-12-01 01:57:19 UTC
+  Text: I see. I didn't reproduce the ICE since I didn't enable gcc_assert_checking.
+
+Could you tell me how to enable it ?
+
+
+I hack the codes as follows:
+
+diff --git a/gcc/poly-int.h b/gcc/poly-int.h
+index 828714ee910..24cce294414 100644
+--- a/gcc/poly-int.h
++++ b/gcc/poly-int.h
+@@ -1825,7 +1825,7 @@ template<unsigned int N, typename Ca, typename Cb>
+ inline poly_int<N, Ca>
+ force_align_down_and_div (const poly_int<N, Ca> &value, Cb align)
+ {
+-  gcc_checking_assert (can_align_p (value, align));
++  gcc_assert (can_align_p (value, align));
+
+   poly_int<N, Ca> r;
+   POLY_SET_COEFF (Ca, r, 0, ((value.coeffs[0]
+
+
+Then I can see the assertion FAIL.
+
+- User: JuzheZhong | Time: 2023-12-01 02:01:42 UTC
+  Text: After reproducing the ICE.
+
+I confirm the root cause is because we enable vec_extract for mask:
+
+;; -------------------------------------------------------------------------
+;; This extracts a bit (via QImode) from a bitmask vector.
+;; -------------------------------------------------------------------------
+(define_expand "vec_extract<mode>qi"
+  [(set (match_operand:QI	  0 "register_operand")
+     (vec_select:QI
+       (match_operand:VB	  1 "register_operand")
+       (parallel
+	 [(match_operand	  2 "nonmemory_operand")])))]
+
+
+The ICE happens optimized IR is as follows:
+
+_68 = BIT_FIELD_REF <mask__25.17_66, 1, POLY_INT_CST [3, 4]>;
+
+can_align_p return false for POLY_INT_CST [3, 4] since the alignment require
+multipe of 8:
+
+force_align_down_and_div (X, BITS_PER_UNIT) -> BITS_PER_UNIT = 8.
+
+
+It's ovbious POLY_INT_CST [3, 4] is definitely not aligned with 8.
+
+
+I have no idea how to fix it.
+
+CCing Robin who enable mask bit extraction should know much better than me.
+
+And CCing Richard B and Richard S may give us some useful suggestions.
+
+Thanks.
+
+- User: JuzheZhong | Time: 2023-12-01 02:02:49 UTC
+  Text: Besides, the mask type is:
+
+vector([4,4]) <signed-boolean:1>
+
+- User: Patrick O'Neill | Time: 2023-12-01 02:05:00 UTC
+  Text: (In reply to JuzheZhong fromcomment #3)> I see. I didn't reproduce the ICE since I didn't enable gcc_assert_checking.
+> 
+> Could you tell me how to enable it ?I didn't explicitly enable checking. The full configure command I ran with (from -freport-bug output) is:
+/scratch/tc-testing/tc-nov-30-trunk/build-rv64gcv/../gcc/configure --target=riscv64-unknown-linux-gnu --prefix=/scratch/tc-testing/tc-nov-30-trunk/build-rv64gcv --with-sysroot=/scratch/tc-testing/tc-nov-30-trunk/build-rv64gcv/sysroot --with-pkgversion=g18d8a50a042 --with-system-zlib --enable-shared --enable-tls --enable-languages=c,c++,fortran --disable-libmudflap --disable-libssp --disable-libquadmath --disable-libsanitizer --disable-nls --disable-bootstrap --src=../../gcc --enable-multilib --with-abi=lp64d --with-arch=rv64imafdc --with-tune=rocket --with-isa-spec=20191213 'CFLAGS_FOR_TARGET=-O2    -mcmodel=medlow' 'CXXFLAGS_FOR_TARGET=-O2    -mcmodel=medlow'
+
+I built the toolchain using riscv-gnu-toolchain `make linux`.
+
+- User: JuzheZhong | Time: 2023-12-01 02:05:34 UTC
+  Text: Here is the compiler explorer for reference and easily see the issue:https://godbolt.org/z/8v1dsKG3f
+
+- User: Robin Dapp | Time: 2023-12-01 10:27:39 UTC
+  Text: Thanks for the testcase.  It looks pretty similar to the situation why I introduced the bitmask extract in the first place and I don't think that's the root cause.
+
+As last time the problem is that the generic bit_field_ref expansion code does not handle bitmask extraction with a precision < 8 very well and this is why we run into an assertion failure.  I worked around this by providing the extract expander so we don't go down that road.
+
+The difference to before is that the bit_field_ref occurs in the epilogue (i.e. not LOOP_VINFO_FULLY_WITH_LENGTH_P) so we fall back.
+
+Maybe we can work around it by providing a fold_extract_last implementation for masks (even though the operation itself seems a bit weird).  Will see how far I get with it.
+
+- User: Robin Dapp | Time: 2023-12-01 11:54:12 UTC
+  Text: Ok, it's not the fold_extract_last expander.  It just appeared that way here because I disabled some other things.
+
+What we want to do is extract the last element from a vector.  This works as long as we have a loop length (or a loop mask) as we can defer that to vec_extract with element index len - 1.
+
+In the epilog here we don't have either so the only workaround I can quickly think of is allowing a poly_int constant as vec_extract index (where we know the vector length and can extract the proper thing with a bit of extra work).
+
+Richi, Richard:  Is that somehow viable or am I on the wrong track?
+
+- User: Richard Biener | Time: 2023-12-01 12:07:50 UTC
+  Text: The issue might be we do not use vec_extract for memory arguments:
+
+  /* Use vec_extract patterns for extracting parts of vectors whenever
+     available.  If that fails, see whether the current modes and bitregion
+     give a natural subreg.  */                  
+  machine_mode outermode = GET_MODE (op0);
+  if (VECTOR_MODE_P (outermode) && !MEM_P (op0))
+    {   
+
+and somehow the original reg operand got spilled inbetween.  That happens
+here, after we could make vec_extract work for this.
+
+  /* Make sure we are playing with integral modes.  Pun with subregs
+     if we aren't.  */
+  opt_scalar_int_mode op0_mode = int_mode_for_mode (GET_MODE (op0));
+  scalar_int_mode imode;
+  if (!op0_mode.exists (&imode) || imode != GET_MODE (op0))
+    { 
+...
+      else
+        {
+          poly_int64 size = GET_MODE_SIZE (GET_MODE (op0));
+          rtx mem = assign_stack_temp (GET_MODE (op0), size);
+          emit_move_insn (mem, op0);
+          op0 = adjust_bitfield_address_size (mem, BLKmode, 0, size);
+        }
+
+now, if we spilled we can elide the round-down I think (which is for
+the fear of accessing invalid memory).  Thus like the following?
+
+diff --git a/gcc/expmed.cc b/gcc/expmed.cc
+index b294eabb08d..e2b38b87bdf 100644
+--- a/gcc/expmed.cc
++++ b/gcc/expmed.cc
+@@ -1856,7 +1856,7 @@ extract_bit_field_1 (rtx str_rtx, poly_uint64 bitsize, poly_uint64 bitnum,
+   /* If we have a memory source and a non-constant bit offset, restrict
+      the memory to the referenced bytes.  This is a worst-case fallback
+      but is useful for things like vector booleans.  */
+-  if (MEM_P (op0) && !bitnum.is_constant ())
++  if (MEM_P (str_rtx) && !bitnum.is_constant ())
+     {
+       bytenum = bits_to_bytes_round_down (bitnum);
+       bitnum = num_trailing_bits (bitnum);
+
+but that defers the ICE to
+
+during RTL pass: expand
+t.c: In function 'e':
+t.c:4:6: internal compiler error: in to_constant, at poly-int.h:588
+    4 | void e(unsigned f) {
+      |      ^
+0x10ea530 poly_int<2u, unsigned long>::to_constant() const
+        /home/rguenther/src/trunk/gcc/poly-int.h:588
+0x13cec67 extract_bit_field_1
+        /home/rguenther/src/trunk/gcc/expmed.cc:1872
+
+so I guess we really need to match the vec_extract pattern.
+
+So you need to debug why that doesn't match here.
+
+- User: Robin Dapp | Time: 2023-12-01 12:44:03 UTC
+  Text: When I define a vec_extract...bi pattern we don't enter the if (vec_extract) in expmed because e.g.
+
+bitsize = {1, 0}
+bitnum = {3, 4}
+
+and GET_MODE_BITSIZE (innermode) = {1, 0} with innermode = BImode.
+
+This fails multiple_p (bitnum, GET_MODE_BITSIZE (innermode), &pos).
+
+It is a multiple of course, but still dependent on the actual vector length.
+(So we would also need to extract a [3 4] from the vector).
+
+That would be the same as an extract_last with a CONST_M1 mask.  Maybe that's an option?  So if we have an extract_last and no loop len or mask fall back to an extract_last with a full mask?  That would delegate the length calculation to the backend.
+
+- User: rguenther@suse.de | Time: 2023-12-01 13:20:30 UTC
+  Text: On Fri, 1 Dec 2023, rdapp at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=112773> 
+> ---Comment #11from Robin Dapp <rdapp at gcc dot gnu.org> ---
+> When I define a vec_extract...bi pattern we don't enter the if (vec_extract) in
+> expmed because e.g.
+> 
+> bitsize = {1, 0}
+> bitnum = {3, 4}
+> 
+> and GET_MODE_BITSIZE (innermode) = {1, 0} with innermode = BImode.
+> 
+> This fails multiple_p (bitnum, GET_MODE_BITSIZE (innermode), &pos).
+> 
+> It is a multiple of course, but still dependent on the actual vector length.
+> (So we would also need to extract a [3 4] from the vector).
+> 
+> That would be the same as an extract_last with a CONST_M1 mask.  Maybe that's
+> an option?  So if we have an extract_last and no loop len or mask fall back to
+> an extract_last with a full mask?  That would delegate the length calculation
+> to the backend.Hm, yeah, but is that an issue?  I guess all vec_extract can end up
+at a variable position with VLA?
+
+- User: Robin Dapp | Time: 2023-12-01 21:16:58 UTC
+  Text: Mostly an issue because our expander is definitely not prepared to handle that :)
+
+It looks like aarch64's is, though, and ours can/should be changed then.
+aarch64 doesn't need to implement a qi/bi extract from a mask because the bit_field_ref fallback code works for sve masks.
+
+There is (at least) three things that prevent us from creating a vec_extract here.  First, my old friend MODE_BITSIZE vs MODE_PRECISION, second we expect a mask -> BI extract here (while we do mask -> QI extraction on the other path) but I haven't yet defined a vec_extract...bi either.
+Once those two are our of the way I still hit QI vs BI inconsistencies but I think they can be sorted out.  Then we emit a VLA vec_extract.
+
+I hope to have a patch ready by Monday.
+
+- User: GCC Commits | Time: 2023-12-14 16:54:01 UTC
+  Text: The master branch has been updated by Robin Dapp <rdapp@gcc.gnu.org>:https://gcc.gnu.org/g:0a5170b5f596bb5fcedf25d93952b979d02d1f56commitr14-6555-g0a5170b5f596bb5fcedf25d93952b979d02d1f56Author: Robin Dapp <rdapp@ventanamicro.com>
+Date:   Sun Dec 3 21:55:16 2023 +0100
+
+    expmed: Use GET_MODE_PRECISION and expander's output mode.
+    
+    This changes the vec_extract path of extract_bit_field to use
+    GET_MODE_PRECISION instead of GET_MODE_BITSIZE and uses
+    the mode obtained from insn_data[icode].operand[0] as target mode.
+    
+    Also, it adds a vec_extract<mode>bi expander for riscv that maps
+    to vec_extract<mode>qi.  This fixes an ICE on riscv where we did
+    not find a vec_extract optab and continued with the generic code
+    which requires 1-byte alignment that riscv mask modes do not provide.
+    
+    Apart from that it adds poly_int support to riscv's vec_extract
+    expander and makes the RVV..BImode -> QImode expander call
+    emit_vec_extract in order not to duplicate code.
+    
+    gcc/ChangeLog:PR target/112773* config/riscv/autovec.md (vec_extract<mode>bi): New expander
+            calling vec_extract<mode>qi.
+            * config/riscv/riscv-protos.h (riscv_legitimize_poly_move):
+            Export.
+            (emit_vec_extract): Change argument from poly_int64 to rtx.
+            * config/riscv/riscv-v.cc (shuffle_extract_and_slide1up_patterns):
+            Ditto.
+            * config/riscv/riscv.cc (riscv_legitimize_poly_move): Export.
+            (riscv_legitimize_move): Use rtx instead of poly_int64.
+            * expmed.cc (store_bit_field_1): Change BITSIZE to PRECISION.
+            (extract_bit_field_1): Change BITSIZE to PRECISION and use
+            return mode from insn_data as target mode.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/autovec/partial/pr112773.c: New test.
+
+- User: Patrick O'Neill | Time: 2023-12-14 19:51:30 UTC
+  Text: Fixed on trunk.
+
+Weirdly this was fixed before Robin's patch by this patch:r14-6472-g8501edba91e
+
+- User: Robin Dapp | Time: 2023-12-14 20:13:07 UTC
+  Text: I'd hope it was not fixed by this but just latent because we chose a VLS-mode vectorization instead.  Hopefully we're better off with the fix than without :)
+
+- User: Patrick O'Neill | Time: 2023-12-14 21:09:44 UTC
+  Text: (In reply to Robin Dapp fromcomment #16)> I'd hope it was not fixed by this but just latent because we chose a
+> VLS-mode vectorization instead.  Hopefully we're better off with the fix
+> than without :)Using -fno-vect-cost-model confirms thatr14-6472-g8501edba91edidn't actually fix the problem, but it's fixed on trunk. I'll send a patch to add -fno-vect-cost-model to the testcase options.
+

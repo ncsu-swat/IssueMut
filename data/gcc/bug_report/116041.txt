@@ -1,0 +1,124 @@
+Bug Summary: aarch64 fallout from removing vcond{,u,eq} patterns
+Product: gcc
+Component: testsuite
+
+  (show other bugs)
+Keywords: internal-improvement, testsuite-fail
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2024-07-22 21:10:18 UTC
+  Text: FromPR 114189:
+
+aarch64 reports just
+``
+FAIL: gcc.target/aarch64/if-compare_2.c check-function-bodies bar1
+FAIL: gcc.target/aarch64/if-compare_2.c check-function-bodies bar2
+```
+
+When I removed the vcond support from aarch64, these testcases fail.
+
+The reduced testcase is:
+```
+void bar1 (int * restrict a, int * restrict b, int * restrict c,
+          int * restrict d, int * restrict res, int n)
+{
+  for (int i = 0; i < (n & -4); i++)
+    res[i] = ((a[i] < b[i]) & c[i]) | ((a[i] >= b[i]) & d[i]);
+}
+```
+
+This fails to vectorize even.
+
+From the dump:
+t1.c:4:21: note:   vect_is_simple_use: operand _4 < _6, type of def: internal
+t1.c:4:21: note:   vect_is_simple_use: vectype vector(4) <signed-boolean:32>
+t1.c:4:21: note:   vect_is_simple_use: operand 1, type of def: constant
+t1.c:4:21: note:   vect_is_simple_use: operand 0, type of def: constant
+t1.c:1:6: missed:   not vectorized: relevant stmt not supported: patt_72 = _7 ? 1 : 0;
+t1.c:4:21: missed:  bad operation or unsupported loop bound.
+
+- User: Andrew Pinski | Time: 2024-07-22 21:36:24 UTC
+  Text: Actually I am wrong; I accidently removed vcond_mask .
+
+bar1:
+
+body: .*\tcmge  v[0-9]+.4s, v[0-9]+.4s, v[0-9]+.4s
+\tbsl   v[0-9]+.16b, v[0-9]+.16b, v[0-9]+.16b
+\tand   v[0-9]+.16b, v[0-9]+.16b, v[0-9]+.16b
+.*
+
+vs:
+
+        cmge    v29.4s, v29.4s, v0.4s
+        bit     v30.16b, v28.16b, v29.16b
+        and     v30.16b, v30.16b, v31.16b
+
+bar2:
+body: .*\tcmge  v[0-9]+.4s, v[0-9]+.4s, v[0-9]+.4s
+\tbsl   v[0-9]+.16b, v[0-9]+.16b, v[0-9]+.16b
+.*
+
+vs:
+        cmge    v30.4s, v30.4s, v0.4s
+        bit     v31.16b, v29.16b, v30.16b
+
+
+the difference is bit vs bsl.
+So this is just a testcase failure.
+
+- User: Andrew Pinski | Time: 2024-07-22 21:48:23 UTC
+  Text: From aarch64-simd.md:
+;; aarch64_simd_bsl may compile to any of bsl/bif/bit depending on register
+;; allocation.
+;; Operand 1 is the mask, operands 2 and 3 are the bitfields from which
+;; to select.
+;;
+;; Thus our BSL is of the form:
+;;   op0 = bsl (mask, op2, op3)
+;; We can use any of:
+;;
+;;   if (op0 = mask)
+;;     bsl mask, op1, op2
+;;   if (op0 = op1) (so 1-bits in mask choose bits from op2, else op0)
+;;     bit op0, op2, mask
+;;   if (op0 = op2) (so 0-bits in mask choose bits from op1, else op0)
+;;     bif op0, op1, mask
+;;
+;; This pattern is expanded to by the aarch64_simd_bsl<mode> expander.
+;; Some forms of straight-line code may generate the equivalent form
+;; in *aarch64_simd_bsl<mode>_alt.
+
+
+so it is the same but just with different operand ordering.
+
+So I will handle this testcase change.
+
+- User: Andrew Pinski | Time: 2024-08-06 23:10:06 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2024-August/659655.html
+
+- User: GCC Commits | Time: 2024-08-08 17:57:45 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:7223c64745530db102a160d5a1db4c2c8d2b9fe1commitr15-2840-g7223c64745530db102a160d5a1db4c2c8d2b9fe1Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Tue Aug 6 16:00:02 2024 -0700
+
+    aarch64/testsuite: Fix if-compare_2.c for removing vcond{,u,eq} patterns [PR116041]
+    
+    For bar1 and bar2, we currently is expecting to use the bsl instruction but
+    with slightly different register allocation inside the loop (which happens after
+    the removal of the vcond{,u,eq} patterns), we get the bit instruction.  The pattern that
+    outputs bsl instruction will output bit and bif too depending register allocation.
+    
+    So let's check for bsl, bit or bif instructions instead of just bsl instruction.
+    
+    Tested on aarch64 both with an unmodified compiler and one which has the patch to disable
+    these optabs.
+    
+    gcc/testsuite/ChangeLog:PR testsuite/116041* gcc.target/aarch64/if-compare_2.c: Support bit and bif for
+            both bar1 and bar2; add comment on why too.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-08-08 17:59:19 UTC
+  Text: Fixed.
+

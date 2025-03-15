@@ -1,0 +1,135 @@
+Bug Summary: ICE: in lower_stmt, at gimple-lower-bitint.cc:5455 with -O -mavx512f and _BitInt() in memcpy()
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-02-06 11:13:55 UTC
+  Text: Createdattachment 57340[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O -mavx512f testcase.c
+during GIMPLE pass: bitintlower
+testcase.c: In function 'foo':
+testcase.c:2:1: internal compiler error: in lower_stmt, at gimple-lower-bitint.cc:5455
+    2 | foo(void *p, _BitInt(246) x)
+      | ^~~
+0xd8cedf lower_stmt
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:5455
+0x2721439 gimple_lower_bitint
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:6582
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-8817-20240205212943-gc5d34912ad5-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-8817-20240205212943-gc5d34912ad5-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240206 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2024-02-07 11:20:50 UTC
+  Text: Ugh, folding turns this into
+  uint256_t D.3758;
+
+  <bb 2> :
+  D.3758 = MEM <uint256_t> [(char * {ref-all})&x];
+  MEM <uint256_t> [(char * {ref-all})p] = D.3758;
+and later ssa turns it into
+  uint256_t _2;
+
+  <bb 2> :
+  _2 = VIEW_CONVERT_EXPR<uint256_t>(x_1(D));
+  MEM <uint256_t> [(char * {ref-all})p_4(D)] = _2;
+where presumably uint256_t is some 256-bit unsigned INTEGER_TYPE.
+Except it isn't really supported except perhaps for moves.
+
+Similarly
+void
+bar (void *p, _BitInt(502) x)
+{
+  __builtin_memcpy (p, &x, sizeof x);
+}
+into
+  uint512_t D.3758;
+
+  D.3758 = MEM <uint512_t> [(char * {ref-all})&x];
+  MEM <uint512_t> [(char * {ref-all})p] = D.3758;
+and later
+  uint512_t _2;
+
+  <bb 2> :
+  _2 = VIEW_CONVERT_EXPR<uint512_t>(x_1(D));
+  MEM <uint512_t> [(char * {ref-all})p_4(D)] = _2;
+
+
+I don't see how I could handle that in bitint lowering when shifts, BIT_IOR_EXPR etc.
+will not work on such types.
+
+- User: Jakub Jelinek | Time: 2024-02-07 11:32:19 UTC
+  Text: This comes from
+              scalar_int_mode mode;
+              if (int_mode_for_size (ilen * 8, 0).exists (&mode)
+                  && GET_MODE_SIZE (mode) * BITS_PER_UNIT == ilen * 8
+                  /* If the destination pointer is not aligned we must be able
+                     to emit an unaligned store.  */
+                  && (dest_align >= GET_MODE_ALIGNMENT (mode)
+                      || !targetm.slow_unaligned_access (mode, dest_align)
+                      || (optab_handler (movmisalign_optab, mode)
+                          != CODE_FOR_nothing)))
+where we just care if that huge mode exists, not whether it is supported (but for moves or in misaligned case movmisalign).
+
+- User: Jakub Jelinek | Time: 2024-02-08 12:28:57 UTC
+  Text: Createdattachment 57358[details]gcc14-pr113783.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-02-09 15:17:45 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:c9bdcb0c3433ce09f5bb713a51a14130858578a2commitr14-8899-gc9bdcb0c3433ce09f5bb713a51a14130858578a2Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Feb 9 16:17:08 2024 +0100
+
+    lower-bitint: Fix handling of VIEW_CONVERT_EXPRs to minimally supported huge INTEGER_TYPEs [PR113783]
+    
+    On the following testcases memcpy lowering folds the calls to
+    reading and writing of MEM_REFs with huge INTEGER_TYPEs - uint256_t
+    with OImode or uint512_t with XImode.  Further optimization turn
+    the load from MEM_REF from the large/huge _BitInt var into VIEW_CONVERT_EXPR
+    from it to the uint256_t/uint512_t.  The backend doesn't really
+    support those except for "movoi"/"movxi" insns, so it isn't possible
+    to handle it like casts to supportable INTEGER_TYPEs where we can
+    construct those from individual limbs - there are no OImode/XImode shifts
+    and the like we can use.
+    So, the following patch makes sure for such VCEs that the SSA_NAME operand
+    of the VCE lives in memory and then turns it into a VIEW_CONVERT_EXPR so
+    that we actually load the OImode/XImode integer from memory (i.e. a mov).
+    We need to make sure those aren't merged with other
+    operations in the gimple_lower_bitint hunks.
+    For SSA_NAMEs which have underlying VAR_DECLs that is all we need, those
+    VAR_DECL have ARRAY_TYPEs.
+    For SSA_NAMEs which have underlying PARM_DECLs or RESULT_DECLs those have
+    BITINT_TYPE and I had to tweak expand_expr_real_1 for that so that it
+    doesn't try convert_modes on those when one of the modes is BLKmode - we
+    want to fall through into the adjust_address on the MEM.
+    
+    2024-02-09  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113783* gimple-lower-bitint.cc (bitint_large_huge::lower_stmt): Look
+            through VIEW_CONVERT_EXPR for final cast checks.  Handle
+            VIEW_CONVERT_EXPRs from large/huge _BitInt to > MAX_FIXED_MODE_SIZE
+            INTEGER_TYPEs.
+            (gimple_lower_bitint): Don't merge mergeable operations or other
+            casts with VIEW_CONVERT_EXPRs to > MAX_FIXED_MODE_SIZE INTEGER_TYPEs.
+            * expr.cc (expand_expr_real_1): Don't use convert_modes if either
+            mode is BLKmode.
+    
+            * gcc.dg/bitint-88.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-09 15:18:10 UTC
+  Text: Fixed.
+

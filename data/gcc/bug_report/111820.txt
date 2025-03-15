@@ -1,0 +1,438 @@
+Bug Summary: [13 Regression] Compiler time hog in the vectorizer with `-O3 -fno-tree-vrp`
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: compile-time-hog, needs-bisection
+Known to Work: 11.1.0, 12.1.0, 12.3.0, 14.0, 9.1.0
+Known to Fail: 13.1.0
+
+Comments:
+- User: wierton | Time: 2023-10-15 02:02:46 UTC
+  Text: Compiler Explorer:https://godbolt.org/z/ezdG5GGd8When compile below program with option `-O3 -fno-tree-vrp`, GCC consumes upto 46 seconds to finish:
+```
+int r;
+int r_0;
+
+void f (void)
+{
+  int n = 0;
+  while (-- n)
+    {
+      r_0 += r ;
+      r  += r;
+      r  += r ;
+      r  += r ;
+      r  >= r ;
+      r  += r ;
+    }
+}
+```
+
+- User: Andrew Pinski | Time: 2023-10-15 02:07:00 UTC
+  Text: Looks to be the vectorizer:
+#0  0x00000000012d1fe5 in wide_int_storage::operator= (x=..., this=<optimized out>) at /home/apinski/src/upstream-gcc-git/gcc/gcc/wide-int.h:1221
+#1  generic_wide_int<wide_int_storage>::operator= (this=<optimized out>) at /home/apinski/src/upstream-gcc-git/gcc/gcc/wide-int.h:775
+#2  vect_peel_nonlinear_iv_init (stmts=0x7fffffffd1c0, init_expr=0x7ffff79dbbd0, skip_niters=<optimized out>, step_expr=0x7ffff79bad38, induction_type=<optimized out>) at /home/apinski/src/upstream-gcc-git/gcc/gcc/tree-vect-loop.cc:9138
+#3  0x00000000012f5322 in vect_update_ivs_after_vectorizer (loop_vinfo=0x3181a90, niters=0x7ffff79e60c0, update_e=0x7ffff79d5ba0) at /home/apinski/src/upstream-gcc-git/gcc/gcc/tree-vect-loop-manip.cc:2028
+#4  0x00000000012fec74 in vect_do_peeling (loop_vinfo=loop_vinfo@entry=0x3181a90, niters=<optimized out>, niters@entry=0x7ffff79bad50, nitersm1=nitersm1@entry=0x7ffff79e0b40, niters_vector=niters_vector@entry=0x7fffffffd700, step_vector=step_vector@entry=0x7fffffffd708,
+    niters_vector_mult_vf_var=niters_vector_mult_vf_var@entry=0x7fffffffd710, th=<optimized out>, check_profitability=<optimized out>, niters_no_overflow=<optimized out>, advance=<optimized out>) at /home/apinski/src/upstream-gcc-git/gcc/gcc/tree-vect-loop-manip.cc:3370
+#5  0x00000000012f01a9 in vect_transform_loop (loop_vinfo=loop_vinfo@entry=0x3181a90, loop_vectorized_call=loop_vectorized_call@entry=0x0) at /home/apinski/src/upstream-gcc-git/gcc/gcc/tree-vect-loop.cc:11386
+#6  0x0000000001331bec in vect_transform_loops (simduid_to_vf_htab=<optimized out>, loop=0x7ffff78054b0, loop_vectorized_call=0x0, fun=<optimized out>) at /home/apinski/src/upstream-gcc-git/gcc/gcc/tree-vectorizer.cc:1004
+#7  0x00000000013321ed in try_vectorize_loop_1 (fun=0x7ffff79d6000, loop_dist_alias_call=0x0, loop_vectorized_call=0x0, loop=0x7ffff78054b0, num_vectorized_loops=0x7fffffffdacc, simduid_to_vf_htab=@0x7fffffffdad0: 0x0) at /home/apinski/src/upstream-gcc-git/gcc/gcc/tree-vectorizer.cc:1150
+#8  try_vectorize_loop (simduid_to_vf_htab=@0x7fffffffdad0: 0x0, num_vectorized_loops=0x7fffffffdacc, loop=0x7ffff78054b0, fun=0x7ffff79d6000) at /home/apinski/src/upstream-gcc-git/gcc/gcc/tree-vectorizer.cc:1180
+#9  0x0000000001332845 in (anonymous namespace)::pass_vectorize::execute (this=<optimized out>, fun=0x7ffff79d6000) at /home/apinski/src/upstream-gcc-git/gcc/gcc/tree-vectorizer.cc:1296
+
+- User: Andrew Pinski | Time: 2023-10-15 02:09:49 UTC
+  Text: Confirmed.
+
+- User: Richard Biener | Time: 2023-10-16 07:14:18 UTC
+  Text: for (unsigned i = 0; i != skipn - 1; i++)
+          begin = wi::mul (begin, wi::to_wide (step_expr));
+
+(gdb) p skipn
+$5 = 4294967292
+
+niters is 4294967292 in vect_update_ivs_after_vectorizer.  Maybe the loop
+should terminate when begin is zero.  But I wonder why we pass in 'niters'
+and then name it 'skip_niters' ...
+
+CCing author for fixing.
+
+- User: Hongtao.liu | Time: 2023-10-16 07:22:57 UTC
+  Text: > niters is 4294967292 in vect_update_ivs_after_vectorizer.  Maybe the loop
+> should terminate when begin is zero.  But I wonder why we pass in 'niters'
+> and then name it 'skip_niters' ...>
+
+It's coming from here
+
+ 9448  niters_skip = LOOP_VINFO_MASK_SKIP_NITERS (loop_vinfo);
+ 9449  /* If we are using the loop mask to "peel" for alignment then we need
+ 9450     to adjust the start value here.  */
+ 9451  if (niters_skip != NULL_TREE)
+ 9452    init_expr = vect_peel_nonlinear_iv_init (&stmts, init_expr, niters_skip,
+ 9453                                             step_expr, induction_type);
+ 9454
+
+- User: Hongtao.liu | Time: 2023-10-16 07:43:34 UTC
+  Text: (In reply to Richard Biener fromcomment #3)>         for (unsigned i = 0; i != skipn - 1; i++)
+>           begin = wi::mul (begin, wi::to_wide (step_expr));
+> 
+> (gdb) p skipn
+> $5 = 4294967292
+> 
+> niters is 4294967292 in vect_update_ivs_after_vectorizer.  Maybe the loop
+> should terminate when begin is zero.  But I wonder why we pass in 'niters'Here, it want to calculate begin * pow (step_expr, skipn), yes we can just skip the loop when begin is 0.
+Also optimize the loop to shift when step_expr is power of 2.
+But for other cases, the loop is still needed.
+
+- User: rguenther@suse.de | Time: 2023-10-16 08:46:57 UTC
+  Text: On Mon, 16 Oct 2023, crazylht at gmail dot com wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=111820> 
+> ---Comment #5from Hongtao.liu <crazylht at gmail dot com> ---
+> (In reply to Richard Biener fromcomment #3)
+> >         for (unsigned i = 0; i != skipn - 1; i++)
+> >           begin = wi::mul (begin, wi::to_wide (step_expr));
+> > 
+> > (gdb) p skipn
+> > $5 = 4294967292
+> > 
+> > niters is 4294967292 in vect_update_ivs_after_vectorizer.  Maybe the loop
+> > should terminate when begin is zero.  But I wonder why we pass in 'niters'
+> Here, it want to calculate begin * pow (step_expr, skipn), yes we can just skip
+> the loop when begin is 0.I mean terminate it when the multiplication overflowed to zero.
+
+As for the MASK_ thing the skip is to be interpreted negative (we
+should either not use a 'tree' here or make it have the correct type
+maybe).  Can we even handle this here?  It would need to be
+a division, no?
+
+So I think we need to disable non-linear IV or masked peeling for
+niter/aligment?  But I wonder how we run into this with plain -O3.
+
+- User: Hongtao.liu | Time: 2023-10-17 06:56:50 UTC
+  Text: (In reply torguenther@suse.defromcomment #6)> On Mon, 16 Oct 2023, crazylht at gmail dot com wrote:
+> 
+> >https://gcc.gnu.org/bugzilla/show_bug.cgi?id=111820> > 
+> > ---Comment #5from Hongtao.liu <crazylht at gmail dot com> ---
+> > (In reply to Richard Biener fromcomment #3)
+> > >         for (unsigned i = 0; i != skipn - 1; i++)
+> > >           begin = wi::mul (begin, wi::to_wide (step_expr));
+> > > 
+> > > (gdb) p skipn
+> > > $5 = 4294967292
+> > > 
+> > > niters is 4294967292 in vect_update_ivs_after_vectorizer.  Maybe the loop
+> > > should terminate when begin is zero.  But I wonder why we pass in 'niters'
+> > Here, it want to calculate begin * pow (step_expr, skipn), yes we can just skip
+> > the loop when begin is 0.
+> 
+> I mean terminate it when the multiplication overflowed to zero.for pow (3, skipn), it will never overflowed to zero.
+To solve this problem once and for all, I'm leaning towards setting a threshold in vect_can_peel_nonlinear_iv_p for vect_step_op_mul,if step_expr is not exact_log2() and niter > TYPE_PRECISION (step_expr) we give up on doing vectorization.> 
+> As for the MASK_ thing the skip is to be interpreted negative (we
+> should either not use a 'tree' here or make it have the correct type
+> maybe).  Can we even handle this here?  It would need to be
+> a division, no?
+> 
+> So I think we need to disable non-linear IV or masked peeling for
+> niter/aligment?  But I wonder how we run into this with plain -O3.I think we already disabled negative niters_skip in vect_can_peel_nonlinear_iv_p.
+
+416  /* Also doens't support peel for neg when niter is variable.
+1417     ??? generate something like niter_expr & 1 ? init_expr : -init_expr?  */
+1418  niters_skip = LOOP_VINFO_MASK_SKIP_NITERS (loop_vinfo);
+1419  if ((niters_skip != NULL_TREE
+1420       && TREE_CODE (niters_skip) != INTEGER_CST)
+1421      || (!vect_use_loop_mask_for_alignment_p (loop_vinfo)
+1422          && LOOP_VINFO_PEELING_FOR_ALIGNMENT (loop_vinfo) < 0))
+1423    {
+1424      if (dump_enabled_p ())
+1425        dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
+1426                         "Peeling for alignement is not supported"
+1427                         " for nonlinear induction when niters_skip"
+1428                         " is not constant.\n");
+1429      return false;
+1430    }
+
+- User: rguenther@suse.de | Time: 2023-10-17 07:16:18 UTC
+  Text: On Tue, 17 Oct 2023, crazylht at gmail dot com wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=111820> 
+> ---Comment #7from Hongtao.liu <crazylht at gmail dot com> ---
+> (In reply torguenther@suse.defromcomment #6)
+> > On Mon, 16 Oct 2023, crazylht at gmail dot com wrote:
+> > 
+> > >https://gcc.gnu.org/bugzilla/show_bug.cgi?id=111820> > > 
+> > > ---Comment #5from Hongtao.liu <crazylht at gmail dot com> ---
+> > > (In reply to Richard Biener fromcomment #3)
+> > > >         for (unsigned i = 0; i != skipn - 1; i++)
+> > > >           begin = wi::mul (begin, wi::to_wide (step_expr));
+> > > > 
+> > > > (gdb) p skipn
+> > > > $5 = 4294967292
+> > > > 
+> > > > niters is 4294967292 in vect_update_ivs_after_vectorizer.  Maybe the loop
+> > > > should terminate when begin is zero.  But I wonder why we pass in 'niters'
+> > > Here, it want to calculate begin * pow (step_expr, skipn), yes we can just skip
+> > > the loop when begin is 0.
+> > 
+> > I mean terminate it when the multiplication overflowed to zero.
+> for pow (3, skipn), it will never overflowed to zero.
+> To solve this problem once and for all, I'm leaning towards setting a threshold
+> in vect_can_peel_nonlinear_iv_p for vect_step_op_mul,if step_expr is not
+> exact_log2() and niter > TYPE_PRECISION (step_expr) we give up on doing
+> vectorization.Hm, yeah - that's probably best.> > 
+> > As for the MASK_ thing the skip is to be interpreted negative (we
+> > should either not use a 'tree' here or make it have the correct type
+> > maybe).  Can we even handle this here?  It would need to be
+> > a division, no?
+> > 
+> > So I think we need to disable non-linear IV or masked peeling for
+> > niter/aligment?  But I wonder how we run into this with plain -O3.
+> I think we already disabled negative niters_skip in
+> vect_can_peel_nonlinear_iv_p.
+> 
+> 416  /* Also doens't support peel for neg when niter is variable.
+> 1417     ??? generate something like niter_expr & 1 ? init_expr : -init_expr? 
+> */
+> 1418  niters_skip = LOOP_VINFO_MASK_SKIP_NITERS (loop_vinfo);
+> 1419  if ((niters_skip != NULL_TREE
+> 1420       && TREE_CODE (niters_skip) != INTEGER_CST)But we end up here with niters_skip being INTEGER_CST and ..> 1421      || (!vect_use_loop_mask_for_alignment_p (loop_vinfo)possibly vect_use_loop_mask_for_alignment_p.  Note
+LOOP_VINFO_PEELING_FOR_ALIGNMENT < 0 simply means the amount of
+peeling is unknown.
+
+But I wonder how we run into this on x86 without enabling
+loop masking ...> 1422          && LOOP_VINFO_PEELING_FOR_ALIGNMENT (loop_vinfo) < 0))
+> 1423    {
+> 1424      if (dump_enabled_p ())
+> 1425        dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
+> 1426                         "Peeling for alignement is not supported"
+> 1427                         " for nonlinear induction when niters_skip"
+> 1428                         " is not constant.\n");
+> 1429      return false;
+> 1430    }
+
+- User: Hongtao.liu | Time: 2023-10-17 09:13:59 UTC
+  Text: > But we end up here with niters_skip being INTEGER_CST and ..
+> 
+> > 1421      || (!vect_use_loop_mask_for_alignment_p (loop_vinfo)
+> 
+> possibly vect_use_loop_mask_for_alignment_p.  Note
+> LOOP_VINFO_PEELING_FOR_ALIGNMENT < 0 simply means the amount of
+> peeling is unknown.
+> 
+> But I wonder how we run into this on x86 without enabling
+> loop masking ...
+> 
+> > 1422          && LOOP_VINFO_PEELING_FOR_ALIGNMENT (loop_vinfo) < 0))
+> > 1423    {
+> > 1424      if (dump_enabled_p ())
+> > 1425        dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
+> > 1426                         "Peeling for alignement is not supported"
+> > 1427                         " for nonlinear induction when niters_skip"
+> > 1428                         " is not constant.\n");
+> > 1429      return false;
+> > 1430    }Can you point out where it's assigned as nagative?
+I saw LOOP_VINFO_MASK_SKIP_NITERS is only assigned in vect_prepare_for_masked_peels.
+
+when LOOP_VINFO_PEELING_FOR_ALIGNMENT (loop_vinfo) > 0
+it's assigned as vf-npeel(will npeel > vf?)
+else
+it's assigned in get_misalign_in_elems and should be positive.
+
+  HOST_WIDE_INT elem_size
+    = int_cst_value (TYPE_SIZE_UNIT (TREE_TYPE (vectype)));
+  tree elem_size_log = build_int_cst (type, exact_log2 (elem_size));
+
+  /* Create:  misalign_in_bytes = addr & (target_align - 1).  */
+  tree int_start_addr = fold_convert (type, start_addr);
+  tree misalign_in_bytes = fold_build2 (BIT_AND_EXPR, type, int_start_addr,
+					target_align_minus_1);
+
+  /* Create:  misalign_in_elems = misalign_in_bytes / element_size.  */
+  tree misalign_in_elems = fold_build2 (RSHIFT_EXPR, type, misalign_in_bytes,
+					elem_size_log);
+
+  return misalign_in_elems;
+
+void
+vect_prepare_for_masked_peels (loop_vec_info loop_vinfo)
+{
+  tree misalign_in_elems;
+  tree type = TREE_TYPE (LOOP_VINFO_NITERS (loop_vinfo));
+
+  gcc_assert (vect_use_loop_mask_for_alignment_p (loop_vinfo));
+
+  /* From the information recorded in LOOP_VINFO get the number of iterations
+     that need to be skipped via masking.  */
+  if (LOOP_VINFO_PEELING_FOR_ALIGNMENT (loop_vinfo) > 0)
+    {
+      poly_int64 misalign = (LOOP_VINFO_VECT_FACTOR (loop_vinfo)
+			     - LOOP_VINFO_PEELING_FOR_ALIGNMENT (loop_vinfo));
+      misalign_in_elems = build_int_cst (type, misalign);
+    }
+  else
+    {
+      gimple_seq seq1 = NULL, seq2 = NULL;
+      misalign_in_elems = get_misalign_in_elems (&seq1, loop_vinfo);
+      misalign_in_elems = fold_convert (type, misalign_in_elems);
+      misalign_in_elems = force_gimple_operand (misalign_in_elems,
+						&seq2, true, NULL_TREE);
+      gimple_seq_add_seq (&seq1, seq2);
+      if (seq1)
+	{
+	  edge pe = loop_preheader_edge (LOOP_VINFO_LOOP (loop_vinfo));
+	  basic_block new_bb = gsi_insert_seq_on_edge_immediate (pe, seq1);
+	  gcc_assert (!new_bb);
+	}
+    }
+
+  if (dump_enabled_p ())
+    dump_printf_loc (MSG_NOTE, vect_location,
+		     "misalignment for fully-masked loop: %T\n",
+		     misalign_in_elems);
+
+  LOOP_VINFO_MASK_SKIP_NITERS (loop_vinfo) = misalign_in_elems;
+
+  vect_update_inits_of_drs (loop_vinfo, misalign_in_elems, MINUS_EXPR);
+}
+
+- User: Richard Biener | Time: 2023-10-17 09:47:13 UTC
+  Text: (In reply to Hongtao.liu fromcomment #9)> > But we end up here with niters_skip being INTEGER_CST and ..
+> > 
+> > > 1421      || (!vect_use_loop_mask_for_alignment_p (loop_vinfo)
+> > 
+> > possibly vect_use_loop_mask_for_alignment_p.  Note
+> > LOOP_VINFO_PEELING_FOR_ALIGNMENT < 0 simply means the amount of
+> > peeling is unknown.
+> > 
+> > But I wonder how we run into this on x86 without enabling
+> > loop masking ...
+> > 
+> > > 1422          && LOOP_VINFO_PEELING_FOR_ALIGNMENT (loop_vinfo) < 0))
+> > > 1423    {
+> > > 1424      if (dump_enabled_p ())
+> > > 1425        dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
+> > > 1426                         "Peeling for alignement is not supported"
+> > > 1427                         " for nonlinear induction when niters_skip"
+> > > 1428                         " is not constant.\n");
+> > > 1429      return false;
+> > > 1430    }
+> 
+> Can you point out where it's assigned as nagative?
+> I saw LOOP_VINFO_MASK_SKIP_NITERS is only assigned in
+> vect_prepare_for_masked_peels.Yes.> when LOOP_VINFO_PEELING_FOR_ALIGNMENT (loop_vinfo) > 0
+> it's assigned as vf-npeel(will npeel > vf?)npeel should be < vf
+
+OK, so it should be positive indeed.  But LOOP_VINFO_MASK_SKIP_NITERS
+(when vect_use_loop_mask_for_alignment_p ()) means that the
+first vector iteration only processes the first
+vf - LOOP_VINFO_MASK_SKIP_NITERS scalar iterations, so a
+
+ for (i = start; i < end; ++i)
+   ..
+
+loop is executed as
+
+ for (i = start - LOOP_VINFO_MASK_SKIP_NITERS; i < end; ++i)
+   if (i >= start)
+     {
+     }
+
+that is, the loop mask is used to mask out the first
+LOOP_VINFO_MASK_SKIP_NITERS elements.
+
+It's a bit difficult to force peeling for alignment on x86, but
+usually -fno-vect-cost-model will peel a store (it will peel the
+most used ref for alignment).  With --param vect-partial-vector-usage=2
+you should get AVX512 masked alignment peeling then I think.
+
+- User: GCC Commits | Time: 2023-10-23 01:16:03 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:dbde384bd56f07bfbcae86f81fc74aa92e3786adcommitr14-4834-gdbde384bd56f07bfbcae86f81fc74aa92e3786adAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Oct 18 10:08:24 2023 +0800
+
+    Avoid compile time hog on vect_peel_nonlinear_iv_init for nonlinear induction vec_step_op_mul when iteration count is too big.
+    
+    There's loop in vect_peel_nonlinear_iv_init to get init_expr *
+    pow (step_expr, skip_niters). When skipn_iters is too big, compile time
+    hogs. To avoid that, optimize init_expr * pow (step_expr, skip_niters) to
+    init_expr << (exact_log2 (step_expr) * skip_niters) when step_expr is
+    pow of 2, otherwise give up vectorization when skip_niters >=
+    TYPE_PRECISION (TREE_TYPE (init_expr)).
+    
+    Also give up vectorization when niters_skip is negative which will be
+    used for fully masked loop.
+    
+    gcc/ChangeLog:PR tree-optimization/111820PR tree-optimization/111833* tree-vect-loop-manip.cc (vect_can_peel_nonlinear_iv_p): Give
+            up vectorization for nonlinear iv vect_step_op_mul when
+            step_expr is not exact_log2 and niters is greater than
+            TYPE_PRECISION (TREE_TYPE (step_expr)). Also don't vectorize
+            for nagative niters_skip which will be used by fully masked
+            loop.
+            (vect_can_advance_ivs_p): Pass whole phi_info to
+            vect_can_peel_nonlinear_iv_p.
+            * tree-vect-loop.cc (vect_peel_nonlinear_iv_init): Optimize
+            init_expr * pow (step_expr, skipn) to init_expr
+            << (log2 (step_expr) * skipn) when step_expr is exact_log2.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr111820-1.c: New test.
+            * gcc.target/i386/pr111820-2.c: New test.
+            * gcc.target/i386/pr111820-3.c: New test.
+            * gcc.target/i386/pr103144-mul-1.c: Adjust testcase.
+            * gcc.target/i386/pr103144-mul-2.c: Adjust testcase.
+
+- User: Hongtao.liu | Time: 2023-10-23 02:39:42 UTC
+  Text: Fixed in GCC14, not sure if we want to backport the patch.
+If so, the patch needs to be adjusted since GCC13 doesn't support auto_mpz.
+
+- User: Richard Biener | Time: 2023-10-23 09:42:41 UTC
+  Text: (In reply to Hongtao.liu fromcomment #12)> Fixed in GCC14, not sure if we want to backport the patch.
+> If so, the patch needs to be adjusted since GCC13 doesn't support auto_mpz.Yes, we want to backport.
+
+- User: GCC Commits | Time: 2023-10-27 01:06:31 UTC
+  Text: The releases/gcc-13 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:82919cf4cb232166fed03d84a91fefd07feef6bbcommitr13-7988-g82919cf4cb232166fed03d84a91fefd07feef6bbAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Oct 18 10:08:24 2023 +0800
+
+    Avoid compile time hog on vect_peel_nonlinear_iv_init for nonlinear induction vec_step_op_mul when iteration count is too big.
+    
+    There's loop in vect_peel_nonlinear_iv_init to get init_expr *
+    pow (step_expr, skip_niters). When skipn_iters is too big, compile time
+    hogs. To avoid that, optimize init_expr * pow (step_expr, skip_niters) to
+    init_expr << (exact_log2 (step_expr) * skip_niters) when step_expr is
+    pow of 2, otherwise give up vectorization when skip_niters >=
+    TYPE_PRECISION (TREE_TYPE (init_expr)).
+    
+    Also give up vectorization when niters_skip is negative which will be
+    used for fully masked loop.
+    
+    gcc/ChangeLog:PR tree-optimization/111820PR tree-optimization/111833* tree-vect-loop-manip.cc (vect_can_peel_nonlinear_iv_p): Give
+            up vectorization for nonlinear iv vect_step_op_mul when
+            step_expr is not exact_log2 and niters is greater than
+            TYPE_PRECISION (TREE_TYPE (step_expr)). Also don't vectorize
+            for nagative niters_skip which will be used by fully masked
+            loop.
+            (vect_can_advance_ivs_p): Pass whole phi_info to
+            vect_can_peel_nonlinear_iv_p.
+            * tree-vect-loop.cc (vect_peel_nonlinear_iv_init): Optimize
+            init_expr * pow (step_expr, skipn) to init_expr
+            << (log2 (step_expr) * skipn) when step_expr is exact_log2.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr111820-1.c: New test.
+            * gcc.target/i386/pr111820-2.c: New test.
+            * gcc.target/i386/pr111820-3.c: New test.
+            * gcc.target/i386/pr103144-mul-1.c: Adjust testcase.
+            * gcc.target/i386/pr103144-mul-2.c: Adjust testcase.
+
+- User: Hongtao.liu | Time: 2023-10-27 01:18:13 UTC
+  Text: (In reply to Richard Biener fromcomment #13)> (In reply to Hongtao.liu fromcomment #12)
+> > Fixed in GCC14, not sure if we want to backport the patch.
+> > If so, the patch needs to be adjusted since GCC13 doesn't support auto_mpz.
+> 
+> Yes, we want to backport.Also fixed in GCC13.
+
+- User: Andrew Pinski | Time: 2023-10-27 01:20:33 UTC
+  Text: .
+
+- User: Andrew Pinski | Time: 2023-10-27 03:29:13 UTC
+  Text: ***Bug 111833has been marked as a duplicate of this bug. ***
+

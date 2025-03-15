@@ -1,0 +1,167 @@
+Bug Summary: [14 Regression] missed cmov optimization after r14-1014-gc5df248509b489364c573e8
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: missed-optimization, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2023-05-30 19:36:03 UTC
+  Text: Take:
+```
+unsigned
+f1(int t, int t1)
+{
+  int tt = 0;
+  if(t)
+    tt = (t1&0x8)!=0;
+  return tt;
+}
+```
+On aarch64 we should produce:
+```
+        cmp     w0, 0
+        ubfx    x0, x1, 3, 1
+        csel    w0, w0, wzr, ne
+        ret
+```
+
+But on the trunk we get:
+```
+        cbz     w0, .L3
+        ubfx    x0, x1, 3, 1
+        ret
+        .p2align 2,,3
+.L3:
+        mov     w0, 0
+        ret
+```
+
+
+The difference in the IR is:
+old:
+```
+(insn 11 10 12 3 (set (reg:SI 97)
+        (lshiftrt:SI (reg/v:SI 96 [ t1 ])
+            (const_int 3 [0x3]))) "/app/example.cpp":7:18 782 {*aarch64_lshr_sisd_or_int_si3}
+     (expr_list:REG_DEAD (reg/v:SI 96 [ t1 ])
+        (nil)))
+(insn 12 11 25 3 (set (reg:SI 94 [ <retval> ])
+        (and:SI (reg:SI 97)
+            (const_int 1 [0x1]))) "/app/example.cpp":7:18 533 {andsi3}
+     (expr_list:REG_DEAD (reg:SI 97)
+        (nil)))
+```
+new:
+```
+(insn 11 10 12 3 (set (subreg:DI (reg:SI 97) 0)
+        (zero_extract:DI (subreg:DI (reg/v:SI 96 [ t1 ]) 0)
+            (const_int 1 [0x1])
+            (const_int 3 [0x3]))) "/app/example.cpp":7:18 832 {*extzvdi}
+     (expr_list:REG_DEAD (reg/v:SI 96 [ t1 ])
+        (nil)))
+(insn 12 11 24 3 (set (reg:SI 94 [ <retval> ])
+        (reg:SI 97)) "/app/example.cpp":8:10 64 {*movsi_aarch64}
+     (expr_list:REG_DEAD (reg:SI 97)
+        (nil)))
+```
+noce_try_cmove_arith handles the old one but not the new one for some reason:
+```
+if-conversion succeeded through noce_try_cmove_arith
+``
+
+- User: Andrew Pinski | Time: 2023-05-30 19:36:56 UTC
+  Text: I am still looking into this. This is definitely a latent bug and maybe even can be reproduced some bitfield extractions too.
+
+- User: Andrew Pinski | Time: 2023-05-30 19:45:38 UTC
+  Text: Here is a bitfield testcase which shows this was a latent issue:
+```
+struct f
+{
+  unsigned t:3;
+  unsigned t1:4;
+};
+unsigned f2(struct f);
+unsigned
+f1(int t, struct f y)
+{
+  int tt = 0;
+  if(t)
+    tt = y.t1;
+  return tt;
+}
+```
+
+
+We should produce:
+```
+        ubfx    w8, w1, #3, #4
+        cmp     w0, #0
+        csel    w0, wzr, w8, eq
+        ret
+``
+
+But currently produces:
+```
+        cbz     w0, .L3
+        ubfx    x0, x1, 3, 4
+        ret
+.L3:
+        mov     w0, 0
+        ret
+```
+
+The IR is similar too:
+```
+(insn 11 10 12 3 (set (subreg:DI (reg:QI 96) 0)
+        (zero_extract:DI (subreg:DI (reg/v:SI 95 [ y ]) 0)
+            (const_int 4 [0x4])
+            (const_int 3 [0x3]))) "/app/example.cpp":12:11 832 {*extzvdi}
+     (expr_list:REG_DEAD (reg/v:SI 95 [ y ])
+        (nil)))
+(insn 12 11 24 3 (set (reg:SI 93 [ <retval> ])
+        (zero_extend:SI (reg:QI 96))) "/app/example.cpp":13:10 146 {*zero_extendqisi2_aarch64}
+     (expr_list:REG_DEAD (reg:QI 96)
+        (nil)))
+```
+
+- User: Andrew Pinski | Time: 2023-05-30 20:59:03 UTC
+  Text: bb_valid_for_noce_process_p returns false for the zero_extract case ...
+
+- User: Andrew Pinski | Time: 2023-05-30 21:00:28 UTC
+  Text: Because of the subreg.
+
+- User: Andrew Pinski | Time: 2023-05-30 21:12:56 UTC
+  Text: I have a patch which adds support for paradoxical subregs.
+Since paradoxical subregs as the dest always assign the full register still, there is no reason to reject it.
+
+- User: Andrew Pinski | Time: 2023-05-30 21:13:37 UTC
+  Text: Createdattachment 55219[details]untested patch
+
+I am going to test this on both x86_64 and aarch64 tonight.
+
+- User: GCC Commits | Time: 2023-06-02 19:30:38 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:df0853d72d38247aed577a4511450c91794f2f06commitr14-1507-gdf0853d72d38247aed577a4511450c91794f2f06Author: Andrew Pinski <apinski@marvell.com>
+Date:   Tue May 30 15:54:32 2023 -0700
+
+    FixPR 110042: ifcvt regression due to paradoxical subregs
+    
+    Afterr14-1014-gc5df248509b489364c573e8, GCC started to emit
+    directly a zero_extract for `(t1&0x8)!=0`. This introduced
+    a small regression where ifcvt would not do the ifconversion
+    as there is now a paradoxical subreg in the dest which
+    was being rejected. Since paradoxical subreg set the whole
+    register, we can treat it as the same as a reg in the two places.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu and aarch64-linux-gnu.
+    
+    gcc/ChangeLog:PR rtl-optimization/110042* ifcvt.cc (bbs_ok_for_cmove_arith): Allow paradoxical subregs.
+            (bb_valid_for_noce_process_p): Strip the subreg for the SET_DEST.
+    
+    gcc/testsuite/ChangeLog:PR rtl-optimization/110042* gcc.target/aarch64/csel_bfx_2.c: New test.
+
+- User: Andrew Pinski | Time: 2023-06-02 19:31:14 UTC
+  Text: Fixed.
+

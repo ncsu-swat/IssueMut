@@ -1,0 +1,228 @@
+Bug Summary: [12/13 regression] internal error on array element comparison in loop with -O2 -mvis3
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 11.3.1
+Known to Fail: 12.2.1
+
+Comments:
+- User: Sam James | Time: 2023-03-15 09:43:30 UTC
+  Text: Hit when building QEMU 7.2.0's qemu-user component for mips on sparc64. This one is reproducible with cross.
+
+It needs -O2 -mcpu=niagara4 at least and -O2 -march=ultrasparc is fine.
+
+```
+$ sparc64-unknown-linux-gnu-gcc target_mips_tcg_lmmi_helper.c.i -O2 -mcpu=niagara4 -c
+../target/mips/tcg/lmmi_helper.c: In function ‘helper_pcmpgtb’:
+../target/mips/tcg/lmmi_helper.c:554:1: error: unrecognizable insn:
+(insn 9 8 10 2 (set (reg:DI 118)
+        (unspec:DI [
+                (ltu:V8QI (subreg:V8QI (reg/v:DI 115 [ ft ]) 0)
+                    (subreg:V8QI (reg/v:DI 114 [ fs ]) 0))
+            ] UNSPEC_FUCMP)) "../target/mips/tcg/lmmi_helper.c":551:18 -1
+     (nil))
+during RTL pass: vregs
+../target/mips/tcg/lmmi_helper.c:554:1: internal compiler error: in extract_insn, at recog.cc:2791
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+See <https://bugs.gentoo.org/> for instructions.
+
+$ sparc64-unknown-linux-gnu-gcc --version
+sparc64-unknown-linux-gnu-gcc (Gentoo Hardened 12.2.1_p20230304 p13) 12.2.1 20230304
+Copyright (C) 2022 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE
+```
+
+Attached the preprocessed source, not yet reduced or bisected, but I'll be doing both later.
+
+- User: Sam James | Time: 2023-03-15 09:43:49 UTC
+  Text: Createdattachment 54669[details]target_mips_tcg_lmmi_helper.c.i.xz
+
+- User: Sam James | Time: 2023-03-15 09:45:17 UTC
+  Text: Createdattachment 54670[details]reduced.i
+
+Attached reduced version.
+
+```
+# sparc64-unknown-linux-gnu-gcc reduced.i -O2 -mcpu=niagara4 -c
+reduced.i:3:1: warning: no semicolon at end of struct or union
+    3 | } LMIValue;
+      | ^
+reduced.i:6:1: warning: return type defaults to ‘int’ [-Wimplicit-int]
+    6 | helper_pcmpgtb() {
+      | ^~~~~~~~~~~~~~
+reduced.i: In function ‘helper_pcmpgtb’:
+reduced.i:10:1: error: unrecognizable insn:
+   10 | }
+      | ^
+(insn 24 23 25 2 (set (reg:DI 130)
+        (unspec:DI [
+                (gtu:V8QI (reg:V8QI 125)
+                    (reg:V8QI 119))
+            ] UNSPEC_FUCMP)) "reduced.i":9:55 -1
+     (nil))
+during RTL pass: vregs
+reduced.i:10:1: internal compiler error: in extract_insn, at recog.cc:2791
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+See <https://bugs.gentoo.org/> for instructions.
+```
+
+- User: Sam James | Time: 2023-03-15 09:47:04 UTC
+  Text: I'll bisect later but someone is free to beat me if they want. I think 11 was fine, but need to check.
+
+- User: Sam James | Time: 2023-03-15 10:16:00 UTC
+  Text: so far:
+11.3.1 20230303 is OK.
+12.2.1 20230304 isn't.
+
+- User: Mikael Pettersson | Time: 2023-03-15 15:49:28 UTC
+  Text: I can reproduce with a cross to sparc64-linux-gnu hosted on x86_64-linux-gnu.
+
+git bisect between 11.3.0 (good) and 12.2.0 (bad) identified:
+
+2b8453c401b699ed93c085d0413ab4b5030bcdb8 is the first bad commit
+commit 2b8453c401b699ed93c085d0413ab4b5030bcdb8
+Author: liuhongt <hongtao.liu@intel.com>
+Date:   Mon Sep 6 13:48:49 2021 +0800
+
+    Enable auto-vectorization at O2 with very-cheap cost model.
+
+which tells me the issue is pre-existing.
+
+- User: Mikael Pettersson | Time: 2023-03-15 15:58:25 UTC
+  Text: With -O2 -ftree-vectorize -mcpu=niagara4 the ICE reproduces with gcc-10.4.0 but not with gcc-9.5.0.
+
+- User: Mikael Pettersson | Time: 2023-03-15 17:32:16 UTC
+  Text: With -O2 -ftree-vectorize -mcpu=niagara4 a bisect between 9.5.0 (good) and 10.4.0 (bad) found
+
+6271dd984d7f920d4fb17ad37af6a1f8e6b796dc is the first bad commit
+commit 6271dd984d7f920d4fb17ad37af6a1f8e6b796dc
+Author: Wilco Dijkstra <wdijkstr@arm.com>
+Date:   Wed Nov 20 16:29:23 2019 +0000PR85678: Change default to -fno-common
+
+And sure enough, with -O2 -ftree-vectorize -fno-common -mcpu=niagara4 gcc-9.5.0 also ICEs.
+
+- User: Andrew Pinski | Time: 2023-03-15 17:58:50 UTC
+  Text: (In reply to Mikael Pettersson fromcomment #7)> With -O2 -ftree-vectorize -mcpu=niagara4 a bisect between 9.5.0 (good) and
+> 10.4.0 (bad) found
+> 
+> 6271dd984d7f920d4fb17ad37af6a1f8e6b796dc is the first bad commit
+> commit 6271dd984d7f920d4fb17ad37af6a1f8e6b796dc
+> Author: Wilco Dijkstra <wdijkstr@arm.com>
+> Date:   Wed Nov 20 16:29:23 2019 +0000
+> 
+>PR85678: Change default to -fno-common
+> 
+> And sure enough, with -O2 -ftree-vectorize -fno-common -mcpu=niagara4
+> gcc-9.5.0 also ICEs.Right still latent from before that commit ...
+
+- User: Mikael Pettersson | Time: 2023-03-15 19:03:04 UTC
+  Text: I can reproduce all the way down to gcc-4.7.4, gcc-4.6.4 doesn't support -mcpu=niagara4.
+
+- User: Mikael Pettersson | Time: 2023-03-16 17:15:09 UTC
+  Text: A bisect between 4.6.4 (good) and 4.7.4 (bad) found:
+
+1f9ed162eb30f1b40b65d164b3a40ac78e1f006e is the first bad commit
+commit 1f9ed162eb30f1b40b65d164b3a40ac78e1f006e
+Author: David S. Miller <davem@davemloft.net>
+Date:   Tue Nov 1 08:42:57 2011 +0000
+
+    Add vcond/vcondu patterns to sparc backend.
+
+If I disable the "vconduv8qiv8qi" expander this test case doesn't cause an ICE.
+
+- User: Sam James | Time: 2023-03-16 18:27:05 UTC
+  Text: Thank you for the extremely thorough bisect!
+
+- User: Eric Botcazou | Time: 2023-03-27 09:48:36 UTC
+  Text: I can reproduce.
+
+- User: Eric Botcazou | Time: 2023-03-27 09:49:13 UTC
+  Text: Investigating.
+
+- User: GCC Commits | Time: 2023-03-28 08:42:08 UTC
+  Text: The master branch has been updated by Eric Botcazou <ebotcazou@gcc.gnu.org>:https://gcc.gnu.org/g:a21bd7faba67997a6da457dbda16f15bca1a9156commitr13-6893-ga21bd7faba67997a6da457dbda16f15bca1a9156Author: Eric Botcazou <ebotcazou@adacore.com>
+Date:   Tue Mar 28 10:13:24 2023 +0200
+
+    FixPR target/109140This is a regression present on the mainline and 12 branch at -O2, but the
+    issue is related to vectorization so was present at -O3 in earlier versions.
+    
+    The vcondu expander that was added for VIS 3 more than a decade ago does not
+    fully work, because it does not filter out the unsigned condition codes (the
+    instruction is an UNSPEC that accepts only signed condition codes).
+    
+    While I was at it, I also added the missing vcond and vcondu expanders for
+    the new comparison instructions that were added in VIS 4.
+    
+    gcc/PR target/109140* config/sparc/sparc.cc (sparc_expand_vcond): Call signed_condition
+            on operand #3 to get the final condition code.  Use std::swap.
+            * config/sparc/sparc.md (vcondv8qiv8qi): New VIS 4 expander.
+            (fucmp<gcond:code>8<P:mode>_vis): Move around.
+            (fpcmpu<gcond:code><GCM:gcm_name><P:mode>_vis): Likewise.
+            (vcondu<GCM:mode><GCM:mode>): New VIS 4 expander.
+    
+    gcc/testsuite/
+            * gcc.target/sparc/20230328-1.c: New test.
+            * gcc.target/sparc/20230328-2.c: Likewise.
+            * gcc.target/sparc/20230328-3.c: Likewise.
+            * gcc.target/sparc/20230328-4.c: Likewise.
+
+- User: GCC Commits | Time: 2023-03-28 08:46:23 UTC
+  Text: The releases/gcc-12 branch has been updated by Eric Botcazou <ebotcazou@gcc.gnu.org>:https://gcc.gnu.org/g:6f2bb57f909014618aaf770bfaaf49e28e410311commitr12-9324-g6f2bb57f909014618aaf770bfaaf49e28e410311Author: Eric Botcazou <ebotcazou@adacore.com>
+Date:   Tue Mar 28 10:13:24 2023 +0200
+
+    FixPR target/109140This is a regression present on the mainline and 12 branch at -O2, but the
+    issue is related to vectorization so was present at -O3 in earlier versions.
+    
+    The vcondu expander that was added for VIS 3 more than a decade ago does not
+    fully work, because it does not filter out the unsigned condition codes (the
+    instruction is an UNSPEC that accepts only signed condition codes).
+    
+    While I was at it, I also added the missing vcond and vcondu expanders for
+    the new comparison instructions that were added in VIS 4.
+    
+    gcc/PR target/109140* config/sparc/sparc.cc (sparc_expand_vcond): Call signed_condition
+            on operand #3 to get the final condition code.  Use std::swap.
+            * config/sparc/sparc.md (vcondv8qiv8qi): New VIS 4 expander.
+            (fucmp<gcond:code>8<P:mode>_vis): Move around.
+            (fpcmpu<gcond:code><GCM:gcm_name><P:mode>_vis): Likewise.
+            (vcondu<GCM:mode><GCM:mode>): New VIS 4 expander.
+    
+    gcc/testsuite/
+            * gcc.target/sparc/20230328-1.c: New test.
+            * gcc.target/sparc/20230328-2.c: Likewise.
+            * gcc.target/sparc/20230328-3.c: Likewise.
+            * gcc.target/sparc/20230328-4.c: Likewise.
+
+- User: GCC Commits | Time: 2023-03-28 08:48:37 UTC
+  Text: The releases/gcc-11 branch has been updated by Eric Botcazou <ebotcazou@gcc.gnu.org>:https://gcc.gnu.org/g:002470a073ca0742820991ee221986a722848ff2commitr11-10601-g002470a073ca0742820991ee221986a722848ff2Author: Eric Botcazou <ebotcazou@adacore.com>
+Date:   Tue Mar 28 10:13:24 2023 +0200
+
+    FixPR target/109140This is a regression present on the mainline and 12 branch at -O2, but the
+    issue is related to vectorization so was present at -O3 in earlier versions.
+    
+    The vcondu expander that was added for VIS 3 more than a decade ago does not
+    fully work, because it does not filter out the unsigned condition codes (the
+    instruction is an UNSPEC that accepts only signed condition codes).
+    
+    While I was at it, I also added the missing vcond and vcondu expanders for
+    the new comparison instructions that were added in VIS 4.
+    
+    gcc/PR target/109140* config/sparc/sparc.c (sparc_expand_vcond): Call signed_condition
+            on operand #3 to get the final condition code.  Use std::swap.
+            * config/sparc/sparc.md (vcondv8qiv8qi): New VIS 4 expander.
+            (fucmp<gcond:code>8<P:mode>_vis): Move around.
+            (fpcmpu<gcond:code><GCM:gcm_name><P:mode>_vis): Likewise.
+            (vcondu<GCM:mode><GCM:mode>): New VIS 4 expander.
+    
+    gcc/testsuite/
+            * gcc.target/sparc/20230328-1.c: New test.
+            * gcc.target/sparc/20230328-2.c: Likewise.
+            * gcc.target/sparc/20230328-3.c: Likewise.
+            * gcc.target/sparc/20230328-4.c: Likewise.
+
+- User: Eric Botcazou | Time: 2023-03-28 08:50:49 UTC
+  Text: Thanks for reporting the problem.
+

@@ -1,0 +1,122 @@
+Bug Summary: [11/12/13/14/15 regression] FAIL: gcc.target/s390/vector/vec-abi-vararg-1.c
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: missed-optimization, testsuite-fail
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Stefan Schulze Frielinghaus | Time: 2024-05-28 14:49:59 UTC
+  Text: Afterr11-5821-gebdfd1606da6b5multiple BIT_INSERT_EXPRs are vectorized which as a side-effect leads to the usage of V2SI which seems to be the culprit of an extra stack slot.  For s390/vector/vec-abi-vararg-1.c we end up with
+
+(insn 11 10 12 2 (set (subreg:V2SI (reg:V4SI 73 [ _3 ]) 0)
+        (plus:V2SI (mem:V2SI (plus:DI (reg/f:DI 32 %ap)
+                    (const_int 16 [0x10])) [0 MEM[(v2si * {ref-all})_26 + 16B]+0 S8 A64])
+            (mem:V2SI (plus:DI (reg/f:DI 32 %ap)
+                    (const_int 40 [0x28])) [0 MEM[(v2si * {ref-all})_26 + 40B]+0 S8 A64]))) "vec-abi-vararg-1.c":44:16 581 {addv2si3}
+     (nil))
+
+which reload needs to fix
+
+11: r79:V2SI=r80:V2SI+r81:V2SI
+ Inserting insn reload before:
+26: r80:V2SI=[%ap:DI+0x170]
+27: r81:V2SI=[%ap:DI+0x188]
+ Inserting insn reload after:
+25: r73:V4SI#0=r79:V2SI
+...
+12: r74:V2DI=sign_extend(vec_select(r82:V4SI,parallel))
+   REG_DEAD r73:V4SI
+ Inserting insn reload before:
+28: r82:V4SI=r73:V4SI
+
+which materializes as:
+
+(insn 10 14 24 2 (set (reg:V4SI 16 %f0 [orig:73 _3 ] [73])
+        (const_vector:V4SI [
+                (const_int 0 [0]) repeated x4
+            ])) "vec-abi-vararg-1.c":44:16 410 {movv4si}
+      (expr_list:REG_EQUAL (const_vector:V4SI [
+                (const_int 0 [0]) repeated x4
+            ])
+        (nil)))
+(insn 24 10 26 2 (set (mem/c:V4SI (plus:DI (reg/f:DI 15 %r15)
+                (const_int 160 [0xa0])) [4 %sfp+-48 S16 A64])
+        (reg:V4SI 16 %f0 [orig:73 _3 ] [73])) "vec-abi-vararg-1.c":44:16 410 {movv4si}
+     (nil))
+(insn 26 24 27 2 (set (reg:V2SI 16 %f0 [80])
+        (mem:V2SI (plus:DI (reg/f:DI 15 %r15)
+                (const_int 384 [0x180])) [0 MEM[(v2si * {ref-all})_26 + 16B]+0 S8 A64])) "vec-abi-vararg-1.c":44:16 426 {movv2si}
+     (nil))
+(insn 27 26 11 2 (set (reg:V2SI 17 %f2 [81])
+        (mem:V2SI (plus:DI (reg/f:DI 15 %r15)
+                (const_int 408 [0x198])) [0 MEM[(v2si * {ref-all})_26 + 40B]+0 S8 A64])) "vec-abi-vararg-1.c":44:16 426 {movv2si}
+     (nil))
+(insn 11 27 25 2 (set (reg:V2SI 16 %f0 [79])
+        (plus:V2SI (reg:V2SI 16 %f0 [80])
+            (reg:V2SI 17 %f2 [81]))) "vec-abi-vararg-1.c":44:16 581 {addv2si3}
+     (nil))
+(insn 25 11 28 2 (set (mem/c:V2SI (plus:DI (reg/f:DI 15 %r15)
+                (const_int 160 [0xa0])) [4 %sfp+-48 S8 A64])
+        (reg:V2SI 16 %f0 [79])) "vec-abi-vararg-1.c":44:16 426 {movv2si}
+     (nil))
+(insn 28 25 12 2 (set (reg:V4SI 16 %f0 [orig:73 _3 ] [73])
+        (mem/c:V4SI (plus:DI (reg/f:DI 15 %r15)
+                (const_int 160 [0xa0])) [4 %sfp+-48 S16 A64])) "vec-abi-vararg-1.c":44:16 410 {movv4si}
+     (nil))
+(insn 12 28 29 2 (set (reg:V2DI 16 %f0 [orig:74 _29 ] [74])
+        (sign_extend:V2DI (vec_select:V2SI (reg:V4SI 16 %f0 [orig:73 _3 ] [73])
+                (parallel [
+                        (const_int 0 [0])
+                        (const_int 1 [0x1])
+                    ])))) "vec-abi-vararg-1.c":44:16 1345 {vec_unpacks_hi_v4si}
+     (nil))
+
+Insn 25 and 28 convert a V2SI into a V4SI via stack.  It is a bit unfortunate since the resulting V4SI vector is used for unpacking which ignores the rightmost half, i.e., zeroing out the rightmost half by going over the stack is unnecessary.
+
+- User: Richard Biener | Time: 2024-05-29 07:35:30 UTC
+  Text: I suppose it's
+
+  di_result[0] += si_result[0];
+  di_result[1] += si_result[1];
+
+on x86 we do
+
+  vect__5.11_99 = (vector(2) long long int) _100;
+  vect__6.12_98 = _29 + vect__5.11_99;
+
+as we have a extendv2siv2di pattern.  It's probably easier to try reproducing
+with a testcase not involving varargs but {di,si}_result initialized from
+incoming parameters?
+
+- User: Stefan Schulze Frielinghaus | Time: 2024-05-29 10:40:25 UTC
+  Text: Thanks for the pointer. Indeed, adding an extendv2siv2di pattern solves this and the code looks optimal then. I will come up with a patch.
+
+- User: GCC Commits | Time: 2024-06-17 06:37:07 UTC
+  Text: The master branch has been updated by Stefan Schulze Frielinghaus <stefansf@gcc.gnu.org>:https://gcc.gnu.org/g:2ab143df110a40bd41b5368ef84819953bf971b1commitr15-1365-g2ab143df110a40bd41b5368ef84819953bf971b1Author: Stefan Schulze Frielinghaus <stefansf@linux.ibm.com>
+Date:   Mon Jun 17 08:36:11 2024 +0200
+
+    s390: Extend two/four element integer vectors
+    
+    For the moment I deliberately left out one-element QHS vectors since it
+    is unclear whether these are pathological cases or whether they are
+    really used.  If we ever get an extend for V1DI -> V1TI we should
+    reconsider this.
+    
+    As a side-effect this fixesPR115261.
+    
+    gcc/ChangeLog:PR target/115261* config/s390/s390.md (any_extend,extend_insn,zero_extend):
+            New code attributes and code iterator.
+            * config/s390/vector.md (V_EXTEND): New mode iterator.
+            (<extend_insn><V_EXTEND:mode><vec_2x_wide>2): New insn.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/s390/vector/vec-extend-1.c: New test.
+            * gcc.target/s390/vector/vec-extend-2.c: New test.
+
+- User: Stefan Schulze Frielinghaus | Time: 2024-06-24 08:12:07 UTC
+  Text: Fixed on mainline.
+

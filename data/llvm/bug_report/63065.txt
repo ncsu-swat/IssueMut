@@ -1,0 +1,76 @@
+Issue Title: [clang] Wrong optimization when -D_FORTIFY_SOURCE is passed
+Original Post: When compiling a program that calls `bcopy`, clang replaces it by a `memmove` call (as per `llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp`). This is not taking into account that it should generate a `__memmove_chk` when any level of `-D_FORTIFY_SOURCE` is passed to the compiler.
+
+I think the issue is caused by the fact that this `bcopy` to `memmove` conversion should be done somewhere else in the code (probably in `SemaChecking.cpp`).
+
+This issue was seen while building the glibc testsuite (`debug/tst-fortify*.c`), in our work to add llvm/clang support for it upstream.  GCC builds these tests correctly.
+
+To reproduce:
+
+The branch can be accessed [here](https://github.com/zatrazz/glibc/tree/azanella/clang).
+
+Configure glibc with:
+
+```shell
+AR="${PATH_TO_LLVM}/llvm-ar" \
+AS="${PATH_TO_LLVM}/llvm-as" \
+NM="${PATH_TO_LLVM}/llvm-nm" \
+OBJDUMP="${PATH_TO_LLVM}/llvm-objdump" \
+OBJCOPY="${PATH_TO_LLVM}/llvm-objcopy" \
+RANLIB="${PATH_TO_LLVM}/llvm-ranlib" \
+READELF="${PATH_TO_LLVM}/llvm-readelf" \
+STRIP="${PATH_TO_LLVM}/llvm-strip" \
+CC="${PATH_TO_LLVM}/clang -target ${arch}-linux-gnu -fuse-ld=lld -Wno-unused-command-line-argument" \
+CXX="${PATH_TO_LLVM}/clang++ -target ${arch}-linux-gnu -fuse-ld=lld -Wno-unused-command-line-argument" \
+LD="${PATH_TO_LLVM}/ld.lld" \
+CFLAGS="-O2 -g" \
+CXXFLAGS="${CFLAGS}" \
+${GLIBCSRC}/configure \
+            --prefix=/usr \
+            --host=${arch}-linux-gnu \
+            --with-binutils="${PATH_TO_LLVM}" \
+            --enable-stack-protector=all \
+            --enable-tunables=yes \
+            --enable-bind-now=yes \
+            --enable-profile=no
+```
+
+then `make` and `make check`
+
+Failures will be inside the `debug` directory. Screen output is in `tst-fortify-cc-default-*.out` and binaries will be in `tst-fortify-cc-default-*o`.
+
+Comment by ceseo: If anyone is willing to give me a hint on how to start fixing this, I can take a look at it myself.
+Comment by antmox: Hey Carlos,
+
+I think you are right, bcopy calls should not be transformed into memmove calls in 'fortified' mode.
+In this mode, bcopy is indeed equivalent to memmove_chk, not to memmove.
+
+Here is a small code showing your issue: https://godbolt.org/z/KvE5ffes6
+
+This bcopy-to-memmove transformation has been introduced here:
+  https://reviews.llvm.org/rG6b45029676e5d0b5eb5baddab919c511881dd186
+
+I do not yet see a clean way to distinguish the regular bcopy version from the fortified one.
+
+As a possible temporary workaround, note that this bcopy -> memmove transformation, like the other libcall simplifications, is not done with the -fno-builtin flag.
+
+Another thing, I am a bit surprised by the fact that these InstCombine libcall simplifications are done as soon as the prototype matches: https://godbolt.org/z/njjWx3cqc
+
+Comment by antmox: Hmm actually there may be a simple solution:
+
+It looks like the fortified functions are defined (as extern inline), while the non-fortified ones are just declared (Is this always true ?)
+
+So maybe these InstCombine libcall simplifications could be done only on non-defined functions.
+
+It might be easier to understand (cf my 2nd case), and it would solve the fortified bcopy issue. 
+
+Not entirely sure it makes sense.
+
+
+Comment by ceseo: @antmox yes, that's true (see the [original gcc implementation](https://gcc.gnu.org/legacy-ml/gcc-patches/2004-09/msg02055.html)).  I think your idea might work.
+
+However, bcopy should still be replaced by a `__memmove_chk` call. It's still a deprecated function. 
+Comment by antmox: > However, bcopy should still be replaced by a __memmove_chk call.
+
+The definition of bcopy from strings_fortified.h already calls __memmove_chk 
+Comment by ceseo: I 'll submit a patch for this shortly.

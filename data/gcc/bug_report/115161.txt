@@ -1,0 +1,635 @@
+Bug Summary: highway-1.0.7 miscompilation of _mm_cvttps_epi32(): invalid result assumed
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2024-05-20 10:07:29 UTC
+  Text: Createdattachment 58250[details]bug.cc
+
+Initially observed atr15-656-ge1a7e2c54d52d0on highway-1.0.7 where HwyConvertTestGroup/HwyConvertTest.TestAllF2IPromoteTo/SSE2 was failing as:
+
+[ RUN      ] HwyConvertTestGroup/HwyConvertTest.TestAllF2IPromoteTo/SSE2
+
+
+i64x2 expect [0+ ->]:
+  0x7fffffffffffffff,0x7fffffffffffffff,
+i64x2 actual [0+ ->]:
+  0x7fffffff00000000,0x7fffffff00000000,
+Abort at convert_test.cc:41: SSE2, i64x2 lane 0 mismatch: expected '0x7fffffffffffffff', got '0x7fffffff00000000'.
+
+I extracted it down to attached bug.cc. It's 5kb of straightforward self-contained code.
+
+Crashing:
+
+$ g++-15 bug.cc -o bug -O0 && ./bug
+exponent_adj(i): 0x00002000000020 0x00002000000020
+     adj_v(f): 0x4f8000004f800000 0x4f8000004f800000
+lo64_or_mask(i): 0xffffffffffffffff 0xffffffffffffffff
+         i(f): 0x5f8000005f800000 0x5f8000005f800000
+  expected(i): 0xffffffffffffffff 0xffffffffffffffff
+    actual(i): 0xffffffffffffffff 0xffffffffffffffff
+
+Expected example:
+
+$ g++-15 bug.cc -o bug -O2 && ./bug
+exponent_adj(i): 0x00002000000020 0x00002000000020
+     adj_v(f): 0x4f8000004f800000 0x4f8000004f800000
+lo64_or_mask(i): 0000000000000000 0000000000000000
+         i(f): 0x5f8000005f800000 0x5f8000005f800000
+  expected(i): 0xffffffffffffffff 0xffffffffffffffff
+    actual(i): 0000000000000000 0000000000000000
+Illegal instruction (core dumped)
+
+$ g++ -v
+Using built-in specs.
+COLLECT_GCC=/<<NIX>>/gcc-15.0.0/bin/g++
+COLLECT_LTO_WRAPPER=/<<NIX>>/gcc-15.0.0/libexec/gcc/x86_64-unknown-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-unknown-linux-gnu
+Configured with: ../source/configure --prefix=/<<NIX>>/gcc-15.0.0 --with-gmp-include=/<<NIX>>/gmp-6.3.0-dev/include --with-gmp-lib=/<<NIX>>/gmp-6.3.0/lib --with-mpfr-include=/<<NIX>>/mpfr-4.2.1-dev/include --with-mpfr-lib=/<<NIX>>/mpfr-4.2.1/lib --with-mpc=/<<NIX>>/libmpc-1.3.1 --with-native-system-header-dir=/<<NIX>>/glibc-2.39-52-dev/include --with-build-sysroot=/ --with-gxx-include-dir=/<<NIX>>/gcc-15.0.0/include/c++/15.0.0/ --program-prefix= --enable-lto --disable-libstdcxx-pch --without-included-gettext --with-system-zlib --enable-checking=release --enable-static --enable-languages=c,c++ --disable-multilib --enable-plugin --disable-libcc1 --with-isl=/<<NIX>>/isl-0.20 --disable-bootstrap --build=x86_64-unknown-linux-gnu --host=x86_64-unknown-linux-gnu --target=x86_64-unknown-linux-gnu
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 99999999 (experimental) (GCC)
+
+- User: Sergei Trofimovich | Time: 2024-05-20 11:26:46 UTC
+  Text: Bisect landed onr15-352-gf2449b55fb2d32commit f2449b55fb2d32fc4200667ba79847db31f6530d
+  Author: Roger Sayle <roger@nextmovesoftware.com>
+  Date:   Thu May 9 22:45:54 2024 +0100
+
+    Constant fold {-1,-1} << 1 in simplify-rtx.cc
+
+But I'm not sure if it's the real cause or the code moved around enough. The sample is somewhat fragile and resisted minimization.
+
+- User: Roger Sayle | Time: 2024-05-20 14:48:34 UTC
+  Text: I can confirm that I can reproduce this and see the same thing.
+Adding 
+  vi tmp1 = Set_i32(INT32_MAX);
+  d_i("tmp1",tmp1.raw);
+at multiple places in bug.cc, reveals that sometimes the result is the correct [0x7ffffff x 4], and at other places is the incorrect [0x80000000 x 4], even though this affected snippet doesn't involve binary operation simplification.
+
+- User: Sergei Trofimovich | Time: 2024-05-20 22:08:39 UTC
+  Text: Looking at -O2's bug.cc.265t.optimized tree optimizations come up with unfolded saturated sub8:
+
+  _12 = __builtin_ia32_psubusb128 ({ -65, 0, 0, 0, -65, 0, 0, 0, -65, 0, 0, 0, -65, 0, 0, 0 }, { -99, 0, 0, 0, -99, 0, 0, 0, -99, 0, 0, 0, -99, 0, 0, 0 });
+  _13 = __builtin_ia32_pminub128 (_12, { 32, 0, 0, 0, 32, 0, 0, 0, 32, 0, 0, 0, 32, 0, 0, 0 });
+  ...
+
+
+bug.cc.272r.cse1 still has that subtraction:
+
+    5: r119:V16QI=[`*.LC0']
+      REG_EQUAL const_vector
+    6: r120:V16QI=[`*.LC1']
+      REG_EQUAL const_vector
+    7: r118:V16QI=us_minus(r119:V16QI,r120:V16QI)
+
+bug.cc.273r.fwprop1 does not anymore:
+
+    3: NOTE_INSN_BASIC_BLOCK 2
+    2: NOTE_INSN_FUNCTION_BEG
+    9: r122:V16QI=[`*.LC2']
+      REG_EQUAL const_vector
+   13: r123:V4SI=r122:V16QI#0<<0x17
+      REG_EQUAL const_vector
+   16: r128:SI=0x5f800000
+   15: r127:V4SI=vec_duplicate(r128:SI)
+
+Could it be that constant folder "forgot" to generate anything for unsupported saturated-sub instead of leaving it as is?
+
+- User: Jakub Jelinek | Time: 2024-05-21 14:53:14 UTC
+  Text: (In reply to Sergei Trofimovich fromcomment #3)> Looking at -O2's bug.cc.265t.optimized tree optimizations come up with
+> unfolded saturated sub8:
+> 
+>   _12 = __builtin_ia32_psubusb128 ({ -65, 0, 0, 0, -65, 0, 0, 0, -65, 0, 0,
+> 0, -65, 0, 0, 0 }, { -99, 0, 0, 0, -99, 0, 0, 0, -99, 0, 0, 0, -99, 0, 0, 0
+> });
+>   _13 = __builtin_ia32_pminub128 (_12, { 32, 0, 0, 0, 32, 0, 0, 0, 32, 0, 0,
+> 0, 32, 0, 0, 0 });
+>   ...
+> 
+> 
+> bug.cc.272r.cse1 still has that subtraction:
+> 
+>     5: r119:V16QI=[`*.LC0']
+>       REG_EQUAL const_vector
+>     6: r120:V16QI=[`*.LC1']
+>       REG_EQUAL const_vector
+>     7: r118:V16QI=us_minus(r119:V16QI,r120:V16QI)
+> 
+> bug.cc.273r.fwprop1 does not anymore:
+> 
+>     3: NOTE_INSN_BASIC_BLOCK 2
+>     2: NOTE_INSN_FUNCTION_BEG
+>     9: r122:V16QI=[`*.LC2']
+>       REG_EQUAL const_vector
+>    13: r123:V4SI=r122:V16QI#0<<0x17
+>       REG_EQUAL const_vector
+>    16: r128:SI=0x5f800000
+>    15: r127:V4SI=vec_duplicate(r128:SI)
+> 
+> Could it be that constant folder "forgot" to generate anything for
+> unsupported saturated-sub instead of leaving it as is?No.  It is normal constant folding on RTL (not done on GIMPLE because
+the i386 backend doesn't try to gimple fold __builtin_ia32_psubusb128
+or __builtin_ia32_psubusb128).  0xbf - 0x9d is 0x22, so the us_minus works actually in this case exactly like minus and because 0x20 is smaller than that, the minimum is a vector with 0x20 elements (plus min (0 - 0, 0) = 0 elements).
+
+The reason the testcase FAILs is the same as in the other PRs, it is trying to
+convert
+{0x0.8p+33f, 0x0.8p+33f, 0x0.8p+33f, 0x0.8p+33f}
+V4SFmode vector to V4SImode, and because the backend sees the constant operand of the
+fix, it folds it to the unspecified value as with scalar conversion.
+
+Consider:
+int
+main ()
+{
+  volatile float f = 0x0.8p+33f;
+  volatile float __attribute__((vector_size (16))) vf = { 0x0.8p+33f, 0x0.8p+33f, 0x0.8p+33f, 0x0.8p+33f };
+  int a = f;
+  int __attribute__((vector_size (16))) vi = __builtin_convertvector (vf, int __attribute__((vector_size (16))));
+  __builtin_printf ("%d\n", a);
+  __builtin_printf ("{%d, %d, %d, %d}\n", vi[0], vi[1], vi[2], vi[3]);
+}
+This prints
+-2147483648
+{-2147483648, -2147483648, -2147483648, -2147483648}
+at -O0 or -O2, but with -O2 -Dvolatile= prints
+2147483647
+{2147483647, 2147483647, 2147483647, 2147483647}
+instead.
+Either is IMHO fine, the C standard doesn't specify what should be the result of the conversion.
+Now, whether for _mm_cvttps_epi32 etc. such cases are also unspecified or not is debatable.  The Intel spec obviously specifies what the CPU instructions do even in those otherwise unspecified cases, the question is if the intrinsic must behave the same or if those invalid conversions are still unspecified.
+If they'd be well defined when using the intrinsics, arguably the backend shouldn't use FIX RTL but some UNSPEC, or should use the FIX RTL conditionally (if_then_else:SI (argument_is_in_bounds) (fix arg) (const_int 0x8000000)).
+
+- User: Jakub Jelinek | Time: 2024-05-21 15:02:17 UTC
+  Text: Trying
+#include <emmintrin.h>
+
+int
+main ()
+{
+  float f = 0x0.8p+33f;
+  float __attribute__((vector_size (16))) vf = { 0x0.8p+33f, 0x0.8p+33f, 0x0.8p+33f, 0x0.8p+33f };
+  int a = f;
+  int __attribute__((vector_size (16))) vi = __builtin_convertvector (vf, int __attribute__((vector_size (16))));
+  int __attribute__((vector_size (16))) vi2 = (int __attribute__((vector_size (16)))) _mm_cvttps_epi32 ((__m128) vf);
+  __builtin_printf ("%d\n", a);
+  __builtin_printf ("{%d, %d, %d, %d}\n", vi[0], vi[1], vi[2], vi[3]);
+  __builtin_printf ("{%d, %d, %d, %d}\n", vi2[0], vi2[1], vi2[2], vi2[3]);
+}
+with gcc and clang both with -O0 and -O2, this prints
+-2147483648
+{-2147483648, -2147483648, -2147483648, -2147483648}
+{-2147483648, -2147483648, -2147483648, -2147483648}
+with both compilers at -O0, clang at -O2 prints
+-1720305736
+{8524448, 0, 1, 135169}
+{-2147483648, -2147483648, -2147483648, -2147483648}
+i.e. complete garbage for the non-intrinsic cases, but what the HW does for the intrinsic cases, while gcc at -O2 prints
+2147483647
+{2147483647, 2147483647, 2147483647, 2147483647}
+{2147483647, 2147483647, 2147483647, 2147483647}
+i.e. treats intrinsics and non-intrinsics the same.
+GCC behaves this way consistently since GCC 9 (before __builtin_convertvector hasn't been supported), but if the vi related lines are commented out, even GCC 4.7 works that way.
+
+- User: Jakub Jelinek | Time: 2024-05-21 15:13:16 UTC
+  Text: The standard GCC behavior is that out of range floating conversions to integers result in signed integer maximum if the floating point value sign is clear and signed integer minimum otherwise (including infinities/nans).
+
+- User: Alexander Monakov | Time: 2024-05-21 15:40:30 UTC
+  Text: > the question is if the intrinsic must behave the same or if those invalid conversions are still unspecified.I'd say it must match, the whole point of intrinsics is offering portable interface to specific instructions. If I wanted a conversion with C semantics I wouldn't need an intrinsic in the first place, it's more clearly expressed in plain C.
+
+- User: Sergei Trofimovich | Time: 2024-05-21 15:50:49 UTC
+  Text: Thank you, Jakub!> The reason the testcase FAILs is the same as in the other PRs, it is trying to convert {0x0.8p+33f, 0x0.8p+33f, 0x0.8p+33f, 0x0.8p+33f} V4SFmode vector to V4SImode, and because the backend sees the constant operand of the fix, it folds it to the unspecified value as with scalar conversion.To be super-clear: the problem is the out-of-range value, not just any V4SFmode->V4SImode, right?
+
+Specifically, float32{INT32_MAX} -> int32_t should be fine, right?
+
+I was trying to extract the following example (and likely failed):
+
+It tries very hard not to pass anything outside float32{INT32_MAX} to
+(a different) `PromoteTo()` at the end of the function fromhttps://github.com/google/highway/blob/2270e77d0d0ccc1d6bc7393f0ebb0b6352ddfd00/hwy/ops/x86_128-inl.h#L10275HWY_API VFromD<D> PromoteTo(D di64, VFromD<Rebind<float, D>> v) {
+  const Rebind<int32_t, decltype(di64)> di32;
+  const RebindToFloat<decltype(di32)> df32;
+  const RebindToUnsigned<decltype(di32)> du32;
+  const Repartition<uint8_t, decltype(du32)> du32_as_du8;
+
+  const auto exponent_adj = BitCast(
+      du32,
+      Min(SaturatedSub(BitCast(du32_as_du8, ShiftRight<23>(BitCast(du32, v))),
+                       BitCast(du32_as_du8, Set(du32, uint32_t{157}))),
+          BitCast(du32_as_du8, Set(du32, uint32_t{32}))));
+  const auto adj_v =
+      BitCast(df32, BitCast(du32, v) - ShiftLeft<23>(exponent_adj));
+
+  const auto f32_to_i32_result = ConvertTo(di32, adj_v);
+  const auto lo64_or_mask = PromoteTo(
+      di64,
+      BitCast(du32, VecFromMask(di32, Eq(f32_to_i32_result,
+                                         Set(di32, LimitsMax<int32_t>())))));
+
+  return Or(PromoteTo(di64, BitCast(di32, f32_to_i32_result))
+                << PromoteTo(di64, exponent_adj),
+            lo64_or_mask);
+ }
+
+Specifically `const auto f32_to_i32_result = ConvertTo(di32, adj_v);` hits overflow
+and the masking below should account for that (I tried to preserve masking in the original sample):https://github.com/google/highway/blob/2270e77d0d0ccc1d6bc7393f0ebb0b6352ddfd00/hwy/ops/x86_128-inl.h#L10870template <class D, HWY_IF_I32_D(D)>
+  HWY_API VFromD<D> ConvertTo(D di, VFromD<RebindToFloat<D>> v) {
+    const RebindToFloat<decltype(di)> df;
+    // See comment at the first occurrence of "IfThenElse(overflow,".
+    const MFromD<D> overflow = RebindMask(di, Ge(v, Set(df, 2147483648.0f)));
+    return IfThenElse(overflow, Set(di, LimitsMax<int32_t>()),
+                      ConvertInRangeTo(di, v));
+  }
+
+Is it obvious from the minimized C code where I got it into overflow condition?
+Or constant folding propagates through masks here?
+
+I'll try to re-minimize it again.
+
+- User: Jakub Jelinek | Time: 2024-05-21 15:51:40 UTC
+  Text: In that case we should separate *.md patterns which are used for C conversions from the patterns used by the intrinsics, keep using what we are right now for the former and either use UNSPEC (the quickest but not best code generating variant) or something more complex.  If UNSPEC is used, we could get some constant folding back by adding gimple_fold handling for those and the like of __builtin_ia32_psubusb128 or __builtin_ia32_pminub128.
+For __builtin_ia32_cvttps2dq etc. obviously the folding should either punt folding if some argument is out of range or fold those to what the hw does.
+
+- User: Jakub Jelinek | Time: 2024-05-21 16:07:18 UTC
+  Text: Any of the floating point to integer intrinsics if they have out of range value (haven't checked whether floating point to unsigned intrinsic is a problem too or not).
+No matter if it is float or double (dunno if _Float16 too, or __bf16), and no matter if it is scalar intrinsic (ss/sd etc.) or vector and how many vector elements.
+But, this isn't really a regression, GCC has always behaved that way, the only thing that actually changed is that perhaps we can constant fold more than we used to do in the past.
+When not using intrinsics, IMNSHO we should keep doing what we did before.
+
+- User: Hongtao Liu | Time: 2024-05-22 01:06:09 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #10)> Any of the floating point to integer intrinsics if they have out of range
+> value (haven't checked whether floating point to unsigned intrinsic is a
+> problem too or not).
+> No matter if it is float or double (dunno if _Float16 too, or __bf16), and
+> no matter if it is scalar intrinsic (ss/sd etc.) or vector and how many
+> vector elements.
+> But, this isn't really a regression, GCC has always behaved that way, the
+> only thing that actually changed is that perhaps we can constant fold more
+> than we used to do in the past.
+> When not using intrinsics, IMNSHO we should keep doing what we did before.Can we restrict them under flag_trapping_math?
+
+.i.e
+
+diff --git a/gcc/simplify-rtx.cc b/gcc/simplify-rtx.cc
+index 53f54d1d392..b7a770dad60 100644
+--- a/gcc/simplify-rtx.cc
++++ b/gcc/simplify-rtx.cc
+@@ -2256,14 +2256,25 @@ simplify_const_unary_operation (enum rtx_code code, machine_mode mode,
+       switch (code)
+        {
+        case FIX:
++         /* According to IEEE standard, for conversions from floating point to
++            integer. When a NaN or infinite operand cannot be represented in
++            the destination format and this cannot otherwise be indicated, the
++            invalid operation exception shall be signaled. When a numeric
++            operand would convert to an integer outside the range of the
++            destination format, the invalid operation exception shall be
++            signaled if this situation cannot otherwise be indicated.  */
+          if (REAL_VALUE_ISNAN (*x))
+-           return const0_rtx;
++           return flag_trapping_math ? NULL_RTX : const0_rtx;
++
++         if (REAL_VALUE_ISINF (*x) && flag_trapping_math)
++           return NULL_RTX;
+
+          /* Test against the signed upper bound.  */
+          wmax = wi::max_value (width, SIGNED);
+          real_from_integer (&t, VOIDmode, wmax, SIGNED);
+          if (real_less (&t, x))
+-           return immed_wide_int_const (wmax, mode);
++           return (flag_trapping_math
++                   ? NULL_RTX : immed_wide_int_const (wmax, mode));
+
+          /* Test against the signed lower bound.  */
+          wmin = wi::min_value (width, SIGNED);
+@@ -2276,13 +2287,17 @@ simplify_const_unary_operation (enum rtx_code code, machine_mode mode,
+
+        case UNSIGNED_FIX:
+          if (REAL_VALUE_ISNAN (*x) || REAL_VALUE_NEGATIVE (*x))
+-           return const0_rtx;
++           return flag_trapping_math ? NULL_RTX : const0_rtx;
++
++         if (REAL_VALUE_ISINF (*x) && flag_trapping_math)
++           return NULL_RTX;
+
+          /* Test against the unsigned upper bound.  */
+          wmax = wi::max_value (width, UNSIGNED);
+          real_from_integer (&t, VOIDmode, wmax, UNSIGNED);
+          if (real_less (&t, x))
+-           return immed_wide_int_const (wmax, mode);
++           return (flag_trapping_math
++                   ? NULL_RTX : immed_wide_int_const (wmax, mode));
+
+          return immed_wide_int_const (real_to_integer (x, &fail, width),
+
+- User: Andrew Pinski | Time: 2024-05-22 01:13:45 UTC
+  Text: So GCC behavior changed in 2003 to match more of what Java requires ...
+
+- User: Jakub Jelinek | Time: 2024-05-22 07:27:12 UTC
+  Text: (In reply to Hongtao Liu fromcomment #11)> (In reply to Jakub Jelinek fromcomment #10)
+> > Any of the floating point to integer intrinsics if they have out of range
+> > value (haven't checked whether floating point to unsigned intrinsic is a
+> > problem too or not).
+> > No matter if it is float or double (dunno if _Float16 too, or __bf16), and
+> > no matter if it is scalar intrinsic (ss/sd etc.) or vector and how many
+> > vector elements.
+> > But, this isn't really a regression, GCC has always behaved that way, the
+> > only thing that actually changed is that perhaps we can constant fold more
+> > than we used to do in the past.
+> > When not using intrinsics, IMNSHO we should keep doing what we did before.
+> 
+> Can we restrict them under flag_trapping_math?If we do that, we should do it on the fold-const.cc side as well.  There we fold it but add TREE_OVERFLOW flag in the overflow cases to the resulting tree, whether it prevents folding or not during GIMPLE passes would need to be figured out.
+
+C23 in F.4 says:
+If the integer type is bool, 6.3.1.2 applies and the conversion raises no floating-point exceptions if the floating-point value is not a signaling NaN. Otherwise, if the floating value is infinite or NaN or if the integral part of the floating value exceeds the range of the integer type, then the "invalid" floating-point exception is raised and the resulting value is unspecified. Otherwise, the resulting value is determined by 6.3.1.4. Conversion of an integral floating value that does not exceed the range of the integer type raises no floating-point exceptions; whether conversion of a non-integral floating value raises the "inexact" floating-point exception is unspecified.
+
+That said, this change really won't help the backend which supposedly should have the same behavior regardless of -fno-trapping-math, because in that case it is the value
+of the result (which is unspecified by the standards) rather than whether an exception is triggered or not.
+
+- User: Sergei Trofimovich | Time: 2024-05-22 07:41:12 UTC
+  Text: Createdattachment 58265[details]shorter-bug.cc
+
+I shrunk bug.cc slightly further into shorter-bug.cc and now it fails equally on gcc-13 and gcc-15. I agree that gcc-15 just got more constant folds available now, but otherwise it's behaviour did not change.
+
+But is it correct?
+
+- User: Sergei Trofimovich | Time: 2024-05-22 07:43:17 UTC
+  Text: > I shrunk bug.cc slightly further into shorter-bug.cc and now it fails
+> equally on gcc-13 and gcc-15. I agree that gcc-15 just got more constant
+> folds available now, but otherwise it's behaviour did not change.
+> 
+> But is it correct?Specifically -O0 works:
+
+  $ /tmp/gb/gcc/xg++ -Wall -B/tmp/gb/gcc bug.cc -o bug -O0 && ./bug
+    overflow(i): 0xffffffffffffffff 0xffffffffffffffff
+
+And -O2 crashes:
+
+  $ /tmp/gb/gcc/xg++ -Wall -B/tmp/gb/gcc bug.cc -o bug -O2 && ./bug
+    overflow(i): 0xffffffffffffffff 0xffffffffffffffff
+  Illegal instruction (core dumped)
+
+- User: Hongtao Liu | Time: 2024-05-22 07:52:51 UTC
+  Text: > 
+> That said, this change really won't help the backend which supposedly should
+> have the same behavior regardless of -fno-trapping-math, because in that
+> case it is the value
+> of the result (which is unspecified by the standards) rather than whether an
+> exception is triggered or not.First, I agree with you, they're 2 separate issues.
+What I proposed is just trying to find a balance that makes it possible not to refine all cvtt* instructions to UNSPEC, because that would lose a lot of optimization opportunities.
+If it can be restricted under flag_trapping_math, at least those intrinsics are fine at O2/O3.
+
+- User: Jakub Jelinek | Time: 2024-05-22 08:03:25 UTC
+  Text: I don't think the cost of using UNSPEC would be significant if the backend tried to constant fold more target builtins.  Anyway, with the proposed changes perhaps you could keep using FIX/UNSIGNED_FIX for flag_trapping_math case even for the intrinsics and use UNSPECs only for !flag_trapping_math.
+
+- User: Alexander Monakov | Time: 2024-05-22 08:22:17 UTC
+  Text: No, allowing value-changing transformations under -ftrapping-math is really not appropriate. Invoking the intrinsic on a large floating-point value is not UB.
+
+- User: Jakub Jelinek | Time: 2024-05-22 08:26:22 UTC
+  Text: (In reply to Alexander Monakov fromcomment #18)> No, allowing value-changing transformations under -ftrapping-math is really
+> not appropriate. Invoking the intrinsic on a large floating-point value is
+> not UB.If we guarantee that we never constant fold FIX/UNSIGNED_FIX with -ftrapping-math (we shouldn't, as the exceptions should be raised), then using FIX/UNSIGNED_FIX is ok in
+flag_trapping_math guarded patterns even if the intrinsics have some specific value they want in those cases, because they will never be folded.
+While for !flag_trapping_math, we should use UNSPEC because FIX/UNSIGNED_FIX can be folded and would be folded to whatever the generic code decides, which might disagree to what the intrinsics need.
+
+- User: Alexander Monakov | Time: 2024-05-22 08:49:51 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #19)> If we guarantee that we never constant fold FIX/UNSIGNED_FIX with
+> -ftrapping-math (we shouldn't, as the exceptions should be raised), then
+> using FIX/UNSIGNED_FIX is ok in
+> flag_trapping_math guarded patterns even if the intrinsics have some
+> specific value they want in those cases, because they will never be folded.No, this sounds illogical. The compiler may fold out-of-range conversions just fine, it just needs to preserve the original operation (with its result now dead), or use any other opportunity to ensure that exceptions are still raised. Specifically, it is okay to transform
+
+float f;
+int i;
+
+f = 0x0.8p+33f;
+i = (int) f;
+
+to
+
+f = 0x0.8p+33f;
+dummy = (int) f;
+i = INT_MAX; // or whatever
+
+The "known" value of 'i' may then facilitate further folding.
+
+- User: Sergei Trofimovich | Time: 2024-05-23 10:39:22 UTC
+  Text: Shrunk the example down to a single simpler function while preserving the original masking intent:
+
+```c
+cat bug.cc
+#include <stdint.h>
+#include <string.h>
+#include <emmintrin.h>
+
+__attribute__((noipa))
+static void assert_eq_p(void * l, void * r) {
+    char lb[16];
+    char rb[16];
+
+    __builtin_memcpy(lb, l, 16);
+    __builtin_memcpy(rb, r, 16);
+
+    if (__builtin_memcmp(lb, rb, 16) != 0) __builtin_trap();
+}
+
+__attribute__((noipa))
+static void assert_eq(__m128i l, __m128i r) { assert_eq_p(&l, &r); }
+
+int main() {
+  const __m128i su = _mm_set1_epi32(0x4f800000);
+  const __m128  sf = _mm_castsi128_ps(su);
+
+  const __m128  overflow_mask_f32 = _mm_cmpge_ps(sf, _mm_set1_ps(2147483648.0f));
+  const __m128i overflow_mask = _mm_castps_si128(overflow_mask_f32);
+
+  const __m128i conv = _mm_cvttps_epi32(sf); // overflows
+  const __m128i yes = _mm_set1_epi32(INT32_MAX);
+
+  const __m128i a = _mm_and_si128(overflow_mask, yes);
+  const __m128i na = _mm_andnot_si128(overflow_mask, conv);
+
+  const __m128i conv_masked = _mm_or_si128(a, na);
+
+  const __m128i actual = _mm_cmpeq_epi32(conv_masked, _mm_set1_epi32(INT32_MAX));
+  const __m128i expected = _mm_set1_epi32(-1);
+
+  assert_eq(expected, actual);
+}
+```
+
+The discrepancy:
+
+Ok:
+    $ /tmp/gb/gcc/xg++ -Wall -B/tmp/gb/gcc bug.cc -o bug -O0 && ./bug
+Bad:
+    $ /tmp/gb/gcc/xg++ -Wall -B/tmp/gb/gcc bug.cc -o bug -O2 && ./bug
+    Illegal instruction (core dumped)
+
+- User: Sergei Trofimovich | Time: 2024-05-24 22:00:35 UTC
+  Text: (In reply to Sergei Trofimovich fromcomment #21)
+
+gcc generates the following code for this C code:> int main() {
+>   const __m128i su = _mm_set1_epi32(0x4f800000);
+>   const __m128  sf = _mm_castsi128_ps(su);
+> 
+>   const __m128  overflow_mask_f32 = _mm_cmpge_ps(sf,
+> _mm_set1_ps(2147483648.0f));
+>   const __m128i overflow_mask = _mm_castps_si128(overflow_mask_f32);
+> 
+>   const __m128i conv = _mm_cvttps_epi32(sf); // overflows
+>   const __m128i yes = _mm_set1_epi32(INT32_MAX);
+> 
+>   const __m128i a = _mm_and_si128(overflow_mask, yes);
+>   const __m128i na = _mm_andnot_si128(overflow_mask, conv);
+> 
+>   const __m128i conv_masked = _mm_or_si128(a, na);Dump of assembler code for function main:
+   0x0000000000401020 <+0>:     sub    $0x8,%rsp
+   0x0000000000401024 <+4>:     movss  0xfdc(%rip),%xmm2        # 0x402008
+   0x000000000040102c <+12>:    movss  0xfd0(%rip),%xmm0        # 0x402004
+   0x0000000000401034 <+20>:    movss  0xfd0(%rip),%xmm3        # 0x40200c
+   0x000000000040103c <+28>:    shufps $0x0,%xmm2,%xmm2
+   0x0000000000401040 <+32>:    shufps $0x0,%xmm0,%xmm0
+   0x0000000000401044 <+36>:    cmpleps %xmm2,%xmm0
+   0x0000000000401048 <+40>:    cvttps2dq %xmm2,%xmm2
+   0x000000000040104c <+44>:    shufps $0x0,%xmm3,%xmm3
+   0x0000000000401050 <+48>:    movdqa %xmm0,%xmm1
+   0x0000000000401054 <+52>:    andps  %xmm3,%xmm0
+   0x0000000000401057 <+55>:    pandn  %xmm2,%xmm1
+   0x000000000040105b <+59>:    por    %xmm0,%xmm1
+
+All of this all looks fine.>   const __m128i actual = _mm_cmpeq_epi32(conv_masked,
+> _mm_set1_epi32(INT32_MAX));
+>   const __m128i expected = _mm_set1_epi32(-1);0x000000000040105f <+63>:    pcmpeqd %xmm0,%xmm0
+   0x0000000000401063 <+67>:    pcmpeqd %xmm2,%xmm1
+   0x0000000000401067 <+71>:    call   0x401160 <_ZL9assert_eqDv2_xS_>
+
+Here `pcmpeqd %xmm2,%xmm1` is a problematic instruction. Why does `gcc` use `%xmm2` (result of `cvttps2dq`) instead of, say `%xmm0` which contains `0xFFFFffff` pattern?>   assert_eq(expected, actual);
+> }
+> ```
+
+- User: Alexander Monakov | Time: 2024-05-25 17:15:14 UTC
+  Text: (In reply to Sergei Trofimovich fromcomment #22)> Here `pcmpeqd %xmm2,%xmm1` is a problematic instruction. Why does `gcc` use
+> `%xmm2` (result of `cvttps2dq`) instead of, say `%xmm0` which contains
+> `0xFFFFffff` pattern?%xmm0 contains the first all-ones argument to assert_eq. The comparison needs to happen against a register that contains 0x7fff_ffff (x4), and GCC "thinks" that %xmm2 contains that value. At -O1, the optimization is done by the RTL CSE pass (you can confirm by switching it off with -fdisable-rtl-cse1 along -O1), it sees
+
+(insn 6 5 7 2 (set (reg:V4SF 97)
+        (mem/u/c:V4SF (symbol_ref/u:DI ("*.LC1") [flags 0x2]) [0  S16 A128])) "/usr/lib/gcc/x86_64-pc-linux-gnu/10.2.0/include/xmmintrin.h":386:19 1335 {movv4sf_internal}
+     (expr_list:REG_EQUAL (const_vector:V4SF [
+                (const_double:SF 4.294967296e+9 [0x0.8p+33]) repeated x4
+            ])
+        (nil)))
+
+(insn 10 9 11 2 (set (reg:V4SI 98)
+        (fix:V4SI (reg:V4SF 97))) "/usr/lib/gcc/x86_64-pc-linux-gnu/10.2.0/include/emmintrin.h":832:19 2635 {fix_truncv4sfv4si2}
+     (expr_list:REG_EQUAL (const_vector:V4SI [
+                (const_int 2147483647 [0x7fffffff]) repeated x4
+            ])
+        (expr_list:REG_DEAD (reg:V4SF 99)
+            (nil))))
+
+Note the incorrect REG_EQUAL caused by inappropriate use of fix:V4SI where the source code had cvttps2dq.
+
+- User: Sergei Trofimovich | Time: 2024-05-25 18:44:40 UTC
+  Text: Thank you, Alexander! Tricky `REG_EQUAL` makes sense.
+
+- User: Hongtao Liu | Time: 2024-05-27 00:47:54 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #17)> I don't think the cost of using UNSPEC would be significant if the backend
+> tried to constant fold more target builtins.  Anyway, with the proposed
+> changes perhaps you could keep using FIX/UNSIGNED_FIX for flag_trapping_math
+> case even for the intrinsics and use UNSPECs only for !flag_trapping_math.Ok, we'll refactor all {V,}CVTT* instructions with UNSPEC instead of FIX/UNSIGNED_FIX.
+
+- User: GCC Commits | Time: 2024-06-05 04:09:07 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:b05288d1f1e4b632eddf8830b4369d4659f6c2ffcommitr15-1022-gb05288d1f1e4b632eddf8830b4369d4659f6c2ffAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Tue May 21 16:57:17 2024 +0800
+
+    Don't simplify NAN/INF or out-of-range constant for FIX/UNSIGNED_FIX.
+    
+    According to IEEE standard, for conversions from floating point to
+    integer. When a NaN or infinite operand cannot be represented in the
+    destination format and this cannot otherwise be indicated, the invalid
+    operation exception shall be signaled. When a numeric operand would
+    convert to an integer outside the range of the destination format, the
+    invalid operation exception shall be signaled if this situation cannot
+    otherwise be indicated.
+    
+    The patch prevent simplication of the conversion from floating point
+    to integer for NAN/INF/out-of-range constant when flag_trapping_math.
+    
+    gcc/ChangeLog:PR rtl-optimization/100927PR rtl-optimization/115161PR rtl-optimization/115115* simplify-rtx.cc (simplify_const_unary_operation): Prevent
+            simplication of FIX/UNSIGNED_FIX for NAN/INF/out-of-range
+            constant when flag_trapping_math.
+            * fold-const.cc (fold_convert_const_int_from_real): Don't fold
+            for overflow value when_trapping_math.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr100927.c: New test.
+            * c-c++-common/Wconversion-1.c: Add -fno-trapping-math.
+            * c-c++-common/dfp/convert-int-saturate.c: Ditto.
+            * g++.dg/ubsan/pr63956.C: Ditto.
+            * g++.dg/warn/Wconversion-real-integer.C: Ditto.
+            * gcc.c-torture/execute/20031003-1.c: Ditto.
+            * gcc.dg/Wconversion-complex-c99.c: Ditto.
+            * gcc.dg/Wconversion-real-integer.c: Ditto.
+            * gcc.dg/c90-const-expr-11.c: Ditto.
+            * gcc.dg/overflow-warn-8.c: Ditto.
+
+- User: Sergei Trofimovich | Time: 2024-06-05 09:13:01 UTC
+  Text: The change fixed highway-1.0.7 test suite for me. Thank you!
+
+- User: GCC Commits | Time: 2024-06-17 08:17:33 UTC
+  Text: The master branch has been updated by Hu <hulin@gcc.gnu.org>:https://gcc.gnu.org/g:b5d3ad256afdfd891d37d8fdb126d599f150e78bcommitr15-1370-gb5d3ad256afdfd891d37d8fdb126d599f150e78bAuthor: Hu, Lin1 <lin1.hu@intel.com>
+Date:   Wed Jun 12 16:25:34 2024 +0800
+
+    i386: Refine all cvtt* instructions with UNSPEC instead of FIX/UNSIGNED_FIX.
+    
+    gcc/ChangeLog:PR target/115161* config/i386/i386-builtin.def: Change CODE_FOR_* for cvtt*'s builtins.
+            * config/i386/sse.md:
+            (unspec_avx512fp16_fix<vcvtt_uns_suffix>
+            _trunc<mode>2<mask_name><round_saeonly_name>):
+            Use UNSPEC instead of FIX/UNSIGNED_FIX.
+            (unspec_avx512fp16_fix<vcvtt_uns_suffix>_trunc<mode>2<mask_name>):
+            Ditto.
+            (unspec_avx512fp16_fix<vcvtt_uns_suffix>_truncv2di2<mask_name>): Ditto.
+            (unspec_avx512fp16_fix<vcvtt_uns_suffix>_trunc<mode>2<round_saeonly_name>):
+            Ditto.
+            (unspec_sse_cvttps2pi): Ditto.
+            (unspec_sse_cvttss2si<rex64namesuffix><round_saeonly_name>): Ditto.
+            (unspec_fix<vcvtt_uns_suffix>_truncv16sfv16si2<mask_name><round_saeonly_name>):
+            Ditto.
+            (unspec_fix_truncv8sfv8si2<mask_name>): Ditto.
+            (unspec_fix_truncv4sfv4si2<mask_name>): Ditto.
+            (unspec_sse2_cvttpd2pi): Ditto.
+            (unspec_fixuns_truncv2dfv2si2): Ditto.
+            (unspec_avx512f_vcvttss2usi<rex64namesuffix><round_saeonly_name>):
+            Ditto.
+            (unspec_avx512f_vcvttsd2usi<rex64namesuffix><round_saeonly_name>):
+            Ditto.
+            (unspec_sse2_cvttsd2si<rex64namesuffix><round_saeonly_name>): Ditto.
+            (unspec_fix<vcvtt_uns_suffix>_truncv8dfv8si2<mask_name><round_saeonly_name>):
+            Ditto.
+            (*unspec_fixuns_truncv2dfv2si2): Ditto.
+            (unspec_fixuns_truncv2dfv2si2_mask): Ditto.
+            (unspec_fix_truncv4dfv4si2<mask_name>): Ditto.
+            (unspec_fixuns_truncv4dfv4si2<mask_name>): Ditto.
+            (unspec_fix<vcvtt_uns_suffix>
+            _trunc<mode><sseintvecmodelower>2<mask_name><round_saeonly_name>):
+            Ditto.
+            (unspec_fix<vcvtt_uns_suffix>
+            _trunc<mode><sselongvecmodelower>2<mask_name><round_saeonly_name>):
+            Ditto.
+            (unspec_avx512dq_fix<vcvtt_uns_suffix>_truncv2sfv2di2<mask_name>):
+            Ditto.
+            (<mask_codefor>unspec_fixuns_trunc<mode><sseintvecmodelower>2<mask_name>):
+            Ditto.
+            (unspec_sse2_cvttpd2dq<mask_name>): Ditto.
+    
+    gcc/testsuite/ChangeLog:PR target/115161* gcc.target/i386/pr115161-1.c: New test.
+
+- User: Sergei Trofimovich | Time: 2024-07-25 08:08:20 UTC
+  Text: Declaring FIXED. Thanks all!
+

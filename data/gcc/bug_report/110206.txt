@@ -1,0 +1,540 @@
+Bug Summary: [14 Regression] wrong code with -Os -march=cascadelake since r14-1246
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: patch, wrong-code
+Known to Work: 13.1.1
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-06-11 11:27:27 UTC
+  Text: Createdattachment 55301[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -Os -march=cascadelake testcase.c
+$ sde64 -future -- ./a.out 
+Aborted
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-1694-20230611112131-g20643513b8d-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-1694-20230611112131-g20643513b8d-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20230611 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2023-06-11 16:39:36 UTC
+  Text: There is a difference at the gimple level even:
+trunk:
+  _3 = { 204, 204, 204, 204 } >> u_7(D);
+
+GCC 13.1:
+  _15 = BIT_FIELD_REF <u_7(D), 8, 0>;
+  _16 = 204 >> _15;
+  _17 = BIT_FIELD_REF <u_7(D), 8, 8>;
+  _18 = 204 >> _17;
+  _19 = BIT_FIELD_REF <u_7(D), 8, 16>;
+  _20 = 204 >> _19;
+  _21 = BIT_FIELD_REF <u_7(D), 8, 24>;
+  _22 = 204 >> _21;
+  _3 = {_16, _18, _20, _22};
+
+- User: Jakub Jelinek | Time: 2023-06-11 17:37:26 UTC
+  Text: Started withr14-1246-g52ff3f7b863da1011b
+
+- User: Uroš Bizjak | Time: 2023-06-12 08:55:03 UTC
+  Text: Here is the problem:
+
+        vmovd   .LC1(%rip), %xmm4       # 21    [c=4 l=10]  *movv4qi_internal/4
+        ...
+        vpmovzxbw       %xmm4, %xmm4    # 22    [c=10 l=6]  sse4_1_zero_extendv8qiv8hi2/2
+        ...
+        vpsrlvw %xmm1, %xmm4, %xmm1     # 24    [c=4 l=6]  avx512vl_lshrvv8hi
+        ...
+        vpmullw %xmm4, %xmm0, %xmm0     # 63    [c=4 l=4]  *mulv8hi3/1
+
+
+.LC1:
+        .byte   -52
+        .byte   -52
+        .byte   -52
+        .byte   -52
+
+The compiler loads .LC1 (actually { 204, 204, 204, 204 } into %xmm4. Please note that this only has 4 QImode elements. Following that, it uses VPMOVZXBW which extends 8 QImode elements to 8 HImode elements. VPSRLVW actually uses only 4 QImode elements, so everything is OK here.
+
+However, VPMULLW needs all 8 QImode elements, but %xmm4 only has 4 loaded; the high 4 elements are zero. This effectively clears high four elements from the multiplication result, and this is what the testcase detects.
+
+- User: Uroš Bizjak | Time: 2023-06-12 09:09:53 UTC
+  Text: cprop1 pass does not consider paradoxical subreg and for (insn 22) claims that it equals 8 elements of QImode:
+
+(insn 21 19 22 4 (set (reg:V4QI 98)
+        (mem/u/c:V4QI (symbol_ref/u:DI ("*.LC1") [flags 0x2]) [0  S4 A32])) "pr110206.c":12:42 1530 {*movv4qi_internal}
+     (expr_list:REG_EQUAL (const_vector:V4QI [
+                (const_int -52 [0xffffffffffffffcc]) repeated x4
+            ])
+        (nil)))
+(insn 22 21 23 4 (set (reg:V8HI 100)
+        (zero_extend:V8HI (vec_select:V8QI (subreg:V16QI (reg:V4QI 98) 0)
+                (parallel [
+                        (const_int 0 [0])
+                        (const_int 1 [0x1])
+                        (const_int 2 [0x2])
+                        (const_int 3 [0x3])
+                        (const_int 4 [0x4])
+                        (const_int 5 [0x5])
+                        (const_int 6 [0x6])
+                        (const_int 7 [0x7])
+                    ])))) "pr110206.c":12:42 7471 {sse4_1_zero_extendv8qiv8hi2}
+     (expr_list:REG_EQUAL (const_vector:V8HI [
+                (const_int 204 [0xcc]) repeated x8
+            ])
+        (expr_list:REG_DEAD (reg:V4QI 98)
+            (nil))))
+
+- User: Uroš Bizjak | Time: 2023-06-12 09:11:25 UTC
+  Text: Recategorized as generic RTL optimization problem.
+
+- User: Uroš Bizjak | Time: 2023-06-12 09:15:21 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #3)> However, VPMULLW needs all 8 QImode elements, but %xmm4 only has 4 loaded;To be consistent, VPSRLVW and VPMULLW use HImode elements.
+
+- User: Uroš Bizjak | Time: 2023-06-12 09:18:39 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #4)> cprop1 pass does not consider paradoxical subreg and for (insn 22) claims
+> that it equals 8 elements of QImode:8 elements of HImode.
+
+- User: Uroš Bizjak | Time: 2023-07-08 14:07:57 UTC
+  Text: The testcase needs __attribute__((noinline)) to supress unwanted constant propagation with recent gcc.
+
+void
+__attribute__((noinline))
+foo (U u, u16 c, V *r)
+...
+
+- User: Uroš Bizjak | Time: 2023-07-08 16:56:41 UTC
+  Text: Some more digging through the code:
+
+In cprop.cc/try_replace_reg, we try to simplify the source of the set given our substitution:
+
+Breakpoint 1, try_replace_reg (from=0x7fffe9f0b7f8, to=0x7fffe9f099e0, insn=0x7fffea01b6c0) at ../../git/gcc/gcc/cprop.cc:789
+789           src = simplify_replace_rtx (SET_SRC (set), from, to);
+
+(gdb) list
+784       if (!success && set && reg_mentioned_p (from, SET_SRC (set)))
+785         {
+786           /* If above failed and this is a single set, try to simplify the source
+787              of the set given our substitution.  We could perhaps try this for
+788              multiple SETs, but it probably won't buy us anything.  */
+789           src = simplify_replace_rtx (SET_SRC (set), from, to);
+
+(gdb) p debug_rtx (set)
+(set (reg:V8HI 100)
+    (zero_extend:V8HI (vec_select:V8QI (subreg:V16QI (reg:V4QI 98) 0)
+            (parallel [
+                    (const_int 0 [0])
+                    (const_int 1 [0x1])
+                    (const_int 2 [0x2])
+                    (const_int 3 [0x3])
+                    (const_int 4 [0x4])
+                    (const_int 5 [0x5])
+                    (const_int 6 [0x6])
+                    (const_int 7 [0x7])
+                ]))))
+
+(gdb) p debug_rtx (from)
+(reg:V4QI 98)
+
+(gdb) p debug_rtx (to)
+(const_vector:V4QI [
+        (const_int -52 [0xffffffffffffffcc]) repeated x4
+    ])
+
+and simplify_replace_rtx simplifies the above to:
+
+(gdb) p debug_rtx (src)
+(const_vector:V8HI [
+        (const_int 204 [0xcc]) repeated x8
+    ])
+
+which is obviously wrong, we have V4QImode input register holding V4QImode constant.
+
+Tracing through simplify-rtx.cc brings us to a recursive simplify_replace_fn_rtx, which gets us to:
+
+Breakpoint 1, simplify_replace_fn_rtx (x=0x7fffe9f0b888, old_rtx=0x7fffe9f0b7f8, fn=0x0, data=0x7fffe9f099e0) at ../../git/gcc/gcc/simplify-rtx.cc:474
+474               op0 = simplify_gen_subreg (GET_MODE (x), op0,
+
+(gdb) list
+469           if (code == SUBREG)
+470             {
+471               op0 = simplify_replace_fn_rtx (SUBREG_REG (x), old_rtx, fn, data);
+472               if (op0 == SUBREG_REG (x))
+473                 return x;
+474               op0 = simplify_gen_subreg (GET_MODE (x), op0,
+475                                          GET_MODE (SUBREG_REG (x)),
+476                                          SUBREG_BYTE (x));
+477               return op0 ? op0 : x;
+478             }
+
+(gdb) p debug_rtx (op0)
+(const_vector:V4QI [
+        (const_int -52 [0xffffffffffffffcc]) repeated x4
+    ])
+(gdb) p debug_rtx (x)
+(subreg:V16QI (reg:V4QI 98) 0)
+
+and simplify_gen_subreg with the above arguments returns:
+
+(gdb) p debug_rtx (op0)
+(const_vector:V16QI [
+        (const_int -52 [0xffffffffffffffcc]) repeated x16
+    ])
+
+No way! It is not possible to get V16QImode vector from V4QImode vector, even when all elements are duplicates.
+
+Tracing even deeper to simplify_context::simplify_subreg, we found the following:
+
+Breakpoint 1, simplify_context::simplify_subreg (this=0x7fffffffd528, outermode=E_V16QImode, op=0x7fffe9f099e0, innermode=E_V4QImode, byte=...)
+    at ../../git/gcc/gcc/simplify-rtx.cc:7561
+7561            return gen_vec_duplicate (outermode, elt);
+
+(gdb) list
+7556          rtx elt;
+7557
+7558          if (VECTOR_MODE_P (outermode)
+7559              && GET_MODE_INNER (outermode) == GET_MODE_INNER (innermode)
+7560              && vec_duplicate_p (op, &elt))
+7561            return gen_vec_duplicate (outermode, elt);
+7562
+7563          if (outermode == GET_MODE_INNER (innermode)
+7564              && vec_duplicate_p (op, &elt))
+7565            return elt;
+
+(gdb) p outermode
+$1 = E_V16QImode
+(gdb) p debug_rtx (elt)
+(const_int -52 [0xffffffffffffffcc])
+
+(gdb) fin
+Run till exit from #0  simplify_context::simplify_subreg (this=0x7fffffffd528, outermode=E_V16QImode, op=0x7fffe9f099e0, innermode=E_V4QImode, byte=...)
+    at ../../git/gcc/gcc/simplify-rtx.cc:7561
+0x0000000000eb24d3 in simplify_subreg (byte=..., innermode=E_V4QImode, op=<optimized out>, outermode=<optimized out>) at ../../git/gcc/gcc/rtl.h:3513
+3513      return simplify_context ().simplify_subreg (outermode, op, innermode, byte);
+Value returned is $4 = (rtx_def *) 0x7fffe9f09c10
+
+(gdb) p debug_rtx ($4)
+(const_vector:V16QI [
+        (const_int -52 [0xffffffffffffffcc]) repeated x16
+    ])
+
+Nope. This transformation is valid only for non-paradoxical registers.
+
+Patch is then obvious:
+
+diff --git a/gcc/simplify-rtx.cc b/gcc/simplify-rtx.cc
+index d7315d82aa3..87ca25086dc 100644
+--- a/gcc/simplify-rtx.cc
++++ b/gcc/simplify-rtx.cc
+@@ -7557,6 +7557,7 @@ simplify_context::simplify_subreg (machine_mode outermode, rtx op,
+ 
+       if (VECTOR_MODE_P (outermode)
+          && GET_MODE_INNER (outermode) == GET_MODE_INNER (innermode)
++         && !paradoxical_subreg_p (outermode, innermode)
+          && vec_duplicate_p (op, &elt))
+        return gen_vec_duplicate (outermode, elt);
+
+- User: Uroš Bizjak | Time: 2023-07-08 17:36:21 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #9)> and simplify_replace_rtx simplifies the above to:
+> 
+> (gdb) p debug_rtx (src)
+> (const_vector:V8HI [
+>         (const_int 204 [0xcc]) repeated x8
+>     ])Patched compiler simplifies to:
+
+(gdb) p debug_rtx (src)
+(const_vector:V8HI [
+        (const_int 204 [0xcc]) repeated x4
+        (const_int 0 [0]) repeated x4
+    ])
+
+- User: Uroš Bizjak | Time: 2023-07-09 08:54:43 UTC
+  Text: Patch at [1].
+
+[1]https://gcc.gnu.org/pipermail/gcc-patches/2023-July/623933.html
+
+- User: Richard Biener | Time: 2023-07-10 11:54:57 UTC
+  Text: I can see cprop1 adds the REG_EQUAL note:
+
+(insn 22 21 23 4 (set (reg:V8HI 100)
+        (zero_extend:V8HI (vec_select:V8QI (subreg:V16QI (reg:V4QI 98) 0)
+                (parallel [
+                        (const_int 0 [0])
+                        (const_int 1 [0x1])
+                        (const_int 2 [0x2])
+                        (const_int 3 [0x3])
+                        (const_int 4 [0x4])
+                        (const_int 5 [0x5])
+                         (const_int 6 [0x6])
+                         (const_int 7 [0x7])
+                     ])))) "t.c":12:42 7557 {sse4_1_zero_extendv8qiv8hi2}
+-     (expr_list:REG_DEAD (reg:V4QI 98)
+-        (nil)))
++     (expr_list:REG_EQUAL (const_vector:V8HI [
++                (const_int 204 [0xcc]) repeated x8
++            ])
++        (expr_list:REG_DEAD (reg:V4QI 98)
++            (nil))))
+
+but I don't see yet what the actual wrong transform based on this REG_EQUAL note is?
+
+It looks like we CSE the above with
+
+-   46: r122:V8QI=[`*.LC3']
+-      REG_EQUAL const_vector
+-   48: r125:V8HI=zero_extend(vec_select(r122:V8QI#0,parallel))
+-      REG_EQUAL const_vector
+-      REG_DEAD r122:V8QI
+-   49: r126:V8HI=r124:V8HI*r125:V8HI
+-      REG_DEAD r125:V8HI
++   49: r126:V8HI=r124:V8HI*r100:V8HI
+
+but otherwise do nothing.  So the issue is that we rely on the "undefined"
+vals to have a specific value (from the earlier REG_EQUAL note) but actual
+code generation doesn't ensure this (it doesn't need to).  That said,
+the issue isn't the constant folding per-se but that we do not actually
+constant fold but register an equality that doesn't hold.
+
+- User: Uroš Bizjak | Time: 2023-07-10 12:33:11 UTC
+  Text: (In reply to Richard Biener fromcomment #12)> I can see cprop1 adds the REG_EQUAL note:
+> 
+> (insn 22 21 23 4 (set (reg:V8HI 100)
+>         (zero_extend:V8HI (vec_select:V8QI (subreg:V16QI (reg:V4QI 98) 0)
+>                 (parallel [
+>                         (const_int 0 [0])
+>                         (const_int 1 [0x1])
+>                         (const_int 2 [0x2])
+>                         (const_int 3 [0x3])
+>                         (const_int 4 [0x4])
+>                         (const_int 5 [0x5])
+>                          (const_int 6 [0x6])
+>                          (const_int 7 [0x7])
+>                      ])))) "t.c":12:42 7557 {sse4_1_zero_extendv8qiv8hi2}
+> -     (expr_list:REG_DEAD (reg:V4QI 98)
+> -        (nil)))
+> +     (expr_list:REG_EQUAL (const_vector:V8HI [
+> +                (const_int 204 [0xcc]) repeated x8
+> +            ])
+> +        (expr_list:REG_DEAD (reg:V4QI 98)
+> +            (nil))))
+> 
+> but I don't see yet what the actual wrong transform based on this REG_EQUAL
+> note is?We constant fold V4QImode const_vector to a V8HImode const_vector with 8 defined elements. We started with undefined top four bytes, but now we magically define them.> 
+> It looks like we CSE the above with
+> 
+> -   46: r122:V8QI=[`*.LC3']
+> -      REG_EQUAL const_vector
+> -   48: r125:V8HI=zero_extend(vec_select(r122:V8QI#0,parallel))
+> -      REG_EQUAL const_vector
+> -      REG_DEAD r122:V8QI
+> -   49: r126:V8HI=r124:V8HI*r125:V8HI
+> -      REG_DEAD r125:V8HI
+> +   49: r126:V8HI=r124:V8HI*r100:V8HI
+> 
+> but otherwise do nothing.  So the issue is that we rely on the "undefined"
+> vals to have a specific value (from the earlier REG_EQUAL note) but actual
+> code generation doesn't ensure this (it doesn't need to).  That said,
+> the issue isn't the constant folding per-se but that we do not actually
+> constant fold but register an equality that doesn't hold.The above CSE is the consequence of REG_EQUAL note that compiler set on the insn. Compiler claims that the value of (insn 22) equals an array of 8 consts { 204 , ... , 204 }, but in reality (c.f.Comment #3) the value in the register %xmm4 before VPMULLW insn is { 0, 0, 0, 0, 204, 204, 204, 204 }.
+
+- User: Uroš Bizjak | Time: 2023-07-10 12:37:51 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #10)> (In reply to Uroš Bizjak fromcomment #9)
+> > and simplify_replace_rtx simplifies the above to:
+> > 
+> > (gdb) p debug_rtx (src)
+> > (const_vector:V8HI [
+> >         (const_int 204 [0xcc]) repeated x8
+> >     ])
+> 
+> Patched compiler simplifies to:
+> 
+> (gdb) p debug_rtx (src)
+> (const_vector:V8HI [
+>         (const_int 204 [0xcc]) repeated x4
+>         (const_int 0 [0]) repeated x4
+>     ])The patched compiler puts the above in REG_EQUAL note. While the value is "more correct", I don't think the compiler has the right to set REG_EQUAL note when the top 4 bytes are actually undefined (as a result of an operation with an undefined input, which is the case with paradoxical subreg).
+
+- User: Uroš Bizjak | Time: 2023-07-13 17:51:32 UTC
+  Text: Createdattachment 55537[details]Proposed patch.
+
+v2 patch in testing.
+
+This version prevents emission of invalid REG_EQUAL note in cprop.cc/try_replace_reg when original, non-simplified RTX contains SUBREG. The patch is in effect an one-liner:
+
+@@ -795,7 +796,8 @@ try_replace_reg (rtx from, rtx to, rtx_insn *insn)
+       /* If we've failed perform the replacement, have a single SET to
+ 	 a REG destination and don't yet have a note, add a REG_EQUAL note
+ 	 to not lose information.  */
+-      if (!success && note == 0 && set != 0 && REG_P (SET_DEST (set)))
++      if (!success && note == 0 && set != 0 && REG_P (SET_DEST (set))
++	  && !contains_paradoxical_subreg_p (SET_SRC (set)))
+ 	note = set_unique_reg_note (insn, REG_EQUAL, copy_rtx (src));
+     }
+ 
+but we have to move contains_paradoxical_subreg_p to rtlanal.cc.
+
+- User: Uroš Bizjak | Time: 2023-07-14 06:26:15 UTC
+  Text: v2 patch at [1].
+
+[1]https://gcc.gnu.org/pipermail/gcc-patches/2023-July/624491.html
+
+- User: GCC Commits | Time: 2023-07-14 15:17:29 UTC
+  Text: The master branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:1815e313a8fb519a77c94a908eb6dafc4ce51ffecommitr14-2525-g1815e313a8fb519a77c94a908eb6dafc4ce51ffeAuthor: Uros Bizjak <ubizjak@gmail.com>
+Date:   Fri Jul 14 11:46:22 2023 +0200
+
+    cprop: Do not set REG_EQUAL note when simplifying paradoxical subreg [PR110206]
+    
+    cprop1 pass does not consider paradoxical subreg and for (insn 22) claims
+    that it equals 8 elements of HImodeby setting REG_EQUAL note:
+    
+    (insn 21 19 22 4 (set (reg:V4QI 98)
+            (mem/u/c:V4QI (symbol_ref/u:DI ("*.LC1") [flags 0x2]) [0  S4 A32])) "pr110206.c":12:42 1530 {*movv4qi_internal}
+         (expr_list:REG_EQUAL (const_vector:V4QI [
+                    (const_int -52 [0xffffffffffffffcc]) repeated x4
+                ])
+            (nil)))
+    (insn 22 21 23 4 (set (reg:V8HI 100)
+            (zero_extend:V8HI (vec_select:V8QI (subreg:V16QI (reg:V4QI 98) 0)
+                    (parallel [
+                            (const_int 0 [0])
+                            (const_int 1 [0x1])
+                            (const_int 2 [0x2])
+                            (const_int 3 [0x3])
+                            (const_int 4 [0x4])
+                            (const_int 5 [0x5])
+                            (const_int 6 [0x6])
+                            (const_int 7 [0x7])
+                        ])))) "pr110206.c":12:42 7471 {sse4_1_zero_extendv8qiv8hi2}
+         (expr_list:REG_EQUAL (const_vector:V8HI [
+                    (const_int 204 [0xcc]) repeated x8
+                ])
+            (expr_list:REG_DEAD (reg:V4QI 98)
+                (nil))))
+    
+    We rely on the "undefined" vals to have a specific value (from the earlier
+    REG_EQUAL note) but actual code generation doesn't ensure this (it doesn't
+    need to).  That said, the issue isn't the constant folding per-se but that
+    we do not actually constant fold but register an equality that doesn't hold.PR target/110206gcc/ChangeLog:
+    
+            * fwprop.cc (contains_paradoxical_subreg_p): Move to ...
+            * rtlanal.cc (contains_paradoxical_subreg_p): ... here.
+            * rtlanal.h (contains_paradoxical_subreg_p): Add prototype.
+            * cprop.cc (try_replace_reg): Do not set REG_EQUAL note
+            when the original source contains a paradoxical subreg.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110206.c: New test.
+
+- User: GCC Commits | Time: 2023-07-14 20:03:16 UTC
+  Text: The releases/gcc-13 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:bef95ba085b0ae9bf3eb79a8eed685236d773116commitr13-7565-gbef95ba085b0ae9bf3eb79a8eed685236d773116Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Fri Jul 14 11:46:22 2023 +0200
+
+    cprop: Do not set REG_EQUAL note when simplifying paradoxical subreg [PR110206]
+    
+    cprop1 pass does not consider paradoxical subreg and for (insn 22) claims
+    that it equals 8 elements of HImodeby setting REG_EQUAL note:
+    
+    (insn 21 19 22 4 (set (reg:V4QI 98)
+            (mem/u/c:V4QI (symbol_ref/u:DI ("*.LC1") [flags 0x2]) [0  S4 A32])) "pr110206.c":12:42 1530 {*movv4qi_internal}
+         (expr_list:REG_EQUAL (const_vector:V4QI [
+                    (const_int -52 [0xffffffffffffffcc]) repeated x4
+                ])
+            (nil)))
+    (insn 22 21 23 4 (set (reg:V8HI 100)
+            (zero_extend:V8HI (vec_select:V8QI (subreg:V16QI (reg:V4QI 98) 0)
+                    (parallel [
+                            (const_int 0 [0])
+                            (const_int 1 [0x1])
+                            (const_int 2 [0x2])
+                            (const_int 3 [0x3])
+                            (const_int 4 [0x4])
+                            (const_int 5 [0x5])
+                            (const_int 6 [0x6])
+                            (const_int 7 [0x7])
+                        ])))) "pr110206.c":12:42 7471 {sse4_1_zero_extendv8qiv8hi2}
+         (expr_list:REG_EQUAL (const_vector:V8HI [
+                    (const_int 204 [0xcc]) repeated x8
+                ])
+            (expr_list:REG_DEAD (reg:V4QI 98)
+                (nil))))
+    
+    We rely on the "undefined" vals to have a specific value (from the earlier
+    REG_EQUAL note) but actual code generation doesn't ensure this (it doesn't
+    need to).  That said, the issue isn't the constant folding per-se but that
+    we do not actually constant fold but register an equality that doesn't hold.PR target/110206gcc/ChangeLog:
+    
+            * fwprop.cc (contains_paradoxical_subreg_p): Move to ...
+            * rtlanal.cc (contains_paradoxical_subreg_p): ... here.
+            * rtlanal.h (contains_paradoxical_subreg_p): Add prototype.
+            * cprop.cc (try_replace_reg): Do not set REG_EQUAL note
+            when the original source contains a paradoxical subreg.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110206.c: New test.
+    
+    (cherry picked from commit 1815e313a8fb519a77c94a908eb6dafc4ce51ffe)
+
+- User: GCC Commits | Time: 2023-07-14 22:38:13 UTC
+  Text: The releases/gcc-12 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:eeb8e9a36d7aa9bc4ac8b0d7abe1e84e9afc4250commitr12-9774-geeb8e9a36d7aa9bc4ac8b0d7abe1e84e9afc4250Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Fri Jul 14 11:46:22 2023 +0200
+
+    cprop: Do not set REG_EQUAL note when simplifying paradoxical subreg [PR110206]
+    
+    cprop1 pass does not consider paradoxical subreg and for (insn 22) claims
+    that it equals 8 elements of HImodeby setting REG_EQUAL note:
+    
+    (insn 21 19 22 4 (set (reg:V4QI 98)
+            (mem/u/c:V4QI (symbol_ref/u:DI ("*.LC1") [flags 0x2]) [0  S4 A32])) "pr110206.c":12:42 1530 {*movv4qi_internal}
+         (expr_list:REG_EQUAL (const_vector:V4QI [
+                    (const_int -52 [0xffffffffffffffcc]) repeated x4
+                ])
+            (nil)))
+    (insn 22 21 23 4 (set (reg:V8HI 100)
+            (zero_extend:V8HI (vec_select:V8QI (subreg:V16QI (reg:V4QI 98) 0)
+                    (parallel [
+                            (const_int 0 [0])
+                            (const_int 1 [0x1])
+                            (const_int 2 [0x2])
+                            (const_int 3 [0x3])
+                            (const_int 4 [0x4])
+                            (const_int 5 [0x5])
+                            (const_int 6 [0x6])
+                            (const_int 7 [0x7])
+                        ])))) "pr110206.c":12:42 7471 {sse4_1_zero_extendv8qiv8hi2}
+         (expr_list:REG_EQUAL (const_vector:V8HI [
+                    (const_int 204 [0xcc]) repeated x8
+                ])
+            (expr_list:REG_DEAD (reg:V4QI 98)
+                (nil))))
+    
+    We rely on the "undefined" vals to have a specific value (from the earlier
+    REG_EQUAL note) but actual code generation doesn't ensure this (it doesn't
+    need to).  That said, the issue isn't the constant folding per-se but that
+    we do not actually constant fold but register an equality that doesn't hold.PR target/110206gcc/ChangeLog:
+    
+            * fwprop.cc (contains_paradoxical_subreg_p): Move to ...
+            * rtlanal.cc (contains_paradoxical_subreg_p): ... here.
+            * rtlanal.h (contains_paradoxical_subreg_p): Add prototype.
+            * cprop.cc (try_replace_reg): Do not set REG_EQUAL note
+            when the original source contains a paradoxical subreg.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110206.c: New test.
+    
+    (cherry picked from commit 1815e313a8fb519a77c94a908eb6dafc4ce51ffe)
+
+- User: Uroš Bizjak | Time: 2023-07-14 22:39:25 UTC
+  Text: Fixed for gcc-12.4+.
+

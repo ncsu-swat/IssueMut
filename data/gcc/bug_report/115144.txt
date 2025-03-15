@@ -1,0 +1,237 @@
+Bug Summary: [15 Regression] 2% performance regression for some codes with r15-518-g99b1daae18c095
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Hans-Peter Nilsson | Time: 2024-05-18 03:07:22 UTC
+  Text: ...and also, regresses gcc.target/cris/pr93372-47.c.  The actual
+purpose of that test-case is as a regression-test for a fixed bug with
+delay-slot-filling, but it also serves as a guard against code quality
+regression.  Following up as per the comment inpr93372-47.c about
+what to investigate in case it regressed, I see a quite large
+regression:
+
+The commitr15-518-g99b1daae18c095"tree-optimization/114589 - remove
+profile based sink heuristics" caused an almost 2% performance
+regression for certain codes, as measured by simulator output by executing
+gcc.c-torture/execute/arith-rand-ll.c compiled for cris-elf with -O2
+-march=v10.r15-0517:
+Basic clock cycles, total @: 13025734r15-0518:
+Basic clock cycles, total @: 13279004
+
+Also,
+
+I inspected simulator output and the bulk is indeed in random_bitstring
+(i.e. not in div and mod library functions).
+
+Perhaps you say that ivopts matters here?
+
+The same, adding -fno-ivopts,r15-0517:
+Basic clock cycles, total @: 13008338r15-0518:
+Basic clock cycles, total @: 13330520
+
+...so the regression is then even larger; almost 2.5%.
+
+It may be argued that arith-rand-ll.c is not a reliable performance
+test, so I also ranr15-0517andr15-0518by coremark, which paints
+a different picture:r15-0517:
+Basic clock cycles, total @: 5022704r15-0518:
+Basic clock cycles, total @: 5021785
+
+So there, it's a win in performance, if only small (~0.02%).
+Same, with -fno-ivopts:r15-0517:
+Basic clock cycles, total @: 5641650r15-0518:
+Basic clock cycles, total @: 5640721
+Still a win in performance, only smaller (still ~0.02%).
+
+Judging from coremark, there's no general conclusion regarding
+performance ofr15-518, but I know from other performance
+investigations that "double register"-heavy code such as
+arith-rand-ll.c for CRIS has different characteristics than other
+test-code, here coremark.
+
+Maybe something can be done to improve onr15-518for this type of code
+or maybe it exposed problems for other ports, so I'm not going to
+immediately myself close this as WONTFIX.  I'll also be using this PR
+as an anchor when dealing with (likely xfailing) the regression for
+gcc.target/cris/pr93372-47.c.
+
+- User: Hans-Peter Nilsson | Time: 2024-05-19 02:27:12 UTC
+  Text: I also ran a round compiled with -fno-ivopts -fno-delayed-branch: the latter because it's somewhat non-linear in finding delay-slot-filling opportunities (lack of "luck" causing improvements to negate) and the former because it was mentioned in the commit as similarly messing things up.
+
+That "fixed" all of the performance drop for random_bitstring, but still left an almost-as-large performance drop in main in gcc.c-torture/execute/arith-rand-ll.c. IOW, the net performance drop is 1.25%:r15-0517:
+Basic clock cycles, total @: 13662157r15-0518:
+Basic clock cycles, total @: 13832953
+
+The focus of this bug was the on subset of arith-rand-ll.c that is in gcc.target/cris/pr93372-47.c (i.e. no main function), so if I keep that, the gist of this PR should instead shift to something like 50% "r15-518doesn't play nice with ivopts" but I guess that's already known.
+
+So if anyone's interested in improvingr15-518(but not in ivopts interaction), I'd suggest that'd be in what happens in the main function for gcc.c-torture/execute/arith-rand-ll.c.
+
+Having said that, I did compile gcc.target/cris/pr93372-47.c adding -fno-ivopts -fdump-tree-optimized and it shows that the tot_bits computation ("tot_bits_13 = tot_bits_8 + n_bits_12;") is moved later, right before it's used in a conditional, which makes me think the delay-branch-scheduling has less "material" to fill the first delays-slots.
+
+I also compiled gcc.c-torture/execute/arith-rand-ll.c with -fno-ivopts -fdump-tree-optimized (plus the usual -O2 -march=v10) and will attach the tree-dump files.  They show what thepr93372-47.c change *and* that several division operations are moved forward.  This separates them from the modulus opterations on the same values, so I guess targets where computing these values together is a win (not CRIS), we'll see a performance loss.
+
+- User: Hans-Peter Nilsson | Time: 2024-05-19 02:32:57 UTC
+  Text: Createdattachment 58238[details]tree-dump file@517
+
+arith-rand.c @r15-517compiled with -fno-ivopts -fdump-tree-optimized -march=v10 -O2
+
+- User: Hans-Peter Nilsson | Time: 2024-05-19 02:33:52 UTC
+  Text: Createdattachment 58239[details]tree-dump file @518
+
+arith-rand.c @r15-518compiled with -fno-ivopts -fdump-tree-optimized -march=v10 -O2
+
+- User: Hans-Peter Nilsson | Time: 2024-05-19 02:43:31 UTC
+  Text: Createdattachment 58240[details]tree-dump file@517 w. ivopts
+
+As above @517, but no -fno-ivopts
+
+- User: Hans-Peter Nilsson | Time: 2024-05-19 02:44:37 UTC
+  Text: Createdattachment 58241[details]tree-dump file@518 w. ivopts
+
+As above @518 without -fno-ivopts
+
+- User: Richard Biener | Time: 2024-05-21 07:31:37 UTC
+  Text: For gcc.c-torture/execute/arith-rand-ll.c, does it help to replace the exit (0) call with a return 0 statement?
+
+Looking at gcc.target/cris/pr93372-47.c what we do here is sink tot_bits += n_bits into the else { of the in-loop conditional, in particular we sink
+it right before the exit conditional in the loop.  That's exactly what
+we are supposed to do and the previous heuristic avoided because of the
+guessed profile which is
+
+  if (n_bits_12 == 0)
+    goto <bb 4>; [5.50%]
+  else
+    goto <bb 5>; [94.50%]
+
+thus the n_bits == 0 exit is unlikely and for some reason we thought
+sinking across that isn't profitable.
+
+To quote the loop in question is:
+
+  for (;;)
+    {
+      ran = simple_rand ();
+      n_bits = (ran >> 1) % 16;
+      tot_bits += n_bits;
+
+      if (n_bits == 0)
+        return x;
+      else
+        {
+          x <<= n_bits;
+          if (ran & 1)
+            x |= (1 << n_bits) - 1;
+
+          if (tot_bits > 8 * sizeof (long long) + 6)
+            return x;
+        }
+    }
+
+Note that the sinking doesn't increase register lifetime (one of the reasons
+of the previous heuristic), esp. if we'd go one step further and sink
+to the start of the else { block rather than right before the exit
+conditional.  But I'd guess that wouldn't help the delay-slot filling here?
+
+I've noticed CRIS doesn't support scheduling at all, so delay slot filling
+(where's that done?) relies purely on our "random" scheduling we do at
+RTL expansion time (via TER) and during GIMPLE optimization?
+
+That said, I think sinking now works as expected.  I do want to play with
+sinking to the start of the else {, but without doing any lifetime analysis
+I fear that's going to be worse in the average as the current location
+at least ensures we're close to the first use of the DEF we sink.
+
+- User: Hans-Peter Nilsson | Time: 2024-05-22 01:15:52 UTC
+  Text: (In reply to Richard Biener fromcomment #6)> For gcc.c-torture/execute/arith-rand-ll.c, does it help to replace the exit
+> (0) call with a return 0 statement?No.  FWIW, it also doesn't help renaming and wrapping main to xmain __attribute__ noipa.> Looking at gcc.target/cris/pr93372-47.c what we do here is sink tot_bits +=
+> n_bits into the else { of the in-loop conditional, in particular we sink
+> it right before the exit conditional in the loop.  That's exactly what
+> we are supposed to do[...]Yes; see previous comments.  I'd say the changes in random_bitstring are no longer "interesting".  I've also analyzed the unfilled delay-slot signalled by gcc.target/cris/pr93372-47.c to be because of a bug in that pass.  (Not the same, but events are amusingly parallel to the bug that made me add that test-case.)> Note that the sinking doesn't increase register lifetime (one of the reasons
+> of the previous heuristic), esp. if we'd go one step further and sink
+> to the start of the else { block rather than right before the exit
+> conditional.  But I'd guess that wouldn't help the delay-slot filling here?Sorry, I don't follow here, but I'm going to let that be, as random_bitstring isn't interesting (except regarding the bug).> I've noticed CRIS doesn't support scheduling at all, so delay slot filling
+> (where's that done?) relies purely on our "random" scheduling we do at
+> RTL expansion time (via TER) and during GIMPLE optimization?Delay-slot-filling is unrelated to scheduling.  It's in reorg.cc with its own horribly outdated dataflow analysis in resource.cc (but used to be shared).> That said, I think sinking now works as expected.In random_bitstring I agree, but there's fallout in main.>  I do want to play with
+> sinking to the start of the else {, but without doing any lifetime analysis
+> I fear that's going to be worse in the average as the current location
+> at least ensures we're close to the first use of the DEF we sink.Thank you in advance and for the look this far!  I haven't looked closer at what happens with later passes in main, but looking at the generated assembly code, the "sinking" of a division has the eventual effect of increasing register pressure; see the previously attached dumps.
+
+- User: Richard Biener | Time: 2024-05-22 07:13:25 UTC
+  Text: (In reply to Hans-Peter Nilsson fromcomment #7)> (In reply to Richard Biener fromcomment #6)[...]> >  I do want to play with
+> > sinking to the start of the else {, but without doing any lifetime analysis
+> > I fear that's going to be worse in the average as the current location
+> > at least ensures we're close to the first use of the DEF we sink.
+> 
+> Thank you in advance and for the look this far!  I haven't looked closer at
+> what happens with later passes in main, but looking at the generated
+> assembly code, the "sinking" of a division has the eventual effect of
+> increasing register pressure; see the previously attached dumps.Indeed, we have originally
+
+  _38 = _36 / _37;
+  _39 = _36 % _37;
+  r2_78 = (signed char) _39;
+
+where both _36 and _37 die (but _39 and _38 are live for a lot longer).  We
+sink the _38 def across
+
+  <bb 28> [local count: 173045540]:
+  # iftmp.10_49 = PHI <iftmp.10_79(27), _31(51)>
+  if (_41 >= iftmp.10_49)
+    goto <bb 42>; [0.00%]
+  else
+    goto <bb 29>; [100.00%]
+
+  <bb 29> [local count: 173045540]:
+  r1.13_43 = (unsigned char) _38;
+
+which the original profile check avoided.  I'll note the above is a more
+sensible case where to avoid such sinking but I'll also note that sinking
+does not look at register pressure (or basically whether a sinking
+increases or decreases register pressure) at all and generally GIMPLE
+passes are not supposed to do this (it's also not an easy feat).
+
+- User: GCC Commits | Time: 2024-05-24 11:01:45 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:5b9b3bae33cae7fca2e3c3e3028be6b8bee9b698commitr15-815-g5b9b3bae33cae7fca2e3c3e3028be6b8bee9b698Author: Richard Biener <rguenther@suse.de>
+Date:   Wed May 22 09:16:51 2024 +0200
+
+    tree-optimization/115144 - improve sinking destination choice
+    
+    When sinking code closer to its uses we already try to minimize the
+    distance we move by inserting at the start of the basic-block.  The
+    following makes sure to sink closest to the control dependence
+    check of the region we want to sink to as well as make sure to
+    ignore control dependences that are only guarding exceptional code.
+    This restores somewhat the old profile check but without requiring
+    nearly even probabilities.  The patch also makes sure to not give
+    up completely when the best sink location is one we do not want to
+    sink to but possibly then choose the next best one.PR tree-optimization/115144* tree-ssa-sink.cc (do_not_sink): New function, split out
+            from ...
+            (select_best_block): Here.  First pick valid block to
+            sink to.  From that search for the best valid block,
+            avoiding sinking across conditions to exceptional code.
+            (sink_code_in_bb): When updating vuses of stores in
+            paths we do not sink a store to make sure we didn't
+            pick a dominating sink location.
+    
+            * gcc.dg/tree-ssa/ssa-sink-22.c: New testcase.
+
+- User: Richard Biener | Time: 2024-05-24 11:02:30 UTC
+  Text: This should be fixed now.
+
+- User: Hans-Peter Nilsson | Time: 2024-05-25 03:40:10 UTC
+  Text: (In reply to Richard Biener fromcomment #10)> This should be fixed now.I applied the commitr15-815-g5b9b3bae33caetor15-518and built arith-rand-ll.c with -O2 -fno-delayed-branch -fno-ivopts -march=v10 (like above, to avoid ivopts and delayed-branch issues and the simulation numbers are even better than withr15-517:
+
+Basic clock cycles, total @: 13653025
+Memory source stall cycles: 78259
+
+So, verified.
+
+Thanks!
+ps. I removed the testsuite-fail keyword as that belongs toPR115182.
+

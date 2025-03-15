@@ -1,0 +1,127 @@
+Bug Summary: [15 Regression] ICE in vect_analyze_loop_1 on aarch64 with -Ofast in TSVC
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 14.2.0
+Known to Fail: 15.0
+
+Comments:
+- User: N/A | Time: 2024-09-06 07:27:52 UTC
+  Text: The testcase is reduced from TSVC:
+
+typedef float c;
+c a[2000], b[0];
+void d() {
+  for (int e = 0; e < 2000; e++)
+    if (b[e])
+      a[e] = b[e];
+}
+
+ICEs with -Ofast -mcpu=neoverse-v2
+during GIMPLE pass: vect
+tsvc.i: In function ‘d’:
+tsvc.i:3:6: internal compiler error: in vect_analyze_loop_1, at tree-vect-loop.cc:3481
+    3 | void d() {
+      |      ^
+0x21d897b internal_error(char const*, ...)
+        $SRC/gcc/diagnostic-global-context.cc:492
+0x7d8813 fancy_abort(char const*, int, char const*)
+        $SRC/gcc/diagnostic.cc:1658
+0x12dfaef vect_analyze_loop_1
+        $SRC/gcc/tree-vect-loop.cc:3481
+0x12e03ab vect_analyze_loop(loop*, vec_info_shared*)
+        $SRC/gcc/tree-vect-loop.cc:3682
+0x13256b7 try_vectorize_loop_1
+        $SRC/gcc/tree-vectorizer.cc:1068
+0x13256b7 try_vectorize_loop
+        $SRC/gcc/tree-vectorizer.cc:1184
+0x1325f87 execute
+        $SRC/gcc/tree-vectorizer.cc:1300
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: Andrew Pinski | Time: 2024-09-06 07:41:23 UTC
+  Text: What revision/commit id are you using? Is it before or afterr15-3411?
+
+- User: N/A | Time: 2024-09-06 07:42:35 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> What revision/commit id are you using? Is it before or afterr15-3411?It's a fairly freshg:6a1a856ba78589f7f5285b00ecd40ba2bbeef8b0
+
+- User: Tamar Christina | Time: 2024-09-06 07:44:26 UTC
+  Text: Still seems to ICE after that commit on last night's trunkhttps://godbolt.org/z/GnYT7Kx46
+
+- User: Richard Biener | Time: 2024-09-06 09:04:11 UTC
+  Text: Confirmed.  The ICE means we've "fatally" failed to analyze an epilogue which we do not expect.
+
+t.c:4:21: note:   worklist: examine stmt: .MASK_STORE (&a[e_10], 8B, _9 != 0, _1);
+t.c:4:21: note:   vect_is_simple_use: operand _9 != 0, type of def: unknown
+t.c:4:21: missed:   Unsupported pattern.
+
+possibly the embedded _9 != 0 is the problem?
+
+t.c:4:21: note:   vect_recog_bool_pattern: detected: _ifc__24 = _9 ? _1 : _ifc__22;
+t.c:4:21: note:   bool pattern recognized: patt_8 = _9 != 0 ? _1 : _ifc__22;
+t.c:4:21: note:   vect_recog_cond_store_pattern: detected: a[e_10] = _ifc__24;
+t.c:4:21: note:   cond_store pattern recognized: .MASK_STORE (&a[e_10], 8B, _9 != 0, _1);
+
+- User: Tamar Christina | Time: 2024-09-06 09:07:22 UTC
+  Text: (In reply to Richard Biener fromcomment #4)> Confirmed.  The ICE means we've "fatally" failed to analyze an epilogue
+> which we do not expect.
+> 
+> t.c:4:21: note:   worklist: examine stmt: .MASK_STORE (&a[e_10], 8B, _9 !=
+> 0, _1);
+> t.c:4:21: note:   vect_is_simple_use: operand _9 != 0, type of def: unknown
+> t.c:4:21: missed:   Unsupported pattern.
+> 
+> possibly the embedded _9 != 0 is the problem?
+> 
+> t.c:4:21: note:   vect_recog_bool_pattern: detected: _ifc__24 = _9 ? _1 :
+> _ifc__22;
+> t.c:4:21: note:   bool pattern recognized: patt_8 = _9 != 0 ? _1 : _ifc__22;
+> t.c:4:21: note:   vect_recog_cond_store_pattern: detected: a[e_10] =
+> _ifc__24;
+> t.c:4:21: note:   cond_store pattern recognized: .MASK_STORE (&a[e_10], 8B,
+> _9 != 0, _1);Hmmm if sohttps://gcc.gnu.org/pipermail/gcc-patches/2024-September/662146.htmlshould fix it?
+
+- User: Tamar Christina | Time: 2024-09-06 09:33:21 UTC
+  Text: I'll take this one then.
+
+- User: GCC Commits | Time: 2024-09-06 13:06:07 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:2c4438d39156493b5b382eb48b1f884ca5ab7ed4commitr15-3518-g2c4438d39156493b5b382eb48b1f884ca5ab7ed4Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Fri Sep 6 14:05:43 2024 +0100
+
+    middle-end: check that the lhs of a COND_EXPR is an SSA_NAME in cond_store recognition [PR116628]
+    
+    Because the vect_recog_bool_pattern can at the moment still transition
+    out of GIMPLE and back into GENERIC the vect_recog_cond_store_pattern can
+    end up using an expression as a mask rather than an SSA_NAME.
+    
+    This adds an explicit check that we have a mask and not an expression.
+    
+    gcc/ChangeLog:PR tree-optimization/116628* tree-vect-patterns.cc (vect_recog_cond_store_pattern): Add SSA_NAME
+            check on expression.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/116628* gcc.dg/vect/pr116628.c: New test.
+
+- User: Tamar Christina | Time: 2024-09-06 13:09:29 UTC
+  Text: Fixed, thanks for the report!
+
+- User: GCC Commits | Time: 2024-09-20 16:02:58 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:0189ab205aa86b8e67ae982294f0fe58aa9c4774commitr15-3738-g0189ab205aa86b8e67ae982294f0fe58aa9c4774Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Fri Sep 20 17:01:39 2024 +0100
+
+    testsuite: Update commandline forPR116628.c to use neoverse-v2 [PR116628]
+    
+    The testcase for this tests needs Neoverse V2 to be used
+    since due to costing the other cost models don't pick this
+    particular SVE mode.
+    
+    committed as obvious.
+    
+    Thanks,
+    Tamar
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/116628* gcc.dg/vect/pr116628.c: Update cmdline.
+

@@ -1,0 +1,420 @@
+Bug Summary: [lra][avr] internal compiler error: in final_scan_insn_1, at final.cc:2807
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: build, ice-on-valid-code, patch, ra
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Georg-Johann Lay | Time: 2024-08-31 15:36:50 UTC
+  Text: Createdattachment 59030[details]lra-bug3.c: C test case from libgcc
+
+$ avr-gcc lra-bug3.c -mmcu=avr25 -Os -S -mlra -fnon-call-exceptions
+
+lra-bug3.c: In function '__divmoddi4':
+lra-bug3.c:214:1: error: could not split insn
+  214 | }
+      | ^
+(insn 528 1670 1671 (parallel [
+            (set (reg/v:SI 24 r24 [orig:146 __q1 ] [146])
+                (plus:SI (reg/v:SI 24 r24 [orig:146 __q1 ] [146])
+                    (const_int -2 [0xfffffffffffffffe])))
+            (clobber (mem/c:QI (plus:HI (reg/f:HI 28 r28)
+                        (const_int 33 [0x21])) [6 %sfp+33 S1 A8]))
+        ]) "lra-bug3.c":163:405 discrim 7 186 {addsi3}
+     (nil))
+during RTL pass: final
+dump file: lra-bug3.c.357r.final
+lra-bug3.c:214:1: internal compiler error: in final_scan_insn_1, at final.cc:2807
+
+That insn is invalid, of course.  With -da, the .ira dump reads:
+
+(insn 500 499 501 65 (parallel [
+            (set (reg/v:SI 146 [ __q1 ])
+                (plus:SI (reg/v:SI 146 [ __q1 ])
+                    (const_int -2 [0xfffffffffffffffe])))
+            (clobber (scratch:QI))
+        ]) "lra-bug3.c":163:405 discrim 7 186 {addsi3}
+     (nil))
+
+so everything is fine (at least as far as the dump goes).  .reload has then:
+
+(insn 1393 499 500 89 (set (reg/v:SI 18 r18 [orig:146 __q1 ] [146])
+        (mem/c:SI (plus:HI (reg/f:HI 28 r28)
+                (const_int 33 [0x21])) [6 %sfp+33 S4 A8])) "lra-bug3.c":163:405 discrim 7 119 {*movsi_split}
+     (nil))
+(insn 500 1393 1394 89 (parallel [
+            (set (reg/v:SI 18 r18 [orig:146 __q1 ] [146])
+                (plus:SI (reg/v:SI 18 r18 [orig:146 __q1 ] [146])
+                    (const_int -2 [0xfffffffffffffffe])))
+            (clobber (mem/c:QI (plus:HI (reg/f:HI 28 r28)
+                        (const_int 33 [0x21])) [6 %sfp+33 S1 A8]))
+        ]) "lra-bug3.c":163:405 discrim 7 186 {addsi3}
+     (nil))
+
+As it seems, R146 has been spilled to FP+33, and insn 1393 is loading it to R18.  The clobber operand looks like a colateral damage.  FYI, the insn reads:
+
+;; "addsi3"
+;; "addsq3" "addusq3"
+;; "addsa3" "addusa3"
+(define_insn_and_split "add<mode>3"
+  [(set (match_operand:ALL4 0 "register_operand"          "=??r,d ,r")
+        (plus:ALL4 (match_operand:ALL4 1 "register_operand" "%0,0 ,0")
+                   (match_operand:ALL4 2 "nonmemory_operand" "r,i ,n Ynn")))
+   (clobber (match_scratch:QI 3                             "=X,X ,&d"))]
+  ""
+  "#"
+  "&& reload_completed"
+  ...)
+
+A QImode scratch is only required when op0 ends up in a non-d register (REGNO < 16), hence the 2nd alternatice should match and op3 = scratch:QI.
+
+This ICE is relatively new; I don't see it with "gcc version 15.0.0 20240818".
+
+Target: avr
+Configured with: ../../source/gcc-master/configure --target=avr --disable-nls --with-dwarf2 --with-gnu-as --with-gnu-ld --disable-shared --with-long-double=64 --enable-languages=c,c++
+gcc version 15.0.0 20240831 (experimental) (GCC)
+
+- User: Georg-Johann Lay | Time: 2024-09-10 07:41:35 UTC
+  Text: (In reply to Georg-Johann Lay fromcomment #0)> This ICE is relatively new; I don't see it with "gcc version 15.0.0
+> 20240818".So that's just a matter of options.  The PR also occurs with 20240818 for the same test case:
+
+$ avr-gcc -S lra-bug3.c -O3 -mmcu=avr4 -mlra
+
+- User: Denis Chertykov | Time: 2024-09-21 09:42:30 UTC
+  Text: Probably I found a bug in lra-constraints.cc
+I can explain it later.
+Johan can you test the patch ?
+
+
+diff --git a/gcc/lra-constraints.cc b/gcc/lra-constraints.cc
+index fdcc07764a2..1f63113f321 100644
+--- a/gcc/lra-constraints.cc
++++ b/gcc/lra-constraints.cc
+@@ -680,7 +680,8 @@ get_reload_reg (enum op_type type, machine_mode mode, rtx original,
+ 	 used by reload instructions.  */
+       if (REG_P (original)
+ 	  && (int) REGNO (original) >= new_regno_start
+-	  && INSN_UID (curr_insn) >= new_insn_uid_start
++	  && (INSN_UID (curr_insn) >= new_insn_uid_start
++	      || ira_former_scratch_p (REGNO (original)))
+ 	  && in_class_p (original, rclass, &new_class, true))
+ 	{
+ 	  unsigned int regno = REGNO (original);
+
+- User: Denis Chertykov | Time: 2024-09-25 13:37:10 UTC
+  Text: Createdattachment 59192[details]LRA dump file
+
+- User: Denis Chertykov | Time: 2024-09-25 13:45:46 UTC
+  Text: Explanation.
+
+Test file: udivmoddi.c
+problem insn: 484
+
+Before LRA pass we have:
+(insn 484 483 485 72 (parallel [
+            (set (reg/v:SI 143 [ __q1 ])
+                (plus:SI (reg/v:SI 143 [ __q1 ])
+                    (const_int -2 [0xfffffffffffffffe])))
+            (clobber (scratch:QI))
+        ]) "udivmoddi.c":163:405 discrim 5 186 {addsi3}
+     (nil))
+
+LRA substitute all scratches with new pseudos, so we have: 
+(insn 484 483 485 72 (parallel [
+            (set (reg/v:SI 143 [ __q1 ])
+                (plus:SI (reg/v:SI 143 [ __q1 ])
+                    (const_int -2 [0xfffffffffffffffe])))
+            (clobber (reg:QI 619))
+        ]) "/mnt/d/avr-lra/udivmoddi.c":163:405 discrim 5 186 {addsi3}
+     (expr_list:REG_UNUSED (reg:QI 619)
+        (nil)))
+
+Pseudo 619 is a special scratch register generated by LRA which is marked in `scratch_bitmap' and can be tested by call `ira_former_scratch_p(regno)'.
+
+In dump file (udivmoddi.c.317r.reload) we have:
+      Creating newreg=619
+Removing SCRATCH to p619 in insn #484 (nop 3)
+rescanning insn with uid = 484.
+
+After that LRA trying to spill (reg:QI 619)
+It's a bug because (reg:QI 619) is an output scratch register which is already something like spill register.
+
+Fragment from udivmoddi.c.317r.reload:
+      Choosing alt 2 in insn 484:  (0) r  (1) 0  (2) nYnn  (3) &d {addsi3}
+      Creating newreg=728 from oldreg=619, assigning class LD_REGS to r728
+
+IMHO: the bug is in lra-constraints.cc in function `get_reload_reg'
+fragment of `get_reload_reg':
+  if (type == OP_OUT)
+    {
+      /* Output reload registers tend to start out with a conservative
+	 choice of register class.  Usually this is ALL_REGS, although
+	 a target might narrow it (for performance reasons) through
+	 targetm.preferred_reload_class.  It's therefore quite common
+	 for a reload instruction to require a more restrictive class
+	 than the class that was originally assigned to the reload register.
+
+	 In these situations, it's more efficient to refine the choice
+	 of register class rather than create a second reload register.
+	 This also helps to avoid cycling for registers that are only
+	 used by reload instructions.  */
+      if (REG_P (original)
+	  && (int) REGNO (original) >= new_regno_start
+	  && INSN_UID (curr_insn) >= new_insn_uid_start
+__________________________________^^	  
+	  && in_class_p (original, rclass, &new_class, true))
+	{
+	  unsigned int regno = REGNO (original);
+	  if (lra_dump_file != NULL)
+	    {
+	      fprintf (lra_dump_file, "	 Reuse r%d for output ", regno);
+	      dump_value_slim (lra_dump_file, original, 1);
+	    }
+
+
+This condition incorrectly limits register reuse to ONLY newly generated instructions.
+i.e. LRA can reuse register only from insns generated by himself.
+
+IMHO:It's wrong.
+Scratch registers generated by LRA also have to be reused.
+
+The patch is very simple.
+
+- User: Georg-Johann Lay | Time: 2024-09-26 06:50:47 UTC
+  Text: Createdattachment 59196[details]diff-test.txt: avr testsuite delta
+
+(In reply to denisc fromcomment #2)> Johan can you test the patch ?On x86_64, it bootstraps+regtests fine.
+
+On avr, I am getting quite a delta like attached.
+
+- User: Georg-Johann Lay | Time: 2024-09-26 07:35:29 UTC
+  Text: ...I am stuck here.  When I am testing locally, a single test like
+
+$ make -k check-gcc RUNTESTFLAGS="--target_board=atmega128-sim --tool_opts=-mlra compile.exp=20011119-1.c -all"
+
+works fine, but on the remote (cfarm421 in that case) I am getting UNRESOLVED/UNSUPPORTED result.
+
+- User: Georg-Johann Lay | Time: 2024-09-26 09:17:27 UTC
+  Text: Createdattachment 59197[details]diff-test-v2.txt
+
+Results are looking good on avr, too (I had a nit in PATH).
+
+- User: Georg-Johann Lay | Time: 2024-09-26 09:33:21 UTC
+  Text: Though it seems there are also new execution FAILs:
+
+$ make -k check-gcc RUNTESTFLAGS="--target_board=atmega128-sim --tool_opts=-mlra execute.exp=simd-[12].c -all"
+
+Running /home/john/xgnu/source/gcc-master/gcc/testsuite/gcc.c-torture/execute/execute.exp ...
+PASS: gcc.c-torture/execute/simd-1.c   -O0  (test for excess errors)
+PASS: gcc.c-torture/execute/simd-1.c   -O0  execution test
+PASS: gcc.c-torture/execute/simd-1.c   -O1  (test for excess errors)
+FAIL: gcc.c-torture/execute/simd-1.c   -O1  execution test
+PASS: gcc.c-torture/execute/simd-1.c   -O2  (test for excess errors)
+FAIL: gcc.c-torture/execute/simd-1.c   -O2  execution test
+PASS: gcc.c-torture/execute/simd-1.c   -O3 -g  (test for excess errors)
+FAIL: gcc.c-torture/execute/simd-1.c   -O3 -g  execution test
+PASS: gcc.c-torture/execute/simd-1.c   -Os  (test for excess errors)
+FAIL: gcc.c-torture/execute/simd-1.c   -Os  execution test
+PASS: gcc.c-torture/execute/simd-1.c   -O2 -flto -fno-use-linker-plugin -flto-partition=none  (test for excess errors)
+FAIL: gcc.c-torture/execute/simd-1.c   -O2 -flto -fno-use-linker-plugin -flto-partition=none  execution test
+PASS: gcc.c-torture/execute/simd-1.c   -O2 -flto -fuse-linker-plugin -fno-fat-lto-objects  (test for excess errors)
+PASS: gcc.c-torture/execute/simd-1.c   -O2 -flto -fuse-linker-plugin -fno-fat-lto-objects  execution test
+PASS: gcc.c-torture/execute/simd-2.c   -O0  (test for excess errors)
+PASS: gcc.c-torture/execute/simd-2.c   -O0  execution test
+PASS: gcc.c-torture/execute/simd-2.c   -O1  (test for excess errors)
+PASS: gcc.c-torture/execute/simd-2.c   -O1  execution test
+PASS: gcc.c-torture/execute/simd-2.c   -O2  (test for excess errors)
+FAIL: gcc.c-torture/execute/simd-2.c   -O2  execution test
+PASS: gcc.c-torture/execute/simd-2.c   -O3 -g  (test for excess errors)
+FAIL: gcc.c-torture/execute/simd-2.c   -O3 -g  execution test
+PASS: gcc.c-torture/execute/simd-2.c   -Os  (test for excess errors)
+FAIL: gcc.c-torture/execute/simd-2.c   -Os  execution test
+FAIL: gcc.c-torture/execute/simd-2.c   -O2 -flto -fno-use-linker-plugin -flto-partition=none  (internal compiler error: in patch_jump_insn, at cfgrtl.cc:1303)
+FAIL: gcc.c-torture/execute/simd-2.c   -O2 -flto -fno-use-linker-plugin -flto-partition=none  (test for excess errors)
+FAIL: gcc.c-torture/execute/simd-2.c   -O2 -flto -fno-use-linker-plugin -flto-partition=none  execution test
+PASS: gcc.c-torture/execute/simd-2.c   -O2 -flto -fuse-linker-plugin -fno-fat-lto-objects  (test for excess errors)
+PASS: gcc.c-torture/execute/simd-2.c   -O2 -flto -fuse-linker-plugin -fno-fat-lto-objects  execution test
+
+- User: Georg-Johann Lay | Time: 2024-09-26 10:01:00 UTC
+  Text: The gcc.c-torture/execute/simd-[12].c tests PASS with -mno-lra but are FAILing with -mlra.  Without your patch there are some ICEs, with your patch it's only execution FAILs.
+
+- User: Denis Chertykov | Time: 2024-10-02 16:22:03 UTC
+  Text: Createdattachment 59265[details]Reduced test case
+
+I have reduced the test case.
+
+The bug in calculation of 'k = i & j;'
+It have to be '{2, 4, 20, 8}', 
+but it '{2, 0, 20, 8}'
+
+- User: Georg-Johann Lay | Time: 2024-10-02 18:44:51 UTC
+  Text: There'sPR116778that also produces wrong code; maybe it's the same issue -- but easier to analyse.  At least for that PR the bad insn is already known.
+
+- User: Richard Sandiford | Time: 2024-10-09 20:27:02 UTC
+  Text: (In reply to denisc fromcomment #4)> Explanation.
+> […]Thanks for the great explanation!  Based on that, the patch LGTM FWIW, although Vlad should have the final say.
+
+- User: Segher Boessenkool | Time: 2024-10-10 14:09:21 UTC
+  Text: Yeah :-)  So post an actual patch, to gcc-patches@?  :-)
+
+- User: Denis Chertykov | Time: 2024-10-10 18:36:50 UTC
+  Text: I sent a patch "[PATCH][LRA][PR116550] Reuse scratch registers generated by LRA"
+
+- User: Denis Chertykov | Time: 2024-10-16 07:47:27 UTC
+  Text: (In reply to Segher Boessenkool fromcomment #13)> Yeah :-)  So post an actual patch, to gcc-patches@?  :-)PING ...
+I sent a patch.
+
+- User: Sam James | Time: 2024-10-16 08:29:18 UTC
+  Text: https://inbox.sourceware.org/gcc-patches/70ac546b-984c-4f84-9b5c-d3ff71f8cbe9@gmail.com/
+
+- User: Georg-Johann Lay | Time: 2024-10-16 08:38:01 UTC
+  Text: (In reply to denisc fromcomment #15)> I sent a patch.What might help is to CC the respective maintainer as listed in MAINTAINERS.
+
+- User: Denis Chertykov | Time: 2024-10-16 15:31:53 UTC
+  Text: (In reply to Georg-Johann Lay fromcomment #17)> (In reply to denisc fromcomment #15)
+> > I sent a patch.
+> 
+> What might help is to CC the respective maintainer as listed in MAINTAINERS.Done.
+"PING - [PATCH][LRA][PR116550] Reuse scratch registers generated by LRA"https://gcc.gnu.org/pipermail/gcc-patches/2024-October/665646.htmlI think that Richard can approve it as a general maintainer.
+
+- User: Sam James | Time: 2024-10-17 05:28:05 UTC
+  Text: (In reply to denisc fromcomment #18)
+
+Vlad is pretty active and fast to reply to pings as well. And looks like he's approved it already now even. But I mean in general with LRA, it's not like it's a dead subsystem or something.
+
+- User: GCC Commits | Time: 2024-10-17 07:14:59 UTC
+  Text: The master branch has been updated by Denis Chertykov <denisc@gcc.gnu.org>:https://gcc.gnu.org/g:e7393cbb5f2cae50b42713e71984064073aa378acommitr15-4406-ge7393cbb5f2cae50b42713e71984064073aa378aAuthor: Denis Chertykov <chertykov@gmail.com>
+Date:   Thu Oct 17 11:12:38 2024 +0400
+
+    The detailed explanation fromPR116550:
+    
+    Test file: udivmoddi.c
+    problem insn: 484
+    
+    Before LRA pass we have:
+    (insn 484 483 485 72 (parallel [
+                (set (reg/v:SI 143 [ __q1 ])
+                    (plus:SI (reg/v:SI 143 [ __q1 ])
+                        (const_int -2 [0xfffffffffffffffe])))
+                (clobber (scratch:QI))
+            ]) "udivmoddi.c":163:405 discrim 5 186 {addsi3}
+         (nil))
+    
+    LRA substitute all scratches with new pseudos, so we have:
+    (insn 484 483 485 72 (parallel [
+                (set (reg/v:SI 143 [ __q1 ])
+                    (plus:SI (reg/v:SI 143 [ __q1 ])
+                        (const_int -2 [0xfffffffffffffffe])))
+                (clobber (reg:QI 619))
+            ]) "/mnt/d/avr-lra/udivmoddi.c":163:405 discrim 5 186 {addsi3}
+         (expr_list:REG_UNUSED (reg:QI 619)
+            (nil)))
+    
+    Pseudo 619 is a special scratch register generated by LRA which is marked in `scratch_bitmap' and can be tested by call `ira_former_scratch_p(regno)'.
+    
+    In dump file (udivmoddi.c.317r.reload) we have:
+          Creating newreg=619
+    Removing SCRATCH to p619 in insn #484 (nop 3)
+    rescanning insn with uid = 484.
+    
+    After that LRA tries to spill (reg:QI 619)
+    It's a bug because (reg:QI 619) is an output scratch register which is already something like spill register.
+    
+    Fragment from udivmoddi.c.317r.reload:
+          Choosing alt 2 in insn 484:  (0) r  (1) 0  (2) nYnn  (3) &d {addsi3}
+          Creating newreg=728 from oldreg=619, assigning class LD_REGS to r728
+    
+    IMHO: the bug is in lra-constraints.cc in function `get_reload_reg'
+    fragment of `get_reload_reg':
+      if (type == OP_OUT)
+        {
+          /* Output reload registers tend to start out with a conservative
+             choice of register class.  Usually this is ALL_REGS, although
+             a target might narrow it (for performance reasons) through
+             targetm.preferred_reload_class.  It's therefore quite common
+             for a reload instruction to require a more restrictive class
+             than the class that was originally assigned to the reload register.
+    
+             In these situations, it's more efficient to refine the choice
+             of register class rather than create a second reload register.
+             This also helps to avoid cycling for registers that are only
+             used by reload instructions.  */
+          if (REG_P (original)
+              && (int) REGNO (original) >= new_regno_start
+              && INSN_UID (curr_insn) >= new_insn_uid_start
+    __________________________________^^
+              && in_class_p (original, rclass, &new_class, true))
+            {
+              unsigned int regno = REGNO (original);
+              if (lra_dump_file != NULL)
+                {
+                  fprintf (lra_dump_file, "  Reuse r%d for output ", regno);
+                  dump_value_slim (lra_dump_file, original, 1);
+                }
+    
+    This condition incorrectly limits register reuse to ONLY newly generated instructions.
+    i.e. LRA can reuse registers only from insns generated by himself.
+    
+    IMHO:It's wrong.
+    Scratch registers generated by LRA also have to be reused.
+    
+    The patch is very simple.
+    On x86_64, it bootstraps+regtests fine.
+    
+    gcc/PR target/116550* lra-constraints.cc (get_reload_reg): Reuse scratch registers
+            generated by LRA.
+
+- User: GCC Commits | Time: 2024-10-17 11:27:45 UTC
+  Text: The master branch has been updated by Georg-Johann Lay <gjl@gcc.gnu.org>:https://gcc.gnu.org/g:e74d25cd00629e001038cf6ff83e48d7ca6f4873commitr15-4410-ge74d25cd00629e001038cf6ff83e48d7ca6f4873Author: Georg-Johann Lay <avr@gjlay.de>
+Date:   Thu Oct 17 13:19:51 2024 +0200
+
+    rtl-optimization/116550 - Add test cases.PR rtl-optimization/116550gcc/testsuite/
+            * gcc.target/avr/torture/lra-pr116550-1.c: New file.
+            * gcc.target/avr/torture/lra-pr116550-2.c: New file.
+
+- User: Georg-Johann Lay | Time: 2024-10-17 11:31:46 UTC
+  Text: I allowed me to add some test cases.  Unfortunatels, one of them is failing with the patch and -mlra, whereas is passes with -mno-lra.
+
+In $builddir/gcc:
+
+$ make -k check-gcc RUNTESTFLAGS="--target_board=atmega128-sim --tool_opts='-mlra' avr-torture.exp=lra-pr116550-2.c"
+[...]
+Running /home/john/xgnu/source/gcc-master/gcc/testsuite/gcc.target/avr/torture/avr-torture.exp ...
+FAIL: gcc.target/avr/torture/lra-pr116550-2.c   -O1  execution test
+
+		=== gcc Summary ===
+
+# of expected passes		21
+# of unexpected failures	1
+
+- User: Georg-Johann Lay | Time: 2024-10-17 11:35:59 UTC
+  Text: (In reply to Georg-Johann Lay fromcomment #22)> Unfortunately, one of them [lra-pr116550-2.c} is failing
+> with the patch and -mlra, whereas is passes with -mno-lra.Ok, I messed that one up.  That test also fails with -mlra and without the patch.
+
+Closing this one as fixed.
+
+- User: Denis Chertykov | Time: 2024-10-17 13:15:43 UTC
+  Text: (In reply to Georg-Johann Lay fromcomment #23)> (In reply to Georg-Johann Lay fromcomment #22)
+> > Unfortunately, one of them [lra-pr116550-2.c} is failing
+> > with the patch and -mlra, whereas is passes with -mno-lra.
+> 
+> Ok, I messed that one up.  That test also fails with -mlra and without the
+> patch.
+> 
+> Closing this one as fixed.I'm in the process of analyzing lra-pr116550-2.c (or simd-r.c as I call it first).
+The real wrong things happened in dse2 pass.
+The dse2 pass made a wrong elimination of a few store insns.
+
+Right now I can't say if it is the lra derived bug or a clean dse2 bug.
+
+Johann do you think that it is better to open a new bug for lra-pr116550-2.c ?
+
+- User: Georg-Johann Lay | Time: 2024-10-17 13:48:38 UTC
+  Text: (In reply to denisc fromcomment #24)> Johann do you think that it is better to open a new bug for lra-pr116550-2.cYes, seems to be a different issue.
+
+- User: Georg-Johann Lay | Time: 2024-10-17 15:03:05 UTC
+  Text: (In reply to denisc fromcomment #24)> Johann do you think that it is better to open a new bug for lra-pr116550-2.c ?Filed asPR117189.
+

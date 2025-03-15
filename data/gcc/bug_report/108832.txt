@@ -1,0 +1,204 @@
+Bug Summary: [13 Regression] ICE in replace_rtx, at rtlanal.cc:3358
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Arseny Solokha | Time: 2023-02-17 10:28:27 UTC
+  Text: gcc 13.0.1 20230212 snapshot (g:06ca0c9abb260266b688e2c2154c72214bb47076) ICEs when compiling the following testcase w/ -O2 -funroll-loops:
+
+unsigned int m;
+short int n;
+
+long int
+bar (unsigned int x)
+{
+  return x ? x : 1;
+}
+
+__attribute__ ((simd)) void
+foo (void)
+{
+  int a;
+
+  a = m / bar (3);
+  n = 1 % bar (a << 1);
+}
+
+% x86_64-pc-linux-gnu-gcc-13 -O2 -funroll-loops -c rxkpgn0d.c
+during RTL pass: peephole2
+rxkpgn0d.c: In function 'foo.simdclone.7':
+rxkpgn0d.c:17:1: internal compiler error: in replace_rtx, at rtlanal.cc:3358
+   17 | }
+      | ^
+0x73a043 replace_rtx(rtx_def*, rtx_def*, rtx_def*, bool)
+	/var/tmp/portage/sys-devel/gcc-13.0.1_p20230212/work/gcc-13-20230212/gcc/rtlanal.cc:3358
+0xe97803 replace_rtx(rtx_def*, rtx_def*, rtx_def*, bool)
+	/var/tmp/portage/sys-devel/gcc-13.0.1_p20230212/work/gcc-13-20230212/gcc/rtlanal.cc:3397
+0xe97803 replace_rtx(rtx_def*, rtx_def*, rtx_def*, bool)
+	/var/tmp/portage/sys-devel/gcc-13.0.1_p20230212/work/gcc-13-20230212/gcc/rtlanal.cc:3397
+0x19035d6 gen_peephole2_125(rtx_insn*, rtx_def**)
+	/var/tmp/portage/sys-devel/gcc-13.0.1_p20230212/work/gcc-13-20230212/gcc/config/i386/i386.md:22054
+0x1c816cc peephole2_17
+	/var/tmp/portage/sys-devel/gcc-13.0.1_p20230212/work/gcc-13-20230212/gcc/config/i386/i386.md:1077
+0x1c816cc peephole2_19
+	/var/tmp/portage/sys-devel/gcc-13.0.1_p20230212/work/gcc-13-20230212/gcc/config/i386/i386.md:1094
+0x1cbb55d peephole2_46
+	/var/tmp/portage/sys-devel/gcc-13.0.1_p20230212/work/gcc-13-20230212/gcc/config/i386/i386.md:5200
+0xe62447 peephole2_optimize
+	/var/tmp/portage/sys-devel/gcc-13.0.1_p20230212/work/gcc-13-20230212/gcc/recog.cc:4180
+0xe62447 rest_of_handle_peephole2
+	/var/tmp/portage/sys-devel/gcc-13.0.1_p20230212/work/gcc-13-20230212/gcc/recog.cc:4331
+0xe62447 execute
+	/var/tmp/portage/sys-devel/gcc-13.0.1_p20230212/work/gcc-13-20230212/gcc/recog.cc:4368
+
+- User: Jakub Jelinek | Time: 2023-02-17 11:40:18 UTC
+  Text: So, this is on
+(insn 263 304 17 2 (set (reg:DI 2 cx [98])
+        (reg:DI 1 dx [98])) "pr108832.c":15:9 discrim 1 82 {*movdi_internal}
+     (expr_list:REG_DEAD (reg:DI 1 dx [98])
+        (nil)))
+(insn 17 263 261 2 (parallel [
+            (set (reg:CCZ 17 flags)
+                (compare:CCZ (and:SI (reg:SI 2 cx [98])
+                        (const_int -2 [0xfffffffffffffffe]))
+                    (const_int 0 [0])))
+            (set (reg:DI 2 cx)
+                (zero_extend:DI (and:SI (reg:SI 2 cx [98])
+                        (const_int -2 [0xfffffffffffffffe]))))
+        ]) "pr108832.c":16:11 565 {*andsi_2_zext}
+     (nil))
+(insn 261 17 259 2 (set (reg:DI 0 ax)
+        (const_int 1 [0x1])) 82 {*movdi_internal}
+     (expr_list:REG_EQUIV (const_int 1 [0x1])
+        (nil)))
+(insn 259 261 4 2 (set (reg:DI 2 cx)
+        (if_then_else:DI (ne (reg:CCZ 17 flags)
+                (const_int 0 [0]))
+            (reg:DI 2 cx)
+            (reg:DI 0 ax))) 1304 {*movdicc_noc}
+     (expr_list:REG_DEAD (reg:CCZ 17 flags)
+        (expr_list:REG_DEAD (reg:DI 0 ax)
+            (nil))))
+on which
+;; Eliminate a reg-reg mov by inverting the condition of a cmov (#1).
+;; mov r0,r1; dec r0; mov r2,r3; cmov r0,r2 -> dec r1; mov r0,r3; cmov r0, r1
+(define_peephole2
+ [(set (match_operand:SWI248 0 "general_reg_operand")
+       (match_operand:SWI248 1 "general_reg_operand"))
+  (parallel [(set (reg FLAGS_REG) (match_operand 5))
+             (set (match_dup 0) (match_operand:SWI248 6))])
+  (set (match_operand:SWI248 2 "general_reg_operand")
+       (match_operand:SWI248 3 "general_gr_operand"))
+  (set (match_dup 0)
+       (if_then_else:SWI248 (match_operator 4 "ix86_comparison_operator"
+                             [(reg FLAGS_REG) (const_int 0)])
+        (match_dup 0)
+        (match_dup 2)))]
+ "TARGET_CMOVE
+  && REGNO (operands[2]) != REGNO (operands[0])
+  && REGNO (operands[2]) != REGNO (operands[1])
+  && peep2_reg_dead_p (1, operands[1])
+  && peep2_reg_dead_p (4, operands[2])
+  && !reg_overlap_mentioned_p (operands[0], operands[3])"
+ [(parallel [(set (match_dup 7) (match_dup 8))
+             (set (match_dup 1) (match_dup 9))])
+  (set (match_dup 0) (match_dup 3))
+  (set (match_dup 0) (if_then_else:SWI248 (match_dup 4)
+                                          (match_dup 1)
+                                          (match_dup 0)))]
+{
+  operands[7] = SET_DEST (XVECEXP (PATTERN (peep2_next_insn (1)), 0, 0));
+  operands[8] = replace_rtx (operands[5], operands[0], operands[1], true);
+  operands[9] = replace_rtx (operands[6], operands[0], operands[1], true);
+})
+
+applies.  replace_rtx has 2 modes, !all_regs in which it replaces just x == from with to
+and all_regs, in which case it does:
+  if (all_regs
+      && REG_P (x)
+      && REG_P (from)
+      && REGNO (x) == REGNO (from))
+    {
+      gcc_assert (GET_MODE (x) == GET_MODE (from));
+      return to;
+    }
+and so ICEs if we see the same REGNO as from in a different mode.
+I think we actually don't need most of what replace_rtx is doing, we don't need to simplify anything etc. because we are just changing one register to another and can do it in place.
+So, I think we need a different function for what the backend wants.
+It can avoid all the simplify stuff because replace_rtx was destructive, so could be implemented say using FOR_EACH_SUBRTX_PTR.  When seeing *loc == from, it obviously
+should set *loc = to, if it sees REG_P (*loc) && REGNO (*loc) == REGNO (from), then
+if the mode is the same, it can also just *loc = to, but if it is a different mode,
+I'd say for narrower mode it should *loc = gen_rtx_REG (GET_MODE (*loc), REGNO (to));
+and for wider mode (especially if say a multi-register reg) punt.
+Not sure if such a case can occur though, but the punting would be hard if we have made some changes already...
+
+- User: Richard Biener | Time: 2023-02-17 11:51:14 UTC
+  Text: Confirmed.
+
+- User: Jakub Jelinek | Time: 2023-02-17 11:57:37 UTC
+  Text: ICEs sincer13-4224-g826c22dff6455ba32, latent before.
+
+- User: Uroš Bizjak | Time: 2023-02-17 13:16:06 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #1)> and so ICEs if we see the same REGNO as from in a different mode.
+> I think we actually don't need most of what replace_rtx is doing, we don't
+> need to simplify anything etc. because we are just changing one register to
+> another and can do it in place.
+> So, I think we need a different function for what the backend wants.
+> It can avoid all the simplify stuff because replace_rtx was destructive, so
+> could be implemented say using FOR_EACH_SUBRTX_PTR.  When seeing *loc ==
+> from, it obviously
+> should set *loc = to, if it sees REG_P (*loc) && REGNO (*loc) == REGNO
+> (from), then
+> if the mode is the same, it can also just *loc = to, but if it is a
+> different mode,
+> I'd say for narrower mode it should *loc = gen_rtx_REG (GET_MODE (*loc),
+> REGNO (to));
+> and for wider mode (especially if say a multi-register reg) punt.
+> Not sure if such a case can occur though, but the punting would be hard if
+> we have made some changes already...There are no multi-registers in flags-setting integer instructions, we only have instructions with implicit ZERO_EXTEND from SI to DImode in case of x86_64 target.
+
+So, a FOR_EACH_RTX loop that blindly changes REGNOs of the RTX should do the trick. Perhaps do it on a copied RTX, to avoid nasty surprises.
+
+- User: Jakub Jelinek | Time: 2023-02-17 13:45:27 UTC
+  Text: Createdattachment 54481[details]gcc13-pr108832.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2023-02-18 11:41:19 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:3c135697fd5f79db0954a79a48dcbba657e93f2ecommitr13-6131-g3c135697fd5f79db0954a79a48dcbba657e93f2eAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Sat Feb 18 12:40:04 2023 +0100
+
+    i386: Fix up replacement of registers in certain peephole2s [PR108832]
+    
+    As mentioned in the PR, replace_rtx has 2 modes, one that only replaces
+    x == from with to, the other which i386.md uses which also replaces
+    REGNO (x) == REGNO (from) with to if both are REGs, but assert they have
+    the same mode.  This is reasonable behavior if one replaces from with
+    some other expression, say constant etc., but ICEs whenever the register
+    appears in a different mode, which happens e.g. on the following testcase,
+    where from/to has DImode but inside of the operands we have SImode of
+    the from register.  replace_rtx also does some limited simplifications
+    (though far less than simplify_replace_fn_rtx), which is needed if
+    from a REG is replaced say with CONST_INT, but the peephole2s that use
+    this only replace one REG with another one.
+    
+    The following patch introduces a new backend function for this, avoids doing
+    any simplifications and just replaces the REGs, for safety on a copy of
+    the expression if any changes will be needed.
+    
+    2023-02-18  Jakub Jelinek  <jakub@redhat.com>PR target/108832* config/i386/i386-protos.h (ix86_replace_reg_with_reg): Declare.
+            * config/i386/i386-expand.cc (ix86_replace_reg_with_reg): New
+            function.
+            * config/i386/i386.md: Replace replace_rtx calls in all peephole2s
+            with ix86_replace_reg_with_reg.
+    
+            * gcc.target/i386/pr108832.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-02-18 11:41:46 UTC
+  Text: Fixed.
+

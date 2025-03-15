@@ -1,0 +1,208 @@
+Bug Summary: [13 Regression] wrong code with -Oz -fno-dce -fno-forward-propagate -flive-range-shrinkage -fweb since r13-1826
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 13.2.0
+Known to Fail: 13.2.1, 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-03-21 12:52:07 UTC
+  Text: Createdattachment 57755[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -Oz -fno-dce -fno-forward-propagate -flive-range-shrinkage -fweb testcase.c -Wno-psabi
+$ ./a.out 
+Aborted
+
+
+It seems the issue is in:
+
+
+   0x000000000040137e <+214>:   movq   $0x1,-0x1b0(%rbp)
+   0x0000000000401389 <+225>:   push   $0x10
+   0x000000000040138b <+227>:   pop    %rcx
+   0x000000000040138c <+228>:   rep movsl %ds:(%rsi),%es:(%rdi)
+=> 0x000000000040138e <+230>:   push   $0x10
+   0x0000000000401390 <+232>:   mov    %rbx,%rdi
+   0x0000000000401393 <+235>:   lea    -0xf0(%rbp),%rsi
+   0x000000000040139a <+242>:   pop    %rcx
+
+(gdb) p $rsp
+$48 = (void *) 0x7fffffffd3c0
+
+(gdb) p/x $rdi
+$50 = 0x7fffffffd3c0
+
+that "push" overwrites the destination of the just finished "rep movsd"; this is probably specific to -Oz
+
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-9591-20240321175934-gac2f8c2a367-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-9591-20240321175934-gac2f8c2a367-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240321 (experimental) (GCC)
+
+- User: Jakub Jelinek | Time: 2024-03-25 14:43:54 UTC
+  Text: Started withr13-1826-g16aafa3194d4851a07cc204f56a5f0618f77e5d7
+
+- User: Jakub Jelinek | Time: 2024-03-25 16:59:28 UTC
+  Text: Seems it is lr_shrinkage pass where things go wrong.
+In bar0, all the 3 calls the function makes have 2 64-byte arguments (plus 64-byte return passed by hidden reference).  -Oz apparently uses -mno-accumulate-outgoing-args, allocates some stack and then have (at least initially) before each of the 3 calls two spots which decrement %rsp by 64 and after each call one spot which increments %rsp by 128.
+csa merges the first %rsp -= 64 with the previous much larger %rsp decrement and in some cases the %rsp += 128 with following %rsp -= 64.
+The function sets %r12 to be the REG_ARGS_SIZE 64 %rsp level and %rbx to be the REG_ARGS_SIZE 128 %rsp level, i.e. %rbx = %r12 - 64.
+In asmcons pass, we still have before the call to bar1 %rsp -= 64; rep_movsi (fills in the second argument); %rsp -= 64; rep_movsi (fills in the first argument).
+But then lr_shrinkage pass moves both the stack decrements after all the rep_movsi calls, so we then have:
+(insn 60 71 66 2 (parallel [
+            (set (reg/f:DI 7 sp)
+                (plus:DI (reg/f:DI 7 sp)
+                    (const_int -64 [0xffffffffffffffc0])))
+            (clobber (reg:CC 17 flags))
+        ]) "pr114415.c":27:8 272 {*adddi_1}
+     (expr_list:REG_UNUSED (reg:CC 17 flags)
+        (expr_list:REG_ARGS_SIZE (const_int 64 [0x40])
+            (nil))))
+(insn 66 60 72 2 (parallel [
+            (set (reg/f:DI 7 sp)
+                (plus:DI (reg/f:DI 129)
+                    (const_int -64 [0xffffffffffffffc0])))
+            (clobber (reg:CC 17 flags))
+        ]) "pr114415.c":27:8 272 {*adddi_1}
+     (expr_list:REG_DEAD (reg/f:DI 129)
+        (expr_list:REG_UNUSED (reg:CC 17 flags)
+            (expr_list:REG_ARGS_SIZE (const_int 128 [0x80])
+                (nil)))))
+and just set of %rdi and call to bar1.
+
+Now, as x86-64 has red zone, this in theory could still work fine (dunno if backend is supposed to have some barriers which prevent moving the rep movsl insns across it, unfortunately the fact that it uses some %rsp based address is not visible directly in the insn due to CSE), but then comes peephole2
+;; With -Oz, transform mov $imm,reg to the shorter push $imm; pop reg.
+and converts the (set (reg:DI %rcx) (const_int 16)) insns to push/pop pair, which when
+the stack pointer is higher than it should have been causes clobbering of the value.
+
+- User: Jakub Jelinek | Time: 2024-03-25 17:15:34 UTC
+  Text: BTW, with additional -mno-red-zone there is still movement of these insns, though they           
+        leaq    128(%rbx), %rsp       ! level 0
+        movq    %r13, %rsi
+        movl    %r10d, %edx
+        rep stosl
+        andq    $0, -424(%rbp)
+        movq    %r12, %rdi
+        leaq    -112(%rbp), %rax
+        movq    $1, -432(%rbp)
+        pushq   $16
+        popq    %rcx
+        rep movsl                     ! fill in second argument - at %rsp - 64
+        pushq   $16                   ! again overwrite last 8 bytes of the second argument
+        movq    %rbx, %rdi
+        leaq    -240(%rbp), %rsi
+        popq    %rcx
+        movq    %r12, %rsp            ! level 64
+        movq    %rbx, %rsp            ! level 128
+        rep movsl                     ! fill in first argument
+        xchgq   %rax, %rdi
+        call    bar1
+
+Ah, and it is sched2 pass which moves the movq %r12, %rsp and movq %rbx, %rsp instructions before the second rep movsl.
+
+- User: Vladimir Makarov | Time: 2024-04-03 16:28:12 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #3)> BTW, with additional -mno-red-zone there is still movement of these insns,
+>The problem is even bigger.  Live range splitting uses a standard insn dependency calculation of the scheduler.  The scheduler can not recognize that there should be dependencies between insns 60/66 and 65/71:
+
+   60: {sp:DI=sp:DI-0x40;clobber flags:CC;}                                                                                                                                                                                                                                      
+   65: {r262:DI=0;r161:DI=r132:DI<<0x2+r129:DI;r162:DI=r132:DI<<0x2+r140:DI;[r129:DI]=[r140:DI];use r132:DI;}                                                                                                                                                                    
+   66: {sp:DI=r129:DI-0x40;clobber flags:CC;}                                                                                                                                                                                                                                    
+   71: {r263:DI=0;r165:DI=r132:DI<<0x2+r136:DI;r166:DI=r132:DI<<0x2+r128:DI;[r136:DI]=[r128:DI];use r132:DI;}                                                                                                                                                                    
+
+Therefore it moves insns 65 and 71 before insn 60 during live range shrinkage.  It is wrong when there is no red zone but, even worse, split3 inserts the following
+
+  446: [--sp:DI]=0x10
+  447: cx:DI=[sp:DI++]
+
+between insns 65 and 71 before insn 60 which makes code wrong (rewriting memory updated by insn 65) even if there is a red zone.
+
+The analogous problem could occur in sched1 or/and sched2 when we don't use live range shrinkage.
+
+There is no way that the scheduler find and create specific deps 60->65, 66->65 (too much analysis is required to find insn 65 or 71 works with the stack)
+
+I see two possible solutions:
+  1. prohibit sched1, sched2, and live range shrinkage when accumulating args is used
+  2. create deps between any stack modification insns and memory modification insns
+
+The first one is easier and affects only one target (although the same problem can be on other targets).  Still probably the same should be done for selective scheduler.
+
+The second one is the safest approach solving problems on all targets but may affect performance of other targets.  The fix can require more time to implement.
+
+I'll think a bit about the possible fixes and inform you tomorrow.
+
+- User: Vladimir Makarov | Time: 2024-04-04 11:32:44 UTC
+  Text: After some considerations, I've decided to fix it in the scheduler.
+
+Such approach solves the problem for all targets and schedulers, still permitting live range shrinkage (important for space optimizations) and scheduling for all option cases.
+
+I see the only downside in adding additional dependencies for stack pointer modifications.  But such insns have very small latency time and increase critical paths only quite a bit.
+
+I'll push the patch today or tomorrow.
+
+- User: GCC Commits | Time: 2024-04-04 20:07:23 UTC
+  Text: The master branch has been updated by Vladimir Makarov <vmakarov@gcc.gnu.org>:https://gcc.gnu.org/g:a24476422ba311b83737cf8bdc5892a7fc7514ebcommitr14-9793-ga24476422ba311b83737cf8bdc5892a7fc7514ebAuthor: Vladimir N. Makarov <vmakarov@redhat.com>
+Date:   Thu Apr 4 16:04:04 2024 -0400
+
+    [PR114415][scheduler]: Fixing wrong code generation
+    
+      For the test case, the insn scheduler (working for live range
+    shrinkage) moves insns modifying stack memory before an insn reserving
+    the stack memory. Comments in the patch contains more details about
+    the problem and its solution.
+    
+    gcc/ChangeLog:PR rtl-optimization/114415* sched-deps.cc (add_insn_mem_dependence): Add memory check for mem argument.
+            (sched_analyze_1): Treat stack pointer modification as memory read.
+            (sched_analyze_2, sched_analyze_insn): Add memory guard for processing pending_read_mems.
+            * sched-int.h (deps_desc): Add comment to pending_read_mems.
+    
+    gcc/testsuite/ChangeLog:PR rtl-optimization/114415* gcc.target/i386/pr114415.c: New test.
+
+- User: Jeffrey A. Law | Time: 2024-04-05 04:10:14 UTC
+  Text: Given the problems we've generally had in this space, it's probably quite reasonable to treat modifications to the stack pointer as memory accesses.
+
+It probably would have been enough to avoid the RISC-V bug I just fixed a week or so ago.
+
+- User: Eric Botcazou | Time: 2024-04-06 12:01:27 UTC
+  Text: > It probably would have been enough to avoid the RISC-V bug I just fixed a
+> week or so ago.As well as numerous similar bugs for various architectures over the last couple of decades!
+
+- User: Jeffrey A. Law | Time: 2024-04-06 17:35:24 UTC
+  Text: Yea.  I think my first one in this space was in the mid 90s on the PA.  Sigh.
+
+- User: Jakub Jelinek | Time: 2024-05-09 10:04:15 UTC
+  Text: Vlad, do you plan to backport this to 13.3?  One of the 2 release blockers we have for that release.
+
+- User: Vladimir Makarov | Time: 2024-05-09 15:40:09 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #10)> Vlad, do you plan to backport this to 13.3?  One of the 2 release blockers
+> we have for that release.Ok, I'll port it to releases/gcc-13 branch today.  The patch should be safe.
+
+- User: GCC Commits | Time: 2024-05-09 16:42:34 UTC
+  Text: The releases/gcc-13 branch has been updated by Vladimir Makarov <vmakarov@gcc.gnu.org>:https://gcc.gnu.org/g:e30211cb0b3a2b88959e9bc40626a17461de52decommitr13-8740-ge30211cb0b3a2b88959e9bc40626a17461de52deAuthor: Vladimir N. Makarov <vmakarov@redhat.com>
+Date:   Thu Apr 4 16:04:04 2024 -0400
+
+    [PR114415][scheduler]: Fixing wrong code generation
+    
+      For the test case, the insn scheduler (working for live range
+    shrinkage) moves insns modifying stack memory before an insn reserving
+    the stack memory. Comments in the patch contains more details about
+    the problem and its solution.
+    
+    gcc/ChangeLog:PR rtl-optimization/114415* sched-deps.cc (add_insn_mem_dependence): Add memory check for mem argument.
+            (sched_analyze_1): Treat stack pointer modification as memory read.
+            (sched_analyze_2, sched_analyze_insn): Add memory guard for processing pending_read_mems.
+            * sched-int.h (deps_desc): Add comment to pending_read_mems.
+    
+    gcc/testsuite/ChangeLog:PR rtl-optimization/114415* gcc.target/i386/pr114415.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-05-09 19:06:01 UTC
+  Text: Fixed, thanks.
+

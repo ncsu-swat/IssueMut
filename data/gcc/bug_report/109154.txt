@@ -1,0 +1,2290 @@
+Bug Summary: [13 regression] jump threading de-optimizes nested floating point comparisons
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Prachi Godbole | Time: 2023-03-16 11:57:47 UTC
+  Text: Createdattachment 54681[details]Reduced microbude test case
+
+We're observing a significant performance drop (~30%) in an application when comparing gcc trunk against gcc 12, observed with -mcpu=neoverse-v1 on an aarch64 Neoverse-V1. With OMP_NUM_THREADS=1 we see a regression of nearly 60% between gcc12 and gcc13. The test case attached is reduced from a test shared herehttps://github.com/UoB-HPC/microBUDEand has been made more suitable for a gcc bug report.
+
+$ install-gcc-12/bin/g++ --version
+g++ (GCC) 12.2.1 20221222 [masterr13-4850-g74544bdadc4]
+Copyright (C) 2022 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ 
+$ install-gcc-trunk/bin/g++ --version
+g++ (GCC) 13.0.1 20230315 (experimental)
+Copyright (C) 2023 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+Command line used : 
+ 
+$ install-gcc-12/bin/g++ -std=c++17 -Wall -Wno-sign-compare -Wno-unused-variable -Ofast -mcpu=neoverse-v1 -fopenmp -g3 reduced_microbude.cpp -o microbude-12-neoverse-v1
+$ ./microbude-12-neoverse-v1
+
+$ install-gcc-trunk/bin/g++ -std=c++17 -Wall -Wno-sign-compare -Wno-unused-variable -Ofast -mcpu=neoverse-v1  -fopenmp -g3 reduced_microbude.cpp -o microbude-trunk-neoverse-v1
+ 
+Bisecting suggests that commithttps://gcc.gnu.org/git/gitweb.cgi?p=gcc.git;h=4fbe3e6acould be a possible candidate. Thank you Tom Lin for the help here with the bisection. 
+ 
+Thanks
+
+- User: Tamar Christina | Time: 2023-03-16 13:11:10 UTC
+  Text: Thanks for the report, taking a look!
+
+- User: Tamar Christina | Time: 2023-03-16 17:03:03 UTC
+  Text: Confirmed, It looks like the extra range information fromg:4fbe3e6aa74dae5c75a73c46ae6683fdecd1a75dis leading jump threading down the wrong path.
+
+Reduced testcase:
+---
+
+int etot_0, fasten_main_natpro_chrg_init;
+
+void fasten_main_natpro() {
+  float elcdst = 1;
+  for (int l; l < 1; l++) {
+    int zone1 = l < 0.0f, chrg_e = fasten_main_natpro_chrg_init * (zone1 ?: 1) *
+                                   (l < elcdst ? 1 : 0.0f);
+    etot_0 += chrg_e;
+  }
+}
+
+---
+
+and compile with `-O1`. Issue also effects all targets not just AArch64https://godbolt.org/z/qes4K4oTz. and using `-fno-thread-jumps` confirmed to "fix" it.
+
+With the new case jump threading seems to duplicate the edges on the l < 0.0f check.
+
+the dump says:
+
+"Jump threading proved probability of edge 5->7 too small (it is 41.0% (guessed) should be 69.5% (guessed))"
+
+In BB 3 the branch probabilities are guessed as:
+
+    if (_1 < 0.0)
+      goto <bb 4>; [41.00%]
+    else
+      goto <bb 5>; [59.00%]
+
+and in BB 5:
+
+    if (_1 < 1.0e+0)       
+      goto <bb 7>; [41.00%]
+    else
+      goto <bb 6>; [59.00%]
+
+and so it thinks that the chances of _1 >= 0.0 && _1 < 1.0 is very small:
+
+    if (_1 < 1.0e+0)
+      goto <bb 7>; [14.80%]
+    else
+      goto <bb 6>; [85.20%]
+
+The problem is that both BB 4 falls through to BB 5, and BB 6 falls through to BB 7.
+
+jump threading optimizes BB 5 by splitting the work to be done in BB 5 for the fall-through from BB 4 back into BB 4.
+It then threads the additional edge to BB 7 where the final calculation is now more expensive.  much more than before (three way phi-node).
+
+but because the hot path in BB 6 also falls into BB 7 the overall result is that all paths become slower. but the hot path actually got an additional comparison.
+
+This is why the code slows down, for each instance of this occurrence (and in the example provided by microbude it happens often) we get an addition branch in a few paths.
+
+this has a bigger slow down in SVE (vs the scalar slowdown) because it then creates a longer dependency chain on producing the predicate for the BB.
+
+It looks like this threading shouldn't be done if both hot and cold branches end up in the same place?
+
+- User: Tamar Christina | Time: 2023-03-16 17:03:57 UTC
+  Text: Aldy, any thoughts here?
+
+- User: Aldy Hernandez | Time: 2023-03-22 10:20:53 UTC
+  Text: (In reply to Tamar Christina fromcomment #3)> Aldy, any thoughts here?We need a "real" threading expert on this one, as the decision by ranger is correct.  It looks like this is a profitability issue in the threader.
+
+The problem can be seen with -O2 --param=threader-debug=all, on the threadfull1 dump:
+
+The threaded path is:
+path: 4->5->7 SUCCESS
+
+ranger can fold the conditional in BB5:
+
+    if (_1 < 1.0e+0)
+      goto <bb 7>; [41.00%]
+    else
+      goto <bb 6>; [59.00%]
+
+...because on entry to BB5 we know _1 < 0.0:
+
+  <bb 3> [local count: 955630225]:
+  _1 = (float) l_9;
+  _2 = _1 < 0.0;
+  zone1_15 = (int) _2;
+  if (_1 < 0.0)
+    goto <bb 4>; [41.00%]
+  else
+    goto <bb 5>; [59.00%]
+
+  <bb 4> [local count: 391808389]:
+
+  <bb 5> [local count: 955630225]:
+  # iftmp.0_10 = PHI <zone1_15(4), 1(3)>
+  fasten_main_natpro_chrg_init.2_3 = fasten_main_natpro_chrg_init;
+  _4 = fasten_main_natpro_chrg_init.2_3 * iftmp.0_10;
+  _5 = (float) _4;
+  if (_1 < 1.0e+0)
+    goto <bb 7>; [41.00%]
+  else
+    goto <bb 6>; [59.00%]
+
+If this shouldn't be threaded because of a hot/cold issue, perhaps the code goes in back_threader_profitability::profitable_path_p() where there's already logic wrt hot blocks.
+
+- User: N/A | Time: 2023-03-22 10:29:01 UTC
+  Text: Im slightly confused here, on entry to BB 5 we know the opposite of _1 < 0.0 no? if we branch to BB 5 we know !(_1 < 0.0) so we can't fold _1 <= 1.0, we just know that the range of _1 is >= 0.0 . Or am I misreading, I've not tried compiling myself just going off the code both of you posted here.
+
+- User: Richard Biener | Time: 2023-03-22 12:22:41 UTC
+  Text: We have
+
+  if (_1 < 0.0)
+
+
+  # PHI < .., ..>  // the if above only controls which PHI arg we take
+  ... code ...
+  if (_1 < 1.0e+0)
+
+  # PHI < .., ...> // likewise
+
+and are threading _1 < 0.0 -> _1 < 1.0e+0
+
+So on the _1 < 0.0 path we are eliding one conditional jump.  The
+main pessimization would be that we now have an additional entry
+to the 2nd PHI, but with the same value as the _1 < 1.0 path, so
+a forwarder would be able to "solve" that IL detail.
+
+The only heuristic I can imagine doing is to avoid extra entries
+into a diamond that's really just a simple COND_EXPR.
+
+What's odd is that with -fno-thread-jumps it's the dom2 pass
+optimizes the branching of the first compare:
+
+   _1 = (float) l_21;
+   _2 = _1 < 0.0;
+   zone1_15 = (int) _2;
+-  if (_1 < 0.0)
+-    goto <bb 4>; [41.00%]
+-  else
+-    goto <bb 5>; [59.00%]
+-
+-  <bb 4> [local count: 391808389]:
+-
+-  <bb 5> [local count: 955630225]:
+-  # iftmp.0_10 = PHI <zone1_15(4), 1(3)>
+   fasten_main_natpro_chrg_init.2_3 = fasten_main_natpro_chrg_init;
+-  _4 = fasten_main_natpro_chrg_init.2_3 * iftmp.0_10;
+-  _5 = (float) _4;
++  _4 = fasten_main_natpro_chrg_init.2_3;
++  _5 = (float) fasten_main_natpro_chrg_init.2_3;
+
+but we fail to see this opportunity earlier (maybe the testcase is too simplified?).  When we thread the jump this simplification opportunity
+is lost.
+
+I wonder if exactly how DOM handles this - it does
+
+Visiting conditional with predicate: if (_1 < 0.0)
+
+With known ranges
+        _1: [frange] float VARYING +-NAN
+
+Predicate evaluates to: DON'T KNOW
+LKUP STMT _1 lt_expr 0.0
+FIND: _2
+  Replaced redundant expr '_1 < 0.0' with '_2'
+0>>> COPY _2 = 0
+<<<< COPY _2 = 0
+
+
+Optimizing block #4
+
+1>>> STMT 1 = _1 ordered_expr 0.0
+1>>> STMT 1 = _1 ltgt_expr 0.0
+1>>> STMT 1 = _1 le_expr 0.0
+1>>> STMT 1 = _1 ne_expr 0.0
+1>>> STMT 0 = _1 eq_expr 0.0
+1>>> STMT 0 = truth_not_expr _1 < 0.0
+0>>> COPY _2 = 1
+Match-and-simplified (int) _2 to 1
+0>>> COPY zone1_15 = 1
+
+how does it go backwards adjusting zone1_15?!
+
+Anyhow - EVRP doesn't seem to handle any of this (replacing PHI arguments
+by values on edges to see if the PHI becomes singleton, or even handling
+the PHI "properly"):
+
+Visiting conditional with predicate: if (_1 < 0.0)
+
+With known ranges
+        _1: [frange] float VARYING +-NAN
+
+Predicate evaluates to: DON'T KNOW
+Not folded
+Global Exported: iftmp.0_11 = [irange] int [0, 1] NONZERO 0x1
+Folding PHI node: iftmp.0_11 = PHI <zone1_17(4), 1(3)>
+No folding possible
+
+ah, probably it's the missing CSE there:
+
+    <bb 3> :
+    _1 = (float) l_10;
+    _2 = _1 < 0.0;
+    zone1_17 = (int) _2;
+    if (_1 < 0.0)
+
+we are not considering to replace the FP compare control if (_1 < 0.0)
+with an integer compare control if (_2 != 0).  Maybe we should do that?
+
+So to me it doesn't look like a bug in jump threading but at most a
+phase ordering issue or an early missed optimization.
+
+Yes, we could eventually tame down jump threading with some additional
+heuristic.  But IMHO optimizing the above earlier would be better?
+
+- User: Richard Biener | Time: 2023-03-22 12:42:38 UTC
+  Text: (In reply to Richard Biener fromcomment #6)> ah, probably it's the missing CSE there:
+> 
+>     <bb 3> :
+>     _1 = (float) l_10;
+>     _2 = _1 < 0.0;
+>     zone1_17 = (int) _2;
+>     if (_1 < 0.0)
+> 
+> we are not considering to replace the FP compare control if (_1 < 0.0)
+> with an integer compare control if (_2 != 0).  Maybe we should do that?Just to note it's forwprop which introudces the FP control stmt:
+
+   _1 = (float) l_10;
+   _2 = _1 < 0.0;
+   zone1_17 = (int) _2;
+-  zone1.1_18 = zone1_17;
+-  if (zone1.1_18 != 0)
++  if (_1 < 0.0)
+     goto <bb 4>; [INV]
+   else
+     goto <bb 5>; [INV]
+ 
+   <bb 4> :
+-  iftmp.0_20 = zone1.1_18;
+ 
+   <bb 5> :
+-  # iftmp.0_11 = PHI <iftmp.0_20(4), 1(3)>
++  # iftmp.0_11 = PHI <zone1_17(4), 1(3)>
+
+that makes the situation more difficult for VRP, I suppose that relations
+should still allow us to see zone1_17(4) is 1 on the edge 3->4?  For
+value-numbering the situation is not easily resovable.
+
+- User: Aldy Hernandez | Time: 2023-03-22 13:11:10 UTC
+  Text: (In reply to avieira fromcomment #5)> Im slightly confused here, on entry to BB 5 we know the opposite of _1 < 0.0
+> no? if we branch to BB 5 we know !(_1 < 0.0) so we can't fold _1 <= 1.0, we
+> just know that the range of _1 is >= 0.0 . Or am I misreading, I've not
+> tried compiling myself just going off the code both of you posted here.Sorry, I should've been more clear.
+
+_1 is < 0.0 on entry to BB5, but only on the 4->5->?? path which is what's being analyzed.
+
+- User: Andrew Macleod | Time: 2023-03-22 14:00:25 UTC
+  Text: (In reply to Richard Biener fromcomment #7)> (In reply to Richard Biener fromcomment #6)
+> > ah, probably it's the missing CSE there:
+> > 
+> >     <bb 3> :
+> >     _1 = (float) l_10;
+> >     _2 = _1 < 0.0;
+> >     zone1_17 = (int) _2;
+> >     if (_1 < 0.0)
+> > 
+> > we are not considering to replace the FP compare control if (_1 < 0.0)
+> > with an integer compare control if (_2 != 0).  Maybe we should do that?
+>That would resolve the issue from VRPs point of view. _2 has no involvement in the condition, sonother _2 nor zone1_17 are considered direct exports. 
+
+
+ We do however recognize that it can be recomputed as it depends on _1.  I have not yet had a chance to extend relations to recomputations, (its probably not a win very often as we assume CSE takes care fo those things)
+
+I see we do make an attempt to recompute:
+
+13      GORI  recomputation attempt on edge 3->4 for _2 = _1 < 0.0;
+14      GORI    outgoing_edge for _1 on edge 3->4
+15      GORI      compute op 1 (_1) at if (_1 < 0.0)
+        GORI        LHS =[irange] _Bool [1, 1]
+        GORI        Computes _1 = [frange] float [-Inf, -0.0 (-0x0.0p+0)] intersect Known range : [frange] float VARYING +-NAN
+        GORI      TRUE : (15) produces  (_1) [frange] float [-Inf, -0.0 (-0x0.0p+0)]
+        GORI    TRUE : (14) outgoing_edge (_1) [frange] float [-Inf, -0.0 (-0x0.0p+0)]
+        GORI  TRUE : (13) recomputation (_2) [irange] _Bool VARYING
+
+folding _2 using the true edge value:
+   [-Inf, -0.0 (-0x0.0p+0)] < 0.0 
+is returning false, so we dont recognize that _2 is always true.  I assume this has something to do with the wonders of floating point and +/- 0:-)
+
+- User: Aldy Hernandez | Time: 2023-03-22 14:39:59 UTC
+  Text: (In reply to Andrew Macleod fromcomment #9)> (In reply to Richard Biener fromcomment #7)
+> > (In reply to Richard Biener fromcomment #6)
+> > > ah, probably it's the missing CSE there:
+> > > 
+> > >     <bb 3> :
+> > >     _1 = (float) l_10;
+> > >     _2 = _1 < 0.0;
+> > >     zone1_17 = (int) _2;
+> > >     if (_1 < 0.0)BTW, I don't think it helps at all here, but casting from l_10 to a float, we know _1 can't be either -0.0 or +-INF or +-NAN.  We could add a range-op entry for NOP_EXPR / CONVERT_EXPR to expose this fact.  Well, at the very least that it can't be a NAN...in the current representation for frange's.
+
+- User: Richard Biener | Time: 2023-03-27 08:09:03 UTC
+  Text: (In reply to Andrew Macleod fromcomment #9)> (In reply to Richard Biener fromcomment #7)
+> > (In reply to Richard Biener fromcomment #6)
+> > > ah, probably it's the missing CSE there:
+> > > 
+> > >     <bb 3> :
+> > >     _1 = (float) l_10;
+> > >     _2 = _1 < 0.0;
+> > >     zone1_17 = (int) _2;
+> > >     if (_1 < 0.0)
+> > > 
+> > > we are not considering to replace the FP compare control if (_1 < 0.0)
+> > > with an integer compare control if (_2 != 0).  Maybe we should do that?
+> > 
+> 
+> That would resolve the issue from VRPs point of view. _2 has no involvement
+> in the condition, sonother _2 nor zone1_17 are considered direct exports. 
+> 
+> 
+>  We do however recognize that it can be recomputed as it depends on _1.  I
+> have not yet had a chance to extend relations to recomputations, (its
+> probably not a win very often as we assume CSE takes care fo those things)
+> 
+> I see we do make an attempt to recompute:
+> 
+> 13      GORI  recomputation attempt on edge 3->4 for _2 = _1 < 0.0;
+> 14      GORI    outgoing_edge for _1 on edge 3->4
+> 15      GORI      compute op 1 (_1) at if (_1 < 0.0)
+>         GORI        LHS =[irange] _Bool [1, 1]
+>         GORI        Computes _1 = [frange] float [-Inf, -0.0 (-0x0.0p+0)]
+> intersect Known range : [frange] float VARYING +-NAN
+>         GORI      TRUE : (15) produces  (_1) [frange] float [-Inf, -0.0
+> (-0x0.0p+0)]
+>         GORI    TRUE : (14) outgoing_edge (_1) [frange] float [-Inf, -0.0
+> (-0x0.0p+0)]
+>         GORI  TRUE : (13) recomputation (_2) [irange] _Bool VARYING
+> 
+> folding _2 using the true edge value:
+>    [-Inf, -0.0 (-0x0.0p+0)] < 0.0 
+> is returning false, so we dont recognize that _2 is always true.  I assume
+> this has something to do with the wonders of floating point and +/- 0:-)Yes, -0.0 is not < 0.0, it's equal.  So the "bug" is> 15      GORI      compute op 1 (_1) at if (_1 < 0.0)
+>         GORI        LHS =[irange] _Bool [1, 1]
+>         GORI        Computes _1 = [frange] float [-Inf, -0.0 (-0x0.0p+0)]_1 shoud be [-Inf, nextafter (0.0, -Inf)], not [-Inf, -0.0]
+
+The issue seems to be that frange_nextafter used in build_lt uses
+real_nextafter and for 0.0 that produces a denormal (correctly so I think)
+but then we do flush_denormals_to_zero () in frange::set which makes
+a -0.0 out of this.
+
+Not sure why we treat denormals this way (guess we're just "careful").
+
+"Fixing" this then yields
+
+        GORI  TRUE : (186) recomputation (_2) [irange] _Bool [1, 1]
+3->4  (T) _2 :  [irange] _Bool [1, 1]
+
+but this doesn't seem to help the PHI range in the successor?
+
+=========== BB 3 ============
+Imports: _1
+Exports: _1
+         _2 : _1(I)
+         zone1_17 : _1(I)  _2
+l_10    [irange] int [-2147483646, 0]
+    <bb 3> :
+    _1 = (float) l_10;
+    _2 = _1 < 0.0;
+    zone1_17 = (int) _2;
+    if (_1 < 0.0)
+      goto <bb 4>; [INV]
+    else
+      goto <bb 5>; [INV]
+
+I don't see any recompute for zone1_17 from the [1,1] _2 we recomputed?
+
+- User: Jakub Jelinek | Time: 2023-03-27 09:30:19 UTC
+  Text: (In reply to Richard Biener fromcomment #11)> _1 shoud be [-Inf, nextafter (0.0, -Inf)], not [-Inf, -0.0]Well, that is a consequence of the decision to always flush denormals to zero in
+frange::flush_denormals_to_zero, because some CPUs do it always and others do it when asked for (e.g. x86 if linked with -ffast-math).
+Unless we revert that decision and flush denormals to zero only selectively (say on alpha in non-ieee mode (the default), or if fast math (which exact suboption?) etc.
+
+(In reply to Aldy Hernandez fromcomment #10)> BTW, I don't think it helps at all here, but casting from l_10 to a float,
+> we know _1 can't be either -0.0 or +-INF or +-NAN.  We could add a range-op
+> entry for NOP_EXPR / CONVERT_EXPR to expose this fact.  Well, at the very
+> least that it can't be a NAN...in the current representation for frange's.We definitely should add range-ops for conversions from integral to floating point and from floating to integral and their reverses.  But until we have more than one range, if the integral value is VARYING, for 32-bit signed int the range would be
+[-0x1.p+31, 0x1.p+31] so nothing specific around zero.  With 3+ ranges we could make it
+[-0x1.p+31, -1.][0., 0.][1., 0x1.p+31] if we think normal values around zero are important special cases.
+Not sure how that would help in this case.
+
+The reduced testcase is invalid because it uses uninitialized l.
+
+- User: Aldy Hernandez | Time: 2023-03-27 09:42:24 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #12)> (In reply to Aldy Hernandez fromcomment #10)
+> > BTW, I don't think it helps at all here, but casting from l_10 to a float,
+> > we know _1 can't be either -0.0 or +-INF or +-NAN.  We could add a range-op
+> > entry for NOP_EXPR / CONVERT_EXPR to expose this fact.  Well, at the very
+> > least that it can't be a NAN...in the current representation for frange's.
+> 
+> We definitely should add range-ops for conversions from integral to floating
+> point and from floating to integral and their reverses.  But until we have
+> more than one range, if the integral value is VARYING, for 32-bit signed int
+> the range would be
+> [-0x1.p+31, 0x1.p+31] so nothing specific around zero.  With 3+ ranges we
+> could make it
+> [-0x1.p+31, -1.][0., 0.][1., 0x1.p+31] if we think normal values around zero
+> are important special cases.Ultimately we want "unlimited" sub-ranges like we have for int_range_max, but who knows what pandora's box that will open :-/.
+
+- User: Jakub Jelinek | Time: 2023-03-27 09:44:47 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #12)> We definitely should add range-ops for conversions from integral to floating
+> point and from floating to integral and their reverses.Do we have range-ops for floating to floating point conversions btw (float to double or vice versa etc.)?
+If not, that is something to implement too for GCC 14.
+
+- User: rguenther@suse.de | Time: 2023-03-27 10:18:13 UTC
+  Text: On Mon, 27 Mar 2023, jakub at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109154> 
+> ---Comment #12from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> (In reply to Richard Biener fromcomment #11)
+> > _1 shoud be [-Inf, nextafter (0.0, -Inf)], not [-Inf, -0.0]
+> 
+> Well, that is a consequence of the decision to always flush denormals to zero
+> in
+> frange::flush_denormals_to_zero, because some CPUs do it always and others do
+> it when asked for (e.g. x86 if linked with -ffast-math).
+> Unless we revert that decision and flush denormals to zero only selectively
+> (say on alpha in non-ieee mode (the default), or if fast math (which exact
+> suboption?) etc.I think flushing denormals makes sense for "forward" propagation,
+aka computing LHS ranges.  For ranges derived from relations it
+really hurts (well, just for compares against zero).
+
+OTOH, if you consider
+
+ _1 = a[1]; // load from a denormal representation
+ if (_1 < 0.)
+
+then whether _1 should include -0.0 or not depends on what the target
+does on the load.  I suppose the standard leaves this implementation
+defined?
+
+Given -ffast-math on x86 enables FTZ we'd have to be conservative there
+as well.  But OTOH we don't have any HONOR_DENORMALS or so?
+
+Note the testcase in this PR was about -Ofast ...
+
+- User: Jakub Jelinek | Time: 2023-03-27 10:40:56 UTC
+  Text: Createdattachment 54766[details]gcc13-pr109154-denorm.patch
+
+Untested patch to honor denormals if floating point mode has them, unless
+-funsafe-math-optimizations or Alpha (except -mieee or -mieee-with-inexact).
+
+- User: Jakub Jelinek | Time: 2023-03-27 10:44:56 UTC
+  Text: (In reply torguenther@suse.defromcomment #15)> I think flushing denormals makes sense for "forward" propagation,Well, it still hurts quite a lot exactly for the ranges around zero.
+Given that most CPU honor it most of the time, I think asking users
+to use -funsafe-math-optimizations/-ffast-math/-Ofast if they instruct
+the CPU not to do that is fine (different situation is Alpha where it
+is the default behavior).> Given -ffast-math on x86 enables FTZ we'd have to be conservative there
+> as well.  But OTOH we don't have any HONOR_DENORMALS or so?We don't but that is roughly what my patch adds...> Note the testcase in this PR was about -Ofast ...Indeed, for ranges from comparisons we could ignore the flush_denormals_to_zero calls always; guess we'd need to add some defaulted new flag to set, pass true to it from
+the comparisons and don't call it if the flag is set.
+In addition or instead of the above patch.  Aldy?
+
+- User: Richard Biener | Time: 2023-03-27 10:54:07 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #17)> (In reply torguenther@suse.defromcomment #15)
+> > I think flushing denormals makes sense for "forward" propagation,
+> 
+> Well, it still hurts quite a lot exactly for the ranges around zero.
+> Given that most CPU honor it most of the time, I think asking users
+> to use -funsafe-math-optimizations/-ffast-math/-Ofast if they instruct
+> the CPU not to do that is fine (different situation is Alpha where it
+> is the default behavior).Hmm, I guess if users enable FTZ we could instruct them to tell that to
+the compiler, but requiring -funsafe-math-optimizations is quite a
+difficult suggestion here.  Maybe we can add a special -fftz flag for
+this (or do it per target, -mftz)?  Maybe name it in a way not suggesting
+the compiler should FTZ but the compiler should assume the CPU would
+(-mprocess-ftz?).  Maybe -fassume-fp-ftz?  I suppose a user altering
+MSRS to enable FTZ leave any standards grounds ...> > Given -ffast-math on x86 enables FTZ we'd have to be conservative there
+> > as well.  But OTOH we don't have any HONOR_DENORMALS or so?
+> 
+> We don't but that is roughly what my patch adds...
+> 
+> > Note the testcase in this PR was about -Ofast ...
+> 
+> Indeed, for ranges from comparisons we could ignore the
+> flush_denormals_to_zero calls always; guess we'd need to add some defaulted
+> new flag to set, pass true to it from
+> the comparisons and don't call it if the flag is set.
+> In addition or instead of the above patch.  Aldy?I guess _just_ doing this for compares at this point feels safer to me.
+
+- User: Jakub Jelinek | Time: 2023-03-27 10:56:31 UTC
+  Text: Though, we likely use set also when just copying ranges and the like, so we'd probably
+need to move the flush_denormals_to_zero calls from set to somewhere else, perhaps
+range_operator_float::fold_range?
+
+As for the normal binary/unary ops doing flush to zero always, the problem isn't just for comparisons but e.g. also for divisions where it is essential if the divisor is denormal but not zero vs. when it might be or is zero.
+
+- User: Jakub Jelinek | Time: 2023-03-27 10:59:54 UTC
+  Text: (In reply to Richard Biener fromcomment #18)> Hmm, I guess if users enable FTZ we could instruct them to tell that to
+> the compiler, but requiring -funsafe-math-optimizations is quite a
+> difficult suggestion here.  Maybe we can add a special -fftz flag forI think people rarely enable FTZ by hand, they enable it by linking in crtfastmath
+through linking with -Ofast/-ffast-math/-funsafe-math-optimizations.
+And, enabling FTZ is such an unsafe math optimization already, it violates IEEE 754
+to gain some extra performance.
+
+- User: Jakub Jelinek | Time: 2023-03-27 17:07:40 UTC
+  Text: Createdattachment 54770[details]gcc13-pr109154.patch
+
+So what about this then?
+It matches the x86 FTZ behavior, because FTZ is a masked reaction to underflow
+exception, so for operations like comparisons nothing is flushed to zero nor comparing as it was flushed to zero.
+But no idea what e.g. Alpha will do, if it has in hardware support for comparisons including denormals...
+
+- User: Richard Biener | Time: 2023-03-28 08:33:36 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #21)> Createdattachment 54770[details]> gcc13-pr109154.patch
+> 
+> So what about this then?
+> It matches the x86 FTZ behavior, because FTZ is a masked reaction to
+> underflow
+> exception, so for operations like comparisons nothing is flushed to zero nor
+> comparing as it was flushed to zero.
+> But no idea what e.g. Alpha will do, if it has in hardware support for
+> comparisons including denormals...I think that's reasonable but it doesn't fix the regression, we still miss
+to recompute zone1_17 somehow.
+
+- User: GCC Commits | Time: 2023-03-28 09:01:06 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:ce3974e5962b0e1f72a1f71ebda39d53a77b7cc9commitr13-6898-gce3974e5962b0e1f72a1f71ebda39d53a77b7cc9Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Mar 28 11:00:32 2023 +0200
+
+    range-op-float: Only flush_denormals_to_zero for +-*/ [PR109154]
+    
+    As discussed in the PR, flushing denormals to zero on every frange::set
+    might be harmful for e.g. x < 0.0 comparisons, because we then on both
+    sides use ranges that include zero [-Inf, -0.0] on the true side, and
+    [-0.0, +Inf] NAN on the false side, rather than [-Inf, nextafter (-0.0, -Inf)]
+    on the true side.
+    
+    The following patch does it only in range_operator_float::fold_range
+    which is right now used for +-*/ (both normal and reverse ops of those).
+    
+    Though, I don't see any difference on the testcase in the PR, but not sure
+    what I should be looking at and the reduced testcase there has undefined
+    behavior.
+    
+    2023-03-28  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109154* value-range.h (frange::flush_denormals_to_zero): Make it public
+            rather than private.
+            * value-range.cc (frange::set): Don't call flush_denormals_to_zero
+            here.
+            * range-op-float.cc (range_operator_float::fold_range): Call
+            flush_denormals_to_zero.
+
+- User: Tamar Christina | Time: 2023-03-28 10:07:21 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #12)> (In reply to Richard Biener fromcomment #11)
+> > _1 shoud be [-Inf, nextafter (0.0, -Inf)], not [-Inf, -0.0]
+> The reduced testcase is invalid because it uses uninitialized l.Sure, lets fix that, it was reduced a bit too far:https://godbolt.org/z/he3rT5ExqHas the extracted codegen part.
+
+Note how GCC 14 does at least 2x the number of floating point comparisons in the hot loops.
+
+The scalar code doesn't look (off the top of my head) that bad, but the additional entries in the phi nodes are still causing major headaches for vector code.
+
+  # iftmp.2_36 = PHI <1(10), _95(11), 0(9)>
+  # iftmp.0_97 = PHI <2.0e+0(10), 2.0e+0(11), 4.0e+0(9)>
+  # iftmp.1_101 = PHI <5.0e-1(10), 5.0e-1(11), 2.5e-1(9)>
+
+vs before
+
+  # iftmp.2_38 = PHI <1(11), _95(12)>
+  # iftmp.0_96 = PHI <2.0e+0(11), iftmp.0_94(12)>
+  # iftmp.1_100 = PHI <5.0e-1(11), iftmp.1_98(12)>
+
+which causes it to generate:
+
+        fcmge   p3.s, p0/z, z0.s, z6.s
+        fcmlt   p1.s, p0/z, z0.s, z6.s
+        fcmge   p1.s, p1/z, z0.s, #0.0
+	fcmge   p1.s, p3/z, z0.s, #0.0
+        fcmlt   p3.s, p0/z, z0.s, #0.0
+		
+	vs
+		
+	fcmge   p3.s, p0/z, z0.s, #0.0
+        fcmlt   p2.s, p0/z, z0.s, z16.s
+
+The split in threading is causing it to miss that it can do the comparison with 0 just once on all the element.
+
+- User: Tamar Christina | Time: 2023-03-28 10:08:10 UTC
+  Text: Createdattachment 54777[details]extracted codegen
+
+- User: Jakub Jelinek | Time: 2023-03-28 12:18:08 UTC
+  Text: The above slightly simplified (dead var removal, preprocessing etc.):
+typedef struct __attribute__((__packed__)) _Atom { float x, y, z; int type; } Atom;
+typedef struct __attribute__((__packed__)) _FFParams { int hbtype; float radius; float hphb; float elsc; } FFParams;
+
+void
+fasten_main (unsigned long group, unsigned long natlig, unsigned long natpro, const Atom *protein, const Atom *ligand,
+             const FFParams *forcefield, float *energies)
+{
+  float etot[64];
+  float lpos_x[64];
+  for (int l = 0; l < 64; l++) {
+    etot[l] = 0.f;
+    lpos_x[l] = 0.f;
+  }
+  for (int il = 0; il < natlig; il++) {
+    const Atom l_atom = ligand[il];
+    const FFParams l_params = forcefield[l_atom.type];
+    for (int ip = 0; ip < natpro; ip++) {
+      const Atom p_atom = protein[ip];
+      const FFParams p_params = forcefield[p_atom.type];
+      const float radij = p_params.radius + l_params.radius;
+      const float elcdst = (p_params.hbtype == 70 && l_params.hbtype == 70) ? 4.0f : 2.0f;
+      const float elcdst1 = (p_params.hbtype == 70 && l_params.hbtype == 70) ? 0.25f : 0.5f;
+      const int type_E = ((p_params.hbtype == 69 || l_params.hbtype == 69));
+      const float chrg_init = l_params.elsc * p_params.elsc;
+      for (int l = 0; l < 64; l++) {
+        const float x = lpos_x[l] - p_atom.x;
+        const float distij = (x * x);
+        const float distbb = distij - radij;
+        const int zone1 = (distbb < 0.0f);
+        float chrg_e = chrg_init * ((zone1 ? 1.0f : (1.0f - distbb * elcdst1)) * (distbb < elcdst ? 1.0f : 0.0f));
+        float neg_chrg_e = -__builtin_fabsf(chrg_e);
+        chrg_e = type_E ? neg_chrg_e : chrg_e;
+        etot[l] += chrg_e * 45.0f;
+      }
+    }
+  }
+  for (int l = 0; l < 64; l++)
+    energies[group * 64 + l] = etot[l] * 0.5f;
+}
+
+Ther13-2266tor13-2267diff indeed starts during threadfull1, the dump says:
+...
+  Registering killing_def (path_oracle) distbb_75
+- Registering value_relation (path_oracle) (iftmp.0_32 <= distbb_75) (root: bb16)
+-path: 16->18->xx REJECTED
+-Checking profitability of path (backwards):  bb:18 (3 insns) bb:16 (6 insns) bb:23
+-  Control statement insns: 2
+-  Overall: 7 insns
+-
+- Registering killing_def (path_oracle) distbb_75
+- Registering value_relation (path_oracle) (iftmp.0_32 <= distbb_75) (root: bb23)
+-path: 23->16->18->xx REJECTED
+-Checking profitability of path (backwards):  bb:18 (3 insns) bb:16 (6 insns) bb:23 (3 insns) bb:15
+-  Control statement insns: 2
+-  Overall: 10 insns
+-  FAIL: Did not thread around loop and would copy too many statements.
+-Checking profitability of path (backwards):  bb:18 (3 insns) bb:16 (6 insns) bb:23 (3 insns) bb:22 (latch)
+-  Control statement insns: 2
+-  Overall: 10 insns
+-  FAIL: Did not thread around loop and would copy too many statements.
++Checking profitability of path (backwards): 
++  [10] Registering jump thread: (16, 18) incoming edge;  (18, 20) nocopy; 
++path: 16->18->20 SUCCESS
+ Checking profitability of path (backwards):  bb:20 (7 insns) bb:18
+   Control statement insns: 2
+   Overall: 5 insns
+...
+etc.  Though, I know nothing about the threader and don't see suspect ranges in the decisions there.
+
+- User: Richard Biener | Time: 2023-03-28 12:25:24 UTC
+  Text: I've added heuristics to threading toPR109048but I think it's too strong to reject them.
+
+For the testcase in this PR ranger could fix up if it managed to properly
+propagate the singleton range early.  After Jakubs change we're still not
+doing that for unknown reasons.
+
+Jakubs later testcase OTOH looks completely different (and more likePR109048).
+
+- User: Richard Biener | Time: 2023-03-28 12:42:27 UTC
+  Text: So as for what ranger should get, the testcase incomment#2after EVRP still sees
+
+  <bb 3> :
+  _1 = (float) l_10;
+  _2 = _1 < 0.0;
+  zone1_17 = (int) _2;
+  if (_1 < 0.0)
+    goto <bb 4>; [INV]
+  else
+    goto <bb 5>; [INV]
+
+  <bb 4> :
+
+  <bb 5> :
+  # iftmp.0_11 = PHI <zone1_17(4), 1(3)>
+
+note how zone1_17 in the PHI argument should have '1' substituted.  That
+still is missing if you simplify and remove undefined behavior like
+
+int fasten_main_natpro_chrg_init;
+
+int fasten_main_natpro(int l)
+{
+  float elcdst = 1;
+  int zone1 = l < 0.0f, chrg_e = fasten_main_natpro_chrg_init * (zone1 ?: 1) *
+      (l < elcdst ? 1 : 0.0f);
+  return chrg_e;
+}
+
+- User: Richard Biener | Time: 2023-03-28 13:19:37 UTC
+  Text: For the testcase incomment#26we see that if-conversion from
+
+  if (distbb_170 >= 0.0)
+    goto <bb 42>; [59.00%]
+  else
+    goto <bb 46>; [41.00%]
+
+  <bb 42> [local count: 311875831]:
+...
+  if (distbb_170 < iftmp.0_97)
+    goto <bb 44>; [20.00%]
+  else
+    goto <bb 46>; [80.00%]
+
+  <bb 44> [local count: 62375167]:
+...
+  <bb 46> [local count: 528603100]:
+  # prephitmp_153 = PHI <0.0(42), _158(44), chrg_init_70(41)>
+
+produces
+
+  _102 = distbb_170 >= 0.0;
+  _109 = iftmp.0_97 > distbb_170;
+  _104 = _102 & _109;
+  _86 = iftmp.0_97 <= distbb_170;
+  _87 = _86 & _102;
+  _ifc__124 = _87 ? 0.0 : _158;
+  _ifc__123 = _104 ? _158 : _ifc__124;
+  _122 = distbb_170 < 0.0;
+  prephitmp_153 = _122 ? chrg_init_70 : _ifc__123;
+
+so from two comparisons it ends up generating four (two inverted) and
+three COND_EXPRs.  There's optimization to explicitely negate but
+the
+
+  _85 = iftmp.0_97 > distbb_170
+  _86 = ~_85;
+
+that's originally created gets CSEd and then, when _109 is substituted,
+folded to the inverted comparison (by match.pd:5069).  At least the
+last COND_EXPR could have recovered the original compare by swapping
+the COND_EXPR arms - best the if-conversion code emission should do
+this itself.
+
+It currently emits
+
+_102 = distbb_170 >= 0.0;
+_145 = distbb_170 >= 0.0;
+_158 = chrg_init_70 * iftmp.3_159;
+_109 = iftmp.0_97 > distbb_170;
+_104 = _102 & _109;
+_85 = iftmp.0_97 > distbb_170;
+_86 = ~_85;
+_87 = _86 & _102;
+_ifc__124 = _87 ? 0.0 : _158;
+_ifc__123 = _104 ? _158 : _ifc__124;
+_122 = ~_145;
+prephitmp_153 = _122 ? chrg_init_70 : _ifc__123;
+
+so that micro-optimization would help us a little bit here.  I have a patch
+in testing to do that.
+
+- User: Jakub Jelinek | Time: 2023-03-28 13:44:25 UTC
+  Text: But at least the zone1_100 stuff is unused in #c26, so improving #c28 there wouldn't help.
+  distbb_99 = distij_98 - radij_82;
+  _27 = distbb_99 < 0.0;
+  # RANGE [irange] const int [0, 1] NONZERO 0x1
+  zone1_100 = (const int) _27;
+  if (distbb_99 < 0.0)
+_27 is only used by the dead zone1_100.
+
+So, we have 2 different testcases now for 2 different issues.
+
+- User: Jakub Jelinek | Time: 2023-03-28 13:52:37 UTC
+  Text: On the #c28 testcase, my #c23 patch seems to improve something only visible in the details of the evrp dump:
+ zone1_12 : [irange] int [0, 1] NONZERO 0x1
+-2->3  (T) _1 : 	[frange] float [-Inf, -0.0 (-0x0.0p+0)]
++2->3  (T) _1 : 	[frange] float [-Inf, -1.40129846432481707092372958328991613128026194187651577176e-45 (-0x0.8p-148)]
++2->3  (T) _2 : 	[irange] _Bool [1, 1]
+ 2->4  (F) _1 : 	[frange] float [-0.0 (-0x0.0p+0), +Inf] +-NAN
+So, at least it knows that _2 = _1 < 0.0; is true on that edge, which is a progress.
+But seems it doesn't know that zone1_12 = (int) _2; is also int [1, 1] there and so
+the
+  # iftmp.0_8 = PHI <zone1_12(3), 1(2)>
+range would be int [1, 1] too.
+I think we are here outside of the frange stuff and into GORI.
+
+Andrew, could you please have a look?
+
+- User: Andrew Macleod | Time: 2023-03-28 15:31:23 UTC
+  Text: The issues is here is pruning to avoid significant time growth.
+
+  _1 = (float) l_11(D); 
+  _2 = _1 < 0.0;
+  zone1_12 = (int) _2;
+  if (_1 < 0.0)
+    goto <bb 3>; [INV]
+
+_1 is an export from the block. In theory if there was a proper range-op entry for a cast from float to int l_11 could also be an export.
+
+We can recompute anything which directly uses an export from the block. _2 uses _1 so we can recompute _2.    We currently only support one level of recomputation because recognition and computation grows between quadratically and expoential based on the number of recomputations required, and indentifying/evaluating the levels of indirection...
+
+zone1_12 does not directly use an export, so GORI does not see it as something which it can evaluate. To evaluate it, we have to see that _2 is recomputable, reconmpute it, then recompute zone1_12.
+
+This could in theory be an arbitrarily long range, and for performance reasons, we limited it to 1 up until this point.
+
+Note that is we had used _2:
+if (_2 != 0)
+   goto <bb 3>
+then _2 would be a export, and zone1_12 would be a recomputation and have the approriate value.
+
+I have plans to eventually rejig GORI to cache outgoing ranges on edges.  This would allow us to recompute chains without the quadratic growth and we would have all the recomputations we want, but at this point, we are only doing one level
+
+We could in theory expand it to look at 2 levels if its a single operand... which will help with some of these cases where there are casts, and keep the performance degradation from being too bad.   I'm sure there will be cases where a third would be handy :-P
+
+- User: Jakub Jelinek | Time: 2023-03-28 15:40:08 UTC
+  Text: (In reply to Andrew Macleod fromcomment #32)> We could in theory expand it to look at 2 levels if its a single operand...Yeah, that would help here and could be worth it.> which will help with some of these cases where there are casts, and keep the
+> performance degradation from being too bad.   I'm sure there will be cases
+> where a third would be handy :-PAnd/or, could we go from seeing zone1_12 in an PHI arg and in that case walk a level or two or three to see if it is dependent on an SSA_NAME known to have specific range on the edge and if so, do those range queries using that range?
+
+- User: Andrew Macleod | Time: 2023-03-28 15:53:37 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #33)> (In reply to Andrew Macleod fromcomment #32)
+> > We could in theory expand it to look at 2 levels if its a single operand...
+> 
+> Yeah, that would help here and could be worth it.
+> 
+> > which will help with some of these cases where there are casts, and keep the
+> > performance degradation from being too bad.   I'm sure there will be cases
+> > where a third would be handy :-P
+> 
+> And/or, could we go from seeing zone1_12 in an PHI arg and in that case walk
+> a level or two or three to see if it is dependent on an SSA_NAME known to
+> have specific range on the edge and if so, do those range queries using that
+> range?well, its knowing it has a specific ranges that is the not-cheap part. For every one we find a useful range, therea re likely many queries that do not fina anything useful.  and every level of indirection adds to that.
+
+So we know zone1_12 uses _2, we can see that it is a recomputable value, but without outgoing edge values cached, we have to actually calculate it.   Until we calculate it, we dont know that its going to help us.. we just know it *can* be recomputed, not that its useful.
+
+Even if we limited it to just PHI arguments (which specializing is not easy btw), that means every PHI argument could have additional 2nd level checks and recomputations, many of which are not useful.
+
+I will poke at whether its possible to cheaply handle a second (or third) level for single dependency defs.
+
+- User: Jakub Jelinek | Time: 2023-03-28 15:58:09 UTC
+  Text: (In reply to Andrew Macleod fromcomment #34)> I will poke at whether its possible to cheaply handle a second (or third)
+> level for single dependency defs.Will those include also binary ops which have one of the operands constant?
+I think that would be quite useful as well, in addition to unary ops/casts and the like.
+
+And as written above, we definitely should do something for GCC 14 about floating to floating, floating to integral and integral to floating casts, normal as well as reverse ops.
+
+- User: Andrew Macleod | Time: 2023-03-28 16:42:17 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #35)> (In reply to Andrew Macleod fromcomment #34)
+> > I will poke at whether its possible to cheaply handle a second (or third)
+> > level for single dependency defs.
+> 
+> Will those include also binary ops which have one of the operands constant?
+> I think that would be quite useful as well, in addition to unary ops/casts
+> and the like.
+>Yes, single dependency means single SSA name. and it may keep it linear in cost...
+
+- User: Andrew Macleod | Time: 2023-03-28 21:12:28 UTC
+  Text: Createdattachment 54780[details]in progress patch
+
+Well call me a liar. 
+
+It took me a while to understand why, but if we leave it to single dependencies only, the impact is relatively linear.  I wrote a bunch of code, then deleted most of it as I found the engine was bypassing my code and doing it on its own.
+
+The attached patch is the core.  It actually works to a depth of 5 recomputations. my sample of:
+  int a = left * 2;
+  int b = a - 4;
+  int c = b % 7;
+  func (a,b ,c);
+  int d = c * 4;
+  if (left == 20)
+    {
+      func (b,c,d);
+
+produces 
+  <bb 5> :
+  func (36, 1, 4);
+
+IT also changes your program somewhat.
+ 
+Try applying it and see if it does what you want. It bootstraps, regression are running.. but based on the minimal code impact, I wouldn't expect incorrect failures.
+
+Performance impact on building GCC is barely half a percent in VRP, and 0.05% overall compile time.  pretty minimal.
+
+Im still working with it to tweak it, I just wanted you to be able to see if it helps.  I presume we dont want to add a new --param this late in the game.   But it seems we can set a reasonable number and not run into much trouble.
+
+- User: GCC Commits | Time: 2023-03-29 06:33:48 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:c9954996cd647daf0ba03e34dd279b97982f671fcommitr13-6923-gc9954996cd647daf0ba03e34dd279b97982f671fAuthor: Richard Biener <rguenther@suse.de>
+Date:   Tue Mar 28 15:20:22 2023 +0200
+
+    tree-optimization/109154 - improve if-conversion for vectorization
+    
+    With multi-argument PHIs and now doing VN on the if-converted blocks
+    the optimization of CSEing condition and negated condition doesn't
+    work well anymore.  The following restores this a little bit for
+    the case of a single inverted condition into a COND_EXPR where
+    we can instead swap the COND_EXPR arms.  The same optimization
+    is already done for the case of two-argument PHIs.
+    
+    This avoids one comparison/mask for the testcase at hand.PR tree-optimization/109154* tree-if-conv.cc (gen_phi_arg_condition): Handle single
+            inverted condition specially by inverting at the caller.
+            (gen_phi_arg_condition): Swap COND_EXPR arms if requested.
+
+- User: Richard Biener | Time: 2023-03-29 06:38:18 UTC
+  Text: (In reply to Andrew Macleod fromcomment #37)> Createdattachment 54780[details]> in progress patch
+> 
+> Well call me a liar. 
+> 
+> It took me a while to understand why, but if we leave it to single
+> dependencies only, the impact is relatively linear.  I wrote a bunch of
+> code, then deleted most of it as I found the engine was bypassing my code
+> and doing it on its own.
+> 
+> The attached patch is the core.  It actually works to a depth of 5
+> recomputations. my sample of:
+>   int a = left * 2;
+>   int b = a - 4;
+>   int c = b % 7;
+>   func (a,b ,c);
+>   int d = c * 4;
+>   if (left == 20)
+>     {
+>       func (b,c,d);
+> 
+> produces 
+>   <bb 5> :
+>   func (36, 1, 4);
+> 
+> IT also changes your program somewhat.
+>  
+> Try applying it and see if it does what you want. It bootstraps, regression
+> are running.. but based on the minimal code impact, I wouldn't expect
+> incorrect failures.
+> 
+> Performance impact on building GCC is barely half a percent in VRP, and
+> 0.05% overall compile time.  pretty minimal.
+> 
+> Im still working with it to tweak it, I just wanted you to be able to see if
+> it helps.  I presume we dont want to add a new --param this late in the
+> game.   But it seems we can set a reasonable number and not run into much
+> trouble.There is no problem with adding --params, and those are always better than
+magic numbers.
+
+Btw, I originally wondered why we don't re-compute zone1_12 because it's
+in the imports of the successor (OK, the empty successors single successor
+block) and expected those to trigger re-computes.
+
+- User: Andrew Macleod | Time: 2023-03-29 22:41:52 UTC
+  Text: > There is no problem with adding --params, and those are always better than
+> magic numbers.
+> 
+> Btw, I originally wondered why we don't re-compute zone1_12 because it's
+> in the imports of the successor (OK, the empty successors single successor
+> block) and expected those to trigger re-computes.Yeah, I don't like magic number either.  I vaguely recall that it changed the footprint of something and caused linking issues with something else requiring complete rebuilds which annoyed some people.. but I  have lost the context.
+
+
+Recomputes have nothing to do with imports, its all about exports.  Exports drive the range engine... they are the things that change on exit to block based on the edge taken.  Imports are things which can affect an export. So in some iterative/analytical world, if the imports to a block do not change, the exports will not change either.
+
+Recomputes are about having an export from a block in your definition chain. This means you are only indirectly related to the export.   If the export changes, then your value may also change if you can be recalculated using the export.
+
+This issue is fundamentally about how much effort we make into looking if you can be recomputed.  Its turns out the underlying engine is more efficient than I realized, and once we indicate it can be calculated, the calculation itself is actually linear. 
+
+If we stick to single ssa-names dependencies, then even though the lookup is currently quadratic, for smallish numbers, its pretty minimal impact.
+
+Most cases I've seen that are of impact seem to be a sequence involving a few casts.  The current patchset with a depth of 5 catches the vast majority of things, and is not that expensive.
+
+- User: GCC Commits | Time: 2023-03-30 18:17:52 UTC
+  Text: The master branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:429a7a88438cc80e7c58d9f63d44838089899b12commitr13-6945-g429a7a88438cc80e7c58d9f63d44838089899b12Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Tue Mar 28 12:16:34 2023 -0400
+
+    Add recursive GORI recompuations with a depth limit.PR tree-optimization/109154gcc/
+            * gimple-range-gori.cc (gori_compute::may_recompute_p): Add depth limit.
+            * gimple-range-gori.h (may_recompute_p): Add depth param.
+            * params.opt (ranger-recompute-depth): New param.
+    
+            gcc/testsuite/
+            * gcc.dg/Walloca-13.c: Remove bogus warning that is now fixed.
+
+- User: Tamar Christina | Time: 2023-04-05 09:28:37 UTC
+  Text: Thanks for all the work so far folks!
+
+Just to clarify the current state, it looks like the first reduced testcase is now correct.
+
+But the larger example as in c26 is still suboptimal, but slightly better.https://godbolt.org/z/7vbrG8EMj
+
+- User: N/A | Time: 2023-04-05 09:34:02 UTC
+  Text: Indeed, thank you for the high quality analysis and improvements!
+Marking this as P1 as it's a regression on aarch64-linux in GCC 13 so we'd want to track this for the release, but of course it's up to RMs for the final say.
+
+- User: Richard Biener | Time: 2023-04-11 09:36:50 UTC
+  Text: The larger testcase:
+
+typedef struct __attribute__((__packed__)) _Atom { float x, y, z; int type; } Atom;
+typedef struct __attribute__((__packed__)) _FFParams { int hbtype; float radius; float hphb; float elsc; } FFParams;
+
+void
+fasten_main (unsigned long group, unsigned long natlig, unsigned long natpro, const Atom *protein, const Atom *ligand,
+             const FFParams *forcefield, float *energies)
+{
+  float etot[64];
+  float lpos_x[64];
+  for (int l = 0; l < 64; l++) {
+    etot[l] = 0.f;
+    lpos_x[l] = 0.f;
+  }
+  for (int il = 0; il < natlig; il++) {
+    const Atom l_atom = ligand[il];
+    const FFParams l_params = forcefield[l_atom.type];
+    for (int ip = 0; ip < natpro; ip++) {
+      const Atom p_atom = protein[ip];
+      const FFParams p_params = forcefield[p_atom.type];
+      const float radij = p_params.radius + l_params.radius;
+      const float elcdst = (p_params.hbtype == 70 && l_params.hbtype == 70) ? 4.0f : 2.0f;
+      const float elcdst1 = (p_params.hbtype == 70 && l_params.hbtype == 70) ? 0.25f : 0.5f;
+      const int type_E = ((p_params.hbtype == 69 || l_params.hbtype == 69));
+      const float chrg_init = l_params.elsc * p_params.elsc;
+      for (int l = 0; l < 64; l++) {
+        const float x = lpos_x[l] - p_atom.x;
+        const float distij = (x * x);
+        const float distbb = distij - radij;
+        const int zone1 = (distbb < 0.0f);
+        float chrg_e = chrg_init * ((zone1 ? 1.0f : (1.0f - distbb * elcdst1)) * (distbb < elcdst ? 1.0f : 0.0f));
+        float neg_chrg_e = -__builtin_fabsf(chrg_e);
+        chrg_e = type_E ? neg_chrg_e : chrg_e;
+        etot[l] += chrg_e * 45.0f;
+      }
+    }
+  }
+  for (int l = 0; l < 64; l++)
+    energies[group * 64 + l] = etot[l] * 0.5f;
+}
+
+- User: Jakub Jelinek | Time: 2023-04-13 16:54:19 UTC
+  Text: So, would
+void
+foo (float *f, float d, float e)
+{
+  if (e >= 2.0f && e <= 4.0f)
+    ;
+  else
+    __builtin_unreachable ();
+  for (int i = 0; i < 1024; i++)
+    {
+      float a = f[i];
+      f[i] = (a < 0.0f ? 1.0f : 1.0f - a * d) * (a < e ? 1.0f : 0.0f);
+    }
+}
+be a better reduction on what's going on?
+From the frange/threading POV, when e is in [2.0f, 4.0f] range, if a < 0.0f, we know that a < e is also true, so there is no point in testing that at runtime.
+So I think what threadfull1 does is right and desirable if the final code actually performs those comparisons and uses conditional jumps.
+The only thing is that it is harmful for vectorization and maybe for predicated code.
+Therefore, for scalar code at least without massive ARM style conditional execution,
+the above is better emitted as
+  if (a < 0.0f)
+    tmp = 1.0f;
+  else
+    {
+      tmp = (1.0f - a * d) * (a < e ? 1.0f : 0.0f);
+    }
+or even
+  if (a < 0.0f)
+    tmp = 1.0f;
+  else if (a < e)
+    tmp = 1.0f - a * d;
+  else
+    tmp = 0.0f;
+  f[i] = tmp;
+Thus, could we effectively try to undo it at ifcvt time on loops for vectorization only, or during vectorization or something similar?
+As ifcvt then turns the IMHO desirable
+  if (a_16 >= 0.0)
+    goto <bb 5>; [59.00%]
+  else
+    goto <bb 11>; [41.00%]
+
+  <bb 11> [local count: 435831803]:
+  goto <bb 7>; [100.00%]
+
+  <bb 5> [local count: 627172605]:
+  _7 = a_16 * d_17(D);
+  iftmp.0_18 = 1.0e+0 - _7;
+  if (e_13(D) > a_16)
+    goto <bb 12>; [20.00%]
+  else
+    goto <bb 6>; [80.00%]
+
+  <bb 12> [local count: 125434523]:
+  goto <bb 7>; [100.00%]
+
+  <bb 6> [local count: 501738082]:
+
+  <bb 7> [local count: 1063004410]:
+  # prephitmp_26 = PHI <iftmp.0_18(12), 0.0(6), 1.0e+0(11)>
+(ok, the 2 empty forwarders are unlikely useful) into:
+  _7 = a_16 * d_17(D);
+  iftmp.0_18 = 1.0e+0 - _7;
+  _21 = a_16 >= 0.0;
+  _10 = e_13(D) > a_16;
+  _9 = _10 & _21;
+  _27 = e_13(D) <= a_16;
+  _28 = _21 & _27;
+  _ifc__43 = _9 ? iftmp.0_18 : 0.0;
+  _ifc__44 = _28 ? 0.0 : _ifc__43;
+  _45 = a_16 < 0.0;
+  prephitmp_26 = _45 ? 1.0e+0 : _ifc__44;
+Now, perhaps if ifcvt used ranger, it could figure out that a_16 < 0.0 implies e_13(D) > a_16 and do something smarter with it.
+Or maybe just try to do smarter ifcvt just based on the original CFG.
+The pre-ifcvt code was a_16 < 0.0f ? 1.0f : a_16 < e_13 ? 1.0f - a_16 * d_17 : 0.0f
+so when ifcvt puts everything together, make it
+  _7 = a_16 * d_17(D);
+  iftmp.0_18 = 1.0e+0 - _7;
+  _27 = e_13(D) > a_16;
+  _28 = a_16 < 0.0;
+  _ifc__43 = _27 ? iftmp.0_18 : 0.0f;
+  prephitmp_26 = _28 ? 1.0f : _ifc__43;
+?
+
+- User: rguenther@suse.de | Time: 2023-04-13 17:25:47 UTC
+  Text: Am 13.04.2023 um 18:54 schrieb jakub at gcc dot gnu.org <gcc-bugzilla@gcc.gnu.org>:> 
+> ﻿https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109154> 
+> ---Comment #45from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> So, would
+> void
+> foo (float *f, float d, float e)
+> {
+>  if (e >= 2.0f && e <= 4.0f)
+>    ;
+>  else
+>    __builtin_unreachable ();
+>  for (int i = 0; i < 1024; i++)
+>    {
+>      float a = f[i];
+>      f[i] = (a < 0.0f ? 1.0f : 1.0f - a * d) * (a < e ? 1.0f : 0.0f);
+>    }
+> }
+> be a better reduction on what's going on?
+> From the frange/threading POV, when e is in [2.0f, 4.0f] range, if a < 0.0f, we
+> know that a < e is also true, so there is no point in testing that at runtime.
+> So I think what threadfull1 does is right and desirable if the final code
+> actually performs those comparisons and uses conditional jumps.
+> The only thing is that it is harmful for vectorization and maybe for predicated
+> code.
+> Therefore, for scalar code at least without massive ARM style conditional
+> execution,
+> the above is better emitted as
+>  if (a < 0.0f)
+>    tmp = 1.0f;
+>  else
+>    {
+>      tmp = (1.0f - a * d) * (a < e ? 1.0f : 0.0f);
+>    }
+> or even
+>  if (a < 0.0f)
+>    tmp = 1.0f;
+>  else if (a < e)
+>    tmp = 1.0f - a * d;
+>  else
+>    tmp = 0.0f;
+>  f[i] = tmp;
+> Thus, could we effectively try to undo it at ifcvt time on loops for
+> vectorization only, or during vectorization or something similar?
+> As ifcvt then turns the IMHO desirable
+>  if (a_16 >= 0.0)
+>    goto <bb 5>; [59.00%]
+>  else
+>    goto <bb 11>; [41.00%]
+> 
+>  <bb 11> [local count: 435831803]:
+>  goto <bb 7>; [100.00%]
+> 
+>  <bb 5> [local count: 627172605]:
+>  _7 = a_16 * d_17(D);
+>  iftmp.0_18 = 1.0e+0 - _7;
+>  if (e_13(D) > a_16)
+>    goto <bb 12>; [20.00%]
+>  else
+>    goto <bb 6>; [80.00%]
+> 
+>  <bb 12> [local count: 125434523]:
+>  goto <bb 7>; [100.00%]
+> 
+>  <bb 6> [local count: 501738082]:
+> 
+>  <bb 7> [local count: 1063004410]:
+>  # prephitmp_26 = PHI <iftmp.0_18(12), 0.0(6), 1.0e+0(11)>
+> (ok, the 2 empty forwarders are unlikely useful) into:
+>  _7 = a_16 * d_17(D);
+>  iftmp.0_18 = 1.0e+0 - _7;
+>  _21 = a_16 >= 0.0;
+>  _10 = e_13(D) > a_16;
+>  _9 = _10 & _21;
+>  _27 = e_13(D) <= a_16;
+>  _28 = _21 & _27;
+>  _ifc__43 = _9 ? iftmp.0_18 : 0.0;
+>  _ifc__44 = _28 ? 0.0 : _ifc__43;
+>  _45 = a_16 < 0.0;
+>  prephitmp_26 = _45 ? 1.0e+0 : _ifc__44;
+> Now, perhaps if ifcvt used ranger, it could figure out that a_16 < 0.0 implies
+> e_13(D) > a_16 and do something smarter with it.
+> Or maybe just try to do smarter ifcvt just based on the original CFG.
+> The pre-ifcvt code was a_16 < 0.0f ? 1.0f : a_16 < e_13 ? 1.0f - a_16 * d_17 :
+> 0.0f
+> so when ifcvt puts everything together, make it
+>  _7 = a_16 * d_17(D);
+>  iftmp.0_18 = 1.0e+0 - _7;
+>  _27 = e_13(D) > a_16;
+>  _28 = a_16 < 0.0;
+>  _ifc__43 = _27 ? iftmp.0_18 : 0.0f;
+>  prephitmp_26 = _28 ? 1.0f : _ifc__43;
+> ?Certainly improving what ifcvt produces for multiarg phis is desirable. I’m not sure if undoing the threading is generally possible.> -- 
+> You are receiving this mail because:
+> You are on the CC list for the bug.
+
+- User: Jakub Jelinek | Time: 2023-04-13 17:29:26 UTC
+  Text: The testcase then doesn't have to be floating point, say on x86 -O3 -mavx512f
+void
+foo (int *f, int d, int e)
+{
+  for (int i = 0; i < 1024; i++)
+    {
+      int a = f[i];
+      int t;
+      if (a < 0)
+	t = 1;
+      else if (a < e)
+	t = 1 - a * d;
+      else
+	t = 0;
+      f[i] = t;
+    }
+}
+shows similar problems.  Strangely, for
+void
+foo (int *f, int d, int e)
+{
+  if (e < 32 || e > 64)
+    __builtin_unreachable ();
+  for (int i = 0; i < 1024; i++)
+    {
+      int a = f[i];
+      f[i] = (a < 0 ? 1 : 1 - a * d) * (a < e ? 1 : 0);
+    }
+}
+the threader doesn't do what it does for floating point code and we use just 2 comparisons rather than 3 (or more).  Still, only one multiplication, not 2.
+Strangely, in that case the second multiplication is there until vrp2, which
+folds it using
+/* Transform x * { 0 or 1, 0 or 1, ... } into x & { 0 or -1, 0 or -1, ...},
+   unless the target has native support for the former but not the latter.  */
+match.pd pattern and others into oblivion.
+
+- User: Jakub Jelinek | Time: 2023-04-14 18:10:32 UTC
+  Text: for PHIs with 3+ arguments unless all the arguments but one are the same even when not doing any smarts seems we emit one more COND_EXPR from what we could.
+The
+      /* Common case.  */
+case loop emits args_len COND_EXPRs, where to select one of the args_len values, one should need only args_len - 1 COND_EXPRs.
+So e.g. for the #c47 first testcase, we emit:
+  _7 = a_10 < 0;
+  _21 = a_10 >= 0;
+  _22 = a_10 < e_11(D);
+  _23 = _21 & _22;
+  _26 = a_10 >= e_11(D);
+  _27 = _21 & _26;
+  _ifc__42 = _7 ? 1 : t_13;
+  _ifc__43 = _23 ? t_13 : _ifc__42;
+  t_6 = _27 ? 0 : _ifc__43;
+Even when not trying to be smart on which predicate goes first and which goes last (currently we only make sure that argument with most duplicates gets last), I don't see why we should emit args_len COND_EXPRs, if we check just the last args_len - 1 predicates or first args_len - 1 predicates, when all the predicates are false it should represent the argument that wasn't otherwise picked.  So, the above without smart optimizations IMHO could be either replaced with
+  _ifc__42 = _23 ? t_13 : 1;
+  t_6 = _27 ? 0 : _ifc__42;
+or
+  _ifc__42 = _23 ? t_13 : 0;
+  t_6 = _7 ? 1 : _ifc__42;
+etc.
+But we really should also do the smart optimization, see through the bb_predicates which one is BIT_AND_EXPRed with inversion of some other arg's predicate and avoid those BIT_AND_EXPRs and redundant comparisons by sorting them better.
+
+- User: Jakub Jelinek | Time: 2023-04-14 18:14:48 UTC
+  Text: Plus for 4+ args_len, if we don't find some smart sorting, we should still consider at least some reassociation between the COND_EXPRs, instead of emitting for 4 args_len
+3 COND_EXPRs where second depends on the first and third depends on the second we could
+emit two independent COND_EXPRs and third that depends on those two.
+Of course, it might be harmful for register allocation if we do that aggressively for very large number of PHI args.
+
+- User: Jakub Jelinek | Time: 2023-04-14 18:22:20 UTC
+  Text: Anyway, given that in the sorting the last entry has the maximum number of occurrences,
+I think without trying to do more smarts best would be to avoid evaluating that last condition for now.
+
+- User: Jakub Jelinek | Time: 2023-04-14 19:09:56 UTC
+  Text: Dumb untested patch which saves 2 instructions from each of those testcases:
+
+--- gcc/tree-if-conv.cc.jj	2023-04-12 08:53:58.264496474 +0200
++++ gcc/tree-if-conv.cc	2023-04-14 21:02:42.403826690 +0200
+@@ -2071,7 +2071,7 @@ predicate_scalar_phi (gphi *phi, gimple_
+     }
+ 
+   /* Put element with max number of occurences to the end of ARGS.  */
+-  if (max_ind != -1 && max_ind +1 != (int) args_len)
++  if (max_ind != -1 && max_ind + 1 != (int) args_len)
+     std::swap (args[args_len - 1], args[max_ind]);
+ 
+   /* Handle one special case when number of arguments with different values
+@@ -2116,12 +2116,12 @@ predicate_scalar_phi (gphi *phi, gimple_
+       vec<int> *indexes;
+       tree type = TREE_TYPE (gimple_phi_result (phi));
+       tree lhs;
+-      arg1 = args[1];
+-      for (i = 0; i < args_len; i++)
++      arg1 = args[args_len - 1];
++      for (i = args_len - 1; i > 0; i--)
+ 	{
+-	  arg0 = args[i];
+-	  indexes = phi_arg_map.get (args[i]);
+-	  if (i != args_len - 1)
++	  arg0 = args[i - 1];
++	  indexes = phi_arg_map.get (args[i - 1]);
++	  if (i != 1)
+ 	    lhs = make_temp_ssa_name (type, NULL, "_ifc_");
+ 	  else
+ 	    lhs = res;
+
+- User: GCC Commits | Time: 2023-04-15 10:10:02 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:de0ee9d14165eebb3d31c84e98260c05c3b33acbcommitr13-7192-gde0ee9d14165eebb3d31c84e98260c05c3b33acbAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Sat Apr 15 12:08:45 2023 +0200
+
+    if-conv: Small improvement for expansion of complex PHIs [PR109154]
+    
+    The following patch is just a dumb improvement, gets rid of 2 unnecessary
+    instructions on both the PR's original testcase and on the two reduced ones,
+    both on -mcpu=neoverse-v1 and -mavx512f.
+    
+    The thing is, if we have args_len (args_len >= 2) unique PHI arguments,
+    we need only args_len - 1 COND_EXPRs to expand the PHI, because first
+    COND_EXPR can merge 2 unique arguments and all the following ones merge
+    another unique argument with the previously merged arguments,
+    while the code for mysterious reasons was always emitting args_len
+    COND_EXPRs, where the first COND_EXPR merged the first and second unique
+    arguments, the second COND_EXPR merged the second unique argument with
+    result of merging the first and second unique arguments and the rest was
+    already expectable, nth COND_EXPR for n > 2 merged the nth unique argument
+    with result of merging the previous unique arguments.
+    Now, in my understanding, the bb_predicate for bb's predecessor need to
+    form a disjunct set which together creates the successor's bb_predicate,
+    so I don't see why we'd need to check all the bb_predicates, if we check
+    all but one then when all those other ones are false the last bb_predicate
+    is necessarily true.  Given that the code attempts to sort argument with
+    most occurrences (so likely most complex combined predicate) last, I chose
+    not to test that last argument's predicate.
+    So e.g. on the testcase fromcomment 47in the PR:
+    void
+    foo (int *f, int d, int e)
+    {
+      for (int i = 0; i < 1024; i++)
+        {
+          int a = f[i];
+          int t;
+          if (a < 0)
+            t = 1;
+          else if (a < e)
+            t = 1 - a * d;
+          else
+            t = 0;
+          f[i] = t;
+        }
+    }
+    we used to emit:
+      _7 = a_10 < 0;
+      _21 = a_10 >= 0;
+      _22 = a_10 < e_11(D);
+      _23 = _21 & _22;
+      _26 = a_10 >= e_11(D);
+      _27 = _21 & _26;
+      _ifc__42 = _7 ? 1 : t_13;
+      _ifc__43 = _23 ? t_13 : _ifc__42;
+      t_6 = _27 ? 0 : _ifc__43;
+    while the following patch changes it to:
+      _7 = a_10 < 0;
+      _21 = a_10 >= 0;
+      _22 = a_10 < e_11(D);
+      _23 = _21 & _22;
+      _ifc__42 = _23 ? t_13 : 0;
+      t_6 = _7 ? 1 : _ifc__42;
+    which I believe should be sufficient for a PHI <1, t_13, 0>.
+    
+    I've gathered some statistics and on x86_64-linux and i686-linux
+    bootstraps/regtests, this code triggers:
+         92 4 4
+        112 2 4
+        141 3 4
+       4046 3 3
+    (where 2nd number is args_len and 3rd argument EDGE_COUNT (bb->preds)
+    and first argument count of those from sort | uniq -c | sort -n).
+    In all these cases the patch should squeze one extra COND_EXPR and
+    its associated predicate (the latter only if it wasn't used elsewhere).
+    
+    Incrementally, I think we should try to perform some analysis on which
+    predicates depend on inverses of other predicates and if possible try
+    to sort the arguments better and omit testing unnecessary predicates.
+    So essentially for the above testcase deconstruct it back to:
+      _7 = a_10 < 0;
+      _22 = a_10 < e_11(D);
+      _ifc__42 = _22 ? t_13 : 0;
+      t_6 = _7 ? 1 : _ifc__42;
+    which is like what this patch produces, but with the & a_10 >= 0 part
+    removed, because the last predicate is a_10 < 0 and so testing a_10 >= 0
+    on what appears on the false branch doesn't make sense.
+    But I'm afraid that will take more work than is doable in stage4 right now.
+    
+    2023-04-15  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109154* tree-if-conv.cc (predicate_scalar_phi): For complex PHIs, emit just
+            args_len - 1 COND_EXPRs rather than args_len.  Formatting fix.
+
+- User: Jakub Jelinek | Time: 2023-04-17 11:07:36 UTC
+  Text: Downgrading to P2 for the rest of the changes which aren't appropriate for GCC 13.
+
+- User: Tamar Christina | Time: 2023-04-25 18:32:00 UTC
+  Text: @Jakub, just to check to avoid doing duplicate work, did you intend to do the remaining ifcvt changes or should we?
+
+- User: Jakub Jelinek | Time: 2023-04-25 18:34:36 UTC
+  Text: If you could do it, that would be great.  I'm now working on frange libm functions and will need to switch to OpenMP work soon.
+
+- User: Richard Biener | Time: 2023-04-26 06:58:08 UTC
+  Text: GCC 13.1 is being released, retargeting bugs to GCC 13.2.
+
+- User: Tamar Christina | Time: 2023-04-26 09:43:26 UTC
+  Text: Ah, Cool, will take the remaining work then.
+
+Thanks for all the patches in stage 4 everyone!
+
+- User: Jakub Jelinek | Time: 2023-04-26 10:07:25 UTC
+  Text: As a different testcase showing what still needs to be done is e.g.
+void
+foo (int *p, int *q, int *r, int *s, int *t, int *u)
+{
+  #pragma omp simd
+  for (int i = 0; i < 1024; i++)
+    {
+      int vp = p[i];
+      int vq = q[i];
+      int vr = r[i];
+      int vs = s[i];
+      int vt = t[i];
+      int vu = u[i];
+      int vw;
+      if (vp != 0)
+	{
+	  if (vp > 100)
+	    {
+	      if (vq < 200)
+		vw = 1;
+	      else if (vr)
+		vw = 2;
+	      else
+		vw = 3;
+	    }
+	  else if (vs > 100)
+	    {
+	      if (vq < 180)
+		vw = 4;
+	      else if (vr > 20)
+		vw = 5;
+	      else
+		vw = 6;
+	    }
+	  else
+	    {
+	      if (vq < -100)
+		vw = 7;
+	      else if (vr < -20)
+		vw = 8;
+	      else
+		vw = 9;
+	    }
+	}
+      else if (vt > 10)
+	{
+	  if (vu > 100)
+	    vw = 10;
+	  else if (vu < -100)
+	    vw = 11;
+	  else
+	    vw = 12;
+	}
+      else
+	vw = 13;
+      u[i] = vw;
+    }
+}
+with -O2 -fopenmp-simd.
+I think we still need 12 VEC_COND_EXPRs to merge it all together, but if we follow what the source is doing (or rediscover it), we can certainly
+avoid so many useless &s on the conditions by merging it together in the right order.
+
+- User: Tamar Christina | Time: 2023-07-07 18:10:43 UTC
+  Text: I've sent two patches upstream this morning to fix the remaining ifcvt issues:https://gcc.gnu.org/pipermail/gcc-patches/2023-July/623848.htmlhttps://gcc.gnu.org/pipermail/gcc-patches/2023-July/623849.htmlThis brings us within 5% of GCC-12, but not all the way there,  the reason is that since GCC-13 PRE behaves differently.
+
+In GCC-12 after PRE we'd have the following CFG:
+
+  <bb 15> [local count: 623751662]:
+  _16 = distbb_79 * iftmp.1_100;
+  iftmp.8_80 = 1.0e+0 - _16;
+  _160 = chrg_init_75 * iftmp.8_80;
+
+  <bb 16> [local count: 1057206200]:
+  # iftmp.8_39 = PHI <iftmp.8_80(15), 1.0e+0(14)>
+  # prephitmp_161 = PHI <_160(15), chrg_init_75(14)>
+  if (distbb_79 < iftmp.0_96)
+    goto <bb 17>; [50.00%]
+  else
+    goto <bb 18>; [50.00%]
+
+  <bb 17> [local count: 528603100]:
+  _164 = ABS_EXPR <prephitmp_161>;
+  _166 = -_164;
+
+  <bb 18> [local count: 1057206200]:
+  # iftmp.9_40 = PHI <1.0e+0(17), 0.0(16)>
+  # prephitmp_163 = PHI <prephitmp_161(17), 0.0(16)>
+  # prephitmp_167 = PHI <_166(17), 0.0(16)>
+  if (iftmp.2_38 != 0)
+    goto <bb 20>; [50.00%]
+  else
+    goto <bb 19>; [50.00%]
+
+  <bb 19> [local count: 528603100]:
+
+  <bb 20> [local count: 1057206200]:
+  # iftmp.10_41 = PHI <prephitmp_167(18), prephitmp_163(19)>
+
+That is to say, in both branches we always do the multiply, gimple-isel then correctly turns this into a COND_MUL based on the mask.
+
+Since GCC-13 PRE now does some extra optimizations:
+
+  <bb 15> [local count: 1057206200]:
+  # l_107 = PHI <l_84(21), 0(14)>
+  _13 = lpos_x[l_107];
+  x_72 = _13 - p_atom$x_81;
+  powmult_73 = x_72 * x_72;
+  distbb_74 = powmult_73 - radij_58;
+  if (distbb_74 >= 0.0)
+    goto <bb 17>; [59.00%]
+  else
+    goto <bb 16>; [41.00%]
+
+  <bb 16> [local count: 433454538]:
+  _165 = ABS_EXPR <chrg_init_70>;
+  _168 = -_165;
+  goto <bb 19>; [100.00%]
+
+  <bb 17> [local count: 623751662]:
+  _14 = distbb_74 * iftmp.1_101;
+  iftmp.8_76 = 1.0e+0 - _14;
+  if (distbb_74 < iftmp.0_97)
+    goto <bb 18>; [20.00%]
+  else
+    goto <bb 19>; [80.00%]
+
+  <bb 18> [local count: 124750334]:
+  _162 = chrg_init_70 * iftmp.8_76;
+  _164 = ABS_EXPR <_162>;
+  _167 = -_164;
+
+  <bb 19> [local count: 1057206200]:
+  # iftmp.9_38 = PHI <1.0e+0(18), 0.0(17), 1.0e+0(16)>
+  # iftmp.8_102 = PHI <iftmp.8_76(18), iftmp.8_76(17), 1.0e+0(16)>
+  # prephitmp_163 = PHI <_162(18), 0.0(17), chrg_init_70(16)>
+  # prephitmp_169 = PHI <_167(18), 0.0(17), _168(16)>
+  if (iftmp.2_36 != 0)
+    goto <bb 21>; [50.00%]
+  else
+    goto <bb 20>; [50.00%]
+	
+That is to say, the multiplication is now compleletely skipped in one branch,
+this should be better for scalar code, but for vector we have to do the
+multiplication anyway.
+
+after ifcvt we end up with:
+
+  _162 = chrg_init_70 * iftmp.8_76;
+  _164 = ABS_EXPR <_162>;
+  _167 = -_164;
+  _ifc__166 = distbb_74 < iftmp.0_97 ? _167 : 0.0;
+  prephitmp_169 = distbb_74 >= 0.0 ? _ifc__166 : _168;
+  
+instead of
+
+  _160 = chrg_init_75 * iftmp.8_80;
+  prephitmp_161 = distbb_79 < 0.0 ? chrg_init_75 : _160;
+  _164 = ABS_EXPR <prephitmp_161>;
+  _166 = -_164;
+  prephitmp_167 = distbb_79 < iftmp.0_96 ? _166 : 0.0;
+
+previously we'd make COND_MUL and COND_NEG and so don't need a VCOND in the end,
+now we select after the multiplication, so we only have a COND_NEG followed by a VCOND.
+
+This is obviously worse, but I have no idea how to recover it.  Any ideas?
+
+- User: Richard Biener | Time: 2023-07-10 07:15:33 UTC
+  Text: (In reply to Tamar Christina fromcomment #59)> after ifcvt we end up with:
+> 
+>   _162 = chrg_init_70 * iftmp.8_76;
+>   _164 = ABS_EXPR <_162>;
+>   _167 = -_164;
+>   _ifc__166 = distbb_74 < iftmp.0_97 ? _167 : 0.0;
+>   prephitmp_169 = distbb_74 >= 0.0 ? _ifc__166 : _168;
+>   
+> instead of
+> 
+>   _160 = chrg_init_75 * iftmp.8_80;
+>   prephitmp_161 = distbb_79 < 0.0 ? chrg_init_75 : _160;
+>   _164 = ABS_EXPR <prephitmp_161>;
+>   _166 = -_164;
+>   prephitmp_167 = distbb_79 < iftmp.0_96 ? _166 : 0.0;
+> 
+> previously we'd make COND_MUL and COND_NEG and so don't need a VCOND in the
+> end,
+> now we select after the multiplication, so we only have a COND_NEG followed
+> by a VCOND.
+> 
+> This is obviously worse, but I have no idea how to recover it.  Any ideas?None.  This is with -O3, right?  Can you try selectively disabling parts
+of PRE with -fno-tree-partial-pre -fno-code-hoisting?  But I suspect it's
+the improvement for general PRE that we hit here.
+
+One idea that was always floating around was to move PRE after loop opts
+like we did with predcom.  But the no PRE before loop will likely hurt as well
+so we might instead want to limit PRE when it involves generating
+constants in PHIs and schedule another PRE after loop opts (at some cost
+then).  It's something to experiment with ...
+
+- User: Tamar Christina | Time: 2023-07-10 10:33:49 UTC
+  Text: (In reply to Richard Biener fromcomment #60)> (In reply to Tamar Christina fromcomment #59)
+> > after ifcvt we end up with:
+> > 
+> >   _162 = chrg_init_70 * iftmp.8_76;
+> >   _164 = ABS_EXPR <_162>;
+> >   _167 = -_164;
+> >   _ifc__166 = distbb_74 < iftmp.0_97 ? _167 : 0.0;
+> >   prephitmp_169 = distbb_74 >= 0.0 ? _ifc__166 : _168;
+> >   
+> > instead of
+> > 
+> >   _160 = chrg_init_75 * iftmp.8_80;
+> >   prephitmp_161 = distbb_79 < 0.0 ? chrg_init_75 : _160;
+> >   _164 = ABS_EXPR <prephitmp_161>;
+> >   _166 = -_164;
+> >   prephitmp_167 = distbb_79 < iftmp.0_96 ? _166 : 0.0;
+> > 
+> > previously we'd make COND_MUL and COND_NEG and so don't need a VCOND in the
+> > end,
+> > now we select after the multiplication, so we only have a COND_NEG followed
+> > by a VCOND.
+> > 
+> > This is obviously worse, but I have no idea how to recover it.  Any ideas?
+> 
+> None.  This is with -O3, right?  Can you try selectively disabling parts
+> of PRE with -fno-tree-partial-pre -fno-code-hoisting?  But I suspect it's
+> the improvement for general PRE that we hit here.
+>Those don't seem to make a difference sadly.> One idea that was always floating around was to move PRE after loop opts
+> like we did with predcom.  But the no PRE before loop will likely hurt as
+> well
+> so we might instead want to limit PRE when it involves generating
+> constants in PHIs and schedule another PRE after loop opts (at some cost
+> then).  It's something to experiment with ...It looks like `-fno-tree-pre` does the trick, but then of course, messes up
+elsewhere.  The conditional statement seem to stay in the most complicated form possible in scalar code.
+
+I'll try to track down what to turn off and experiment with a pre2 after vect.
+Is before predcom a good place?
+
+- User: Richard Biener | Time: 2023-07-10 10:46:45 UTC
+  Text: (In reply to Tamar Christina fromcomment #61)> (In reply to Richard Biener fromcomment #60)
+> > (In reply to Tamar Christina fromcomment #59)
+> > > after ifcvt we end up with:
+> > > 
+> > >   _162 = chrg_init_70 * iftmp.8_76;
+> > >   _164 = ABS_EXPR <_162>;
+> > >   _167 = -_164;
+> > >   _ifc__166 = distbb_74 < iftmp.0_97 ? _167 : 0.0;
+> > >   prephitmp_169 = distbb_74 >= 0.0 ? _ifc__166 : _168;
+> > >   
+> > > instead of
+> > > 
+> > >   _160 = chrg_init_75 * iftmp.8_80;
+> > >   prephitmp_161 = distbb_79 < 0.0 ? chrg_init_75 : _160;
+> > >   _164 = ABS_EXPR <prephitmp_161>;
+> > >   _166 = -_164;
+> > >   prephitmp_167 = distbb_79 < iftmp.0_96 ? _166 : 0.0;
+> > > 
+> > > previously we'd make COND_MUL and COND_NEG and so don't need a VCOND in the
+> > > end,
+> > > now we select after the multiplication, so we only have a COND_NEG followed
+> > > by a VCOND.
+> > > 
+> > > This is obviously worse, but I have no idea how to recover it.  Any ideas?
+> > 
+> > None.  This is with -O3, right?  Can you try selectively disabling parts
+> > of PRE with -fno-tree-partial-pre -fno-code-hoisting?  But I suspect it's
+> > the improvement for general PRE that we hit here.
+> > 
+> 
+> Those don't seem to make a difference sadly.
+> 
+> > One idea that was always floating around was to move PRE after loop opts
+> > like we did with predcom.  But the no PRE before loop will likely hurt as
+> > well
+> > so we might instead want to limit PRE when it involves generating
+> > constants in PHIs and schedule another PRE after loop opts (at some cost
+> > then).  It's something to experiment with ...
+> 
+> It looks like `-fno-tree-pre` does the trick, but then of course, messes up
+> elsewhere.  The conditional statement seem to stay in the most complicated
+> form possible in scalar code.
+> 
+> I'll try to track down what to turn off and experiment with a pre2 after
+> vect.
+> Is before predcom a good place?I would avoid putting it into the loop pipeline.  Instead I'd turn the
+FRE pass that runs after tracer into PRE.  Maybe conditional on whether
+there are any loops.
+
+Note it's not so easy to "tame" PRE, the existing things happen at
+elimination time in eliminate_dom_walker::eliminate_stmt.  I would
+experiment with restricting the use of inserted PHIs in innermost(!)
+loops containing invariants, maybe only if the number of PHI args is
+more than two ... (but that's somewhat artificial).
+
+That said, I'm not really convinced this is a good idea.
+
+- User: Tamar Christina | Time: 2023-07-10 11:02:45 UTC
+  Text: > > It looks like `-fno-tree-pre` does the trick, but then of course, messes up
+> > elsewhere.  The conditional statement seem to stay in the most complicated
+> > form possible in scalar code.
+> > 
+> > I'll try to track down what to turn off and experiment with a pre2 after
+> > vect.
+> > Is before predcom a good place?
+> 
+> I would avoid putting it into the loop pipeline.  Instead I'd turn the
+> FRE pass that runs after tracer into PRE.  Maybe conditional on whether
+> there are any loops.
+> 
+> Note it's not so easy to "tame" PRE, the existing things happen at
+> elimination time in eliminate_dom_walker::eliminate_stmt.  I would
+> experiment with restricting the use of inserted PHIs in innermost(!)
+> loops containing invariants, maybe only if the number of PHI args is
+> more than two ... (but that's somewhat artificial).
+> 
+> That said, I'm not really convinced this is a good idea.I hear you.. there's also the added complexity that this likely only is beneficial for fully masked architectures.  I wonder, if it might be feasible and better to pass on additional information from pre to ifcvt to indicate that the operation was created from a common block.
+
+In which case ifcvt could move the cond to just before the first shared statement?
+
+- User: Richard Biener | Time: 2023-07-10 11:27:05 UTC
+  Text: (In reply to Tamar Christina fromcomment #63)> > > It looks like `-fno-tree-pre` does the trick, but then of course, messes up
+> > > elsewhere.  The conditional statement seem to stay in the most complicated
+> > > form possible in scalar code.
+> > > 
+> > > I'll try to track down what to turn off and experiment with a pre2 after
+> > > vect.
+> > > Is before predcom a good place?
+> > 
+> > I would avoid putting it into the loop pipeline.  Instead I'd turn the
+> > FRE pass that runs after tracer into PRE.  Maybe conditional on whether
+> > there are any loops.
+> > 
+> > Note it's not so easy to "tame" PRE, the existing things happen at
+> > elimination time in eliminate_dom_walker::eliminate_stmt.  I would
+> > experiment with restricting the use of inserted PHIs in innermost(!)
+> > loops containing invariants, maybe only if the number of PHI args is
+> > more than two ... (but that's somewhat artificial).
+> > 
+> > That said, I'm not really convinced this is a good idea.
+> 
+> I hear you.. there's also the added complexity that this likely only is
+> beneficial for fully masked architectures.  I wonder, if it might be
+> feasible and better to pass on additional information from pre to ifcvt to
+> indicate that the operation was created from a common block.
+> 
+> In which case ifcvt could move the cond to just before the first shared
+> statement?I don't think PRE "knows" where the operation was created from since it's
+transforms from a global dataflow problem solution.
+
+Btw, what's the testcase your last examples are from?
+
+- User: Tamar Christina | Time: 2023-07-10 11:49:28 UTC
+  Text: > > 
+> > In which case ifcvt could move the cond to just before the first shared
+> > statement?
+> 
+> I don't think PRE "knows" where the operation was created from since it's
+> transforms from a global dataflow problem solution.
+> 
+> Btw, what's the testcase your last examples are from?It's fromhttps://gcc.gnu.org/bugzilla/attachment.cgi?id=54777Seehttps://godbolt.org/z/KfzW4ob4Y
+
+- User: GCC Commits | Time: 2023-07-14 10:22:50 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:d8f5e349772b6652bddb0620bb178290905998b9commitr14-2516-gd8f5e349772b6652bddb0620bb178290905998b9Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Fri Jul 14 11:21:12 2023 +0100
+
+    ifcvt: Reduce comparisons on conditionals by tracking truths [PR109154]
+    
+    Following on from Jakub's patch ing:de0ee9d14165eebb3d31c84e98260c05c3b33acbthese two patches finishes the work fixing the regression and improves codegen.
+    
+    As explained in that commit, ifconvert sorts PHI args in increasing number of
+    occurrences in order to reduce the number of comparisons done while
+    traversing the tree.
+    
+    The remaining task that this patch fixes is dealing with the long chain of
+    comparisons that can be created from phi nodes, particularly when they share
+    any common successor (classical example is a diamond node).
+    
+    on a PHI-node the true and else branches carry a condition, true will
+    carry `a` and false `~a`.  The issue is that at the moment GCC tests both `a`
+    and `~a` when the phi node has more than 2 arguments. Clearly this isn't
+    needed.  The deeper the nesting of phi nodes the larger the repetition.
+    
+    As an example, for
+    
+    foo (int *f, int d, int e)
+    {
+      for (int i = 0; i < 1024; i++)
+        {
+          int a = f[i];
+          int t;
+          if (a < 0)
+            t = 1;
+          else if (a < e)
+            t = 1 - a * d;
+          else
+            t = 0;
+          f[i] = t;
+        }
+    }
+    
+    after Jakub's patch we generate:
+    
+      _7 = a_10 < 0;
+      _21 = a_10 >= 0;
+      _22 = a_10 < e_11(D);
+      _23 = _21 & _22;
+      _ifc__42 = _23 ? t_13 : 0;
+      t_6 = _7 ? 1 : _ifc__42
+    
+    but while better than before it is still inefficient, since in the false
+    branch, where we know ~_7 is true, we still test _21.
+    
+    This leads to superfluous tests for every diamond node.  After this patch we
+    generate
+    
+     _7 = a_10 < 0;
+     _22 = a_10 < e_11(D);
+     _ifc__42 = _22 ? t_13 : 0;
+     t_6 = _7 ? 1 : _ifc__42;
+    
+    Which correctly elides the test of _21.  This is done by borrowing the
+    vectorizer's helper functions to limit predicate mask usages.  Ifcvt will chain
+    conditionals on the false edge (unless specifically inverted) so this patch on
+    creating cond a ? b : c, will register ~a when traversing c.  If c is a
+    conditional then c will be simplified to the smaller possible predicate given
+    the assumptions we already know to be true.
+    
+    gcc/ChangeLog:PR tree-optimization/109154* tree-if-conv.cc (gen_simplified_condition,
+            gen_phi_nest_statement): New.
+            (gen_phi_arg_condition, predicate_scalar_phi): Use it.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/109154* gcc.dg/vect/vect-ifcvt-19.c: New test.
+
+- User: GCC Commits | Time: 2023-07-14 10:22:55 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:9ed4fcfe47f28b36c73d74109898514ef4da00fbcommitr14-2517-g9ed4fcfe47f28b36c73d74109898514ef4da00fbAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Fri Jul 14 11:21:46 2023 +0100
+
+    ifcvt: Sort PHI arguments not only occurrences but also complexity [PR109154]
+    
+    This patch builds on the previous patch by fixing another issue with the
+    way ifcvt currently picks which branches to test.
+    
+    The issue with the current implementation is while it sorts for
+    occurrences of the argument, it doesn't check for complexity of the arguments.
+    
+    As an example:
+    
+      <bb 15> [local count: 528603100]:
+      ...
+      if (distbb_75 >= 0.0)
+        goto <bb 17>; [59.00%]
+      else
+        goto <bb 16>; [41.00%]
+    
+      <bb 16> [local count: 216727269]:
+      ...
+      goto <bb 19>; [100.00%]
+    
+      <bb 17> [local count: 311875831]:
+      ...
+      if (distbb_75 < iftmp.0_98)
+        goto <bb 18>; [20.00%]
+      else
+        goto <bb 19>; [80.00%]
+    
+      <bb 18> [local count: 62375167]:
+      ...
+    
+      <bb 19> [local count: 528603100]:
+      # prephitmp_175 = PHI <_173(18), 0.0(17), _174(16)>
+    
+    All tree arguments to the PHI have the same number of occurrences, namely 1,
+    however it makes a big difference which comparison we test first.
+    
+    Sorting only on occurrences we'll pick the compares coming from BB 18 and BB 17,
+    This means we end up generating 4 comparisons, while 2 would have been enough.
+    
+    By keeping track of the "complexity" of the COND in each BB, (i.e. the number
+    of comparisons needed to traverse from the start [BB 15] to end [BB 19]) and
+    using a key tuple of <occurrences, complexity> we end up selecting the compare
+    from BB 16 and BB 18 first.  BB 16 only requires 1 compare, and BB 18, after we
+    test BB 16 also only requires one additional compare.  This change paired with
+    the one previous above results in the optimal 2 compares.
+    
+    For deep nesting, i.e. for
+    
+    ...
+      _79 = vr_15 > 20;
+      _80 = _68 & _79;
+      _82 = vr_15 <= 20;
+      _83 = _68 & _82;
+      _84 = vr_15 < -20;
+      _85 = _73 & _84;
+      _87 = vr_15 >= -20;
+      _88 = _73 & _87;
+      _ifc__111 = _55 ? 10 : 12;
+      _ifc__112 = _70 ? 7 : _ifc__111;
+      _ifc__113 = _85 ? 8 : _ifc__112;
+      _ifc__114 = _88 ? 9 : _ifc__113;
+      _ifc__115 = _45 ? 1 : _ifc__114;
+      _ifc__116 = _63 ? 3 : _ifc__115;
+      _ifc__117 = _65 ? 4 : _ifc__116;
+      _ifc__118 = _83 ? 6 : _ifc__117;
+      _ifc__119 = _60 ? 2 : _ifc__118;
+      _ifc__120 = _43 ? 13 : _ifc__119;
+      _ifc__121 = _75 ? 11 : _ifc__120;
+      vw_1 = _80 ? 5 : _ifc__121;
+    
+    Most of the comparisons are still needed because the chain of
+    occurrences to not negate eachother. i.e. _80 is _73 & vr_15 >= -20 and
+    _85 is _73 & vr_15 < -20.  clearly given _73 needs to be true in both branches,
+    the only additional test needed is on vr_15, where the one test is the negation
+    of the other.  So we don't need to do the comparison of _73 twice.
+    
+    The changes in the patch reduces the overall number of compares by one, but has
+    a bigger effect on the dependency chain.
+    
+    Previously we would generate 5 instructions chain:
+    
+            cmple   p7.s, p4/z, z29.s, z30.s
+            cmpne   p7.s, p7/z, z29.s, #0
+            cmple   p6.s, p7/z, z31.s, z30.s
+            cmpge   p6.s, p6/z, z27.s, z25.s
+            cmplt   p15.s, p6/z, z28.s, z21.s
+    
+    as the longest chain.  With this patch we generate 3:
+    
+            cmple   p7.s, p3/z, z27.s, z30.s
+            cmpne   p7.s, p7/z, z27.s, #0
+            cmpgt   p7.s, p7/z, z31.s, z30.s
+    
+    and I don't think (x <= y) && (x != 0) && (z > y) can be reduced further.
+    
+    gcc/ChangeLog:PR tree-optimization/109154* tree-if-conv.cc (INCLUDE_ALGORITHM): Include.
+            (struct bb_predicate): Add no_predicate_stmts.
+            (set_bb_predicate): Increase predicate count.
+            (set_bb_predicate_gimplified_stmts): Conditionally initialize
+            no_predicate_stmts.
+            (get_bb_num_predicate_stmts): New.
+            (init_bb_predicate): Initialzie no_predicate_stmts.
+            (release_bb_predicate): Cleanup no_predicate_stmts.
+            (insert_gimplified_predicates): Preserve no_predicate_stmts.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/109154* gcc.dg/vect/vect-ifcvt-20.c: New test.
+
+- User: Richard Biener | Time: 2023-07-27 09:25:40 UTC
+  Text: GCC 13.2 is being released, retargeting bugs to GCC 13.3.
+
+- User: GCC Commits | Time: 2023-10-02 10:53:43 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:19610580d49f3d2d8d511fba55b39efa0764dfc2commitr14-4361-g19610580d49f3d2d8d511fba55b39efa0764dfc2Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Mon Oct 2 11:48:26 2023 +0100
+
+    ifcvt: replace C++ sort with vec::qsort [PR109154]
+    
+    As requested later on, this replaces the C++ sort with vec::qsort.
+    
+    gcc/ChangeLog:PR tree-optimization/109154* tree-if-conv.cc (INCLUDE_ALGORITHM): Remove.
+            (cmp_arg_entry): New.
+            (predicate_scalar_phi): Use it.
+
+- User: GCC Commits | Time: 2023-10-18 08:54:46 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:4b39aeef594f311e2c1715f15608f1d7ebc2d868commitr14-4713-g4b39aeef594f311e2c1715f15608f1d7ebc2d868Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Wed Oct 18 09:32:55 2023 +0100
+
+    middle-end: Fold vec_cond into conditional ternary or binary operation when sharing operand [PR109154]
+    
+    When we have a vector conditional on a masked target which is doing a selection
+    on the result of a conditional operation where one of the operands of the
+    conditional operation is the other operand of the select, then we can fold the
+    vector conditional into the operation.
+    
+    Concretely this transforms
+    
+      c = mask1 ? (masked_op mask2 a b) : b
+    
+    into
+    
+      c = masked_op (mask1 & mask2) a b
+    
+    The mask is then propagated upwards by the compiler.  In the SVE case we don't
+    end up needing a mask AND here since `mask2` will end up in the instruction
+    creating `mask` which gives us a natural &.
+    
+    Such transformations are more common now in GCC 13+ as PRE has not started
+    unsharing of common code in case it can make one branch fully independent.
+    
+    e.g. in this case `b` becomes a loop invariant value after PRE.
+    
+    This transformation removes the extra select for masked architectures but
+    doesn't fix the general case.
+    
+    gcc/ChangeLog:PR tree-optimization/109154* match.pd: Add new cond_op rule.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/109154* gcc.target/aarch64/sve/pre_cond_share_1.c: New test.
+
+- User: GCC Commits | Time: 2023-10-18 08:54:51 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:b0fe8f2f960d746e61debd61655f231f503bccaacommitr14-4714-gb0fe8f2f960d746e61debd61655f231f503bccaaAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Wed Oct 18 09:33:30 2023 +0100
+
+    middle-end: ifcvt: Allow any const IFN in conditional blocks
+    
+    When ifcvt was initially added masking was not a thing and as such it was
+    rather conservative in what it supported.
+    
+    For builtins it only allowed C99 builtin functions which it knew it can fold
+    away.
+    
+    These days the vectorizer is able to deal with needing to mask IFNs itself.
+    vectorizable_call is able vectorize the IFN by emitting a VEC_PERM_EXPR after
+    the operation to emulate the masking.
+    
+    This is then used by match.pd to conver the IFN into a masked variant if it's
+    available.
+    
+    For these reasons the restriction in ifconvert is no longer require and we
+    needless block vectorization when we can effectively handle the operations.
+    
+    Bootstrapped Regtested on aarch64-none-linux-gnu and no issues.
+    
+    Note: This patch is part of a testseries and tests for it are added in the
+    AArch64 patch that adds supports for the optab.
+    
+    gcc/ChangeLog:PR tree-optimization/109154* tree-if-conv.cc (if_convertible_stmt_p): Allow any const IFN.
+
+- User: GCC Commits | Time: 2023-10-18 08:54:58 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:04227acbe9e6c60d1e314a6b4f2d949c07f30baacommitr14-4715-g04227acbe9e6c60d1e314a6b4f2d949c07f30baaAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Wed Oct 18 09:34:01 2023 +0100
+
+    AArch64: Rewrite simd move immediate patterns to new syntax
+    
+    This rewrites the simd MOV patterns to use the new compact syntax.
+    No change in semantics is expected.  This will be needed in follow on patches.
+    
+    This also merges the splits into the define_insn which will also be needed soon.
+    
+    gcc/ChangeLog:PR tree-optimization/109154* config/aarch64/aarch64-simd.md (*aarch64_simd_mov<VDMOV:mode>):
+            Rewrite to new syntax.
+            (*aarch64_simd_mov<VQMOV:mode): Rewrite to new syntax and merge in
+            splits.
+
+- User: GCC Commits | Time: 2023-10-18 08:55:04 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:dd28f90c95378bf8ebb82a3dfdf24a6ad190877acommitr14-4716-gdd28f90c95378bf8ebb82a3dfdf24a6ad190877aAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Wed Oct 18 09:49:36 2023 +0100
+
+    ifcvt: rewrite args handling to remove lookups
+    
+    This refactors the code to remove the args cache and index lookups
+    in favor of a single structure. It also again, removes the use of
+    std::sort as previously requested but avoids the new asserts in
+    trunk.
+    
+    gcc/ChangeLog:PR tree-optimization/109154* tree-if-conv.cc (INCLUDE_ALGORITHM): Remove.
+            (typedef struct ifcvt_arg_entry): New.
+            (cmp_arg_entry): New.
+            (gen_phi_arg_condition, gen_phi_nest_statement,
+            predicate_scalar_phi): Use them.
+
+- User: GCC Commits | Time: 2023-11-09 14:20:00 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:2d44ab221f64f01fc676be0da1a6774740d713c6commitr14-5283-g2d44ab221f64f01fc676be0da1a6774740d713c6Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Thu Nov 9 13:58:59 2023 +0000
+
+    middle-end: expand copysign handling from lockstep to nested iters
+    
+    various optimizations in match.pd only happened on COPYSIGN in lock step
+    which means they exclude IFN_COPYSIGN.  COPYSIGN however is restricted to only
+    the C99 builtins and so doesn't work for vectors.
+    
+    The patch expands these optimizations to work as nested iters.
+    
+    This is needed for the second patch which will add the testcase.
+    
+    gcc/ChangeLog:PR tree-optimization/109154* match.pd: expand existing copysign optimizations.
+
+- User: GCC Commits | Time: 2023-11-09 14:20:05 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:3f176e1adc6bc9cc2c21222d776b51d9f43cb66bcommitr14-5284-g3f176e1adc6bc9cc2c21222d776b51d9f43cb66bAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Thu Nov 9 13:59:39 2023 +0000
+
+    middle-end: optimize fneg (fabs (x)) to copysign (x, -1) [PR109154]
+    
+    This patch transforms fneg (fabs (x)) into copysign (x, -1) which is more
+    canonical and allows a target to expand this sequence efficiently.  Such
+    sequences are common in scientific code working with gradients.
+    
+    There is an existing canonicalization of copysign (x, -1) to fneg (fabs (x))
+    which I remove since this is a less efficient form.  The testsuite is also
+    updated in light of this.
+    
+    gcc/ChangeLog:PR tree-optimization/109154* match.pd: Add new neg+abs rule, remove inverse copysign rule.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/109154* gcc.dg/fold-copysign-1.c: Updated.
+            * gcc.dg/pr55152-2.c: Updated.
+            * gcc.dg/tree-ssa/abs-4.c: Updated.
+            * gcc.dg/tree-ssa/backprop-6.c: Updated.
+            * gcc.dg/tree-ssa/copy-sign-2.c: Updated.
+            * gcc.dg/tree-ssa/mult-abs-2.c: Updated.
+            * gcc.target/aarch64/fneg-abs_1.c: New test.
+            * gcc.target/aarch64/fneg-abs_2.c: New test.
+            * gcc.target/aarch64/fneg-abs_3.c: New test.
+            * gcc.target/aarch64/fneg-abs_4.c: New test.
+            * gcc.target/aarch64/sve/fneg-abs_1.c: New test.
+            * gcc.target/aarch64/sve/fneg-abs_2.c: New test.
+            * gcc.target/aarch64/sve/fneg-abs_3.c: New test.
+            * gcc.target/aarch64/sve/fneg-abs_4.c: New test.
+
+- User: GCC Commits | Time: 2023-11-09 14:20:10 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:f30ecd8050444fb902ab66b4600c590908861fdfcommitr14-5285-gf30ecd8050444fb902ab66b4600c590908861fdfAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Thu Nov 9 14:00:20 2023 +0000
+
+    ifcvt: Add support for conditional copysign
+    
+    This adds a masked variant of copysign.  Nothing very exciting just the
+    general machinery to define and use a new masked IFN.
+    
+    Bootstrapped Regtested on aarch64-none-linux-gnu and no issues.
+    
+    Note: This patch is part of a testseries and tests for it are added in the
+    AArch64 patch that adds supports for the optab.
+    
+    gcc/ChangeLog:PR tree-optimization/109154* internal-fn.def (COPYSIGN): New.
+            * match.pd (UNCOND_BINARY, COND_BINARY): Map IFN_COPYSIGN to
+            IFN_COND_COPYSIGN.
+            * optabs.def (cond_copysign_optab, cond_len_copysign_optab): New.
+
+- User: GCC Commits | Time: 2023-11-09 14:20:15 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:2ea13fb9c0b56e9b8c0425d101cf81437a5200cfcommitr14-5286-g2ea13fb9c0b56e9b8c0425d101cf81437a5200cfAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Thu Nov 9 14:02:21 2023 +0000
+
+    AArch64: Add special patterns for creating DI scalar and vector constant 1 << 63 [PR109154]
+    
+    This adds a way to generate special sequences for creation of constants for
+    which we don't have single instructions sequences which would have normally
+    lead to a GP -> FP transfer or a literal load.
+    
+    The patch starts out by adding support for creating 1 << 63 using fneg (mov 0).
+    
+    gcc/ChangeLog:PR tree-optimization/109154* config/aarch64/aarch64-protos.h (aarch64_simd_special_constant_p,
+            aarch64_maybe_generate_simd_constant): New.
+            * config/aarch64/aarch64-simd.md (*aarch64_simd_mov<VQMOV:mode>,
+            *aarch64_simd_mov<VDMOV:mode>): Add new coden for special constants.
+            * config/aarch64/aarch64.cc (aarch64_extract_vec_duplicate_wide_int):
+            Take optional mode.
+            (aarch64_simd_special_constant_p,
+            aarch64_maybe_generate_simd_constant): New.
+            * config/aarch64/aarch64.md (*movdi_aarch64): Add new codegen for
+            special constants.
+            * config/aarch64/constraints.md (Dx): new.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/109154* gcc.target/aarch64/fneg-abs_1.c: Updated.
+            * gcc.target/aarch64/fneg-abs_2.c: Updated.
+            * gcc.target/aarch64/fneg-abs_4.c: Updated.
+            * gcc.target/aarch64/dbl_mov_immediate_1.c: Updated.
+
+- User: GCC Commits | Time: 2023-11-09 14:20:21 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:830460d67a10549939602ba323ea3fa65fb7de20commitr14-5287-g830460d67a10549939602ba323ea3fa65fb7de20Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Thu Nov 9 14:03:04 2023 +0000
+
+    AArch64: Add movi for 0 moves for scalar types [PR109154]
+    
+    Following the Neoverse N/V and Cortex-A optimization guides SIMD 0 immediates
+    should be created with a movi of 0.
+    
+    At the moment we generate an `fmov .., xzr` which is slower and requires a
+    GP -> FP transfer.
+    
+    gcc/ChangeLog:PR tree-optimization/109154* config/aarch64/aarch64.md (*mov<mode>_aarch64, *movsi_aarch64,
+            *movdi_aarch64): Add new w -> Z case.
+            * config/aarch64/iterators.md (Vbtype): Add QI and HI.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/109154* gcc.target/aarch64/fneg-abs_2.c: Updated.
+            * gcc.target/aarch64/fneg-abs_4.c: Updated.
+            * gcc.target/aarch64/dbl_mov_immediate_1.c: Updated.
+
+- User: GCC Commits | Time: 2023-11-09 14:20:26 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:ffd40d3b233d63c925cceb0dcd5a4fc8925e2993commitr14-5288-gffd40d3b233d63c925cceb0dcd5a4fc8925e2993Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Thu Nov 9 14:18:48 2023 +0000
+
+    AArch64: Use SVE unpredicated LOGICAL expressions when Advanced SIMD inefficient [PR109154]
+    
+    SVE has much bigger immediate encoding range for bitmasks than Advanced SIMD has
+    and so on a system that is SVE capable if we need an Advanced SIMD Inclusive-OR
+    by immediate and would require a reload then use an unpredicated SVE ORR instead.
+    
+    This has both speed and size improvements.
+    
+    gcc/ChangeLog:PR tree-optimization/109154* config/aarch64/aarch64.md (<optab><mode>3): Add SVE split case.
+            * config/aarch64/aarch64-simd.md (ior<mode>3<vczle><vczbe>): Likewise.
+            * config/aarch64/predicates.md(aarch64_orr_imm_sve_advsimd): New.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/109154* gcc.target/aarch64/sve/fneg-abs_1.c: Updated.
+            * gcc.target/aarch64/sve/fneg-abs_2.c: Updated.
+            * gcc.target/aarch64/sve/fneg-abs_4.c: Updated.
+
+- User: GCC Commits | Time: 2023-11-09 14:20:31 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:ed2e058c58ab064fe3a26bc4a47a5d0a47350f97commitr14-5289-ged2e058c58ab064fe3a26bc4a47a5d0a47350f97Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Thu Nov 9 14:04:57 2023 +0000
+
+    AArch64: Handle copysign (x, -1) expansion efficiently
+    
+    copysign (x, -1) is effectively fneg (abs (x)) which on AArch64 can be
+    most efficiently done by doing an OR of the signbit.
+    
+    The middle-end will optimize fneg (abs (x)) now to copysign as the
+    canonical form and so this optimizes the expansion.
+    
+    If the target has an inclusive-OR that takes an immediate, then the transformed
+    instruction is both shorter and faster.  For those that don't, the immediate
+    has to be separately constructed, but this still ends up being faster as the
+    immediate construction is not on the critical path.
+    
+    Note that this is part of another patch series, the additional testcases
+    are mutually dependent on the match.pd patch.  As such the tests are added
+    there insteadof here.
+    
+    gcc/ChangeLog:PR tree-optimization/109154* config/aarch64/aarch64.md (copysign<GPF:mode>3): Handle
+            copysign (x, -1).
+            * config/aarch64/aarch64-simd.md (copysign<mode>3): Likewise.
+            * config/aarch64/aarch64-sve.md (copysign<mode>3): Likewise.
+
+- User: GCC Commits | Time: 2023-11-09 14:20:36 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:e01c2eeb2b654abc82378e204da8327bcdaf05dccommitr14-5290-ge01c2eeb2b654abc82378e204da8327bcdaf05dcAuthor: Tamar Christina <tamar.christina@arm.com>
+Date:   Thu Nov 9 14:05:40 2023 +0000
+
+    AArch64: Add SVE implementation for cond_copysign.
+    
+    This adds an implementation for masked copysign along with an optimized
+    pattern for masked copysign (x, -1).
+    
+    gcc/ChangeLog:PR tree-optimization/109154* config/aarch64/aarch64-sve.md (cond_copysign<mode>): New.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/109154* gcc.target/aarch64/sve/fneg-abs_5.c: New test.
+
+- User: Tamar Christina | Time: 2023-11-09 14:25:54 UTC
+  Text: This should give better performance then GCC-12.  The patches are not backportable so closing as resolved in GCC-14.
+

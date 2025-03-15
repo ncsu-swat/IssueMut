@@ -1,0 +1,324 @@
+Bug Summary: [12 Regression] Bit field stores can be incorrectly optimized away when -fstore-merging is in effect since r12-5383-g22c242342e38eb
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 12.4.1, 13.3.1, 14.1.1, 15.0
+Known to Fail: 12.4.0, 13.3.0, 14.1.0
+
+Comments:
+- User: Michał Kępień | Time: 2023-09-27 12:51:14 UTC
+  Text: Createdattachment 56002[details]Preprocessed reproducer
+
+This is the simplest reproducer I could come up with:
+
+	$ cat bitfield.c
+	#include <stdio.h>
+	#include <stdlib.h>
+
+	struct bitfield {
+		unsigned int field1 : 1;
+		unsigned int field2 : 1;
+		unsigned int field3 : 1;
+	};
+
+	__attribute__((noinline)) static void
+	set_field1_and_field2(struct bitfield *b) {
+		b->field1 = 1;
+		b->field2 = 1;
+	}
+
+	__attribute__((noinline)) static struct bitfield *
+	new_bitfield(void) {
+		struct bitfield *b = (struct bitfield *)malloc(sizeof(*b));
+		b->field3 = 1;
+		set_field1_and_field2(b);
+		return b;
+	}
+
+	int main(void) {
+		struct bitfield *b = new_bitfield();
+		printf("%d\n", b->field3);
+		return 0;
+	}
+	$ gcc -O2 -o bitfield bitfield.c
+	$ ./bitfield
+	0
+	$ gcc -O2 -fno-store-merging -o bitfield bitfield.c
+	$ ./bitfield
+	1
+
+Removing one of the stores from set_field1_and_field2() makes the issue
+go away.  Moving "b->field3 = 1;" below the call to
+set_field1_and_field2() also makes the issue go away.
+
+This was originally found for the following GCC version:
+
+	$ gcc -v
+	Using built-in specs.
+	COLLECT_GCC=/usr/bin/gcc
+	COLLECT_LTO_WRAPPER=/usr/lib/gcc/x86_64-pc-linux-gnu/13.2.1/lto-wrapper
+	Target: x86_64-pc-linux-gnu
+	Configured with: /build/gcc/src/gcc/configure --enable-languages=ada,c,c++,d,fortran,go,lto,objc,obj-c++ --enable-bootstrap --prefix=/usr --libdir=/usr/lib --libexecdir=/usr/lib --mandir=/usr/share/man --infodir=/usr/share/info --with-bugurl=https://bugs.archlinux.org/--with-build-config=bootstrap-lto --with-linker-hash-style=gnu --with-system-zlib --enable-__cxa_atexit --enable-cet=auto --enable-checking=release --enable-clocale=gnu --enable-default-pie --enable-default-ssp --enable-gnu-indirect-function --enable-gnu-unique-object --enable-libstdcxx-backtrace --enable-link-serialization=1 --enable-linker-build-id --enable-lto --enable-multilib --enable-plugin --enable-shared --enable-threads=posix --disable-libssp --disable-libstdcxx-pch --disable-werror
+	Thread model: posix
+	Supported LTO compression algorithms: zlib zstd
+	gcc version 13.2.1 20230801 (GCC) 
+
+However, I have subsequently confirmed that it also happens on the
+current master branch.
+
+A git bisect points at the following commit as the culprit (first
+included in GCC 12.1.0):
+
+	commit 22c242342e38ebffa6bbf7e86e7a1e4abdf0d686
+	Author: Martin Liska <mliska@suse.cz>
+	Date:   Thu Nov 18 17:50:19 2021 +0100
+
+	    IPA: fix reproducibility in IPA MOD REF
+	    
+	    gcc/ChangeLog:
+	    
+		    * ipa-modref.c (analyze_function): Do not execute the code
+		    only if dump_file != NULL.
+
+Reverting this change on top of current master makes the issue
+disappear, so it looks legit to me.
+
+Disassembly of new_bitfield() for "gcc -O2":
+
+	   0x0000000000001190 <+0>:	sub    $0x8,%rsp
+	   0x0000000000001194 <+4>:	mov    $0x4,%edi
+	   0x0000000000001199 <+9>:	call   0x1040 <malloc@plt>
+	   0x000000000000119e <+14>:	mov    %rax,%rdi
+	   0x00000000000011a1 <+17>:	call   0x1180 <set_field1_and_field2>
+	   0x00000000000011a6 <+22>:	add    $0x8,%rsp
+	   0x00000000000011aa <+26>:	ret
+
+Disassembly of new_bitfield() for "gcc -O2 -fno-store-merging":
+
+	   0x0000000000001190 <+0>:	sub    $0x8,%rsp
+	   0x0000000000001194 <+4>:	mov    $0x4,%edi
+	   0x0000000000001199 <+9>:	call   0x1040 <malloc@plt>
+	   0x000000000000119e <+14>:	orb    $0x4,(%rax)
+	   0x00000000000011a1 <+17>:	mov    %rax,%rdi
+	   0x00000000000011a4 <+20>:	call   0x1180 <set_field1_and_field2>
+	   0x00000000000011a9 <+25>:	add    $0x8,%rsp
+	   0x00000000000011ad <+29>:	ret
+
+- User: Richard Biener | Time: 2023-09-27 13:52:01 UTC
+  Text: Confirmed.
+
+- User: Richard Biener | Time: 2023-09-27 13:53:37 UTC
+  Text: It's the late IPA modref that mis-analyzes the store-merged sequence I think.
+
+- User: Andrew Pinski | Time: 2023-10-30 13:24:02 UTC
+  Text: ***Bug 112289has been marked as a duplicate of this bug. ***
+
+- User: Richard Biener | Time: 2023-11-07 09:23:57 UTC
+  Text: DSE removes the store before set_field1_and_field2:
+
+   b_3 = malloc (4);
+-  b_3->field3 = 1;
+   set_field1_and_field2 (b_3);
+
+modref analyzing 'set_field1_and_field2/22' (ipa=0)
+Past summary:
+  loads:
+  stores:
+      Base 0: alias set 1
+        Ref 0: alias set 1
+          access: Parm 0 param offset:0 offset:0 size:1 max_size:2
+  kills:
+     Parm 0 param offset:0 offset:0 size:2 max_size:2
+  Try dse
+  parm 0 flags: no_indirect_clobber no_direct_escape no_indirect_escape no_direct_read no_indirect_read
+
+and local analysis:
+
+ - Analyzing load: MEM <unsigned char> [(struct bitfield *)b_2(D)]
+   - Recording base_set=1 ref_set=1  Parm 0 param offset:0 offset:0 size:8 max_size:8
+ - Analyzing store: MEM <unsigned char> [(struct bitfield *)b_2(D)]
+   - Recording base_set=1 ref_set=1  Parm 0 param offset:0 offset:0 size:8 max_size:8
+   - Recording kill
+ - modref done with result: tracked.
+  loads:
+      Base 0: alias set 1
+        Ref 0: alias set 1
+          access: Parm 0 param offset:0 offset:0 size:8 max_size:8
+  stores:
+      Base 0: alias set 1
+        Ref 0: alias set 1
+          access: Parm 0 param offset:0 offset:0 size:8 max_size:8
+  kills:
+     Parm 0 param offset:0 offset:0 size:8 max_size:8
+  Try dse
+  parm 0 flags: no_indirect_clobber no_direct_escape no_indirect_escape no_direct_read no_indirect_read
+
+note how we merge flags of the param to include the IPA time no_direct_read.
+
+Basically the store-merging transform changes the store to kill all bits
+but by reading the original bits and storing them again.
+
+The change by Martin made us use the IPA param flags, but as shown we
+really can't do this, at least not for all flag kinds.  So I don't think
+we can use the IPA state for the function we're re-analyzing, but we
+can probably use the IPA of function calls we run into during analyzing?
+
+Honza, please have a look here.
+
+- User: Richard Biener | Time: 2023-12-15 12:50:40 UTC
+  Text: Yours.
+
+- User: Richard Biener | Time: 2024-06-20 09:14:07 UTC
+  Text: GCC 12.4 is being released, retargeting bugs to GCC 12.5.
+
+- User: Jan Hubicka | Time: 2024-07-22 16:19:36 UTC
+  Text: I suppose there is not much to do about past noread flags. I do not see how optimization can invalidate other properties, so I am testing the following:
+
+diff --git a/gcc/ipa-modref.cc b/gcc/ipa-modref.cc
+index f994388a96a..53a2e35133d 100644
+--- a/gcc/ipa-modref.cc
++++ b/gcc/ipa-modref.cc
+@@ -3004,6 +3004,9 @@ analyze_parms (modref_summary *summary, modref_summary_lto *summary_lto,
+                     (past, ecf_flags,
+                      VOID_TYPE_P (TREE_TYPE
+                          (TREE_TYPE (current_function_decl))));
++         /* Store merging can produce reads when combining together multiple
++            bitfields.  SeePR111613.  */
++         past &= ~(EAF_NO_DIRECT_READ | EAF_NO_INDIRECT_READ);
+          if (dump_file && (flags | past) != flags && !(flags & EAF_UNUSED))
+            {
+              fprintf (dump_file,
+
+- User: GCC Commits | Time: 2024-07-22 17:01:27 UTC
+  Text: The master branch has been updated by Jan Hubicka <hubicka@gcc.gnu.org>:https://gcc.gnu.org/g:14074773350ffed7efdebbc553adf0f23b572e87commitr15-2205-g14074773350ffed7efdebbc553adf0f23b572e87Author: Jan Hubicka <hubicka@ucw.cz>
+Date:   Mon Jul 22 19:00:39 2024 +0200
+
+    Fix modref's iteraction with store merging
+    
+    Hi,
+    this patch fixes wrong code in case store-merging introduces load of function
+    parameter that was previously write-only (which happens for bitfields).
+    Without this, the whole store-merged area is consdered to be killed.PR ipa/111613gcc/ChangeLog:
+    
+            * ipa-modref.cc (analyze_parms): Do not preserve EAF_NO_DIRECT_READ and
+            EAF_NO_INDIRECT_READ from past flags.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/pr111613.c: New test.
+
+- User: Jan Hubicka | Time: 2024-07-22 17:04:08 UTC
+  Text: Fixed on 14/15
+
+- User: GCC Commits | Time: 2024-07-22 20:56:14 UTC
+  Text: The releases/gcc-14 branch has been updated by Jan Hubicka <hubicka@gcc.gnu.org>:https://gcc.gnu.org/g:9ddd5f88e60972147dff74b48658e2b12040d468commitr14-10495-g9ddd5f88e60972147dff74b48658e2b12040d468Author: Jan Hubicka <hubicka@ucw.cz>
+Date:   Mon Jul 22 19:00:39 2024 +0200
+
+    Fix modref's iteraction with store merging
+    
+    Hi,
+    this patch fixes wrong code in case store-merging introduces load of function
+    parameter that was previously write-only (which happens for bitfields).
+    Without this, the whole store-merged area is consdered to be killed.PR ipa/111613gcc/ChangeLog:
+    
+            * ipa-modref.cc (analyze_parms): Do not preserve EAF_NO_DIRECT_READ and
+            EAF_NO_INDIRECT_READ from past flags.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/pr111613.c: New test.
+    
+    (cherry picked from commit 14074773350ffed7efdebbc553adf0f23b572e87)
+
+- User: GCC Commits | Time: 2024-07-29 21:21:26 UTC
+  Text: The master branch has been updated by Sam James <sjames@gcc.gnu.org>:https://gcc.gnu.org/g:5e5d7a88932b132437069f716160f8b20862890bcommitr15-2388-g5e5d7a88932b132437069f716160f8b20862890bAuthor: Sam James <sam@gentoo.org>
+Date:   Mon Jul 29 21:47:16 2024 +0100
+
+    testsuite: fixPR111613testPR ipa/111613* gcc.c-torture/pr111613.c: Rename to..
+            * gcc.c-torture/execute/pr111613.c: ...this.
+
+- User: GCC Commits | Time: 2024-10-13 21:43:48 UTC
+  Text: The releases/gcc-14 branch has been updated by Sam James <sjames@gcc.gnu.org>:https://gcc.gnu.org/g:d8ac855f796b0cf47d80c713d2f01943dffec0b7commitr14-10780-gd8ac855f796b0cf47d80c713d2f01943dffec0b7Author: Sam James <sam@gentoo.org>
+Date:   Mon Jul 29 21:47:16 2024 +0100
+
+    testsuite: fixPR111613testPR ipa/111613* gcc.c-torture/pr111613.c: Rename to..
+            * gcc.c-torture/execute/pr111613.c: ...this.
+    
+    (cherry picked from commit 5e5d7a88932b132437069f716160f8b20862890b)
+
+- User: Sam James | Time: 2024-10-13 21:47:19 UTC
+  Text: richi or honza: can I test and queue backports for the IPA fixes (the slew from the other month, inc. this one) at least for 13, possibly 12 but don't mind waiting more there?
+
+- User: rguenther@suse.de | Time: 2024-10-14 05:42:08 UTC
+  Text: On Sun, 13 Oct 2024, sjames at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=111613> 
+> ---Comment #13from Sam James <sjames at gcc dot gnu.org> ---
+> richi or honza: can I test and queue backports for the IPA fixes (the slew from
+> the other month, inc. this one) at least for 13, possibly 12 but don't mind
+> waiting more there?Sure - go ahead.
+
+- User: GCC Commits | Time: 2024-10-14 17:44:22 UTC
+  Text: The releases/gcc-13 branch has been updated by Sam James <sjames@gcc.gnu.org>:https://gcc.gnu.org/g:fefa09cb6a1afe0c16186bfc9c80f91e2d5aa5bacommitr13-9107-gfefa09cb6a1afe0c16186bfc9c80f91e2d5aa5baAuthor: Jan Hubicka <hubicka@ucw.cz>
+Date:   Mon Jul 22 19:00:39 2024 +0200
+
+    Fix modref's iteraction with store merging
+    
+    Hi,
+    this patch fixes wrong code in case store-merging introduces load of function
+    parameter that was previously write-only (which happens for bitfields).
+    Without this, the whole store-merged area is consdered to be killed.PR ipa/111613gcc/ChangeLog:
+    
+            * ipa-modref.cc (analyze_parms): Do not preserve EAF_NO_DIRECT_READ and
+            EAF_NO_INDIRECT_READ from past flags.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/pr111613.c: New test.
+    
+    (cherry picked from commit 14074773350ffed7efdebbc553adf0f23b572e87)
+
+- User: GCC Commits | Time: 2024-10-14 17:44:27 UTC
+  Text: The releases/gcc-13 branch has been updated by Sam James <sjames@gcc.gnu.org>:https://gcc.gnu.org/g:1a2725d346d382503c8d4f18f095fa8678b9f823commitr13-9108-g1a2725d346d382503c8d4f18f095fa8678b9f823Author: Sam James <sam@gentoo.org>
+Date:   Mon Jul 29 21:47:16 2024 +0100
+
+    testsuite: fixPR111613testPR ipa/111613* gcc.c-torture/pr111613.c: Rename to..
+            * gcc.c-torture/execute/pr111613.c: ...this.
+    
+    (cherry picked from commit 5e5d7a88932b132437069f716160f8b20862890b)
+
+- User: Sam James | Time: 2024-10-14 17:45:00 UTC
+  Text: Thanks, pushed for 13. I'll do 12 tonight probably.
+
+- User: GCC Commits | Time: 2024-10-14 21:14:39 UTC
+  Text: The releases/gcc-12 branch has been updated by Sam James <sjames@gcc.gnu.org>:https://gcc.gnu.org/g:65b67169fb1c641a11973988bd439e255d62131acommitr12-10771-g65b67169fb1c641a11973988bd439e255d62131aAuthor: Jan Hubicka <hubicka@ucw.cz>
+Date:   Mon Jul 22 19:00:39 2024 +0200
+
+    Fix modref's iteraction with store merging
+    
+    Hi,
+    this patch fixes wrong code in case store-merging introduces load of function
+    parameter that was previously write-only (which happens for bitfields).
+    Without this, the whole store-merged area is consdered to be killed.PR ipa/111613gcc/ChangeLog:
+    
+            * ipa-modref.cc (analyze_parms): Do not preserve EAF_NO_DIRECT_READ and
+            EAF_NO_INDIRECT_READ from past flags.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/pr111613.c: New test.
+    
+    (cherry picked from commit 14074773350ffed7efdebbc553adf0f23b572e87)
+
+- User: GCC Commits | Time: 2024-10-14 21:14:44 UTC
+  Text: The releases/gcc-12 branch has been updated by Sam James <sjames@gcc.gnu.org>:https://gcc.gnu.org/g:0e3580191b449e599a4c8d7bfd634df2ca351d4acommitr12-10772-g0e3580191b449e599a4c8d7bfd634df2ca351d4aAuthor: Sam James <sam@gentoo.org>
+Date:   Mon Jul 29 21:47:16 2024 +0100
+
+    testsuite: fixPR111613testPR ipa/111613* gcc.c-torture/pr111613.c: Rename to..
+            * gcc.c-torture/execute/pr111613.c: ...this.
+    
+    (cherry picked from commit 5e5d7a88932b132437069f716160f8b20862890b)
+
+- User: Sam James | Time: 2024-10-14 21:16:52 UTC
+  Text: All done, fixed for 12.5 too.
+

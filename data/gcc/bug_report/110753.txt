@@ -1,0 +1,141 @@
+Bug Summary: [14 Regression] ICE in meet_with_1, at ipa-cp.cc:1057
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: ice-on-valid-code, needs-bisection
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Shaohua Li | Time: 2023-07-20 16:09:12 UTC
+  Text: This looks like a recent regression. 
+
+Compiler explorer:https://godbolt.org/z/sGjbfYj16$ cat a.c
+int a, b, c;
+int d(long e, long f) { return f == 0 || e && f == 1 ?: f; }
+int g() {}
+static int h(long e) {
+  b = e + 4294967295;
+  a = d(b || d(e, 8), g());
+}
+int i() {
+  c = i;
+  h(c);
+}
+int main() {}
+$
+$ gcc-tk -O3 a.c
+<source>: In function 'i':
+<source>:9:5: warning: assignment to 'int' from 'int (*)()' makes integer from pointer without a cast [-Wint-conversion]
+    9 |   c = i;
+      |     ^
+during IPA pass: cp
+<source>: At top level:
+<source>:12:1: internal compiler error: in meet_with_1, at ipa-cp.cc:1057
+   12 | int main() {}
+      | ^~~
+0x215ca2e internal_error(char const*, ...)
+	???:0
+0x9cfbf0 fancy_abort(char const*, int, char const*)
+	???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+Compiler returned: 1
+$
+$ gcc-tk -v
+Using built-in specs.
+COLLECT_GCC=gcc-tk
+COLLECT_LTO_WRAPPER=/zdata/shaoli/compilers/ccbuilder-compilers/gcc-322d17ae51ea0137167424e0018d7fa355948f9f/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../configure --disable-multilib --disable-bootstrap --enable-languages=c,c++ --prefix=/zdata/shaoli/compilers/ccbuilder-compilers/gcc-322d17ae51ea0137167424e0018d7fa355948f9f
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20230711 (experimental) (GCC) 
+$
+
+- User: Andrew Pinski | Time: 2023-07-20 16:19:04 UTC
+  Text: Confirmed.
+
+Slightly less undefined code:
+```
+int a, b, c;
+static int d(long e, long f) { return f == 0 || e && f == 1 ?: f; }
+int g(void) {static int t; return t;}
+static int h(long e) {
+  b = e - 1;
+  a = d(b || d(e, 8), g());
+}
+int tt;
+void i(void) {
+  c = (__SIZE_TYPE__)&tt;
+  h(c);
+}
+//int main() {}
+```
+
+- User: Shaohua Li | Time: 2023-07-30 20:45:10 UTC
+  Text: Bisect tor14-2379-gc496d15954c, which was committed by @aldyh@redhat.com
+
+- User: Aldy Hernandez | Time: 2023-08-03 09:10:31 UTC
+  Text: The intersection of two mask/value pairs is being pessimized incorrectly.
+
+MASK 0x0 VALUE 0x1 (value is known to be 1)
+MASK 0xfffffffffffffffc VALUE 0x0 (low 2 bits are known to be 1, everything else is unknown).
+
+irange_bitmask::intersect() is intersecting these to:
+
+MASK 0xffffffffffffffff VALUE 0x0
+
+(i.e. totally unknown value).
+
+This is causing union_bitmask() to return a change when none actually occurred, because we end up losing the bitmask.
+
+Mine.
+
+- User: GCC Commits | Time: 2023-08-18 15:39:21 UTC
+  Text: The master branch has been updated by Aldy Hernandez <aldyh@gcc.gnu.org>:https://gcc.gnu.org/g:53fcd3bdbc9104a8acdc79134d8d272d7eead0fdcommitr14-3326-g53fcd3bdbc9104a8acdc79134d8d272d7eead0fdAuthor: Aldy Hernandez <aldyh@redhat.com>
+Date:   Fri Aug 18 12:41:46 2023 +0200
+
+    [irange] Return FALSE if updated bitmask is unchanged [PR110753]
+    
+    The mask/value pair we track in the irange is a bit fickle in that it
+    can sometimes contradict the bitmask inherent in the range.  This can
+    happen when a series of calculations yield a combination such as:
+    
+            [3, 1000] MASK 0xfffffffe VALUE 0x0
+    
+    The mask/value above implies that the lowest bit is a known 0, which
+    would exclude the 3 in the range.  At one time we tried keeping mask
+    and ranges 100% consistent, but the performance penalty was too high
+    (5% in VRP).  Also, it's unclear whether the intersection of two
+    incompatible known bits should make the whole range undefined, or
+    just the contradicting bits.  This is all documented in
+    irange::get_bitmask().  We could revisit both of these assumptions
+    in the future.
+    
+    In this testcase IPA ends up with a range where the lower 2 bits are
+    expected to be 0, but the range is [1,1].
+    
+            [irange] long int [1, 1] MASK 0xfffffffffffffffc VALUE 0x0
+    
+    This causes irange::union_bitmask() to think an update occurred, when
+    no semantic change happened, thus triggering an assert in IPA-cp.  We
+    could get rid of the assert, but it's cleaner to make
+    irange::{union,intersect}_bitmask always tell the truth.  Beside, the
+    ranger's cache also depends on union being truthful.PR ipa/110753gcc/ChangeLog:
+    
+            * value-range.cc (irange::union_bitmask): Return FALSE if updated
+            bitmask is semantically equivalent to the original mask.
+            (irange::intersect_bitmask): Same.
+            (irange::get_bitmask): Add comment.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/pr110753.c: New test.
+
+- User: Aldy Hernandez | Time: 2023-08-18 15:42:45 UTC
+  Text: (In reply to Aldy Hernandez fromcomment #3)> MASK 0xfffffffffffffffc VALUE 0x0 (low 2 bits are known to be 1, everything
+> else is unknown).FWIW, the above implies the low 2 bits are known to be 0, not 1.  Not that it matters, as I just fixed this PR in trunk :).
+

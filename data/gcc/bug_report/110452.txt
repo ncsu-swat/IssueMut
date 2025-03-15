@@ -1,0 +1,125 @@
+Bug Summary: Bad vectorization of invariant masks
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Richard Biener | Time: 2023-06-28 11:11:46 UTC
+  Text: When we have loop like
+
+double a[1024], b[1024], c[1024];
+
+void foo (int flag, int n)
+{
+  _Bool x = flag == 3;
+  for (int i = 0; i < n; ++i)
+    a[i] = (x ? b[i] : c[i]) * 42.;
+}
+
+and build it with -O2 -ftree-vectorize -march=znver4 (to avoid unswitching)
+we get
+
+  _55 = _2 ? -1 : 0;
+  vect_cst__56 = {_55, _55, _55, _55, _55, _55, _55, _55};
+
+  <bb 3> [local count: 567644343]:
+  # i_14 = PHI <i_11(9), 0(21)>
+  # vectp_b.10_49 = PHI <vectp_b.10_50(9), &b(21)>
+  # vectp_c.13_52 = PHI <vectp_c.13_53(9), &c(21)>
+  # vectp_a.18_62 = PHI <vectp_a.18_63(9), &a(21)>
+  # ivtmp_65 = PHI <ivtmp_66(9), 0(21)>
+  vect_iftmp.12_51 = MEM <vector(8) double> [(double *)vectp_b.10_49];
+  iftmp.0_9 = b[i_14];
+  vect_iftmp.15_54 = MEM <vector(8) double> [(double *)vectp_c.13_52];
+  iftmp.0_8 = c[i_14];
+  vect_patt_13.16_59 = VEC_COND_EXPR <vect_cst__56, vect_iftmp.12_51, vect_iftmp.15_54>;
+  iftmp.0_3 = _2 ? iftmp.0_9 : iftmp.0_8;
+
+so the invariant but not constant condition _2 on the COND_EXPR is vectorized as
+
+  _55 = _2 ? -1 : 0;
+  vect_cst__56 = {_55, _55, _55, _55, _55, _55, _55, _55};
+
+unfortunately that leads to very bad generated code
+
+        cmpl    $3, %edi
+        sete    %cl
+        movl    %ecx, %esi
+        leal    (%rsi,%rsi), %eax
+        leal    0(,%rsi,4), %r9d
+        leal    0(,%rsi,8), %r8d
+        orl     %esi, %eax
+        orl     %r9d, %eax
+        movl    %ecx, %r9d
+        orl     %r8d, %eax
+        movl    %ecx, %r8d
+        sall    $4, %r9d
+        sall    $5, %r8d
+        sall    $6, %esi
+        orl     %r9d, %eax
+        orl     %r8d, %eax
+        movl    %ecx, %r8d
+        orl     %esi, %eax
+        sall    $7, %r8d
+        orl     %r8d, %eax
+        kmovb   %eax, %k1
+
+- User: GCC Commits | Time: 2023-06-29 08:34:58 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:6d2eddf456f2d6494cac490c4aa3e7d089926098commitr14-2183-g6d2eddf456f2d6494cac490c4aa3e7d089926098Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Jun 28 14:05:55 2023 +0200
+
+    middle-end/110452 - bad code generation with AVX512 mask splat
+    
+    The following adds an alternate way of expanding a uniform
+    mask vector constructor like
+    
+      _55 = _2 ? -1 : 0;
+      vect_cst__56 = {_55, _55, _55, _55, _55, _55, _55, _55};
+    
+    when the mask mode is a scalar int mode like for AVX512 or GCN.
+    Instead of piecewise building the result via shifts and ors
+    we can take advantage of uniformity and signedness of the
+    component and simply sign-extend to the result.
+    
+    Instead of
+    
+            cmpl    $3, %edi
+            sete    %cl
+            movl    %ecx, %esi
+            leal    (%rsi,%rsi), %eax
+            leal    0(,%rsi,4), %r9d
+            leal    0(,%rsi,8), %r8d
+            orl     %esi, %eax
+            orl     %r9d, %eax
+            movl    %ecx, %r9d
+            orl     %r8d, %eax
+            movl    %ecx, %r8d
+            sall    $4, %r9d
+            sall    $5, %r8d
+            sall    $6, %esi
+            orl     %r9d, %eax
+            orl     %r8d, %eax
+            movl    %ecx, %r8d
+            orl     %esi, %eax
+            sall    $7, %r8d
+            orl     %r8d, %eax
+            kmovb   %eax, %k1
+    
+    we then get
+    
+            cmpl    $3, %edi
+            sete    %cl
+            negl    %ecx
+            kmovb   %ecx, %k1
+    
+    Code generation for non-uniform masks remains bad, but at least
+    I see no easy way out for the most general case here.PR middle-end/110452* expr.cc (store_constructor): Handle uniform boolean
+            vectors with integer mode specially.
+
+- User: Richard Biener | Time: 2023-06-29 08:35:26 UTC
+  Text: Fixed for GCC 14.
+

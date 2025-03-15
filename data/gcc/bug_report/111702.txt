@@ -1,0 +1,168 @@
+Bug Summary: [14 Regression] ICE: in insert_regs, at cse.cc:1114 with -O2 -fstack-protector-all -frounding-math
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 13.2.1
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-10-05 12:34:11 UTC
+  Text: Createdattachment 56055[details]reduced testcase
+
+Compiler output:
+$ aarch64-unknown-linux-gnu-gcc -O2 -fstack-protector-all -frounding-math testcase.c -w
+during RTL pass: cse2
+testcase.c: In function 'foo':
+testcase.c:108:1: internal compiler error: in insert_regs, at cse.cc:1114
+  108 | }
+      | ^
+0xb01a00 insert_regs
+        /repo/gcc-trunk/gcc/cse.cc:1114
+0x1e0237e merge_equiv_classes
+        /repo/gcc-trunk/gcc/cse.cc:1758
+0x1e08d85 cse_insn
+        /repo/gcc-trunk/gcc/cse.cc:4780
+0x1e0ca53 cse_extended_basic_block
+        /repo/gcc-trunk/gcc/cse.cc:6557
+0x1e0ca53 cse_main
+        /repo/gcc-trunk/gcc/cse.cc:6702
+0x1e0d470 rest_of_handle_cse2
+        /repo/gcc-trunk/gcc/cse.cc:7600
+0x1e0d470 execute
+        /repo/gcc-trunk/gcc/cse.cc:7655
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ aarch64-unknown-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-aarch64/bin/aarch64-unknown-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-4413-20231005141000-g1f7295af602-checking-yes-rtl-df-extra-aarch64/bin/../libexec/gcc/aarch64-unknown-linux-gnu/14.0.0/lto-wrapper
+Target: aarch64-unknown-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --with-cloog --with-ppl --with-isl --with-sysroot=/usr/aarch64-unknown-linux-gnu --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=aarch64-unknown-linux-gnu --with-ld=/usr/bin/aarch64-unknown-linux-gnu-ld --with-as=/usr/bin/aarch64-unknown-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-4413-20231005141000-g1f7295af602-checking-yes-rtl-df-extra-aarch64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20231005 (experimental) (GCC)
+
+- User: Richard Biener | Time: 2023-10-17 13:05:04 UTC
+  Text: Confirmed.
+
+- User: Jakub Jelinek | Time: 2023-11-10 17:41:23 UTC
+  Text: Started withr14-807-g8b18714fbb1ca9812b33b3de75fe6ba4a57d4946
+
+- User: N/A | Time: 2023-11-10 17:46:00 UTC
+  Text: HI, sorry for the breakage, will take a look.
+
+Thanks,
+Prathamesh
+
+- User: GCC Commits | Time: 2023-12-20 19:07:46 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:08ab2293dcce442e139b163ba22f65a32e7ebd6ccommitr14-6757-g08ab2293dcce442e139b163ba22f65a32e7ebd6cAuthor: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Wed Dec 20 19:07:35 2023 +0000
+
+    cse: Fix handling of fake vec_select sets [PR111702]
+    
+    If cse sees:
+    
+      (set (reg R) (const_vector [A B ...]))
+    
+    it creates fake sets of the form:
+    
+      (set R[0] A)
+      (set R[1] B)
+      ...
+    
+    (with R[n] replaced by appropriate rtl) and then adds them to the tables
+    in the same way as for normal sets.  This allows a sequence like:
+    
+      (set (reg R2) A)
+      ...(reg R2)...
+    
+    to try to use R[0] instead of (reg R2).
+    
+    But the pass was taking the analogy too far, and was trying to simplify
+    these fake sets based on costs.  That is, if there was an earlier:
+    
+      (set (reg T) A)
+    
+    the pass would go to considerable effort trying to work out whether:
+    
+      (set R[0] A)
+    
+    or:
+    
+      (set R[0] (reg T))
+    
+    was more profitable.  This included running validate*_change on the sets,
+    which has no meaning given that the sets are not part of the insn.
+    
+    In this example, the equivalence A == T is already known, and the
+    purpose of the fake sets is to add A == T == R[0].  We can do that
+    just as easily (or, as the PR shows, more easily) if we keep the
+    original form of the fake set, with A instead of T.
+    
+    The problem in the PR occurred if we had:
+    
+    (1) something that establishes an equivalence between a vector V1 of
+        M-bit scalar integers and a hard register H
+    
+    (2) something that establishes an equivalence between a vector V2 of
+        N-bit scalar integers, where N<M and where V2 contains at least 2
+        instances of V1[0]
+    
+    (1) established an equivalence between V1[0] and H in M bits.
+    (2) then triggered a search for an equivalence of V1[0] in N bits.
+    This included:
+    
+          /* See if we have a CONST_INT that is already in a register in a
+             wider mode.  */
+    
+    which (correctly) found that the low N bits of H contain the right value.
+    But because it came from a wider mode, this equivalence between N-bit H
+    and N-bit V1[0] was not yet in the hash table.  It therefore survived
+    the purge in:
+    
+          /* At this point, ELT, if nonzero, points to a class of expressions
+             equivalent to the source of this SET and SRC, SRC_EQV, SRC_FOLDED,
+             and SRC_RELATED, if nonzero, each contain additional equivalent
+             expressions.  Prune these latter expressions by deleting expressions
+             already in the equivalence class.
+    
+    And since more than 1 set found the same N-bit equivalence between
+    H and V1[0], the pass tried to add it more than once.
+    
+    Things were already wrong at this stage, but an ICE was only triggered
+    later when trying to merge this N-bit equivalence with another one.
+    
+    We could avoid the double registration by adding:
+    
+      for (elt = classp; elt; elt = elt->next_same_value)
+        if (rtx_equal_p (elt->exp, x))
+          return elt;
+    
+    to insert_with_costs, or by making cse_insn check whether previous
+    sets have recorded the same equivalence.  The latter seems more
+    appealing from a compile-time perspective.  But in this case,
+    doing that would be adding yet more spurious work to the handling
+    of fake sets.
+    
+    The handling of fake sets therefore seems like the more fundamental bug.
+    
+    While there, the patch also makes sure that we don't apply REG_EQUAL
+    notes to these fake sets.  They only describe the "real" (first) set.
+    
+    gcc/PR rtl-optimization/111702* cse.cc (set::mode): Move earlier.
+            (set::src_in_memory, set::src_volatile): Convert to bitfields.
+            (set::is_fake_set): New member variable.
+            (add_to_set): Add an is_fake_set parameter.
+            (find_sets_in_insn): Update calls accordingly.
+            (cse_insn): Do not apply REG_EQUAL notes to fake sets.  Do not
+            try to optimize them either, or validate changes to them.
+    
+    gcc/testsuite/PR rtl-optimization/111702* gcc.dg/rtl/aarch64/pr111702.c: New test.
+
+- User: Richard Sandiford | Time: 2023-12-20 19:08:13 UTC
+  Text: Fixed.
+

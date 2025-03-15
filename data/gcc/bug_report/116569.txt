@@ -1,0 +1,313 @@
+Bug Summary: [15 Regression] ICE in to_constant, at poly-int.h:592
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: aarch64-sve, ice-on-valid-code
+Known to Work: 14.2.0
+Known to Fail: 15.0
+
+Comments:
+- User: N/A | Time: 2024-09-02 12:14:44 UTC
+  Text: int a;
+short b, c, e;
+long d, f;
+long g(long h) {
+  if (h)
+    return h;
+  return d;
+}
+void i(int h[][0][0][0]) {
+  for (short j; j; j += 3) {
+    a = g(h[1][2] ? 0 : h[1][1][1][1]);
+    b = e ?: f % c;
+  }
+}
+
+with -O3 -mcpu=neoverse-v2 ICEs with trunk:
+0x24ef04b internal_error(char const*, ...)
+        $SRC/gcc/diagnostic-global-context.cc:492
+0x80ebd7 fancy_abort(char const*, int, char const*)
+        $SRC/gcc/diagnostic.cc:1658
+0x7fcc03 poly_int<2u, unsigned long>::to_constant() const
+        $SRC/gcc/poly-int.h:592
+0x1589ae7 poly_int<2u, unsigned long>::to_constant() const
+        $SRC/gcc/poly-int.h:590
+0x1589ae7 nunits_for_known_piecewise_op
+        $SRC/gcc/tree-vect-generic.cc:96
+0x1589ae7 expand_vector_piecewise
+        $SRC/gcc/tree-vect-generic.cc:290
+0x158c673 expand_vector_operation
+        $SRC/gcc/tree-vect-generic.cc:1257
+0x158d657 expand_vector_operations_1
+        $SRC/gcc/tree-vect-generic.cc:2366
+0x158d657 expand_vector_operations
+        $SRC/gcc/tree-vect-generic.cc:2400
+0x158d657 execute
+        $SRC/gcc/tree-vect-generic.cc:2454
+
+- User: Alex Coplan | Time: 2024-09-02 13:03:07 UTC
+  Text: Confirmed.  Started withr15-3082-g9bbad3685131ec95d970f81bf75f9556d4d92742.
+
+- User: Richard Biener | Time: 2024-09-02 13:51:35 UTC
+  Text: Apparently the vectorizer introduces ops that are not supported by the target.  Or vector lowering indentifes them wrong.
+
+- User: Andrew Pinski | Time: 2024-09-02 21:57:58 UTC
+  Text: (In reply to Richard Biener fromcomment #2)> Apparently the vectorizer introduces ops that are not supported by the
+> target.  Or vector lowering indentifes them wrong.Or rather match-and-simplify puts it back together:
+Applying pattern match.pd:5024, gimple-match-6.cc:5803
+Applying pattern match.pd:898, gimple-match-9.cc:1334
+gimple_simplified to _282 = vect_cst__192 % vect_cst__193;
+vect_patt_106.24_204 = _282;
+
+Match pattern:
+```
+/* X - (X / Y) * Y is the same as X % Y.  */
+(simplify
+ (minus (convert1? @0) (convert2? (mult:c (trunc_div @@0 @@1) @1)))
+ (if (INTEGRAL_TYPE_P (type) || VECTOR_INTEGER_TYPE_P (type))
+  (convert (trunc_mod @0 @1))))
+```
+
+I think we need to add a check to make sure we support the mod optab here (for after the lowering). I also think veclowering should also lower % case too (for general vector usage too).
+
+- User: Andrew Pinski | Time: 2024-09-06 04:10:49 UTC
+  Text: ***Bug 116626has been marked as a duplicate of this bug. ***
+
+- User: Jennifer Schmitz | Time: 2024-09-06 09:23:06 UTC
+  Text: I looked into the issue and summarize below what I found:
+
+My current fix that checks for the support of the mod optab for vectors looks like this:
+
+@@ -894,7 +894,9 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+ /* X - (X / Y) * Y is the same as X % Y.  */
+ (simplify
+  (minus (convert1? @0) (convert2? (mult:c (trunc_div @@0 @@1) @1)))
+- (if (INTEGRAL_TYPE_P (type) || VECTOR_INTEGER_TYPE_P (type))
++ (if (INTEGRAL_TYPE_P (type)
++      || (VECTOR_INTEGER_TYPE_P (type)
++         && target_supports_op_p (type, TRUNC_MOD_EXPR, optab_vector)))
+   (convert (trunc_mod @0 @1))))
+
+However, the test fold-minus-1.c fails, because the simplification is not applied anymore:
+
+/* { dg-options "-O -fdump-tree-gimple" } */
+void f(vec*x,vec*y){
+  *x -= *x / *y * *y;
+}
+
+/* { dg-final { scan-tree-dump-times "%" 1 "gimple"} } */
+/* { dg-final { scan-tree-dump-not "/" "gimple"} } */
+
+I looked into applying the simplification in early tree passes only instead of checking for support of the mod optab and found functions like optimize_vectors_before_lowering_p that use the PROP_gimple_xxx macros (in tree-pass.h) as mask.
+
+I tried different PROP_xxx macros and all tests (fold-minus-1.c; the minimal testcase Kyrill posted that produced the ICE; and my previous vect-mod tests) run successfully for
+
+@@ -896,7 +896,7 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+  (minus (convert1? @0) (convert2? (mult:c (trunc_div @@0 @@1) @1)))
+  (if (INTEGRAL_TYPE_P (type)
+       || (VECTOR_INTEGER_TYPE_P (type)
+-         && target_supports_op_p (type, TRUNC_MOD_EXPR, optab_vector)))
++         && (!cfun || (cfun->curr_properties & PROP_gimple_any) == 0)))
+   (convert (trunc_mod @0 @1))))
+
+But I don't think that the PROP_gimple_any is exactly what I want, but I haven't found anything that fits perfectly.
+
+Any advise on how to proceed?
+
+- User: Andrew Pinski | Time: 2024-09-06 09:28:06 UTC
+  Text: Try optimize_vectors_before_lowering_p () like what is used a few other places.
+
+- User: Jennifer Schmitz | Time: 2024-09-06 09:35:10 UTC
+  Text: Thanks for the quick reply. I tried
+
+(simplify
+ (minus (convert1? @0) (convert2? (mult:c (trunc_div @@0 @@1) @1)))
+ (if (INTEGRAL_TYPE_P (type)
+      || (VECTOR_INTEGER_TYPE_P (type)
+          && optimize_vectors_before_lowering_p ()))
+  (convert (trunc_mod @0 @1))))
+
+and the result is that the test case still ICEs, but fold-minus-1.c passes.
+
+- User: Andrew Pinski | Time: 2024-09-06 09:37:26 UTC
+  Text: (In reply to Jennifer Schmitz fromcomment #7)> Thanks for the quick reply. I tried
+> 
+> (simplify
+>  (minus (convert1? @0) (convert2? (mult:c (trunc_div @@0 @@1) @1)))
+>  (if (INTEGRAL_TYPE_P (type)
+>       || (VECTOR_INTEGER_TYPE_P (type)
+>           && optimize_vectors_before_lowering_p ()))
+>   (convert (trunc_mod @0 @1))))
+> 
+> and the result is that the test case still ICEs, but fold-minus-1.c passes.Try:
+INTEGRAL_TYPE_P (type)
+|| (VECTOR_INTEGER_TYPE_P (type)
+    && (optimize_vectors_before_lowering_p ()
+        || target_supports_op_p (type, TRUNC_MOD_EXPR, optab_vector)))
+
+- User: Andrew Pinski | Time: 2024-09-06 09:41:53 UTC
+  Text: (In reply to Andrew Pinski fromcomment #8)> (In reply to Jennifer Schmitz fromcomment #7)
+> > Thanks for the quick reply. I tried
+> > 
+> > (simplify
+> >  (minus (convert1? @0) (convert2? (mult:c (trunc_div @@0 @@1) @1)))
+> >  (if (INTEGRAL_TYPE_P (type)
+> >       || (VECTOR_INTEGER_TYPE_P (type)
+> >           && optimize_vectors_before_lowering_p ()))
+> >   (convert (trunc_mod @0 @1))))
+> > 
+> > and the result is that the test case still ICEs, but fold-minus-1.c passes.
+> 
+> Try:
+> INTEGRAL_TYPE_P (type)
+> || (VECTOR_INTEGER_TYPE_P (type)
+>     && (optimize_vectors_before_lowering_p ()
+>         || target_supports_op_p (type, TRUNC_MOD_EXPR, optab_vector)))Oh wait the problem is this is before lowering but SVE vectors can't be lowered.
+
+I think maybe the lowering pass should handle the case where:
+!target_supports_op_p (type, TRUNC_MOD_EXPR, optab_vector) && target_supports_op_p (type, TRUNC_DIV_EXPR, optab_vector) && target_supports_op_p (type, MULT_EXPR, optab_vector) && target_supports_op_p (type, MINUS_EXPR, optab_vector)
+
+And expand TRUNC_MOD_EXPR there.
+
+I am thinking about adding a similar thing for MIN/MAX too.
+
+- User: Andrew Pinski | Time: 2024-09-06 09:52:36 UTC
+  Text: (In reply to Andrew Pinski fromcomment #9)> Oh wait the problem is this is before lowering but SVE vectors can't be
+> lowered.
+> 
+> I think maybe the lowering pass should handle the case where:
+> !target_supports_op_p (type, TRUNC_MOD_EXPR, optab_vector) &&
+> target_supports_op_p (type, TRUNC_DIV_EXPR, optab_vector) &&
+> target_supports_op_p (type, MULT_EXPR, optab_vector) && target_supports_op_p
+> (type, MINUS_EXPR, optab_vector)That would also help if you add that lowering to vect lowering:
+```
+#define vect16 __attribute__((vector_size(16)))
+vect16 unsigned g(vect16 unsigned a, vect16 unsigned b)
+{
+        return a % b;
+}
+```
+
+- User: N/A | Time: 2024-09-06 10:12:18 UTC
+  Text: (In reply to Andrew Pinski fromcomment #9)> (In reply to Andrew Pinski fromcomment #8)
+> > (In reply to Jennifer Schmitz fromcomment #7)
+> > > Thanks for the quick reply. I tried
+> > > 
+> > > (simplify
+> > >  (minus (convert1? @0) (convert2? (mult:c (trunc_div @@0 @@1) @1)))
+> > >  (if (INTEGRAL_TYPE_P (type)
+> > >       || (VECTOR_INTEGER_TYPE_P (type)
+> > >           && optimize_vectors_before_lowering_p ()))
+> > >   (convert (trunc_mod @0 @1))))
+> > > 
+> > > and the result is that the test case still ICEs, but fold-minus-1.c passes.
+> > 
+> > Try:
+> > INTEGRAL_TYPE_P (type)
+> > || (VECTOR_INTEGER_TYPE_P (type)
+> >     && (optimize_vectors_before_lowering_p ()
+> >         || target_supports_op_p (type, TRUNC_MOD_EXPR, optab_vector)))
+> 
+> Oh wait the problem is this is before lowering but SVE vectors can't be
+> lowered.
+> 
+> I think maybe the lowering pass should handle the case where:
+> !target_supports_op_p (type, TRUNC_MOD_EXPR, optab_vector) &&
+> target_supports_op_p (type, TRUNC_DIV_EXPR, optab_vector) &&
+> target_supports_op_p (type, MULT_EXPR, optab_vector) && target_supports_op_p
+> (type, MINUS_EXPR, optab_vector)
+> 
+> And expand TRUNC_MOD_EXPR there.
+> 
+> I am thinking about adding a similar thing for MIN/MAX too.I don't think we have other lowering of SVE ops in the veclower, is that something we want to start doing now?
+
+- User: Richard Biener | Time: 2024-09-06 11:22:41 UTC
+  Text: (In reply to Andrew Pinski fromcomment #3)> (In reply to Richard Biener fromcomment #2)
+> > Apparently the vectorizer introduces ops that are not supported by the
+> > target.  Or vector lowering indentifes them wrong.
+> 
+> Or rather match-and-simplify puts it back together:
+> Applying pattern match.pd:5024, gimple-match-6.cc:5803
+> Applying pattern match.pd:898, gimple-match-9.cc:1334
+> gimple_simplified to _282 = vect_cst__192 % vect_cst__193;
+> vect_patt_106.24_204 = _282;
+> 
+> Match pattern:
+> ```
+> /* X - (X / Y) * Y is the same as X % Y.  */
+> (simplify
+>  (minus (convert1? @0) (convert2? (mult:c (trunc_div @@0 @@1) @1)))
+>  (if (INTEGRAL_TYPE_P (type) || VECTOR_INTEGER_TYPE_P (type))
+>   (convert (trunc_mod @0 @1))))
+> ```
+> 
+> I think we need to add a check to make sure we support the mod optab here
+> (for after the lowering).Yes.> I also think veclowering should also lower % case
+> too (for general vector usage too).Yeah, but isn't that handled by generic binop code?
+
+- User: Richard Biener | Time: 2024-09-06 11:23:38 UTC
+  Text: (In reply to ktkachov fromcomment #11)> (In reply to Andrew Pinski fromcomment #9)
+> > (In reply to Andrew Pinski fromcomment #8)
+> > > (In reply to Jennifer Schmitz fromcomment #7)
+> > > > Thanks for the quick reply. I tried
+> > > > 
+> > > > (simplify
+> > > >  (minus (convert1? @0) (convert2? (mult:c (trunc_div @@0 @@1) @1)))
+> > > >  (if (INTEGRAL_TYPE_P (type)
+> > > >       || (VECTOR_INTEGER_TYPE_P (type)
+> > > >           && optimize_vectors_before_lowering_p ()))
+> > > >   (convert (trunc_mod @0 @1))))
+> > > > 
+> > > > and the result is that the test case still ICEs, but fold-minus-1.c passes.
+> > > 
+> > > Try:
+> > > INTEGRAL_TYPE_P (type)
+> > > || (VECTOR_INTEGER_TYPE_P (type)
+> > >     && (optimize_vectors_before_lowering_p ()
+> > >         || target_supports_op_p (type, TRUNC_MOD_EXPR, optab_vector)))
+> > 
+> > Oh wait the problem is this is before lowering but SVE vectors can't be
+> > lowered.
+> > 
+> > I think maybe the lowering pass should handle the case where:
+> > !target_supports_op_p (type, TRUNC_MOD_EXPR, optab_vector) &&
+> > target_supports_op_p (type, TRUNC_DIV_EXPR, optab_vector) &&
+> > target_supports_op_p (type, MULT_EXPR, optab_vector) && target_supports_op_p
+> > (type, MINUS_EXPR, optab_vector)
+> > 
+> > And expand TRUNC_MOD_EXPR there.
+> > 
+> > I am thinking about adding a similar thing for MIN/MAX too.
+> 
+> I don't think we have other lowering of SVE ops in the veclower, is that
+> something we want to start doing now?No, I think you can only get there with intrinsics in which case it's the
+users fault?  GCC generic vectors do not support variable-length vectors IIRC.
+
+- User: GCC Commits | Time: 2024-09-18 11:07:54 UTC
+  Text: The master branch has been updated by Jennifer Schmitz <jschmitz@gcc.gnu.org>:https://gcc.gnu.org/g:6f3b6a451771cd54c98768e7db3c5d58aab2b6aacommitr15-3683-g6f3b6a451771cd54c98768e7db3c5d58aab2b6aaAuthor: Jennifer Schmitz <jschmitz@nvidia.com>
+Date:   Thu Sep 5 08:10:02 2024 -0700
+
+    match.pd: Check trunc_mod vector obtap before folding.
+    
+    In the pattern X - (X / Y) * Y to X % Y, this patch guards the
+    simplification for vector types by a check for:
+    1) Support of the mod optab for vectors OR
+    2) Application before vector lowering for non-VL vectors.
+    This is to prevent reverting vectorization of modulo to div/mult/sub
+    if the target does not support vector mod optab.
+    
+    The patch was bootstrapped and tested with no regression on
+    aarch64-linux-gnu and x86_64-linux-gnu.
+    OK for mainline?
+    
+    Signed-off-by: Jennifer Schmitz <jschmitz@nvidia.com>
+    
+    gcc/PR tree-optimization/116569* match.pd: Guard simplification to trunc_mod with check for
+            mod optab support.
+    
+    gcc/testsuite/PR tree-optimization/116569* gcc.dg/torture/pr116569.c: New test.
+
+- User: Jennifer Schmitz | Time: 2024-09-18 11:09:48 UTC
+  Text: fixed in GCC 15.1
+

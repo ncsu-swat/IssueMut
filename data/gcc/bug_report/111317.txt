@@ -1,0 +1,170 @@
+Bug Summary: RISC-V: Incorrect COST model for RVV conversions
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2023-09-07 07:09:53 UTC
+  Text: #include <stdint.h>
+
+void foo (int32_t *__restrict a, int64_t * __restrict b, int n)
+{
+    for (int i = 0; i < n; i++)
+      b[i] = (int64_t)a[i];
+}
+
+--param=riscv-autovec-preference=scalable -O3 -fopt-info-vec-missed:
+Failed to vectorize:
+
+<source>:5:23: missed: couldn't vectorize loop
+<source>:6:24: missed: not vectorized: no vectype for stmt: _4 = *_3;
+
+However, try -fno-vect-cost-model.
+
+We must adjust the COST model for RVV corretly.
+
+- User: Robin Dapp | Time: 2023-09-12 14:29:23 UTC
+  Text: I think the default cost model is not too bad for these simple cases.  Our emitted instructions match gimple pretty well.
+
+The thing we don't model is vsetvl.  We could ignore it under the assumption that it is going to be rather cheap on most uarchs.
+
+Something that needs to be fixed is the general costing used for length-masking:
+
+	    /* Each may need two MINs and one MINUS to update lengths in body
+	       for next iteration.  */
+	    if (need_iterate_p)
+	      body_stmts += 3 * num_vectors;
+
+We don't actually need min with vsetvl (they are our mins) so this would need to be adjusted down, provided vsetvl is cheap.  
+
+This is the scalar baseline:
+.L3:
+	lw	a5,0(a0)
+	sd	a5,0(a1)
+	addi	a0,a0,4
+	addi	a1,a1,8
+	bne	a4,a0,.L3
+
+
+While this is what zvl128b would emit:
+ .L3:
+	vsetvli	a5,a2,e8,mf8,ta,ma
+	vle32.v	v2,0(a0)
+	vsetvli	a4,zero,e64,m1,ta,ma
+	vsext.vf2	v1,v2
+	vsetvli	zero,a2,e64,m1,ta,ma
+	vse64.v	v1,0(a1)
+	slli	a4,a5,2
+	add	a0,a0,a4
+	slli	a4,a5,3
+	add	a1,a1,a4
+	sub	a2,a2,a5
+	bne	a2,zero,.L3
+
+With a vectorization factor of 2 (might effectively be higher of course but possibly unknown at compile time) I'm not sure vectorization is always a win and the costs actually reflect that.  If we disregard vsetvl for now we have 8 instructions in the vectorized loop and 2 * 4 instructions in the scalar loop for the same amount of data.  Factoring in the vsetvls I'd say it's worse.
+Once we statically know the VF is higher, we will vectorize.
+
+- User: GCC Commits | Time: 2023-12-13 11:52:18 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:f6d787c231905063dc3b55ce7028e348b74719becommitr14-6488-gf6d787c231905063dc3b55ce7028e348b74719beAuthor: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Wed Dec 13 17:21:07 2023 +0800
+
+    Middle-end: Adjust decrement IV style partial vectorization COST model
+    
+    Hi, before this patch, a simple conversion case for RVV codegen:
+    
+    foo:
+            ble     a2,zero,.L8
+            addiw   a5,a2,-1
+            li      a4,6
+            bleu    a5,a4,.L6
+            srliw   a3,a2,3
+            slli    a3,a3,3
+            add     a3,a3,a0
+            mv      a5,a0
+            mv      a4,a1
+            vsetivli        zero,8,e16,m1,ta,ma
+    .L4:
+            vle8.v  v2,0(a5)
+            addi    a5,a5,8
+            vzext.vf2       v1,v2
+            vse16.v v1,0(a4)
+            addi    a4,a4,16
+            bne     a3,a5,.L4
+            andi    a5,a2,-8
+            beq     a2,a5,.L10
+    .L3:
+            slli    a4,a5,32
+            srli    a4,a4,32
+            subw    a2,a2,a5
+            slli    a2,a2,32
+            slli    a5,a4,1
+            srli    a2,a2,32
+            add     a0,a0,a4
+            add     a1,a1,a5
+            vsetvli zero,a2,e16,m1,ta,ma
+            vle8.v  v2,0(a0)
+            vzext.vf2       v1,v2
+            vse16.v v1,0(a1)
+    .L8:
+            ret
+    .L10:
+            ret
+    .L6:
+            li      a5,0
+            j       .L3
+    
+    This vectorization go through first loop:
+    
+            vsetivli        zero,8,e16,m1,ta,ma
+    .L4:
+            vle8.v  v2,0(a5)
+            addi    a5,a5,8
+            vzext.vf2       v1,v2
+            vse16.v v1,0(a4)
+            addi    a4,a4,16
+            bne     a3,a5,.L4
+    
+    Each iteration processes 8 elements.
+    
+    For a scalable vectorization with VLEN > 128 bits CPU, it's ok when VLEN = 128.
+    But, as long as VLEN > 128 bits, it will waste the CPU resources. That is, e.g. VLEN = 256bits.
+    only half of the vector units are working and another half is idle.
+    
+    After investigation, I realize that I forgot to adjust COST for SELECT_VL.
+    So, adjust COST for SELECT_VL styple length vectorization. We adjust COST from 3 to 2. since
+    after this patch:
+    
+    foo:
+            ble     a2,zero,.L5
+    .L3:
+            vsetvli a5,a2,e16,m1,ta,ma     -----> SELECT_VL cost.
+            vle8.v  v2,0(a0)
+            slli    a4,a5,1                -----> additional shift of outcome SELECT_VL for memory address calculation.
+            vzext.vf2       v1,v2
+            sub     a2,a2,a5
+            vse16.v v1,0(a1)
+            add     a0,a0,a5
+            add     a1,a1,a4
+            bne     a2,zero,.L3
+    .L5:
+            ret
+    
+    This patch is a simple fix that I previous forgot.
+    
+    Ok for trunk ?
+    
+    If not, I am going to adjust cost in backend cost model.PR target/111317gcc/ChangeLog:
+    
+            * tree-vect-loop.cc (vect_estimate_min_profitable_iters): Adjust for COST for decrement IV.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/vect/costmodel/riscv/rvv/pr111317.c: New test.
+
+- User: JuzheZhong | Time: 2023-12-13 11:54:57 UTC
+  Text: Fixed on the trunk.
+

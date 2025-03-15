@@ -1,0 +1,142 @@
+Bug Summary: FAIL: gcc.dg/debug/btf/btf-bitfields-3.c scan-assembler-times [\t ]0x6000004[\t ]+[^\n]*btt_info 1
+Product: gcc
+Component: debug
+
+  (show other bugs)
+Keywords: testsuite-fail
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: John David Anglin | Time: 2024-01-13 19:24:04 UTC
+  Text: Createdattachment 57074[details]Assembler output
+
+spawn -ignore SIGHUP /home/dave/gnu/gcc/objdir64/gcc/xgcc -B/home/dave/gnu/gcc/o
+bjdir64/gcc/ /home/dave/gnu/gcc/gcc/gcc/testsuite/gcc.dg/debug/btf/btf-bitfields
+-3.c -fdiagnostics-plain-output -O0 -gbtf -dA -fno-ident -S -o btf-bitfields-3.s
+PASS: gcc.dg/debug/btf/btf-bitfields-3.c (test for excess errors)
+gcc.dg/debug/btf/btf-bitfields-3.c: [\t ]0x6000004[\t ]+[^\n]*btt_info found 0 t
+imes
+FAIL: gcc.dg/debug/btf/btf-bitfields-3.c scan-assembler-times [\t ]0x6000004[\t ]+[^\n]*btt_info 1
+PASS: gcc.dg/debug/btf/btf-bitfields-3.c scan-assembler-times [\t ]0x84000001[\t ]+[^\n]*btt_info 1
+PASS: gcc.dg/debug/btf/btf-bitfields-3.c scan-assembler-times  btm_type: \\(BTF_KIND_ENUM 'foo' 1
+
+- User: John David Anglin | Time: 2024-01-21 22:00:52 UTC
+  Text: Similar fails:
+FAIL: gcc.dg/debug/btf/btf-enum-1.c scan-assembler-times [\\t ]0x6000004[\\t ]+[^\\n]*btt_info 1
+FAIL: gcc.dg/debug/btf/btf-enum-small.c scan-assembler-times [\\t ]0x6000002[\\t ]+[^\\n]*btt_info 1
+FAIL: gcc.dg/debug/btf/btf-enum64-1.c scan-assembler-times [\\t ]0x13000003[\\t ]+[^\\n]*btt_info 2
+FAIL: gcc.dg/debug/btf/btf-enum64-1.c scan-assembler-times [\\t ]0x93000003[\\t ]+[^\\n]*btt_info 1
+
+- User: John David Anglin | Time: 2024-01-21 22:54:12 UTC
+  Text: We have:
+	.word	0x86000004	; btt_info: kind=6, kflag=1, vlen=4
+
+This seems correct encoding:
+
+/* Encoding for struct btf_type.info.  */
+#define BTF_TYPE_INFO(kind, kflag, vlen) \
+  ((((kflag) ? 1 : 0 ) << 31) | ((kind) << 24) | ((vlen) & 0xffff))
+
+Problem seems kflag.
+
+- User: John David Anglin | Time: 2024-01-22 02:35:34 UTC
+  Text: btf_kflag is set here:
+
+  else if (btf_kind == BTF_KIND_ENUM)
+    {
+      btf_kflag = dtd->dtd_enum_unsigned
+                    ? BTF_KF_ENUM_UNSIGNED
+                    : BTF_KF_ENUM_SIGNED;
+
+(gdb) p dtd->dtd_enum_unsigned
+$10 = false
+
+/* BTF_KF_ENUM_ holds the flags for kflags in BTF_KIND_ENUM{,64}.  */
+#define BTF_KF_ENUM_UNSIGNED    (0)
+#define BTF_KF_ENUM_SIGNED      (1 << 0)
+
+Test has:
+enum foo
+{
+  BAR = 0,
+  BAZ = 1,
+  QUZ = 2,
+  QUX = 3
+};
+
+I think the choice of signed int is correct:https://en.cppreference.com/w/c/language/enumBut then there are articles indicating that the type is implementation
+dependent:https://stackoverflow.com/questions/159034/are-c-enums-signed-or-unsignedMaybe test needs to handle either case.
+
+- User: John David Anglin | Time: 2024-01-22 15:34:22 UTC
+  Text: dtd->dtd_enum_unsigned is set in ctf_add_enum:
+dtd->dtd_enum_unsigned = eunsigned;
+
+  /* Generate a CTF type for the enumeration.  */
+  enumeration_type_id = ctf_add_enum (ctfc, CTF_ADD_ROOT,
+                                      enum_name, bit_size / 8,
+                                      (signedness == DW_ATE_unsigned),
+                                      enumeration);
+
+signedness = 0
+
+(gdb) bt
+#0  ctf_add_enum (ctfc=0x800003ffbfea7c00, flag=1,
+    name=0x800003ffbfe6b188 "foo", size=4, eunsigned=false,
+    die=0x800003ffbfea2320) at ../../gcc/gcc/ctfc.cc:591
+#1  0x400000000082df34 in gen_ctf_enumeration_type (
+    enumeration=0x800003ffbfea2320, ctfc=0x800003ffbfea7c00)
+    at ../../gcc/gcc/dwarf2ctf.cc:762
+#2  gen_ctf_type (ctfc=0x800003ffbfea7c00, die=0x800003ffbfea2320)
+    at ../../gcc/gcc/dwarf2ctf.cc:899
+#3  0x400000000082e8b8 in ctf_do_die (die=0x800003ffbfea2320)
+    at ../../gcc/gcc/dwarf2ctf.cc:978
+#4  0x400000000088f9b0 in ctf_debug_do_cu (die=<optimized out>)
+    at ../../gcc/gcc/dwarf2out.cc:33017
+#5  ctf_debug_do_cu (die=<optimized out>) at ../../gcc/gcc/dwarf2out.cc:33010
+#6  dwarf2out_early_finish (filename=0x800003ffbfea7c00 "▒\362\004\002")
+    at ../../gcc/gcc/dwarf2out.cc:33146
+#7  0x40000000007de578 in symbol_table::finalize_compilation_unit (
+    this=0x800003ffbfe6b188) at ../../gcc/gcc/cgraphunit.cc:2579
+#8  0x4000000000d55338 in compile_file () at ../../gcc/gcc/toplev.cc:474
+
+- User: John David Anglin | Time: 2024-01-22 18:09:33 UTC
+  Text: The problem seems to be DW_AT_encoding is not found in this call:
+static ctf_id_t
+gen_ctf_enumeration_type (ctf_container_ref ctfc, dw_die_ref enumeration)
+{
+  const char *enum_name = get_AT_string (enumeration, DW_AT_name);
+  unsigned int bit_size = ctf_die_bitsize (enumeration);
+  unsigned int signedness = get_AT_unsigned (enumeration, DW_AT_encoding);
+
+get_AT() returns NULL.
+
+This is because dwarf_strict is 1:
+      if (!dwarf_strict)
+        add_AT_unsigned (type_die, DW_AT_encoding,
+                         TYPE_UNSIGNED (type)
+                         ? DW_ATE_unsigned
+                         : DW_ATE_signed);
+
+I believe we need to add -gno-strict-dwarf option on hppa*64*-*-hpux*.
+
+- User: GCC Commits | Time: 2024-01-22 19:08:17 UTC
+  Text: The master branch has been updated by John David Anglin <danglin@gcc.gnu.org>:https://gcc.gnu.org/g:bc77c035c45bb224790b1c03d06a64c8a1cc51c5commitr14-8338-gbc77c035c45bb224790b1c03d06a64c8a1cc51c5Author: John David Anglin <danglin@gcc.gnu.org>
+Date:   Mon Jan 22 19:07:32 2024 +0000
+
+    Add -gno-strict-dwarf to dg-options in various btf enum tests
+    
+    The -gno-strict-dwarf option is needed to ensure enum signedness
+    is added to type_die.
+    
+    2024-01-22  John David Anglin  <danglin@gcc.gnu.org>
+    
+    gcc/testsuite/ChangeLog:PR debug/113382* gcc.dg/debug/btf/btf-bitfields-3.c: Add -gno-strict-dwarf
+            option to dg-options.
+            * gcc.dg/debug/btf/btf-enum-1.c: Likewise.
+            * gcc.dg/debug/btf/btf-enum-small.c: Likewise.
+            * gcc.dg/debug/btf/btf-enum64-1.c: Likewise.
+
+- User: John David Anglin | Time: 2024-01-22 19:12:40 UTC
+  Text: Fixed on trunk.
+

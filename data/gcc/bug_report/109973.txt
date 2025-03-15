@@ -1,0 +1,299 @@
+Bug Summary: [13 Regression] Wrong code for AVX2 since 13.1 by combining VPAND and VPTEST since r13-2006-ga56c1641e9d25e
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 12.3.0, 13.1.1
+Known to Fail: 13.1.0
+
+Comments:
+- User: Benji Smith | Time: 2023-05-26 00:38:41 UTC
+  Text: The following code is a minimal repro of the issue, when compiled with `gcc -O1 -mavx2`:
+
+#include <immintrin.h>
+
+int do_stuff(__m256i Y0, __m256i Y1, __m128i X2) {
+  __m256i And01 = _mm256_and_si256(Y0, Y1);
+  int TestResult = _mm256_testc_si256(And01, And01);
+  return TestResult;
+}
+
+I have also attached the preprocessed version of that minimal repro
+
+12.3 produces the following assembly
+        vpand   ymm0, ymm0, ymm1  ; <<<<< missing in 13.1
+        mov     eax, 0
+        vptest  ymm0, ymm0
+        setb    al
+        ret
+
+While 13.1 generates:
+        mov     eax, 0
+        vptest  ymm0, ymm1
+        setb    al
+        ret
+
+Note that as of 13.1, the VPAND is removed, and just the VPTEST remains. However, this is incorrect because _mm256_testc_si256 returns the results of the Carry Flag, which is based on the bitwise AND of the second operand and the bitwise NOT of the first operand, meaning these two can't be combined like that for this intrinsic
+
+Here is a Godbolt link showing the issue with a full execution case:https://godbolt.org/z/x9or4WEWhThis issue is present in 12.3 but not 13.1. A bisect shows that it was most likely introduced in a56c1641e9d25e46059168e811b4a2f185f07b6b
+
+I have confirmed that this issue is still present on the latest trunk, 8d2fa90a41567670d2dbd4918d19d21d9bec4a8f
+
+-O0 on trunk will also return the correct result
+
+For triage/priority purposes: this bug was not found in manually written code, but instead from a fuzzer meant to test SIMD codegen
+
+PS: This is my first bug on the GCC tracker, so if I've done anything wrong let me know. I marked it as in "rtl-optimization" though I'm not sure if that's correct
+
+- User: Benji Smith | Time: 2023-05-26 00:42:40 UTC
+  Text: Createdattachment 55159[details]A compressed preprocessed minimal repro of the VPAND/VPTEST issue
+
+- User: Andrew Pinski | Time: 2023-05-26 00:47:46 UTC
+  Text: The patch which introduced the failure is all in the x86_64 backend so it is target issue.r13-2006-ga56c1641e9d25e
+
+- User: Jakub Jelinek | Time: 2023-05-26 06:56:50 UTC
+  Text: Guess the optimization is perfectly valid when it is just the ZF flag that is tested, i.e. in bar:
+
+#include <immintrin.h>
+
+int
+foo (__m256i x, __m256i y)
+{
+  __m256i a = _mm256_and_si256 (x, y);
+  return _mm256_testc_si256 (a, a);
+}
+
+int
+bar (__m256i x, __m256i y)
+{
+  __m256i a = _mm256_and_si256 (x, y);
+  return _mm256_testz_si256 (a, a);
+}
+
+_mm256_testc_si256 (a, a) is dumb (always returns non-zero because a & ~a is 0), perhaps we could fold it in gimple folding to 1.  Still I'm afraid at RTL we can't rely on that folding.  One option could be to use CCZmode instead of CCmode for the _mm*_testz* cases and perform this optimization solely for CCZmode and not for CCmode that would be used
+for _mm*_testc*.  It has a disadvantage that we'd likely not be able to merge
+_mm256_testc_si256 (a, b) + _mm256_testz_si256 (a, b) (or vice versa).
+
+- User: Benji Smith | Time: 2023-05-26 12:06:42 UTC
+  Text: Just as follow-up, I also tested the same code with _mm_and_si128/_mm_testc_si128 on SSE4.1, and the same issue repros (via `gcc -O1 -msse4.1`):
+
+#include <immintrin.h>
+
+int do_stuff(__m128i Y0, __m128i Y1, __m128i X2) {
+  __m128i And01 = _mm_and_si128(Y0, Y1);
+  int TestResult = _mm_testc_si128(And01, And01);
+
+  return TestResult;
+}
+
+- User: Roger Sayle | Time: 2023-05-29 18:24:01 UTC
+  Text: Many thanks to Benji for reporting this issue.  I've proposed a solution athttps://gcc.gnu.org/pipermail/gcc-patches/2023-May/619973.html(following Jakub's suggestions incomment #3).
+
+- User: GCC Commits | Time: 2023-05-30 13:44:01 UTC
+  Text: The master branch has been updated by Roger Sayle <sayle@gcc.gnu.org>:https://gcc.gnu.org/g:69185294f322dd53d4e1592115014c5488302e2ecommitr14-1405-g69185294f322dd53d4e1592115014c5488302e2eAuthor: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Tue May 30 14:40:50 2023 +0100PR target/107172: Avoid "unusual" MODE_CC comparisons in simplify-rtx.cc
+    
+    I believe that a better (or supplementary) fix toPR target/107172is to
+    avoid producing incorrect (but valid) RTL in
+    simplify_const_relational_operation when presented with questionable
+    (obviously invalid) expressions, such as those produced during combine.
+    Just as with the "first do no harm" clause with the Hippocratic Oath,
+    simplify-rtx (probably) shouldn't unintentionally transform invalid RTL
+    expressions, into incorrect (non-equivalent) but valid RTL that may be
+    inappropriately recognized by recog.
+    
+    In this specific case, many GCC backends represent their flags register via
+    MODE_CC, whose representation is intentionally "opaque" to the middle-end.
+    The only use of MODE_CC comprehensible to the middle-end's RTL optimizers
+    is relational comparisons between the result of a COMPARE rtx (op0) and zero
+    (op1).  Any other uses of MODE_CC should be left alone, and some might argue
+    indicate representational issues in the backend.
+    
+    In practice, CPUs occasionally have numerous instructions that affect the
+    flags register(s) other than comparisons [AVR's setc, powerpc's mtcrf,
+    x86's clc, stc and cmc and x86_64's ptest that sets C and Z flags in
+    non-obvious ways, c.f.PR target/109973].  Currently care has to be taken,
+    wrapping these in UNSPEC, to avoid combine inappropriately merging flags
+    setters with flags consumers (such as conditional jumps).  It's safer to
+    teach simplify_const_relational_operation not to modify expressions that
+    it doesn't understand/recognize.
+    
+    2023-05-30  Roger Sayle  <roger@nextmovesoftware.com>
+    
+    gcc/ChangeLogPR target/107172* simplify-rtx.cc (simplify_const_relational_operation): Return
+            early if we have a MODE_CC comparison that isn't a COMPARE against
+            const0_rtx.
+
+- User: GCC Commits | Time: 2023-06-01 14:12:24 UTC
+  Text: The master branch has been updated by Roger Sayle <sayle@gcc.gnu.org>:https://gcc.gnu.org/g:3635e8c67e13e3da7e1e23a617dd9952218e93e0commitr14-1466-g3635e8c67e13e3da7e1e23a617dd9952218e93e0Author: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Thu Jun 1 15:10:09 2023 +0100PR target/109973: CCZmode and CCCmode variants of [v]ptest on x86.
+    
+    This is my proposed minimal fix forPR target/109973(hopefully suitable
+    for backporting) that follows Jakub Jelinek's suggestion that we introduce
+    CCZmode and CCCmode variants of ptest and vptest, so that the i386
+    backend treats [v]ptest instructions similarly to testl instructions;
+    using different CCmodes to indicate which condition flags are desired,
+    and then relying on the RTL cmpelim pass to eliminate redundant tests.
+    
+    This conveniently matches Intel's intrinsics, that provide different
+    functions for retrieving different flags, _mm_testz_si128 tests the
+    Z flag, _mm_testc_si128 tests the carry flag.  Currently we use the
+    same instruction (pattern) for both, and unfortunately the *ptest<mode>_and
+    optimization is only valid when the ptest/vptest instruction is used to
+    set/test the Z flag.
+    
+    The downside, as predicted by Jakub, is that GCC's cmpelim pass is
+    currently COMPARE-centric and not able to merge the ptests from expressions
+    such as _mm256_testc_si256 (a, b) + _mm256_testz_si256 (a, b), which is a
+    known issue,PR target/80040.
+    
+    2023-06-01  Roger Sayle  <roger@nextmovesoftware.com>
+                Uros Bizjak  <ubizjak@gmail.com>
+    
+    gcc/ChangeLogPR target/109973* config/i386/i386-builtin.def (__builtin_ia32_ptestz128): Use new
+            CODE_for_sse4_1_ptestzv2di.
+            (__builtin_ia32_ptestc128): Use new CODE_for_sse4_1_ptestcv2di.
+            (__builtin_ia32_ptestz256): Use new CODE_for_avx_ptestzv4di.
+            (__builtin_ia32_ptestc256): Use new CODE_for_avx_ptestcv4di.
+            * config/i386/i386-expand.cc (ix86_expand_branch): Use CCZmode
+            when expanding UNSPEC_PTEST to compare against zero.
+            * config/i386/i386-features.cc (scalar_chain::convert_compare):
+            Likewise generate CCZmode UNSPEC_PTESTs when converting comparisons.
+            (general_scalar_chain::convert_insn): Use CCZmode for COMPARE result.
+            (timode_scalar_chain::convert_insn): Use CCZmode for COMPARE result.
+            * config/i386/i386-protos.h (ix86_match_ptest_ccmode): Prototype.
+            * config/i386/i386.cc (ix86_match_ptest_ccmode): New predicate to
+            check for suitable matching modes for the UNSPEC_PTEST pattern.
+            * config/i386/sse.md (define_split): When splitting UNSPEC_MOVMSK
+            to UNSPEC_PTEST, preserve the FLAG_REG mode as CCZ.
+            (*<sse4_1>_ptest<mode>): Add asterisk to hide define_insn.  Remove
+            ":CC" mode of FLAGS_REG, instead use ix86_match_ptest_ccmode.
+            (<sse4_1>_ptestz<mode>): New define_expand to specify CCZ.
+            (<sse4_1>_ptestc<mode>): New define_expand to specify CCC.
+            (<sse4_1>_ptest<mode>): A define_expand using CC to preserve the
+            current behavior.
+            (*ptest<mode>_and): Specify CCZ to only perform this optimization
+            when only the Z flag is required.
+    
+    gcc/testsuite/ChangeLogPR target/109973* gcc.target/i386/pr109973-1.c: New test case.
+            * gcc.target/i386/pr109973-2.c: Likewise.
+
+- User: Benji Smith | Time: 2023-06-03 18:01:01 UTC
+  Text: Yes, just pulled latest trunk and confirmed that the issue no longer repros. Thanks for the fix!
+
+- User: GCC Commits | Time: 2023-06-04 11:01:39 UTC
+  Text: The master branch has been updated by Roger Sayle <sayle@gcc.gnu.org>:https://gcc.gnu.org/g:8ab9fb6b8e05cf9acca7bd8282979ede53524cf1commitr14-1528-g8ab9fb6b8e05cf9acca7bd8282979ede53524cf1Author: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Sun Jun 4 11:59:32 2023 +0100PR target/110083: Fix-up REG_EQUAL notes on COMPARE in STV.
+    
+    This patch fixesPR target/110083, an ICE-on-valid regression exposed by
+    my recent PTEST improvements (to addressPR target/109973).  The latent
+    bug (admittedly mine) is that the scalar-to-vector (STV) pass doesn't update
+    or delete REG_EQUAL notes attached to COMPARE instructions.  As a result
+    the operands of COMPARE would be mismatched, with the register transformed
+    to V1TImode, but the immediate operand left as const_wide_int, which is
+    valid for TImode but not V1TImode.  This remained latent when the STV
+    conversion converted the mode of the COMPARE to CCmode, with later passes
+    recognizing the REG_EQUAL note is obviously invalid as the modes didn't
+    match, but now that we (correctly) preserve the CCZmode on COMPARE, the
+    mismatched operand modes trigger a sanity checking ICE downstream.
+    
+    Fixed by updating (or deleting) any REG_EQUAL notes in convert_compare.
+    
+    Before:
+        (expr_list:REG_EQUAL (compare:CCZ (reg:V1TI 119 [ ivin.29_38 ])
+            (const_wide_int 0x80000000000000000000000000000000))
+    
+    After:
+        (expr_list:REG_EQUAL (compare:CCZ (reg:V1TI 119 [ ivin.29_38 ])
+            (const_vector:V1TI [
+                (const_wide_int 0x80000000000000000000000000000000)
+             ]))
+    
+    2023-06-04  Roger Sayle  <roger@nextmovesoftware.com>
+    
+    gcc/ChangeLogPR target/110083* config/i386/i386-features.cc (scalar_chain::convert_compare):
+            Update or delete REG_EQUAL notes, converting CONST_INT and
+            CONST_WIDE_INT immediate operands to a suitable CONST_VECTOR.
+    
+    gcc/testsuite/ChangeLogPR target/110083* gcc.target/i386/pr110083.c: New test case.
+
+- User: GCC Commits | Time: 2023-06-22 06:44:08 UTC
+  Text: The master branch has been updated by Roger Sayle <sayle@gcc.gnu.org>:https://gcc.gnu.org/g:5322f009e8f7d1c7a1c9aab7cb4c90c433398fddcommitr14-2030-g5322f009e8f7d1c7a1c9aab7cb4c90c433398fddAuthor: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Thu Jun 22 07:43:07 2023 +0100
+
+    i386: Convert ptestz of pandn into ptestc.
+    
+    This patch is the next installment in a set of backend patches around
+    improvements to ptest/vptest.  A previous patch optimized the sequence
+    t=pand(x,y); ptestz(t,t) into the equivalent ptestz(x,y), using the
+    property that ZF is set to (X&Y) == 0.  This patch performs a similar
+    transformation, converting t=pandn(x,y); ptestz(t,t) into the (almost)
+    equivalent ptestc(y,x), using the property that the CF flags is set to
+    (~X&Y) == 0.  The tricky bit is that this sets the CF flag instead of
+    the ZF flag, so we can only perform this transformation when we can
+    also convert the flags consumer, as well as the producer.
+    
+    For the test case:
+    
+    int foo (__m128i x, __m128i y)
+    {
+      __m128i a = x & ~y;
+      return __builtin_ia32_ptestz128 (a, a);
+    }
+    
+    With -O2 -msse4.1 we previously generated:
+    
+    foo:    pandn   %xmm0, %xmm1
+            xorl    %eax, %eax
+            ptest   %xmm1, %xmm1
+            sete    %al
+            ret
+    
+    with this patch we now generate:
+    
+    foo:    xorl    %eax, %eax
+            ptest   %xmm0, %xmm1
+            setc    %al
+            ret
+    
+    At the same time, this patch also provides alternative fixes forPR target/109973andPR target/110118, by recognizing that ptestc(x,x)
+    always sets the carry flag (X&~X is always zero).  This is achieved
+    both by recognizing the special case in ix86_expand_sse_ptest and with
+    a splitter to convert an eligible ptest into an stc.
+    
+    2023-06-22  Roger Sayle  <roger@nextmovesoftware.com>
+                Uros Bizjak  <ubizjak@gmail.com>
+    
+    gcc/ChangeLog
+            * config/i386/i386-expand.cc (ix86_expand_sse_ptest): Recognize
+            expansion of ptestc with equal operands as producing const1_rtx.
+            * config/i386/i386.cc (ix86_rtx_costs): Provide accurate cost
+            estimates of UNSPEC_PTEST, where the ptest performs the PAND
+            or PAND of its operands.
+            * config/i386/sse.md (define_split): Transform CCCmode UNSPEC_PTEST
+            of reg_equal_p operands into an x86_stc instruction.
+            (define_split): Split pandn/ptestz/set{n?}e into ptestc/set{n?}c.
+            (define_split): Similar to above for strict_low_part destinations.
+            (define_split): Split pandn/ptestz/j{n?}e into ptestc/j{n?}c.
+    
+    gcc/testsuite/ChangeLog
+            * gcc.target/i386/avx-vptest-4.c: New test case.
+            * gcc.target/i386/avx-vptest-5.c: Likewise.
+            * gcc.target/i386/avx-vptest-6.c: Likewise.
+            * gcc.target/i386/pr109973-1.c: Update test case.
+            * gcc.target/i386/pr109973-2.c: Likewise.
+            * gcc.target/i386/sse4_1-ptest-4.c: New test case.
+            * gcc.target/i386/sse4_1-ptest-5.c: Likewise.
+            * gcc.target/i386/sse4_1-ptest-6.c: Likewise.
+
+- User: Roger Sayle | Time: 2023-07-03 13:28:57 UTC
+  Text: This issue is now fixed on mainline for GCC 14, and a backport of the relevant bits (minimum viable fix) for GCC 13 was proposed herehttps://gcc.gnu.org/pipermail/gcc-patches/2023-June/621256.html
+
+- User: Jakub Jelinek | Time: 2023-07-03 13:43:58 UTC
+  Text: Wrong-code issues like this shouldn't be just closed.
+I think you should ping Uros on this, or another option would be to revert on the branch the change that caused the regression.
+
+- User: Richard Biener | Time: 2023-07-20 07:28:44 UTC
+  Text: Fixed on the branch by reverting the offending commit instead.
+

@@ -1,0 +1,151 @@
+Bug Summary: Invalid ROP hashst offset is emitted when using -mabi=no-altivec
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 11.0, 12.0, 13.0, 14.0, 15.0
+
+Comments:
+- User: Peter Bergner | Time: 2024-06-07 21:34:42 UTC
+  Text: We emit a hashst instruction with an invalid offset when compiling with -mabi=no-altivec.
+
+bergner@ltcd97-lp3:~/ROP$ cat bug.c 
+extern void foo (void);
+long
+bar (void)
+{
+  foo ();
+  return 0;
+}
+bergner@ltcd97-lp3:~/ROP$ gcc -c -O2 -mcpu=power10 -mrop-protect -mno-vsx -mno-altivec -mabi=altivec bug.c
+bergner@ltcd97-lp3:~/ROP$ gcc -c -O2 -mcpu=power10 -mrop-protect -mno-vsx -mno-altivec -mabi=no-altivec bug.c 
+/tmp/ccSzxbv5.s: Assembler messages:
+/tmp/ccSzxbv5.s:15: Error: invalid offset: must be in the range [-512, -8] and be a multiple of 8
+/tmp/ccSzxbv5.s:25: Error: invalid offset: must be in the range [-512, -8] and be a multiple of 8
+
+The bug is we only compute the ROP hash save slot offset when TARGET_ALTIVEC_ABI is true. If TARGET_ALTIVEC_ABI is false and we enable ROP mitigation, then we use the initialized value of zero which is an illegal offset value for hashst and hashchk.
+
+This has been broken since the rs6000 ROP mitigation code was first added, so not a regression.
+
+- User: Peter Bergner | Time: 2024-06-07 21:36:25 UTC
+  Text: I have a patch I'm testing.
+
+- User: Segher Boessenkool | Time: 2024-06-11 22:54:10 UTC
+  Text: So, what value do we output? And why?
+
+- User: Segher Boessenkool | Time: 2024-06-11 22:55:09 UTC
+  Text: (In reply to Segher Boessenkool fromcomment #2)> So, what value do we output? And why?It would be nice if the assembler told us, btw :-)
+
+- User: Peter Bergner | Time: 2024-06-12 03:16:14 UTC
+  Text: (In reply to Segher Boessenkool fromcomment #2)> So, what value do we output? And why?The invalid offset is zero, so: hashst r0,0(r1)
+As the assembler mentions, the range of valid offsets is [-512,-8] and the offset must be a multiple of 8.
+
+The "bug" is that we initialize rop_hash_save_offset to zero very early, before any option processing.  Later, we compute the actual offset, but only in the case where Altivec is enabled (TARGET_ALTIVEC_ABI is true).  If Altivec is disabled as in this test case, we end up using rop_hash_save_offset's invalid initial zero value.
+
+- User: GCC Commits | Time: 2024-06-17 13:14:03 UTC
+  Text: The master branch has been updated by Peter Bergner <bergner@gcc.gnu.org>:https://gcc.gnu.org/g:c70eea0dba5f223d49c80cfb3e80e87b74330aaccommitr15-1377-gc70eea0dba5f223d49c80cfb3e80e87b74330aacAuthor: Peter Bergner <bergner@linux.ibm.com>
+Date:   Fri Jun 14 14:36:20 2024 -0500
+
+    rs6000: Compute rop_hash_save_offset for non-Altivec compiles [PR115389]
+    
+    We currently only compute the offset for the ROP hash save location in
+    the stack frame for Altivec compiles.  For non-Altivec compiles when we
+    emit ROP mitigation instructions, we use a default offset of zero which
+    corresponds to the backchain save location which will get clobbered on
+    any call.  The fix is to compute the ROP hash save location for all
+    compiles.
+    
+    2024-06-14  Peter Bergner  <bergner@linux.ibm.com>
+    
+    gcc/PR target/115389* config/rs6000/rs6000-logue.cc (rs6000_stack_info): Compute
+            rop_hash_save_offset for non-Altivec compiles.
+    
+    gcc/testsuitePR target/115389* gcc.target/powerpc/pr115389.c: New test.
+
+- User: Peter Bergner | Time: 2024-06-17 13:15:10 UTC
+  Text: Fixed on trunk.  I will let it burn-in on trunk for a couple of days before pushing the backports.
+
+- User: GCC Commits | Time: 2024-07-22 19:41:44 UTC
+  Text: The releases/gcc-14 branch has been updated by Peter Bergner <bergner@gcc.gnu.org>:https://gcc.gnu.org/g:33ebeb2435d68ae0546b29394e99e00647943fa9commitr14-10491-g33ebeb2435d68ae0546b29394e99e00647943fa9Author: Peter Bergner <bergner@linux.ibm.com>
+Date:   Fri Jun 14 14:36:20 2024 -0500
+
+    rs6000: Compute rop_hash_save_offset for non-Altivec compiles [PR115389]
+    
+    We currently only compute the offset for the ROP hash save location in
+    the stack frame for Altivec compiles.  For non-Altivec compiles when we
+    emit ROP mitigation instructions, we use a default offset of zero which
+    corresponds to the backchain save location which will get clobbered on
+    any call.  The fix is to compute the ROP hash save location for all
+    compiles.
+    
+    2024-06-14  Peter Bergner  <bergner@linux.ibm.com>
+    
+    gcc/PR target/115389* config/rs6000/rs6000-logue.cc (rs6000_stack_info): Compute
+            rop_hash_save_offset for non-Altivec compiles.
+    
+    gcc/testsuitePR target/115389* gcc.target/powerpc/pr115389.c: New test.
+    
+    (cherry picked from commit c70eea0dba5f223d49c80cfb3e80e87b74330aac)
+
+- User: Segher Boessenkool | Time: 2024-07-22 20:53:34 UTC
+  Text: (In reply to Peter Bergner fromcomment #4)> (In reply to Segher Boessenkool fromcomment #2)
+> > So, what value do we output? And why?
+> The invalid offset is zero, so: hashst r0,0(r1)
+> As the assembler mentions, the range of valid offsets is [-512,-8] and the
+> offset must be a multiple of 8.
+> 
+> The "bug" is that we initialize rop_hash_save_offset to zero very early,
+> before any option processing.  Later, we compute the actual offset, but only
+> in the case where Altivec is enabled (TARGET_ALTIVEC_ABI is true).  If
+> Altivec is disabled as in this test case, we end up using
+> rop_hash_save_offset's invalid initial zero value.And offset 0 is the backchain, not something you can innocently clobber :-)
+
+- User: GCC Commits | Time: 2024-07-24 01:21:03 UTC
+  Text: The releases/gcc-13 branch has been updated by Peter Bergner <bergner@gcc.gnu.org>:https://gcc.gnu.org/g:bc51e5abcd9cf9a4f74384f2df7c0c8c5ae07c1ccommitr13-8939-gbc51e5abcd9cf9a4f74384f2df7c0c8c5ae07c1cAuthor: Peter Bergner <bergner@linux.ibm.com>
+Date:   Fri Jun 14 14:36:20 2024 -0500
+
+    rs6000: Compute rop_hash_save_offset for non-Altivec compiles [PR115389]
+    
+    We currently only compute the offset for the ROP hash save location in
+    the stack frame for Altivec compiles.  For non-Altivec compiles when we
+    emit ROP mitigation instructions, we use a default offset of zero which
+    corresponds to the backchain save location which will get clobbered on
+    any call.  The fix is to compute the ROP hash save location for all
+    compiles.
+    
+    2024-06-14  Peter Bergner  <bergner@linux.ibm.com>
+    
+    gcc/PR target/115389* config/rs6000/rs6000-logue.cc (rs6000_stack_info): Compute
+            rop_hash_save_offset for non-Altivec compiles.
+    
+    gcc/testsuitePR target/115389* gcc.target/powerpc/pr115389.c: New test.
+    
+    (cherry picked from commit c70eea0dba5f223d49c80cfb3e80e87b74330aac)
+
+- User: GCC Commits | Time: 2024-07-24 13:15:30 UTC
+  Text: The releases/gcc-12 branch has been updated by Peter Bergner <bergner@gcc.gnu.org>:https://gcc.gnu.org/g:60e513cd47aadd8f139079f8388b14930e6e0913commitr12-10639-g60e513cd47aadd8f139079f8388b14930e6e0913Author: Peter Bergner <bergner@linux.ibm.com>
+Date:   Fri Jun 14 14:36:20 2024 -0500
+
+    rs6000: Compute rop_hash_save_offset for non-Altivec compiles [PR115389]
+    
+    We currently only compute the offset for the ROP hash save location in
+    the stack frame for Altivec compiles.  For non-Altivec compiles when we
+    emit ROP mitigation instructions, we use a default offset of zero which
+    corresponds to the backchain save location which will get clobbered on
+    any call.  The fix is to compute the ROP hash save location for all
+    compiles.
+    
+    2024-06-14  Peter Bergner  <bergner@linux.ibm.com>
+    
+    gcc/PR target/115389* config/rs6000/rs6000-logue.cc (rs6000_stack_info): Compute
+            rop_hash_save_offset for non-Altivec compiles.
+    
+    gcc/testsuitePR target/115389* gcc.target/powerpc/pr115389.c: New test.
+    
+    (cherry picked from commit c70eea0dba5f223d49c80cfb3e80e87b74330aac)
+
+- User: Peter Bergner | Time: 2024-07-24 13:57:23 UTC
+  Text: Fixed everywhere.
+

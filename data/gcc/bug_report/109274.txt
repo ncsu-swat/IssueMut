@@ -1,0 +1,280 @@
+Bug Summary: [13 Regression] ice in in_chain_p, at gimple-range-gori.cc:119 starting with r13-6787-g0963cb5fde158cce986
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2023-03-24 12:23:38 UTC
+  Text: This C++ code:
+
+float mulsignf_cb, mulsignf_t, mulsignf_bpa;
+int mulsignf___trans_tmp_1;
+float mulsignf() {
+  mulsignf_cb = 0 * -(2.0f * mulsignf_bpa);
+  mulsignf___trans_tmp_1 = mulsignf_cb != mulsignf_cb ? 0 : mulsignf();
+  mulsignf_t = mulsignf_bpa;
+}
+
+when compiled by recent g++ trunk and flag -O2, does this:bug902.cc: In function ‘float mulsignf()’:bug902.cc:7:1: warning: no return statement in function returning non-void [-Wre
+turn-type]
+    7 | }
+      | ^
+during GIMPLE pass: vrpbug902.cc:3:7: internal compiler error: in in_chain_p, at gimple-range-gori.cc:1
+19
+    3 | float mulsignf() {
+      |       ^~~~~~~~
+0x92e285 range_def_chain::in_chain_p(tree_node*, tree_node*)
+	../../trunk.year/gcc/gimple-range-gori.cc:119
+0x1fd69f4 gori_compute::compute_operand_range(vrange&, gimple*, vrange const&, t
+ree_node*, fur_source&, value_relation*)
+	../../trunk.year/gcc/gimple-range-gori.cc:667
+
+The bug first seems to appear sometime from git hashg:454a4d5041f53cd1tog:0963cb5fde158cce, a distance of 41 commits.
+
+- User: Jakub Jelinek | Time: 2023-03-24 12:30:34 UTC
+  Text: Started withr13-6787-g0963cb5fde158cce986.  Perhaps dup ofPR109265?
+Cleaned up testcase, still for -O2:
+
+float a, b, c;
+int d;
+float bar (void);
+
+void
+foo (void)
+{
+  a = 0 * -(2.0f * c);
+  d = a != a ? 0 : bar ();
+  b = c;
+}
+
+- User: Richard Biener | Time: 2023-03-24 12:48:16 UTC
+  Text: (gdb) p *vrel_ptr
+$4 = {related = VREL_VARYING, name1 = <tree 0x0>, name2 = <tree 0x0>}
+
+and we pass on NULL here:
+
+666           if (op1_in_chain)
+667             res = in_chain_p (vrel_ptr->op1 (), op1)
+668                   && in_chain_p (vrel_ptr->op2 (), op1);
+
+very likely a duplicate.
+
+- User: Jakub Jelinek | Time: 2023-03-24 13:33:25 UTC
+  Text: I think:
+--- gcc/gimple-range-gori.cc.jj	2023-03-23 15:25:47.060741116 +0100
++++ gcc/gimple-range-gori.cc	2023-03-24 14:30:38.272043631 +0100
+@@ -632,10 +632,11 @@ gori_compute::compute_operand_range (vra
+       if (!vrel_ptr && k == VREL_VARYING && op1 == op2)
+ 	k = VREL_EQ;
+       if (k != VREL_VARYING)
+-       {
+-	 vrel.set_relation (k, op1, op2);
+-	 vrel_ptr = &vrel;
+-       }
++	{
++	  vrel.set_relation (k, op1, op2);
++	  if (vrel.kind () != VREL_VARYING)
++	    vrel_ptr = &vrel;
++	}
+     }
+ 
+   // Handle end of lookup first.
+should fix this.
+
+- User: Jakub Jelinek | Time: 2023-03-24 14:27:41 UTC
+  Text: Createdattachment 54742[details]gcc13-pr109274.patch
+
+Full untested patch.
+
+- User: Jakub Jelinek | Time: 2023-03-24 14:28:09 UTC
+  Text: ***Bug 109265has been marked as a duplicate of this bug. ***
+
+- User: Andrew Macleod | Time: 2023-03-24 15:02:23 UTC
+  Text: Createdattachment 54743[details]new patch
+
+Before floating point relations were added, we tried to sanitize 
+value-relation records to not include non-sensensical records... ie 
+x != x or x < x.   Instead, we made a VREL_VARYING record with no 
+operands. 
+  
+When floating point relations were supported, some of these were no 
+longer non-sensical, AND we expanded the use of value_relation records 
+into GORI. 
+  
+As a result, this sanitization is no longer needed.  The Oracle 
+does not create records with op1 == op2, so its only within GORI 
+that these records can exist, and we shouldn't try to interpret them. 
+  
+The bug occurs because the "sanitized" records doesn't set op1 and op2, and changes the relation to VARYING..  and we have a record so expected the operands it to be set the way they were just set.
+
+We should not be setting a VREL_VARYING record if asked to set something else.
+
+- User: Jakub Jelinek | Time: 2023-03-24 15:10:06 UTC
+  Text: Agree your patch is better, but can you please also include the Fortran testcase from my patch?  Or I could commit it incrementally of course.
+
+- User: Sergei Trofimovich | Time: 2023-03-27 07:46:56 UTC
+  Text: I think I got a similar crash on this week's gcc on afdko-3.9.3. Minimal example:
+
+float selfIsectPath_lo, selfIsectPath_a;
+int selfIsectPath_isecta;
+void splitBez(float *a, float t) {
+  float p1 = p1;
+  *a = t * t - p1;
+}
+int checkSelfIsectCurve(float *p2) {
+  if (*p2 == *p2)
+    return 0;
+  return 1;
+}
+void selfIsectPath() {
+  float hi;
+  while (selfIsectPath_lo) {
+    float t = hi / 2;
+    splitBez(&selfIsectPath_a, t);
+    checkSelfIsectCurve(&selfIsectPath_a);
+    if (selfIsectPath_isecta)
+      hi = t;
+  }
+}
+
+$ gcc -O3 -c absfont_path.c.c -o a.o
+during GIMPLE pass: evrp
+absfont_path.c.c: In function 'selfIsectPath':
+absfont_path.c.c:21:1: internal compiler error: Segmentation fault
+   21 | }
+      | ^
+0xcb7c0f crash_signal
+        ../../gcc-13-20230326/gcc/toplev.cc:314
+0x19682c4 range_def_chain::in_chain_p(tree_node*, tree_node*)
+        ../../gcc-13-20230326/gcc/gimple-range-gori.cc:126
+0x19682c4 gori_compute::compute_operand_range(vrange&, gimple*, vrange const&, tree_node*, fur_source&, value_relation*)
+        ../../gcc-13-20230326/gcc/gimple-range-gori.cc:667
+0x19690d7 gori_compute::compute_operand1_range(vrange&, gimple_range_op_handler&, vrange const&, tree_node*, fur_source&, value_relation*)
+        ../../gcc-13-20230326/gcc/gimple-range-gori.cc:1174
+0x1968165 gori_compute::compute_operand_range(vrange&, gimple*, vrange const&, tree_node*, fur_source&, value_relation*)
+        ../../gcc-13-20230326/gcc/gimple-range-gori.cc:726
+0x19698a7 gori_compute::compute_operand2_range(vrange&, gimple_range_op_handler&, vrange const&, tree_node*, fur_source&, value_relation*)
+        ../../gcc-13-20230326/gcc/gimple-range-gori.cc:1254
+0x1969cf4 gori_compute::compute_operand1_and_operand2_range(vrange&, gimple_range_op_handler&, vrange const&, tree_node*, fur_source&, value_relation*)
+        ../../gcc-13-20230326/gcc/gimple-range-gori.cc:1274
+
+- User: Martin Liška | Time: 2023-03-27 08:11:13 UTC
+  Text: And I see the very same problem in opencv3 package.
+
+- User: Jakub Jelinek | Time: 2023-03-27 08:49:49 UTC
+  Text: As I said on gcc-patches, both my above patch and your patch cause
+FAIL: gcc.dg/tree-ssa/vrp-float-3a.c scan-tree-dump-not evrp "link_error"
+FAIL: gcc.dg/tree-ssa/vrp-float-4a.c scan-tree-dump-not evrp "link_error"
+regressions.
+
+The following patch fixes the 2 new tests and doesn't regress the above ones, but I haven't actually analyzed why the vrp-float-?a.c tests failed.
+
+--- gcc/gimple-range-gori.cc.jj	2023-03-24 17:27:30.788929236 +0100
++++ gcc/gimple-range-gori.cc	2023-03-27 10:40:53.350453280 +0200
+@@ -658,7 +658,7 @@ gori_compute::compute_operand_range (vra
+   // the result.
+   if (lhs.varying_p ())
+     {
+-      if (!vrel_ptr)
++      if (!vrel_ptr || vrel_ptr->kind () == VREL_VARYING)
+ 	return false;
+       // If there is a relation (ie: x != y) , it can only be relevant if
+       // a) both elements are in the defchain
+
+- User: Andrew Macleod | Time: 2023-03-27 14:10:42 UTC
+  Text: I will provide a fix today, once I look deeper and settle it.  Sorry, I was busy and incommunicado all weekend.
+
+The real root of the problem seems to be that previously if symbolically op1 == op2, we were incorrectly not passing op1 ==/!= op1 relations up the GORI call chain as we intended.
+
+I fixed that, but the new problem is that we *always* do it if op1 and op2 are the same symbol.  For floating point, that is *not* the case.  We have code in == and != to deal with this, but as you can see, we arent doing any kind of check..
+
+      if (!vrel_ptr && k == VREL_VARYING && op1 == op2)
+        k = VREL_EQ;
+
+so we are setting them to EQ when they may not be.
+
+Im trying to decide whether to fix this "properly" right now (when we first create this, we do not have access to the range of op1 yet), or leave the current behavior and if set_relation doesnt return a proper record, move on.
+
+ That would amount to something like:
+      if (k != VREL_VARYING)
+       {
+         vrel.set_relation (k, op1, op2);
+         if (vrel.kind () != v
+           vrel_ptr = &vrel;
+       }
+
+Anyway I'll investigate and submit something today so we can get on with this. (Or maybe simply recommend your lastest patch to bypass the pointless trap.)
+
+In fact, maybe we should do that anyway...  since its obviously correct..   and then when an appropriate fix is provided we can either also applty it, or defer it to next release as we see fit.
+
+- User: Andrew Macleod | Time: 2023-03-28 03:05:53 UTC
+  Text: Createdattachment 54775[details]new patch
+
+OK, I think I have finally got to the root of the problem.
+
+When trying to communicate cases where the operands of a stmt are symbolically equivalent, it needed a bit more effort.
+
+compute_operand is the controlling routine, and if op1 and op2 were the same symbol, it would create a new relation record for op1 == op2 and pass it to compute_operand_1 and/or compute_operand_2.
+
+The problem is threefold.
+1 - for floating point and such, op1 == op2 requires checking that there is no NAN, which wasn't happening.
+2 - Because we cant make that assumption, creating a relation record and passing it up the GORI chain is incorrect.  Other statements are going to get that record and use it during their calculation when in fact, we haven't proven op1 == op2.
+3 - We were evaluating the relation of op1 == op2 BEFORE processing the statement, and utilizing it.  so given:
+  if (x != x)
+we were creating an x == x record for the stmt, and passing it as (potentially incorrect) fact down the chain. This exposes the duality of trying to use the record to represent both the relation between op1 and op2, vs the symbolic nature of that relation on just the individual statement.
+
+This patch incorporates the original patch where we stop sanitizing value_relation records, and then fixes the compute_operand sequences.
+
+Instead of creating the record in compute_operand and passing it on, the work is broken down in compute_operand_1 and compute_operand_2 where we can separate the current stmt info from what is passed to the next statement.
+
+If the relation record between op1 and op2 does not already exist, and op1 and op2 are the same symbol, then we pass op1 == op2 locally to the handler for opX_range, but it does not travel any further than that. This keeps the context local and will allow the statement to recognize that op1 and op2 are the same value without impacting other statements, nor introducing side effects.
+
+Before proceeding to the next statement in the chain, we query the handler for a relation between op1 and op2 (which uses their respective ranges), and if there is one, a new record is created and passed up the chain.
+
+This is functionally correct because
+  if (x != x)
+      or
+  if (x == x)
+will look at the ranges for x, and the floating point operator for NE_EXPR/EQ_EXPR uses those ranges to determine if there really is a relation and passes the appropriate result up the chain.
+
+Checked the problematic tests and seems fine.   Full bootstrap/Testing running over night.
+
+- User: GCC Commits | Time: 2023-03-28 13:34:36 UTC
+  Text: The master branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:dd63bba0c8dc3a6ae06cfdc084bca7c68b8bbd39commitr13-6906-gdd63bba0c8dc3a6ae06cfdc084bca7c68b8bbd39Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Fri Mar 24 11:21:20 2023 -0400
+
+    Fix compute_operand when op1 == op2 symbolically.
+    
+    First, class value_relation should not sanitize records. just create
+    what is asked.
+    
+    Second., if there is not a relation record, compute_operand was
+    creating one for op1 == op2 if op1 and op2 were the same symbol.   This
+    is not the correct way to communicate the information, as that record
+    will continue to be passed along the GORI unwind chain.
+    
+    Instead, simply pass that information locally to the opX_range routine
+    for only the current statement.PR tree-optimization/109265PR tree-optimization/109274gcc/
+            * gimple-range-gori.cc (gori_compute::compute_operand_range): Do
+            not create a relation record is op1 and op2 are the same symbol.
+            (gori_compute::compute_operand1_range): Pass op1 == op2 to the
+            handler for this stmt, but create a new record only if this statement
+            generates a relation based on the ranges.
+            (gori_compute::compute_operand2_range): Ditto.
+            * value-relation.h (value_relation::set_relation): Always create the
+            record that is requested.
+    
+            gcc/testsuite/
+            * gcc.dg/pr109274.c: New.
+            * gfortran.dg/pr109265.f90: New.
+
+- User: Andrew Macleod | Time: 2023-03-28 13:35:19 UTC
+  Text: fixed.
+
+- User: Sam James | Time: 2023-03-29 01:42:05 UTC
+  Text: ***Bug 109325has been marked as a duplicate of this bug. ***
+

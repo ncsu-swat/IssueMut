@@ -1,0 +1,133 @@
+Bug Summary: Takes until forwprop2 to remove !a sometimes
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: internal-improvement, missed-optimization, patch
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2023-05-02 05:06:03 UTC
+  Text: Take:
+```
+int f(_Bool c, int a, int b)
+{
+        _Bool d = c;
+        d = !d;
+        if (d != 0) return a;
+        return b;
+}
+```
+
+It takes until forwprop2 now to remove all of the code before the conditional.
+In GCC 4.9.0, we used to do it almost all the way in forwprop1; with just one assignment added.
+
+I noticed this while looking intoPR 67628but it is not exactly an issue there so filing it seperately.
+
+- User: Andrew Pinski | Time: 2023-05-02 06:31:46 UTC
+  Text: I have a patch, basically moves tree-ssa-propagate to use simple_dce_from_worklist instead of its own statement removal worklist. As that will do it recusively find dead statements.
+
+- User: Andrew Pinski | Time: 2023-05-02 23:58:21 UTC
+  Text: Still working on this but I ran into an issue where we now remove a dead load but that load has an exception edge (due to -fnon-call-exceptions) and we don't cleanup the eh edge and get an ICE due to that. 
+
+FAIL: g++.dg/pr55263.C  -std=gnu++14 (internal compiler error: verify_flow_info failed)
+
+FAIL: g++.dg/tree-ssa/pr36766.C  -std=gnu++14 (internal compiler error: verify_flow_info failed)
+
+
+Also still have to update a few other testcases.
+FAIL: gcc.dg/pr81192.c scan-tree-dump-times pre "(?n)find_duplicates: <bb .*> duplicate of <bb .*>" 1
+FAIL: c-c++-common/goacc/kernels-alias-8.c scan-tree-dump-times ealias "clique 1 base 1" 2
+
+
+kernels-alias-8.c is because we also dce a load I have to double check how to handle that one but -fno-tree-ccp might work ...
+
+gcc.dg/pr81192.c might need a similar thing now too but I am not 100% sure.pr81192.c should really be a Gimple testcase but gimple testcases were not around when the testcase was added.
+
+- User: Andrew Pinski | Time: 2023-05-03 03:25:46 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> Still working on this but I ran into an issue where we now remove a dead
+> load but that load has an exception edge (due to -fnon-call-exceptions) and
+> we don't cleanup the eh edge and get an ICE due to that. 
+> 
+> FAIL: g++.dg/pr55263.C  -std=gnu++14 (internal compiler error:
+> verify_flow_info failed)
+> 
+> FAIL: g++.dg/tree-ssa/pr36766.C  -std=gnu++14 (internal compiler error:
+> verify_flow_info failed)I have a fix, it was simplier than expected.
+
+- User: Andrew Pinski | Time: 2023-05-05 05:16:10 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> gcc.dg/pr81192.c might need a similar thing now too but I am not 100% sure.
+>pr81192.c should really be a Gimple testcase but gimple testcases were not
+> around when the testcase was added.It is going to need to be a gimple testcase. The testcase has become too fragile otherwise; it already has gone through a few -fno-* -fdisable-* options already too.
+
+- User: Andrew Pinski | Time: 2023-05-05 06:09:45 UTC
+  Text: Createdattachment 55003[details]Patch which is under testing including updates to the testsuite finally
+
+- User: Andrew Pinski | Time: 2023-05-05 15:18:24 UTC
+  Text: Patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2023-May/617612.html
+
+- User: GCC Commits | Time: 2023-05-08 06:18:31 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:21e2ef2dc25de318de29ec32d5390350c6717c6acommitr14-569-g21e2ef2dc25de318de29ec32d5390350c6717c6aAuthor: Andrew Pinski <apinski@marvell.com>
+Date:   Tue May 2 00:10:46 2023 -0700
+
+    Move substitute_and_fold over to use simple_dce_from_worklist
+    
+    While looking into a different issue, I noticed that it
+    would take until the second forwprop pass to do some
+    forward proping and it was because the ssa name was
+    used more than once but the second statement was
+    "dead" and we don't remove that until much later.
+    
+    So this uses simple_dce_from_worklist instead of manually
+    removing of the known unused statements instead.
+    Propagate engine does not do a cleanupcfg afterwards either but manually
+    cleans up possible EH edges so simple_dce_from_worklist
+    needs to communicate that back to the propagate engine.
+    
+    Some testcases needed to be updated/changed even because of better optimization.
+    gcc.dg/pr81192.c even had to be changed to be using the gimple FE so it would
+    be less fragile in the future too.
+    gcc.dg/tree-ssa/pr98737-1.c was failing because __atomic_fetch_ was being matched
+    but in those cases, the result was not being used so both __atomic_fetch_ and
+    __atomic_x_and_fetch_ are valid choices and would not make a code generation difference.
+    evrp7.c, evrp8.c, vrp35.c, vrp36.c: just needed a slightly change as the removal message
+    is different slightly.
+    kernels-alias-8.c: ccp1 is able to remove an unused load which causes ealias to have
+    one less load to analysis so update the expected scan #.
+    
+    OK? Bootstrapped and tested on x86_64-linux-gnu with no regressions.
+    
+    gcc/ChangeLog:PR tree-optimization/109691* tree-ssa-dce.cc (simple_dce_from_worklist): Add need_eh_cleanup
+            argument.
+            If the removed statement can throw, have need_eh_cleanup
+            include the bb of that statement.
+            * tree-ssa-dce.h (simple_dce_from_worklist): Update declaration.
+            * tree-ssa-propagate.cc (struct prop_stats_d): Remove
+            num_dce.
+            (substitute_and_fold_dom_walker::substitute_and_fold_dom_walker):
+            Initialize dceworklist instead of stmts_to_remove.
+            (substitute_and_fold_dom_walker::~substitute_and_fold_dom_walker):
+            Destore dceworklist instead of stmts_to_remove.
+            (substitute_and_fold_dom_walker::before_dom_children):
+            Set dceworklist instead of adding to stmts_to_remove.
+            (substitute_and_fold_engine::substitute_and_fold):
+            Call simple_dce_from_worklist instead of poping
+            from the list.
+            Don't update the stat on removal statements.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/evrp7.c: Update for output change.
+            * gcc.dg/tree-ssa/evrp8.c: Likewise.
+            * gcc.dg/tree-ssa/vrp35.c: Likewise.
+            * gcc.dg/tree-ssa/vrp36.c: Likewise.
+            * gcc.dg/tree-ssa/pr98737-1.c: Update scan-tree-dump-not
+            to check for assignment too instead of just a call.
+            * c-c++-common/goacc/kernels-alias-8.c: Update test
+            for removal of load.
+            * gcc.dg/pr81192.c: Rewrite testcase in gimple based test.
+
+- User: Andrew Pinski | Time: 2023-05-08 06:18:50 UTC
+  Text: Fixed.
+

@@ -1,0 +1,253 @@
+Bug Summary: [13 Regression] ICE in push_agg_values_from_plats, at ipa-cp.cc:1458 since r13-3358-ge0403e95689af7d5
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: G. Steinmetz | Time: 2023-03-27 18:41:17 UTC
+  Text: Started between 20221016 and 20221023, at -O2+ :
+
+
+$ cat z1.c
+struct s
+{
+  struct s1
+  {
+    unsigned char c1;
+    unsigned short a1[2147483647];
+  } __attribute__ ((packed)) p1;
+  struct s2
+  {
+    unsigned char c2;
+    unsigned short a2[100];
+  } __attribute__ ((packed)) p2[4];
+} __attribute__ ((packed));
+
+typedef struct
+{
+  struct s b;
+} qs;
+
+static int
+f (qs *q)
+{
+  int i, j;
+  for (i = 0; i < q->b.p1.c1; i++)
+    for (j = 0; j < q->b.p2[i].c2; j++)
+      g (q->b.p2[i].a2[j]);
+}
+
+int main (void)
+{
+  qs q;
+  q.b.p2[0].c2 = q.b.p2[1].c2 = 3;
+  return f (&q);
+}
+
+
+$ gcc-13-20230326 -c z1.c -O2
+z1.c: In function 'f':
+z1.c:26:7: warning: implicit declaration of function 'g' [-Wimplicit-function-declaration]
+   26 |       g (q->b.p2[i].a2[j]);
+      |       ^
+during IPA pass: cp
+z1.c: At top level:
+z1.c:34:1: internal compiler error: in push_agg_values_from_plats, at ipa-cp.cc:1458
+   34 | }
+      | ^
+0x1db8677 push_agg_values_from_plats
+        ../../gcc/ipa-cp.cc:1457
+0x1db8aef gather_context_independent_values
+        ../../gcc/ipa-cp.cc:3641
+0x1dc0d59 estimate_local_effects
+        ../../gcc/ipa-cp.cc:3746
+0x1dcbe38 propagate_constants_topo
+        ../../gcc/ipa-cp.cc:4105
+0x1dcbe38 ipcp_propagate_stage
+        ../../gcc/ipa-cp.cc:4292
+0x1dcbe38 ipcp_driver
+        ../../gcc/ipa-cp.cc:6616
+
+- User: Martin Liška | Time: 2023-03-27 20:06:44 UTC
+  Text: Started withr13-3358-ge0403e95689af7d5.
+
+- User: Jakub Jelinek | Time: 2023-03-29 15:37:38 UTC
+  Text: Slightly adjusted testcase:
+
+struct __attribute__((packed)) A { char c1; short a1[__INT_MAX__]; };
+struct __attribute__((packed)) B { char c2; short a2[100]; };
+struct S { struct A p1; struct B p2[4]; };
+void bar (short int);
+
+static void
+foo (struct S *q)
+{
+  for (int i = 0; i < q->p1.c1; i++)
+    for (int j = 0; j < q->p2[i].c2; j++)
+      bar (q->p2[i].a2[j]);
+}
+
+int
+main ()
+{
+  struct S q = {};
+  q.p2[0].c2 = q.p2[1].c2 = 3;
+  foo (&q);
+}
+
+- User: Jakub Jelinek | Time: 2023-03-29 16:26:53 UTC
+  Text: And the problem is similar toPR108605, most of IPA uses unsigned int as type for byte offsets and while some spots check for offsets while bit offsets are typically using HOST_WIDE_INT.  So, some larger bit offsets can't be represented in unsigned int byte offset.
+
+- User: Jakub Jelinek | Time: 2023-03-29 16:40:36 UTC
+  Text: --- gcc/ipa-cp.cc.jj	2023-03-14 19:12:19.949553036 +0100
++++ gcc/ipa-cp.cc	2023-03-29 18:32:34.148888423 +0200
+@@ -3117,7 +3117,9 @@ propagate_aggs_across_jump_function (str
+ 	{
+ 	  HOST_WIDE_INT val_size;
+ 
+-	  if (item->offset < 0 || item->jftype == IPA_JF_UNKNOWN)
++	  if (item->offset < 0
++	      || item->jftype == IPA_JF_UNKNOWN
++	      || item->offset >= (HOST_WIDE_INT) UINT_MAX * BITS_PER_UNIT)
+ 	    continue;
+ 	  val_size = tree_to_shwi (TYPE_SIZE (item->type));
+ 
+fixes the ICE and is then similar to thePR108605fix.  Dunno if the code can overflow also offset + size computations or something protects against that.
+Anyway, I think it would be worth it to switch all those unsigned int byte offsets to
+unsigned HOST_WIDE_INTs for GCC 14.
+
+- User: Martin Jambor | Time: 2023-03-29 22:20:46 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #4)> --- gcc/ipa-cp.cc.jj	2023-03-14 19:12:19.949553036 +0100
+> +++ gcc/ipa-cp.cc	2023-03-29 18:32:34.148888423 +0200
+> @@ -3117,7 +3117,9 @@ propagate_aggs_across_jump_function (str
+>  	{
+>  	  HOST_WIDE_INT val_size;
+>  
+> -	  if (item->offset < 0 || item->jftype == IPA_JF_UNKNOWN)
+> +	  if (item->offset < 0
+> +	      || item->jftype == IPA_JF_UNKNOWN
+> +	      || item->offset >= (HOST_WIDE_INT) UINT_MAX * BITS_PER_UNIT)
+>  	    continue;
+>  	  val_size = tree_to_shwi (TYPE_SIZE (item->type));
+>  
+> fixes the ICE and is then similar to thePR108605fix.  Dunno if the code
+> can overflow also offset + size computations or something protects against
+> that.
+> Anyway, I think it would be worth it to switch all those unsigned int byte
+> offsets to
+> unsigned HOST_WIDE_INTs for GCC 14.Actually, I am in the process of doing the reverse in order to try and
+keep the memory footprint of the structures small.  (The reason why
+the HOST_WIDE_BITs are signed is what get_ref_base_and_extent used to
+return).  Unfortunately what I wanted to do but forgot is the
+following (only lightly tested so far, it has the benefit that
+uselessly large offsets are not even streamed):
+
+diff --git a/gcc/ipa-prop.cc b/gcc/ipa-prop.cc
+index de45dbccf16..edc1f469914 100644
+--- a/gcc/ipa-prop.cc
++++ b/gcc/ipa-prop.cc
+@@ -1735,6 +1735,8 @@ build_agg_jump_func_from_list (struct ipa_known_agg_contents_list *list,
+ 
+       item.offset = list->offset - arg_offset;
+       gcc_assert ((item.offset % BITS_PER_UNIT) == 0);
++      if (item.offset + list->size >= (HOST_WIDE_INT) UINT_MAX * BITS_PER_UNIT)
++       continue;
+ 
+       jfunc->agg.items->quick_push (item);
+     }
+
+- User: Jakub Jelinek | Time: 2023-03-30 07:21:39 UTC
+  Text: Ok.  It is yours then, for testcase perhaps:
+--- gcc/testsuite/gcc.dg/pr109303.c.jj	2023-03-29 18:42:31.068144102 +0200
++++ gcc/testsuite/gcc.dg/pr109303.c	2023-03-29 18:42:18.328330526 +0200
+@@ -0,0 +1,24 @@
++/*PR ipa/109303*/
++/* { dg-do compile { target lp64 } } */
++/* { dg-options "-O2" } */
++
++struct __attribute__((packed)) A { char c1; short a1[__INT_MAX__]; };
++struct __attribute__((packed)) B { char c2; short a2[100]; };
++struct S { struct A p1; struct B p2[4]; };
++void bar (short int);
++
++static void
++foo (struct S *q)
++{
++  for (int i = 0; i < q->p1.c1; i++)
++    for (int j = 0; j < q->p2[i].c2; j++)
++      bar (q->p2[i].a2[j]);
++}
++
++int
++main ()
++{
++  struct S q = {};
++  q.p2[0].c2 = q.p2[1].c2 = 3;
++  foo (&q);
++}
+
+(without lp64 it obviously fails on 32-bit targets).
+
+- User: Jakub Jelinek | Time: 2023-03-30 07:28:06 UTC
+  Text: BTW, I think I got that offset >= (HOST_WIDE_INT) UINT_MAX * BITS_PER_UNIT wrong last time, if offset is equal to that, it is still representable (as UINT_MAX).
+So perhaps either offset > (HOST_WIDE_INT) UINT_MAX * BITS_PER_UNIT or>= (UINT_MAX + HOST_WIDE_INT_1) * BITS_PER_UNIT, depending on whether we expectthe divisions to be exact or truncating.  On the other side, if it is just an optimization, who cares...
+
+- User: Martin Jambor | Time: 2023-03-30 16:48:20 UTC
+  Text: Thanks a lot for the testcase.  The divisions must always be exact.
+
+After having one more look, I moved the check a bit earlier still and am currently testing this:
+
+--- a/gcc/ipa-prop.cc
++++ b/gcc/ipa-prop.cc
+@@ -2086,7 +2086,9 @@ determine_known_aggregate_parts (struct ipa_func_body_info *fbi,
+             whether its value is clobbered any other dominating one.  */
+          if ((content->value.pass_through.formal_id >= 0
+               || content->value.pass_through.operand)
+-             && !clobber_by_agg_contents_list_p (all_list, content))
++             && !clobber_by_agg_contents_list_p (all_list, content)
++             && (content->offset + content->size - arg_offset
++                 <= (HOST_WIDE_INT) UINT_MAX * BITS_PER_UNIT))
+            {
+              struct ipa_known_agg_contents_list *copy
+                        = XALLOCA (struct ipa_known_agg_contents_list);
+
+- User: Martin Jambor | Time: 2023-03-31 08:51:26 UTC
+  Text: I have proposed the fix on the mailing list:https://gcc.gnu.org/pipermail/gcc-patches/2023-March/614943.html
+
+- User: GCC Commits | Time: 2023-04-03 14:01:58 UTC
+  Text: The master branch has been updated by Martin Jambor <jamborm@gcc.gnu.org>:https://gcc.gnu.org/g:da3fd01757297c1d20cf3dcd76046488da737569commitr13-6986-gda3fd01757297c1d20cf3dcd76046488da737569Author: Martin Jambor <mjambor@suse.cz>
+Date:   Mon Apr 3 15:53:36 2023 +0200
+
+    ipa: Avoid constructing aggregate jump functions with huge offsets (PR 109303)
+    
+    We are in the process of changing data structures holding information
+    about constants passed by reference and in aggregates to use unsigned
+    int offsets rather than HOST_WIDE_INT (which was selected simply
+    because that is what fell out of get_ref_base_and_extent at that time)
+    in order to conserve memory, especially at WPA time.PR 109303testcase discovers that we do not properly check that we
+    only create jump functions with offsets (plus sizes) that fit into the
+    smaller type.  This patch adds the necessary check.
+    
+    gcc/ChangeLog:
+    
+    2023-03-30  Martin Jambor  <mjambor@suse.cz>PR ipa/109303* ipa-prop.cc (determine_known_aggregate_parts): Check that the
+            offset + size will be representable in unsigned int.
+    
+    gcc/testsuite/ChangeLog:
+    
+    2023-03-30  Jakub Jelinek  <jakub@redhat.com>
+                Martin Jambor  <mjambor@suse.cz>PR ipa/109303* gcc.dg/pr109303.c: New test.
+
+- User: Martin Jambor | Time: 2023-04-03 14:02:21 UTC
+  Text: Fixed.
+
+- User: Martin Liška | Time: 2023-04-05 08:39:15 UTC
+  Text: ***Bug 109408has been marked as a duplicate of this bug. ***
+
+- User: Martin Liška | Time: 2023-04-05 08:40:10 UTC
+  Text: ***Bug 109408has been marked as a duplicate of this bug. ***
+

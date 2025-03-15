@@ -1,0 +1,311 @@
+Bug Summary: [15 Regression] Failure to use aarch64 lane forms after PR101523
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: aarch64-sve, missed-optimization, testsuite-fail
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Richard Sandiford | Time: 2024-03-28 10:01:00 UTC
+  Text: The following test regressed on aarch64 afterg:839bc42772ba7af66af3bd16efed4a69511312ae(the fix forPR101523):
+
+typedef float v4sf __attribute__((vector_size(16)));
+void f (v4sf *ptr, float f)
+{
+  ptr[0] = ptr[0] * (v4sf) { f, f, f, f };
+  ptr[1] = ptr[1] * (v4sf) { f, f, f, f };
+}
+
+Compiled with -O2, we previously generated:
+
+        ldp     q1, q31, [x0]
+        fmul    v1.4s, v1.4s, v0.s[0]
+        fmul    v31.4s, v31.4s, v0.s[0]
+        stp     q1, q31, [x0]
+        ret
+
+Now we generate:
+
+        ldp     q1, q31, [x0]
+        dup     v0.4s, v0.s[0]
+        fmul    v1.4s, v1.4s, v0.4s
+        fmul    v31.4s, v31.4s, v0.4s
+        stp     q1, q31, [x0]
+        ret
+
+with the extra dup.
+
+The patch is trying to avoid cases where i3 is canonicalised by contextual information provided by i2.  But here we place a full copy of i2 into i3 (creating an instruction that is no more expensive).  This is a benefit in its own right because the two instructions can then execute in parallel rather than serially.  But it also means that, as here, we might be able to remove i2 with later combinations.
+
+Perhaps we could also check whether i3 still contains the destination of i2?
+
+- User: Richard Biener | Time: 2024-03-28 10:06:08 UTC
+  Text: Btw, why does forwprop not do this?
+
+- User: Segher Boessenkool | Time: 2024-03-28 10:09:58 UTC
+  Text: ThePR101523fix makes sure we do not get the same I2 back, because that
+violates algorithmic assumptions of combine.  Importantly, the way it was
+things can be changed back time and time again, and that actually happened.
+There is no "canonical form" in combine, it all depends on what little
+piece of context is and is not considered what form combine prefers.  Things
+can -- and DID -- oscillate.
+
+So, what is happening here?  The "dup" here is really a "splat"?  Should the
+backend have some extra define_insn or define_split, or maybe even a peephole?
+
+- User: Richard Sandiford | Time: 2024-03-28 10:19:46 UTC
+  Text: In RTL terms, the dup is vec_duplicate.  The combination is:
+
+Trying 10 -> 13:
+   10: r107:V4SF=vec_duplicate(r115:SF)
+      REG_DEAD r115:SF
+   13: r110:V4SF=r111:V4SF*r107:V4SF
+      REG_DEAD r111:V4SF
+Failed to match this instruction:
+(parallel [
+        (set (reg:V4SF 110 [ _2 ])
+            (mult:V4SF (vec_duplicate:V4SF (reg:SF 115))
+                (reg:V4SF 111 [ *ptr_6(D) ])))
+        (set (reg:V4SF 107)
+            (vec_duplicate:V4SF (reg:SF 115)))
+    ])
+Failed to match this instruction:
+(parallel [
+        (set (reg:V4SF 110 [ _2 ])
+            (mult:V4SF (vec_duplicate:V4SF (reg:SF 115))
+                (reg:V4SF 111 [ *ptr_6(D) ])))
+        (set (reg:V4SF 107)
+            (vec_duplicate:V4SF (reg:SF 115)))
+    ])
+Successfully matched this instruction:
+(set (reg:V4SF 107)
+    (vec_duplicate:V4SF (reg:SF 115)))
+Successfully matched this instruction:
+(set (reg:V4SF 110 [ _2 ])
+    (mult:V4SF (vec_duplicate:V4SF (reg:SF 115))
+        (reg:V4SF 111 [ *ptr_6(D) ])))
+allowing combination of insns 10 and 13
+original costs 8 + 20 = 28
+replacement costs 8 + 20 = 28
+modifying insn i2    10: r107:V4SF=vec_duplicate(r115:SF)
+deferring rescan insn with uid = 10.
+modifying insn i3    13: r110:V4SF=vec_duplicate(r115:SF)*r111:V4SF
+      REG_DEAD r115:SF
+      REG_DEAD r111:V4SF
+deferring rescan insn with uid = 13.
+
+- User: Richard Sandiford | Time: 2024-03-28 10:29:20 UTC
+  Text: (In reply to Richard Biener fromcomment #1)> Btw, why does forwprop not do this?Not 100% sure (I wasn't involved in choosing the current heuristics).  But fwprop can propagate across blocks, so there is probably more risk of increasing register pressure.
+
+- User: Richard Sandiford | Time: 2024-03-28 12:43:19 UTC
+  Text: For the record, the associated new testsuite failures are:
+
+FAIL: gcc.target/aarch64/ashltidisi.c scan-assembler-times asr 3
+FAIL: gcc.target/aarch64/asimd-mull-elem.c scan-assembler-times \\s+fmul\\tv[0-9]+\\.4s, v[0-9]+\\.4s, v[0-9]+\\.s\\[0\\] 4
+FAIL: gcc.target/aarch64/asimd-mull-elem.c scan-assembler-times \\s+mul\\tv[0-9]+\\.4s, v[0-9]+\\.4s, v[0-9]+\\.s\\[0\\] 4
+FAIL: gcc.target/aarch64/ccmp_3.c scan-assembler-not \tcbnz\t
+FAIL: gcc.target/aarch64/pr100056.c scan-assembler-times \\t[us]bfiz\\tw[0-9]+, w[0-9]+, 11 2
+FAIL: gcc.target/aarch64/pr100056.c scan-assembler-times \\tadd\\tw[0-9]+, w[0-9]+, w[0-9]+, uxtb\\n 2
+FAIL: gcc.target/aarch64/pr108840.c scan-assembler-not and\\tw[0-9]+, w[0-9]+, 31
+FAIL: gcc.target/aarch64/pr112105.c scan-assembler-not \\tdup\\t
+FAIL: gcc.target/aarch64/pr112105.c scan-assembler-times (?n)\\tfmul\\t.*v[0-9]+\\.s\\[0\\]\\n 2
+FAIL: gcc.target/aarch64/rev16_2.c scan-assembler-times rev16\\tx[0-9]+ 2
+FAIL: gcc.target/aarch64/vaddX_high_cost.c scan-assembler-not dup\\t
+FAIL: gcc.target/aarch64/vmul_element_cost.c scan-assembler-not dup\\t
+FAIL: gcc.target/aarch64/vmul_high_cost.c scan-assembler-not dup\\t
+FAIL: gcc.target/aarch64/vsubX_high_cost.c scan-assembler-not dup\\t
+FAIL: gcc.target/aarch64/sve/pr98119.c scan-assembler \\tand\\tx[0-9]+, x[0-9]+, #?-31\\n
+FAIL: gcc.target/aarch64/sve/pred-not-gen-1.c scan-assembler-not \\tbic\\t
+FAIL: gcc.target/aarch64/sve/pred-not-gen-1.c scan-assembler-times \\tnot\\tp[0-9]+\\.b, p[0-9]+/z, p[0-9]+\\.b\\n 1
+FAIL: gcc.target/aarch64/sve/pred-not-gen-4.c scan-assembler-not \\tbic\\t
+FAIL: gcc.target/aarch64/sve/pred-not-gen-4.c scan-assembler-times \\tnot\\tp[0-9]+\\.b, p[0-9]+/z, p[0-9]+\\.b\\n 1
+FAIL: gcc.target/aarch64/sve/var_stride_2.c scan-assembler-times \\tubfiz\\tx[0-9]+, x2, 10, 16\\n 1
+FAIL: gcc.target/aarch64/sve/var_stride_2.c scan-assembler-times \\tubfiz\\tx[0-9]+, x3, 10, 16\\n 1
+FAIL: gcc.target/aarch64/sve/var_stride_4.c scan-assembler-times \\tsbfiz\\tx[0-9]+, x2, 10, 32\\n 1
+FAIL: gcc.target/aarch64/sve/var_stride_4.c scan-assembler-times \\tsbfiz\\tx[0-9]+, x3, 10, 32\\n 1
+
+- User: Richard Biener | Time: 2024-04-02 08:05:57 UTC
+  Text: Note I think given the offending rev fixed a very old bug we should eventually revert the fix and rework it during next stage1.  This was at least unexpectedly big fallout AFAIU.
+
+- User: Robin Dapp | Time: 2024-04-02 18:42:01 UTC
+  Text: There is some riscv fallout as well.  Edwin has the details.
+
+- User: Edwin Lu | Time: 2024-04-02 20:24:39 UTC
+  Text: (In reply to Robin Dapp fromcomment #7)> There is some riscv fallout as well.  Edwin has the details.I haven't done an in depth analysis but the full list of new riscv scan-dump failures can be found here:https://github.com/patrick-rivos/gcc-postcommit-ci/issues/694
+
+- User: Jeffrey A. Law | Time: 2024-04-02 20:45:58 UTC
+  Text: Thanks for that info Edwin -- my tester flagged them too and mentally I'd figured it was most likely the combiner change.
+
+- User: Tamar Christina | Time: 2024-04-03 15:20:58 UTC
+  Text: This has also broken our addressing modeshttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=114575
+
+- User: Richard Biener | Time: 2024-04-10 06:01:49 UTC
+  Text: Reverted for GCC 14 but will re-appear for GCC 15.
+
+- User: Jeffrey A. Law | Time: 2024-06-16 03:28:21 UTC
+  Text: Reading the RTL dumps from Richard S. this looks like the exact same problem we're still seeing on the RISC-V port, affecting 557.xz.
+
+Specifically we get the same I2 back, but I3 has changed.  The change in I3 in turn allows I2 to combine into a different instruction and net is a clear improvement.  ISTM that allowing this combination when we get the same I2 back, but a different I3 would be sufficient to fix both the aarch64 and riscv problems.
+
+Unfortunately Segher has gone radio silent on this issue.
+
+- User: GCC Commits | Time: 2024-06-24 07:43:46 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:792f97b44ffc5e6a967292b3747fd835e99396e7commitr15-1579-g792f97b44ffc5e6a967292b3747fd835e99396e7Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Mon Jun 24 08:43:19 2024 +0100
+
+    Add a late-combine pass [PR106594]
+    
+    This patch adds a combine pass that runs late in the pipeline.
+    There are two instances: one between combine and split1, and one
+    after postreload.
+    
+    The pass currently has a single objective: remove definitions by
+    substituting into all uses.  The pre-RA version tries to restrict
+    itself to cases that are likely to have a neutral or beneficial
+    effect on register pressure.
+    
+    The patch fixesPR106594.  It also fixes a few FAILs and XFAILs
+    in the aarch64 test results, mostly due to making proper use of
+    MOVPRFX in cases where we didn't previously.
+    
+    This is just a first step.  I'm hoping that the pass could be
+    used for other combine-related optimisations in future.  In particular,
+    the post-RA version doesn't need to restrict itself to cases where all
+    uses are substitutable, since it doesn't have to worry about register
+    pressure.  If we did that, and if we extended it to handle multi-register
+    REGs, the pass might be a viable replacement for regcprop, which in
+    turn might reduce the cost of having a post-RA instance of the new pass.
+    
+    On most targets, the pass is enabled by default at -O2 and above.
+    However, it has a tendency to undo x86's STV and RPAD passes,
+    by folding the more complex post-STV/RPAD form back into the
+    simpler pre-pass form.
+    
+    Also, running a pass after register allocation means that we can
+    now match define_insn_and_splits that were previously only matched
+    before register allocation.  This trips things like:
+    
+      (define_insn_and_split "..."
+        [...pattern...]
+        "...cond..."
+        "#"
+        "&& 1"
+        [...pattern...]
+        {
+          ...unconditional use of gen_reg_rtx ()...;
+        }
+    
+    because matching and splitting after RA will call gen_reg_rtx when
+    pseudos are no longer allowed.  rs6000 has several instances of this.
+    
+    xtensa has a variation in which the split condition is:
+    
+        "&& can_create_pseudo_p ()"
+    
+    The failure then is that, if we match after RA, we'll never be
+    able to split the instruction.
+    
+    The patch therefore disables the pass by default on i386, rs6000
+    and xtensa.  Hopefully we can fix those ports later (if their
+    maintainers want).  It seems better to add the pass first, though,
+    to make it easier to test any such fixes.
+    
+    gcc.target/aarch64/bitfield-bitint-abi-align{16,8}.c would need
+    quite a few updates for the late-combine output.  That might be
+    worth doing, but it seems too complex to do as part of this patch.
+    
+    I tried compiling at least one target per CPU directory and comparing
+    the assembly output for parts of the GCC testsuite.  This is just a way
+    of getting a flavour of how the pass performs; it obviously isn't a
+    meaningful benchmark.  All targets seemed to improve on average:
+    
+    Target                 Tests   Good    Bad   %Good   Delta  Median
+    ======                 =====   ====    ===   =====   =====  ======
+    aarch64-linux-gnu       2215   1975    240  89.16%   -4159      -1
+    aarch64_be-linux-gnu    1569   1483     86  94.52%  -10117      -1
+    alpha-linux-gnu         1454   1370     84  94.22%   -9502      -1
+    amdgcn-amdhsa           5122   4671    451  91.19%  -35737      -1
+    arc-elf                 2166   1932    234  89.20%  -37742      -1
+    arm-linux-gnueabi       1953   1661    292  85.05%  -12415      -1
+    arm-linux-gnueabihf     1834   1549    285  84.46%  -11137      -1
+    avr-elf                 4789   4330    459  90.42% -441276      -4
+    bfin-elf                2795   2394    401  85.65%  -19252      -1
+    bpf-elf                 3122   2928    194  93.79%   -8785      -1
+    c6x-elf                 2227   1929    298  86.62%  -17339      -1
+    cris-elf                3464   3270    194  94.40%  -23263      -2
+    csky-elf                2915   2591    324  88.89%  -22146      -1
+    epiphany-elf            2399   2304     95  96.04%  -28698      -2
+    fr30-elf                7712   7299    413  94.64%  -99830      -2
+    frv-linux-gnu           3332   2877    455  86.34%  -25108      -1
+    ft32-elf                2775   2667    108  96.11%  -25029      -1
+    h8300-elf               3176   2862    314  90.11%  -29305      -2
+    hppa64-hp-hpux11.23     4287   4247     40  99.07%  -45963      -2
+    ia64-linux-gnu          2343   1946    397  83.06%   -9907      -2
+    iq2000-elf              9684   9637     47  99.51% -126557      -2
+    lm32-elf                2681   2608     73  97.28%  -59884      -3
+    loongarch64-linux-gnu   1303   1218     85  93.48%  -13375      -2
+    m32r-elf                1626   1517    109  93.30%   -9323      -2
+    m68k-linux-gnu          3022   2620    402  86.70%  -21531      -1
+    mcore-elf               2315   2085    230  90.06%  -24160      -1
+    microblaze-elf          2782   2585    197  92.92%  -16530      -1
+    mipsel-linux-gnu        1958   1827    131  93.31%  -15462      -1
+    mipsisa64-linux-gnu     1655   1488    167  89.91%  -16592      -2
+    mmix                    4914   4814    100  97.96%  -63021      -1
+    mn10300-elf             3639   3320    319  91.23%  -34752      -2
+    moxie-rtems             3497   3252    245  92.99%  -87305      -3
+    msp430-elf              4353   3876    477  89.04%  -23780      -1
+    nds32le-elf             3042   2780    262  91.39%  -27320      -1
+    nios2-linux-gnu         1683   1355    328  80.51%   -8065      -1
+    nvptx-none              2114   1781    333  84.25%  -12589      -2
+    or1k-elf                3045   2699    346  88.64%  -14328      -2
+    pdp11                   4515   4146    369  91.83%  -26047      -2
+    pru-elf                 1585   1245    340  78.55%   -5225      -1
+    riscv32-elf             2122   2000    122  94.25% -101162      -2
+    riscv64-elf             1841   1726    115  93.75%  -49997      -2
+    rl78-elf                2823   2530    293  89.62%  -40742      -4
+    rx-elf                  2614   2480    134  94.87%  -18863      -1
+    s390-linux-gnu          1591   1393    198  87.55%  -16696      -1
+    s390x-linux-gnu         2015   1879    136  93.25%  -21134      -1
+    sh-linux-gnu            1870   1507    363  80.59%   -9491      -1
+    sparc-linux-gnu         1123   1075     48  95.73%  -14503      -1
+    sparc-wrs-vxworks       1121   1073     48  95.72%  -14578      -1
+    sparc64-linux-gnu       1096   1021     75  93.16%  -15003      -1
+    v850-elf                1897   1728    169  91.09%  -11078      -1
+    vax-netbsdelf           3035   2995     40  98.68%  -27642      -1
+    visium-elf              1392   1106    286  79.45%   -7984      -2
+    xstormy16-elf           2577   2071    506  80.36%  -13061      -1
+    
+    gcc/PR rtl-optimization/106594PR rtl-optimization/114515PR rtl-optimization/114575PR rtl-optimization/114996PR rtl-optimization/115104* Makefile.in (OBJS): Add late-combine.o.
+            * common.opt (flate-combine-instructions): New option.
+            * doc/invoke.texi: Document it.
+            * opts.cc (default_options_table): Enable it by default at -O2
+            and above.
+            * tree-pass.h (make_pass_late_combine): Declare.
+            * late-combine.cc: New file.
+            * passes.def: Add two instances of late_combine.
+            * doc/passes.texi: Document the new passes.
+            * config/i386/i386-options.cc (ix86_override_options_after_change):
+            Disable late-combine by default.
+            * config/rs6000/rs6000.cc (rs6000_option_override_internal): Likewise.
+            * config/xtensa/xtensa.cc (xtensa_option_override): Likewise.
+    
+    gcc/testsuite/PR rtl-optimization/106594* gcc.dg/ira-shrinkwrap-prep-1.c: Restrict XFAIL to non-aarch64
+            targets.
+            * gcc.dg/ira-shrinkwrap-prep-2.c: Likewise.
+            * gcc.dg/stack-check-4.c: Add -fno-shrink-wrap.
+            * gcc.target/aarch64/bitfield-bitint-abi-align16.c: Add
+            -fno-late-combine-instructions.
+            * gcc.target/aarch64/bitfield-bitint-abi-align8.c: Likewise.
+            * gcc.target/aarch64/sve/cond_asrd_3.c: Remove XFAILs.
+            * gcc.target/aarch64/sve/cond_convert_3.c: Likewise.
+            * gcc.target/aarch64/sve/cond_fabd_5.c: Likewise.
+            * gcc.target/aarch64/sve/cond_convert_6.c: Expect the MOVPRFX /Zs
+            described in the comment.
+            * gcc.target/aarch64/sve/cond_unary_4.c: Likewise.
+            * gcc.target/aarch64/pr106594_1.c: New test.
+
+- User: Richard Sandiford | Time: 2024-06-24 08:17:09 UTC
+  Text: Fixed.
+

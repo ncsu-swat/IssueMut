@@ -1,0 +1,148 @@
+Bug Summary: [14 Regression] wrong code with -march=z13 -O0 since r14-5831
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jakub Jelinek | Time: 2024-04-05 13:23:24 UTC
+  Text: Sincer14-5831-gaae723d360ca26cd9fd0b039fb0a616bd0eae363we miscompile the following testcase on s390x-linux with -O0 -march=z13:
+typedef struct { const float *a; int b, c; float *d; } S;
+
+__attribute__((noipa)) void
+bar (void)
+{
+}
+
+__attribute__((noinline, optimize (2))) static void
+foo (S *e)
+{
+  const float *f;
+  float *g;
+  float h[4] = { 0.0, 0.0, 1.0, 1.0 };
+  if (!e->b)
+    f = h;
+  else
+    f = e->a;
+  g = &e->d[0];
+  __builtin_memcpy (g, f, sizeof (float) * 4);
+  bar ();
+  if (!e->b)
+    if (g[0] != 0.0 || g[1] != 0.0 || g[2] != 1.0 || g[3] != 1.0)
+      __builtin_abort ();
+}
+
+int
+main ()
+{
+  float d[4];
+  S e = { .d = d };
+  foo (&e);
+  return 0;
+}
+
+The optimized dump difference from the previous commit is
+@@ -23,7 +23,6 @@ Removing basic block 17
+ __attribute__((optimize (2), noinline))
+ void foo (struct S * e)
+ {
+-  float h[4];
+   float * g;
+   const float * f;
+   int _1;
+@@ -32,10 +31,10 @@ void foo (struct S * e)
+   float _4;
+   float _5;
+   float _6;
+-  uint128_t _13;
++  uint128_t pretmp_18;
++  uint128_t prephitmp_19;
+ 
+   <bb 2> [local count: 1073741824]:
+-  h = *.LC0;
+   _1 = e_10(D)->b;
+   if (_1 == 0)
+     goto <bb 4>; [50.00%]
+@@ -44,12 +43,12 @@ void foo (struct S * e)
+ 
+   <bb 3> [local count: 536870912]:
+   f_11 = e_10(D)->a;
++  pretmp_18 = MEM <uint128_t> [(char * {ref-all})f_11];
+ 
+   <bb 4> [local count: 1073741824]:
+-  # f_7 = PHI <&h(2), f_11(3)>
++  # prephitmp_19 = PHI <4575657222473777152(2), pretmp_18(3)>
+   g_12 = e_10(D)->d;
+-  _13 = MEM <uint128_t> [(char * {ref-all})f_7];
+-  MEM <uint128_t> [(char * {ref-all})g_12] = _13;
++  MEM <uint128_t> [(char * {ref-all})g_12] = prephitmp_19;
+   bar ();
+   _2 = e_10(D)->b;
+   if (_2 == 0)
+@@ -89,7 +88,6 @@ void foo (struct S * e)
+   __builtin_abort ();
+ 
+   <bb 10> [local count: 1073741824]:
+-  h ={v} {CLOBBER(eol)};
+   return;
+ 
+ }
+4575657222473777152 is 0x3f8000003f800000 so on big endian that looks reasonable.
+
+- User: Jakub Jelinek | Time: 2024-04-05 13:46:20 UTC
+  Text: This is a clear bug in s390_const_int_pool_entry_p.  It just uses get_pool_constant but ignores get_pool_mode, which on big-endian is significant.  The function doesn't allow offsets like e.g. simplify-rtx.cc (avoid_constant_pool_reference), but still needs to deal with mode mismatches.
+
+- User: Jakub Jelinek | Time: 2024-04-05 14:29:52 UTC
+  Text: Createdattachment 57889[details]gcc14-pr114605.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-04-08 14:22:52 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d5d84487dec06186fd9246b505f44ef68a66d6a2commitr14-9834-gd5d84487dec06186fd9246b505f44ef68a66d6a2Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Apr 8 16:22:13 2024 +0200
+
+    s390: Fix s390_const_int_pool_entry_p and movdi peephole2 [PR114605]
+    
+    The following testcase is miscompiled, because we have initially
+    a movti which loads the 0x3f8000003f800000ULL TImode constant
+    from constant pool.  Later on we split it into a pair of DImode
+    loads.  Now, for the first load (why just that?, though not stage4
+    material) we trigger the peephole2 which uses s390_const_int_pool_entry_p.
+    That function doesn't check at all the constant pool mode though, sees
+    the constant pool at that address has a CONST_INT value and just assumes
+    that is the value to return, which is especially wrong for big-endian,
+    if it is a DImode load from offset 0, it should be loading 0 rather than
+    0x3f8000003f800000ULL.
+    The following patch adds checks if we are extracing a MODE_INT mode,
+    if the constant pool has MODE_INT mode as well, punts if constant pool
+    has smaller mode size than the extraction one (then it would be UB),
+    if it has the same mode as before keeps using what it did before,
+    if constant pool has a larger mode than the one being extracted, uses
+    simplify_subreg.  I'd have used avoid_constant_pool_reference
+    instead which can handle also offsets into the constant pool constants,
+    but it can't handle UNSPEC_LTREF.
+    
+    Another thing is that once that is fixed, we ICE when we extract constant
+    like 0, ior insn predicate require non-0 constant.  So, the patch also
+    fixes the peephole2 so that if either 32-bit half is zero, it uses a mere
+    load of the constant into register rather than a pair of such load and ior.
+    
+    2024-04-08  Jakub Jelinek  <jakub@redhat.com>PR target/114605* config/s390/s390.cc (s390_const_int_pool_entry_p): Punt
+            if mem doesn't have MODE_INT mode, or pool constant doesn't
+            have MODE_INT mode, or if pool constant mode is smaller than
+            mem mode.  If mem mode is different from pool constant mode,
+            try to simplify subreg.  If that doesn't work, punt, if it
+            does, use the simplified constant instead of the constant pool
+            constant.
+            * config/s390/s390.md (movdi from const pool peephole): If
+            either low or high 32-bit part is zero, just emit move insn
+            instead of move + ior.
+    
+            * gcc.dg/pr114605.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-04-08 14:23:45 UTC
+  Text: Fixed.
+

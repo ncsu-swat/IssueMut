@@ -1,0 +1,231 @@
+Bug Summary: gimple_fold_builtin_fputs doesn't preserve gimple_builtin_call_types_compatible_p
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: internal-improvement
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Malcolm | Time: 2023-03-01 21:56:52 UTC
+  Text: Whilst working onPR analyzer/107565, I noticed that in this function:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+typedef struct FILE   FILE;
+
+FILE* fopen (const char*, const char*);
+int fprintf (FILE *, const char *, ...);
+
+#define NULL ((void *)0)
+
+void
+test_2 (void)
+{
+  int i;
+
+  for (i = 0; i < 2; ++i) {
+    FILE *fp = fopen ("/tmp/test", "w");
+    fprintf (fp, "hello");
+  }
+} // should report a leak here
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+the fprintf (fp, "hello"); is optimized to:
+
+  __builtin_fwrite ("hello", 1, 5, fp);
+
+but this call has:
+
+(gdb) p gimple_builtin_call_types_compatible_p (repl, gimple_call_fndecl (repl))
+$23 = false
+
+
+Specifically, the fprintf is optimized to:
+  __builtin_fputs ("hello", fp);
+
+Within gimple_fold_builtin_fprintf this has:
+
+(gdb) call debug(stmt)
+__builtin_fputs ("hello", fp);
+
+(gdb) p gimple_builtin_call_types_compatible_p (stmt, gimple_call_fndecl (stmt))
+$19 = true
+
+which is optimized to:
+
+(gdb) call debug(repl)
+__builtin_fwrite ("hello", 1, 5, fp);
+
+(gdb) p gimple_builtin_call_types_compatible_p (repl, gimple_call_fndecl (repl))
+$23 = false
+
+Note how the resulting call has "false" for gimple_builtin_call_types_compatible_p; this is due to argument idx 2 (the 5):
+
+(gdb) p i
+$13 = 2
+(gdb) p arg
+$14 = <integer_cst 0x7fffea7f9ba0>
+(gdb) call debug_tree(arg)
+ <integer_cst 0x7fffea7f9ba0 type <integer_type 0x7fffea663150 ssizetype> constant 5>
+
+
+
+In the analyzer I'm checking that gimple_builtin_call_types_compatible_p is true when handling a builtin that it "knows" how to handle, otherwise the analyzer falls back to assuming that the call could have arbitrary side-effects (e.g. fclose-ing the file, hence it stops reporting the leak).
+
+Is this a bug in gimple_fold_builtin_fprintf?
+
+- User: David Malcolm | Time: 2023-03-01 21:57:03 UTC
+  Text: Replacement stmt is created here:
+(gdb) bt
+#0  gimple_set_op (gs=<gimple_call 0x7fffea8183f0>, i=1, op=<addr_expr 0x7fffea7fa6a0>) at ../../src/gcc/gimple.h:2629
+#1  0x0000000001093a6f in gimple_build_call_1 (fn=<addr_expr 0x7fffea7fa6a0>, nargs=4) at ../../src/gcc/gimple.cc:234
+#2  0x0000000001093bfd in gimple_build_call (fn=<function_decl 0x7fffea771500 __builtin_fwrite>, nargs=4) at ../../src/gcc/gimple.cc:270
+#3  0x00000000010b1a0b in gimple_fold_builtin_fputs (gsi=0x7fffffffd740, arg0=<addr_expr 0x7fffea7fa4e0>, arg1=<var_decl 0x7fffea652d80 fp>, 
+    unlocked=false) at ../../src/gcc/gimple-fold.cc:2993
+#4  0x00000000010b884f in gimple_fold_builtin (gsi=0x7fffffffd740) at ../../src/gcc/gimple-fold.cc:5060
+#5  0x00000000010baf8a in gimple_fold_call (gsi=0x7fffffffd740, inplace=false) at ../../src/gcc/gimple-fold.cc:5575
+#6  0x00000000010be650 in fold_stmt_1 (gsi=0x7fffffffd740, inplace=false, valueize=0x10be840 <no_follow_ssa_edges(tree_node*)>)
+    at ../../src/gcc/gimple-fold.cc:6327
+#7  0x00000000010be8ca in fold_stmt (gsi=0x7fffffffd740) at ../../src/gcc/gimple-fold.cc:6410
+#8  0x00000000010aa554 in replace_call_with_call_and_fold (gsi=0x7fffffffd740, repl=<gimple_call 0x7fffea652f30>)
+    at ../../src/gcc/gimple-fold.cc:842
+#9  0x00000000010b3c93 in gimple_fold_builtin_fprintf (gsi=0x7fffffffd740, fp=<var_decl 0x7fffea652d80 fp>, fmt=<addr_expr 0x7fffea7fa4e0>, 
+    arg=<tree 0x0>, fcode=BUILT_IN_FPRINTF) at ../../src/gcc/gimple-fold.cc:3796
+#10 0x00000000010b8a66 in gimple_fold_builtin (gsi=0x7fffffffd740) at ../../src/gcc/gimple-fold.cc:5100
+#11 0x00000000010baf8a in gimple_fold_call (gsi=0x7fffffffd740, inplace=false) at ../../src/gcc/gimple-fold.cc:5575
+#12 0x00000000010be650 in fold_stmt_1 (gsi=0x7fffffffd740, inplace=false, valueize=0x10be840 <no_follow_ssa_edges(tree_node*)>)
+    at ../../src/gcc/gimple-fold.cc:6327
+#13 0x00000000010be8ca in fold_stmt (gsi=0x7fffffffd740) at ../../src/gcc/gimple-fold.cc:6410
+#14 0x0000000002c93123 in lower_stmt (gsi=0x7fffffffd740, data=0x7fffffffd950) at ../../src/gcc/gimple-low.cc:793
+#15 0x0000000002c910ee in lower_sequence (seq=0x7fffea65d1b8, data=0x7fffffffd950) at ../../src/gcc/gimple-low.cc:229
+#16 0x0000000002c935ff in lower_gimple_bind (gsi=0x7fffffffd860, data=0x7fffffffd950) at ../../src/gcc/gimple-low.cc:882
+#17 0x0000000002c92d28 in lower_stmt (gsi=0x7fffffffd860, data=0x7fffffffd950) at ../../src/gcc/gimple-low.cc:650
+#18 0x0000000002c910ee in lower_sequence (seq=0x7fffea65d178, data=0x7fffffffd950) at ../../src/gcc/gimple-low.cc:229
+#19 0x0000000002c935ff in lower_gimple_bind (gsi=0x7fffffffd930, data=0x7fffffffd950) at ../../src/gcc/gimple-low.cc:882
+#20 0x0000000002c90cf1 in lower_function_body () at ../../src/gcc/gimple-low.cc:119
+#21 0x0000000002c9104f in (anonymous namespace)::pass_lower_cf::execute (this=0x3f43e20) at ../../src/gcc/gimple-low.cc:206
+#22 0x000000000140ff5a in execute_one_pass (pass=<opt_pass* 0x3f43e20 "lower"(15)>) at ../../src/gcc/passes.cc:2644
+
+2993		gimple *repl = gimple_build_call (fn_fwrite, 4, arg0,
+2994						 size_one_node, len, arg1);
+2995		replace_call_with_call_and_fold (gsi, repl);
+
+- User: Andrew Pinski | Time: 2023-03-01 22:20:55 UTC
+  Text: /* Get the length of the string passed to fputs.  If the length
+     can't be determined, punt.  */
+  tree len = get_maxval_strlen (arg0, SRK_STRLEN);
+  if (!len
+      || TREE_CODE (len) != INTEGER_CST)
+    return false;
+
+And before we had a call to c_strlen.
+In both cases, they both always returned a size in ssizetype.
+As far as I can tell this has been broken since the merge of the tree-ssa branch into the trunk. I have not done a "git blame" on the tree-ssa branch to see which revision introduced this without a cast.
+
+Confirmed.
+
+
+
+        gimple *repl = gimple_build_call (fn_fwrite, 4, arg0,
+                                         size_one_node, len, arg1);
+        replace_call_with_call_and_fold (gsi, repl);
+
+Basically you need to add a fold_convert of len to size_type_node and do a temporary if needed.
+
+- User: GCC Commits | Time: 2023-03-01 22:26:14 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:24ebc5404b88b765221b551dc5288f6d64ba3dc7commitr13-6398-g24ebc5404b88b765221b551dc5288f6d64ba3dc7Author: David Malcolm <dmalcolm@redhat.com>
+Date:   Wed Mar 1 17:24:32 2023 -0500
+
+    analyzer: fixes to side-effects for built-in functions [PR107565]
+    
+    Previously, if the analyzer saw a call to a non-pure and non-const
+    built-in function that it didn't have explicit knowledge of the behavior
+    of, it would fall back to assuming that the builtin could have arbitrary
+    behavior, similar to a function defined outside of the current TU.
+    
+    However, this only worked for BUILTIN_NORMAL functions that matched
+    gimple_builtin_call_types_compatible_p; for BUILT_IN_FRONTEND and
+    BUILT_IN_MD, and for mismatched types the analyzer would erroneously
+    assume that the builtin had no side-effects, leading e.g. toPR analyzer/107565, where the analyzer falsely reported that x
+    was still uninitialized after this target-specific builtin:
+    
+      _1 = __builtin_ia32_rdrand64_step (&x);
+    
+    This patch generalizes the handling to cover all classes of builtin,
+    fixing the above false positive.
+    
+    Unfortunately this patch regresses gcc.dg/analyzer/pr99716-1.c due to
+    the:
+      fprintf (fp, "hello");
+    being optimized to:
+       __builtin_fwrite ("hello", 1, (ssizetype)5, fp_6);
+    and the latter has gimple_builtin_call_types_compatible_p return false,
+    whereas the original call had it return true.  I'm assuming that this is
+    an optimization bug, and have filed it asPR middle-end/108988.  The
+    effect on the analyzer is that it fails to recognize the call to
+    __builtin_fwrite and instead assumes arbitraty side-effects (including
+    that it could call fclose on fp, hence the report about the leak goes
+    away).
+    
+    I tried various more involved fixes with new heuristics for handling
+    built-ins that aren't explicitly covered by the analyzer, but those
+    fixes tended to introduce many more regressions, so I'm going with this
+    simpler fix.
+    
+    gcc/analyzer/ChangeLog:PR analyzer/107565* region-model.cc (region_model::on_call_pre): Flatten logic by
+            returning early.  Consolidate logic for detecting const and pure
+            functions.  When considering whether an unhandled built-in
+            function has side-effects, consider all kinds of builtin, rather
+            than just BUILT_IN_NORMAL, and don't require
+            gimple_builtin_call_types_compatible_p.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/107565* gcc.dg/analyzer/builtins-pr107565.c: New test.
+            * gcc.dg/analyzer/pr99716-1.c (test_2): Mark the leak as xfailing.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: Jakub Jelinek | Time: 2023-03-02 09:38:35 UTC
+  Text: Createdattachment 54569[details]gcc13-pr108988.patch
+
+Untested fix.  In this function len is already checked to be INTEGER_CST, so just fold_convert is sufficient.  Went through the whole gimple-fold.cc and
+all other values computed by c_strlen or get_maxval_strlen etc. are properly
+folded to size_type_node when needed.
+
+- User: GCC Commits | Time: 2023-03-03 10:20:33 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:dbeccab7a1f5dcc1876c854f17816047ba1ef137commitr13-6441-gdbeccab7a1f5dcc1876c854f17816047ba1ef137Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Mar 3 11:13:40 2023 +0100
+
+    gimple-fold: Fix up fputs -> fwrite folding [PR108988]
+    
+    gimple_fold_builtin_fputs when folding fputs into fwrite emits the third
+    argument (INTEGER_CST) with incorrect type - get_maxval_strlen or c_strlen
+    return ssizetype, while fwrite argument is size_type_node.
+    The following patch fixes that, I've skimmed through the rest of
+    gimple-fold.cc and in all other places get_maxval_strlen/c_strlen result
+    was fold_converted to size_type_node already (or GIMPLE cast stmt has been
+    emitted directly etc.).
+    
+    2023-03-03  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/108988* gimple-fold.cc (gimple_fold_builtin_fputs): Fold len to
+            size_type_node before passing it as argument to fwrite.  Formatting
+            fixes.
+
+- User: Jakub Jelinek | Time: 2023-03-03 10:23:12 UTC
+  Text: Fixed.
+
+- User: GCC Commits | Time: 2023-03-03 22:48:25 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:d3ef73867e3f70a343ad5aa4e00b270be85fa572commitr13-6465-gd3ef73867e3f70a343ad5aa4e00b270be85fa572Author: David Malcolm <dmalcolm@redhat.com>
+Date:   Fri Mar 3 17:48:04 2023 -0500
+
+    testsuite: remove XFAIL in gcc.dg/analyzer/pr99716-1.c [PR108988]
+    
+    Jakub'sr13-6441-gdbeccab7a1f5dcfix forPR tree-optimization/108988has fixed this failing analyzer test.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/108988* gcc.dg/analyzer/pr99716-1.c (test_2): Remove xfail.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2023-03-03 23:16:13 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #6)> Fixed.Thanks!
+

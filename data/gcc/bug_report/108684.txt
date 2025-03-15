@@ -1,0 +1,272 @@
+Bug Summary: [12 Regression] ICE: verify_ssa failed
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code, inline-asm, patch, wrong-code
+Known to Work: 13.0
+Known to Fail: 12.1.0
+
+Comments:
+- User: G. Steinmetz | Time: 2023-02-06 18:49:49 UTC
+  Text: Started between 20221030 and 20221106 :
+(gcc configured with --enable-checking=yes)
+
+
+$ cat z1.cc
+int f (int a)
+{
+  asm (" " : "=r" (a) : : "eax", "memory");
+  if (a)
+    return 0;
+}
+
+
+$ gcc-13-20230205 -c z1.cc -O2
+z1.cc: In function 'int f(int)':
+z1.cc:6:1: warning: control reaches end of non-void function [-Wreturn-type]
+    6 | }
+      | ^
+z1.cc:1:5: error: virtual use of statement not up to date
+    1 | int f (int a)
+      |     ^
+# VUSE <_2>
+return 0;
+during GIMPLE pass: vrp
+z1.cc:1:5: internal compiler error: verify_ssa failed
+0x14e901b verify_ssa(bool, bool)
+        ../../gcc/tree-ssa.cc:1211
+0x1134857 execute_function_todo
+        ../../gcc/passes.cc:2098
+0x11351a2 execute_todo
+        ../../gcc/passes.cc:2145
+
+- User: Andrew Pinski | Time: 2023-02-06 20:23:35 UTC
+  Text: Confirmed, a slightly better testcase which causes the ICE with the C front-end also (the C++ front-end inserts the __builtin_unreachable there) and should be able to compile on all targets:
+
+int f (int a)
+{
+  asm (" " : "=X" (a) : : "memory");
+  if (a)
+    return 0;
+  __builtin_unreachable();
+}
+
+- User: Andrew Pinski | Time: 2023-02-06 20:26:55 UTC
+  Text: Most likely caused byr13-3595-g7b1cdca6d6d594a8a9d.
+
+- User: Andrew Macleod | Time: 2023-02-07 18:30:24 UTC
+  Text: OK, its been a while.   Why is there a VUSE on the return?  this is the IL right from into-ssa:
+
+int f (int a)
+{
+  int _4;
+
+  <bb 2> :
+  # .MEM_2 = VDEF <.MEM_1(D)>
+  __asm__(" " : "=X" a_3 :  : "memory");
+  if (a_3 != 0)
+    goto <bb 3>; [INV]
+  else
+    goto <bb 4>; [INV]
+
+  <bb 3> :
+  _4 = 0;
+  // predicted unlikely by early return (on trees) predictor.
+  # VUSE <.MEM_2>
+  return _4;
+
+  <bb 4> :
+  __builtin_unreachable ();
+
+}
+
+The problem is that in VRP, we change a_3's global range to be ~[0,0], rewrite the condition to remove the block with the builtin_unreachable... which there leaves the IL something like:
+
+ <bb 2> [local count: 1073741824]:
+  # .MEM_2 = VDEF <.MEM_1(D)>
+  __asm__(" " : "=X" a_3 :  : "memory");
+
+  <bb 3> [local count: 1073741824]:
+  # VUSE <.MEM_2>
+  return 0;
+
+and since there are no more uses of a_3, the asm is considered dead and removed by simple_dce_from_worklist.
+
+BUt it does not adjust the vdefs at all.. so we when its deleted, we are still eft with:
+  <bb 3> [local count: 1073741824]:
+  # VUSE <.MEM_2>
+  return 0;
+
+but now there is no longer a definition of MEM_2  and verify_ssa fails.
+
+I can fix it by not trying to dce any defs that have VDEFS on them... but that doesnt seem  like the correct long term solution... Why is there a VUSE on that return anyway?  to keep it from being hoisted above the asm?
+
+Whats the correct thing to do here?   Im surprised that somewhere in the stmt deletion process, it doesnt rewrite all uses of MEM_2 to MEM_1 before deliting it.   Or is that a manual step?
+
+- User: Andrew Pinski | Time: 2023-02-07 18:33:28 UTC
+  Text: Hmm, simple_dce_from_worklist. It might be the case you could hit this issue without VRP then ...
+Let me try.
+
+- User: Andrew Pinski | Time: 2023-02-07 18:37:31 UTC
+  Text: New testcase which shows this is indepdent of VRP, fails in GCC 12.x also:
+```
+static int t;
+
+int f (int a)
+{
+  int t1;
+  asm (" " : "=r" (t1) : : "eax", "memory");
+  t = t1;
+  if (a)
+    return 0;
+  __builtin_unreachable();
+}
+```
+
+- User: Andrew Macleod | Time: 2023-02-07 18:39:03 UTC
+  Text: diff --git a/gcc/tree-ssa-dce.cc b/gcc/tree-ssa-dce.cc
+index b2fe9f4f55e..752785541e4 100644
+--- a/gcc/tree-ssa-dce.cc
++++ b/gcc/tree-ssa-dce.cc
+@@ -2140,6 +2140,7 @@ simple_dce_from_worklist (bitmap worklist)
+        remove_phi_node (&gsi, true);
+       else
+        {
++         unlink_stmt_vdef (t);
+          gsi_remove (&gsi, true);
+          release_defs (t);
+        }
+
+
+Fixes the issue...  huh     how long has THAT been there
+
+- User: Andrew Pinski | Time: 2023-02-07 18:45:47 UTC
+  Text: (In reply to Andrew Macleod fromcomment #6)> Fixes the issue...  huh     how long has THAT been thereSincer8-5124-g23ffbafe3a39when simple_dce_from_worklist was added. Though simple_dce_from_worklist only started to much more usage in GCC 12 (starting withr12-4598-g113860301f46d14a255bd).
+
+- User: Andrew Pinski | Time: 2023-02-07 19:56:32 UTC
+  Text: I think simple_dce_from_worklist is incorrect of removing this inline-asm in the first place.
+Take:
+```
+static int t;
+
+int f (int *a)
+{
+  int t1;
+  asm (" " : "=r" (t1) : : "memory");
+  t = t1;
+  return *a;
+}
+```
+The inline-asm could have written to *a but now it has been removed.
+
+Let me look into fixing that.
+Note my patch (r12-4598-g113860301f46d14a255bd) exposed this even before VRP exposed this so I feel like I should fix this.
+
+- User: Jakub Jelinek | Time: 2023-02-07 19:59:19 UTC
+  Text: (In reply to Andrew Pinski fromcomment #8)> I think simple_dce_from_worklist is incorrect of removing this inline-asm in
+> the first place.
+> Take:
+> ```
+> static int t;
+> 
+> int f (int *a)
+> {
+>   int t1;
+>   asm (" " : "=r" (t1) : : "memory");
+>   t = t1;
+>   return *a;
+> }
+> ```
+> The inline-asm could have written to *a but now it has been removed.I think that is how inline asm always behaved.  If it is not ok to be DCEd when the result is dead, one needs to use volatile keyword.
+
+- User: Andrew Pinski | Time: 2023-02-07 20:03:51 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #9)> I think that is how inline asm always behaved.  If it is not ok to be DCEd
+> when the result is dead, one needs to use volatile keyword.Oh you are right I always forgot that (yes I double checked the manual this time around), anyways I am going to test (the other) Andrew's patch and will submit it.
+
+- User: Andrew Pinski | Time: 2023-02-08 19:14:40 UTC
+  Text: Patch submitted:https://gcc.gnu.org/pipermail/gcc-patches/2023-February/611584.html
+
+- User: Andrew Pinski | Time: 2023-02-09 15:23:33 UTC
+  Text: Here is a testcase which shows the wrong code which was mentioned during the review:
+```
+static int t;
+
+int f (int *a)
+{
+  int t1, t2 = 0;
+  asm ("shouldshowupstill %1" : "=r" (t1), "=m"(t2) : : );
+  t = t1;
+  return t2;
+}
+```
+
+- User: GCC Commits | Time: 2023-02-10 01:47:48 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:6a5cb782d1486b378d70857c8efae558da0eb2cccommitr13-5768-g6a5cb782d1486b378d70857c8efae558da0eb2ccAuthor: Andrew Pinski <apinski@marvell.com>
+Date:   Tue Feb 7 23:09:40 2023 +0000
+
+    tree-optimization: [PR108684] ICE in verify_ssa due to simple_dce_from_worklist
+    
+    In simple_dce_from_worklist, we were removing an inline-asm which had a vdef.
+    We should not be removing inline-asm which have a vdef as this code
+    does not check to the store.
+    This fixes that oversight. This was a latent bug exposed recently
+    by both VRP and removal of stores to static starting to use
+    simple_dce_from_worklist.
+    
+    Committed as approved.
+    Bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/108684gcc/ChangeLog:
+    
+            * tree-ssa-dce.cc (simple_dce_from_worklist):
+            Check all ssa names and not just non-vdef ones
+            before accepting the inline-asm.
+            Call unlink_stmt_vdef on the statement before
+            removing it.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/compile/dce-inline-asm-1.c: New test.
+            * gcc.c-torture/compile/dce-inline-asm-2.c: New test.
+            * gcc.dg/tree-ssa/pr108684-1.c: New test.
+    
+    co-authored-by: Andrew Macleod  <amacleod@redhat.com>
+
+- User: Andrew Pinski | Time: 2023-02-10 01:48:46 UTC
+  Text: Fixed on the trunk so far.
+
+- User: GCC Commits | Time: 2023-03-10 21:55:17 UTC
+  Text: The releases/gcc-12 branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:657e1e89d34b114ca47fe1f2c5366927c5850af7commitr12-9239-g657e1e89d34b114ca47fe1f2c5366927c5850af7Author: Andrew Pinski <apinski@marvell.com>
+Date:   Tue Feb 7 23:09:40 2023 +0000
+
+    tree-optimization: [PR108684] ICE in verify_ssa due to simple_dce_from_worklist
+    
+    In simple_dce_from_worklist, we were removing an inline-asm which had a vdef.
+    We should not be removing inline-asm which have a vdef as this code
+    does not check to the store.
+    This fixes that oversight. This was a latent bug exposed recently
+    by both VRP and removal of stores to static starting to use
+    simple_dce_from_worklist.
+    
+    Backported after bootstrapped and tested on x86_64-linux-gnu with no regressions.PR tree-optimization/108684gcc/ChangeLog:
+    
+            * tree-ssa-dce.cc (simple_dce_from_worklist):
+            Check all ssa names and not just non-vdef ones
+            before accepting the inline-asm.
+            Call unlink_stmt_vdef on the statement before
+            removing it.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/compile/dce-inline-asm-1.c: New test.
+            * gcc.c-torture/compile/dce-inline-asm-2.c: New test.
+            * gcc.dg/tree-ssa/pr108684-1.c: New test.
+    
+    co-authored-by: Andrew Macleod  <amacleod@redhat.com>
+    (cherry picked from commit 6a5cb782d1486b378d70857c8efae558da0eb2cc)
+
+- User: Andrew Pinski | Time: 2023-03-10 21:55:40 UTC
+  Text: Fixed.
+
+- User: Andrew Pinski | Time: 2023-05-13 14:17:05 UTC
+  Text: ***Bug 109842has been marked as a duplicate of this bug. ***
+

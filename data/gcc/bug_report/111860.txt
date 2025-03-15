@@ -1,0 +1,279 @@
+Bug Summary: [14 Regression] incorrect vUSE after guard block loop skip block during vectorization.
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2023-10-18 08:36:56 UTC
+  Text: Createdattachment 56137[details]C source code
+
+foundBugs $ ../results/bin/gcc -c -w -O3bug967.c
+foundBugs $ ../results/bin/gcc -c -w -O3 -march=znver2bug967.c
+foundBugs $ ../results/bin/gcc -c -w -O3 -march=znver3bug967.c
+Create_POPMUSIC_CandidateSet.c: In function ‘optimize_path’:
+Create_POPMUSIC_CandidateSet.c:170:13: error: stmt with wrong VUSE
+# VUSE <.MEM_103>
+_1958 = *_1959;
+expected .MEM_1937
+
+This worked yesterday, so it is recent breakage.
+
+The bug seems to first appear sometime betweeng:ce55521bcd149fdcandg:60c231cb65807fb9I will have a go at a reduction.
+
+- User: David Binderman | Time: 2023-10-18 08:49:02 UTC
+  Text: Reduced code seems to be:
+
+int optimize_path_n, optimize_path_d;
+int *optimize_path_d_0;
+extern void path_threeOpt( long);
+void optimize_path() {
+  int i;
+  long length;
+  i = 0;
+  for (; i <= optimize_path_n; i++)
+    optimize_path_d = 0;
+  i = 0;
+  for (; i < optimize_path_n; i++)
+    length += optimize_path_d_0[i];
+  path_threeOpt(length);
+}
+
+- User: David Binderman | Time: 2023-10-18 09:29:26 UTC
+  Text: I tried a reduction and the current range isg:7370c479dd34024f..g:60c231cb65807fb9In this range, the Authors are 
+
+Author: Tamar Christina <tamar.christina@arm.com>
+Author: Tamar Christina <tamar.christina@arm.com>
+Author: Tamar Christina <tamar.christina@arm.com>
+Author: Tamar Christina <tamar.christina@arm.com>
+Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Author: Tobias Burnus <tobias@codesourcery.com>
+Author: Haochen Jiang <haochen.jiang@intel.com>
+Author: Haochen Jiang <haochen.jiang@intel.com>
+
+Adding Tamar for their opinion.
+
+- User: David Binderman | Time: 2023-10-18 09:48:26 UTC
+  Text: As expected:
+
+$ git bisect good 0c8522870effb87f9ea0f0f5897d5b0084c32b50
+60c231cb65807fb963624acc4f82d2935e305f93 is the first bad commit
+commit 60c231cb65807fb963624acc4f82d2935e305f93
+Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Wed Oct 18 09:03:06 2023 +0100
+
+    middle-end: maintain LCSSA throughout loop peeling
+
+- User: Tamar Christina | Time: 2023-10-18 09:51:29 UTC
+  Text: Hmm how odd, probably an incorrect edge.
+
+Thanks! taking a look.
+
+- User: Tamar Christina | Time: 2023-10-18 10:10:49 UTC
+  Text: Confirmed,
+
+looks like the rename failed on one edge, BB 15 has:
+
+;;   basic block 15, loop depth 0, count 94607391 (estimated locally, freq 0.8010), maybe hot
+;;    prev block 10, next block 18, flags: (NEW, VISITED)
+;;    pred:       7 [11.0% (guessed)]  count:94607391 (estimated locally, freq 0.8010) (FALSE_VALUE,EXECUTABLE)
+  # length_13 = PHI <length_17(7)>
+  # .MEM_8 = PHI <.MEM_30(7)>
+
+and BB 19 has:
+
+;;   basic block 19, loop depth 0, count 105119324 (estimated locally, freq 0.8900), maybe hot
+;;    prev block 17, next block 8, flags: (NEW, REACHABLE, VISITED)
+;;    pred:       16 [33.3% (guessed)]  count:81467477 (estimated locally, freq 0.6898) (FALSE_VALUE,EXECUTABLE)
+;;                15 [25.0% (guessed)]  count:23651848 (estimated locally, freq 0.2003) (TRUE_VALUE)
+  # length_47 = PHI <length_21(16), _61(15)>
+  # .MEM_48 = PHI <.MEM_30(16), .MEM_30(15)>
+
+It looks like after the loop guard is added after peeling that the use for the edge coming in from BB 15 wasn't updated.
+
+Most likely find_guard failed.  Working on it.
+
+Odd that it only fails on x86 though.
+
+- User: Tamar Christina | Time: 2023-10-18 12:51:44 UTC
+  Text: Ok, so the problem is that the loop never creates memory references, and so after redirecting the edges when we update the new references we do so by trying to update the PHI nodes.
+
+But since the loop has no MEM phi node there's nothing to update but we created a new artificial node during redirect.
+
+Because there's no PHI node that means that adjust_phi_and_debug_stmts isn't strong enough here.
+
+So I can either remove phi nodes whom's SSA vars haven't been defined inside the loop have not been defined in the body, or I'll need to replace adjust_phi_and_debug_stmts with something that goes through all uses inside the new loop and exit.
+
+Which do you prefer richi? It seems like removing the PHI node after redirect is the simplest one and one less thing to keep updated.
+
+- User: Tamar Christina | Time: 2023-10-18 18:31:09 UTC
+  Text: ***Bug 111868has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-10-18 19:56:45 UTC
+  Text: .
+
+- User: Andrew Pinski | Time: 2023-10-18 19:56:53 UTC
+  Text: ***Bug 111869has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2023-10-19 04:01:25 UTC
+  Text: Just an FYI, I do get a similar ICE on:
+libgomp/testsuite/libgomp.fortran/simd3.f90
+
+Testcase on aarch64-linux-gnu now too.
+
+Maybe since it was in the libgomp testsuite you missed it when you tested your patch.
+
+
+/home/ubuntu/src/upstream-gcc-aarch64/gcc/libgomp/testsuite/libgomp.fortran/simd3.f90:56:18: Error: stmt with wrong VUSE^M
+# VUSE <.MEM_68>^M
+_21 = D.3326[_50];^M
+expected .MEM_95^M
+/home/ubuntu/src/upstream-gcc-aarch64/gcc/libgomp/testsuite/libgomp.fortran/simd3.f90:56:18: Error: PHI node with wrong VUSE on edge from BB 32^M
+.MEM_131 = PHI <.MEM_68(32), .MEM_68(29)>^M
+expected .MEM_95^M
+/home/ubuntu/src/upstream-gcc-aarch64/gcc/libgomp/testsuite/libgomp.fortran/simd3.f90:56:18: Error: PHI node with wrong VUSE on edge from BB 29^M
+.MEM_131 = PHI <.MEM_68(32), .MEM_68(29)>^M
+expected .MEM_95^M
+during GIMPLE pass: vect^M
+/home/ubuntu/src/upstream-gcc-aarch64/gcc/libgomp/testsuite/libgomp.fortran/simd3.f90:56:18: internal compiler error: verify_ssa failed^M
+0x12312eb verify_ssa(bool, bool)^M
+
+- User: David Binderman | Time: 2023-10-19 08:05:36 UTC
+  Text: (In reply to Andrew Pinski fromcomment #10)> Maybe since it was in the libgomp testsuite you missed it when you tested
+> your patch.I usually find that compiling all the C,C++ and Fortran code
+in the gcc/testsuite directory and below with "-g -O3 -march=native -Wall"
+and searching for "internal compiler error" can be useful.
+
+testsuite $ find . -name \*.c -print | wc -l
+51192
+testsuite $ find . \( -name \*.C -o -name \*.cc -o -name \*.cpp -o -name \*.cxx \) | wc -l
+20083
+testsuite $ find . -type f -print | grep -E -i "\.f$|\.f[0-9][0-9]$" | wc -l
+8036
+testsuite $ 
+
+Bonus points for two different architectures (arm & x86_64 ?).
+
+- User: Tamar Christina | Time: 2023-10-19 08:08:24 UTC
+  Text: yes, patch was tested on both aarch64 and x86, but I did not test libgomp indeed.
+
+In any case, waiting for regression run to finish and will submit patch.
+
+- User: Tamar Christina | Time: 2023-10-19 12:31:39 UTC
+  Text: Patch postedhttps://gcc.gnu.org/pipermail/gcc-patches/2023-October/633569.html
+
+- User: GCC Commits | Time: 2023-10-19 12:48:53 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:217a0fcb852aeb4aa9e3fb9baec6ff947c8de3d4commitr14-4746-g217a0fcb852aeb4aa9e3fb9baec6ff947c8de3d4Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Thu Oct 19 13:44:01 2023 +0100
+
+    middle-end: don't create LC-SSA PHI variables for PHI nodes who dominate loop
+    
+    As the testcase shows, when a PHI node dominates the loop there is no new
+    definition inside the loop.  As such there would be no PHI nodes to update.
+    
+    When we maintain LCSSA form we create an intermediate node in between the two
+    loops to thread alongt the value.  However later on when we update the second
+    loop we don't have any PHI nodes to update and so adjust_phi_and_debug_stmts
+    does nothing.   This leaves us with an incorrect phi node.  Normally this does
+    nothing and just gets ignored.  But in the case of the vUSE chain we end up
+    corrupting the chain.
+    
+    As such whenever a PHI node's argument dominates the loop, we should remove
+    the newly created PHI node after edge redirection.
+    
+    The one exception to this is when the loop has been versioned.  In such cases
+    the versioned loop may not use the value but the second loop can.
+    
+    When this happens and we add the loop guard unless the join block has the PHI
+    it can't find the original value for use inside the guard block.
+    
+    The next refactoring in the series moves the formation of the guard block
+    inside peeling itself.  Here we have all the information and wouldn't
+    need to re-create it later.
+    
+    gcc/ChangeLog:PR tree-optimization/111860* tree-vect-loop-manip.cc (slpeel_tree_duplicate_loop_to_edge_cfg):
+            Remove PHI nodes that dominate loop.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/111860* gcc.dg/vect/pr111860.c: New test.
+
+- User: Tamar Christina | Time: 2023-10-19 12:54:09 UTC
+  Text: Fixed, thanks for the report
+
+- User: David Binderman | Time: 2023-10-19 15:49:26 UTC
+  Text: Createdattachment 56153[details]C source code
+
+- User: Tamar Christina | Time: 2023-10-19 15:51:23 UTC
+  Text: ***Bug 111877has been marked as a duplicate of this bug. ***
+
+- User: Tamar Christina | Time: 2023-10-19 15:52:41 UTC
+  Text: Fix is too conservative, when there's no use in either loop it fails ashttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=111877shows.
+
+- User: David Binderman | Time: 2023-10-19 16:03:02 UTC
+  Text: Createdattachment 56154[details]C source code
+
+You might like to have a go at getting the attached code working:
+
+$ ~/gcc/results/bin/gcc -c -w -O3bug967B.cbug967B.c: In function ‘__wcstod128_l_internal’:bug967B.c:10:1: error: stmt with wrong VUSE
+   10 | __wcstod128_l_internal() {
+      | ^~~~~~~~~~~~~~~~~~~~~~
+
+I have 20+ other cases. I can provide them, if you like.
+
+- User: Tamar Christina | Time: 2023-10-19 16:22:29 UTC
+  Text: (In reply to David Binderman fromcomment #19)> Createdattachment 56154[details]> C source code
+> 
+> You might like to have a go at getting the attached code working:
+> 
+> $ ~/gcc/results/bin/gcc -c -w -O3bug967B.c
+>bug967B.c: In function ‘__wcstod128_l_internal’:
+>bug967B.c:10:1: error: stmt with wrong VUSE
+>    10 | __wcstod128_l_internal() {
+>       | ^~~~~~~~~~~~~~~~~~~~~~
+> 
+> I have 20+ other cases. I can provide them, if you like.No need :) They're all the same bug.  The idea for the fix was correct, but the way I checked if the loop was versioned wasn't strong enough.
+
+All the reported testcases now pass. I'll start regressions.
+
+- User: Tamar Christina | Time: 2023-10-20 15:35:16 UTC
+  Text: patch submittedhttps://gcc.gnu.org/pipermail/gcc-patches/2023-October/633734.html
+
+- User: Andrew Pinski | Time: 2023-10-20 20:21:56 UTC
+  Text: ***Bug 111902has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2023-10-23 13:08:55 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:9ed6b22eb4188c57bb3f5cdba5a7effa95395186commitr14-4861-g9ed6b22eb4188c57bb3f5cdba5a7effa95395186Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Mon Oct 23 14:07:20 2023 +0100
+
+    middle-end: don't keep .MEM guard nodes for PHI nodes who dominate loop [PR111860]
+    
+    The previous patch tried to remove PHI nodes that dominated the first loop,
+    however the correct fix is to only remove .MEM nodes.
+    
+    This patch thus makes the condition a bit stricter and only tries to remove
+    MEM phi nodes.
+    
+    I couldn't figure out a way to easily determine if a particular PHI is vUSE
+    related, so the patch does:
+    
+    1. check if the definition is a vDEF and not defined in main loop.
+    2. check if the definition is a PHI and not defined in main loop.
+    3. check if the definition is a default definition.
+    
+    For no 2 and 3 we may misidentify the PHI, in both cases the value is defined
+    outside of the loop version block which also makes it ok to remove.
+    
+    gcc/ChangeLog:PR tree-optimization/111860* tree-vect-loop-manip.cc (slpeel_tree_duplicate_loop_to_edge_cfg):
+            Drop .MEM nodes only.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/111860* gcc.dg/vect/pr111860-2.c: New test.
+            * gcc.dg/vect/pr111860-3.c: New test.
+
+- User: Tamar Christina | Time: 2023-10-23 13:12:39 UTC
+  Text: ok, should be actually fixed now
+
+- User: Andrew Pinski | Time: 2023-10-24 15:45:49 UTC
+  Text: ***Bug 111951has been marked as a duplicate of this bug. ***
+

@@ -1,0 +1,67 @@
+Issue Title: -Wconstant-logical-operand regression with comparison operators in C2x mode with Clang 17
+Original Post: Basic programs involving constant comparisons produce `-Wconstant-logical-operand` with `-std=c2x` but not with `-std=c17`.
+This program shouldn't produced `-Wconstant-logical-operand` because my understanding is that's for using boolean operations with integer operands, but these should both be booleans.
+This is happening only in trunk and the clang 17 release, neither one produces the warning in clang 16.
+
+(This program is reduced from a program with a constant `sizeof` comparison that was failing.)
+```c
+int main(int argc, const char **argv) {
+    if ((1 == 1) && (argc == 1)) return 1;
+    return 0;
+}
+```
+
+Godbolt link demonstrating the regression: https://godbolt.org/z/e15rEc6r9
+
+
+Comment by llvmbot: @llvm/issue-subscribers-clang-frontend
+Comment by llvmbot: @llvm/issue-subscribers-c2x
+Comment by AaronBallman: This isn't a regression, it's an intentional improvement to the diagnostic made in https://reviews.llvm.org/D142609
+
+The reason why C23 and C17 modes are different is because of this: https://github.com/llvm/llvm-project/blob/9f72df7e30f074b46b18d3de267450236e4e37ea/clang/lib/Sema/SemaExpr.cpp#L13910
+
+In C23, `getLangOpts().Bool` is true and in C17 it's false. I think that might be a mistake in the logic, however, as C's logical operators return `int` and not `bool`, even in C23. Perhaps that part of the logic should be `((C++ and !bool) or C) and NotMacro(Op2)`?
+
+CC @xgupta 
+Comment by porglezomp: I was identifying this as a regression only because the purpose of `-Wconstant-logical-operand` is to identify when you're misusing a logical operand that's supposed to be bitwise logic, not just to flag things that are constant booleans in a logical expression.
+
+e.g. that improvement is about handling `5 && x` not `true && x`.
+Comment by AaronBallman: Hmm, I don't think I had picked up on that distinction. To me, this diagnostic is when you have logical operands with a constant on one side. Sometimes that's because the intent was to perform a bitwise operation (`5 && x` but meant `5 & x`) and sometimes that's because the intent was to perform a nonconstant operation (`x == x && !y` but meant `x == (x && !y)`). That said, I can see your reasoning why this could be a regression.
+
+CC @cjdb @jyknight @efriedma-quic @rjmccall for opinions on whether we should roll back the changes from https://reviews.llvm.org/D142609 because they're taking the diagnostic in an unintended direction.
+Comment by cjdb: Although a tautology, `true && expr` seems more likely to be intentional than `true & expr`.
+
+I support the roll back.
+Comment by nickdesaulniers: ok2revert
+Comment by davidbolvansky: > Although a tautology, `true && expr` seems more likely to be intentional than `true & expr`.
+> 
+> 
+> 
+> I support the roll back.
+
+Well "true || something something)" case is exactly the case where I would like to see some warning, because it may be the case that you are debugging something, you put "true ||" part as a hack and you forget about it and booom, bug.
+
+
+Comment by porglezomp: I would expect that to be a different warning. That wouldn't fire here since this diagnostic is specifically targeting integer constants involved in `a && b`—this is only firing in C2x because it got booleans as an actual language feature but the comparison operators still produce integers.
+
+Also for the warning you're asking for, `true ||` should produce a dead code warning in a way that `true &&` wouldn't.
+
+But regardless, this warning doesn't fire for actual `true && expr` with `-std=c2x` because `true` is a boolean not an integer, whereas `1 == 1` is the integer `1` and is not `true`.
+
+I think the proper slightly longer-term fix would to re-land this warning exactly the same but to treat the results of comparison operators as being booleans for the purpose of this diagnostic, even though they're actually integers.
+Comment by Fznamznon: Even though changes from https://reviews.llvm.org/D142609 were reverted, the problem still exists. D142609 only made check for both operands, not only the left one. So If I do
+```
+int main(int argc, const char **argv) {
+    if ((argc == 1) && (1 == 1)) return 1;
+    return 0;
+}
+```
+https://godbolt.org/z/88srzhEb5
+The same thing shows up, warning for C23, no warning for C17. This is likely due to `getLangOpts().Bool` returning bool for C23 in https://github.com/llvm/llvm-project/blob/dd70aef05a86bb0c1e04c49cc1bd0457ca362ce3/clang/lib/Sema/SemaExpr.cpp#L14076
+
+But since as @AaronBallman mentioned C's logical operators return int and not bool, even in C23, this check should be modified to avoid this false positive warning and the one reported in https://github.com/llvm/llvm-project/issues/80548 .
+Proposed https://github.com/llvm/llvm-project/pull/80724
+Comment by rjmccall: The behavior of this warning clearly should not differ in C17 and C23 just because the result of `==` is a boolean value encoded as `int` vs. `_Bool`.
+Comment by AaronBallman: > The behavior of this warning clearly should not differ in C17 and C23 just because the result of `==` is a boolean value encoded as `int` vs. `_Bool`.
+
+The changes in https://github.com/llvm/llvm-project/pull/80724 reflect that.

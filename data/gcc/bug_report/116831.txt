@@ -1,0 +1,121 @@
+Bug Summary: [15 Regression] ICE with trunc mod vectorising for SVE
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 14.2.0
+Known to Fail: 15.0
+
+Comments:
+- User: N/A | Time: 2024-09-24 15:10:01 UTC
+  Text: long a;
+int b, c;
+void d(int e[][5], short f[][5][5][5]) {
+  for (short g; g; g += 4)
+    a = c ?: e[6][0] % b ? 0 : f[0][0][0][g];
+}
+
+-O3 -march=armv9-a
+
+0x252429b internal_error(char const*, ...)
+        $SRC/gcc/diagnostic-global-context.cc:517
+0x80fbff fancy_abort(char const*, int, char const*)
+        $SRC/gcc/diagnostic.cc:1512
+0x7fdd1f poly_int<2u, unsigned long>::to_constant() const
+        $SRC/gcc/poly-int.h:592
+0x158c287 poly_int<2u, unsigned long>::to_constant() const
+        $SRC/gcc/poly-int.h:590
+0x158c287 nunits_for_known_piecewise_op
+        $SRC/gcc/tree-vect-generic.cc:96
+0x158c287 expand_vector_piecewise
+        $SRC/gcc/tree-vect-generic.cc:290
+0x158ee13 expand_vector_operation
+        $SRC/gcc/tree-vect-generic.cc:1257
+0x158fdf7 expand_vector_operations_1
+        $SRC/gcc/tree-vect-generic.cc:2366
+0x158fdf7 expand_vector_operations
+        $SRC/gcc/tree-vect-generic.cc:2400
+0x158fdf7 execute
+        $SRC/gcc/tree-vect-generic.cc:2454
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+I suppose it's related toPR101390but the vectoriser dump looks odd to me:
+...
+  vect_cst__214 = [vec_duplicate_expr] _213;
+  vect_cst__215 = [vec_duplicate_expr] b.2_3;
+  _223 = (sizetype) f_16(D);
+  _232 = niters.11_182 - POLY_INT_CST [4, 4];
+
+  <bb 4> [local count: 382252093]:
+  # g_22 = PHI <g_19(10), g_12(D)(24)>
+  # vect_vec_iv_.13_209 = PHI <_212(10), _207(24)>
+  # ivtmp_233 = PHI <ivtmp_234(10), 0(24)>
+  _210 = (vector([4,4]) unsigned short) vect_vec_iv_.13_209;
+  _211 = _210 + { POLY_INT_CST [16, 16], ... };
+  _212 = (vector([4,4]) short int) _211;
+  vect_patt_82.14_216 = vect_cst__214 / vect_cst__215;
+  vect_patt_83.15_218 = vect_cst__215 * vect_patt_82.14_216;
+  vect_patt_84.16_219 = vect_cst__214 - vect_patt_83.15_218; // SYNTHESISED VECTOR MOD
+  _4 = _213 % b.2_3; // ORIGINAL STMT to be DCE'ed
+  _235 = vect_cst__214 % vect_cst__215; // ?????
+...
+The ICEing statement is hte one marked ?????. I'm not sure why that's created but as it's a VLA vector statement it chokes on vector lowering as we don't support VLA lowering there
+
+- User: Richard Biener | Time: 2024-09-25 13:14:46 UTC
+  Text: It looks like something creates vector stmts not supported by the target (and thus then lowered by vector lowering).
+
+- User: Andrew Pinski | Time: 2024-09-26 06:37:48 UTC
+  Text: Applying pattern match.pd:5354, gimple-match-3.cc:2427
+Applying pattern match.pd:6669, gimple-match-3.cc:2452
+gimple_simplified to _203 = vect_cst__182 % vect_cst__183;
+
+Different pattern but similar issue:
+
+/* x / y * y == x -> x % y == 0.  */
+(simplify
+  (eq:c (mult:c (trunc_div:s @0 @1) @1) @0)
+  (if (TREE_CODE (TREE_TYPE (@0)) != COMPLEX_TYPE)
+    (eq (trunc_mod @0 @1) { build_zero_cst (TREE_TYPE (@0)); })))
+
+- User: Andrew Pinski | Time: 2024-09-26 06:39:07 UTC
+  Text: Full dump in the end:
+Applying pattern match.pd:5354, gimple-match-3.cc:2427
+Applying pattern match.pd:6669, gimple-match-3.cc:2452
+gimple_simplified to _203 = vect_cst__182 % vect_cst__183;
+mask__9.16_189 = _203 == { 0, ... };
+
+- User: Andrew Pinski | Time: 2024-09-26 06:44:06 UTC
+  Text: >  I'm not sure why that's createdThat reminds me the -folding option to the dump option is not documented (PR 114892) but if you use -all, you would have gotten the dump where it says was gimple_simplified to that and which match pattern was happening there.
+
+- User: Andrew Pinski | Time: 2024-09-26 06:49:28 UTC
+  Text: I should say similar toPR 116569but different match pattern which is causing the issue.
+
+- User: GCC Commits | Time: 2024-10-10 08:31:58 UTC
+  Text: The master branch has been updated by Jennifer Schmitz <jschmitz@gcc.gnu.org>:https://gcc.gnu.org/g:a2e06b7f081a3d2e50e3afa8d3f1676a05099707commitr15-4236-ga2e06b7f081a3d2e50e3afa8d3f1676a05099707Author: Jennifer Schmitz <jschmitz@nvidia.com>
+Date:   Thu Oct 3 04:46:51 2024 -0700
+
+    match.pd: Check trunc_mod vector obtap before folding.
+    
+    This patch guards the simplification x / y * y == x -> x % y == 0 in
+    match.pd by a check for:
+    1) Non-vector mode of x OR
+    2) Lack of support for vector division OR
+    3) Support of vector modulo
+    
+    The patch was bootstrapped and tested with no regression on
+    aarch64-linux-gnu and x86_64-linux-gnu.
+    OK for mainline?
+    
+    Signed-off-by: Jennifer Schmitz <jschmitz@nvidia.com>
+    
+    gcc/PR tree-optimization/116831* match.pd: Guard simplification to trunc_mod with check for
+            mod optab support.
+    
+    gcc/testsuite/PR tree-optimization/116831* gcc.dg/torture/pr116831.c: New test.
+
+- User: Jennifer Schmitz | Time: 2024-10-10 08:33:37 UTC
+  Text: fixed in GCC 15.1
+

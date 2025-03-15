@@ -1,0 +1,249 @@
+Bug Summary: [13 Regression] ICE in aarch64_function_arg_alignment when building erlang
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 13.1.1
+Known to Fail: 13.1.0
+
+Comments:
+- User: Jakub Jelinek | Time: 2023-04-28 08:18:07 UTC
+  Text: typedef unsigned long U __attribute__ ((aligned (sizeof (long))));
+typedef enum : U { V = 0 } W;
+
+U
+foo (U a, W b)
+{
+  return a + U (b);
+}
+
+ICEs on aarch64-linux with:
+rh2190219.C: In function ‘U foo(U, W)’:
+rh2190219.C:5:14: internal compiler error: in aarch64_function_arg_alignment, at config/aarch64/aarch64.cc:7500
+    5 | foo (U a, W b)
+      |              ^
+0x1e05aef aarch64_function_arg_alignment
+	../../gcc/config/aarch64/aarch64.cc:7500
+0x1e063dd aarch64_layout_arg
+	../../gcc/config/aarch64/aarch64.cc:7716
+0x1e06fda aarch64_function_arg_advance
+	../../gcc/config/aarch64/aarch64.cc:7963
+0x1dfbe52 aarch64_takes_arguments_in_sve_regs_p
+	../../gcc/config/aarch64/aarch64.cc:4023
+
+- User: Jakub Jelinek | Time: 2023-04-28 08:19:48 UTC
+  Text: Started withr13-7167-g66946624b96b7629
+
+- User: Jakub Jelinek | Time: 2023-04-28 08:28:15 UTC
+  Text: When it is changed to
+typedef unsigned long U __attribute__ ((aligned (256)));
+typedef enum : U { V = 0 } W;
+
+U
+foo (U a, W b)
+{
+  return a + U (b);
+}
+the ICE started earlier, mayber13-5123-g3df1a115be22caeab3?
+
+- User: Jakub Jelinek | Time: 2023-04-28 08:44:26 UTC
+  Text: Untested fix:
+
+2023-04-28  Jakub Jelinek  <jakub@redhat.com>PR target/109661* config/aarch64/aarch64.cc (aarch64_function_arg_alignment): For
+	ENUMERAL_TYPEs use alignment of TYPE_MAIN_VARIANT (TREE_TYPE (type))
+	rather than TYPE_MAIN_VARIANT (type).
+
+	* g++.dg/other/pr109661.C: New test.
+
+--- gcc/config/aarch64/aarch64.cc.jj	2023-04-24 14:54:45.558075512 +0200
++++ gcc/config/aarch64/aarch64.cc	2023-04-28 10:37:58.013311653 +0200
+@@ -7487,6 +7487,9 @@ aarch64_function_arg_alignment (machine_
+ 
+   if (!AGGREGATE_TYPE_P (type))
+     {
++      /* For enumeral types use the underlying type if possible.  */
++      if (TREE_CODE (type) == ENUMERAL_TYPE && TREE_TYPE (type))
++	type = TREE_TYPE (type);
+       /* The ABI alignment is the natural alignment of the type, without
+ 	 any attributes applied.  Normally this is the alignment of the
+ 	 TYPE_MAIN_VARIANT, but not always; seePR108910for a counterexample.
+--- gcc/testsuite/g++.dg/other/pr109661.C.jj	2023-04-28 10:41:21.169350306 +0200
++++ gcc/testsuite/g++.dg/other/pr109661.C	2023-04-28 10:40:46.246859362 +0200
+@@ -0,0 +1,12 @@
++//PR target/109661+// { dg-do compile { target c++11 } }
++// { dg-options "-w" } */
++
++typedef unsigned long U __attribute__ ((aligned (128)));
++typedef enum : U { V = 0 } W;
++
++U
++foo (U a, W b)
++{
++  return a + U (b);
++}
+
+The question is if it is an ABI change from GCC 12 or not (GCC 13 ICEs on it, so ABI doesn't matter).
+
+- User: Richard Sandiford | Time: 2023-04-28 08:56:46 UTC
+  Text: Yeah, I'd come up with essentially the same fix locally.  Was just trying
+to see whether it is an ABI problem.  And I think it is.  For:
+
+typedef unsigned long U __attribute__ ((aligned (16)));
+typedef enum : U { V = 0 } W;
+
+U
+foo (int x0, int x1, int x2, int x3, int x4, int x5, int x6, int x7, U a, W b)
+{
+  return a + b;
+}
+
+GCC aligns the b stack argument to 16 bytes:
+
+        ldr     x1, [sp]
+        ldr     x0, [sp, 16]
+        add     x0, x1, x0
+        ret
+
+whereas clang doesn't:
+
+        ldp     x8, x9, [sp]
+        add     x0, x9, x8
+        ret
+
+The clang behaviour is correct, so we'll need to fix it on the GCC side.
+
+(Neither compiler aligns for register arguments.)
+
+- User: Jakub Jelinek | Time: 2023-05-02 11:29:02 UTC
+  Text: Is it worth to test my patch or are you working on something more complete (say -Wpsabi warnings for cases where the ABI changes between 12.x, ICE in 13.1, fixed with different ABI for 13.2/14+?
+
+- User: Richard Sandiford | Time: 2023-05-02 11:50:37 UTC
+  Text: I'm working on a patch (though not literally right now).
+
+- User: GCC Commits | Time: 2023-05-03 16:44:16 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:3a4a39b391e63e5be04cb06ee4cd5400bef63dfccommitr14-455-g3a4a39b391e63e5be04cb06ee4cd5400bef63dfcAuthor: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Wed May 3 17:43:48 2023 +0100
+
+    aarch64: Rename abi_break parameters [PR109661]
+    
+    aarch64_function_arg_alignment has two related abi_break
+    parameters: abi_break for a change in GCC 9, and abi_break_packed
+    for a related follow-on change in GCC 13.  In a sense, abi_break_packed
+    is a "subfix" of abi_break.PR109661now requires a third ABI break that is independent
+    of the other two.  Having abi_break for the GCC 9 break and
+    abi_break_<something> for the GCC 13 and GCC 14 breaks might
+    give the impression that they're all related, and that the GCC 14
+    fix (like the GCC 13 fix) is a "subfix" of the GCC 9 one.
+    It therefore seemed like a good idea to rename the existing
+    variables first.
+    
+    It would be difficult to choose names that describe briefly and
+    precisely what went wrong in each case.  The next best thing
+    seemed to be to name them after the relevant GCC version.
+    (Of course, this might break down in future if we need two
+    independent fixes in the same version.  Let's hope not.)
+    
+    I wondered about putting all the variables in a structure,
+    but one advantage of using independent variables is that it's
+    harder to forget to update a caller.  Maybe a fourth parameter
+    would be a tipping point.
+    
+    gcc/PR target/109661* config/aarch64/aarch64.cc (aarch64_function_arg_alignment): Rename
+            ABI break variables to abi_break_gcc_9 and abi_break_gcc_13.
+            (aarch64_layout_arg, aarch64_function_arg_boundary): Likewise.
+            (aarch64_gimplify_va_arg_expr): Likewise.
+
+- User: GCC Commits | Time: 2023-05-03 16:44:20 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:1c26adba4b95f9a79f3aa57637d34cff7982d832commitr14-456-g1c26adba4b95f9a79f3aa57637d34cff7982d832Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Wed May 3 17:43:48 2023 +0100
+
+    aarch64: Fix ABI handling of aligned enums [PR109661]
+    
+    aarch64_function_arg_alignment has traditionally taken the alignment
+    of a scalar type T from TYPE_ALIGN (TYPE_MAIN_VARIANT (T)).  This is
+    supposed to discard any user alignment and give the alignment of the
+    underlying fundamental type.PR109661shows that this did the wrong thing for enums with
+    a defined underlying type, because:
+    
+    (1) The enum itself could be aligned, using attributes.
+    (2) The enum would pick up any user alignment on the underlying type.
+    
+    We get the right behaviour if we look at the TYPE_MAIN_VARIANT
+    of the underlying type instead.
+    
+    As always, this affects register and stack arguments differently,
+    because:
+    
+    (a) The code that handles register arguments only considers the
+        alignment of types that occupy two registers, whereas the
+        stack alignment is applied regardless of size.
+    
+    (b) The code that handles register arguments tests the alignment
+        for equality with 16 bytes, so that (unexpected) greater alignments
+        are ignored.  The code that handles stack arguments instead caps the
+        alignment to 16 bytes.
+    
+    There is now (since GCC 13) an assert to trap the difference between
+    (a) and (b), which is how the new incompatiblity showed up.
+    
+    Clang alredy handled the testcases correctly, so this patch aligns
+    the GCC behaviour with the Clang behaviour.
+    
+    I'm planning to remove the asserts on the branches, since we don't
+    want to change the ABI there.
+    
+    gcc/PR target/109661* config/aarch64/aarch64.cc (aarch64_function_arg_alignment): Add
+            a new ABI break parameter for GCC 14.  Set it to the alignment
+            of enums that have an underlying type.  Take the true alignment
+            of such enums from the TYPE_ALIGN of the underlying type's
+            TYPE_MAIN_VARIANT.
+            (aarch64_function_arg_boundary): Update accordingly.
+            (aarch64_layout_arg, aarch64_gimplify_va_arg_expr): Likewise.
+            Warn about ABI differences.
+    
+    gcc/testsuite/
+            * g++.target/aarch64/pr109661-1.C: New test.
+            * g++.target/aarch64/pr109661-2.C: Likewise.
+            * g++.target/aarch64/pr109661-3.C: Likewise.
+            * g++.target/aarch64/pr109661-4.C: Likewise.
+            * gcc.target/aarch64/pr109661-1.c: Likewise.
+
+- User: Richard Sandiford | Time: 2023-05-03 16:49:41 UTC
+  Text: Fixed on trunk.  Will remove the assert on branches.
+
+- User: Sam James | Time: 2023-05-09 12:18:57 UTC
+  Text: Could you post the backport here (or chuck it on the 13 branch) so we could pull it in for gentoo? thanks
+
+- User: GCC Commits | Time: 2023-05-11 11:36:39 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:891cdd3b935e3ee9f1b2ecf7390801c534d39a90commitr13-7318-g891cdd3b935e3ee9f1b2ecf7390801c534d39a90Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Thu May 11 12:36:26 2023 +0100
+
+    aarch64: Remove alignment assertions [PR109661]
+    
+    The trunk patch for this PR corrected the ABI for enums that have
+    a defined underlying type.  We shouldn't change the ABI on the branches
+    though, so this patch just removes the assertions that highlighed
+    the problem.
+    
+    I think the same approach makes sense longer-term: keep the assertions
+    at maximum strength in trunk, and in any new branches that get cut.
+    Then, if the assertions trip an ABI problem, fix the problem in trunk
+    and remove the assertions from active branches.
+    
+    The tests are the same as for the trunk version, but with all Wpsabi
+    message and expected output checks removed.
+    
+    gcc/PR target/109661* config/aarch64/aarch64.cc (aarch64_function_arg_alignment): Remove
+            assertion.
+            (aarch64_layout_arg): Likewise.
+    
+    gcc/testsuite/PR target/109661* g++.target/aarch64/pr109661-1.C: New test.
+            * g++.target/aarch64/pr109661-2.C: Likewise.
+            * g++.target/aarch64/pr109661-3.C: Likewise.
+            * g++.target/aarch64/pr109661-4.C: Likewise.
+            * gcc.target/aarch64/pr109661-1.c: Likewise.
+
+- User: Richard Biener | Time: 2023-07-19 11:24:16 UTC
+  Text: So "fixed" on the branch, right?
+

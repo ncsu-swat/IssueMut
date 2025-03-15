@@ -1,0 +1,164 @@
+Bug Summary: [12 Regression] AArch64 vectorizer ICE in vect_transform_reduction and __builtin_fmax
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 11.3.0
+Known to Fail: 12.1.0
+
+Comments:
+- User: Jakub Jelinek | Time: 2023-01-30 21:49:43 UTC
+  Text: int
+foo ()
+{
+  double m = 0;
+  for (int i = 0; i < 256; i++)
+    m = __builtin_fmax (i, m);
+  return m;
+}
+
+ICEs with -O3 on aarch64-linux, both in current GCC 12 branch and on the trunk.r12-3732doesn't ICE, don't have any newer aarch64 cross snapshots except latest 12 branch or trunk though. Also tried godbolt and 11.3 is ok, 12.1 already ICEs.
+
+- User: Jakub Jelinek | Time: 2023-01-30 21:50:27 UTC
+  Text: during GIMPLE pass: vect
+rh2164522.ii: In function ‘foo’:
+rh2164522.ii:2:1: internal compiler error: in vect_transform_reduction, at tree-vect-loop.cc:7758
+    2 | foo ()
+      | ^~~
+0x19243a1 vect_transform_reduction(_loop_vec_info*, _stmt_vec_info*, gimple_stmt_iterator*, gimple**, _slp_tree*)
+	../../gcc/tree-vect-loop.cc:7758
+0x2a0f09b vect_transform_stmt(vec_info*, _stmt_vec_info*, gimple_stmt_iterator*, _slp_tree*, _slp_instance*)
+	../../gcc/tree-vect-stmts.cc:11418
+0x192e5cf vect_transform_loop_stmt
+	../../gcc/tree-vect-loop.cc:10562
+0x192fd54 vect_transform_loop(_loop_vec_info*, gimple*)
+	../../gcc/tree-vect-loop.cc:11000
+0x1988ece vect_transform_loops
+	../../gcc/tree-vectorizer.cc:1007
+0x1989639 try_vectorize_loop_1
+	../../gcc/tree-vectorizer.cc:1153
+0x1989772 try_vectorize_loop
+	../../gcc/tree-vectorizer.cc:1183
+0x1989a05 execute
+	../../gcc/tree-vectorizer.cc:1299
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: Jakub Jelinek | Time: 2023-01-30 21:55:22 UTC
+  Text: The ICE is on:
+7755	  gimple_match_op op;
+7756	  if (!gimple_extract_op (stmt_info->stmt, &op))
+7757	    gcc_unreachable ();
+7758	  gcc_assert (op.code.is_tree_code ());
+7759	  auto code = tree_code (op.code);
+where op.code.rep is -232, i.e. -CFN_BUILT_IN_FMAX, so it isn't a tree code.
+
+- User: Andrew Pinski | Time: 2023-01-30 21:59:29 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #2)> The ICE is on:
+> 7755	  gimple_match_op op;
+> 7756	  if (!gimple_extract_op (stmt_info->stmt, &op))
+> 7757	    gcc_unreachable ();
+> 7758	  gcc_assert (op.code.is_tree_code ());
+> 7759	  auto code = tree_code (op.code);
+> where op.code.rep is -232, i.e. -CFN_BUILT_IN_FMAX, so it isn't a tree code.That assert was added withr12-5601-g30213ae9a2eb53.
+
+- User: Andrew Pinski | Time: 2023-01-30 22:03:21 UTC
+  Text: (In reply to Andrew Pinski fromcomment #3)> (In reply to Jakub Jelinek fromcomment #2)
+> > The ICE is on:
+> > 7755	  gimple_match_op op;
+> > 7756	  if (!gimple_extract_op (stmt_info->stmt, &op))
+> > 7757	    gcc_unreachable ();
+> > 7758	  gcc_assert (op.code.is_tree_code ());
+> > 7759	  auto code = tree_code (op.code);
+> > where op.code.rep is -232, i.e. -CFN_BUILT_IN_FMAX, so it isn't a tree code.
+> 
+> That assert was added withr12-5601-g30213ae9a2eb53.But fmax/fmin support was added withr12-5602-ge32b9eb32d7cd2.
+
+- User: Jakub Jelinek | Time: 2023-01-30 22:09:57 UTC
+  Text: The original code in kokkos had roughly:
+  Real max_rel_err = -1;
+  const Real rel_tol = std::numeric_limits<Real>::epsilon();
+
+
+  for (int n = 0; n < N; n++) {
+    for (int k = 0; k < N; k++) {
+      for (int j = 0; j < N; j++) {
+        for (int i = 1; i < N - 1; i++) {
+          const Real analytic = 2.0 * (i + 1) * pow((j + 2) * (k + 3) * (n + 4), 2.0);
+          const Real err = host_du(n, k, j, i - 1) - analytic;
+
+          max_rel_err = fmax(fabs(err / analytic), max_rel_err);
+        }
+      }
+    }
+  }
+
+  return max_rel_err < rel_tol;
+where Real is double, and host_du is some hard to decipher C++ object.
+
+- User: Jakub Jelinek | Time: 2023-01-30 22:14:17 UTC
+  Text: #define N 64
+extern double host_du[N][N][N][N];
+
+int
+foo (void)
+{
+  double max_rel_err = -1;
+  const double rel_tol = __DBL_EPSILON__;
+  for (int n = 0; n < N; n++)
+    for (int k = 0; k < N; k++)
+      for (int j = 0; j < N; j++)
+        for (int i = 1; i < N - 1; i++) {
+          const double analytic = 2.0 * (i + 1) * __builtin_pow((j + 2) * (k + 3) * (n + 4), 2.0);
+          const double err = host_du[n][k][j][i - 1] - analytic;
+          max_rel_err = __builtin_fmax(__builtin_fabs(err / analytic), max_rel_err);
+        }
+  return max_rel_err < rel_tol;
+}
+
+ICEs too at -O3.
+
+- User: Richard Sandiford | Time: 2023-01-30 22:51:39 UTC
+  Text: Testing a patch.
+
+- User: GCC Commits | Time: 2023-01-31 15:03:54 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:2bb444787ed17a9e786f544cdf51ee2ac6779ab2commitr13-5580-g2bb444787ed17a9e786f544cdf51ee2ac6779ab2Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Tue Jan 31 15:03:43 2023 +0000
+
+    vect: Fix single def-use cycle for ifn reductions [PR108608]
+    
+    The patch that added support for fmin/fmax reductions didn't
+    handle single def-use cycles.  In some ways, this seems like
+    going out of our way to make things slower, but that's a
+    discussion for another day.
+    
+    gcc/PR tree-optimization/108608* tree-vect-loop.cc (vect_transform_reduction): Handle single
+            def-use cycles that involve function calls rather than tree codes.
+    
+    gcc/testsuite/PR tree-optimization/108608* gcc.dg/vect/pr108608.c: New test.
+            * gcc.target/aarch64/sve/pr108608-1.c: Likewise.
+
+- User: GCC Commits | Time: 2023-04-03 08:58:00 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:65216cd44b8c89640ad987b6227ea1d748456a41commitr12-9381-g65216cd44b8c89640ad987b6227ea1d748456a41Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Mon Apr 3 09:57:07 2023 +0100
+
+    vect: Fix single def-use cycle for ifn reductions [PR108608]
+    
+    The patch that added support for fmin/fmax reductions didn't
+    handle single def-use cycles.  In some ways, this seems like
+    going out of our way to make things slower, but that's a
+    discussion for another day.
+    
+    gcc/PR tree-optimization/108608* tree-vect-loop.cc (vect_transform_reduction): Handle single
+            def-use cycles that involve function calls rather than tree codes.
+    
+    gcc/testsuite/PR tree-optimization/108608* gcc.dg/vect/pr108608.c: New test.
+            * gcc.target/aarch64/sve/pr108608-1.c: Likewise.
+    
+    (cherry picked from commit 2bb444787ed17a9e786f544cdf51ee2ac6779ab2)
+
+- User: Richard Sandiford | Time: 2023-04-03 09:03:24 UTC
+  Text: FIxed.
+

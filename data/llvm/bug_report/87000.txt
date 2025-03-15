@@ -1,0 +1,264 @@
+Issue Title: [llvm-cov][MC/DC] "Branch not found in Decisions" when handling complicated macros
+Original Post: Example file `perfmon.c` (It currently looks tedious and should be able to be further minimized, I'll work on that)
+
+```c
+// A example simplified from https://elixir.bootlin.com/linux/v6.8.1/source/drivers/iommu/intel/perfmon.c
+// Reproducible with clang version 18.1.3 (git@github.com:llvm/llvm-project.git
+// 2498e3a07f3df2272fec885f53f09ae13214ca38) and Ubuntu clang version 18.1.3
+// (++20240322073153+ef6d1ec07c69-1~exp1~20240322193300.86).
+//
+// Note that assertions *might* have to be enabled, therefore prebuilt packages
+// from apt.llvm.org etc *might* not behave the same. E.g. as of Mar 28,
+// llvm-cov-18 from apt.llvm.org ends up with "Segmentation fault", llvm-cov-19
+// doesn't fail at least explicitly. On the other hand, if we build LLVM from
+// source and enable assertion, we can observe explicit "UNREACHABLE executed"
+// messages.
+//
+// Steps:
+//
+//   $ rm -rf a.out *.profraw *.profdata
+//   $ clang -Wno-c23-extensions -fprofile-instr-generate -fcoverage-mapping -fcoverage-mcdc perfmon.c
+//   $ ./a.out
+//   $ llvm-profdata merge default.profraw -o default.profdata
+//   $ llvm-cov show --show-mcdc -instr-profile default.profdata a.out
+//
+
+// Dummy definitions to make this file compile.
+// (Some of them are also kernel code but incomplete or modified)
+
+struct attr {
+	long config1;
+	long config2;
+};
+
+struct hw_perf_event {
+	long idx;
+	long config;
+};
+
+struct perf_event {
+	struct hw_perf_event hw;
+	struct attr attr;
+};
+
+struct iommu_pmu {
+	long filter;
+	long cfg_reg;
+	struct perf_event *event_list[100];
+	long num_cntr;
+	long used_mask;
+};
+
+long test_and_set_bit(long, long) { return 0; }
+long iommu_pmu_validate_per_cntr_event(struct iommu_pmu *, long, struct perf_event *) { return 1; }
+void clear_bit(long, long) {}
+void writeq(long, long) {}
+void writel(long, long) {}
+long iommu_config_base(struct iommu_pmu *, long) { return 0; }
+long variable_ffs(long) { return 1; }
+
+#define UL(X) X##UL
+
+// Actually copied from kernel source
+
+#define BIT(nr)			(UL(1) << (nr))
+
+#define ffs(x) (__builtin_constant_p(x) ? __builtin_ffs(x) : variable_ffs(x))
+
+#define dmar_readq(a) readq(a)
+#define dmar_writeq(a,v) writeq(v,a)
+#define dmar_readl(a) readl(a)
+#define dmar_writel(a, v) writel(v, a)
+
+#define iommu_pmu_en_requester_id(e)		((e) & 0x1)
+#define iommu_pmu_en_domain(e)			(((e) >> 1) & 0x1)
+#define iommu_pmu_en_pasid(e)			(((e) >> 2) & 0x1)
+#define iommu_pmu_en_ats(e)			(((e) >> 3) & 0x1)
+#define iommu_pmu_en_page_table(e)		(((e) >> 4) & 0x1)
+#define iommu_pmu_get_requester_id(filter)	(((filter) >> 16) & 0xffff)
+#define iommu_pmu_get_domain(filter)		(((filter) >> 32) & 0xffff)
+#define iommu_pmu_get_pasid(filter)		((filter) & 0x3fffff)
+#define iommu_pmu_get_ats(filter)		(((filter) >> 24) & 0x1f)
+#define iommu_pmu_get_page_table(filter)	(((filter) >> 32) & 0x1f)
+
+#define IOMMU_PMU_NUM_OFF_REGS			4
+#define IOMMU_PMU_OFF_REGS_STEP			4
+
+#define IOMMU_PMU_FILTER_REQUESTER_ID		0x01
+#define IOMMU_PMU_FILTER_DOMAIN			0x02
+#define IOMMU_PMU_FILTER_PASID			0x04
+#define IOMMU_PMU_FILTER_ATS			0x08
+#define IOMMU_PMU_FILTER_PAGE_TABLE		0x10
+
+#define IOMMU_PMU_FILTER_EN			BIT(31)
+
+#define IOMMU_PMU_CFG_OFFSET			0x100
+#define IOMMU_PMU_CFG_CNTRCAP_OFFSET		0x80
+#define IOMMU_PMU_CFG_CNTREVCAP_OFFSET		0x84
+#define IOMMU_PMU_CFG_SIZE			0x8
+#define IOMMU_PMU_CFG_FILTERS_OFFSET		0x4
+
+#define IOMMU_PMU_CAP_REGS_STEP			8
+
+#define iommu_pmu_set_filter(_name, _config, _filter, _idx, _econfig)		\
+{										\
+	if ((iommu_pmu->filter & _filter) && iommu_pmu_en_##_name(_econfig)) {	\
+		dmar_writel(iommu_pmu->cfg_reg + _idx * IOMMU_PMU_CFG_OFFSET +	\
+			    IOMMU_PMU_CFG_SIZE +				\
+			    (ffs(_filter) - 1) * IOMMU_PMU_CFG_FILTERS_OFFSET,	\
+			    iommu_pmu_get_##_name(_config) | IOMMU_PMU_FILTER_EN);\
+	}									\
+}
+
+// Part of https://elixir.bootlin.com/linux/v6.8.1/source/drivers/iommu/intel/perfmon.c#L408
+
+static int iommu_pmu_assign_event(struct iommu_pmu *iommu_pmu,
+				  struct perf_event *event)
+{
+	int idx;
+
+	iommu_pmu_set_filter(requester_id, event->attr.config1,
+			     IOMMU_PMU_FILTER_REQUESTER_ID, idx,
+			     event->attr.config1);
+	// iommu_pmu_set_filter(domain, event->attr.config1,
+	// 		     IOMMU_PMU_FILTER_DOMAIN, idx,
+	// 		     event->attr.config1);
+
+	return 0;
+}
+
+// Dummy main
+
+int main(void) {
+	struct iommu_pmu iommu_pmu;
+	struct perf_event event;
+	iommu_pmu_assign_event(&iommu_pmu, &event);
+	return 0;
+}
+```
+
+Steps to reproduce:
+
+```shell
+rm -rf a.out *.profraw *.profdata
+clang -Wno-c23-extensions -fprofile-instr-generate -fcoverage-mapping -fcoverage-mcdc perfmon.c
+./a.out
+llvm-profdata merge default.profraw -o default.profdata
+# Crash
+llvm-cov show --show-mcdc -instr-profile default.profdata a.out
+```
+
+Message:
+
+```text
+Branch not found in Decisions
+UNREACHABLE executed at /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/lib/ProfileData/Coverage/CoverageMapping.cpp:784!
+PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace.
+Stack dump:
+0.	Program arguments: llvm-cov "llvm-cov show" --show-mcdc -instr-profile default.profdata a.out
+ #0 0x000055cfdb4bf61f llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/lib/Support/Unix/Signals.inc:727:3
+ #1 0x000055cfdb4bd30f llvm::sys::RunSignalHandlers() /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/lib/Support/Signals.cpp:105:20
+ #2 0x000055cfdb4bd666 SignalHandler(int) /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/lib/Support/Unix/Signals.inc:413:1
+ #3 0x00007f0aefc5e520 (/lib/x86_64-linux-gnu/libc.so.6+0x42520)
+ #4 0x00007f0aefcb29fc __pthread_kill_implementation ./nptl/pthread_kill.c:44:76
+ #5 0x00007f0aefcb29fc __pthread_kill_internal ./nptl/pthread_kill.c:78:10
+ #6 0x00007f0aefcb29fc pthread_kill ./nptl/pthread_kill.c:89:10
+ #7 0x00007f0aefc5e476 gsignal ./signal/../sysdeps/posix/raise.c:27:6
+ #8 0x00007f0aefc447f3 abort ./stdlib/abort.c:81:7
+ #9 0x000055cfdb46736e (/users/wtj/have-been/llvm-project/build/bin/llvm-cov+0x45436e)
+#10 0x000055cfdb55527f (anonymous namespace)::MCDCDecisionRecorder::processBranch(llvm::coverage::CounterMappingRegion const&) /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/lib/ProfileData/Coverage/CoverageMapping.cpp:784:5
+#11 0x000055cfdb55b030 llvm::coverage::CoverageMapping::loadFunctionRecord(llvm::coverage::CoverageMappingRecord const&, llvm::IndexedInstrProfReader&) /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/lib/ProfileData/Coverage/CoverageMapping.cpp:879:5
+#12 0x000055cfdb55c260 llvm::Error::setChecked(bool) /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/include/llvm/Support/Error.h:307:22
+#13 0x000055cfdb55c260 llvm::Error::operator bool() /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/include/llvm/Support/Error.h:239:15
+#14 0x000055cfdb55c260 llvm::coverage::CoverageMapping::loadFromReaders(llvm::ArrayRef<std::unique_ptr<llvm::coverage::CoverageMappingReader, std::default_delete<llvm::coverage::CoverageMappingReader>>>, llvm::IndexedInstrProfReader&, llvm::coverage::CoverageMapping&) /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/lib/ProfileData/Coverage/CoverageMapping.cpp:933:71
+#15 0x000055cfdb55c8b9 llvm::Error::setChecked(bool) /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/include/llvm/Support/Error.h:307:22
+#16 0x000055cfdb55c8b9 llvm::Error::operator bool() /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/include/llvm/Support/Error.h:239:15
+#17 0x000055cfdb55c8b9 llvm::coverage::CoverageMapping::loadFromFile(llvm::StringRef, llvm::StringRef, llvm::StringRef, llvm::IndexedInstrProfReader&, llvm::coverage::CoverageMapping&, bool&, llvm::SmallVectorImpl<llvm::SmallVector<unsigned char, 10u>>*) /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/lib/ProfileData/Coverage/CoverageMapping.cpp:992:66
+#18 0x000055cfdb55d35a llvm::Error::setChecked(bool) /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/include/llvm/Support/Error.h:307:22
+#19 0x000055cfdb55d35a llvm::Error::operator bool() /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/include/llvm/Support/Error.h:239:15
+#20 0x000055cfdb55d35a llvm::coverage::CoverageMapping::load(llvm::ArrayRef<llvm::StringRef>, llvm::StringRef, llvm::vfs::FileSystem&, llvm::ArrayRef<llvm::StringRef>, llvm::StringRef, llvm::object::BuildIDFetcher const*, bool) /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/lib/ProfileData/Coverage/CoverageMapping.cpp:1020:80
+#21 0x000055cfdb2ad4c2 llvm::Expected<std::unique_ptr<llvm::coverage::CoverageMapping, std::default_delete<llvm::coverage::CoverageMapping>>>::takeError() /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/include/llvm/Support/Error.h:603:15
+#22 0x000055cfdb2ad4c2 (anonymous namespace)::CodeCoverageTool::load() /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/tools/llvm-cov/CodeCoverage.cpp:486:41
+#23 0x000055cfdb2b118f (anonymous namespace)::CodeCoverageTool::doShow(int, char const**, llvm::function_ref<int (int, char const**)>) (.constprop.0) /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/tools/llvm-cov/CodeCoverage.cpp:1143:3
+#24 0x000055cfdb2b6d58 (anonymous namespace)::CodeCoverageTool::run((anonymous namespace)::CodeCoverageTool::Command, int, char const**) /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/tools/llvm-cov/CodeCoverage.cpp:980:18
+#25 0x000055cfdb2b764f showMain(int, char const**) /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/tools/llvm-cov/CodeCoverage.cpp:1348:1
+#26 0x000055cfdb29908d std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>::~basic_string() /usr/include/c++/11/bits/basic_string.h:672:19
+#27 0x000055cfdb29908d main /users/wtj/have-been/enhanced-gcov/llvm-mcdc/llvm/llvm/tools/llvm-cov/llvm-cov.cpp:82:5
+#28 0x00007f0aefc45d90 __libc_start_call_main ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16
+#29 0x00007f0aefc45e40 call_init ./csu/../csu/libc-start.c:128:20
+#30 0x00007f0aefc45e40 __libc_start_main ./csu/../csu/libc-start.c:379:5
+#31 0x000055cfdb298625 _start (/users/wtj/have-been/llvm-project/build/bin/llvm-cov+0x285625)
+Aborted
+```
+
+It somewhat looks like https://github.com/llvm/llvm-project/issues/77871 and perhaps has something to do with region ordering. 
+
+cc @chapuni @evodius96 
+
+
+
+Comment by whentojump: Also reproduced on compiler explorer: [link](https://godbolt.org/#z:OYLghAFBqd5QCxAYwPYBMCmBRdBLAF1QCcAaPECAMzwBtMA7AQwFtMQByARg9KtQYEAysib0QXACx8BBAKoBnTAAUAHpwAMvAFYTStJg1DIApACYAQuYukl9ZATwDKjdAGFUtAK4sGIM6SuADJ4DJgAcj4ARpjEEgDM8aQADqgKhE4MHt6%2B/ilpGQIhYZEsMXFcibaY9o4CQgRMxATZPn4BdpgOmQ1NBMUR0bEJSQqNza25HeP9oYNlw5XxAJS2qF7EyOwcAPQ7ANQAgvuYqqzJ9PvpLBd4NJjo%2B1TEqCz7CAQEyQogezV4qjwxAAdFFUKgCLRQsC0CwdlCGF5VDsAG4ANmBAA5gVwdgp1ptMDt0MQ8CjYgodk4WCwvFTBDUdslYlQWAIYSYNIc9vsAEqYZIvdBeZB4KKXADuhAQ%2B2QBiM%2B3JxHSAn2XGxXGB8X20EIAAFgNKvFEYa8QLRaCi4RarQBaQWobRdAjAw0ETncg5mSQATkxmHiTA0AHYqPF0FQzGZg2YqF1MZiAKxURPxKgaH1MTCVMxSUTxTHLfaGR5yKJeQReWXy4CKimZNUarUenkQazWMwab0aeJRkPxLip6yYKho9BcLoh5Bon22rgAP1OyQXne7vdzPsSGg0WLRy2BLZ2h/24QhmH2BAQTAIxYUSmamQU%2BwAVCw8MAPs/3kxyRfUPsYhOZhxQeUgLwQWIRxIc9BUwcs6BvZImGQABrJhgEwBRj2eV5i2SF0bRYYESFrTACGQF83w/AgvwYCEAMwK9f0vc8FFYTBgX2bBXU4pgn1QKh9gAWSafYzExUhj0I200BROdMSeF43iYfDgUI4jiFIhh0CfLxkn2KVL32cwzCETBgDYQRrwbKgmC8Wh3SjMDpNkucfWPdBUEwhgwA4G9bLoYsb3oPibyXKFRUhABPTiAHkGHA88IQg4hv20sC7gM894NoR4giCAA1ITFNeY98Q2LZi20oCmBA297zqBgwIlc9RAS1AonvX9wrwSLjKjORwl5bBDjcAAJQ4LCCbATlULovAIB4TOPNg73QzCDy5PZjwaAUfkPY99n2AASfZiDeW1iEEphiIWl9gQdZ4mAle7HvQa8mEOk7q0MWtbQAdTomSzHiW1TkWhgVUh/ZbSoR66EwW1QjGYhbQwsJiGvc9Ydk2J1ttFgVOSUI/qoXHMYwgnkHQCjmSutkGA5LaDiO07gR2G71ndZmju%2B6S3o%2B/Y2E088sFs%2ByXUezGXttf8xbshyHpeKh3saL7Tpc1AUSuBBUBl20FF1iUqZpmHkYIVH4cueWJaVgTVaYYtbu5z0PWPAARHwWCi/YxdCQpoaIIWmBQ89LzwJ8aEuWFifoTbPR1IRXiSwSWOU4hzzEfF9lD4gwloWUMGyu7Qhj%2BhFv2EghYwO48AeZY3a5FGRRva8LeM4MrC5TkfVoARazQBgaGALgTHiLvDh7vuFUH4ezDHieTGDd2F8bw5m4cd4JQAfTpqht8wclBA7xeM2n2s8HQVRV%2B7s/%2B8Lof3xvyfl%2Bfj0N8QlkD6Pm8l9Pn0P5b13l/Q%2BjAbwIAlG/DMgC26pVgW/V%2B4816AOpLSXetIT6N17vfKOi1iBQOwTPKgwBt4Z2AAQwBe9v5gJfKAwQ28oRjBMImCwXBtzMJXkg2%2BhDayIhYNvZAgh8FcMnnfBUXglDoG3oTBQKEEGcNPocc%2BF5MIEG3iWbeSg1FREIBAc%2Bzl%2B5Fj/mdMiGwEoaAXh3FeXJlGoK8Og%2BxKIxCXyxsA4gAihHUMEBAFBrw0HJAwc%2BAxRgwKUJAT/F8RjO4mIIGYtUlil7WMOCiVAl9qyYCaNvHRBA9H92CcAKJVhX5chSWkiUpJFoAEdckhP2OfQpiSPSlMeOUwgNQanAHyQ04pSj752IEQIYeWS%2BKYB8RbFu%2Bx%2BkBKrEEuphiT4xLiRY8eViPTKKcaSWq9Bt5UCoAoDphTFl53iSsxpt9J4gz9mEfYcgggQAABpFnueYeILzblrx5IcBwXgxC0B9mgYmDwSpvFzvnK4BIthrxeVc88FgACSAAVCADBiANwzD3HuEBbkQC4EY%2BIbgx5uB1Ci5YaLREXPDCOOYTw9kQFUEWCA28sleAQqEAZkNGj0OSHSvFAAxfYTKcqOAYDs2l9L9ggEVE0PAWzMCiv2fSslbtLlUuuegQm7iM5MHQNUpgRYtU6ogHq5VlKaBqo1dvVpVSjWkBREWK1mBqkolIMa7uKqzWiwtQa2gRr9UZPQD611FKYW%2BwtQ6wNYE7UGQqe051xYlVutNdSqZaDGCkMdV4VRsRt6XwgJgNF7kMxQHzf1NE%2BwNCqFxSakNKb7Fps8oTUIeaC0YqLcWvF2Ax4zVxaW8tlalXuuTX4%2Bx0yD4iqQukdAzbW2Fp9FAZtxl4idqXWJIxZgy0VqrYmmtw6HFjvUQQfZ%2BaZ2YvbYu5dM0Vi9s3QOpN1za37qQhhbejQQLTvRW2hdXau37EkGujd/bq2qvPA%2BjCaiM6VMzWMbNubcGxALfOuDqLz0/q4Hua9qhdm7NvTumkI60Fge3g2pgTakMts/WRlDK7ez/r7VhqgOHgOTN3aOwjE7YMIXgzOqAlHzAAbTPRxjHrmN4b3YR68%2ByyPcZ45x5D36V3elo5uhjQHhOgbIrvdaL7ZXUFkwhmTDl4NUcvWYJTlaVPnOhUxuFsUhJCTkNvZQ9nt7hDkEJbesVeW8u3sNAA4kIE9GZJCqepTZuzDmnMOc895vzQht5CARdgZQgWfTBcs4O65YXnORe3ryuFQREu8h89gAAinIbACXsBFbhdY2dFaNCj23dZ2z2XnN5YK1V7e7tbOHDheEFL9X55NeE1liLbX8uFcc4cIQNWBuqA0Gl4NzXwuOfGx1orhwEUBY/XV%2BbmIQuZZa2Nhz7XJvKEOL57A28EWTWmjOzdFj0t3vPKN1bJ2JudewP1nbPd4VIoHAmpbI2jtve3m4XlvmPNeaENgBFc22GPaB6FkHOXweQ7cOEBFvI3CHGUFD3lMO4c7YrZiRHVngcrdRxDsHmPhoFRx3j6LhP7uqExIt8nyPKfObR/FuFAAtTtP2Mwk4Oy9lH3Pqenaq3FpnsOWfs%2BG5z1rDmGfFf8/FxLyWhd%2BihRlkDLG0FaJ2bJxlzA2BgXZcPC3SGLeX1UBbrogz3zkfcomAl3dO4pa99rjFbusGZSgLW20XakO9uN4ZuT66%2BMif8amkVLyXnbzN6Mg%2Bs9ncNPRX77hPd1WZPDRAIPXbkDEPTbWawAq7cvn2K9qnkPZcIv6l3V37vRGzp7rzav4uVfU5mwLxv3vm9YJnR36gtLw94KLLaNURYvw14l5DqXvIZfQ9h5JTPLeUsd/U2ohPIMk/sUZWngpHciVz/e%2Bt7eX2G5IKz63s5befeP8Hx7pJx5lB9EroJD4Xwfh/ChICEEMECEBEU0a0UIJEVEDEDUPECFIkEkMkCkKkYdekRaWgJkFkBmDkEGIISQDQfbc5MYayCiUIG8B9PidIYAEVOhHJXxUTaZF8WtNfO/bXI6MJK6LxG8Z8agpVT3bhEgyZK%2BKBVvB9I3JDCACDKDPBHNdAMCag4PJdWBU0R%2BEeJgzfDvM/XLD7IrYaMrCrSbGrDKK%2BVQlgjvOQrtRQo/KtERHuHkEQjTMQ4jUIWQn%2BeQ7ACwp3FQrBHkYfdQrvTQi/brISXrcIQw%2B3Lwg4Hw3mMwhQz4EESw6/RRHuDOWJY5ZZReHpD2L2H2RtBgNefgnIiAZpDPVvWg2PKsWtChcZTeKhagk4H%2BAhMgu8d8Kgn%2BNsddRg0tbgghZIpZeRDgVYWgTgRMXgPwDgLQUgVATgAlSwcvcqQkfqAcXgAgTQfo1YFCEARMDQfQTgSQEYlYiYzgXgH4LY5YsY/o0gOAWAGARAFAV4WOWIcgSgGOBGOIOUX6dRO8WIRqBQF9YgCsFCPgWTH4CAKIfYnRZgYgKKTgHgUgcEpoKKWKKIJ0BwaE3gWESyAgeKP5fYrAcsYANwX5H4bgXgLAQmIwcQM40gfADObockIk8Y04eaRaVE8gBkQYykqEKITGSEjwLAFki2PAFgVE1YKgAwYABQAqOuCUWKZkUYmE/gQQEQMQdgKQGQQQRQFQdQSk3QLgfQX6FAdsSwfQMUH4SAVYVAfCR8TgWGK2RGc2VGdGPGCuHGLWPGSmQmZIYmBUF0pUfGFgamZAXgV04gUkLAU0iAVYToboZwPNbSSYPwXU4IOYUocoPQVIdIRqeMtMgoRqAYFMxYaoWoHoGYLM3UqMxqXoZoPMoYCoWwEszwNoPQQgqs5MmsiQSM2A9s7YjgYY0gUY8YyYjgfYVnNEW0NESQH6BUI1T4h8AQJ8cZBgFCBlXAQgKuF5XFJYlY0lUgdYzY7s3Y0gIUvc/soMw42wEAE4rci464iAJAIgTwR4o1TSIk3gJocU9/fOIQI2OUtEu4l48IdiTgEcscic4AZACiLgMwYEMwXgB4Vc0MvQBU4QUQcQVUpCjUtQfYnUw8gQZCVAFcogYgMaPiCwTARgQ4BaVAGUxgB4FkhmPCgikgain8nC5gNABofAFisYTis87i0ID8moL8vWFi%2B82gOFdAc0S0FgGSLWBcgE8pFSYU7s3sk8g4jgTWbWCAN4owWWBgP5IsYC8cyc2sachqR8C8P4xc5c/AQihY3U/YDwG4F4uy5YTcs47ciCbVYYCM/c3gI8rY1Swco4i80gU4rQbc3crY9k%2BIPYykoK0KrcgYzgGCvs/Y%2BKsK1Y21esZwSQIAA%3D%3D%3D)
+Comment by chapuni: It's a Clang's bug in synthesizing an identifier with `##` in macro, aka `<scratch space>`.
+Reproducible in clang-18.
+
+A tweaked testcase with avoiding `##` https://godbolt.org/z/qPTEh4c8n
+An expansion disappeared there.
+
+The reduced testcase: https://godbolt.org/z/sMscqWeq7
+
+```
+#if 0
+#define FOO(x) x
+#else
+#define FOO(x) foo_##x
+#endif
+
+int foo(int a, int b, int foo_b) {
+  return (a && FOO(b));
+}
+```
+
+The wrong case (#if 0):
+`Cond[2,0,0]` disappears.
+```
+foo:
+  File 0, 7:34 -> 9:2 = #0
+  File 0, 8:11 -> 8:12 = #0
+  Decision,File 0, 8:11 -> 8:19 = M:0, C:2
+  Branch,File 0, 8:11 -> 8:12 = #1, (#0 - #1) [1,2,0] 
+  Expansion,File 0, 8:16 -> 8:19 = 0 (Expanded file = 1)
+  File 1, 4:16 -> 4:20 = 0
+```
+
+Should be (#if 1)
+```
+foo:
+  File 0, 7:34 -> 9:2 = #0
+  File 0, 8:11 -> 8:12 = #0
+  Decision,File 0, 8:11 -> 8:19 = M:0, C:2
+  Branch,File 0, 8:11 -> 8:12 = #1, (#0 - #1) [1,2,0] 
+  Expansion,File 0, 8:16 -> 8:19 = #1 (Expanded file = 1)
+  File 1, 2:16 -> 2:17 = #1
+  Branch,File 1, 2:16 -> 2:17 = #2, (#1 - #2) [2,0,0] 
+```
+Comment by whentojump: Thanks for reducing the example! Great insight!
+Comment by whentojump: @chapuni Thanks again for your input! I'll prepare a patch for it.
+
+May I ask how did you get this reduced program? Do you use some automatic tools like [creduce](https://github.com/csmith-project/creduce)? Or you experienced with similar problems and had a hunch? Just curious :))
+
+Comment by chapuni: I've created #89573 as the fix.
+Comment by chapuni: @whentojump Sorry, I haven't noticed your reply while I was working.
+Please give your comments in #89573 , or push your changes if you knew better resolution.
+
+I have been aware of it for a while but I forgot to file since I was too lazy.
+I can find it since I am working for improving mcdc.
+Comment by whentojump: > Sorry, I haven't noticed your reply while I was working.
+
+No problem at all! And thanks as always for your contributions to the tool :))
+
+> I've created #89573 as the fix.
+
+This is awesome! I will test it and comment there
+Comment by chapuni: A patch for releae/18.x is available.
+https://github.com/llvm/llvm-project/compare/release/18.x...chapuni:llvm-project:release/18.x
+fb5f215e1c5e0af587c627be51fecd583d2097a5

@@ -1,0 +1,158 @@
+Bug Summary: [14 Regression] Wrong code at -O3 on x86_64-linux-gnu
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Shaohua Li | Time: 2023-05-22 19:39:44 UTC
+  Text: For the following code, gcc trunk at -O3 emits wrong code.
+
+Compiler explorer:https://godbolt.org/z/3E8xf69rP$ cat a.c
+int printf(const char *, ...);
+short a;
+long b = 3, c;
+int d(int e) {
+  switch (e)
+  case 111:
+  case 222:
+  case 44:
+    return 0;
+  return e;
+}
+int main() {
+  for (; a >= 0; --a)
+    if (d(c + 23) - 23)
+      b = 0;
+  printf("%d\n", (int)b);
+}
+$
+$ gcc-tk -O0 a.c && ./a.out
+3
+$ gcc-tk -O3 a.c && ./a.out
+0
+$
+$ gcc-tk -v
+Using built-in specs.
+COLLECT_GCC=gcc-tk
+COLLECT_LTO_WRAPPER=/zdata/shaoli/compilers/ccbuilder-compilers/gcc-c09471fbc7588db2480f036aa56a2403d3c03ae5/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../configure --disable-multilib --disable-bootstrap --enable-languages=c,c++ --prefix=/zdata/shaoli/compilers/ccbuilder-compilers/gcc-c09471fbc7588db2480f036aa56a2403d3c03ae5
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20230521 (experimental) (GCC)
+$
+
+- User: Jakub Jelinek | Time: 2023-05-22 20:19:03 UTC
+  Text: Started withr14-862-g76e11280e79c5dd5089c17d5726cae9a5a21bc2e
+
+- User: Aldy Hernandez | Time: 2023-05-23 10:41:15 UTC
+  Text: Woah...this is a latent bug in irange::invert that seems to have been here for a very long time.
+
+In the loop unswitching code we do:
+
+    false_range = true_range;
+    if (!false_range.varying_p ()
+	&& !false_range.undefined_p ())
+      false_range.invert ();
+
+...and get the false_range all wrong:
+
+(gdb) p debug(false_range)
+[irange] unsigned int [44, 44][111, 111][222, 222] NONZERO 0xff
+$40 = void
+(gdb) n
+(gdb) n
+(gdb) n
+(gdb) n
+(gdb) p debug(false_range)
+[irange] unsigned int [44, +INF]
+
+In no universe is the inverse of the false_range equal to [44, +INF].  Whoops.
+
+This craziness happens here:
+
+  if (m_num_ranges == m_max_ranges
+      && lower_bound () != type_min
+      && upper_bound () != type_max)
+    {
+      m_base[1] = type_max;
+      m_num_ranges = 1;
+      return;
+    }
+
+I have no idea what we were trying to do here, but it's clearly wrong.  This probably never triggered because the old legacy code didn't use this code, and the new code used int_range<255> (int_range_max) which made it extremely unlikely this would ever trigger.
+
+- User: Aldy Hernandez | Time: 2023-05-23 10:42:30 UTC
+  Text: Createdattachment 55140[details]untested patch in testing
+
+- User: GCC Commits | Time: 2023-05-23 12:56:48 UTC
+  Text: The master branch has been updated by Aldy Hernandez <aldyh@gcc.gnu.org>:https://gcc.gnu.org/g:8d5f050dabbf6dd3b992c3b46661848dbcf30d9ecommitr14-1133-g8d5f050dabbf6dd3b992c3b46661848dbcf30d9eAuthor: Aldy Hernandez <aldyh@redhat.com>
+Date:   Tue May 23 12:34:45 2023 +0200
+
+    Remove buggy special case in irange::invert [PR109934].
+    
+    This patch removes a buggy special case in irange::invert which seems
+    to have been broken for a while, and probably never triggered because
+    the legacy code was handled elsewhere, and the non-legacy code was
+    using an int_range_max of int_range<255> which made it extremely
+    likely for num_ranges == 255.  However, with auto-resizing ranges,
+    int_range_max will start off at 3 and can hit this bogus code in the
+    unswitching code.PR tree-optimization/109934gcc/ChangeLog:
+    
+            * value-range.cc (irange::invert): Remove buggy special case.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/pr109934.c: New test.
+
+- User: Aldy Hernandez | Time: 2023-05-23 12:59:13 UTC
+  Text: fixed.  Thanks for reporting.
+
+- User: GCC Commits | Time: 2024-10-14 17:54:35 UTC
+  Text: The releases/gcc-13 branch has been updated by Sam James <sjames@gcc.gnu.org>:https://gcc.gnu.org/g:a987affa2b10cd8a0b1d244d9f010746837e031ccommitr13-9114-ga987affa2b10cd8a0b1d244d9f010746837e031cAuthor: Aldy Hernandez <aldyh@redhat.com>
+Date:   Tue May 23 12:34:45 2023 +0200
+
+    Remove buggy special case in irange::invert [PR109934].
+    
+    This patch removes a buggy special case in irange::invert which seems
+    to have been broken for a while, and probably never triggered because
+    the legacy code was handled elsewhere, and the non-legacy code was
+    using an int_range_max of int_range<255> which made it extremely
+    likely for num_ranges == 255.  However, with auto-resizing ranges,
+    int_range_max will start off at 3 and can hit this bogus code in the
+    unswitching code.PR tree-optimization/109934gcc/ChangeLog:
+    
+            * value-range.cc (irange::invert): Remove buggy special case.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/pr109934.c: New test.
+    
+    (cherry picked from commit 8d5f050dabbf6dd3b992c3b46661848dbcf30d9e)
+
+- User: GCC Commits | Time: 2024-10-14 18:09:42 UTC
+  Text: The releases/gcc-12 branch has been updated by Sam James <sjames@gcc.gnu.org>:https://gcc.gnu.org/g:ea7d7818fdc7a49be3d35acd441ce122e8bb477ecommitr12-10766-gea7d7818fdc7a49be3d35acd441ce122e8bb477eAuthor: Aldy Hernandez <aldyh@redhat.com>
+Date:   Tue May 23 12:34:45 2023 +0200
+
+    Remove buggy special case in irange::invert [PR109934].
+    
+    This patch removes a buggy special case in irange::invert which seems
+    to have been broken for a while, and probably never triggered because
+    the legacy code was handled elsewhere, and the non-legacy code was
+    using an int_range_max of int_range<255> which made it extremely
+    likely for num_ranges == 255.  However, with auto-resizing ranges,
+    int_range_max will start off at 3 and can hit this bogus code in the
+    unswitching code.PR tree-optimization/109934gcc/ChangeLog:
+    
+            * value-range.cc (irange::invert): Remove buggy special case.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/pr109934.c: New test.
+    
+    (cherry picked from commit 8d5f050dabbf6dd3b992c3b46661848dbcf30d9e)
+

@@ -1,0 +1,958 @@
+Bug Summary: [12 Regression] Wrong code at -O with ipa-modref on aarch64
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 12.4.1, 13.3.1, 14.1.1, 15.0
+Known to Fail: 12.4.0, 13.3.0, 14.1.0
+
+Comments:
+- User: Alex Coplan | Time: 2024-02-06 13:40:46 UTC
+  Text: The following testcase appears to be miscompiled on the trunk, on
+aarch64-linux-gnu:
+
+$ cat t.c
+void foo(int x, int y, int z, int d, int *buf)
+{
+  for(int i = z; i < y-z; ++i)
+    for(int j = 0; j < d; ++j)
+      /* buf[x(i+1) + j] = buf[x(i+1)-j-1] */
+      buf[i*x+(x-z+j)] = buf[i*x+(x-z-1-j)];
+}
+
+void bar(int x, int y, int z, int d, int *buf)
+{
+  for(int i = 0; i < d; ++i)
+    for(int j = z; j < x-z; ++j)
+      /* buf[j+(y+i)*x] = buf[j+(y-1-i)*x] */
+      buf[j+(y-z+i)*x] = buf[j+(y-z-1-i)*x];
+}
+
+__attribute__((noipa))
+void baz(int x, int y, int d, int *buf)
+{
+  foo(x, y, 0, d, buf);
+  bar(x, y, 0, d, buf);
+}
+
+int main(void)
+{
+  int a[] = { 1, 2, 3 };
+  baz (1, 2, 1, a);
+  /* foo does:
+     buf[1] = buf[0];
+     buf[2] = buf[1];
+
+     bar does:
+     buf[2] = buf[1]; (no-op)
+     so we should have { 1, 1, 1 }.  */
+  for (int i = 0; i < 3; i++)
+    if (a[i] != 1)
+      __builtin_abort ();
+}
+$ gcc t.c -O -fno-ipa-modref
+$ ./a.out
+$ gcc t.c -O
+$ ./a.out
+Aborted
+
+The problem seems to be that the call to foo gets incorrectly optimized
+out from baz when ipa-modref is enabled:
+
+$ gcc -c -S -o /dev/null t.c -O -fno-ipa-modref -fdump-tree-optimized=good.tree
+$ gcc -c -S -o /dev/null t.c -O -fdump-tree-optimized=bad.tree
+$ diff -u good.tree bad.tree
+--- good.tree   2024-02-06 13:23:36.080926703 +0000
++++ bad.tree    2024-02-06 13:23:38.356916302 +0000
+@@ -223,7 +223,6 @@
+ void baz (int x, int y, int d, int * buf)
+ {
+   <bb 2> [local count: 1073741824]:
+-  foo (x_2(D), y_3(D), 0, d_4(D), buf_5(D));
+   bar (x_2(D), y_3(D), 0, d_4(D), buf_5(D));
+   return;
+
+I can't seem to reproduce the issue with GCC 13 or on x86_64.
+
+- User: Jakub Jelinek | Time: 2024-02-06 13:49:35 UTC
+  Text: Why do you think it is a 14 Regression?
+Seemsr12-5166works fine whiler12-6600already doesn't, so that would make it [12/13/14 Regression], no?
+
+- User: Andrew Pinski | Time: 2024-02-06 13:56:10 UTC
+  Text: Also try -fno-ivopts .
+
+- User: Alex Coplan | Time: 2024-02-06 13:57:11 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #1)> Why do you think it is a 14 Regression?
+> Seemsr12-5166works fine whiler12-6600already doesn't, so that would make
+> it [12/13/14 Regression], no?Well on the head of the GCC 13 branch the execution test seems to pass for me and I see no difference with/without ipa-modref, I'll double check with GCC 12.
+
+- User: Alex Coplan | Time: 2024-02-06 14:07:19 UTC
+  Text: Same with the head of the GCC 12 branch, but I agree it isn't a [14 Regression] as I can reproduce the issue with basepoints/gcc-14, so maybe something was backported to 12/13 that is making it latent on the branches?
+
+- User: Jakub Jelinek | Time: 2024-02-06 14:13:48 UTC
+  Text: My bisection points tor12-5915-ge93809f62363ba4b233858005aef652fb550e896
+
+- User: Andrew Pinski | Time: 2024-02-06 14:19:12 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #5)> My bisection points tor12-5915-ge93809f62363ba4b233858005aef652fb550e896Which means it is related tobug 110702.
+
+Again try -fno-ivopts . I suspect ivopts is producing some odd ir that is confusing modref here.
+
+- User: Alex Coplan | Time: 2024-02-06 14:23:32 UTC
+  Text: (In reply to Andrew Pinski fromcomment #6)> (In reply to Jakub Jelinek fromcomment #5)
+> > My bisection points tor12-5915-ge93809f62363ba4b233858005aef652fb550e896> 
+> Which means it is related tobug 110702.
+> 
+> Again try -fno-ivopts . I suspect ivopts is producing some odd ir that is
+> confusing modref here.Yeah, it seems -fno-ivopts makes the execution test pass too (so -O -fno-ivopts).
+
+- User: Jan Hubicka | Time: 2024-02-06 15:41:45 UTC
+  Text: I will take a look.  Mod-ref only reuses the code detecting errneous paths in ssa-split-paths, so that code will get confused, too. It makes sense for ivopts to compute difference of two memory allocations, but I wonder if that won't also confuse PTA and other stuff, so perhaps we need way to exlicitely tag memory location where such optimization happen? (to make it clear that original base is lost, or keep track of it)
+
+- User: Andrew Pinski | Time: 2024-02-06 16:18:51 UTC
+  Text: _57 = &MEM[(int *)0B + _56 + _55 * 1];
+  *_57 = _14;
+
+The fix forPR 110702must not have been enough.
+
+Or rather this part of the explanation was fully true:
+```
+The patch below
+    recognizes the fallback after the fact and transforms the
+    TARGET_MEM_REF memory reference into a LEA for which this form
+    isn't problematic:
+    
+      _24 = &MEM[(long int *)0B + ivtmp.36_34 + ivtmp.28_44 * 4];
+      _3 = *_24;
+```
+
+Maybe it was enough for GCC 13/12 branches but the trunk it was not.
+
+- User: Richard Biener | Time: 2024-02-07 08:48:27 UTC
+  Text: I think it's ipa-modref analyze_store bailing for
+
+  if (a.parm_index == MODREF_LOCAL_MEMORY_PARM)
+    return false;
+
+no idea how it arrives at that.
+
+- User: Richard Biener | Time: 2024-02-07 08:49:18 UTC
+  Text: Btw, there's related IPA modref wrong-code issues where IPA and late summaries are merged incorrectly (also receiving no attention)
+
+- User: Alex Coplan | Time: 2024-02-08 14:40:08 UTC
+  Text: Here is an alternative testcase that also fails in the same way on the GCC 12 and 13 branches:
+
+void foo(int x, int y, int z, int d, int *buf)
+{
+  for(int i = z; i < y-z; ++i)
+    for(int j = 0; j < d; ++j)
+      buf[i*x+(z-j-1)] = buf[i*x+(z+j)];
+}
+
+void bar(int x, int y, int z, int d, int *buf)
+{
+  for(int i = 0; i < d; ++i)
+    for(int j = z; j < x-z; ++j)
+      buf[j+(z-i-1)*x] = buf[j+(z+i)*x];
+}
+
+__attribute__((noipa))
+void baz(int x, int y, int d, int *buf)
+{
+  foo(x, y, 0, d, buf);
+  bar(x, y, 0, d, buf);
+}
+
+int main(void)
+{
+  int a[] = { 1, 2, 3 };
+  baz (1, 2, 1, a+1);
+  /* buf = a+1.
+     foo does:
+     buf[-1] = buf[0]; // { 2, 2, 3 }
+     buf[0] = buf[1];  // { 2, 3, 3 }
+
+     bar does:
+     buf[-1] = buf[0]; // { 3, 3, 3 }  */
+  for (int i = 0; i < 2; i++)
+    if (a[i] != 3)
+      __builtin_abort ();
+}
+
+- User: Jan Hubicka | Time: 2024-02-13 09:03:36 UTC
+  Text: So my understanding is that ivopts does something like
+ 
+ offset = &base2 - &base1
+
+and then translate
+ val = base2[i]
+to
+ val = *((base1+i)+offset)
+
+Where (base1+i) is then an iv variable.
+
+I wonder if we consider doing memory reference with base changed via offset a valid transformation. Is there way to tell when this happens?
+A quick fix would be to run IPA modref before ivopts, but I do not see how such transformation can work with rest of alias analysis (PTA etc)
+
+- User: rguenther@suse.de | Time: 2024-02-13 09:21:38 UTC
+  Text: On Tue, 13 Feb 2024, hubicka at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113787> 
+> ---Comment #13from Jan Hubicka <hubicka at gcc dot gnu.org> ---
+> So my understanding is that ivopts does something like
+> 
+>  offset = &base2 - &base1
+> 
+> and then translate
+>  val = base2[i]
+> to
+>  val = *((base1+i)+offset)
+> 
+> Where (base1+i) is then an iv variable.
+> 
+> I wonder if we consider doing memory reference with base changed via offset a
+> valid transformation. Is there way to tell when this happens?IVOPTs does the above but it does it (or should) as
+
+  offset = (uintptr)&base2 - (uintptr)&base1;
+  val = *((T *)((uintptr)base1 + i + offset))
+
+which is OK for points-to as no POINTER_PLUS_EXPR is involved so the
+resulting pointer points to both base1 and base2 (which isn't optimal
+but correct).
+
+If we somehow get back a POINTER_PLUS that's where things go wrong.
+
+Doing the above in C code would be valid input so we have to treat
+it correctly (OK, the standard only allows back-and-forth
+pointer-to-integer casts w/o any adjustment, but of course we relax
+this).
+
+IVOPTs then in putting all of the stuff into 'offset' gets at
+trying a TARGET_MEM_REF based on a NULL base but that's invalid.
+We then resort to a LEA (ADDR_EXPR of TARGET_MEM_REF) to compute
+the address which gets us into some phishy argument that it's
+not valid to decompose ADDR_EXPR of TARGET_MEM_REF to
+POINTER_PLUS of the TARGET_MEM_REF base and the offset.  But
+that's how it is (points-to treats (address of) TARGET_MEM_REF
+as pointing to anything ...).> A quick fix would be to run IPA modref before ivopts, but I do not see how such
+> transformation can work with rest of alias analysis (PTA etc)It does.  Somewhere IPA modref interprets things wrongly, I didn't figure
+out here though.
+
+- User: Jan Hubicka | Time: 2024-02-13 18:21:47 UTC
+  Text: > 
+> IVOPTs does the above but it does it (or should) as
+> 
+>   offset = (uintptr)&base2 - (uintptr)&base1;
+>   val = *((T *)((uintptr)base1 + i + offset))
+> 
+> which is OK for points-to as no POINTER_PLUS_EXPR is involved so the
+> resulting pointer points to both base1 and base2 (which isn't optimal
+> but correct).
+> 
+> If we somehow get back a POINTER_PLUS that's where things go wrong.
+> 
+> Doing the above in C code would be valid input so we have to treat
+> it correctly (OK, the standard only allows back-and-forth
+> pointer-to-integer casts w/o any adjustment, but of course we relax
+> this).OK. Modrefs tracks base pointer for accesses and tries to prove that
+they are function parameters.  This should immitate ivopts:
+void
+__attribute__ ((noinline))
+set(int *a, unsigned long off)
+{
+  *(int *)((unsigned long)a + off) = 1;
+}
+int
+test ()
+{
+  int a;
+  int b = 0;
+  set (&a, (unsigned long)&b - (unsigned long)&a);
+  return b;
+}
+
+Here set gets following gimple at modref2 time:
+__attribute__((noinline)) 
+void set (int * a, long unsigned int off)
+{
+  long unsigned int a.0_1;
+  long unsigned int _2;
+  int * _3; 
+    
+  <bb 2> [local count: 1073741824]:
+  a.0_1 = (long unsigned int) a_4(D);
+  _2 = a.0_1 + off_5(D); 
+  _3 = (int *) _2; 
+  *_3 = 1; 
+  return;
+
+}
+
+This is not pattern matched so modref does not think the access has a as
+a base:
+
+  stores:
+      Base 0: alias set 1
+        Ref 0: alias set 1
+          Every access
+
+While for:
+
+void
+__attribute__ ((noinline))
+set(int *a, unsigned long off)
+{
+  *(a+off/sizeof(int))=1;
+}
+
+we produce:
+
+__attribute__((noinline))
+void set (int * a, long unsigned int off)
+{
+  sizetype _1;
+  int * _2;
+
+  <bb 2> [local count: 1073741824]:
+  _1 = off_3(D) & 18446744073709551612;
+  _2 = a_4(D) + _1;
+  *_2 = 1;
+  return;
+}
+
+And this is understood:
+
+  stores:
+      Base 0: alias set 1
+        Ref 0: alias set 1
+          access: Parm 0
+
+If we consider it correct to optimize out the conversion from and to
+pointer type, then I suppose any addition of pointer and integer which
+we do not see means that we need to give up on tracking base completely.
+
+I guess PTA gets around by tracking points-to set also for non-pointer
+types and consequently it also gives up on any such addition.
+
+But what we really get from relaxing this?> 
+> IVOPTs then in putting all of the stuff into 'offset' gets at
+> trying a TARGET_MEM_REF based on a NULL base but that's invalid.
+> We then resort to a LEA (ADDR_EXPR of TARGET_MEM_REF) to compute
+> the address which gets us into some phishy argument that it's
+> not valid to decompose ADDR_EXPR of TARGET_MEM_REF to
+> POINTER_PLUS of the TARGET_MEM_REF base and the offset.  But
+> that's how it is (points-to treats (address of) TARGET_MEM_REF
+> as pointing to anything ...).
+> 
+> > A quick fix would be to run IPA modref before ivopts, but I do not see how such
+> > transformation can work with rest of alias analysis (PTA etc)
+> 
+> It does.  Somewhere IPA modref interprets things wrongly, I didn't figure
+> out here though.I guess PTA gets around by tracking points-to set also for non-pointer
+types and consequently it also gives up on any such addition.
+
+I think it is ipa-prop.c::unadjusted_ptr_and_unit_offset. It accepts
+pointer_plus expression, but does not look through POINTER_PLUS.
+We can restrict it further, but tracking base pointer is quite useful,
+so it would be nice to not give up completely.
+
+Honza> 
+> -- 
+> You are receiving this mail because:
+> You are on the CC list for the bug.
+
+- User: rguenther@suse.de | Time: 2024-02-14 08:19:31 UTC
+  Text: On Tue, 13 Feb 2024, hubicka at ucw dot cz wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113787> 
+> ---Comment #15from Jan Hubicka <hubicka at ucw dot cz> ---
+> > 
+> > IVOPTs does the above but it does it (or should) as
+> > 
+> >   offset = (uintptr)&base2 - (uintptr)&base1;
+> >   val = *((T *)((uintptr)base1 + i + offset))
+> > 
+> > which is OK for points-to as no POINTER_PLUS_EXPR is involved so the
+> > resulting pointer points to both base1 and base2 (which isn't optimal
+> > but correct).
+> > 
+> > If we somehow get back a POINTER_PLUS that's where things go wrong.
+> > 
+> > Doing the above in C code would be valid input so we have to treat
+> > it correctly (OK, the standard only allows back-and-forth
+> > pointer-to-integer casts w/o any adjustment, but of course we relax
+> > this).
+> 
+> OK. Modrefs tracks base pointer for accesses and tries to prove that
+> they are function parameters.  This should immitate ivopts:
+> void
+> __attribute__ ((noinline))
+> set(int *a, unsigned long off)
+> {
+>   *(int *)((unsigned long)a + off) = 1;
+> }
+> int
+> test ()
+> {
+>   int a;
+>   int b = 0;
+>   set (&a, (unsigned long)&b - (unsigned long)&a);
+>   return b;
+> }
+> 
+> Here set gets following gimple at modref2 time:
+> __attribute__((noinline)) 
+> void set (int * a, long unsigned int off)
+> {
+>   long unsigned int a.0_1;
+>   long unsigned int _2;
+>   int * _3; 
+> 
+>   <bb 2> [local count: 1073741824]:
+>   a.0_1 = (long unsigned int) a_4(D);
+>   _2 = a.0_1 + off_5(D); 
+>   _3 = (int *) _2; 
+>   *_3 = 1; 
+>   return;
+> 
+> }
+> 
+> This is not pattern matched so modref does not think the access has a as
+> a base:
+> 
+>   stores:
+>       Base 0: alias set 1
+>         Ref 0: alias set 1
+>           Every access
+> 
+> While for:
+> 
+> void
+> __attribute__ ((noinline))
+> set(int *a, unsigned long off)
+> {
+>   *(a+off/sizeof(int))=1;
+> }
+> 
+> we produce:
+> 
+> __attribute__((noinline))
+> void set (int * a, long unsigned int off)
+> {
+>   sizetype _1;
+>   int * _2;
+> 
+>   <bb 2> [local count: 1073741824]:
+>   _1 = off_3(D) & 18446744073709551612;
+>   _2 = a_4(D) + _1;
+>   *_2 = 1;
+>   return;
+> }
+> 
+> And this is understood:
+> 
+>   stores:
+>       Base 0: alias set 1
+>         Ref 0: alias set 1
+>           access: Parm 0
+> 
+> If we consider it correct to optimize out the conversion from and to
+> pointer type, then I suppose any addition of pointer and integer which
+> we do not see means that we need to give up on tracking base completely.
+> 
+> I guess PTA gets around by tracking points-to set also for non-pointer
+> types and consequently it also gives up on any such addition.
+> 
+> But what we really get from relaxing this?
+> > 
+> > IVOPTs then in putting all of the stuff into 'offset' gets at
+> > trying a TARGET_MEM_REF based on a NULL base but that's invalid.
+> > We then resort to a LEA (ADDR_EXPR of TARGET_MEM_REF) to compute
+> > the address which gets us into some phishy argument that it's
+> > not valid to decompose ADDR_EXPR of TARGET_MEM_REF to
+> > POINTER_PLUS of the TARGET_MEM_REF base and the offset.  But
+> > that's how it is (points-to treats (address of) TARGET_MEM_REF
+> > as pointing to anything ...).
+> > 
+> > > A quick fix would be to run IPA modref before ivopts, but I do not see how such
+> > > transformation can work with rest of alias analysis (PTA etc)
+> > 
+> > It does.  Somewhere IPA modref interprets things wrongly, I didn't figure
+> > out here though.
+> 
+> 
+> I guess PTA gets around by tracking points-to set also for non-pointer
+> types and consequently it also gives up on any such addition.It does.  But note it does _not_ for POINTER_PLUS where it treats
+the offset operand as non-pointer.> I think it is ipa-prop.c::unadjusted_ptr_and_unit_offset. It accepts
+> pointer_plus expression, but does not look through POINTER_PLUS.
+> We can restrict it further, but tracking base pointer is quite useful,
+> so it would be nice to not give up completely.It looks like that function might treat that
+
+ ADDR_EXPR <TARGET_MEM_REF <0B, ...>>
+
+as integer_zerop base.  It does
+
+      if (TREE_CODE (op) == ADDR_EXPR) 
+        {
+          poly_int64 extra_offset = 0; 
+          tree base = get_addr_base_and_unit_offset (TREE_OPERAND (op, 0),
+                                                     &offset);
+          if (!base)
+            {
+              base = get_base_address (TREE_OPERAND (op, 0));
+              if (TREE_CODE (base) != MEM_REF)
+                break;
+              offset_known = false;
+            }
+          else
+            {
+              if (TREE_CODE (base) != MEM_REF)
+                break;
+
+with a variable offset we fall to the TREE_CODE (base) != MEM_REF
+and will have offset_known == true.  Not sure what it does with
+the result though (it's not the address of a decl).
+
+This function seems to oddly special-case != MEM_REF ... (maybe
+it wants to hande DECL_P () as finishing?
+
+Note get_addr_base_and_unit_offset will return NULL for
+a TARGET_MEM_REF <&decl, ..., offset> but TARGET_MEM_REF
+itself if the base isn't an ADDR_EXPR, irrespective of whether
+the offset within it is constant or not.
+
+Not sure if the above is a problem, but it seems the only caller
+will just call points_to_local_or_readonly_memory_p on the
+ADDR_EXPR where refs_local_or_readonly_memory_p via
+points_to_local_or_readonly_memory_p will eventually do
+
+  /* See if memory location is clearly invalid.  */
+  if (integer_zerop (t))
+    return flag_delete_null_pointer_checks;
+
+and that might be a problem.  As said, we rely on
+ADDR_EXPR <TARGET_MEM_REF <...> > to be an address computation
+that's not subject to strict interpretation to allow IVOPTs
+doing this kind of optimization w/o introducing some kind of
+INTEGER_LEA <...>.  I know that's a bit awkward but we should
+make sure this is honored by IPA as well.
+
+I'd say
+
+diff --git a/gcc/ipa-fnsummary.cc b/gcc/ipa-fnsummary.cc
+index 74c9b4e1d1e..45a770cf940 100644
+--- a/gcc/ipa-fnsummary.cc
++++ b/gcc/ipa-fnsummary.cc
+@@ -2642,7 +2642,8 @@ points_to_local_or_readonly_memory_p (tree t)
+        return true;
+       return !ptr_deref_may_alias_global_p (t, false);
+     }
+-  if (TREE_CODE (t) == ADDR_EXPR)
++  if (TREE_CODE (t) == ADDR_EXPR
++      && TREE_CODE (TREE_OPERAND (t, 0)) != TARGET_MEM_REF)
+     return refs_local_or_readonly_memory_p (TREE_OPERAND (t, 0));
+   return false;
+ }
+
+might eventually work?  Alternatively a bit less aggressive like
+the following.
+
+diff --git a/gcc/ipa-fnsummary.cc b/gcc/ipa-fnsummary.cc
+index 74c9b4e1d1e..7c79adf6440 100644
+--- a/gcc/ipa-fnsummary.cc
++++ b/gcc/ipa-fnsummary.cc
+@@ -2642,7 +2642,9 @@ points_to_local_or_readonly_memory_p (tree t)
+        return true;
+       return !ptr_deref_may_alias_global_p (t, false);
+     }
+-  if (TREE_CODE (t) == ADDR_EXPR)
++  if (TREE_CODE (t) == ADDR_EXPR
++      && (TREE_CODE (TREE_OPERAND (t, 0)) != TARGET_MEM_REF
++         || TREE_CODE (TREE_OPERAND (TREE_OPERAND (t, 0), 0)) != 
+INTEGER_CST))
+     return refs_local_or_readonly_memory_p (TREE_OPERAND (t, 0));
+   return false;
+ }
+
+A "nicer" solution might be to add a informational operand
+to TARGET_MEM_REF, representing the base pointer to be used for
+alias/points-to purposes.  But if that's not invariant it might
+keep some otherwise unnecessary definition stmts live.
+
+- User: Jan Hubicka | Time: 2024-02-14 15:07:22 UTC
+  Text: > > I guess PTA gets around by tracking points-to set also for non-pointer
+> > types and consequently it also gives up on any such addition.
+> 
+> It does.  But note it does _not_ for POINTER_PLUS where it treats
+> the offset operand as non-pointer.
+> 
+> > I think it is ipa-prop.c::unadjusted_ptr_and_unit_offset. It accepts
+> > pointer_plus expression, but does not look through POINTER_PLUS.
+> > We can restrict it further, but tracking base pointer is quite useful,
+> > so it would be nice to not give up completely.
+> 
+> It looks like that function might treat that
+> 
+>  ADDR_EXPR <TARGET_MEM_REF <0B, ...>>
+> 
+> as integer_zerop base.  It does
+> 
+>       if (TREE_CODE (op) == ADDR_EXPR) 
+>         {
+>           poly_int64 extra_offset = 0; 
+>           tree base = get_addr_base_and_unit_offset (TREE_OPERAND (op, 0),
+>                                                      &offset);
+>           if (!base)
+>             {
+>               base = get_base_address (TREE_OPERAND (op, 0));
+>               if (TREE_CODE (base) != MEM_REF)
+>                 break;
+>               offset_known = false;
+>             }
+>           else
+>             {
+>               if (TREE_CODE (base) != MEM_REF)
+>                 break;
+> 
+> with a variable offset we fall to the TREE_CODE (base) != MEM_REF
+> and will have offset_known == true.  Not sure what it does with
+> the result though (it's not the address of a decl).
+> 
+> This function seems to oddly special-case != MEM_REF ... (maybe
+> it wants to hande DECL_P () as finishing?Hmm the function was definitely not written with TARGET_MEM_REF in mind,
+since it was originally used for IPA passes only.
+We basically want to handle stuff like
+ &decl->foo
+or
+ &(ptr->foo)
+In the second case we want to continue the SSA walk to hopefully work
+out the origin of PTR.
+ipa-modref then looks if the base pointer is derived from function
+parameter or points to local or readonly memory to produce its summary.> 
+> Note get_addr_base_and_unit_offset will return NULL for
+> a TARGET_MEM_REF <&decl, ..., offset> but TARGET_MEM_REF
+> itself if the base isn't an ADDR_EXPR, irrespective of whether
+> the offset within it is constant or not.Hmm, interesting.  I would expect it to interpret the emantics of TMR
+and return base.> 
+> Not sure if the above is a problem, but it seems the only caller
+> will just call points_to_local_or_readonly_memory_p on the
+> ADDR_EXPR where refs_local_or_readonly_memory_p via
+> points_to_local_or_readonly_memory_p will eventually do
+> 
+>   /* See if memory location is clearly invalid.  */
+>   if (integer_zerop (t))
+>     return flag_delete_null_pointer_checks;
+> 
+> and that might be a problem.  As said, we rely on
+> ADDR_EXPR <TARGET_MEM_REF <...> > to be an address computation
+> that's not subject to strict interpretation to allow IVOPTs
+> doing this kind of optimization w/o introducing some kind of
+> INTEGER_LEA <...>.  I know that's a bit awkward but we should
+> make sure this is honored by IPA as well.
+> 
+> I'd say
+> 
+> diff --git a/gcc/ipa-fnsummary.cc b/gcc/ipa-fnsummary.cc
+> index 74c9b4e1d1e..45a770cf940 100644
+> --- a/gcc/ipa-fnsummary.cc
+> +++ b/gcc/ipa-fnsummary.cc
+> @@ -2642,7 +2642,8 @@ points_to_local_or_readonly_memory_p (tree t)
+>         return true;
+>        return !ptr_deref_may_alias_global_p (t, false);
+>      }
+> -  if (TREE_CODE (t) == ADDR_EXPR)
+> +  if (TREE_CODE (t) == ADDR_EXPR
+> +      && TREE_CODE (TREE_OPERAND (t, 0)) != TARGET_MEM_REF)
+>      return refs_local_or_readonly_memory_p (TREE_OPERAND (t, 0));
+>    return false;
+>  }
+> 
+> might eventually work?  Alternatively a bit less aggressive like
+> the following.
+> 
+> diff --git a/gcc/ipa-fnsummary.cc b/gcc/ipa-fnsummary.cc
+> index 74c9b4e1d1e..7c79adf6440 100644
+> --- a/gcc/ipa-fnsummary.cc
+> +++ b/gcc/ipa-fnsummary.cc
+> @@ -2642,7 +2642,9 @@ points_to_local_or_readonly_memory_p (tree t)
+>         return true;
+>        return !ptr_deref_may_alias_global_p (t, false);
+>      }
+> -  if (TREE_CODE (t) == ADDR_EXPR)
+> +  if (TREE_CODE (t) == ADDR_EXPR
+> +      && (TREE_CODE (TREE_OPERAND (t, 0)) != TARGET_MEM_REF
+> +         || TREE_CODE (TREE_OPERAND (TREE_OPERAND (t, 0), 0)) != 
+> INTEGER_CST))
+>      return refs_local_or_readonly_memory_p (TREE_OPERAND (t, 0));
+>    return false;
+>  }Yes, those both looks reasonable to me, perhaps less agressive would be
+better.> 
+> A "nicer" solution might be to add a informational operand
+> to TARGET_MEM_REF, representing the base pointer to be used for
+> alias/points-to purposes.  But if that's not invariant it might
+> keep some otherwise unnecessary definition stmts live.Yep, I see that forcing extra IV to track original semantics would be
+trouble here.  I think that after iv-opts we should be done with more
+fancy propagation across loops.
+
+However, to avoid ipa-modref summary degradation, perhaps scheduling the
+pass before ivopts would make sense...
+
+Thanks,
+Honza
+
+- User: rguenther@suse.de | Time: 2024-02-14 15:09:55 UTC
+  Text: On Wed, 14 Feb 2024, hubicka at ucw dot cz wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113787> 
+> ---Comment #17from Jan Hubicka <hubicka at ucw dot cz> ---
+> > > I guess PTA gets around by tracking points-to set also for non-pointer
+> > > types and consequently it also gives up on any such addition.
+> > 
+> > It does.  But note it does _not_ for POINTER_PLUS where it treats
+> > the offset operand as non-pointer.
+> > 
+> > > I think it is ipa-prop.c::unadjusted_ptr_and_unit_offset. It accepts
+> > > pointer_plus expression, but does not look through POINTER_PLUS.
+> > > We can restrict it further, but tracking base pointer is quite useful,
+> > > so it would be nice to not give up completely.
+> > 
+> > It looks like that function might treat that
+> > 
+> >  ADDR_EXPR <TARGET_MEM_REF <0B, ...>>
+> > 
+> > as integer_zerop base.  It does
+> > 
+> >       if (TREE_CODE (op) == ADDR_EXPR) 
+> >         {
+> >           poly_int64 extra_offset = 0; 
+> >           tree base = get_addr_base_and_unit_offset (TREE_OPERAND (op, 0),
+> >                                                      &offset);
+> >           if (!base)
+> >             {
+> >               base = get_base_address (TREE_OPERAND (op, 0));
+> >               if (TREE_CODE (base) != MEM_REF)
+> >                 break;
+> >               offset_known = false;
+> >             }
+> >           else
+> >             {
+> >               if (TREE_CODE (base) != MEM_REF)
+> >                 break;
+> > 
+> > with a variable offset we fall to the TREE_CODE (base) != MEM_REF
+> > and will have offset_known == true.  Not sure what it does with
+> > the result though (it's not the address of a decl).
+> > 
+> > This function seems to oddly special-case != MEM_REF ... (maybe
+> > it wants to hande DECL_P () as finishing?
+> 
+> Hmm the function was definitely not written with TARGET_MEM_REF in mind,
+> since it was originally used for IPA passes only.
+> We basically want to handle stuff like
+>  &decl->foo
+> or
+>  &(ptr->foo)
+> In the second case we want to continue the SSA walk to hopefully work
+> out the origin of PTR.
+> ipa-modref then looks if the base pointer is derived from function
+> parameter or points to local or readonly memory to produce its summary.
+> > 
+> > Note get_addr_base_and_unit_offset will return NULL for
+> > a TARGET_MEM_REF <&decl, ..., offset> but TARGET_MEM_REF
+> > itself if the base isn't an ADDR_EXPR, irrespective of whether
+> > the offset within it is constant or not.
+> 
+> Hmm, interesting.  I would expect it to interpret the emantics of TMR
+> and return base.
+> > 
+> > Not sure if the above is a problem, but it seems the only caller
+> > will just call points_to_local_or_readonly_memory_p on the
+> > ADDR_EXPR where refs_local_or_readonly_memory_p via
+> > points_to_local_or_readonly_memory_p will eventually do
+> > 
+> >   /* See if memory location is clearly invalid.  */
+> >   if (integer_zerop (t))
+> >     return flag_delete_null_pointer_checks;
+> > 
+> > and that might be a problem.  As said, we rely on
+> > ADDR_EXPR <TARGET_MEM_REF <...> > to be an address computation
+> > that's not subject to strict interpretation to allow IVOPTs
+> > doing this kind of optimization w/o introducing some kind of
+> > INTEGER_LEA <...>.  I know that's a bit awkward but we should
+> > make sure this is honored by IPA as well.
+> > 
+> > I'd say
+> > 
+> > diff --git a/gcc/ipa-fnsummary.cc b/gcc/ipa-fnsummary.cc
+> > index 74c9b4e1d1e..45a770cf940 100644
+> > --- a/gcc/ipa-fnsummary.cc
+> > +++ b/gcc/ipa-fnsummary.cc
+> > @@ -2642,7 +2642,8 @@ points_to_local_or_readonly_memory_p (tree t)
+> >         return true;
+> >        return !ptr_deref_may_alias_global_p (t, false);
+> >      }
+> > -  if (TREE_CODE (t) == ADDR_EXPR)
+> > +  if (TREE_CODE (t) == ADDR_EXPR
+> > +      && TREE_CODE (TREE_OPERAND (t, 0)) != TARGET_MEM_REF)
+> >      return refs_local_or_readonly_memory_p (TREE_OPERAND (t, 0));
+> >    return false;
+> >  }
+> > 
+> > might eventually work?  Alternatively a bit less aggressive like
+> > the following.
+> > 
+> > diff --git a/gcc/ipa-fnsummary.cc b/gcc/ipa-fnsummary.cc
+> > index 74c9b4e1d1e..7c79adf6440 100644
+> > --- a/gcc/ipa-fnsummary.cc
+> > +++ b/gcc/ipa-fnsummary.cc
+> > @@ -2642,7 +2642,9 @@ points_to_local_or_readonly_memory_p (tree t)
+> >         return true;
+> >        return !ptr_deref_may_alias_global_p (t, false);
+> >      }
+> > -  if (TREE_CODE (t) == ADDR_EXPR)
+> > +  if (TREE_CODE (t) == ADDR_EXPR
+> > +      && (TREE_CODE (TREE_OPERAND (t, 0)) != TARGET_MEM_REF
+> > +         || TREE_CODE (TREE_OPERAND (TREE_OPERAND (t, 0), 0)) != 
+> > INTEGER_CST))
+> >      return refs_local_or_readonly_memory_p (TREE_OPERAND (t, 0));
+> >    return false;
+> >  }
+> 
+> Yes, those both looks reasonable to me, perhaps less agressive would be
+> better.Note I didn't check if it helps the testcase ..> > 
+> > A "nicer" solution might be to add a informational operand
+> > to TARGET_MEM_REF, representing the base pointer to be used for
+> > alias/points-to purposes.  But if that's not invariant it might
+> > keep some otherwise unnecessary definition stmts live.
+> 
+> Yep, I see that forcing extra IV to track original semantics would be
+> trouble here.  I think that after iv-opts we should be done with more
+> fancy propagation across loops.
+> 
+> However, to avoid ipa-modref summary degradation, perhaps scheduling the
+> pass before ivopts would make sense...We also have that other bug where store-merging breaks the IPA summary
+which gets prevailed in the late modref, so moving it around doesn't
+solve all of the IL related issues ...
+
+- User: Jan Hubicka | Time: 2024-02-14 15:18:23 UTC
+  Text: > Note I didn't check if it helps the testcase ..I will check.> 
+> > > 
+> > > A "nicer" solution might be to add a informational operand
+> > > to TARGET_MEM_REF, representing the base pointer to be used for
+> > > alias/points-to purposes.  But if that's not invariant it might
+> > > keep some otherwise unnecessary definition stmts live.
+> > 
+> > Yep, I see that forcing extra IV to track original semantics would be
+> > trouble here.  I think that after iv-opts we should be done with more
+> > fancy propagation across loops.
+> > 
+> > However, to avoid ipa-modref summary degradation, perhaps scheduling the
+> > pass before ivopts would make sense...
+> 
+> We also have that other bug where store-merging breaks the IPA summary
+> which gets prevailed in the late modref, so moving it around doesn't
+> solve all of the IL related issues ...I did not mean to paper around the fact that we produce wrong code with
+TARGET_MEM_REFs (we ought to fix that).  If ivopts makes it
+difficult to track bases of memory accesses, we may get better 
+summaries if we built them earlier.  The purpose for late mod-ref is to
+analyze the function body as cleaned up as possible (so we do not get
+confused i.e. by dead memory accesses and other stuff we see before
+inlining) but we do not want to lower the representation too much, since
+that is generally lossy too.
+
+I will look at the store merging issue.
+
+Honza
+
+- User: Alex Coplan | Time: 2024-05-16 09:07:03 UTC
+  Text: I'd just like to ping this serious wrong code bug.  It's unfortunate that this wasn't addressed for the 14.1 release.
+
+- User: GCC Commits | Time: 2024-05-16 13:34:19 UTC
+  Text: The master branch has been updated by Jan Hubicka <hubicka@gcc.gnu.org>:https://gcc.gnu.org/g:96d53252aefcbc2fe419c4c3b4bcd3fc03d4d187commitr15-581-g96d53252aefcbc2fe419c4c3b4bcd3fc03d4d187Author: Jan Hubicka <jh@suse.cz>
+Date:   Thu May 16 15:33:55 2024 +0200
+
+    Fix points_to_local_or_readonly_memory_p wrt TARGET_MEM_REF
+    
+    TARGET_MEM_REF can be used to offset constant base into a memory object (to
+    produce lea instruction).  This confuses points_to_local_or_readonly_memory_p
+    which treats the constant address as a base of the access.
+    
+    Bootstrapped/regtsted x86_64-linux, comitted.
+    Honza
+    
+    gcc/ChangeLog:PR ipa/113787* ipa-fnsummary.cc (points_to_local_or_readonly_memory_p): Do not
+            look into TARGET_MEM_REFS with constant opreand 0.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/execute/pr113787.c: New test.
+
+- User: Jan Hubicka | Time: 2024-05-16 13:39:02 UTC
+  Text: Fixed on trunk so far
+
+- User: Richard Biener | Time: 2024-06-20 09:14:50 UTC
+  Text: GCC 12.4 is being released, retargeting bugs to GCC 12.5.
+
+- User: GCC Commits | Time: 2024-07-18 11:51:08 UTC
+  Text: The releases/gcc-14 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:0b7ec50ae2959153650c0b3dc134c8872ff9fcfccommitr14-10456-g0b7ec50ae2959153650c0b3dc134c8872ff9fcfcAuthor: Jan Hubicka <jh@suse.cz>
+Date:   Thu May 16 15:33:55 2024 +0200
+
+    Fix points_to_local_or_readonly_memory_p wrt TARGET_MEM_REF
+    
+    TARGET_MEM_REF can be used to offset constant base into a memory object (to
+    produce lea instruction).  This confuses points_to_local_or_readonly_memory_p
+    which treats the constant address as a base of the access.
+    
+    Bootstrapped/regtsted x86_64-linux, comitted.
+    Honza
+    
+    gcc/ChangeLog:PR ipa/113787* ipa-fnsummary.cc (points_to_local_or_readonly_memory_p): Do not
+            look into TARGET_MEM_REFS with constant opreand 0.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/execute/pr113787.c: New test.
+    
+    (cherry picked from commit 96d53252aefcbc2fe419c4c3b4bcd3fc03d4d187)
+
+- User: GCC Commits | Time: 2024-10-14 17:44:43 UTC
+  Text: The releases/gcc-13 branch has been updated by Sam James <sjames@gcc.gnu.org>:https://gcc.gnu.org/g:63557666869a2857665df5b387240231a6f7e5fccommitr13-9111-g63557666869a2857665df5b387240231a6f7e5fcAuthor: Jan Hubicka <jh@suse.cz>
+Date:   Thu May 16 15:33:55 2024 +0200
+
+    Fix points_to_local_or_readonly_memory_p wrt TARGET_MEM_REF
+    
+    TARGET_MEM_REF can be used to offset constant base into a memory object (to
+    produce lea instruction).  This confuses points_to_local_or_readonly_memory_p
+    which treats the constant address as a base of the access.
+    
+    Bootstrapped/regtsted x86_64-linux, comitted.
+    Honza
+    
+    gcc/ChangeLog:PR ipa/113787* ipa-fnsummary.cc (points_to_local_or_readonly_memory_p): Do not
+            look into TARGET_MEM_REFS with constant opreand 0.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/execute/pr113787.c: New test.
+    
+    (cherry picked from commit 96d53252aefcbc2fe419c4c3b4bcd3fc03d4d187)
+
+- User: GCC Commits | Time: 2024-10-14 21:14:27 UTC
+  Text: The releases/gcc-12 branch has been updated by Sam James <sjames@gcc.gnu.org>:https://gcc.gnu.org/g:92889011625f16e7eed654a137b9c14a29282917commitr12-10769-g92889011625f16e7eed654a137b9c14a29282917Author: Jan Hubicka <jh@suse.cz>
+Date:   Thu May 16 15:33:55 2024 +0200
+
+    Fix points_to_local_or_readonly_memory_p wrt TARGET_MEM_REF
+    
+    TARGET_MEM_REF can be used to offset constant base into a memory object (to
+    produce lea instruction).  This confuses points_to_local_or_readonly_memory_p
+    which treats the constant address as a base of the access.
+    
+    Bootstrapped/regtsted x86_64-linux, comitted.
+    Honza
+    
+    gcc/ChangeLog:PR ipa/113787* ipa-fnsummary.cc (points_to_local_or_readonly_memory_p): Do not
+            look into TARGET_MEM_REFS with constant opreand 0.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/execute/pr113787.c: New test.
+    
+    (cherry picked from commit 96d53252aefcbc2fe419c4c3b4bcd3fc03d4d187)
+
+- User: Sam James | Time: 2024-10-14 21:16:15 UTC
+  Text: Fixed (backporting done perhttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=111613#c13) for 12.5 too.
+

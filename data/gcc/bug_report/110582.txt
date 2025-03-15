@@ -1,0 +1,177 @@
+Bug Summary: [14 Regression] Wrong code at -O2/3 on x86_64-linux-gnu
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: needs-bisection, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Shaohua Li | Time: 2023-07-07 08:03:05 UTC
+  Text: This seems to be a recent regression. gcc at -O2 and -O3 produce wrong code.
+
+Compiler explorer:https://godbolt.org/z/qWxPW34ch$ cat a.c
+int a, b;
+int main() {
+  char c = a = 0;
+  for (; c != -3; c++) {
+    int d = 2;
+    d ^= 2 && a;
+    b = a == 0 ? d : d / a;
+    a = b;
+  }
+  for (; (1 + 95 << 24) + b + 1 + 686658714L + b - 2297271457;)
+    ;
+}
+$
+$ gcc-tk -O0 a.c && ./a.out
+$
+$ gcc-tk -O2 a.c
+$ 
+$ ./a.out
+Killed
+$
+$ gcc-tk -v
+Using built-in specs.
+COLLECT_GCC=gcc-tk
+COLLECT_LTO_WRAPPER=/zdata/shaoli/compilers/ccbuilder-compilers/gcc-55900189ab517906efe08f8d17f3e4a310ee7fff/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../configure --disable-multilib --disable-bootstrap --enable-languages=c,c++ --prefix=/zdata/shaoli/compilers/ccbuilder-compilers/gcc-55900189ab517906efe08f8d17f3e4a310ee7fff
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20230707 (experimental) (GCC)
+$
+
+- User: Andrew Pinski | Time: 2023-07-07 08:40:53 UTC
+  Text: threadfull2 seems to producing the wrong code but I could be wrong.
+
+Confirmed.
+
+- User: Richard Biener | Time: 2023-07-07 11:19:52 UTC
+  Text: It works with -fno-tree-loop-optimize but the difference from loop opts is just
+
+ int main ()
+ {
+   int D.2782;
+   int b_lsm.13;
+   int a_lsm.12;
+   char c;
+-  unsigned char c.6_2;
+-  unsigned char _3;
+   int iftmp.1_11;
+   int _12(D);
+   int iftmp.1_15;
++  unsigned char ivtmp_36;
++  unsigned char ivtmp_37;
+   int _38;
+   long int _39;
+   long int _40;
+@@ -23,8 +21,8 @@
+   <bb 2> [local count: 10737416]:
+ 
+   <bb 3> [local count: 1063004409]:
+-  # c_21 = PHI <c_18(5), 0(2)>
+   # a_lsm.12_4 = PHI <iftmp.1_11(5), 0(2)>
++  # ivtmp_37 = PHI <ivtmp_36(5), 253(2)>
+   if (a_lsm.12_4 != 0)
+     goto <bb 4>; [50.00%]
+   else
+@@ -35,10 +33,8 @@
+ 
+   <bb 5> [local count: 1063004409]:
+   # iftmp.1_11 = PHI <iftmp.1_15(4), 2(3)>
+-  c.6_2 = (unsigned char) c_21;
+-  _3 = c.6_2 + 1;
+-  c_18 = (char) _3;
+-  if (c_18 != -3)
++  ivtmp_36 = ivtmp_37 - 1;
++  if (ivtmp_36 != 0)
+     goto <bb 3>; [98.99%]
+   else
+
+with that indeed threadfull2 miscompiles this somehow.  Andrew?
+
+- User: Andrew Pinski | Time: 2023-07-08 01:08:44 UTC
+  Text: (In reply to Richard Biener fromcomment #2)> It works with -fno-tree-loop-optimize but the difference from loop opts is
+> justSo changing it to what -ftree-loop-optimize, it still passes with -fno-tree-loop-optimize (which is even odder):
+```
+int a, b;
+int main() {
+  char c = a = 0;
+  unsigned char t = 253;
+  for (; t != 0; t --){
+    int d = 2;
+    d ^= 2 && a;
+    b = a == 0 ? d : d / a;
+    a = b;
+  }
+  for (; (1 + 95 << 24) + b + 1 + 686658714L + b - 2297271457;)
+    ;
+}
+```
+
+The difference in this case is:
++  unsigned charD.20 ivtmp_32;
++  unsigned charD.20 ivtmp_33;
+...
+-  # RANGE [irange] unsigned char [1, 253]
+-  # t_19 = PHI <t_16(5), 253(2)>
+   # .MEM_20 = PHI <.MEM_20(5), .MEM_11(D)(2)>
+   # a_lsm.11_2 = PHI <iftmp.1_9(5), 0(2)>
++  # ivtmp_33 = PHI <ivtmp_32(5), 253(2)>
+
+...
+-  # RANGE [irange] unsigned char [0, 252]
+-  t_16 = t_19 + 255;
+-  if (t_16 != 0)
++  ivtmp_32 = ivtmp_33 - 1;
++  if (ivtmp_32 != 0)
+```
+The only thing I can of which might be causing the issue is +255 vs -1 here.
+
+- User: Andrew Pinski | Time: 2023-07-08 01:17:20 UTC
+  Text: Another testcase:
+```
+int a, b;
+int main() {
+  char a = 0;
+  int t = 0;
+  for (; t <253; t ++){
+    int d = 2;
+    d ^= 2 && a;
+    b = a == 0 ? d : d / a;
+    a = b;
+  }
+  for (; (1 + 95 << 24) + b + 1 + 686658714L + b - 2297271457;)
+    ;
+}
+```
+
+Just to show that you could count up from 0 to 253 and still have an issue without any wrapping happening in the original code.
+
+- User: Shaohua Li | Time: 2023-07-30 14:46:35 UTC
+  Text: Bisect tor14-1179-g1cd5bc387c4
+
+- User: GCC Commits | Time: 2023-07-31 16:06:34 UTC
+  Text: The master branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:b769811e7c1b3dff2fa0ec2c37b52859d7bceed4commitr14-2883-gb769811e7c1b3dff2fa0ec2c37b52859d7bceed4Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Mon Jul 31 10:08:51 2023 -0400
+
+    fur_list should not use the range vector for non-ssa operands.
+    
+            gcc/PR tree-optimization/110582* gimple-range-fold.cc (fur_list::get_operand): Do not use the
+            range vector for non-ssa names.
+    
+            gcc/testsuite/
+            * gcc.dg/pr110582.c: New.
+
+- User: Andrew Macleod | Time: 2023-07-31 16:11:38 UTC
+  Text: There was a bug in the implementation of fur_list where it was using the supplied values for *any* encountered operand, not just ssa_names.   so when the phi analyzer was trying to find an initial value fro the PHI a_lsm.2_29 it was miscalculating the value of iftmp.1_15 and thought it had an (incorrect) limited range of [-2,2].
+
+ # a_lsm.12_29 = PHI <iftmp.1_11(4)>
+  iftmp.1_15 = 3 / a_lsm.12_29; 
+
+it then though it could fold away the condition.
+
+The patch adjusts the operand fetcher to work properly, and then the phi analyzer calcualtes the range for the statement properly, and we can no longer remove the condtion.
+

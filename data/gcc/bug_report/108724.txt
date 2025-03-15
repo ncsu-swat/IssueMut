@@ -1,0 +1,464 @@
+Bug Summary: [11 Regression] Poor codegen when summing two arrays without AVX or SSE
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 12.2.1, 13.0
+Known to Fail: 11.5.0, 12.2.0
+
+Comments:
+- User: Gaelan Steele | Time: 2023-02-08 19:17:27 UTC
+  Text: This program:
+
+void foo(int *a, const int *__restrict b, const int *__restrict c)
+{
+  for (int i = 0; i < 16; i++) {
+    a[i] = b[i] + c[i];
+  }
+}
+
+
+When compiled for x86 by GCC 11.1+ with -O3 -mno-avx -mno-sse, produces:
+
+foo:
+        movq    %rdx, %rax
+        subq    $8, %rsp
+        movl    (%rsi), %edx
+        movq    %rsi, %rcx
+        addl    (%rax), %edx
+        movl    4(%rax), %esi
+        movq    $0, (%rsp)
+        movl    %edx, (%rsp)
+        movq    (%rsp), %rdx
+        addl    4(%rcx), %esi
+        movq    %rdx, -8(%rsp)
+        movl    %esi, -4(%rsp)
+        movq    -8(%rsp), %rdx
+        movq    %rdx, (%rdi)
+        movl    8(%rax), %edx
+        addl    8(%rcx), %edx
+        movq    $0, -16(%rsp)
+        movl    %edx, -16(%rsp)
+        movq    -16(%rsp), %rdx
+        movl    12(%rcx), %esi
+        addl    12(%rax), %esi
+        movq    %rdx, -24(%rsp)
+        movl    %esi, -20(%rsp)
+        movq    -24(%rsp), %rdx
+        movq    %rdx, 8(%rdi)
+        [snip more of the same]
+        movl    48(%rcx), %edx
+        movq    $0, -96(%rsp)
+        addl    48(%rax), %edx
+        movl    %edx, -96(%rsp)
+        movq    -96(%rsp), %rdx
+        movl    52(%rcx), %esi
+        addl    52(%rax), %esi
+        movq    %rdx, -104(%rsp)
+        movl    %esi, -100(%rsp)
+        movq    -104(%rsp), %rdx
+        movq    %rdx, 48(%rdi)
+        movl    56(%rcx), %edx
+        movq    $0, -112(%rsp)
+        addl    56(%rax), %edx
+        movl    %edx, -112(%rsp)
+        movq    -112(%rsp), %rdx
+        movl    60(%rcx), %ecx
+        addl    60(%rax), %ecx
+        movq    %rdx, -120(%rsp)
+        movl    %ecx, -116(%rsp)
+        movq    -120(%rsp), %rdx
+        movq    %rdx, 56(%rdi)
+        addq    $8, %rsp
+        ret
+
+(Godbolt link:https://godbolt.org/z/qq9dbP8ed)
+
+This is bizarre - it's storing intermediate results on the stack, instead of keeping them in registers or writing them directly to *a, which is bound to be slow. (GCC 10.4, and Clang, produce more or less what I would expect, using only the provided arrays and a register.) I haven't done any benchmarking myself, but Jonathan Wakely's results (on list:https://gcc.gnu.org/pipermail/gcc-help/2023-February/142181.html) seem to bear this out.
+
+From a bisect, this behavior seems to have been introduced by commit 33c0f246f799b7403171e97f31276a8feddd05c9 (tree-optimization/97626 - handle SCCs properly in SLP stmt analysis) from Oct 2020, and persists into GCC trunk.
+
+- User: Andrew Pinski | Time: 2023-02-08 19:30:22 UTC
+  Text: I noticed that on aarch64, with -mgeneral-regs-only, the problem of trying to do a vectorization has been there since at least GCC 5 ...
+
+- User: Hongtao.liu | Time: 2023-02-09 09:37:20 UTC
+  Text: Guess it's related to 
+
+ 8537bool
+ 8538vect_can_vectorize_without_simd_p (tree_code code)
+ 8539{
+ 8540  switch (code)
+ 8541    {
+ 8542    case PLUS_EXPR:
+ 8543    case MINUS_EXPR:
+ 8544    case NEGATE_EXPR:
+ 8545    case BIT_AND_EXPR:
+ 8546    case BIT_IOR_EXPR:
+ 8547    case BIT_XOR_EXPR:
+ 8548    case BIT_NOT_EXPR:
+ 8549      return true;
+ 8550
+ 8551    default:
+ 8552      return false;
+ 8553    }
+
+vectorizer will still do vectorization even without simd instructions.
+
+- User: Richard Biener | Time: 2023-02-09 13:54:25 UTC
+  Text: Adding -fopt-info shows
+
+t.c:3:21: optimized: loop vectorized using 8 byte vectors
+t.c:1:6: optimized: loop with 7 iterations completely unrolled (header execution count 63136016)
+
+disabling unrolling instead shows
+
+.L2:
+        leaq    (%rsi,%rax), %r8
+        leaq    (%rdx,%rax), %rdi
+        movl    (%r8), %ecx
+        addl    (%rdi), %ecx
+        movq    %r10, -8(%rsp)
+        movl    %ecx, -8(%rsp)
+        movq    -8(%rsp), %rcx
+        movl    4(%rdi), %edi
+        addl    4(%r8), %edi
+        movq    %rcx, -16(%rsp)
+        movl    %edi, -12(%rsp)
+        movq    -16(%rsp), %rcx
+        movq    %rcx, (%r9,%rax)
+        addq    $8, %rax
+        cmpq    $64, %rax
+        jne     .L2
+
+and what happens is that vector lowering fails to perform generic vector
+addition (vector lowering is supposed to materialize that), but instead
+decomposes the vector, doing scalar adds, which eventually results in
+us spilling ...
+
+The reason is that vector lowering does
+
+/* Expand a vector operation to scalars; for integer types we can use
+   special bit twiddling tricks to do the sums a word at a time, using
+   function F_PARALLEL instead of F.  These tricks are done only if
+   they can process at least four items, that is, only if the vector
+   holds at least four items and if a word can hold four items.  */
+static tree
+expand_vector_addition (gimple_stmt_iterator *gsi,
+                        elem_op_func f, elem_op_func f_parallel,
+                        tree type, tree a, tree b, enum tree_code code)
+{
+  int parts_per_word = BITS_PER_WORD / vector_element_bits (type);
+        
+  if (INTEGRAL_TYPE_P (TREE_TYPE (type))
+      && parts_per_word >= 4
+      && nunits_for_known_piecewise_op (type) >= 4)
+    return expand_vector_parallel (gsi, f_parallel,
+                                   type, a, b, code);
+  else
+    return expand_vector_piecewise (gsi, f,
+                                    type, TREE_TYPE (type),
+                                    a, b, code, false);
+
+so it only treats >= 4 elements as profitable to vectorize this way but the
+vectorizer doesn't seem to know that, it instead applies its own cost model
+here while vector lowering doesn't have any.
+
+- User: Richard Biener | Time: 2023-02-10 10:00:29 UTC
+  Text: So the vectorizer thinks that
+
+foo:
+.LFB0:
+        .cfi_startproc
+        movabsq $9223372034707292159, %rax
+        movq    %rdi, %rcx
+        movq    (%rdx), %r10
+        movq    (%rsi), %rdi
+        movq    %rax, %r8
+        movq    %rax, %r9
+        movq    %rax, %r11
+        andq    %r10, %r8
+        andq    %rdi, %r9
+        addq    %r8, %r9
+        movq    %rdi, %r8
+        movabsq $-9223372034707292160, %rdi
+        xorq    %r10, %r8
+        movq    8(%rdx), %r10
+        andq    %rdi, %r8
+        xorq    %r9, %r8
+        movq    %rax, %r9
+        movq    %r8, (%rcx)
+        movq    8(%rsi), %r8
+        andq    %r10, %r9
+        andq    %r8, %r11
+        xorq    %r10, %r8
+        movq    16(%rdx), %r10
+        addq    %r11, %r9
+        andq    %rdi, %r8
+        movq    %rax, %r11
+        xorq    %r9, %r8
+        movq    %rax, %r9
+        andq    %r10, %r11
+        movq    %r8, 8(%rcx)
+        movq    16(%rsi), %r8
+        andq    %r8, %r9
+        xorq    %r10, %r8
+        movq    24(%rdx), %r10
+        addq    %r11, %r9
+        andq    %rdi, %r8
+        movq    %rax, %r11
+        xorq    %r9, %r8
+        movq    %rax, %r9
+        andq    %r10, %r11
+        movq    %r8, 16(%rcx)
+        movq    24(%rsi), %r8
+        andq    %r8, %r9
+        xorq    %r10, %r8
+        movq    32(%rdx), %r10
+        addq    %r11, %r9
+        andq    %rdi, %r8
+        movq    %rax, %r11
+        xorq    %r9, %r8
+        movq    %rax, %r9
+        andq    %r10, %r11
+        movq    %r8, 24(%rcx)
+        movq    32(%rsi), %r8
+        andq    %r8, %r9
+        xorq    %r10, %r8
+        movq    40(%rdx), %r10
+        addq    %r11, %r9
+        andq    %rdi, %r8
+        movq    %rax, %r11
+        xorq    %r9, %r8
+        movq    %rax, %r9
+        andq    %r10, %r11
+        movq    %r8, 32(%rcx)
+        movq    40(%rsi), %r8
+        andq    %r8, %r9
+        addq    %r11, %r9
+        xorq    %r10, %r8
+        movq    48(%rsi), %r10
+        movq    %rax, %r11
+        andq    %rdi, %r8
+        xorq    %r9, %r8
+        movq    %rax, %r9
+        andq    %r10, %r11
+        movq    %r8, 40(%rcx)
+        movq    48(%rdx), %r8
+        movq    56(%rdx), %rdx
+        andq    %r8, %r9
+        xorq    %r10, %r8
+        addq    %r11, %r9
+        andq    %rdi, %r8
+        xorq    %r9, %r8
+        movq    %r8, 48(%rcx)
+        movq    56(%rsi), %r8
+        movq    %rax, %rsi
+        andq    %rdx, %rsi
+        andq    %r8, %rax
+        xorq    %r8, %rdx
+        addq    %rsi, %rax
+        andq    %rdi, %rdx
+        xorq    %rdx, %rax
+        movq    %rax, 56(%rcx)
+        ret
+
+will be faster than when not vectorizing.  Not vectorizing produces
+
+foo:
+.LFB0:
+        .cfi_startproc
+        movq    %rsi, %rcx
+        movl    (%rsi), %esi
+        addl    (%rdx), %esi
+        movl    %esi, (%rdi)
+        movl    4(%rdx), %esi
+        addl    4(%rcx), %esi
+        movl    %esi, 4(%rdi)
+        movl    8(%rdx), %esi
+        addl    8(%rcx), %esi
+        movl    %esi, 8(%rdi)
+        movl    12(%rdx), %esi
+        addl    12(%rcx), %esi
+        movl    %esi, 12(%rdi)
+        movl    16(%rdx), %esi
+        addl    16(%rcx), %esi
+        movl    %esi, 16(%rdi)
+        movl    20(%rdx), %esi
+        addl    20(%rcx), %esi
+        movl    %esi, 20(%rdi)
+        movl    24(%rdx), %esi
+        addl    24(%rcx), %esi
+        movl    %esi, 24(%rdi)
+        movl    28(%rdx), %esi
+        addl    28(%rcx), %esi
+        movl    %esi, 28(%rdi)
+        movl    32(%rdx), %esi
+        addl    32(%rcx), %esi
+        movl    %esi, 32(%rdi)
+        movl    36(%rdx), %esi
+        addl    36(%rcx), %esi
+        movl    %esi, 36(%rdi)
+        movl    40(%rdx), %esi
+        addl    40(%rcx), %esi
+        movl    %esi, 40(%rdi)
+        movl    44(%rdx), %esi
+        addl    44(%rcx), %esi
+        movl    %esi, 44(%rdi)
+        movl    48(%rdx), %esi
+        addl    48(%rcx), %esi
+        movl    %esi, 48(%rdi)
+        movl    52(%rdx), %esi
+        addl    52(%rcx), %esi
+        movl    %esi, 52(%rdi)
+        movl    56(%rdx), %esi
+        movl    60(%rdx), %edx
+        addl    56(%rcx), %esi
+        addl    60(%rcx), %edx
+        movl    %esi, 56(%rdi)
+        movl    %edx, 60(%rdi)
+        ret
+
+The vectorizer produces un-lowered vector adds which is good in case followup
+optimizations are possible (the ops are not obfuscated), but also bad
+because unrolling estimates the size in a wrong way.  Costs go
+
+*_3 1 times scalar_load costs 12 in prologue
+*_5 1 times scalar_load costs 12 in prologue 
+_4 + _6 1 times scalar_stmt costs 4 in prologue
+_8 1 times scalar_store costs 12 in prologue 
+
+vs
+
+*_3 1 times unaligned_load (misalign -1) costs 12 in body
+*_5 1 times unaligned_load (misalign -1) costs 12 in body
+_4 + _6 1 times vector_stmt costs 4 in body
+_4 + _6 5 times scalar_stmt costs 20 in body
+_8 1 times unaligned_store (misalign -1) costs 12 in body
+
+and as usual the savings from the wide loads and store outweight the
+loss on the arithmetic side, but it's a close call:
+
+  Vector inside of loop cost: 60
+  Scalar iteration cost: 40
+
+so 2*40 > 60 and the vectorization is profitable.
+
+The easiest fix is to avoid vectorizing, another possibility is to adhere
+to the vectorizers decision and expand to the lowered sequence immediately
+from within the vectorizer itself.  The original goal was to remove
+this hard cap on the number of elements but this bug shows that work was
+incomplete.
+
+I'm going to re-instantiate the hard cap and revisit for GCC 14.
+
+- User: GCC Commits | Time: 2023-02-10 11:22:04 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:dc87e1391c55c666c7ff39d4f0dea87666f25468commitr13-5771-gdc87e1391c55c666c7ff39d4f0dea87666f25468Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Feb 10 11:07:30 2023 +0100
+
+    tree-optimization/108724 - vectorized code getting piecewise expanded
+    
+    This fixes an oversight to when removing the hard limits on using
+    generic vectors for the vectorizer to enable both SLP and BB
+    vectorization to use those.  The vectorizer relies on vector lowering
+    to expand plus, minus and negate to bit operations but vector
+    lowering has a hard limit on the minimum number of elements per
+    work item.  Vectorizer costs for the testcase at hand work out
+    to vectorize a loop with just two work items per vector and that
+    causes element wise expansion and spilling.
+    
+    The fix for now is to re-instantiate the hard limit, matching what
+    vector lowering does.  For the future the way to go is to emit the
+    lowered sequence directly from the vectorizer instead.PR tree-optimization/108724* tree-vect-stmts.cc (vectorizable_operation): Avoid
+            using word_mode vectors when vector lowering will
+            decompose them to elementwise operations.
+    
+            * gcc.target/i386/pr108724.c: New testcase.
+
+- User: Richard Biener | Time: 2023-02-10 11:22:26 UTC
+  Text: Fixed on trunk sofar.
+
+- User: GCC Commits | Time: 2023-03-15 09:48:03 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:21e7145aaf582c263e69a3ee05dfa9d42bdbd1aacommitr12-9258-g21e7145aaf582c263e69a3ee05dfa9d42bdbd1aaAuthor: Richard Biener <rguenther@suse.de>
+Date:   Fri Feb 10 11:07:30 2023 +0100
+
+    tree-optimization/108724 - vectorized code getting piecewise expanded
+    
+    This fixes an oversight to when removing the hard limits on using
+    generic vectors for the vectorizer to enable both SLP and BB
+    vectorization to use those.  The vectorizer relies on vector lowering
+    to expand plus, minus and negate to bit operations but vector
+    lowering has a hard limit on the minimum number of elements per
+    work item.  Vectorizer costs for the testcase at hand work out
+    to vectorize a loop with just two work items per vector and that
+    causes element wise expansion and spilling.
+    
+    The fix for now is to re-instantiate the hard limit, matching what
+    vector lowering does.  For the future the way to go is to emit the
+    lowered sequence directly from the vectorizer instead.PR tree-optimization/108724* tree-vect-stmts.cc (vectorizable_operation): Avoid
+            using word_mode vectors when vector lowering will
+            decompose them to elementwise operations.
+    
+            * gcc.target/i386/pr108724.c: New testcase.
+    
+    (cherry picked from commit dc87e1391c55c666c7ff39d4f0dea87666f25468)
+
+- User: Richard Biener | Time: 2023-05-05 08:34:59 UTC
+  Text: Note that the GCC 11 branch isn't affected by what's fixed on trunk and GCC 12, the 11 branch still uses vect_worthwhile_without_simd_p which checks
+vect_min_worthwhile_factor.
+
+Instead the GCC 11 branch correctly doesn't vectorize the add but instead
+vectorizes the stores only which results in stack spilling to build
+the DImode values we then store.  We're also doing this in odd ways.
+
+In GCC 13/12 we have fixed this in the costing:
+
+node 0x4156628 1 times vec_construct costs 100 in prologue
+
+while the GCC 11 branch costs this as 8.  Not sure where this happens in
+the target.
+
+Hmm, I think this happens in error.
+
+- User: Richard Biener | Time: 2023-05-05 12:06:22 UTC
+  Text: And the remaining issue with GCC 11 would be that we fail to account for the
+GPR -> XMM move.  Or the remaining issue for _all_ branches is that we fail
+to realize that emulated "vector" CTORs are even more expensive since we lack
+a good way to materialize the CTOR in a GPR (generic RTL expansion fails to
+consider using shift + and for example).
+
+Not sure what a good expansion of a V2SImode, V4HImode or V8QImode
+CTOR to a GPR DImode reg would look like.
+
+- User: Richard Biener | Time: 2023-05-23 12:55:13 UTC
+  Text: On trunk we're back to vectorizing but as intended with DImode which makes us save half of the loads and stores and we think the extended required arithmetic
+covers up for that (by quite some margin).
+
+        movabsq $9223372034707292159, %rcx
+        movq    (%rdx), %rax
+        movq    (%rsi), %rsi
+        movq    %rcx, %rdx
+        andq    %rax, %rdx
+        andq    %rsi, %rcx
+        xorq    %rsi, %rax
+        addq    %rcx, %rdx
+        movabsq $-9223372034707292160, %rcx
+        andq    %rcx, %rax
+        xorq    %rdx, %rax
+        movq    %rax, (%rdi)
+
+vs
+
+        movl    (%rdx), %eax
+        addl    (%rsi), %eax
+        movl    %eax, (%rdi)
+        movl    4(%rdx), %eax
+        addl    4(%rsi), %eax
+        movl    %eax, 4(%rdi)
+
+- User: Jakub Jelinek | Time: 2023-05-29 10:08:00 UTC
+  Text: GCC 11.4 is being released, retargeting bugs to GCC 11.5.
+
+- User: Richard Biener | Time: 2024-07-19 12:16:14 UTC
+  Text: Fixed in GCC 12.3.
+

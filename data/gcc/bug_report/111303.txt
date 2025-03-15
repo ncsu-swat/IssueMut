@@ -1,0 +1,180 @@
+Bug Summary: [14 Regression] ICE: in type, at value-range.h:869
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Shaohua Li | Time: 2023-09-06 08:24:26 UTC
+  Text: gcc at -O2 crashes on the following test case.
+
+Compiler explorer:https://godbolt.org/z/qK6dMTK14$ cat a.c
+unsigned char a;
+int b(int c) {
+  if (c >= 5000)
+    return c / 5;
+}
+void d() { b(a - 5); }
+int main() {}
+$
+$ gcc -O2 a.c
+during GIMPLE pass: evrp
+<source>: In function 'd':
+<source>:7:1: internal compiler error: in type, at value-range.h:869
+    7 | int main() {}
+      | ^~~
+0x21af71e internal_error(char const*, ...)
+	???:0
+0x9dd814 fancy_abort(char const*, int, char const*)
+	???:0
+0x16cada5 gimple_simplify_TRUNC_DIV_EXPR(gimple_match_op*, gimple**, tree_node* (*)(tree_node*), code_helper, tree_node*, tree_node*, tree_node*)
+	???:0
+0x180c22a gimple_match_op::resimplify(gimple**, tree_node* (*)(tree_node*))
+	???:0
+0x180c880 gimple_simplify(gimple*, gimple_match_op*, gimple**, tree_node* (*)(tree_node*), tree_node* (*)(tree_node*))
+	???:0
+0x1f41940 gimple_ranger::fold_stmt(gimple_stmt_iterator*, tree_node* (*)(tree_node*))
+	???:0
+0x13c5478 rvrp_folder::fold_stmt(gimple_stmt_iterator*)
+	???:0
+0x12a653e substitute_and_fold_dom_walker::before_dom_children(basic_block_def*)
+	???:0
+0x1f09107 dom_walker::walk(basic_block_def*)
+	???:0
+0x12a568b substitute_and_fold_engine::substitute_and_fold(basic_block_def*)
+	???:0
+0x13c4f9c execute_ranger_vrp(function*, bool, bool)
+	???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+Compiler returned: 1
+$
+
+- User: Shaohua Li | Time: 2023-09-06 09:21:35 UTC
+  Text: Bisected tor14-3644-g1aceceb1e2
+
+- User: Jiu Fu Guo | Time: 2023-09-06 11:12:34 UTC
+  Text: Thanks for reporting this!
+
+- User: Jiu Fu Guo | Time: 2023-09-06 12:36:21 UTC
+  Text: In the pattern of match.pd, there is:
+
+          && range_op_handler (PLUS_EXPR).overflow_free_p (vr0, vr1)
+          && get_range_query (cfun)->range_of_expr (vr3, @3)
+          /* "X+C" and "X" are not of opposite sign.  */
+          && (TYPE_UNSIGNED (type)
+              || (vr0.nonnegative_p () && vr3.nonnegative_p ())
+              || (vr0.nonpositive_p () && vr3.nonpositive_p ())))
+
+
+For this case, "vr3" is "undefined_p", then "vr3.nonnegative_p ()" trige ICE.
+
+Checking "!vr3.undefine_p ()" would be a safe fix for this ICE.
+
+- User: Jiu Fu Guo | Time: 2023-09-06 12:47:28 UTC
+  Text: For the pattern: "(X + C) / N", "op (plus@3 @0 INTEGER_CST@1) INTEGER_CST@2)"
+where "X" has value-range, and "X + C" does not overflow:
+
+&& get_range_query (cfun)->range_of_expr (vr0, @0))
+&& get_range_query (cfun)->range_of_expr (vr1, @1)
+&& range_op_handler (PLUS_EXPR).overflow_free_p (vr0, vr1)
+
+Then "@3"(it is X+C) would be with value-range usually.
+But for particular cases, like this PR, "vr3" is undefined. 
+Below would be the reason for why "vr3" is undefined:
+
+
+_3 = _2 + -5;
+if (0 != 0)
+  goto <bb 3>; [34.00%]
+else
+  goto <bb 4>; [66.00%]
+;;  succ:       3
+;;              4
+
+;; basic block 3, loop depth 0
+;;  pred:       2
+_5 = _3 / 5; 
+;;  succ:       4
+
+The whole pattern "(_2 + -5 ) / 5" is in "bb 3", but "bb" would be unreachable (because "if (0 != 0)" is always false).
+And "get_range_query (cfun)->range_of_expr (vr3, @3)" is checked in "bb 3",
+"range_of_expr" gets an "undefined vr3".
+
+- User: Andrew Pinski | Time: 2023-09-09 16:04:06 UTC
+  Text: ***Bug 111355has been marked as a duplicate of this bug. ***
+
+- User: GCC Commits | Time: 2023-09-13 01:32:06 UTC
+  Text: The master branch has been updated by Jiu Fu Guo <guojiufu@gcc.gnu.org>:https://gcc.gnu.org/g:8d8bc560b6ab7f3153db23ffb37157528e5b2c9acommitr14-3913-g8d8bc560b6ab7f3153db23ffb37157528e5b2c9aAuthor: Jiufu Guo <guojiufu@linux.ibm.com>
+Date:   Wed Sep 6 21:38:11 2023 +0800
+
+    Checking undefined_p before using the vr
+    
+    For pattern "(X + C) / N": "div (plus@3 @0 INTEGER_CST@1) INTEGER_CST@2)",
+    Even if "X" has value-range and "X + C" does not overflow, "@3" may still
+    be undefined. Like below example:
+    
+    _3 = _2 + -5;
+    if (0 != 0)
+      goto <bb 3>; [34.00%]
+    else
+      goto <bb 4>; [66.00%]
+    ;;  succ:       3
+    ;;              4
+    
+    ;; basic block 3, loop depth 0
+    ;;  pred:       2
+    _5 = _3 / 5;
+    ;;  succ:       4
+    
+    The whole pattern "(_2 + -5 ) / 5" is in "bb 3", but "bb 3" would be
+    unreachable (because "if (0 != 0)" is always false).
+    And "get_range_query (cfun)->range_of_expr (vr3, @3)" is checked in
+    "bb 3", "range_of_expr" gets an "undefined vr3". Where "@3" is "_5".
+    
+    So, before using "vr3", it would be safe to check "!vr3.undefined_p ()".PR tree-optimization/111303gcc/ChangeLog:
+    
+            * match.pd ((X - N * M) / N): Add undefined_p checking.
+            ((X + N * M) / N): Likewise.
+            ((X + C) div_rshift N): Likewise.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/pr111303.c: New test.
+
+- User: GCC Commits | Time: 2023-09-18 02:19:07 UTC
+  Text: The master branch has been updated by Jiu Fu Guo <guojiufu@gcc.gnu.org>:https://gcc.gnu.org/g:55b22a6f630e76a0be913ced8bf1b017eaffd89bcommitr14-4082-g55b22a6f630e76a0be913ced8bf1b017eaffd89bAuthor: Jiufu Guo <guojiufu@linux.ibm.com>
+Date:   Wed Sep 13 16:12:05 2023 +0800
+
+    use local range for one more pattern in match.pd
+    
+    For "get_global_range_query" SSA_NAME_RANGE_INFO can be queried.
+    For "get_range_query", it could get more context-aware range info.
+    And look at the implementation of "get_range_query",  it returns
+    global range if no local fun info.
+    
+    ATTRIBUTE_RETURNS_NONNULL inline range_query *
+    get_range_query (const struct function *fun)
+    {
+      return (fun && fun->x_range_query) ? fun->x_range_query : &global_ranges;
+    }
+    
+    So, using "get_range_query" would cover more case.
+    For example, the test case of "pr111303.c".PR middle-end/111303gcc/ChangeLog:
+    
+            * match.pd ((t * 2) / 2): Update pattern.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/pr111303.c: New test.
+
+- User: Jiu Fu Guo | Time: 2023-09-18 02:31:06 UTC
+  Text: Fix is committed viar14-3913-g8d8bc560b6ab7f3153db23ffb37157528e5b2c9a.
+
+- User: Jiu Fu Guo | Time: 2023-09-18 02:38:12 UTC
+  Text: (In reply to CVS Commits fromcomment #7) this comment should be linked toPR111324.
+

@@ -1,0 +1,174 @@
+Bug Summary: ICE: verify_flow_info failed: returns_twice call is not first in basic block 7 with a __returns_twice__ function with _BitInt() argument
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-01-18 03:54:58 UTC
+  Text: Createdattachment 57127[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc testcase.c
+testcase.c: In function 'foo':
+testcase.c:4:1: error: returns_twice call is not first in basic block 7
+    4 | foo(int x)
+      | ^~~
+bar (_8);
+during GIMPLE pass: bitintlower0
+testcase.c:4:1: internal compiler error: verify_flow_info failed
+0xf8edde verify_flow_info()
+        /repo/gcc-trunk/gcc/cfghooks.cc:287
+0x156029c checking_verify_flow_info()
+        /repo/gcc-trunk/gcc/cfghooks.h:214
+0x156029c cleanup_tree_cfg_noloop
+        /repo/gcc-trunk/gcc/tree-cfgcleanup.cc:1154
+0x156029c cleanup_tree_cfg(unsigned int)
+        /repo/gcc-trunk/gcc/tree-cfgcleanup.cc:1205
+0x13c8a3c execute_function_todo
+        /repo/gcc-trunk/gcc/passes.cc:2057
+0x13c8eee execute_todo
+        /repo/gcc-trunk/gcc/passes.cc:2142
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc testcase.c
+testcase.c: In function 'foo':
+testcase.c:4:1: error: returns_twice call is not first in basic block 7
+    4 | foo(int x)
+      | ^~~
+bar (_8);
+during GIMPLE pass: bitintlower0
+testcase.c:4:1: internal compiler error: verify_flow_info failed
+0xf8edde verify_flow_info()
+        /repo/gcc-trunk/gcc/cfghooks.cc:287
+0x156029c checking_verify_flow_info()
+        /repo/gcc-trunk/gcc/cfghooks.h:214
+0x156029c cleanup_tree_cfg_noloop
+        /repo/gcc-trunk/gcc/tree-cfgcleanup.cc:1154
+0x156029c cleanup_tree_cfg(unsigned int)
+        /repo/gcc-trunk/gcc/tree-cfgcleanup.cc:1205
+0x13c8a3c execute_function_todo
+        /repo/gcc-trunk/gcc/passes.cc:2057
+0x13c8eee execute_todo
+        /repo/gcc-trunk/gcc/passes.cc:2142
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: Andrew Pinski | Time: 2024-01-18 22:59:28 UTC
+  Text: Confirmed.
+
+  _7 = VIEW_CONVERT_EXPR<_BitInt(313)>(bitint.2);
+
+is placed in the same BB as the call to foo.
+
+- User: Jakub Jelinek | Time: 2024-01-22 12:26:40 UTC
+  Text: The question is what we can do about it.
+
+bitint_large_huge::lower_call wants for the large/huge BITINT_TYPE SSA_NAME call arguments (with the exception of uninitialized ones) add a load before the call, which loads the argument from some VAR_DECL or PARM_DECL etc.
+
+And the CFG requirements for returns_twice calls is that there is an abnormal edge from the .ABNORMAL_DISPATCHER block to the start of the call, so we can't insert anything
+before the call.
+
+Now, in fixes likePR109410this was easy because reassoc is adding those statements to the start of the function, so we can easily split the ENTRY -> bb2 edge and insert stuff there.
+
+But here it is much more complicated.
+In the easier case, we have just one EDGE_FALLTHRU predecessor edge plus the EDGE_ABNORMAL edge.
+I guess we can in that case insert on that EDGE_FALLTHRU edge, but then there is a question if one can just use the SSA_NAME in the return argument or not.
+If there is just one call like in the #c0 case, that is most likely the case, but what about say:
+void foo (_BitInt(6321)) __attribute__((returns_twice));
+void baz (void);
+
+void
+bar (_BitInt(6321) x)
+{
+  foo (x);
+  baz ();
+  foo (x + 1);
+  baz ();
+}
+One can insert the load from x on the entry edge because that dominates the .ABNORMAL_DISPATCHER bb, but guess for the _1 (x + 1) load we need some PHI and it isn't clear to me what to use on the edge from the abnormal dispatcher (and whether to use some PHI on the .ABNORMAL_DISPATCHER bb as well).
+
+And, if the bb with returns_twice call contains multiple predecessor edges and even worse say next to the .ABNORMAL_DISPATCHER abnormal edge some EDGE_EH or similar incoming edges, probably need to add some bb before the returns_twice bb but then no idea what to do with PHIs etc.
+
+Or we could for the time being just sorry on returns_twice calls with large/huge _BitInt arguments.
+
+- User: Richard Biener | Time: 2024-01-22 12:45:11 UTC
+  Text: Well, this simply highlights that the CFG doesn't really match "returns-twice".
+The "returns-twice" part is just
+
+ (void) // no return value
+
+but only the SJLJ __builtin_setjmp_setup/receiver has this properly handled.
+
+If we wanted to apply this in a more general form then a function
+
+T __attribute__((returns_twice)) fn (ARGS ...);
+
+would have to be represented like
+
+
+<bb 2>
+  fn (ARGS ...);
+
+<bb 3>
+  T retval = .RECEIVE ();
+
+where there's two incoming edges into BB 3 (one abnormal) and just a
+fallthru from BB2 to BB3.  IIRC the two outgoing edges from the receive
+part are just a code motion barrier.  So there should never be PHIs
+necessary for the call arguments.
+
+You could make sure to put the correct argument on the fallthru to the
+call and simply put uninit SSA names on the abnormal entry.  I think that
+should work as far as correctness is concerned.
+
+- User: GCC Commits | Time: 2024-03-15 08:21:41 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:90b9872311ccb24685ba33b6ba6f374d50f03874commitr14-9490-g90b9872311ccb24685ba33b6ba6f374d50f03874Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Mar 15 09:16:43 2024 +0100
+
+    bitint: Fix up adjustment of large/huge _BitInt arguments of returns_twice calls [PR113466]
+    
+    This patch (on top of the just posted gsi_safe_insert* fixes patch)
+    fixes the instrumentation of large/huge _BitInt SSA_NAME arguments of
+    returns_twice calls.
+    
+    In this case it isn't just a matter of using gsi_safe_insert_before instead
+    of gsi_insert_before, we need to do more.
+    
+    One thing is that unlike the asan/ubsan instrumentation which does just some
+    checking, here we want the statement before the call to load into a SSA_NAME
+    which is passed to the call.  With another edge we need to add a PHI,
+    with one PHI argument the loaded SSA_NAME, another argument an uninitialized
+    warning free SSA_NAME and a result and arrange for all 3 SSA_NAMEs to be
+    preserved (i.e. stay as is, be no longer lowered afterwards).
+    
+    Unfortunately, edge_before_returns_twice_call can create new SSA_NAMEs using
+    copy_ssa_name and while we can have a reasonable partition for them (same
+    partition as PHI result correspoding to the PHI argument newly added), adding
+    SSA_NAMEs into a partition after the partitions are finalized is too ugly.
+    So, this patch takes a different approach suggested by Richi, just emit
+    the argument loads before the returns_twice call normally (i.e. temporarily
+    create invalid IL) and just remember that we did that, and when the bitint
+    lowering is otherwise done fix this up, gsi_remove those statements,
+    gsi_safe_insert_before and and create the needed new PHIs.
+    
+    2024-03-15  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113466* gimple-lower-bitint.cc (bitint_large_huge): Add m_returns_twice_calls
+            member.
+            (bitint_large_huge::bitint_large_huge): Initialize it.
+            (bitint_large_huge::~bitint_large_huge): Release it.
+            (bitint_large_huge::lower_call): Remember ECF_RETURNS_TWICE call stmts
+            before which at least one statement has been inserted.
+            (gimple_lower_bitint): Move argument loads before ECF_RETURNS_TWICE
+            calls to a different block and add corresponding PHIs.
+    
+            * gcc.dg/bitint-100.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-03-15 08:36:03 UTC
+  Text: Fixed.
+

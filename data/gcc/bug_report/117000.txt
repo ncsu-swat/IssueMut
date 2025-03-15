@@ -1,0 +1,140 @@
+Bug Summary: Inefficient code for 32-byte struct comparison (ptest missing)
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Paweł Bylica | Time: 2024-10-07 15:40:43 UTC
+  Text: I was investigating why in GCC 13.3 the functions test1 and test2 produce different x86 assembly. They only differ by the placement of the int -> U256 user defined conversion.
+
+This lead to the discovery that the generated x86-64-v2 for all the examples is not very efficient. E.g. for some reason a shift instruction is used (psrldq).
+
+In GCC 14+ the compilation converges to test1 also in test2.https://godbolt.org/z/r1vfcPoneusing uint64_t = unsigned long;
+
+struct U256
+{
+    uint64_t words_[4]{};
+
+    U256(uint64_t v)
+      : words_{v}
+    {}
+};
+
+bool eq(const U256& x, const U256& y)
+{
+    uint64_t folded = 0;
+    for (int i = 0; i < 4; ++i)
+        folded |= (x.words_[i] ^ y.words_[i]);
+    return folded == 0;
+}
+
+bool eqi(const U256& x, uint64_t y)
+{
+    return eq(x, U256(y));
+}
+
+auto test1(const U256& x)
+{
+    return eqi(x, uint64_t(0));
+}
+
+bool test2(const U256& x)
+{
+    return eq(x, U256(0));
+}
+
+
+test1(U256 const&):
+        movdqu  xmm1, XMMWORD PTR [rdi+16]
+        movdqu  xmm0, XMMWORD PTR [rdi]
+        por     xmm0, xmm1
+        movdqa  xmm1, xmm0
+        psrldq  xmm1, 8
+        por     xmm0, xmm1
+        movq    rax, xmm0
+        test    rax, rax
+        sete    al
+        ret
+test2(U256 const&):
+        mov     rax, QWORD PTR [rdi]
+        or      rax, QWORD PTR [rdi+8]
+        or      rax, QWORD PTR [rdi+16]
+        or      rax, QWORD PTR [rdi+24]
+        sete    al
+        ret
+
+- User: Andrew Pinski | Time: 2024-10-07 16:47:01 UTC
+  Text: >In GCC 14+ the compilation converges to test1 also in test2.So what is happening in GCC 13 is SLP vectorizer is not able to vectorizer test2 but GCC 14 is. The loop vectorizer is able to handle test1 in both.
+
+- User: Andrew Pinski | Time: 2024-10-07 16:48:03 UTC
+  Text: Otherwise it is a vector cost model issue.
+
+- User: Richard Biener | Time: 2024-10-08 06:47:52 UTC
+  Text: In particular we miss the fact that
+
+  _29 = .REDUC_IOR (vect_folded_10.32_23);
+  _12 = _29 == 0;
+
+could be optimized to
+
+  _12 = vect_folded_10.32_23 == {0, 0, ... };
+
+it's probably too late for RTL to realize this.  Some pattern in match.pd
+could handle this, like
+
+(for cmp (eq ne)
+ (simplify
+  (cmp (IFN_REDUC_IOR @0) integer_zerop)
+  (cmp @0 { build_zero_cst (TREE_TYPE (@0)); } )))
+
+results in
+
+_Z5test1RK4U256:
+.LFB5:
+        .cfi_startproc
+        movdqu  (%rdi), %xmm0
+        movdqu  16(%rdi), %xmm1
+        por     %xmm1, %xmm0
+        ptest   %xmm0, %xmm0
+        sete    %al
+        ret
+
+_Z5test2RK4U256:
+.LFB6:
+        .cfi_startproc
+        movdqu  16(%rdi), %xmm0
+        movdqu  (%rdi), %xmm1
+        por     %xmm1, %xmm0
+        ptest   %xmm0, %xmm0
+        sete    %al
+        ret
+
+- User: GCC Commits | Time: 2024-10-09 07:53:02 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:5977b746db3925aaba37722f5312419d5f2968a5commitr15-4194-g5977b746db3925aaba37722f5312419d5f2968a5Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Oct 8 09:01:01 2024 +0200
+
+    tree-optimization/117000 - elide .REDUC_IOR with compare against zero
+    
+    The following adds a pattern to elide a .REDUC_IOR operation when
+    the result is compared against zero with a cbranch.  I've resorted
+    to using can_compare_p since that's what RTL expansion eventually
+    checks - while GIMPLE allowed whole vector equality compares for long
+    I'll notice vector lowering won't lower unsupported ones and RTL
+    expansion doesn't seem to try using [u]cmp<vector-mode> optabs
+    (and neither x86 nor aarch64 implements those).  There's cstore
+    but no target implements that for vector modes either.PR tree-optimization/117000* match.pd (.REDUC_IOR !=/== 0): New pattern.
+            * gimple-match-head.cc: Include memmodel.h and optabs.h.
+            * generic-match-head.cc: Likewise.
+    
+            * gcc.target/i386/pr117000.c: New testcase.
+
+- User: Richard Biener | Time: 2024-10-09 07:53:53 UTC
+  Text: Fixed for GCC 15.
+
+- User: Paweł Bylica | Time: 2024-10-10 15:25:21 UTC
+  Text: Thanks for fixing this. Is there a way to get similar effect in GCC 14?
+

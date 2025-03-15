@@ -1,0 +1,131 @@
+Bug Summary: [14 Regression] Ice: tree check: expected none of vector_type,  have vector_type in get_value_for_expr, at tree-ssa-ccp.cc:686
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Binderman | Time: 2023-06-30 17:43:20 UTC
+  Text: For this C code:
+
+struct {
+  long *sp;
+  long *csp
+} neko_interp_loop_vm;
+int neko_interp_loop_vm_2;
+void neko_interp_loop() {
+  long pc[] = {&&LabelAccGlobal, &&LabelPhysCompare, &&LabelTailCall,
+               &&LabelLoop, &&LabelMakeArray2};
+  long *sp, *csp = neko_interp_loop_vm.csp;
+LabelAccGlobal:
+  neko_interp_loop_vm.sp = sp;
+  neko_interp_loop_vm.csp = csp;
+  goto * 0;
+LabelTailCall:
+  csp = sp -= neko_interp_loop_vm_2;
+LabelMakeArray2:
+LabelPhysCompare:
+LabelLoop:
+  goto * 0;
+}
+
+compiled byg:9757e4440bd8755d, does this:
+
+$ ~/gcc/results.20230628.asan.ubsan/bin/gcc -c -w -O2bug936.c
+during GIMPLE pass: ccp
+/home/dcb38/rpmbuild/BUILD/neko-2-3-0/vm/interp.c: In function ‘neko_interp_loop’:
+/home/dcb38/rpmbuild/BUILD/neko-2-3-0/vm/interp.c:613:9: internal compiler error: tree check: expected none of vector_type, have vector_type in get_value_for_expr, at tree-ssa-ccp.cc:686
+  613 | int_val neko_interp_loop( neko_vm *VM_ARG, neko_module *m, int_val _acc, int_val *_pc ) {
+      |         ^~~~~~~~~~~~~~~~
+0x11656f9 tree_not_check_failed(tree_node const*, char const*, int, char const*, ...)
+	../../trunk.year/gcc/tree.cc:8936
+0xf75774 tree_not_check(tree_node*, char const*, int, char const*, tree_code)
+	../../trunk.year/gcc/tree.h:3581
+0xf75774 get_value_for_expr(tree_node*, bool)
+	../../trunk.year/gcc/tree-ssa-ccp.cc:686
+
+It was fine with a version from a couple of days earlier:
+
+foundBugs $ ~/gcc/results.20230626.asan.ubsan/bin/gcc -c -w -O2bug936.c
+foundBugs $ ~/gcc/results.20230626.asan.ubsan/bin/gcc -v
+Using built-in specs.
+COLLECT_GCC=/home/dcb38/gcc/results.20230626.asan.ubsan/bin/gcc
+COLLECT_LTO_WRAPPER=/home/dcb38/gcc/results.20230626.asan.ubsan/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../trunk.year/configure --prefix=/home/dcb38/gcc/results.20230626.asan.ubsan --disable-multilib --disable-bootstrap --with-build-config=bootstrap-asan --with-build-config=bootstrap-ubsan --with-pkgversion=3a39a31b8ae9c646 --enable-checking=df,extra,fold,rtl,yes --enable-languages=c,c++,fortran
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20230626 (experimental) (3a39a31b8ae9c646)
+
+- User: Andrew Pinski | Time: 2023-06-30 19:38:00 UTC
+  Text: No reason to do a bisect as it was introduced by the extra checking commit.
+
+- User: Andrew Pinski | Time: 2023-06-30 20:13:25 UTC
+  Text: Confirmed.
+
+- User: Andrew Pinski | Time: 2023-06-30 20:14:02 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> No reason to do a bisect as it was introduced by the extra checking commit.That isr14-2150.
+
+- User: David Binderman | Time: 2023-07-01 08:15:25 UTC
+  Text: This C code might be related:
+
+typedef unsigned uint32_t;
+typedef uint32_t uint32x4 __attribute__((vector_size(16)));
+typedef struct {
+  uint32x4 b, d
+} prng_t;
+prng_t prng_rand_128_r_x;
+main_flags;
+main() {
+  uint32_t ref_crc[] = {7, 3};
+  uint32x4 e = (prng_rand_128_r_x.b << 27) + (prng_rand_128_r_x.b >> 32 - 27);
+  prng_rand_128_r_x.d = e;
+  if (ref_crc[main_flags])
+    __assert_fail();
+}
+
+$ ~/gcc/results/bin/gcc -c -w -O2bug936B.c
+during GIMPLE pass: slpbug936B.c: In function ‘main’:bug936B.c:8:1: internal compiler error: tree check: expected none of vector_type
+, have vector_type in vect_recog_rotate_pattern, at tree-vect-patterns.cc:3729
+    8 | main() {
+      | ^~~~
+0x1166129 tree_not_check_failed(tree_node const*, char const*, int, char const*,
+ ...)
+	../../trunk.year/gcc/tree.cc:8936
+0x1cc8da3 vect_recog_rotate_pattern(vec_info*, _stmt_vec_info*, tree_node**)
+	../../trunk.year/gcc/tree-vect-patterns.cc:0
+
+- User: Richard Biener | Time: 2023-07-03 06:25:59 UTC
+  Text: I will have a look.
+
+- User: GCC Commits | Time: 2023-07-03 08:05:47 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:bd7e9856fe5bbeb487797476c4fffb660f63cf4fcommitr14-2255-gbd7e9856fe5bbeb487797476c4fffb660f63cf4fAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Jul 3 08:28:17 2023 +0200
+
+    tree-optimization/110506 - bogus non-zero mask in CCP for vector types
+    
+    get_value_for_expr was blindlessly using TYPE_PRECISION to produce
+    a mask for vector typed entities which the new tree checking now
+    catches.PR tree-optimization/110506* tree-ssa-ccp.cc (get_value_for_expr): Check for integral
+            type before relying on TYPE_PRECISION to produce a nonzero mask.
+    
+            * gcc.dg/pr110506.c: New testcase.
+
+- User: GCC Commits | Time: 2023-07-03 08:05:52 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:000590c074615cbfffb6ad854a6474e623801460commitr14-2256-g000590c074615cbfffb6ad854a6474e623801460Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Jul 3 09:17:06 2023 +0200
+
+    tree-optimization/110506 - ICE in pattern recog with TYPE_PRECISION
+    
+    The following re-orders checks to make sure we check TYPE_PRECISION
+    on an integral type.PR tree-optimization/110506* tree-vect-patterns.cc (vect_recog_rotate_pattern): Re-order
+            TYPE_PRECISION access with INTEGRAL_TYPE_P check.
+    
+            * gcc.dg/pr110506-2.c: New testcase.
+
+- User: Richard Biener | Time: 2023-07-03 08:06:01 UTC
+  Text: Fixed.
+

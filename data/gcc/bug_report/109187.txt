@@ -1,0 +1,104 @@
+Bug Summary: [13 Regression] ICE: qsort checking failed: qsort comparator non-negative on sorted output: 1736258160 at -O2 since r13-5154-g733a1b777f16cd
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: ice-checking, ice-on-valid-code
+Known to Work: 12.2.1
+Known to Fail: 13.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-03-19 05:45:52 UTC
+  Text: Createdattachment 54703[details]reduced testcase
+
+Compiler output:
+$ aarch64-unknown-linux-gnu-gcc testcase.c -O2
+testcase.c: In function 'foo':
+testcase.c:15:1: error: qsort comparator non-negative on sorted output: 1736258160
+   15 | }
+      | ^
+during RTL pass: sched1
+testcase.c:15:1: internal compiler error: qsort checking failed
+0xad2af3 qsort_chk_error
+        /repo/gcc-trunk/gcc/vec.cc:204
+0xad2c3c qsort_chk(void*, unsigned long, unsigned long, int (*)(void const*, void const*, void*), void*)
+        /repo/gcc-trunk/gcc/vec.cc:246
+0x20ccab5 gcc_qsort(void*, unsigned long, unsigned long, int (*)(void const*, void const*))
+        /repo/gcc-trunk/gcc/sort.cc:272
+0x1ec3882 ready_sort_real
+        /repo/gcc-trunk/gcc/haifa-sched.cc:3095
+0x1ecc05c ready_sort
+        /repo/gcc-trunk/gcc/haifa-sched.cc:3111
+0x1ecc05c schedule_block(basic_block_def**, void*)
+        /repo/gcc-trunk/gcc/haifa-sched.cc:6718
+0x1125b1a schedule_region
+        /repo/gcc-trunk/gcc/sched-rgn.cc:3200
+0x1125b1a schedule_insns()
+        /repo/gcc-trunk/gcc/sched-rgn.cc:3527
+0x1125dec schedule_insns()
+        /repo/gcc-trunk/gcc/sched-rgn.cc:3513
+0x1125dec rest_of_handle_sched
+        /repo/gcc-trunk/gcc/sched-rgn.cc:3731
+0x1125dec execute
+        /repo/gcc-trunk/gcc/sched-rgn.cc:3841
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: Martin Liška | Time: 2023-03-20 13:50:22 UTC
+  Text: Started withr13-5154-g733a1b777f16cd.
+
+- User: Alexander Monakov | Time: 2023-03-20 16:15:28 UTC
+  Text: This is caused by overflowing subtraction in autopref_rank_for_schedule:
+
+      if (!irrel1 && !irrel2)
+        /* Sort memory references from lowest offset to the largest.  */
+        r = data1->offset - data2->offset;
+
+When offsets are arbitrary this pattern (anti-pattern?) is inappropriate for producing a less/equal/greater comparison result. The following (or variants) is safe:
+
+diff --git a/gcc/haifa-sched.cc b/gcc/haifa-sched.cc
+index 4efaa9445..11bf10645 100644
+--- a/gcc/haifa-sched.cc
++++ b/gcc/haifa-sched.cc
+@@ -5686,7 +5686,7 @@ autopref_rank_for_schedule (const rtx_insn *insn1, const rtx_insn *insn2)
+
+       if (!irrel1 && !irrel2)
+        /* Sort memory references from lowest offset to the largest.  */
+-       r = data1->offset - data2->offset;
++       r = (data1->offset > data2->offset) - (data1->offset < data2->offset);
+       else if (write)
+        /* Schedule "irrelevant" insns before memory stores to resolve
+           as many producer dependencies of stores as possible.  */
+
+- User: Alexander Monakov | Time: 2023-03-22 13:15:06 UTC
+  Text: The reduced case is offsetting stack variables in a manner that seems too invalid for my taste, so I plan to send a patch with a following testcase instead (needs -O2 --param sched-autopref-queue-depth=1, ICEs on amd64):
+
+void f(int *a)
+{
+  for (;;)
+    asm("" :: "r"(a[-0x10000000]), "r"(a[0x10000000]), "r"(a[0]) : "memory");
+}
+
+- User: Richard Biener | Time: 2023-03-27 07:45:34 UTC
+  Text: Thanks Alex.
+
+- User: GCC Commits | Time: 2023-03-28 13:44:40 UTC
+  Text: The master branch has been updated by Alexander Monakov <amonakov@gcc.gnu.org>:https://gcc.gnu.org/g:fb046e69f0ed2d637ea715ae71ad50131f30cb2dcommitr13-6907-gfb046e69f0ed2d637ea715ae71ad50131f30cb2dAuthor: Alexander Monakov <amonakov@ispras.ru>
+Date:   Tue Mar 28 16:00:37 2023 +0300
+
+    haifa-sched: fix autopref_rank_for_schedule comparator [PR109187]
+    
+    Do not attempt to use a plain subtraction for generating a three-way
+    comparison result in autopref_rank_for_schedule qsort comparator, as
+    offsets are not restricted and subtraction may overflow.  Open-code
+    a safe three-way comparison instead.
+    
+    gcc/ChangeLog:PR rtl-optimization/109187* haifa-sched.cc (autopref_rank_for_schedule): Avoid use of overflowing
+            subtraction in three-way comparison.
+    
+    gcc/testsuite/ChangeLog:PR rtl-optimization/109187* gcc.dg/pr109187.c: New test.
+
+- User: Alexander Monakov | Time: 2023-03-28 13:46:05 UTC
+  Text: Fixed on the trunk, thanks for the report.
+

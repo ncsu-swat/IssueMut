@@ -1,0 +1,331 @@
+Bug Summary: [13 Regression] ICE in force_decl_die, at dwarf2out.cc:26751 since r13-4161-g32d16fe9d7e347bc
+Product: gcc
+Component: debug
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Martin Liška | Time: 2023-02-13 12:06:38 UTC
+  Text: Noticed that in Firefox package:
+
+$ cat ice.ii
+namespace std {
+struct _Sp_counted_base {
+  virtual void *_M_get_deleter(const int &);
+};
+bool _S_eq(int);
+struct _Sp_make_shared_tag {
+  static const int &_S_ti() {
+    static constexpr char __tag{};
+    return reinterpret_cast<const int &>(__tag);
+  }
+};
+struct _Impl {
+  _Impl(int);
+};
+int _Sp_counted_ptr_inplace___a;
+struct _Sp_counted_ptr_inplace : _Sp_counted_base {
+  _Sp_counted_ptr_inplace() : _M_impl(_Sp_counted_ptr_inplace___a) {}
+  void *_M_get_deleter(const int &__ti) {
+    auto __ptr(_M_ptr());
+    &__ti == &_Sp_make_shared_tag::_S_ti() || _S_eq(__ti);
+    return __ptr;
+  }
+  int *_M_ptr();
+  _Impl _M_impl;
+};
+struct __shared_count {
+  __shared_count(int, int) { _Sp_counted_ptr_inplace(); }
+};
+int _M_ptr;
+struct __shared_ptr {
+  template <typename _Alloc>
+  __shared_ptr(_Alloc __tag) : _M_refcount(_M_ptr, __tag) {}
+  __shared_count _M_refcount;
+};
+int shared_ptr___tag;
+struct shared_ptr : __shared_ptr {
+  shared_ptr() : __shared_ptr(shared_ptr___tag) {}
+};
+void ArgEq() { shared_ptr(); }
+} // namespace std
+
+$ g++ ice.ii -flto -fPIC -shared -O1 -fimplicit-constexpr -g1
+lto1: internal compiler error: in force_decl_die, at dwarf2out.cc:26770
+0x672f7a force_decl_die
+	/home/marxin/Programming/gcc/gcc/dwarf2out.cc:26770
+0x970f8f force_decl_die
+	/home/marxin/Programming/gcc/gcc/dwarf2out.cc:4940
+0x970f8f get_context_die
+	/home/marxin/Programming/gcc/gcc/dwarf2out.cc:26701
+0x970f8f force_decl_die
+	/home/marxin/Programming/gcc/gcc/dwarf2out.cc:26717
+0x984b2d force_decl_die
+	/home/marxin/Programming/gcc/gcc/dwarf2out.cc:26715
+0x984b2d get_context_die
+	/home/marxin/Programming/gcc/gcc/dwarf2out.cc:26701
+0x984b2d flush_limbo_die_list
+	/home/marxin/Programming/gcc/gcc/dwarf2out.cc:32079
+0x988ca8 dwarf2out_finish
+	/home/marxin/Programming/gcc/gcc/dwarf2out.cc:32155
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+lto-wrapper: fatal error: g++ returned 1 exit status
+compilation terminated.
+mold: fatal: lto-wrapper failed
+collect2: error: ld returned 1 exit status
+
+- User: Jakub Jelinek | Time: 2023-02-13 12:35:20 UTC
+  Text: Does firefox really use -fimplicit-constexpr and -g1?
+Anyway, I'm afraid I have no idea what the problem is here, the ICE is when trying
+to force a DIE for std::_Sp_make_shared_tag::_S_ti()::__tag late, but there is no debug info for _S_ti() beucase it was implicitly marked constexpr and with -g1 probably not really used.
+
+- User: Martin Liška | Time: 2023-02-13 14:00:22 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #1)> Does firefox really use -fimplicit-constexpr and -g1?Yes. Note the former option is used since gcc12:https://bugzilla.mozilla.org/show_bug.cgi?id=1754752
+
+- User: Richard Biener | Time: 2023-02-13 15:14:23 UTC
+  Text: (In reply to Martin Liška fromcomment #2)> (In reply to Jakub Jelinek fromcomment #1)
+> > Does firefox really use -fimplicit-constexpr and -g1?
+> 
+> Yes. Note the former option is used since gcc12:
+>https://bugzilla.mozilla.org/show_bug.cgi?id=1754752Note 'decl' is <namespace_decl 0x7ffff60d1260 std> for me.  For dwarf2
+we return comp_unit_die () for this, but for -g1 we run into
+
+    case NAMESPACE_DECL:
+    case IMPORTED_DECL:
+      if (debug_info_level <= DINFO_LEVEL_TERSE)
+        return;
+
+so maybe for force_decl_die we want to do the same or alternatively
+for get_context_die () allow force_decl_die to "fail" and force one
+for the next up context up to comp_unit_die ()?
+
+OTOH, we run into this for a limbo entry that in the end likely will
+not get any DIE at -g1 anyway, so "forcing" a context via get_context_die
+is possibly excessive as well.
+
+So I think the actual bug is that we created a DIE for __tag when -g1
+doesn't want a DIE for its ultimate context.
+
+Alternative make force_decl_die honor the dwarf2out_decl reality like
+with
+
+diff --git a/gcc/dwarf2out.cc b/gcc/dwarf2out.cc
+index 1f39df3b1e2..bd2c9444ff3 100644
+--- a/gcc/dwarf2out.cc
++++ b/gcc/dwarf2out.cc
+@@ -26742,7 +26742,8 @@ force_decl_die (tree decl)
+          break;
+ 
+        case NAMESPACE_DECL:
+-         if (dwarf_version >= 3 || !dwarf_strict)
++         if (debug_info_level > DINFO_LEVEL_TERSE
++             && (dwarf_version >= 3 || !dwarf_strict))
+            dwarf2out_decl (decl);
+          else
+            /* DWARF2 has neither DW_TAG_module, nor DW_TAG_namespace.  */
+
+in which case we'll put the function decl context in the CU DIE rather
+than in a namespace DIE?
+
+- User: Richard Biener | Time: 2023-02-14 11:50:55 UTC
+  Text: I'm going to test this.
+
+- User: Richard Biener | Time: 2023-02-14 12:22:16 UTC
+  Text: Btw, the limbo DIE is created via
+
+#0  new_die (tag_value=DW_TAG_variable, parent_die=<dw_die_ref 0x0>, 
+    t=<var_decl 0x7ffff6271ea0 __tag>)
+    at /home/rguenther/src/trunk/gcc/dwarf2out.cc:5882
+#1  0x0000000000e006ad in gen_variable_die (
+    decl=<var_decl 0x7ffff6271ea0 __tag>, origin=<tree 0x0>, 
+    context_die=<dw_die_ref 0x0>)
+    at /home/rguenther/src/trunk/gcc/dwarf2out.cc:24574
+#2  0x0000000000e08766 in gen_decl_die (decl=<var_decl 0x7ffff6271ea0 __tag>, 
+    origin=<tree 0x0>, ctx=0x0, context_die=<dw_die_ref 0x0>)
+    at /home/rguenther/src/trunk/gcc/dwarf2out.cc:27108
+#3  0x0000000000e09a73 in dwarf2out_decl (decl=<var_decl 0x7ffff6271ea0 __tag>)
+    at /home/rguenther/src/trunk/gcc/dwarf2out.cc:27598
+#4  0x0000000000e08dce in dwarf2out_late_global_decl (
+    decl=<var_decl 0x7ffff6271ea0 __tag>)
+    at /home/rguenther/src/trunk/gcc/dwarf2out.cc:27286
+#5  0x0000000001944222 in varpool_node::assemble_decl (
+    this=<varpool_node * const 0x7ffff7ff3080 "__tag"/0>)
+    at /home/rguenther/src/trunk/gcc/varpool.cc:603
+#6  0x0000000001944a08 in symbol_table::output_variables (this=0x7ffff626a000)
+    at /home/rguenther/src/trunk/gcc/varpool.cc:764
+
+when compiling without -flto we do not get any DIE for __tag.  In the LTRANS unit the decl is
+
+ <var_decl 0x7ffff6271ea0 __tag
+    type <integer_type 0x7ffff60cf1f8 char readonly public QI
+        size <integer_cst 0x7ffff6266d38 constant 8>
+        unit-size <integer_cst 0x7ffff6266d50 constant 1>
+        align:8 warn_if_not_align:0 symtab:0 alias-set -1 canonical-type 0x7ffff62803f0 precision:8 min <integer_cst 0x7ffff60a4e28 -128> max <integer_cst 0x7ffff60a4e10 127>
+        pointer_to_this <pointer_type 0x7ffff60cf3f0>>
+    readonly constant addressable asm_written used public static QI t.ii:8:27 size <integer_cst 0x7ffff6266d38 8> unit-size <integer_cst 0x7ffff6266d50 1>
+    align:8 warn_if_not_align:0 context <function_decl 0x7ffff60d0a00 _S_ti> initial <integer_cst 0x7ffff60a4e40 0>
+    (mem/u/c:QI (symbol_ref:DI ("_ZZNSt19_Sp_make_shared_tag5_S_tiEvE5__tag") <var_decl 0x7ffff6271ea0 __tag>) [0 __tag+0 S1 A8])>
+
+at compile time the symbol is
+
+_ZZNSt19_Sp_make_shared_tag5_S_tiEvE5__tag/0 (constexpr const char __tag)
+  Type: variable definition analyzed 
+  Visibility: semantic_interposition public weak comdat comdat_group:_ZZNSt19_Sp_make_shared_tag5_S_tiEvE5__tag one_only
+  References: 
+  Referring: _ZNSt23_Sp_counted_ptr_inplace14_M_get_deleterERKi/9 (addr)
+  Availability: not-ready
+  Varpool flags: initialized read-only const-value-known
+
+at WPA time
+
+_ZZNSt19_Sp_make_shared_tag5_S_tiEvE5__tag/0 (__tag)
+  Type: variable definition analyzed
+  Visibility: externally_visible semantic_interposition prevailing_def_ironly_exp public weak comdat comdat_group:_ZZNSt19_Sp_make_shared_tag5_S_tiEvE5__tag one_only
+  References: 
+  Referring: _ZNSt23_Sp_counted_ptr_inplace14_M_get_deleterERKi/9 (addr)
+  Read from file: a-t.o
+  Availability: available
+  Varpool flags: initialized read-only const-value-known
+
+
+When without -flto we reach varpool_node::assemble_decl we see
+
+ <var_decl 0x7ffff6274e10 __tag
+    type <integer_type 0x7ffff6295690 char readonly public type_6 QI
+        size <integer_cst 0x7ffff628b0c0 constant 8>
+        unit-size <integer_cst 0x7ffff628b0d8 constant 1>
+        align:8 warn_if_not_align:0 symtab:0 alias-set -1 canonical-type 0x7ffff6295690 precision:8 min <integer_cst 0x7ffff628b108 -128> max <integer_cst 0x7ffff628b138 127>
+        pointer_to_this <pointer_type 0x7ffff6295738>>
+    readonly constant addressable used public static tree_1 tree_2 tree_6 weak read decl_5 decl_6 decl_8 QI t.ii:8:27 size <integer_cst 0x7ffff628b0c0 8> unit-size <integer_cst 0x7ffff628b0d8 1>
+    align:8 warn_if_not_align:0 context <function_decl 0x7ffff6415800 _S_ti> initial <integer_cst 0x7ffff642b138 0>
+    (mem/u/c:QI (symbol_ref/i:DI ("_ZZNSt19_Sp_make_shared_tag5_S_tiEvE5__tag") <var_decl 0x7ffff6274e10 __tag>) [0 __tag+0 S1 A8])>
+
+but dwarf2out_late_global_decl just does nothing for this node since
+there was no DIE created early for it - we never call early_global_decl
+on it, instead we rely on the containing function, _S_ti, to eventually
+create a DIE for it, but even that doesn't get one.
+
+I suppose this is all a disconnect between how we handle -g1 with -flto,
+and for -g1 dwarf2out_late_global_decl should not fall into
+
+  /* Fill-in any location information we were unable to determine
+     on the first pass.  */
+  if (VAR_P (decl))
+    {
+      dw_die_ref die = lookup_decl_die (decl);
+
+      /* We may have to generate full debug late for LTO in case debug
+         was not enabled at compile-time or the target doesn't support
+         the LTO early debug scheme.  */
+      if (! die && in_lto_p)
+        dwarf2out_decl (decl);
+
+another possibility would be to stream "no DIE" info for not late
+created decls or experiment with simply removing this path entirely?
+
+- User: Richard Biener | Time: 2023-02-20 13:37:40 UTC
+  Text: (In reply to Richard Biener fromcomment #5)> another possibility would be to stream "no DIE" info for not late
+> created declslike by setting DECL_IGNORED_P on them?  Like maybe with the following
+which also fixes the issue:
+
+diff --git a/gcc/lto-streamer-in.cc b/gcc/lto-streamer-in.cc
+index 03cb41cfa16..f91e51b9327 100644
+--- a/gcc/lto-streamer-in.cc
++++ b/gcc/lto-streamer-in.cc
+@@ -1739,6 +1739,10 @@ lto_read_tree_1 (class lto_input_block *ib, class data_in *data_in, tree expr)
+          dref_entry e = { expr, str, off };
+          dref_queue.safe_push (e);
+        }
++      else if (DECL_P (expr))
++       /* Avoid creating a full DIE late for a decl that didn't have
++          it created early.  */
++       DECL_IGNORED_P (expr) = 1;
+     }
+ }
+
+- User: Richard Biener | Time: 2023-02-21 12:26:09 UTC
+  Text: (In reply to Richard Biener fromcomment #6)> (In reply to Richard Biener fromcomment #5)
+> > another possibility would be to stream "no DIE" info for not late
+> > created decls
+> 
+> like by setting DECL_IGNORED_P on them?  Like maybe with the following
+> which also fixes the issue:
+> 
+> diff --git a/gcc/lto-streamer-in.cc b/gcc/lto-streamer-in.cc
+> index 03cb41cfa16..f91e51b9327 100644
+> --- a/gcc/lto-streamer-in.cc
+> +++ b/gcc/lto-streamer-in.cc
+> @@ -1739,6 +1739,10 @@ lto_read_tree_1 (class lto_input_block *ib, class
+> data_in *data_in, tree expr)
+>           dref_entry e = { expr, str, off };
+>           dref_queue.safe_push (e);
+>         }
+> +      else if (DECL_P (expr))
+> +       /* Avoid creating a full DIE late for a decl that didn't have
+> +          it created early.  */
+> +       DECL_IGNORED_P (expr) = 1;
+>      }
+>  }Even using
+
+       else if (DECL_P (expr)
+               && ! DECL_ABSTRACT_ORIGIN (expr)
+               && ! (TARGET_PECOFF || TARGET_COFF))
+
+gets us quite some guality regressions.
+
+The original proposed change feels wrong though.
+
+- User: Richard Biener | Time: 2023-02-21 13:32:20 UTC
+  Text: diff --git a/gcc/dwarf2out.cc b/gcc/dwarf2out.cc
+index 1f39df3b1e2..5a2538f80e1 100644
+--- a/gcc/dwarf2out.cc
++++ b/gcc/dwarf2out.cc
+@@ -27282,7 +27282,7 @@ dwarf2out_late_global_decl (tree decl)
+       /* We may have to generate full debug late for LTO in case debug
+          was not enabled at compile-time or the target doesn't support
+         the LTO early debug scheme.  */
+-      if (! die && in_lto_p)
++      if (! die && in_lto_p && (TARGET_PECOFF || TARGET_COFF))
+        dwarf2out_decl (decl);
+       else if (die)
+        {
+
+tests clean though.  Obviously that will cease creating debug info for
+all late generated decls, even when done explicitely (like for late
+generated clones).
+
+- User: GCC Commits | Time: 2023-03-03 07:27:36 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:33ca5c92dfa7e2f591a838bb768d9d6eea56793bcommitr13-6438-g33ca5c92dfa7e2f591a838bb768d9d6eea56793bAuthor: Richard Biener <rguenther@suse.de>
+Date:   Wed Mar 1 10:01:10 2023 +0100
+
+    debug/108772 - ICE with late debug generated with -flto
+    
+    When combining -g1 with -flto we run into the DIE location annotation
+    machinery for globals calling dwarf2out_late_global_decl but not
+    having any early generated DIE for function scope statics.  In
+    this process we'd generate a limbo DIE since also the function scope
+    doesn't have any early generated DIE.  The limbo handling then tries
+    to force a DIE for the context chain which ultimatively fails and
+    ICEs at the std namespace decl because at -g1 we don't represent that.
+    
+    The following avoids this situation by making sure to never generate
+    any DIEs from dwarf2out_late_global_decl in the in_lto_p path
+    for function scope globals but rely on DIE generation for
+    the function to output a DIE for the local static (which doesn't
+    happen for -g1).
+    
+    I explored a lot of other options to fix this but in the end this
+    seems to be the most spot-on fix with the least risk of unwanted
+    effects.PR debug/108772* dwarf2out.cc (dwarf2out_late_global_decl): Do not
+            generate a DIE for a function scope static.
+    
+            * g++.dg/lto/pr108772_0.C: New testcase.
+
+- User: Richard Biener | Time: 2023-03-03 07:34:02 UTC
+  Text: Should be fixed now.  I think the issue is likely latent earlier but unless we run into it in real world lets wait and see.
+

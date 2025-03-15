@@ -1,0 +1,153 @@
+Issue Title: Incorrect -Wformat type warnings with non-variadic functions
+Original Post: This piece of code produces an incorrect warning when compiled with `-Wformat`: 
+```cpp
+template <typename... Args>
+__attribute__((__format__(__printf__, 1, 2)))
+void my_format(char const *format, Args... args);
+
+void foo()
+{
+	float x = 0.f;
+
+	my_format("%f", x);
+}
+```
+```console
+<source>:9:18: warning: format specifies type 'double' but the argument has type 'float' [-Wformat]
+        my_format("%f", x);
+                   ~~   ^
+                   %f
+```
+Meanwhile, declaring `my_format` as a variadic function results in no warning, as expected:
+```cpp
+__attribute__((__format__(__printf__, 1, 2)))
+void my_format(char const *format, ...);
+
+void foo()
+{
+	float x = 0.f;
+
+	my_format("%f", x);
+}
+```
+It doesn't seem to be related to `my_format` being templated, declaring it as `void my_format(char const *format, float f);` results in the same incorrect warning.
+
+Comment by inclyc: Looks like this occurs if `my_format`  is not variadic. Might related to default argument promotions 
+
+```
+int my_format(char const *format, float f) __attribute__ ((format (printf, 1, 2)));
+```
+
+https://godbolt.org/z/8TPqoMv5s
+
+------
+
+upd: Note that we expect `my_format` to be variadic, our codes may not concerned about non-variadic in this case. If you declare `my_format` variadic, `float x` will be promoted into double.
+Comment by inclyc: I think it might be a little misunderstanding on the format attribute, we expect the function to be variadic, because that's how printf works. If you write it as a template or directly declared as `float`, this is inconsistent with the behavior that printf will implicitly convert float to double. 
+
+Our error messages and suggested fixes still look very odd. (suggested you change `%f` to `%f`)
+Comment by sapphyrus: As far as I understood, ever since https://reviews.llvm.org/D112579, `__attribute__((format))` is allowed on non-variadic functions?
+Comment by inclyc: > As far as I understood, ever since https://reviews.llvm.org/D112579, `__attribute__((format))` is allowed on non-variadic functions?
+
+Yes, this is now allowed, what I was trying to say in previous comments was that default argument promotion happens with "stdio" printf (which is variadic), which is different from templates or declared as "float" directly. These tests are interesting and I guess https://github.com/llvm/llvm-project/commit/e3bd67eddf65b20956513e91715b1f997dae2690 should have addressed this (but apparently not).
+Comment by erichkeane: The error itself IS correct here (in that when it is a C variadic, all floats are promoted to doubles, but when it is a variadic template/template param, it stays a float).  The suggested fix is obviously bonkers, and probably should only be there if the argument IS a double (or would be promoted to one).
+
+
+Comment by llvmbot: @llvm/issue-subscribers-good-first-issue
+Comment by Aditya-pixel: Hi, I wanted to work on this issue. I suggest the fix could be adding a check in the compatible types for type Double, if the type is Float then it should return Match. This case is not considered in [e3bd67e](https://github.com/llvm/llvm-project/commit/e3bd67eddf65b20956513e91715b1f997dae2690), in the file `FormatString.cpp` Can you let me know if this fix is correct. If not, can you guide me with the changes. 
+Comment by inclyc: > Hi, I wanted to work on this issue. 
+
+Thanks!  Welcome new contributor :)
+
+> I suggest the fix could be adding a check in the compatible types for type Double, if the type is Float then it should return Match. This case is not considered in [e3bd67e](https://github.com/llvm/llvm-project/commit/e3bd67eddf65b20956513e91715b1f997dae2690), in the file `FormatString.cpp` Can you let me know if this fix is correct. If not, can you guide me with the changes.
+
+I'm not sure if this is correct, because as for variadic template/template param, actually there is no default argument promotion guaranteed. So, say "compatible" may not be correct. I wonder if we should give a warning saying "Note! No default argument promotion!". Your changes planned is another good choice because typically these variadic tempates call normal `printf` eventually.
+
+WDYT? @erichkeane @AaronBallman 
+Comment by AaronBallman: I think the diagnostic is correct but the suggested fix is a bug. I think we might want to add a helper function to `ASTContext` to decide whether a type is promotable or not (we already have `ASTContext::isPromotableIntegerType()` but we don't have anything for half/float types and we probably should) and then use that to determine whether to issue the fix or not.
+
+I don't think we want to warn users that there is no default argument promotion happening, but I'm still thinking about that. My intuition is that this pattern isn't super common to begin with and so we don't really know what users expect in that case, thus we should leave the diagnostic alone for the time being until we get more field experience with it.
+Comment by JoyNyuguto:  @sapphyrus @SamTebbs33 Joy Nyuguto Outreachy
+The warning occurs because the format specifier "%f" is intended for double-precision floating-point values but the argument passed to my_format is a single-precision floating-point value of type float. 
+
+To resolve the warning in the templated version of my_format, you can explicitly cast the float argument to double:
+my_format("%f", static_cast<double>(x));
+``
+
+Alternatively, you can use a different format specifier that is intended for single-precision floating-point values, such as "%g" or "%.f"
+
+``my_format("%g", x);
+``my_format("%.f", x);
+In both cases, the warning should no longer be triggered because the format specifier matches the type of the argument.
+
+
+Comment by pkasting: > Alternatively, you can use a different format specifier that is intended for single-precision floating-point values, such as "%g" or "%.f"
+> 
+> `my_format("%g", x); `my_format("%.f", x); In both cases, the warning should no longer be triggered because the format specifier matches the type of the argument.
+
+At least in C++, I believe both of these still assume the argument is a double, even if they don't print the same precision as %f. Because of default argument promotion, there is no real facility in printf format specifiers for "float" arguments.
+Comment by pkasting: > I think the diagnostic is correct but the suggested fix is a bug. I think we might want to add a helper function to `ASTContext` to decide whether a type is promotable or not (we already have `ASTContext::isPromotableIntegerType()` but we don't have anything for half/float types and we probably should) and then use that to determine whether to issue the fix or not.
+> 
+> I don't think we want to warn users that there is no default argument promotion happening, but I'm still thinking about that. My intuition is that this pattern isn't super common to begin with and so we don't really know what users expect in that case, thus we should leave the diagnostic alone for the time being until we get more field experience with it.
+
+With some experience with this case in Chromium, I think this diagnostic is unhelpful and should likely be suppressed in this case.
+
+If the implementation forwards the supplied args to a variadic method like printf, default argument promotion will happen and the warning will be moot. If it does not, then the argument types are available to it from the function declaration (e.g. in a parameter pack) and it will not erroneously read extra bytes from memory or the like. Either way, the problem the warning intends to prevent -- that the caller has supplied a value that will be fundamentally misinterpreted by whatever deals with the format string -- isn't occurring.
+
+I think this warning should be suppressed in the case where, if default argument promotion had been applied, the argument type would match the expected type.
+Comment by apple-fcloutier: FWIW, I agree that we should diagnose based on types after variadic argument promotion. If you use a variadic template with `__attribute__((format(printf)))`, you almost certainly mean to pass it to printf, and if you don't, you still have a strongly-typed value to work with.
+Comment by AaronBallman: Strictly speaking, the diagnostic is correct -- C specifies that `%f` receives a `double`, this is passing a `float` and a `float` is not a `double`. And that diagnostic may very well be useful; for example, perhaps the way the function works is to `memcpy` the value somewhere else (e.g., a serial bus), so `%f` will try to `memcpy` `sizeof(double)` bytes but is only given `sizeof(float)` bytes of valid memory, and the type size mismatch isn't caught because of conversions to `void *`.
+
+If the user is using `printf` format specifiers because they're passing the data along to `printf` (or similar), then I agree the diagnostic is bad. But the attribute is saying it's using `printf`'s format specifiers, not that the data will eventually be passed to `printf`. I think more users are probably using this attribute because the data eventually is passed along to `printf` and so perhaps this should be a `-Wformat-pedantic` warning just for the non-variadic case? But again, use of this attribute with non-variadic functions is quite uncommon as best I can tell.
+Comment by apple-fcloutier: It's important context that it was impossible to use `__attribute__((format))` on non-variadic functions (including C++ variadic template functions) until I submitted a patch to make it work last year. This means previously, any function using `__attribute__((format))` (including an eventual function copying a `double` to a serial bus) was variadic, and when it was passed a `float`, it actually received a `double` because C specifies that floats are promoted to doubles when passed as variadic arguments.
+
+You're right that preciously few people use `__attribute__((format))` on variadic template functions, but again, that's mostly because it wasn't possible at all before last year, and this issue is a deterrent to more widespread use. We know this because the case before us is that Chrome wants to adopt it but won't unless we fix this.
+
+I think that the question we should try to answer is: in that ~year since `__attribute__((format))` can apply to functions with fixed arguments, has anyone leveraged incompatibilities with `float` types? I don't see how that could be the case, because as it stands, it simply means that fixed-parameter functions with `__attribute__((format))` cannot have parameters with types that variadic argument promotion never produces, such as `float`, `char` and `short`. If no one has leveraged incompatibilities in this way, is there still an argument to leave it the way it is?
+Comment by pkasting: Perhaps a relevant question to answer that is "is there any public library code, either in std:: or elsewhere, that parses a printf-style format string and gives callers types, so they can do something with those types"? If anyone is going to use `__attribute__((format))` and _not_ pass to printf, and would be in danger of running afoul of this, it would only be because they are using code like that.
+
+`absl::StrFormat()` has code akin to this in absl::internal::, but that's not publicly accessible.
+Comment by AaronBallman: I think there's at least two different angles being discussed:
+
+One seems to be: this is a false positive if you're passing the arguments along to `printf`; the ability to use the `format` attribute on a variadic function is ~1 year old, so there's not a lot of code relying on the existing behavior, so we've probably got the ability to change the diagnostic behavior without surprising a lot of users and that removes a false positive.
+
+Another is: what do people expect the attribute to do? Our [documentation](https://clang.llvm.org/docs/AttributeReference.html#format) says: "As an extension to GCC’s behavior, Clang accepts the format attribute on non-variadic functions. Clang checks non-variadic format functions for the same classes of issues that can be found on variadic functions, as controlled by the same warning flags, except that the types of formatted arguments is forced by the function signature." -- that reads to me like this attribute behaves exactly the same as the variadic case, except the types come directly from the function signature rather than the expressions passed as arguments to the function; there are situations where that behavior is useful.
+
+I view the first as being "can we make the change?" and the second as being "should we make the change?" I suspect we can make the change (I don't think it would be overly disruptive), but I'm less convinced we should make the change given that there are reasonable use cases where the type from the function signature not matching the type in the format specifier can be a problem. Changing the diagnostic to assume promotion happens prevents useful diagnostics in some circumstances while silencing unhelpful false positives in others.
+
+I think an underlying question here is whether use of the `format` attribute implies passing the arguments along to the specified function or not. On the one hand, I don't think we want it to imply that because that limits the utility of the attribute. It is reasonable to use format specifiers without passing them along to the specified function given how ubiquitous the format specifiers are. On the other hand, how often do people implement the *full set of format specifiers* for e.g., `printf` but then not turn around and pass the argument on to a printf-variant?
+
+I'm not certain there's a "clearly correct" answer here.
+
+It's worth noting that the original example code has a trivial fix to silence the diagnostic: https://godbolt.org/z/edKzWoWzz Because the format function takes a parameter pack, you can pass the correct type (or use a cast, etc) for the given format specifier and all is well. So the truly problematic case is not with packs, it's with functions with an explicit parameter of a promotable type, which is perhaps a bit of a "doctor, doctor, it hurts when I do this" kind of situation.
+Comment by pkasting: I am skeptical that "Changing the diagnostic to assume promotion happens prevents useful diagnostics in some circumstances". I can't think of a single realistic use case for this.
+
+Forcing callers to manually promote means it is impossible in a large codebase to replace a logging function which previously used varargs with one that uses variadic templates. This isn't a reasonable solution.
+Comment by AaronBallman: > I am skeptical that "Changing the diagnostic to assume promotion happens prevents useful diagnostics in some circumstances". I can't think of a single realistic use case for this.
+
+I pointed out an example above using `memcpy`; do you think that's unrealistic?
+
+> Forcing callers to manually promote means it is impossible in a large codebase to replace a logging function which previously used varargs with one that uses variadic templates. This isn't a reasonable solution.
+
+I'm trying to figure out what the most responsible way forward is that considers the feature in general rather than a narrow focus. There are multiple ways this can go:
+
+1) Do nothing
+2) Silence the diagnostic
+3) Move the diagnostic to another related warning group (perhaps `-Wformat-pedantic`)
+
+Currently, I'm leaning towards 3 being the way forward because I think this diagnostic can help in some circumstances (but not in general) but it sounds like you and @apple-fcloutier are advocating for 2 because you think the diagnostic is never helpful for non-variadic functions.
+Comment by pkasting: Yes, I think the memcpy case is unrealistic; if you have the type information available from the parameter pack, presumably you'd memcpy based on `sizeof(args)...` and not based on parsing a format string, taking the address of your argument, reinterpret_casting it to the type you parsed, and using the size of the type you parsed.
+
+In practice, I suspect that all use of a printf-style format specifier is ultimately destined to funnel to printf. But I don't think I have to prove that suspicion. Instead, I think we could consider the weaker claim that all use of printf-style format specifiers is ultimately designed to funnel to a varargs function (and thus that we should assume default argument promotion will eventually be applied). If it is not -- if it's variadic templates all the way down -- then format specifiers seem unnecessary and byzantine; who would write an API using them?
+Comment by AaronBallman: > Yes, I think the memcpy case is unrealistic; if you have the type information available from the parameter pack, presumably you'd memcpy based on `sizeof(args)...` and not based on parsing a format string, taking the address of your argument, reinterpret_casting it to the type you parsed, and using the size of the type you parsed.
+
+Presumably you'd be using format specifiers for a reason though (otherwise, you could just copy directly into the stream). So I think you do need to look at the format specifier string and perform conversions based on it. If the user passes `%hhd`, you don't want to `memcpy` based on `sizeof(args)...` and hope you get a `char`-sized object, you want to copy that value into a `signed char` and then copy that modified value into the stream. On the flip side, for such an interface, what would `%+#0g` *do*? I mean, it would copy a `double`, but... the flags are rather meaningless, so it would be a pretty odd interface to use `printf` format specifiers for because it's not trying to *print* anything.
+
+> In practice, I suspect that all use of a printf-style format specifier is ultimately destined to funnel to printf. But I don't think I have to prove that suspicion. Instead, I think we could consider the weaker claim that all use of printf-style format specifiers is ultimately designed to funnel to a varargs function (and thus that we should assume default argument promotion will eventually be applied). If it is not -- if it's variadic templates all the way down -- then format specifiers seem unnecessary and byzantine; who would write an API using them?
+
+Hmmm, this is pretty compelling rationale. I think there are cases where you can use variadic templates all the way down (you can process format strings at compile time in C++), but I think those cases are going to feel contrived because the vast majority of uses will delegate to a `printf` variant.
+
+I think I've come around now and agree that we should diagnose based on the type after promotion for the non-variadic case. We should definitely improve the documentation for the attribute at the same time, preferably with some examples.
+
+Thank you for the good discussion on this!
+Comment by apple-fcloutier: This was reviewed in https://reviews.llvm.org/D158318 and merged in https://github.com/llvm/llvm-project/commit/04e6178ae932c9a1d939dcfe3ef1189f4bbb21aa.

@@ -1,0 +1,146 @@
+Bug Summary: RISC-V: ICE during RTL pass: combine with -fwrapv -march=rv64imv_xtheadcondmov_xventanacondops at -O2
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 15.0
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-08-05 16:00:23 UTC
+  Text: Testcase:
+int a, b;
+void c() {
+  int e = a >= 2 ? b : a;
+  short d = e * 2;
+  if (d)
+    for (;;)
+      ;
+}
+
+Command/backtrace:> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -fwrapv -O2 -march=rv64imvxtheadcondmov_xventanacondops red.c -c -S -o /dev/nullduring RTL pass: combine
+red.c: In function 'c':
+red.c:8:1: internal compiler error: Segmentation fault
+    8 | }
+      | ^
+0x2de6255 internal_error(char const*, ...)
+        ../../../gcc/gcc/diagnostic-global-context.cc:491
+0x1388d33 crash_signal
+        ../../../gcc/gcc/toplev.cc:321
+0x759e6644251f ???
+        ./signal/../sysdeps/unix/sysv/linux/x86_64/libc_sigaction.c:0
+0x1310816 rtx_equal_p(rtx_def const*, rtx_def const*, bool (*)(rtx_def const**, rtx_def const**, rtx_def**, rtx_def**))
+        ../../../gcc/gcc/rtl.cc:442
+0x179f0a5 riscv_rtx_costs
+        ../../../gcc/gcc/config/riscv/riscv.cc:3650
+0x1318e37 rtx_cost(rtx_def*, machine_mode, rtx_code, int, bool)
+        ../../../gcc/gcc/rtlanal.cc:4605
+0x268427c set_src_cost(rtx_def*, machine_mode, bool)
+        ../../../gcc/gcc/rtl.h:2953
+0x268427c force_int_to_mode
+        ../../../gcc/gcc/combine.cc:8833
+0x268427c force_to_mode
+        ../../../gcc/gcc/combine.cc:8747
+0x26840d2 force_int_to_mode
+        ../../../gcc/gcc/combine.cc:8991
+0x26840d2 force_to_mode
+        ../../../gcc/gcc/combine.cc:8747
+0x2689dcb make_compound_operation_int
+        ../../../gcc/gcc/combine.cc:8393
+0x268a32f make_compound_operation(rtx_def*, rtx_code)
+        ../../../gcc/gcc/combine.cc:8471
+0x268a2fb make_compound_operation(rtx_def*, rtx_code)
+        ../../../gcc/gcc/combine.cc:8496
+0x268e07e simplify_set
+        ../../../gcc/gcc/combine.cc:6975
+0x268e07e combine_simplify_rtx
+        ../../../gcc/gcc/combine.cc:6374
+0x269031f subst
+        ../../../gcc/gcc/combine.cc:5630
+0x2694499 try_combine
+        ../../../gcc/gcc/combine.cc:3349
+0x2699d19 combine_instructions
+        ../../../gcc/gcc/combine.cc:1285
+0x2699d19 rest_of_handle_combine
+        ../../../gcc/gcc/combine.cc:15127
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+This is a bit of an obscure bug since it's mixing two vendor extensions. If ISA strings like this aren't interesting let me know and I'll make the vendor extensions mutually exclusive during fuzzing.
+
+Found via fuzzer.
+
+- User: Jeffrey A. Law | Time: 2024-08-06 04:53:21 UTC
+  Text: It's a clear bug in the cost handling:
+
++      else if (TARGET_ZICOND
++              && outer_code == SET
++              && ((GET_CODE (XEXP (x, 1)) == REG
++                   && XEXP (x, 2) == CONST0_RTX (GET_MODE (XEXP (x, 1))))
++                  || (GET_CODE (XEXP (x, 2)) == REG
++                      && XEXP (x, 1) == CONST0_RTX (GET_MODE (XEXP (x, 2))))
++                  || (GET_CODE (XEXP (x, 1)) == REG
++                      && rtx_equal_p (XEXP (x, 1), XEXP (XEXP (x, 0), 0)))
++                  || (GET_CODE (XEXP (x, 1)) == REG
++                      && rtx_equal_p (XEXP (x, 2), XEXP (XEXP (x, 0), 0)))))
++       {
++         *total = COSTS_N_INSNS (1);
++         return true;
++       }
+
+Where X has the form:
+
+(if_then_else:DI (reg:DI 148)
+    (reg:DI 147 [ b ])
+    (reg/v:DI 134 [ e ]))
+
+
+I think the code was likely assuming that we'd have a conditional as the first argument and thus it could use XEXP (XEXP (x, 0), 0) to get the the first argument of the comparison.
+
+But the costing code has to be prepared to deal with cases that don't actually match code that would be valid according to the MD file.  So that's not a safe assumption.  I suspect we just need a COMPARISON_P check in the right place.
+
+- User: GCC Commits | Time: 2024-08-08 13:44:52 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:190ad81282057b0e5884faaaad30a7270356b9b1commitr15-2821-g190ad81282057b0e5884faaaad30a7270356b9b1Author: Jeff Law <jlaw@ventanamicro.com>
+Date:   Thu Aug 8 07:42:26 2024 -0600
+
+    [RISC-V][PR target/116240] Ensure object is a comparison before extracting arguments
+    
+    This was supposed to go out the door yesterday, but I kept getting interrupted.
+    
+    The target bits for rtx costing can't assume the rtl they're given actually
+    matches a target pattern.   It's just kind of inherent in how the costing
+    routines get called in various places.
+    
+    In this particular case we're trying to cost a conditional move:
+    
+    (set (dest) (if_then_else (cond) (true) (false))
+    
+    On the RISC-V port the backend only allows actual conditionals for COND.  So
+    something like (eq (reg) (const_int 0)).  In the costing code for if-then-else
+    we did something like
+    
+    (XEXP (XEXP (cond, 0), 0)))
+    
+    Which fails miserably if COND is a terminal node like (reg) rather than (ne
+    (reg) (const_int 0)
+    
+    So this patch tightens up the RTL scanning to ensure that we have a comparison
+    before we start looking at the comparison's arguments.
+    
+    Run through my tester without incident, but I'll wait for the pre-commit tester
+    to run through a cycle before pushing to the trunk.
+    
+    Jeff
+    
+    ps.   We probably could support a naked REG for the condition and internally convert it to (ne (reg) (const_int 0)), but I don't think it likely happens with any regularity.PR target/116240gcc/
+            * config/riscv/riscv.cc (riscv_rtx_costs): Ensure object is a
+            comparison before looking at its arguments.
+    
+    gcc/testsuite
+            * gcc.target/riscv/pr116240.c: New test.
+
+- User: Jeffrey A. Law | Time: 2024-08-08 13:47:08 UTC
+  Text: Fixed on the trunk.
+

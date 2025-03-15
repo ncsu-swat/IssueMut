@@ -1,0 +1,252 @@
+Bug Summary: Error: operand out of range (0x1391c is not between 0xffffffffffff8000 and 0x7fff)
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Mathieu Malaterre | Time: 2023-09-11 10:01:50 UTC
+  Text: I cannot compile highway on powerpc. It fails with a cryptic error message:
+
+/tmp/ccI9XaHH.s: Assembler messages:
+/tmp/ccI9XaHH.s:25: Error: operand out of range (0x1391c is not between 0xffffffffffff8000 and 0x7fff)
+/tmp/ccI9XaHH.s:44: Error: operand out of range (0x1391c is not between 0xffffffffffff8000 and 0x7fff)
+
+- User: Mathieu Malaterre | Time: 2023-09-11 10:02:16 UTC
+  Text: full log:https://buildd.debian.org/status/fetch.php?pkg=highway&arch=powerpc&ver=1.0.8%7Egit20230830.fed142a-1&stamp=1694162297&raw=0
+
+- User: Mathieu Malaterre | Time: 2023-09-11 10:02:47 UTC
+  Text: I am using gcc-snapshot from Debian/sid package. It does contains fixes from PR/111212.
+
+- User: Mathieu Malaterre | Time: 2023-09-11 10:03:09 UTC
+  Text: Reduced test case:
+
+% cat bench_sort.cc
+#define HWY_PRAGMA(tokens) _Pragma(#tokens)
+#define HWY_PUSH_ATTRIBUTES(targets_str) HWY_PRAGMA(GCC target targets_str)
+#define HWY_BEFORE_NAMESPACE() HWY_PUSH_ATTRIBUTES(",cpu=power10")
+#include <time.h>
+struct SortAscending {};
+void VQSort(long long *, size_t, SortAscending);
+void HaveTimerStop(char *);
+HWY_BEFORE_NAMESPACE() void BenchAllColdSort() {
+  char cpu100[100];
+  HaveTimerStop(cpu100);
+  typedef long long T;
+  constexpr size_t kSize = 10 * 1000;
+  alignas(16) T items[kSize];
+  VQSort(items, kSize, SortAscending());
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+}
+
+
+% /usr/lib/gcc-snapshot/bin/g++   -fstack-protector-strong   -maltivec -mcpu=power8   -c bench_sort.cc                                  
+/tmp/ccI9XaHH.s: Assembler messages:
+/tmp/ccI9XaHH.s:25: Error: operand out of range (0x1391c is not between 0xffffffffffff8000 and 0x7fff)
+/tmp/ccI9XaHH.s:44: Error: operand out of range (0x1391c is not between 0xffffffffffff8000 and 0x7fff)
+
+- User: Kewen Lin | Time: 2023-09-12 09:35:08 UTC
+  Text: Confirmed, I'll have a look first.
+
+- User: Kewen Lin | Time: 2023-09-15 07:44:10 UTC
+  Text: This is 32 bit specific issue, the root cause is that we don't support stack_protect_setsi and stack_protect_testsi to emit prefixed insns, but the previous checks consider it's valid to use them.
+
+This is something we missed to update before.
+
+- User: Kewen Lin | Time: 2023-09-18 02:39:27 UTC
+  Text: Createdattachment 55919[details]tested patch
+
+- User: Kewen Lin | Time: 2023-09-18 02:42:48 UTC
+  Text: #c6 is the tested patch.
+
+Hi Mike, I noticed that you committedr10-4547-gce6a6c007e5a98for DImode, I wonder if not updating SImode (32bit) is intentional at that time?
+
+- User: Peter Bergner | Time: 2023-09-18 17:03:47 UTC
+  Text: (In reply to Kewen Lin fromcomment #7)> #c6 is the tested patch.
+> 
+> Hi Mike, I noticed that you committedr10-4547-gce6a6c007e5a98for DImode, I
+> wonder if not updating SImode (32bit) is intentional at that time?Mike will know better than I, but I like the idea of the patch!
+
+- User: Segher Boessenkool | Time: 2023-09-18 17:56:45 UTC
+  Text: I don't like that "wzd" attribute at all.  Please just put an "if" for the mode
+around this -- everywhere else (including in a large part of this patch!) we deal with SImode and DImode separately already.  Or perhaps you can use the "ptrload" attribute,
+which includes the "l"?
+
+There really should be a comment why one alternative needs the %U{n} and the other can
+ignore it, btw.  Nothing new there, but a head-scratcher :-)
+
+- User: Kewen Lin | Time: 2023-09-19 02:15:44 UTC
+  Text: Thanks for both of your comments!
+
+(In reply to Peter Bergner fromcomment #8)> Mike will know better than I, but I like the idea of the patch!Looking forward to Mike's reply. :)
+
+(In reply to Segher Boessenkool fromcomment #9)> I don't like that "wzd" attribute at all.  Please just put an "if" for the
+> mode
+> around this -- everywhere else (including in a large part of this patch!) we
+> deal with SImode and DImode separately already.  Or perhaps you can use the
+> "ptrload" attribute,
+> which includes the "l"?Ok, nice tips!  I will use "ptrload" instead.> 
+> There really should be a comment why one alternative needs the %U{n} and the
+> other can
+> ignore it, btw.  Nothing new there, but a head-scratcher :-)OK, something like: "prefixed load/store insns only have D-form but no update and X-form"?
+
+- User: Segher Boessenkool | Time: 2023-09-19 15:19:06 UTC
+  Text: > > There really should be a comment why one alternative needs the %U{n} and the
+> > other can
+> > ignore it, btw.  Nothing new there, but a head-scratcher :-)
+> 
+> OK, something like: "prefixed load/store insns only have D-form but no
+> update and X-form"?Exactly.  Something short is plenty, but if there is nothing there it is
+surprising.  Surprising is bad :-)
+
+- User: Michael Meissner | Time: 2023-09-19 16:31:05 UTC
+  Text: Basically I did not consider the case.  IIRC, you only need the stack protect DI mode case if the stack is large enough (more than 32K).  I don't think 32-bit programs could have a large enough stack that would force them to use prefixed instructions.
+
+But it should be simple enough to use the :P iterator to catch both SI and DI cases.
+
+- User: Kewen Lin | Time: 2023-09-21 06:57:27 UTC
+  Text: (In reply to Michael Meissner fromcomment #12)> Basically I did not consider the case.  IIRC, you only need the stack
+> protect DI mode case if the stack is large enough (more than 32K).  I don't
+> think 32-bit programs could have a large enough stack that would force them
+> to use prefixed instructions.
+> 
+> But it should be simple enough to use the :P iterator to catch both SI and
+> DI cases.Thanks for the explanation. This reported test case has an array with 10000 long long type element, the corresponding stack size is 80080 bytes and the canary word is put at +80060 which can leverage prefixed insn.
+
+- User: GCC Commits | Time: 2023-10-12 05:06:39 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:530babc2058be5f2b06b1541384e7b730c368b93commitr14-4582-g530babc2058be5f2b06b1541384e7b730c368b93Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Thu Oct 12 00:05:03 2023 -0500
+
+    rs6000: Make 32 bit stack_protect support prefixed insn [PR111367]
+    
+    AsPR111367shows, with prefixed insn supported, some of
+    checkings consider it's able to leverage prefixed insn
+    for stack protect related load/store, but since we don't
+    actually change the emitted assembly for 32 bit, it can
+    cause the assembler error as exposed.
+    
+    Mike's commitr10-4547-gce6a6c007e5a98has already handled
+    the 64 bit case (DImode), this patch is to treat the 32
+    bit case (SImode) by making use of mode iterator P and
+    ptrload attribute iterator, also fixes the constraints
+    to match the emitted operand formats.PR target/111367gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.md (stack_protect_setsi): Support prefixed
+            instruction emission and incorporate to stack_protect_set<mode>.
+            (stack_protect_setdi): Rename to ...
+            (stack_protect_set<mode>): ... this, adjust constraint.
+            (stack_protect_testsi): Support prefixed instruction emission and
+            incorporate to stack_protect_test<mode>.
+            (stack_protect_testdi): Rename to ...
+            (stack_protect_test<mode>): ... this, adjust constraint.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/powerpc/pr111367.C: New test.
+
+- User: GCC Commits | Time: 2023-10-23 05:32:14 UTC
+  Text: The releases/gcc-11 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:f0b38334c57a8e92139c22efa82fe96994bb8eb8commitr11-11074-gf0b38334c57a8e92139c22efa82fe96994bb8eb8Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Thu Oct 12 00:05:03 2023 -0500
+
+    rs6000: Make 32 bit stack_protect support prefixed insn [PR111367]
+    
+    AsPR111367shows, with prefixed insn supported, some of
+    checkings consider it's able to leverage prefixed insn
+    for stack protect related load/store, but since we don't
+    actually change the emitted assembly for 32 bit, it can
+    cause the assembler error as exposed.
+    
+    Mike's commitr10-4547-gce6a6c007e5a98has already handled
+    the 64 bit case (DImode), this patch is to treat the 32
+    bit case (SImode) by making use of mode iterator P and
+    ptrload attribute iterator, also fixes the constraints
+    to match the emitted operand formats.PR target/111367gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.md (stack_protect_setsi): Support prefixed
+            instruction emission and incorporate to stack_protect_set<mode>.
+            (stack_protect_setdi): Rename to ...
+            (stack_protect_set<mode>): ... this, adjust constraint.
+            (stack_protect_testsi): Support prefixed instruction emission and
+            incorporate to stack_protect_test<mode>.
+            (stack_protect_testdi): Rename to ...
+            (stack_protect_test<mode>): ... this, adjust constraint.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/powerpc/pr111367.C: New test.
+    
+    (cherry picked from commit 530babc2058be5f2b06b1541384e7b730c368b93)
+
+- User: GCC Commits | Time: 2023-10-23 05:35:40 UTC
+  Text: The releases/gcc-12 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:93361f2b0a8344a33147e5290e4d194ef9e5d9e1commitr12-9937-g93361f2b0a8344a33147e5290e4d194ef9e5d9e1Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Thu Oct 12 00:05:03 2023 -0500
+
+    rs6000: Make 32 bit stack_protect support prefixed insn [PR111367]
+    
+    AsPR111367shows, with prefixed insn supported, some of
+    checkings consider it's able to leverage prefixed insn
+    for stack protect related load/store, but since we don't
+    actually change the emitted assembly for 32 bit, it can
+    cause the assembler error as exposed.
+    
+    Mike's commitr10-4547-gce6a6c007e5a98has already handled
+    the 64 bit case (DImode), this patch is to treat the 32
+    bit case (SImode) by making use of mode iterator P and
+    ptrload attribute iterator, also fixes the constraints
+    to match the emitted operand formats.PR target/111367gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.md (stack_protect_setsi): Support prefixed
+            instruction emission and incorporate to stack_protect_set<mode>.
+            (stack_protect_setdi): Rename to ...
+            (stack_protect_set<mode>): ... this, adjust constraint.
+            (stack_protect_testsi): Support prefixed instruction emission and
+            incorporate to stack_protect_test<mode>.
+            (stack_protect_testdi): Rename to ...
+            (stack_protect_test<mode>): ... this, adjust constraint.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/powerpc/pr111367.C: New test.
+    
+    (cherry picked from commit 530babc2058be5f2b06b1541384e7b730c368b93)
+
+- User: GCC Commits | Time: 2023-10-23 05:38:32 UTC
+  Text: The releases/gcc-13 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:3ae7f45ea0d9caa54ebd5dc19caf94fa002e7ee2commitr13-7975-g3ae7f45ea0d9caa54ebd5dc19caf94fa002e7ee2Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Thu Oct 12 00:05:03 2023 -0500
+
+    rs6000: Make 32 bit stack_protect support prefixed insn [PR111367]
+    
+    AsPR111367shows, with prefixed insn supported, some of
+    checkings consider it's able to leverage prefixed insn
+    for stack protect related load/store, but since we don't
+    actually change the emitted assembly for 32 bit, it can
+    cause the assembler error as exposed.
+    
+    Mike's commitr10-4547-gce6a6c007e5a98has already handled
+    the 64 bit case (DImode), this patch is to treat the 32
+    bit case (SImode) by making use of mode iterator P and
+    ptrload attribute iterator, also fixes the constraints
+    to match the emitted operand formats.PR target/111367gcc/ChangeLog:
+    
+            * config/rs6000/rs6000.md (stack_protect_setsi): Support prefixed
+            instruction emission and incorporate to stack_protect_set<mode>.
+            (stack_protect_setdi): Rename to ...
+            (stack_protect_set<mode>): ... this, adjust constraint.
+            (stack_protect_testsi): Support prefixed instruction emission and
+            incorporate to stack_protect_test<mode>.
+            (stack_protect_testdi): Rename to ...
+            (stack_protect_test<mode>): ... this, adjust constraint.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.target/powerpc/pr111367.C: New test.
+    
+    (cherry picked from commit 530babc2058be5f2b06b1541384e7b730c368b93)
+
+- User: Kewen Lin | Time: 2023-10-23 06:22:03 UTC
+  Text: Should be fixed on trunk and active branch releases.
+

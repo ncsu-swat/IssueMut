@@ -1,0 +1,264 @@
+Bug Summary: powerpc: epilogue in _Unwind_RaiseException corrupts return value due to __builtin_eh_return
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2024-04-25 07:34:49 UTC
+  Text: I reduced an miscompile for aarch64 inside _Unwind_RaiseException and I noticed the same issue can be reproduced on powerpc64-linux-gnu and powerpc-linux-gnu.
+
+Reduced testcase:
+```
+__attribute__((noipa,noinline))
+int f(int *a, long offset, void *handler)
+{
+  if (*a == 5)
+    return 5;
+  __builtin_eh_return (offset, handler);
+}
+
+int main()
+{
+  int t = 5;
+  if (f(&t, 0, 0) != 5)
+    __builtin_abort();
+}
+```
+
+This produces a load in the epilogue part for the `return 5` path (which is reduced from the end of stack path inside _Unwind_RaiseException).
+```
+        li 3,5
+        li 10,0
+.L4:
+        ld 2,40(1)
+        ld 4,-24(1)
+        ld 5,-16(1)
+        ld 6,-8(1)
+        ld 3,-32(1)
+        add 1,1,10
+        blr
+```
+
+- User: Kewen Lin | Time: 2024-04-25 09:23:06 UTC
+  Text: Thanks for reporting, confirmed, it also fails on LE (ppc64le-linux).
+
+- User: Kewen Lin | Time: 2024-04-25 09:25:43 UTC
+  Text: Ashttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=114843#c8, we may need some similar handling liker14-6440-g4b421728289e6f.
+
+- User: Andrew Pinski | Time: 2024-04-25 21:37:09 UTC
+  Text: (In reply to Kewen Lin fromcomment #2)> Ashttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=114843#c8, we may need some
+> similar handling liker14-6440-g4b421728289e6f.Note rs6000_emit_epilogue mostly handles eh_returns so it might not be as hard as other targets.
+
+- User: Kewen Lin | Time: 2024-04-29 05:20:26 UTC
+  Text: (In reply to Andrew Pinski fromcomment #3)> (In reply to Kewen Lin fromcomment #2)
+> > Ashttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=114843#c8, we may need some
+> > similar handling liker14-6440-g4b421728289e6f.
+> 
+> Note rs6000_emit_epilogue mostly handles eh_returns so it might not be as
+> hard as other targets.Yes, making a patch.
+
+- User: Kewen Lin | Time: 2024-04-29 09:04:59 UTC
+  Text: Createdattachment 58067[details]untested patch
+
+- User: Kewen Lin | Time: 2024-05-14 08:49:50 UTC
+  Text: Createdattachment 58201[details]tested patch
+
+- User: GCC Commits | Time: 2024-05-29 02:15:00 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:e5fc5d42d25c86ae48178db04ce64d340a834614commitr15-884-ge5fc5d42d25c86ae48178db04ce64d340a834614Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Tue May 28 21:13:40 2024 -0500
+
+    rs6000: Don't clobber return value when eh_return called [PR114846]
+    
+    As the associated test case inPR114846shows, currently
+    with eh_return involved some register restoring for EH
+    RETURN DATA in epilogue can clobber the one which holding
+    the return value.  Referring to the existing handlings in
+    some other targets, this patch makes eh_return expander
+    call one new define_insn_and_split eh_return_internal which
+    directly calls rs6000_emit_epilogue with epilogue_type
+    EPILOGUE_TYPE_EH_RETURN instead of the previous treating
+    normal return with crtl->calls_eh_return specially.PR target/114846gcc/ChangeLog:
+    
+            * config/rs6000/rs6000-logue.cc (rs6000_emit_epilogue): As
+            EPILOGUE_TYPE_EH_RETURN would be passed as epilogue_type directly
+            now, adjust the relevant handlings on it.
+            * config/rs6000/rs6000.md (eh_return expander): Append by calling
+            gen_eh_return_internal and emit_barrier.
+            (eh_return_internal): New define_insn_and_split, call function
+            rs6000_emit_epilogue with epilogue type EPILOGUE_TYPE_EH_RETURN.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr114846.c: New test.
+
+- User: Kewen Lin | Time: 2024-05-29 02:33:45 UTC
+  Text: Should be fixed on trunk, it's not a regression, but we probably want backporting this?
+
+- User: Peter Bergner | Time: 2024-05-29 12:30:01 UTC
+  Text: (In reply to Kewen Lin fromcomment #8)> Should be fixed on trunk, it's not a regression, but we probably want
+> backporting this?For code correctness bugs, yes, we want them backported.
+
+- User: Kewen Lin | Time: 2024-05-29 12:50:43 UTC
+  Text: (In reply to Peter Bergner fromcomment #9)> (In reply to Kewen Lin fromcomment #8)
+> > Should be fixed on trunk, it's not a regression, but we probably want
+> > backporting this?
+> 
+> For code correctness bugs, yes, we want them backported.Thanks for confirming!  Will do backporting after burn-in time.
+
+- User: Peter Bergner | Time: 2024-06-21 19:53:04 UTC
+  Text: (In reply to Kewen Lin fromcomment #10)> (In reply to Peter Bergner fromcomment #9)
+> > (In reply to Kewen Lin fromcomment #8)
+> > > Should be fixed on trunk, it's not a regression, but we probably want
+> > > backporting this?
+> > 
+> > For code correctness bugs, yes, we want them backported.
+> 
+> Thanks for confirming!  Will do backporting after burn-in time.Have we done the backports so we can just mark this bug a FIXED?  ...or do we still need to push the backports?
+
+- User: Segher Boessenkool | Time: 2024-06-23 19:42:02 UTC
+  Text: The backports have not been done yet.
+
+It would be good if the blockage / barrier would get some comment btw, saying
+what exactly it is intended to do!  It is very much cargo-cult the way it is.
+
+- User: GCC Commits | Time: 2024-06-24 01:43:47 UTC
+  Text: The releases/gcc-14 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:2b5e8f918ef0027d2af8e53c4e114e1d133fc609commitr14-10342-g2b5e8f918ef0027d2af8e53c4e114e1d133fc609Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Tue May 28 21:13:40 2024 -0500
+
+    rs6000: Don't clobber return value when eh_return called [PR114846]
+    
+    As the associated test case inPR114846shows, currently
+    with eh_return involved some register restoring for EH
+    RETURN DATA in epilogue can clobber the one which holding
+    the return value.  Referring to the existing handlings in
+    some other targets, this patch makes eh_return expander
+    call one new define_insn_and_split eh_return_internal which
+    directly calls rs6000_emit_epilogue with epilogue_type
+    EPILOGUE_TYPE_EH_RETURN instead of the previous treating
+    normal return with crtl->calls_eh_return specially.PR target/114846gcc/ChangeLog:
+    
+            * config/rs6000/rs6000-logue.cc (rs6000_emit_epilogue): As
+            EPILOGUE_TYPE_EH_RETURN would be passed as epilogue_type directly
+            now, adjust the relevant handlings on it.
+            * config/rs6000/rs6000.md (eh_return expander): Append by calling
+            gen_eh_return_internal and emit_barrier.
+            (eh_return_internal): New define_insn_and_split, call function
+            rs6000_emit_epilogue with epilogue type EPILOGUE_TYPE_EH_RETURN.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr114846.c: New test.
+    
+    (cherry picked from commit e5fc5d42d25c86ae48178db04ce64d340a834614)
+
+- User: GCC Commits | Time: 2024-06-24 01:45:01 UTC
+  Text: The releases/gcc-13 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:dd54ed4ae417935300a3c4bb356d37c2ae7f731ecommitr13-8866-gdd54ed4ae417935300a3c4bb356d37c2ae7f731eAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Tue May 28 21:13:40 2024 -0500
+
+    rs6000: Don't clobber return value when eh_return called [PR114846]
+    
+    As the associated test case inPR114846shows, currently
+    with eh_return involved some register restoring for EH
+    RETURN DATA in epilogue can clobber the one which holding
+    the return value.  Referring to the existing handlings in
+    some other targets, this patch makes eh_return expander
+    call one new define_insn_and_split eh_return_internal which
+    directly calls rs6000_emit_epilogue with epilogue_type
+    EPILOGUE_TYPE_EH_RETURN instead of the previous treating
+    normal return with crtl->calls_eh_return specially.PR target/114846gcc/ChangeLog:
+    
+            * config/rs6000/rs6000-logue.cc (rs6000_emit_epilogue): As
+            EPILOGUE_TYPE_EH_RETURN would be passed as epilogue_type directly
+            now, adjust the relevant handlings on it.
+            * config/rs6000/rs6000.md (eh_return expander): Append by calling
+            gen_eh_return_internal and emit_barrier.
+            (eh_return_internal): New define_insn_and_split, call function
+            rs6000_emit_epilogue with epilogue type EPILOGUE_TYPE_EH_RETURN.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr114846.c: New test.
+    
+    (cherry picked from commit e5fc5d42d25c86ae48178db04ce64d340a834614)
+
+- User: GCC Commits | Time: 2024-06-24 01:46:35 UTC
+  Text: The releases/gcc-12 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:0fd6ae9b20913ab84d596448e14411eedbd324f9commitr12-10579-g0fd6ae9b20913ab84d596448e14411eedbd324f9Author: Kewen Lin <linkw@linux.ibm.com>
+Date:   Tue May 28 21:13:40 2024 -0500
+
+    rs6000: Don't clobber return value when eh_return called [PR114846]
+    
+    As the associated test case inPR114846shows, currently
+    with eh_return involved some register restoring for EH
+    RETURN DATA in epilogue can clobber the one which holding
+    the return value.  Referring to the existing handlings in
+    some other targets, this patch makes eh_return expander
+    call one new define_insn_and_split eh_return_internal which
+    directly calls rs6000_emit_epilogue with epilogue_type
+    EPILOGUE_TYPE_EH_RETURN instead of the previous treating
+    normal return with crtl->calls_eh_return specially.PR target/114846gcc/ChangeLog:
+    
+            * config/rs6000/rs6000-logue.cc (rs6000_emit_epilogue): As
+            EPILOGUE_TYPE_EH_RETURN would be passed as epilogue_type directly
+            now, adjust the relevant handlings on it.
+            * config/rs6000/rs6000.md (eh_return expander): Append by calling
+            gen_eh_return_internal and emit_barrier.
+            (eh_return_internal): New define_insn_and_split, call function
+            rs6000_emit_epilogue with epilogue type EPILOGUE_TYPE_EH_RETURN.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr114846.c: New test.
+    
+    (cherry picked from commit e5fc5d42d25c86ae48178db04ce64d340a834614)
+
+- User: GCC Commits | Time: 2024-06-24 01:49:01 UTC
+  Text: The releases/gcc-11 branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:549701628b64a7c4ac9bb5f9623e83a8dc1d828ccommitr11-11535-g549701628b64a7c4ac9bb5f9623e83a8dc1d828cAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Tue May 28 21:13:40 2024 -0500
+
+    rs6000: Don't clobber return value when eh_return called [PR114846]
+    
+    As the associated test case inPR114846shows, currently
+    with eh_return involved some register restoring for EH
+    RETURN DATA in epilogue can clobber the one which holding
+    the return value.  Referring to the existing handlings in
+    some other targets, this patch makes eh_return expander
+    call one new define_insn_and_split eh_return_internal which
+    directly calls rs6000_emit_epilogue with epilogue_type
+    EPILOGUE_TYPE_EH_RETURN instead of the previous treating
+    normal return with crtl->calls_eh_return specially.PR target/114846gcc/ChangeLog:
+    
+            * config/rs6000/rs6000-logue.c (rs6000_emit_epilogue): As
+            EPILOGUE_TYPE_EH_RETURN would be passed as epilogue_type directly
+            now, adjust the relevant handlings on it.
+            * config/rs6000/rs6000.md (eh_return expander): Append by calling
+            gen_eh_return_internal and emit_barrier.
+            (eh_return_internal): New define_insn_and_split, call function
+            rs6000_emit_epilogue with epilogue type EPILOGUE_TYPE_EH_RETURN.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr114846.c: New test.
+    
+    (cherry picked from commit e5fc5d42d25c86ae48178db04ce64d340a834614)
+
+- User: Kewen Lin | Time: 2024-06-24 03:46:14 UTC
+  Text: (In reply to Peter Bergner fromcomment #11)> Have we done the backports so we can just mark this bug a FIXED?  ...or do
+> we still need to push the backports?(In reply to Segher Boessenkool fromcomment #12)> The backports have not been done yet.
+>Yeah, I just backported it to all active release branches, previously when I wanted to backport them, I noticed release 12.4 is ongoing, so I held it for a while.> It would be good if the blockage / barrier would get some comment btw, saying
+> what exactly it is intended to do!  It is very much cargo-cult the way it is.Good idea, sorry that didn't specify it originally, the reason why adding the barrier is that: bb verifier requires returnjump_p should be followed by a barrier:
+
+      if (JUMP_P (x)
+	  && returnjump_p (x) && ! condjump_p (x)
+	  && ! ((y = next_nonnote_nondebug_insn (x))
+		&& BARRIER_P (y)))
+	    fatal_insn ("return not followed by barrier", x); 
+
+, otherwise we will encounter an ICE. Adding blockage follows the existing practice when calling rs6000_emit_epilogue to respect option -mno-sched-epilog (put one scheduling boundary on the emitted insns from rs6000_emit_epilogue).
+
+- User: Kewen Lin | Time: 2024-06-24 03:50:26 UTC
+  Text: Should be fixed on trunk and all active release branches.
+

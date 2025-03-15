@@ -1,0 +1,289 @@
+Bug Summary: RISC-V: Redundant vsetvl instructions
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Lehua Ding | Time: 2023-09-07 07:13:05 UTC
+  Text: The next two vsetvl instructions in assembly should be removed. Because the vadd instruction is calculated in vlmax length, but where it is used only the first avl, we can change the vl of the vadd to the avl of the instruction being used.
+
+C Code:
+#include <riscv_vector.h>
+
+void foo1 (int32_t* restrict a, int32_t* restrict b, int32_t *restrict c, int n)
+{
+    for (int i = 0; i < n; i += 1)
+      c[i] = a[i] + b[i];
+}
+
+Assembly Code:
+foo1:
+        ble     a3,zero,.L5
+.L3:
+        vsetvli a5,a3,e32,m2,ta,ma
+        vle32.v v4,0(a0)
+        vle32.v v2,0(a1)
+        vsetvli a6,zero,e32,m2,ta,ma
+        slli    a4,a5,2
+        vadd.vv v2,v2,v4
+        sub     a3,a3,a5
+        vsetvli zero,a5,e32,m2,ta,ma
+        vse32.v v2,0(a2)
+        add     a0,a0,a4
+        add     a1,a1,a4
+        add     a2,a2,a4
+        bne     a3,zero,.L3
+.L5:
+        rethttps://godbolt.org/z/jzWjK6EM9
+
+- User: GCC Commits | Time: 2023-10-26 23:02:17 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:e37bc2cf00671e3bc4d82f2627330c0f885a6f29commitr14-4961-ge37bc2cf00671e3bc4d82f2627330c0f885a6f29Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Thu Oct 26 16:13:51 2023 +0800
+
+    RISC-V: Add AVL propagation PASS for RVV auto-vectorization
+    
+    This patch addresses the redundant AVL/VL toggling in RVV partial auto-vectorization
+    which is a known issue for a long time and I finally find the time to address it.
+    
+    Consider a simple vector addition operation:https://godbolt.org/z/7hfGfEjW3void
+    foo (int *__restrict a,
+         int *__restrict b,
+         int *__restrict n)
+    {
+      for (int i = 0; i < n; i++)
+          a[i] = a[i] + b[i];
+    }
+    
+    Optimized IR:
+    
+    Loop body:
+      _38 = .SELECT_VL (ivtmp_36, POLY_INT_CST [4, 4]);                          -> vsetvli a5,a2,e8,mf4,ta,ma
+      ...
+      vect__4.8_27 = .MASK_LEN_LOAD (vectp_a.6_29, 32B, { -1, ... }, _38, 0);    -> vle32.v v2,0(a0)
+      vect__6.11_20 = .MASK_LEN_LOAD (vectp_b.9_25, 32B, { -1, ... }, _38, 0);   -> vle32.v v1,0(a1)
+      vect__7.12_19 = vect__6.11_20 + vect__4.8_27;                              -> vsetvli a6,zero,e32,m1,ta,ma + vadd.vv v1,v1,v2
+      .MASK_LEN_STORE (vectp_a.13_11, 32B, { -1, ... }, _38, 0, vect__7.12_19);  -> vsetvli zero,a5,e32,m1,ta,ma + vse32.v v1,0(a4)
+    
+    We can see 2 redundant vsetvls inside the loop body due to AVL/VL toggling.
+    The AVL/VL toggling is because we are missing LEN information in simple PLUS_EXPR GIMPLE assignment:
+    
+    vect__7.12_19 = vect__6.11_20 + vect__4.8_27;
+    
+    GCC apply partial predicate load/store and un-predicated full vector operation on partial vectorization.
+    Such flow are used by all other targets like ARM SVE (RVV also uses such flow):
+    
+    ARM SVE:
+    
+    .L3:
+            ld1w    z30.s, p7/z, [x0, x3, lsl 2]   -> predicated load
+            ld1w    z31.s, p7/z, [x1, x3, lsl 2]   -> predicated load
+            add     z31.s, z31.s, z30.s            -> un-predicated add
+            st1w    z31.s, p7, [x0, x3, lsl 2]     -> predicated store
+    
+    Such vectorization flow causes AVL/VL toggling on RVV so we need AVL propagation PASS for it.
+    
+    Also, It's very unlikely that we can apply predicated operations on all vectorization for following reasons:
+    
+    1. It's very heavy workload to support them on all vectorization and we don't see any benefits if we can handle that on targets backend.
+    2. Changing Loop vectorizer for it will make code base ugly and hard to maintain.
+    3. We will need so many patterns for all operations. Not only COND_LEN_ADD, COND_LEN_SUB, ....
+       We also need COND_LEN_EXTEND, ...., COND_LEN_CEIL, ... .. over 100+ patterns, unreasonable number of patterns.
+    
+    To conclude, we prefer un-predicated operations here, and design a nice and clean AVL propagation PASS for it to elide the redundant vsetvls
+    due to AVL/VL toggling.
+    
+    The second question is that why we separate a PASS called AVL propagation. Why not optimize it in VSETVL PASS (We definitetly can optimize AVL in VSETVL PASS)
+    
+    Frankly, I was planning to address such issue in VSETVL PASS that's why we recently refactored VSETVL PASS. However, I changed my mind recently after several
+    experiments and tries.
+    
+    The reasons as follows:
+    
+    1. For code base management and maintainience. Current VSETVL PASS is complicated enough and aleady has enough aggressive and fancy optimizations which
+       turns out it can always generate optimal codegen in most of the cases. It's not a good idea keep adding more features into VSETVL PASS to make VSETVL
+             PASS become heavy and heavy again, then we will need to refactor it again in the future.
+             Actuall, the VSETVL PASS is very stable and optimal after the recent refactoring. Hopefully, we should not change VSETVL PASS any more except the minor
+             fixes.
+    
+    2. vsetvl insertion (VSETVL PASS does this thing) and AVL propagation are 2 different things,  I don't think we should fuse them into same PASS.
+    
+    3. VSETVL PASS is an post-RA PASS, wheras AVL propagtion should be done before RA which can reduce register allocation.
+    
+    4. This patch's AVL propagation PASS only does AVL propagation for RVV partial auto-vectorization situations.
+       This patch's codes are only hundreds lines which is very managable and can be very easily extended features and enhancements.
+             We can easily extend and enhance more AVL propagation in a clean and separate PASS in the future. (If we do it on VSETVL PASS, we will complicate
+             VSETVL PASS again which is already so complicated.)
+    
+    Here is an example to demonstrate more:https://godbolt.org/z/bE86sv3q5void foo2 (int *__restrict a,
+              int *__restrict b,
+              int *__restrict c,
+              int *__restrict a2,
+              int *__restrict b2,
+              int *__restrict c2,
+              int *__restrict a3,
+              int *__restrict b3,
+              int *__restrict c3,
+              int *__restrict a4,
+              int *__restrict b4,
+              int *__restrict c4,
+              int *__restrict a5,
+              int *__restrict b5,
+              int *__restrict c5,
+              int n)
+    {
+        for (int i = 0; i < n; i++){
+          a[i] = b[i] + c[i];
+          b5[i] = b[i] + c[i];
+          a2[i] = b2[i] + c2[i];
+          a3[i] = b3[i] + c3[i];
+          a4[i] = b4[i] + c4[i];
+          a5[i] = a[i] + a4[i];
+          a[i] = a5[i] + b5[i]+ a[i];
+    
+          a[i] = a[i] + c[i];
+          b5[i] = a[i] + c[i];
+          a2[i] = a[i] + c2[i];
+          a3[i] = a[i] + c3[i];
+          a4[i] = a[i] + c4[i];
+          a5[i] = a[i] + a4[i];
+          a[i] = a[i] + b5[i]+ a[i];
+        }
+    }
+    
+    1. Loop Body:
+    
+    Before this patch:                                          After this patch:
+    
+                  vsetvli a4,t1,e8,mf4,ta,ma                           vsetvli      a4,t1,e32,m1,ta,ma
+            vle32.v v2,0(a2)                                     vle32.v    v2,0(a2)
+            vle32.v v4,0(a1)                                     vle32.v    v3,0(t2)
+            vle32.v v1,0(t2)                                     vle32.v    v4,0(a1)
+            vsetvli a7,zero,e32,m1,ta,ma                         vle32.v    v1,0(t0)
+            vadd.vv v4,v2,v4                                     vadd.vv    v4,v2,v4
+            vsetvli zero,a4,e32,m1,ta,ma                         vadd.vv    v1,v3,v1
+            vle32.v v3,0(s0)                                     vadd.vv    v1,v1,v4
+            vsetvli a7,zero,e32,m1,ta,ma                         vadd.vv    v1,v1,v4
+            vadd.vv v1,v3,v1                                     vadd.vv    v1,v1,v4
+            vadd.vv v1,v1,v4                                     vadd.vv    v1,v1,v2
+            vadd.vv v1,v1,v4                                     vadd.vv    v2,v1,v2
+            vadd.vv v1,v1,v4                                     vse32.v    v2,0(t5)
+            vsetvli zero,a4,e32,m1,ta,ma                         vadd.vv    v2,v2,v1
+            vle32.v v4,0(a5)                                     vadd.vv    v2,v2,v1
+            vsetvli a7,zero,e32,m1,ta,ma                         slli       a7,a4,2
+            vadd.vv v1,v1,v2                                     vadd.vv    v3,v1,v3
+            vadd.vv v2,v1,v2                                     vle32.v    v5,0(a5)
+            vadd.vv v4,v1,v4                                     vle32.v    v6,0(t6)
+            vsetvli zero,a4,e32,m1,ta,ma                         vse32.v    v3,0(t3)
+            vse32.v v2,0(t5)                                     vse32.v    v2,0(a0)
+            vse32.v v4,0(a3)                                     vadd.vv    v3,v3,v1
+            vsetvli a7,zero,e32,m1,ta,ma                         vadd.vv    v2,v1,v5
+            vadd.vv v3,v1,v3                                     vse32.v    v3,0(t4)
+            vadd.vv v2,v2,v1                                     vadd.vv    v1,v1,v6
+            vadd.vv v2,v2,v1                                     vse32.v    v2,0(a3)
+            vsetvli zero,a4,e32,m1,ta,ma                         vse32.v    v1,0(a6)
+            vse32.v v2,0(a0)
+            vse32.v v3,0(t3)
+            vle32.v v2,0(t0)
+            vsetvli a7,zero,e32,m1,ta,ma
+            vadd.vv v3,v3,v1
+            vsetvli zero,a4,e32,m1,ta,ma
+            vse32.v v3,0(t4)
+            vsetvli a7,zero,e32,m1,ta,ma
+            slli    a7,a4,2
+            vadd.vv v1,v1,v2
+            sub     t1,t1,a4
+            vsetvli zero,a4,e32,m1,ta,ma
+            vse32.v v1,0(a6)
+    
+    It's quite obvious, all heavy && redundant vsetvls inside loop body are eliminated.
+    
+    2. Epilogue:
+        Before this patch:                                          After this patch:
+    
+         .L5:                                                      .L5:
+            ld      s0,8(sp)                                         ret
+            addi    sp,sp,16
+            jr      ra
+    
+    This is the benefit we do the AVL propation before RA since we eliminate the use of 'a7' register
+    which is used by the redudant AVL/VL toggling instruction: 'vsetvli a7,zero,e32,m1,ta,ma'
+    
+    The final codegen after this patch:
+    
+    foo2:
+            lw      t1,56(sp)
+            ld      t6,0(sp)
+            ld      t3,8(sp)
+            ld      t0,16(sp)
+            ld      t2,24(sp)
+            ld      t4,32(sp)
+            ld      t5,40(sp)
+            ble     t1,zero,.L5
+    .L3:
+            vsetvli a4,t1,e32,m1,ta,ma
+            vle32.v v2,0(a2)
+            vle32.v v3,0(t2)
+            vle32.v v4,0(a1)
+            vle32.v v1,0(t0)
+            vadd.vv v4,v2,v4
+            vadd.vv v1,v3,v1
+            vadd.vv v1,v1,v4
+            vadd.vv v1,v1,v4
+            vadd.vv v1,v1,v4
+            vadd.vv v1,v1,v2
+            vadd.vv v2,v1,v2
+            vse32.v v2,0(t5)
+            vadd.vv v2,v2,v1
+            vadd.vv v2,v2,v1
+            slli    a7,a4,2
+            vadd.vv v3,v1,v3
+            vle32.v v5,0(a5)
+            vle32.v v6,0(t6)
+            vse32.v v3,0(t3)
+            vse32.v v2,0(a0)
+            vadd.vv v3,v3,v1
+            vadd.vv v2,v1,v5
+            vse32.v v3,0(t4)
+            vadd.vv v1,v1,v6
+            vse32.v v2,0(a3)
+            vse32.v v1,0(a6)
+            sub     t1,t1,a4
+            add     a1,a1,a7
+            add     a2,a2,a7
+            add     a5,a5,a7
+            add     t6,t6,a7
+            add     t0,t0,a7
+            add     t2,t2,a7
+            add     t5,t5,a7
+            add     a3,a3,a7
+            add     a6,a6,a7
+            add     t3,t3,a7
+            add     t4,t4,a7
+            add     a0,a0,a7
+            bne     t1,zero,.L3
+    .L5:
+            retPR target/111318PR target/111888gcc/ChangeLog:
+    
+            * config.gcc: Add AVL propagation pass.
+            * config/riscv/riscv-passes.def (INSERT_PASS_AFTER): Ditto.
+            * config/riscv/riscv-protos.h (make_pass_avlprop): Ditto.
+            * config/riscv/t-riscv: Ditto.
+            * config/riscv/riscv-avlprop.cc: New file.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/vect/costmodel/riscv/rvv/dynamic-lmul4-5.c: Adapt test.
+            * gcc.dg/vect/costmodel/riscv/rvv/dynamic-lmul8-2.c: Ditto.
+            * gcc.target/riscv/rvv/autovec/partial/select_vl-2.c: Ditto.
+            * gcc.target/riscv/rvv/autovec/ternop/ternop_nofm-2.c: Ditto.
+            * gcc.target/riscv/rvv/autovec/pr111318.c: New test.
+            * gcc.target/riscv/rvv/autovec/pr111888.c: New test.
+    Tested-by: Patrick O'Neill <patrick@rivosinc.com>
+
+- User: Lehua Ding | Time: 2023-10-27 03:23:45 UTC
+  Text: Confirmed.
+

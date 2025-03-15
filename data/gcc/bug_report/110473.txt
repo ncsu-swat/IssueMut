@@ -1,0 +1,125 @@
+Bug Summary: vec_convert for aarch64 seems to lower to something which should be improved
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Andrew Pinski | Time: 2023-06-29 04:15:40 UTC
+  Text: Take:
+```
+typedef unsigned int v4si __attribute__ ((vector_size (4*sizeof(int))));
+typedef unsigned short v4hi __attribute__ ((vector_size (4*sizeof(short))));
+
+v4si f(v4si a, v4si b)
+{
+  v4hi t = __builtin_convertvector (a, v4hi);
+  v4si t1 = __builtin_convertvector (t, v4si);
+  return t1;
+}
+```
+
+This gets lowered in veclower21 to
+```
+  _6 = BIT_FIELD_REF <_5, 64, 0>;
+  t_2 = _6;
+  _7 = BIT_FIELD_REF <t_2, 16, 0>;
+  _8 = (unsigned int) _7;
+  _9 = BIT_FIELD_REF <t_2, 16, 16>;
+  _10 = (unsigned int) _9;
+  _11 = BIT_FIELD_REF <t_2, 16, 32>;
+  _12 = (unsigned int) _11;
+  _13 = BIT_FIELD_REF <t_2, 16, 48>;
+  _14 = (unsigned int) _13;
+  t1_3 = {_8, _10, _12, _14};
+```
+
+And then forwprop optimizes this to:
+```
+  _6 = BIT_FIELD_REF <_5, 64, 0>;
+  t1_3 = (v4si) _6;
+```
+
+And then combine comes along and optimizes that to:
+(insn 9 8 11 2 (set (reg:V8HI 98)
+        (vec_concat:V8HI (truncate:V4HI (reg:V4SI 102))
+            (const_vector:V4HI [
+                    (const_int 0 [0]) repeated x4
+                ]))) "/app/example.cpp":7:8 5467 {truncv4siv4hi2_vec_concatz_le}
+     (expr_list:REG_DEAD (reg:V4SI 102)
+        (nil)))
+(note 11 9 16 2 NOTE_INSN_DELETED)
+(insn 16 11 17 2 (set (reg/i:V4SI 32 v0)
+        (sign_extend:V4SI (subreg:V4HI (reg:V8HI 98) 0))) "/app/example.cpp":10:1 5459 {extendv4hiv4si2}
+     (expr_list:REG_DEAD (reg:V8HI 98)
+        (nil)))
+
+But the first one is basically just (truncate:V4HI (reg:V4SI 102)) (due to the way the instruction works, the top parts is also zeros).
+So we get in the end:
+        xtn     v0.4h, v0.4s
+        sxtl    v0.4s, v0.4h
+
+Why couldn't vectlower could just do:
+```
+_6 = (v4hi)a_1(D);
+t1_3 = (v4si) _6;
+```
+In the first place instead of depending on later optimizations (at least handle the second part)?
+
+note with the above lowering we might hit an issue in match.pd where it is trying to turn that into t1_3 = t1_3 = {0xFFFF,0xFFFF,0xFFFF,0xFFFF} & _6;
+(both because of TYPE_PRECISION and because it just uses wide_int_to_tree ...
+
+- User: Richard Biener | Time: 2023-06-29 07:26:00 UTC
+  Text: probably nobody implemented this in veclower?
+
+On x86-64 I get
+
+  _5 = VEC_PACK_TRUNC_EXPR <a_1(D), { 0, 0, 0, 0 }>;
+  _6 = BIT_FIELD_REF <_5, 64, 0>;
+  t_2 = _6;
+  _7 = [vec_unpack_lo_expr] t_2;
+  _8 = [vec_unpack_hi_expr] t_2;
+  t1_3 = {_7, _8};
+
+- User: Andrew Pinski | Time: 2024-07-02 07:37:02 UTC
+  Text: Fixed byr15-1677-gc320a7efcd35ba.
+
+I will add a testcase.
+
+veclower now produces:
+v4si f (v4si a, v4si b)
+{
+  v4si t1;
+  v4hi t;
+
+  <bb 2> [local count: 1073741824]:
+  t_2 = (v4hi) a_1(D);
+  t1_3 = (v4si) t_2;
+  return t1_3;
+
+}
+
+- User: GCC Commits | Time: 2024-07-02 22:28:07 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:a7ad9cb813063ddf51269910f33b56116c10462ccommitr15-1800-ga7ad9cb813063ddf51269910f33b56116c10462cAuthor: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Tue Jul 2 15:02:17 2024 -0700
+
+    aarch64: Add testcase for vectorconvert lowering [PR110473]
+    
+    Vectorconvert lowering was changed to use the convert optab directly
+    starting inr15-1677-gc320a7efcd35ba. I had filed an aarch64 specific
+    issue for this specific thing and it would make sense to add an aarch64
+    specific testcase instead of just having a x86_64 specific ones for
+    this.
+    
+    Pushed as obvious after testing for aarch64-linux-gnu.PR tree-optimization/110473PR tree-optimization/107432gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/vect-convert-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: Andrew Pinski | Time: 2024-07-02 22:28:28 UTC
+  Text: Fixed.
+

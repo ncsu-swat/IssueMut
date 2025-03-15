@@ -1,0 +1,313 @@
+Bug Summary: [12 regression] -fno-strict-overflow erroneously elides null pointer checks and causes SIGSEGV on perf from linux-6.4.10
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 13.2.1, 14.0
+Known to Fail: 12.3.0, 13.2.0
+
+Comments:
+- User: Sergei Trofimovich | Time: 2023-08-14 08:26:33 UTC
+  Text: Initially observed the failure as a perf SIGSEGV when running againstr14-3191-g614052dd4ea083.
+
+I hope I did not break it too much when minimizing. Self-contained example:
+
+// $ cat bug c.c
+struct dso {
+ struct dso * next;
+ int maj;
+};
+
+__attribute__((noipa)) static void __dso_id__cmp_(void) {}
+
+__attribute__((noipa))
+static int bug(struct dso * d, struct dso *dso)
+{
+ struct dso **p = &d;
+ struct dso *curr = 0;
+
+ while (*p) {
+  curr = *p;
+  // prevent null deref below
+  if (!dso) return 1;
+  if (dso == curr) return 1;
+
+  int *a = &dso->maj;
+  // null deref
+  if (!(a && *a)) __dso_id__cmp_();
+
+  p = &curr->next;
+ }
+ return 0;
+}
+
+__attribute__((noipa))
+int main(void) {
+    struct dso d = { 0, 0, };
+    bug(&d, 0);
+}
+
+Triggering the bug:
+
+$ gcc -fno-strict-overflow -O3 bug.c.c -obug3&& ./bug3Segmentation fault (core dumped)
+
+$ gcc -fno-strict-overflow -O2 bug.c.c -obug2&& ./bug2<ok>
+
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=/<<NIX>>/gcc-14.0.0/bin/gcc
+COLLECT_LTO_WRAPPER=/<<NIX>>/gcc-14.0.0/libexec/gcc/x86_64-unknown-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-unknown-linux-gnu
+Configured with: ../source/configure --prefix=/<<NIX>>/gcc-14.0.0 --with-gmp-include=/<<NIX>>/gmp-6.3.0-dev/include --with-gmp-lib=/<<NIX>>/gmp-6.3.0/lib --with-mpfr-include=/<<NIX>>/mpfr-4.2.0-12-dev/include --with-mpfr-lib=/<<NIX>>/mpfr-4.2.0-12/lib --with-mpc=/<<NIX>>/libmpc-1.3.1 --with-native-system-header-dir=/<<NIX>>/glibc-2.38-dev/include --with-build-sysroot=/ --program-prefix= --enable-lto --disable-libstdcxx-pch --without-included-gettext --with-system-zlib --enable-checking=release --enable-static --enable-languages=c,c++ --disable-multilib --enable-plugin --disable-libcc1 --with-isl=/<<NIX>>/isl-0.20 --disable-bootstrap --build=x86_64-unknown-linux-gnu --host=x86_64-unknown-linux-gnu --target=x86_64-unknown-linux-gnu
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 99999999 (experimental) (GCC)
+
+- User: Alexander Monakov | Time: 2023-08-14 09:34:05 UTC
+  Text: Triggered by GIMPLE loop invariant motion lifting
+
+  a_9 = &dso_8(D)->maj;
+
+across a (dso != NULL) test.
+
+- User: Richard Biener | Time: 2023-08-14 11:34:55 UTC
+  Text: There's nothing really wrong with lifting the &dso->maj computation, on GIMPLE &dso->maj is just address arithmetic.
+
+Interestingly we unswitch the loop but only with -fwrapv-pointer.
+
+OK, so the bug looks like we have
+
+
+ if (&dso->maj != 0)
+   for (;;)
+     {
+       if (!dso) return 1;
+       if (dso == curr) return 1;
+...
+     }
+
+and the if (!dso) test is optimized away since &dso->maj != 0.
+
+That's done by DOM3 here:
+
+Optimizing statement _21 = dso_8(D) == _11;
+LKUP STMT _21 = dso_8(D) eq_expr _11
+2>>> STMT _21 = dso_8(D) eq_expr _11
+Optimizing statement _22 = _21 | _13;
+  Replaced '_13' with constant '0'
+Applying pattern match.pd:201, gimple-match-10.cc:6318
+gimple_simplified to _22 = _21;
+  Folded to: _22 = _21;
+
+I don't see where _13 = 0 is entered, this is possibly ranger related:
+
+_13 : CACHE: BB 9 DOM query for _13, found [irange] _Bool VARYING at BB3
+797     GORI  recomputation attempt on edge 3->16 for _13 = dso_8(D) == 0B;
+798     GORI    outgoing_edge for dso_8(D) on edge 3->16
+799     GORI      compute op 1 (a_9) at if (a_9 == 0B)
+        GORI        LHS =[irange] _Bool [1, 1]
+        GORI        Computes a_9 = [irange] int * [0, 0] intersect Known range : [irange] int * VARYING
+        GORI      TRUE : (799) produces  (a_9) [irange] int * [0, 0]
+800     GORI      compute op 1 (dso_8(D)) at a_9 = &dso_8(D)->maj;
+        GORI        LHS =[irange] int * [0, 0]
+        GORI        Computes dso_8(D) = [irange] struct dso * [0, 0] intersect Known range : [irange] struct dso * VARYING
+        GORI      TRUE : (800) produces  (dso_8(D)) [irange] struct dso * [0, 0]
+        GORI    TRUE : (798) outgoing_edge (dso_8(D)) [irange] struct dso * [0, 0]
+        GORI  TRUE : (797) recomputation (_13) [irange] _Bool [1, 1]
+
+I don't think we can do this.  Andrew?
+
+- User: Richard Biener | Time: 2023-08-14 11:48:14 UTC
+  Text: bool
+operator_addr_expr::fold_range (irange &r, tree type,
+                                const irange &lh,
+                                const irange &rh,
+                                relation_trio) const
+{ 
+  if (empty_range_varying (r, type, lh, rh))
+    return true;
+  
+  // Return a non-null pointer of the LHS type (passed in op2).
+  if (lh.zero_p ())
+    r = range_zero (type); 
+
+not sure how this is called, but we can only derive this if the offset
+is zero as well, definitely if targetm.addr_space.zero_address_valid,
+but I think this is true in general.
+
+  else if (!contains_zero_p (lh))
+    r = range_nonzero (type);
+
+and this is only true for TYPE_OVERFLOW_UNDEFINED (type), with
+-fwrapv-pointer we could wrap to zero.
+
+That is, it's _not_ GIMPLE undefined behavior to compute &0->bar.
+
+It looks like without -fwrapv-pointer we elide the if (!a) check,
+dereferencing it when dso && dso != curr.  I suppose that looks reasonable
+with a = &dso->maj, when dso != 0 then a != 0 unless ->maj wraps.
+
+- User: Andrew Macleod | Time: 2023-08-15 17:57:13 UTC
+  Text: (In reply to Richard Biener fromcomment #3)> bool
+> operator_addr_expr::fold_range (irange &r, tree type,
+>                                 const irange &lh,
+>                                 const irange &rh,
+>                                 relation_trio) const
+> { 
+>   if (empty_range_varying (r, type, lh, rh))
+>     return true;
+>   
+>   // Return a non-null pointer of the LHS type (passed in op2).
+>   if (lh.zero_p ())
+>     r = range_zero (type); 
+> 
+> not sure how this is called, but we can only derive this if the offset
+> is zero as well, definitely if targetm.addr_space.zero_address_valid,
+> but I think this is true in general.
+> 
+>   else if (!contains_zero_p (lh))
+>     r = range_nonzero (type);
+> 
+> and this is only true for TYPE_OVERFLOW_UNDEFINED (type), with
+> -fwrapv-pointer we could wrap to zero.
+> 
+> That is, it's _not_ GIMPLE undefined behavior to compute &0->bar.> It looks like without -fwrapv-pointer we elide the if (!a) check,
+> dereferencing it when dso && dso != curr.  I suppose that looks reasonable
+> with a = &dso->maj, when dso != 0 then a != 0 unless ->maj wraps.Range-ops won't see anything like &dso->maj.. it sees rangers and nothing else. it just gets the result of that expression determined by someone else. . so if it see [0,0] for the range, that means &dso->maj has been determined to be 0.
+
+When folding, addressof has some funky mechanics, and it symbolically processes the trees in gimple-range-fold.cc  in fold_using_range::range_of_address
+
+I think it takes care of all the funky things you mention.
+
+I also notice in the earlier comment where we set _13 to 0...   the code you quoted where _13 was recomputed by ranger. it ends with   
+   GORI  TRUE : (797) recomputation (_13) [irange] _Bool [1, 1]
+The result was [1,1] as far as ranger was concerned o the edge from 3->16
+so that prop0bably isn't how gimple fold determined it was zero.
+
+Is there still an issue here?
+
+- User: Sergei Trofimovich | Time: 2023-08-16 20:14:42 UTC
+  Text: For what it's worth bisect pointed atr12-4871-g502ffb1f389011$ git bisect good
+502ffb1f389011b28ee51815242c7397790802d5 is the first bad commit
+commit 502ffb1f389011b28ee51815242c7397790802d5
+Date:   Tue Nov 2 21:26:44 2021 -0400
+
+    Switch vrp2 to ranger.
+
+- User: Sam James | Time: 2023-08-16 20:21:38 UTC
+  Text: Can you bisect further back with -param=vrp2-mode=ranger, to force ranger before it was the default?
+
+- User: Sergei Trofimovich | Time: 2023-08-16 20:40:37 UTC
+  Text: commit bd400db6d3ec167142ace352db00f84d382e33a8 (HEAD)
+Date:   Fri Oct 15 12:06:27 2021 -0400
+
+  Add --param=vrp1-mode and --param=vrp2-mode.
+
+(the first commit that adds the option) generates SIGSEGVs all the same:
+
+$ gcc/xgcc -Bgcc ~/dev/bugs/gcc-14-perf-wrong-code-PR111009/bug.c.c -fno-strict-overflow -O3 -o bug --param=vrp2-mode=ranger && ./bug
+Segmentation fault (core dumped)
+
+Not much to bisect.
+
+- User: Andrew Macleod | Time: 2023-08-16 21:05:52 UTC
+  Text: Do I need some special target or something?   on trunk just "-fno-strict-overflow -O3" doesnt fail for me on x86_64-pc-linux-gnu...
+./cc1 -fno-strict-overflow -O3 009.c  -quiet
+<island:/gcc/master/build/gcc>
+
+- User: Sergei Trofimovich | Time: 2023-08-16 21:24:06 UTC
+  Text: Createdattachment 55744[details]bug.S
+
+At the hazard of stating the obvious: it's a wrong-code when you execute it (not a gcc ICE).
+
+Should fail on vanilla x86_64-linux-gnu. Tested on today'sr14-3254-g9ade70bb86c874as:
+
+    $ gcc -Bgcc bug.c.c -fno-strict-overflow -O3 -o bug && ./bug
+    Segmentation fault (core dumped)
+
+I also uploaded bug.S as an output of
+
+    $ gcc -Bgcc bug.c.c -fno-strict-overflow -O3 -S -fverbose-asm -o bug.S
+
+if it helps you to find why your output is different.
+
+- User: Andrew Macleod | Time: 2023-08-17 15:37:45 UTC
+  Text: > At the hazard of stating the obvious: it's a wrong-code when you execute it
+> (not a gcc ICE).
+>doh. of course. 
+
+test is in progress.  Richi was correct.  Although the code in range-ops for fold_range is correct, op1_range cannot make the same assumptions that fold_range does because it has no concept of the symbolic values on the RHS.
+I am making op1_range more restrictive.
+
+- User: GCC Commits | Time: 2023-08-17 17:39:41 UTC
+  Text: The master branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:dc48d1d1d4458773f89f21b2f019f66ddf88f2e5commitr14-3296-gdc48d1d1d4458773f89f21b2f019f66ddf88f2e5Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Thu Aug 17 11:13:14 2023 -0400
+
+    Fix range-ops operator_addr.
+    
+    Lack of symbolic information prevents op1_range from beig able to draw
+    the same conclusions as fold_range can.PR tree-optimization/111009gcc/
+            * range-op.cc (operator_addr_expr::op1_range): Be more restrictive.
+    
+            gcc/testsuite/
+            * gcc.dg/pr111009.c: New.
+
+- User: Sergei Trofimovich | Time: 2023-08-17 19:44:47 UTC
+  Text: I confirm the change fixed `perf` startup for me. Thank you!
+
+- User: Richard Biener | Time: 2024-05-08 12:03:12 UTC
+  Text: Andrew - this doesn't pick to gcc-13 because of the following but we should
+backport the fix somehow.  Can you please see to that in time for GCC 13.3 (next week)?
+
+/space/rguenther/src/gcc-13-branch/gcc/range-op.cc: In member function ‘virtual bool operator_addr_expr::op1_range(irange&, tree, const irange&, const irange&, relation_trio) const’:
+/space/rguenther/src/gcc-13-branch/gcc/range-op.cc:4366:8: error: ‘contains_zero_p’ was not declared in this scope
+   if (!contains_zero_p (lhs) && TYPE_OVERFLOW_UNDEFINED (type))
+        ^~~~~~~~~~~~~~~
+/space/rguenther/src/gcc-13-branch/gcc/range-op.cc:4366:8: note: suggested alternative: ‘contains_mem_rtx_p’
+   if (!contains_zero_p (lhs) && TYPE_OVERFLOW_UNDEFINED (type))
+        ^~~~~~~~~~~~~~~
+        contains_mem_rtx_p
+
+- User: Andrew Macleod | Time: 2024-05-08 18:26:38 UTC
+  Text: Createdattachment 58134[details]adjusted patch
+
+(In reply to Richard Biener fromcomment #13)> Andrew - this doesn't pick to gcc-13 because of the following but we should
+> backport the fix somehow.  Can you please see to that in time for GCC 13.3
+> (next week)?
+>Sure. Its just missing the definition of contains_zero_p () from value-range.h that must have been added in an earlier patch.   I'm running the following tweaked patch thru testing for GCC 13
+
+- User: GCC Commits | Time: 2024-05-09 14:32:29 UTC
+  Text: The releases/gcc-13 branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:421311a31a12b96143eb901fde0e020771fe71d4commitr13-8739-g421311a31a12b96143eb901fde0e020771fe71d4Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Wed May 8 10:22:23 2024 -0400
+
+    Fix range-ops operator_addr.
+    
+    Lack of symbolic information prevents op1_range from being able to draw
+    the same conclusions as fold_range can.PR tree-optimization/111009gcc/
+            * range-op.cc (operator_addr_expr::op1_range): Be more restrictive.
+            * value-range.h (contains_zero_p): New.
+    
+            gcc/testsuite/
+            * gcc.dg/pr111009.c: New.
+
+- User: Richard Biener | Time: 2024-05-10 06:36:32 UTC
+  Text: Thanks, there's still the 12 branch left to fix.
+
+- User: GCC Commits | Time: 2024-05-13 17:49:04 UTC
+  Text: The releases/gcc-12 branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:c5c3a4a265256535a66f1656d44e143f05d77f66commitr12-10439-gc5c3a4a265256535a66f1656d44e143f05d77f66Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Fri May 10 13:56:01 2024 -0400
+
+    Fix range-ops operator_addr.
+    
+    Lack of symbolic information prevents op1_range from being able to draw
+    the same conclusions as fold_range can.PR tree-optimization/111009gcc/
+            * range-op.cc (operator_addr_expr::op1_range): Be more restrictive.
+            * value-range.h (contains_zero_p): New.
+    
+            gcc/testsuite/
+            * gcc.dg/pr111009.c: New.
+
+- User: Richard Biener | Time: 2024-06-12 11:38:02 UTC
+  Text: Fixed.
+

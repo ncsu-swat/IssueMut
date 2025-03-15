@@ -1,0 +1,584 @@
+Bug Summary: [13 Regression] glibc math/test-*-iseqsig failures
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jakub Jelinek | Time: 2023-01-18 17:37:11 UTC
+  Text: +++ This bug was initially created as a clone ofBug #107608+++
+
+Fromhttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=107608#c32:
+
+FYI, most likely it's totally unrelated to this bug, for right now with latest gcc trunk and glibc trunk on x86-64, I still see the following iseqsig errors:
+
+FAIL: math/test-double-iseqsig
+FAIL: math/test-float-iseqsig
+FAIL: math/test-float128-iseqsig
+FAIL: math/test-float32-iseqsig
+FAIL: math/test-float32x-iseqsig
+FAIL: math/test-float64-iseqsig
+FAIL: math/test-float64x-iseqsig
+FAIL: math/test-ldouble-iseqsig
+
+I think this can be reduced to e.g.
+__attribute__((noipa)) int
+foo (float x, float y)
+{
+  _Bool cmp1 = x <= y;
+  _Bool cmp2 = x >= y;
+  if (cmp1 && cmp2)
+    return 1;
+  else if (!cmp1 && !cmp2)
+    return -1;
+  return 0;
+}
+
+int
+main ()
+{
+  if (foo (0.0f, __builtin_nanf ("")) != -1)
+    __builtin_abort ();
+  if (foo (__builtin_nanf (""), -42.0f) != -1)
+    __builtin_abort ();
+  if (foo (0.0f, -0.0f) != 1)
+    __builtin_abort ();
+  if (foo (42.0f, 42.0f) != 1)
+    __builtin_abort ();
+  if (foo (42.0f, -0.0f) != 0)
+    __builtin_abort ();
+  if (foo (0.0f, -42.0f) != 0)
+    __builtin_abort ();
+  return 0;
+}
+and is fairly different from thePR106805bug, which is about iseqsig too, but in that case the ranges of the operands are singletons and there are issues not just on the trunk, but also on GCC 12 etc. (though more on the trunk).
+
+In the above short testcase, it works fine in GCC 12 and only fails on the trunk.
+
+- User: Jakub Jelinek | Time: 2023-01-18 17:54:14 UTC
+  Text: This one started withr13-1933-g24012539ae3410174.
+I think the problem is in:
+
+Folding statement: _3 = cmp1_10 & cmp2_11;
+Not folded
+Folding statement: if (_3 != 0)
+ Registering value_relation (x_8(D) <= y_9(D)) on (2->3)
+ Registering value_relation (x_8(D) >= y_9(D)) on (2->3)
+    Intersecting with existing (x_8(D) <= y_9(D)) to produce (x_8(D) == y_9(D)) Updated.
+and later
+Folding statement: _1 = cmp1_10 | cmp2_11;
+  Relation adjustment: cmp1_10  and cmp2_11  combine to produce [irange] _Bool [1, 1]
+Queued stmt for removal.  Folds to: 1
+
+When NANs are honored, the above is not true for floating point comparisons.
+x <= y and x >= y comparisons are signaling (if either operand is qNaN or sNaN), x == y and x != y aren't (they only signal if either operand is sNaN), and while
+x <= y && x >= y implies that x == y will be true (but the former will raise exception
+on qNaN while the latter wouldn't), if !(x <= y && x >= y) means (with different exceptions) that x != y, which is either x is uncomparable to y (either is NaN), or
+x is finite/infinite but different from finite/infinite y.
+To me the above looks like implying from x_8(D) != y_9(D) (which is the case in bb 4
+where _3 != 0 was false) that (x <= y) | (x >= y) will be true.
+
+- User: Jakub Jelinek | Time: 2023-01-18 18:04:32 UTC
+  Text: Seems relations are just the
+  VREL_VARYING = 0,     // No known relation,  AKA varying.
+  VREL_UNDEFINED,       // Impossible relation, ie (r1 < r2) && (r2 > r1)
+  VREL_LT,              // r1 < r2
+  VREL_LE,              // r1 <= r2
+  VREL_GT,              // r1 > r2
+  VREL_GE,              // r1 >= r2
+  VREL_EQ,              // r1 == r2
+  VREL_NE,              // r1 != r2
+and some special ones and we just union/intersect those, the information whether it was a floating point 4 state relation or integral 3 state is lost.
+So, either we should punt on the relations for now if the comparison operands are floating point that honor NANs, or we need a way to differentiate between integral/pointer and floating point relations (and for the latter perhaps be able to express the various others, like LTGT, UNLT, UNLE, UNGE, UNGT, UNEQ, UNNE etc.).
+
+Aldy/Andrew, can you please have a look?  Thanks.
+
+- User: Andrew Macleod | Time: 2023-01-18 18:54:24 UTC
+  Text: Those specialized relations are handled within the floating point range-ops code iirc.  We established that none of the other floating point relations needed to be exposed to non-floating point code.
+
+The frange class has all the knowledge of NAN and such, and the oracle is suppose to invokes a routine called "validate_relation" which invokes a fold operation to find out if the operation is actually valid between 2 operands.  (this is how we were suppose to determine x == x may not be true)
+
+I can't seem to find any application of the routine tho... It was supplied so floating point x == x would not short-circuit in the oracle as it was symbolically true.  I'll have to sync with aldy and see what we currently do,
+
+They theoretical application here would be to apply it to the intersection/union routines too. ie
+
+Registering value_relation (x_8(D) >= y_9(D)) on (2->3)
+    Intersecting with existing (x_8(D) <= y_9(D)) to produce (x_8(D) == y_9(D)) 
+
+if we can determine that x == y isnt true.. or that somehow it has different floating point characteristics from the inputs...   
+we'll get back to you.
+
+- User: Jakub Jelinek | Time: 2023-01-18 19:48:16 UTC
+  Text: I see fold_using_range::relation_fold_and_or
+which sees relation1 VREL_LE and relation2 VREL_GE and !is_and, and because of
+relation_union (relation1, relation2) == VREL_VARYING fold it to 1.
+But for floating point comparisons, LE | GE is not always true, it is true if
+neither operand is NAN, otherwise false.
+
+- User: Jakub Jelinek | Time: 2023-01-18 20:19:01 UTC
+  Text: I'm surprised by rr_union_table content.
+// VREL_VARYING
+  { VREL_VARYING, VREL_VARYING, VREL_VARYING, VREL_VARYING, VREL_VARYING,
+    VREL_VARYING, VREL_VARYING, VREL_VARYING },
+is obviously correct, sure, but:
+// VREL_UNDEFINED
+  { VREL_VARYING, VREL_LT, VREL_LE, VREL_GT, VREL_GE, VREL_UNDEFINED,
+    VREL_EQ, VREL_NE },
+is strange, VREL_VARYING union VREL_UNDEFINED be VREL_LT?
+I would have expected
+  { VREL_VARYING, VREL_UNDEFINED, VREL_LT, VREL_LE, VREL_GT, VREL_GE,
+    VREL_EQ, VREL_NE },
+instead.
+I fear other entries are weird too (though rr_intersect_table entries look reasonable from quick skimming).
+That said, fixing that will not fix this issue.
+
+- User: Andrew Macleod | Time: 2023-01-18 22:21:29 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #4)> I see fold_using_range::relation_fold_and_or
+> which sees relation1 VREL_LE and relation2 VREL_GE and !is_and, and because
+> of
+> relation_union (relation1, relation2) == VREL_VARYING fold it to 1.
+> But for floating point comparisons, LE | GE is not always true, it is true if
+> neither operand is NAN, otherwise false.right.. we're sorting out whether these relations should be created or not, and if so, how to then verify the result of a union/intersection before committing to it.  That validate_relation routine was created for a reason that we are trying to track down why we arent using it, and if this is an appropriate use, or if we need something else.
+
+- User: Andrew Macleod | Time: 2023-01-18 22:26:38 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #5)> I'm surprised by rr_union_table content.
+> // VREL_VARYING
+>   { VREL_VARYING, VREL_VARYING, VREL_VARYING, VREL_VARYING, VREL_VARYING,
+>     VREL_VARYING, VREL_VARYING, VREL_VARYING },
+> is obviously correct, sure, but:
+> // VREL_UNDEFINED
+>   { VREL_VARYING, VREL_LT, VREL_LE, VREL_GT, VREL_GE, VREL_UNDEFINED,
+>     VREL_EQ, VREL_NE },
+> is strange, VREL_VARYING union VREL_UNDEFINED be VREL_LT?
+> I would have expected
+>   { VREL_VARYING, VREL_UNDEFINED, VREL_LT, VREL_LE, VREL_GT, VREL_GE,
+>     VREL_EQ, VREL_NE },
+> instead.
+> I fear other entries are weird too (though rr_intersect_table entries look
+> reasonable from quick skimming).
+> That said, fixing that will not fix this issue.hmm. I looks like the table from 
+commit ade5531c9dde98c7be005a5c5382739d734797aa
+Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Thu May 12 12:00:39 2022 -0400
+
+    Move VREL values to their own enumerated type.
+
+didn't get committed as intended. It seems like the UNDEFINED entry is the only one affected tho which is why it has not had much impact.   UNDEFINED got moved from a different point in the enum list to be the second one in that patch, adnit looks like that line missed the move from 5 to 2... The others seem fine at a glance.  I will look closer tomorrow.
+
+- User: Aldy Hernandez | Time: 2023-01-19 10:02:03 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #1)> This one started withr13-1933-g24012539ae3410174.
+> I think the problem is in:
+> 
+> Folding statement: _3 = cmp1_10 & cmp2_11;
+> Not folded
+> Folding statement: if (_3 != 0)
+>  Registering value_relation (x_8(D) <= y_9(D)) on (2->3)
+>  Registering value_relation (x_8(D) >= y_9(D)) on (2->3)
+>     Intersecting with existing (x_8(D) <= y_9(D)) to produce (x_8(D) ==
+> y_9(D)) Updated.
+> and later
+> Folding statement: _1 = cmp1_10 | cmp2_11;
+>   Relation adjustment: cmp1_10  and cmp2_11  combine to produce [irange]
+> _Bool [1, 1]
+> Queued stmt for removal.  Folds to: 1
+> 
+> When NANs are honored, the above is not true for floating point comparisons.
+> x <= y and x >= y comparisons are signaling (if either operand is qNaN or
+> sNaN), x == y and x != y aren't (they only signal if either operand is
+> sNaN), and while*blink*.  Woah.  I did not know that.
+
+As Andrew mentions down thread, we had validate_relation() to verify whether a relation could be registered.  So for example, given x == x, validate_relation() would be called at registration time and call the range-ops entry for EQ_EXPR, which would return false for this combo if x could be a NAN.
+
+For some forgotten reason, we forgot to call validate_relation() at the oracle's registry.  My guess is that since we ignore the oracle's answers in frelop_early_resolve() (if !maybe_isnan) in each of the relational operators, it was no longer needed.
+
+Although for the testcase here, perhaps this would not have helped either.  Is there anything in x_8 or y_9 that could be used indicate that we can't register these relations?
+
+ <bb 2> :
+  cmp1_10 = x_8(D) <= y_9(D);
+  cmp2_11 = x_8(D) >= y_9(D);
+  _3 = cmp1_10 & cmp2_11;
+  if (_3 != 0)
+
+That is, when we see x_8 <= y_9, is there anything in either the range of x_8 or y_9 that would hint that we can't register the <= relation?  I would have assumed that we could only register this relation if neither x_8 nor y_9 can have a NAN.  Would this help?
+
+If this won't help, then perhaps the issue is in the oracle's relation intersection code.  We would need a way to indicate that VREL_LE ^ VREL_GE is VREL_VARYING if the source operands may have a NAN (or some other fancy FP condition I don't understand ;-))?
+
+- User: Aldy Hernandez | Time: 2023-01-19 10:05:14 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #4)> I see fold_using_range::relation_fold_and_or
+> which sees relation1 VREL_LE and relation2 VREL_GE and !is_and, and because
+> of
+> relation_union (relation1, relation2) == VREL_VARYING fold it to 1.
+> But for floating point comparisons, LE | GE is not always true, it is true if
+> neither operand is NAN, otherwise false.Ah, it was the union not the intersect.  So we need something here that would avoid resolving this to 1 if maybe_isnan() is true for either source operand.
+
+- User: Jakub Jelinek | Time: 2023-01-19 10:16:34 UTC
+  Text: (In reply to Aldy Hernandez fromcomment #9)> (In reply to Jakub Jelinek fromcomment #4)
+> > I see fold_using_range::relation_fold_and_or
+> > which sees relation1 VREL_LE and relation2 VREL_GE and !is_and, and because
+> > of
+> > relation_union (relation1, relation2) == VREL_VARYING fold it to 1.
+> > But for floating point comparisons, LE | GE is not always true, it is true if
+> > neither operand is NAN, otherwise false.
+> 
+> Ah, it was the union not the intersect.  So we need something here that
+> would avoid resolving this to 1 if maybe_isnan() is true for either source
+> operand.One possibility would be to separate integral/pointer and floating point relations,
+use VREL_FP_LE etc. (and have more of them to cover even the extra ones).
+Another would be based on whether it is a floating point relation or integral/pointer relation use different relation_{intersect,union}, or pass those functions a bool flag whether it is floating point or not (well, to be precise, if NANs aren't honored, we can treat even floating point comparisons as integral/pointer ones).
+If we keep VREL_LE etc. for both floating point with NAN and other relations, I'd think we should treat them as the floating point <= etc. comparisons with their meaning for NANs operand if any.  And then go through the intersect/union tables and think about each case whether it holds even for NANs or not.  I assume most of the cases would be the same.  Say <= intersected with >= is really ==.  But e.g. <= unioned with >= is not VREL_VARYING (the question is what to return in that case though, VREL_LAST as some way to express VREL_UNKNOWN?).
+
+BTW, with the additions of VREL_PE*, the intersect/union tables grew quite a lot but contain 0 (aka VREL_VARYING) in those extra slots.  Does it make sense to include VREL_PE* in those tables at all when it isn't really meaningful?
+
+- User: Aldy Hernandez | Time: 2023-01-19 10:17:55 UTC
+  Text: Hmmm, I wonder if we could do this all in validate_relation like Andrew had planned.
+
+If NAN is a possibility in either x or y, then we could disallow any relation recording right off the bat, and avoid any special casing in union/intersect.  Perhaps allow the != relation even if NAN?
+
+- User: Jakub Jelinek | Time: 2023-01-19 10:29:58 UTC
+  Text: As a workaround in stage4, perhaps, but long term the relations make a lot of sense even for floating point with NANs.  If you know <= relation between 2 vars and know the range of one of them, the other can be computed from it, ...
+
+- User: rguenther@suse.de | Time: 2023-01-19 10:43:55 UTC
+  Text: On Thu, 19 Jan 2023, jakub at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108447> 
+> ---Comment #12from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> As a workaround in stage4, perhaps, but long term the relations make a lot of
+> sense even for floating point with NANs.  If you know <= relation between 2
+> vars and know the range of one of them, the other can be computed from it, ...I think it makes more sense to fix the relation combining code, maybe
+simply disable that for FP as a workaround?
+
+- User: Aldy Hernandez | Time: 2023-01-19 11:39:02 UTC
+  Text: (In reply torguenther@suse.defromcomment #13)> On Thu, 19 Jan 2023, jakub at gcc dot gnu.org wrote:
+> 
+> >https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108447> > 
+> > ---Comment #12from Jakub Jelinek <jakub at gcc dot gnu.org> ---
+> > As a workaround in stage4, perhaps, but long term the relations make a lot of
+> > sense even for floating point with NANs.  If you know <= relation between 2
+> > vars and know the range of one of them, the other can be computed from it, ...
+> 
+> I think it makes more sense to fix the relation combining code, maybe
+> simply disable that for FP as a workaround?Yeah, the combining code definitely needs some tweaks.
+
+Thinking out loud here...
+
+It looks like we ignore relations in the various relation fold_range() methods if NAN can be a possibility.  See how frelop_early_resolve() only looks at the relation if the operands are !NAN.  So perhaps this is why we never used validate_relation().
+
+On the other hand, the op1_range methods *do* use the relations.  For example, on EQ_EXPR (foperator_equal::op1_range), we clear NAN on the TRUE side because equality could never happen if there was a NAN present (regardless of VREL_*).  On the FALSE side we set_nan() only if VREL_EQ.
+
+So we ignore the oracle's relations in fold_range() throughout, unless we're sure !NAN, and use the oracle from op1_range.
+
+- User: Jakub Jelinek | Time: 2023-01-19 16:05:16 UTC
+  Text: I went through the whole rr_{intersect,union}_table tables and I think just
+--- gcc/value-relation.cc.jj	2023-01-02 09:32:42.088000605 +0100
++++ gcc/value-relation.cc	2023-01-19 16:20:06.490126901 +0100
+@@ -115,7 +115,7 @@ relation_kind rr_union_table[VREL_LAST][
+   { VREL_VARYING, VREL_VARYING, VREL_VARYING, VREL_VARYING, VREL_VARYING,
+     VREL_VARYING, VREL_VARYING, VREL_VARYING },
+ // VREL_UNDEFINED
+-  { VREL_VARYING, VREL_LT, VREL_LE, VREL_GT, VREL_GE, VREL_UNDEFINED,
++  { VREL_VARYING, VREL_UNDEFINED, VREL_LT, VREL_LE, VREL_GT, VREL_GE,
+     VREL_EQ, VREL_NE },
+ // VREL_LT
+   { VREL_VARYING, VREL_LT, VREL_LT, VREL_LE, VREL_NE, VREL_VARYING, VREL_LE,
+is really wrong for the integral/pointer relations (plus the question what to do with the VREL_PE* relations and whether they need to be in the tables or punted on by the caller somehow).
+
+Now, when considering the relations in the fp with NAN meaning they have in C/C++
+(and assuming we don't try to replace say two actual comparisons in the IL with one
+with different exception behavior), the only relations in the tables which are true for unordered operand(s) are VREL_VARYING and VREL_NE.  Maybe I miss something, but I can't think of an inappropriate intersection - VREL_VARYING intersects anything is anything,
+VREL_VARYING intersect VREL_VARYING is the only one that gives VREL_VARYING,
+VREL_{VARYING,NE} intersect VREL_NE or vice versa the only one that gives VREL_NE
+and VREL_UNDEFINED returned only from intersections of anything and VREL_UNDEFINED, or
+LT/LE/GT/GE vs. each other where there is no overlap (but in that case neither allows NANs), LT/GT vs. EQ (ditto) and EQ vs. NE (one relation doesn't allow NAN but the other does, so they aren't allowed.
+As for unions - LT U GT or vice versa is incorrectly NE, should be LAST or LTGT or some other way how to express we can't express it. LT U GE or LE U GT or LE U GE or vice versa are incorrectly VARYING, when they are together ORDERED (so again, need some way how to express that).  Can't find anything else wrong.
+But unless we use VR_UNKNOWN or VR_LAST or whatever to stand for something we really don't know how to handle, we'd need the various combinations that tree.def has on top of the basics, LTGT, UNORDERED, ORDERED, UNLT, UNLE, UNGT, UNGE and UNEQ.
+
+- User: Jakub Jelinek | Time: 2023-01-19 16:32:08 UTC
+  Text: BTW, because both union and intersect are commutative, so perhaps we should have a self-test that verifies that.  Guess that would catch the VREL_UNDEFINED line errors.
+
+- User: Andrew Macleod | Time: 2023-01-19 20:00:42 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #15)> I went through the whole rr_{intersect,union}_table tables and I think just
+> --- gcc/value-relation.cc.jj	2023-01-02 09:32:42.088000605 +0100
+> +++ gcc/value-relation.cc	2023-01-19 16:20:06.490126901 +0100
+> @@ -115,7 +115,7 @@ relation_kind rr_union_table[VREL_LAST][
+>    { VREL_VARYING, VREL_VARYING, VREL_VARYING, VREL_VARYING, VREL_VARYING,
+>      VREL_VARYING, VREL_VARYING, VREL_VARYING },
+>  // VREL_UNDEFINED
+> -  { VREL_VARYING, VREL_LT, VREL_LE, VREL_GT, VREL_GE, VREL_UNDEFINED,
+> +  { VREL_VARYING, VREL_UNDEFINED, VREL_LT, VREL_LE, VREL_GT, VREL_GE,
+>      VREL_EQ, VREL_NE },
+>  // VREL_LT
+>    { VREL_VARYING, VREL_LT, VREL_LT, VREL_LE, VREL_NE, VREL_VARYING, VREL_LE,
+> is really wrong for the integral/pointer relations (plus the question what
+> to do with the VREL_PE* relations and whether they need to be in the tables
+> or punted on by the caller somehow).THat was my conclusions as well.
+
+As for the PE's..  it seemed easier just to leave the partial equivalences there as the table only grows from 64 to 144 entries, and in the grand scheme seemed easier than trying to add runtime checks for relation kind ranges just to avoid those few extra words.  
+
+Besides, if we ever end up with x != y when there is a partial equivalence, we may also be able to conclude x > y or something else.. just left the window open for exploration.> 
+> Now, when considering the relations in the fp with NAN meaning they have in
+> C/C++
+> (and assuming we don't try to replace say two actual comparisons in the IL
+> with one
+> with different exception behavior), the only relations in the tables which
+> are true for unordered operand(s) are VREL_VARYING and VREL_NE.  Maybe I
+> miss something, but I can't think of an inappropriate intersection -
+> VREL_VARYING intersects anything is anything,
+> VREL_VARYING intersect VREL_VARYING is the only one that gives VREL_VARYING,
+> VREL_{VARYING,NE} intersect VREL_NE or vice versa the only one that gives
+> VREL_NE
+> and VREL_UNDEFINED returned only from intersections of anything and
+> VREL_UNDEFINED, or
+> LT/LE/GT/GE vs. each other where there is no overlap (but in that case
+> neither allows NANs), LT/GT vs. EQ (ditto) and EQ vs. NE (one relation
+> doesn't allow NAN but the other does, so they aren't allowed.
+> As for unions - LT U GT or vice versa is incorrectly NE, should be LAST or
+> LTGT or some other way how to express we can't express it. LT U GE or LE U
+> GT or LE U GE or vice versa are incorrectly VARYING, when they are together
+> ORDERED (so again, need some way how to express that).  Can't find anything
+> else wrong.
+> But unless we use VR_UNKNOWN or VR_LAST or whatever to stand for something
+> we really don't know how to handle, we'd need the various combinations that
+> tree.def has on top of the basics, LTGT, UNORDERED, ORDERED, UNLT, UNLE,
+> UNGT, UNGE and UNEQ.For this release, I wouldn't want to add too much extra stuff. Im inclined to handle this pretty much where the problems arise as I think it is fairly localized.
+
+ For the next release, I'm inclined to enhance the oracle and relations such that any range class can specify its own relation sets.. so irange (and most others) would use a set which implements what we have, and we could introduce a floating point relation set which includes something like "<>" and "<=>" and we can work out what that looks like to cover exactly what we need to model.   That way we can model slight behaviour changes more easily.
+
+- User: Andrew Macleod | Time: 2023-01-19 20:14:54 UTC
+  Text: Createdattachment 54312[details]possible patch
+
+The only place I think it matters is in set_one_relation.
+
+THis is the central point where we add a new relation, and search for any relations leading to this point.   If we find one, then we perform an intersection and register the result.
+
+If we also check for floating point operands, and see a LT, LE, GT, or GE involved in the intersection, and the result is EQ or NE, this patch simply doesn't register the new relation
+
+so combining <= and >= will simply leave the relation as <= instead of producing ==
+
+Its not incorrect, just not exact.. but we have no way of representing the exact result yet.
+
+I think this is the only place we really use intersection, and the oracle does not use union for anything. We never merge incoming results that way.. we simply search the dominators rather than create new relations for merge points.
+
+THis probably needs to be checked in the path oracle too.. 
+
+I dont think there are any other combinations of relations that will cause a problem?
+
+- User: Andrew Macleod | Time: 2023-01-19 21:28:40 UTC
+  Text: Createdattachment 54313[details]better patch
+
+A more consistent approach.. rather than directly call relation_intersect() from multiple places, add the floating point fix to value_relation::intersect and always go through that.
+
+This will cause the normal oracle and the path oracle to both make the previous adjustment to intersect for floating point operations.   untested, running tests now.
+
+- User: GCC Commits | Time: 2023-01-19 22:27:10 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:c81e68a9cdbb5411dce1f1da3b35854212305c7ccommitr13-5264-gc81e68a9cdbb5411dce1f1da3b35854212305c7cAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Thu Jan 19 23:26:35 2023 +0100
+
+    value-relation: Fix up relation_union [PR108447]
+    
+    While looking at the PR, I've noticed one row in rr_union_table
+    is wrong.  relation_union should be commutative, but due to that
+    bug is not.  The following patch adds a self-test for that
+    property (fails without the first hunk) and fixes that line.
+    
+    The actual floating point relation problem isn't fixed by this patch
+    though.
+    
+    2023-01-19  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/108447* value-relation.cc (rr_union_table): Fix VREL_UNDEFINED row order.
+            (relation_tests): Add self-tests for relation_{intersect,union}
+            commutativity.
+            * selftest.h (relation_tests): Declare.
+            * function-tests.cc (test_ranges): Call it.
+
+- User: Jakub Jelinek | Time: 2023-01-20 15:24:32 UTC
+  Text: (In reply to Andrew Macleod fromcomment #19)> Createdattachment 54313[details]> better patch
+> 
+> A more consistent approach.. rather than directly call relation_intersect()
+> from multiple places, add the floating point fix to
+> value_relation::intersect and always go through that.
+> 
+> This will cause the normal oracle and the path oracle to both make the
+> previous adjustment to intersect for floating point operations.   untested,
+> running tests now.I thought (unless somebody proves otherwise) that relation_intersect is actually just fine, the only thing that is incorrect (IMHO) for floating point with NaNs are the
+relation_union (VREL_L[TE], VREL_G[TE]) and relation_union (VREL_G[TE], VREL_L[TE])
+cases, because those return VREL_NE or VREL_VARYING even when those are actually
+LTGT_EXPR (aka ordered and not equal) or ORDERED_EXPR.
+So, if the callers of relation_union know whether it is a relation for floating point with NAN or integral/pointer/floating point fast math can't they just tweak those cases?
+
+- User: Andrew Macleod | Time: 2023-01-20 15:36:06 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #21)> (In reply to Andrew Macleod fromcomment #19)
+> > Createdattachment 54313[details]> > better patch
+> > 
+> > A more consistent approach.. rather than directly call relation_intersect()
+> > from multiple places, add the floating point fix to
+> > value_relation::intersect and always go through that.
+> > 
+> > This will cause the normal oracle and the path oracle to both make the
+> > previous adjustment to intersect for floating point operations.   untested,
+> > running tests now.
+> 
+> I thought (unless somebody proves otherwise) that relation_intersect is
+> actually just fine, the only thing that is incorrect (IMHO) for floating
+> point with NaNs are the
+> relation_union (VREL_L[TE], VREL_G[TE]) and relation_union (VREL_G[TE],
+> VREL_L[TE])
+> cases, because those return VREL_NE or VREL_VARYING even when those are
+> actually
+> LTGT_EXPR (aka ordered and not equal) or ORDERED_EXPR.
+> So, if the callers of relation_union know whether it is a relation for
+> floating point with NAN or integral/pointer/floating point fast math can't
+> they just tweak those cases?I have since evolved to something close to this.  I am moving all the relation_intersect and relation_union calling locations to instead go through the existing value_relation class.  This stores a relation and 2 operands, and isolates all the smarts for swapping operands and reversing relations as needed.  (this is how the oracle internally handles it).   That class then knows whether this is a floating point relation or not an can make adjustments based on that, keeping it isolated to one place.
+
+We wont have the actual floating point status of NAN and such, but we can at least not get it wrong for this release in those cases.  THen decide how to add the required knowledge properly for the next release... maybe just adding a couple of extra relations will be enough. 
+
+Patch forthcoming soon.
+
+- User: Andrew Macleod | Time: 2023-01-20 16:07:53 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #21)> (In reply to Andrew Macleod fromcomment #19)
+> > Createdattachment 54313[details]> > better patch
+> > 
+> > A more consistent approach.. rather than directly call relation_intersect()
+> > from multiple places, add the floating point fix to
+> > value_relation::intersect and always go through that.
+> > 
+> > This will cause the normal oracle and the path oracle to both make the
+> > previous adjustment to intersect for floating point operations.   untested,
+> > running tests now.
+> 
+> I thought (unless somebody proves otherwise) that relation_intersect is
+> actually just fine, the only thing that is incorrect (IMHO) for floating
+> point with NaNs are theI thought intersection was wrong for x <= y intersect x >= y because it produces x == y?
+
+- User: Jakub Jelinek | Time: 2023-01-20 16:59:40 UTC
+  Text: (In reply to Andrew Macleod fromcomment #23)> (In reply to Jakub Jelinek fromcomment #21)
+> > (In reply to Andrew Macleod fromcomment #19)
+> > > Createdattachment 54313[details]> > > better patch
+> > > 
+> > > A more consistent approach.. rather than directly call relation_intersect()
+> > > from multiple places, add the floating point fix to
+> > > value_relation::intersect and always go through that.
+> > > 
+> > > This will cause the normal oracle and the path oracle to both make the
+> > > previous adjustment to intersect for floating point operations.   untested,
+> > > running tests now.
+> > 
+> > I thought (unless somebody proves otherwise) that relation_intersect is
+> > actually just fine, the only thing that is incorrect (IMHO) for floating
+> > point with NaNs are the
+> 
+> 
+> I thought intersection was wrong for x <= y intersect x >= y because it
+> produces x == y?A floating point comparison when NANs is possible has 4 possible outcomes:
+(1) x < y
+(2) x == y
+(3) x > y
+(4) isnan (x) || isnan (y)
+(unlike say integral which has only the 3 options).
+Now, each of the C or tree comparisons can be expressed in a table for which of those 4 outcomes it returns true.
+Say:
+x < y     (1)
+x <= y    (1) || (2)
+x > y     (3)
+x >= y    (2) || (3)
+x == y    (2)
+x != y    (1) || (3) || (4)
+VARYING   (1) || (2) || (3) || (4)
+UNDEFINED
+etc.
+x <= y && x >= y from the above table is ((1) || (2)) && ((2) || (3)) aka (2) aka x == y.
+While x <= y || x >= y is (1) || (2) || (3) which is something we don't have a VREL_*
+name for (it is ORDERED_EXPR in trees).
+Similarly x < y || x > y is (1) || (3) which we don't have either but is LTGT_EXPR on trees.
+For the integral cases when only (1), (2) and (3) are possible, all we need is 8
+relations, LT, LE, GT, GE, EQ, NE, TRUE (VARYING) and FALSE (UNDEFINED) are needed,
+but for complete coverage of the 4 possibilities we need 16 (32 if it is also about whether qNaN operand(s) raise exceptions or not).
+
+E.g. AVX VCMP instruction has those 32 possibilities:
+
+Predicate      imm8  Description         A > B A < B A = B Unordered Signal on qNAN
+EQ_OQ (EQ)       0H  Equal (ordered, non-signaling)                       F F T F N
+LT_OS (LT)       1H  Less-than (ordered, signaling)                       F T F F Y
+LE_OS (LE)       2H  Less-than-or-equal (ordered, signaling)              F T T F Y
+UNORD_Q (UNORD)  3H  Unordered (non-signaling)                            F F F T N
+NEQ_UQ (NEQ)     4H  Not-equal (unordered, non-signaling)                 T T F T N
+NLT_US (NLT)     5H  Not-less-than (unordered, signaling)                 T F T T Y
+NLE_US (NLE)     6H  Not-less-than-or-equal (unordered, signaling)        T F F T Y
+ORD_Q (ORD)      7H  Ordered (non-signaling)                              T T T F N
+EQ_UQ            8H  Equal (unordered, non-signaling)                     F F T T N
+NGE_US (NGE)     9H  Not-greater-than-or-equal (unordered, signaling)     F T F T Y
+NGT_US (NGT)     AH  Not-greater-than (unordered, signaling)              F T T T Y
+FALSE_OQ (FALSE) BH  False (ordered, non-signaling)                       F F F F N
+NEQ_OQ           CH  Not-equal (ordered, non-signaling)                   T T F F N
+GE_OS (GE)       DH  Greater-than-or-equal (ordered, signaling)           T F T F Y
+GT_OS (GT)       EH  Greater-than (ordered, signaling)                    T F F F Y
+TRUE_UQ(TRUE)    FH  True (unordered, non-signaling)                      T T T T N
+EQ_OS           10H  Equal (ordered, signaling)                           F F T F Y
+LT_OQ           11H  Less-than (ordered, non-signaling)                   F T F F N
+LE_OQ           12H  Less-than-or-equal (ordered, non-signaling)          F T T F N
+UNORD_S         13H  Unordered (signaling)                                F F F T Y
+NEQ_US          14H  Not-equal (unordered, signaling)                     T T F T Y
+NLT_UQ          15H  Not-less-than (unordered, non-signaling)             T F T T N
+NLE_UQ          16H  Not-less-than-or-equal (unordered, non-signaling)    T F F T N
+ORD_S           17H  Ordered (signaling)                                  T T T F Y
+EQ_US           18H  Equal (unordered, signaling)                         F F T T Y
+NGE_UQ          19H  Not-greater-than-or-equal (unordered, non-signaling) F T F T N
+NGT_UQ          1AH  Not-greater-than (unordered, non-signaling)          F T T T N
+FALSE_OS        1BH  False (ordered, signaling)                           F F F F Y
+NEQ_OS          1CH  Not-equal (ordered, signaling)                       T T F F Y
+GE_OQ           1DH  Greater-than-or-equal (ordered, non-signaling)       T F T F N
+GT_OQ           1EH  Greater-than (ordered, non-signaling)                T F F F N
+TRUE_US         1FH  True (unordered, signaling)                          T T T T Y
+
+I think for VREL_*, we could use just the 16, but for the time being need just some
+VREL_* value to represent those 8 that don't have a representation right now (i.e. stand for I don't really know what the relation is).
+
+- User: Andrew Macleod | Time: 2023-01-23 17:26:58 UTC
+  Text: Createdattachment 54327[details]possible patch
+
+There's another infrastructure patch which precedes this one which turns existing relation_union and relation_intersection calls into union_ and intersection calls through the value_relation class.    THen we can isolate all the union and intersection calls in one place.
+
+This patch introduces VREL_OTHER and adjusts intersection and union to produce it as appropriate only if the operands are floating point.
+
+if intersection produces UNDEFINED and either of the relations feeding it were <, <=, >, or >=   then it turns it to VR_OTHER.   the prevents false sides of branches from combining  to produce  UNDEFINED when they end up being a known NAN. 
+
+Union is adjusted such that < >, or <= >= also produce VREL_OTHER.   < > cannot be properly represented, and <= >= was producing VARYING, which is also not correct.
+
+Does this cover things sufficiently? The test case correctly compiles and runs now (I think :-)
+
+I am running builds/tests now and will post the complete patchset when complete.
+
+- User: GCC Commits | Time: 2023-01-27 14:38:32 UTC
+  Text: The master branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:ec5e99e95954fd629283a9c9572193dd95471feacommitr13-5448-gec5e99e95954fd629283a9c9572193dd95471feaAuthor: Andrew MacLeod <amacleod@redhat.com>
+Date:   Wed Jan 25 11:13:23 2023 -0500
+
+    Do not try to logical fold floating point relations.
+    
+    relation_fold_and_or looks for relations among common operands feeding
+    logical ands and ors.  With no knowledge of NANs, it should not attempt
+    to do this with floating point ssa names.PR tree-optimization/108447gcc/
+            * gimple-range-fold.cc (old_using_range::relation_fold_and_or):
+            Do not attempt to fold HONOR_NAN types.
+    
+            gcc/testsuite/
+            * gcc.dg/pr108447.c: New.
+
+- User: Andrew Macleod | Time: 2023-01-27 14:41:12 UTC
+  Text: Fixed with the simple approach in the email thread.
+
+This boils down to a single place where we are trying to do things with relations in ranger that are simply not safe when we need to honor NANs.
+
+I think we can avoid all the other shuffling of relations, and simply not perform this optimization when it comes to floats.
+
+The case the routine handles is:
+
+c_2 = a_6 > b_7
+c_3 = a_6 < b_7
+c_4 = c_2 && c_3
+
+c_2 and c_3 can never be true at the same time, Therefore c_4 can always resolve to false based purely on the relations.
+
+
+Range-ops is unable to do this optimization directly as it requires examining things from outside the statement, and is not easily communicated a simple relation to operator_logical_and.
+
+This routine proceeds to look at the definitions of c_2 and c_3, tries to determine if there are common operands, and queries for any relations between them.   If it turns out there is something, depending on whether its && or || , we use intersection or union to determine if the result of the logical operation can be folded.  If HONOR_NANS is true for the float type, then we cannot do this optimization, and bail early.
+

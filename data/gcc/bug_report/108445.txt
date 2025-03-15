@@ -1,0 +1,119 @@
+Bug Summary: [13 Regression] Address expression on global variable is not normalized
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: lto
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Feng Xue | Time: 2023-01-18 12:58:40 UTC
+  Text: Createdattachment 54296[details]addr_f1.c
+
+Compile two files with option "-flto -g -O2",
+
+  --------addr_f1.c--------
+
+  int gArray[16];
+
+
+  --------addr_f2.c--------
+
+  extern int gArray[];
+
+  int foo(int *a)
+  {
+      int *p = a;
+
+      return *p;
+  }
+
+  int main(int argc, char *argv[])
+  {
+      if (argc & 1)
+          gArray[argc - 1] = 1;
+
+      if (argc > 1)
+          return foo(gArray);
+
+      return 0;
+  }
+
+We will get an ICE as:
+
+  addr_f2.c:10:5: error: invalid address operand in ‘mem_ref’
+     10 | int main(int argc, char *argv[])
+        |     ^
+  MEM[(int *)&gArray];
+
+  # VUSE <.MEM_9>
+  _8 = MEM[(int *)&gArray];
+  during GIMPLE pass: fixup_cfg
+  addr_f2.c:10:5: internal compiler error: verify_gimple failed
+  0xe87e8b verify_gimple_in_cfg(function*, bool, bool)
+          ../../gcc/tree-cfg.cc:5647
+  0xd55eb4 execute_function_todo
+          ../../gcc/passes.cc:2091
+  0xd567e3 do_per_function
+          ../../gcc/passes.cc:1694
+  0xd567e3 execute_todo
+          ../../gcc/passes.cc:2145
+
+Detailed representation of above &gArray is &MEM_REF[&gArray], not a normalized address expression, which is rejected by gimple verifier. For an address expression on global variable, LTO gimple serializer would do a trick transformation to change it to such kind of redundant form, then rely on gimple de-serializer to revert the change. However, in some situation, de-serializer may fail to do that(as the testcase), this does not cause ICE because it almost happens on gimple-debug statement.
+
+With the commit "r13-4743-gda85bfc75024a92b97e60e4436863dd5789786ec", an constant address expression might be shared by gimple-debug and other statements , and thus makes the issue exposed.
+
+  1.  # DEBUG BEGIN_STMT
+  2.  # DEBUG a => &gArray
+  3.  # DEBUG INLINE_ENTRY foo
+  4.  # DEBUG BEGIN_STMT
+  5.  # DEBUG p => &gArray
+  6.  # DEBUG BEGIN_STMT
+  7.  _10 = MEM[(int *)&gArray];
+
+After early-inlining, the "main" function will end up with above gimples, in which stmt "5" and "7" refer to shared &gArray.
+
+- User: Feng Xue | Time: 2023-01-18 12:59:35 UTC
+  Text: Createdattachment 54297[details]addr_f2.c
+
+- User: Richard Biener | Time: 2023-01-18 13:37:43 UTC
+  Text: Mine.
+
+- User: Martin Jambor | Time: 2023-01-18 13:40:26 UTC
+  Text: ***Bug 108444has been marked as a duplicate of this bug. ***
+
+- User: Richard Biener | Time: 2023-01-18 13:51:44 UTC
+  Text: So if we have shared &gArray for
+
+  5.  # DEBUG p => &gArray
+  7.  _10 = MEM[(int *)&gArray];
+
+then we'll effectively wrap the MEM[(int *)&gArray] which we didn't do before
+(and whether we do depends on the order of streaming the stmts!)
+
+Plus we're undoing the wrapping depending on context so any sharing here
+is prohibitive I guess.
+
+One way out is to unshare at the point of wrapping (I don't see how
+the unsharing in remap_ssa_name reliably prevents the issue?  Ah,
+it avoids the sharing of the ADDR_EXPR when inlining foo()).
+
+I guess for GCC 13 I'm going to revert this change, eventually revisiting the
+LTO streaming thing for stage1.
+
+- User: GCC Commits | Time: 2023-01-18 13:57:53 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:d4abe5c456a3023f61c3e053255b7dd72ca0d7eccommitr13-5242-gd4abe5c456a3023f61c3e053255b7dd72ca0d7ecAuthor: Richard Biener <rguenther@suse.de>
+Date:   Wed Jan 18 14:54:33 2023 +0100
+
+    lto/108445 - avoid LTO decl wrapping being confused by tree sharingr13-4743exposed more tree sharing which runs into a latent issue
+    with LTO decl wrapping during streaming.  The following adds a
+    testcase triggering the issue.PR lto/108445* gcc.dg/lto/pr108445_0.c: New testcase.
+            * gcc.dg/lto/pr108445_1.c: Likewise.
+
+- User: Richard Biener | Time: 2023-01-18 13:58:19 UTC
+  Text: I have reverted the offending commit.
+
+- User: Martin Jambor | Time: 2023-01-18 14:37:26 UTC
+  Text: I can confirm that xalancbmk_r is LTO-buildable again too.  Thanks.
+

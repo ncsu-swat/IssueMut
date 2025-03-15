@@ -1,0 +1,506 @@
+Bug Summary: [14/15 Regression] unnecessary integer comparison(s) for a simple loop since r14-5628-g53ba8d669550d3
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: easyhack, missed-optimization
+Known to Work: 13.2.0
+Known to Fail: 14.1.0
+
+Comments:
+- User: Artemiy Volkov | Time: 2024-07-21 14:33:24 UTC
+  Text: gcc 14 and later emits unnecessary instructions when compiling the i() function in the following code:
+$ cat test.i
+# 0 "test.c"
+# 0 "<built-in>"
+# 0 "<command-line>"
+# 1 "test.c"
+typedef enum { a, b } c;
+extern char d, e;
+c f()
+{
+  if (d)
+    return a;
+  d = e;
+  return b;
+}
+void i()
+{
+  int l = 2;
+  while (l <= 2)
+    if (f() == a)
+      l++;
+}
+
+$ riscv32-unknown-elf-gcc test.i -S -O3 -fno-inline -Wall -Wextra
+$ cat test.s
+[snip]
+i:
+	addi	sp,sp,-16
+	sw	s0,8(sp)
+	sw	s1,4(sp)
+	sw	ra,12(sp)
+	li	s1,3
+	li	s0,2
+.L6:
+	call	f
+	sub	a0,s1,a0
+	beq	a0,s0,.L6
+[snip]
+
+gcc 13.2.0 doesn’t load any immediates and just emits a branch-if-not-zero:
+
+[snip]
+i:
+        addi    sp,sp,-16
+        sw      ra,12(sp)
+.L6:
+        call    f
+        bne     a0,zero,.L6
+[snip]
+
+I have bisected the introduction of this behavior down to:
+
+commit 53ba8d669550d3a1f809048428b97ca607f95cf5
+Author: Jan Hubicka <jh@suse.cz>
+Date:   Mon Nov 20 19:35:53 2023 +0100
+
+    inter-procedural value range propagation
+
+I can't be too sure, but I think what ends up happening is that the ipa-cp pass propagates the range of return values of f() ({0,1}), then later on phiopt2 uses this to expand the PHI node to something like 3 - f() == 2:
+
+ <bb 3> [local count: 955630224]:
+  # DEBUG BEGIN_STMT
+  _1 = f ();
+  _6 = (int) _1;
+  _8 = 3 - _6;
+
+  <bb 4> [local count: 1073741824]:
+  # l_2 = PHI <_8(3), 2(2)>
+  # DEBUG l => l_2
+  # DEBUG BEGIN_STMT
+  if (l_2 == 2)
+    goto <bb 3>; [89.00%]
+  else
+    goto <bb 5>; [11.00%]
+
+And the aforementioned expression never gets simplified back to f() != 0, resulting in more complicated assembly code.  Indeed, specifying -fno-ipa-vrp (or -fno-ssa-phiopt) works as a temporary workaround.
+
+godbolt for convenience:https://godbolt.org/z/xr1oTrW51gcc -v output: 
+$ riscv32-unknown-elf-gcc -v
+Using built-in specs.
+COLLECT_GCC=riscv32-unknown-elf-gcc
+COLLECT_LTO_WRAPPER=/home/art/work/install/riscv-gnu-toolchain/libexec/gcc/riscv32-unknown-elf/15.0.0/lto-wrapper
+Target: riscv32-unknown-elf
+Configured with: /home/art/work/src/gcc/configure --target=riscv32-unknown-elf --prefix=/home/art/work/install/riscv-gnu-toolchain --disable-shared --disable-threads --enable-languages=c,c++ --with-pkgversion=g80c37335baf --with-system-zlib --enable-tls --with-newlib --with-sysroot=/home/art/work/install/riscv-gnu-toolchain/riscv32-unknown-elf --with-native-system-header-dir=/include --disable-libmudflap --disable-libssp --disable-libquadmath --disable-libgomp --disable-nls --disable-tm-clone-registry --src=/home/art/work/src/gcc --enable-multilib --with-abi=ilp32 --with-arch=rv32gc --with-tune=rocket --with-isa-spec=20191213 'CFLAGS_FOR_TARGET=-Os    ' 'CXXFLAGS_FOR_TARGET=-Os    '
+Thread model: single
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240721 (experimental) (g80c37335baf)
+
+- User: Andrew Pinski | Time: 2024-07-21 14:57:49 UTC
+  Text: It is VRP which is going funny.
+
+- User: Sam James | Time: 2024-07-21 14:58:57 UTC
+  Text: sorry, I hadn't seen you'd changed component
+
+- User: Andrew Pinski | Time: 2024-07-21 15:00:59 UTC
+  Text: Note I don't think IPA is the issue of exporting (correctly) the return value range. The problem is VRP decides to create `a == 0 ? 2 : 3` which gets converted into `3 - a` (which then vrp again converts into `a == 0 ? 2 : 3`).
+
+But then `(3 - a) == 2` is never optimized to just `a == 0` by match or something else.
+
+- User: Andrew Pinski | Time: 2024-07-21 17:15:56 UTC
+  Text: So the missed optimizations that VRP/PHIopt/match expose are:
+```
+unsigned f(void);
+int i1(void)
+{
+  int l = 2;
+  l = 3 - (int)f();
+  return l <= 2; // f() > 0
+}
+int i2(void)
+{
+  unsigned l = 2;
+  l = 3 - (unsigned)f();
+  return l <= 2; // f() - 1 < 3
+}
+
+int i3(void)
+{
+  unsigned l = 2;
+  l = 3 + (unsigned)f();
+  return l <= 2; // f() > -4u
+}
+
+int i4(void)
+{
+  int l = 2;
+  l = 3 + (int)f();
+  return l <= 2; // f() < 0
+}
+
+```
+
+This can be done even without knowing the range of `f()` here. and these is done by clang already. Note GCC does handle i4 is already.
+
+- User: Artemiy Volkov | Time: 2024-07-22 09:23:53 UTC
+  Text: Hi Andrew, thank you for the breakdown.  For i1() (the case applicable to the initial bug report) something like this seems to fix the issue:
+
+diff --git a/gcc/match.pd b/gcc/match.pd
+index cf359b0ec0f..8ab6d47e278 100644
+--- a/gcc/match.pd
++++ b/gcc/match.pd
+@@ -8773,2 +8773,10 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+ 
++/* Transform comparisons of the form C1 - X CMP C2 to X - C1 CMP -C2.  */
++(for cmp (lt le gt ge eq ne)
++     rcmp (gt ge lt le eq ne)
++  (simplify
++   (cmp (minus INTEGER_CST@0 @1) INTEGER_CST@2)
++   (if (TYPE_OVERFLOW_UNDEFINED (TREE_TYPE (@1)))
++     (rcmp (minus @1 @0) (negate @2)))))
++
+ /* Canonicalizations of BIT_FIELD_REFs.  */
+
+Would it make sense for this ticket to be assigned to me so I could refine and post the above patch as well as tackle i2() and i3() (should those be extracted to a separate PR or is it fine to fix all three under this PR)?
+
+- User: Richard Biener | Time: 2024-07-22 14:01:12 UTC
+  Text: (In reply to Artemiy Volkov fromcomment #5)> Hi Andrew, thank you for the breakdown.  For i1() (the case applicable to
+> the initial bug report) something like this seems to fix the issue:
+> 
+> diff --git a/gcc/match.pd b/gcc/match.pd
+> index cf359b0ec0f..8ab6d47e278 100644
+> --- a/gcc/match.pd
+> +++ b/gcc/match.pd
+> @@ -8773,2 +8773,10 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+>  
+> +/* Transform comparisons of the form C1 - X CMP C2 to X - C1 CMP -C2.  */
+> +(for cmp (lt le gt ge eq ne)
+> +     rcmp (gt ge lt le eq ne)
+> +  (simplify
+> +   (cmp (minus INTEGER_CST@0 @1) INTEGER_CST@2)
+> +   (if (TYPE_OVERFLOW_UNDEFINED (TREE_TYPE (@1)))
+> +     (rcmp (minus @1 @0) (negate @2)))))
+> +
+>  /* Canonicalizations of BIT_FIELD_REFs.  */
+> 
+> Would it make sense for this ticket to be assigned to me so I could refine
+> and post the above patch as well as tackle i2() and i3() (should those be
+> extracted to a separate PR or is it fine to fix all three under this PR)?I don't think this is correct for types with undefined behavior on overflow
+because you can't negate INT_MIN.
+
+- User: Artemiy Volkov | Time: 2024-07-23 10:02:40 UTC
+  Text: (In reply to Richard Biener fromcomment #6)> (In reply to Artemiy Volkov fromcomment #5)
+> > Hi Andrew, thank you for the breakdown.  For i1() (the case applicable to
+> > the initial bug report) something like this seems to fix the issue:
+> > 
+> > diff --git a/gcc/match.pd b/gcc/match.pd
+> > index cf359b0ec0f..8ab6d47e278 100644
+> > --- a/gcc/match.pd
+> > +++ b/gcc/match.pd
+> > @@ -8773,2 +8773,10 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+> >  
+> > +/* Transform comparisons of the form C1 - X CMP C2 to X - C1 CMP -C2.  */
+> > +(for cmp (lt le gt ge eq ne)
+> > +     rcmp (gt ge lt le eq ne)
+> > +  (simplify
+> > +   (cmp (minus INTEGER_CST@0 @1) INTEGER_CST@2)
+> > +   (if (TYPE_OVERFLOW_UNDEFINED (TREE_TYPE (@1)))
+> > +     (rcmp (minus @1 @0) (negate @2)))))
+> > +
+> >  /* Canonicalizations of BIT_FIELD_REFs.  */
+> > 
+> > Would it make sense for this ticket to be assigned to me so I could refine
+> > and post the above patch as well as tackle i2() and i3() (should those be
+> > extracted to a separate PR or is it fine to fix all three under this PR)?
+> 
+> I don't think this is correct for types with undefined behavior on overflow
+> because you can't negate INT_MIN.Fair enough.  How about something like:
+
+diff --git a/gcc/match.pd b/gcc/match.pd
+index cf359b0ec0f..897e01c39a3 100644
+--- a/gcc/match.pd
++++ b/gcc/match.pd
+@@ -8773,2 +8773,37 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+ 
++/* Transform comparisons of the form C1 - X CMP C2 to X CMP C1 - C2.  */
++(for cmp (lt le gt ge eq ne)
++     rcmp (gt ge lt le eq ne)
++  (simplify
++   (cmp (minus INTEGER_CST@0 @1) INTEGER_CST@2)
++   (if (!TREE_OVERFLOW (@0) && !TREE_OVERFLOW (@2)
++       && TYPE_OVERFLOW_UNDEFINED (TREE_TYPE (@1)))
++     (with { tree res = int_const_binop (MINUS_EXPR, @0, @2); }
++      (if (TREE_OVERFLOW (res))
++       (with
++        {
++          fold_overflow_warning (("assuming signed overflow does not occur "
++                                  "when simplifying conditional to constant"),
++                                WARN_STRICT_OVERFLOW_CONDITIONAL);
++        }
++        (switch
++         (if (cmp == NE_EXPR)
++          { constant_boolean_node (true, type); })
++         (if (cmp == EQ_EXPR)
++          { constant_boolean_node (false, type); })
++         {
++           bool less = cmp == LE_EXPR || cmp == LT_EXPR;
++           bool ovf_high = wi::gt_p (wi::to_wide (@0), 0,
++                                     TYPE_SIGN (TREE_TYPE (@0)));
++           constant_boolean_node (less == ovf_high, type);
++         }))
++       (with
++        {
++          fold_overflow_warning (("assuming signed overflow does not occur "
++                                  "when changing C1 - X cmp C2 to "
++                                  "X cmp C1 - C2"),
++                                WARN_STRICT_OVERFLOW_COMPARISON);
++        }
++        (rcmp @1 { res; })))))))
++
+ /* Canonicalizations of BIT_FIELD_REFs.  */
+
+This passes a full dejagnu run plus a couple of newly crafted test cases around INT_MIN and INT_MAX. (I made it mostly by analogy with the "X +- C1 CMP C2” case directly above it.  I did not understand why that one is split into the equality and relational parts with stricter pre-conditions for the former (the old fold-const.c code that came before it didn't have this separation); so for the new pattern I decided to keep them unified and just require TYPE_OVERFLOW_UNDEFINED().)
+
+- User: Jakub Jelinek | Time: 2024-08-01 09:41:35 UTC
+  Text: GCC 14.2 is being released, retargeting bugs to GCC 14.3.
+
+- User: GCC Commits | Time: 2024-10-08 23:52:16 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:0883c88664d48463dfc79335dccaf15a69230952commitr15-4186-g0883c88664d48463dfc79335dccaf15a69230952Author: Artemiy Volkov <Artemiy.Volkov@synopsys.com>
+Date:   Tue Oct 8 17:51:08 2024 -0600
+
+    tree-optimization/116024 - simplify C1-X cmp C2 for UB-on-overflow types
+    
+    Implement a match.pd pattern for C1 - X cmp C2, where C1 and C2 are
+    integer constants and X is of a UB-on-overflow type.  The pattern is
+    simplified to X rcmp C1 - C2 by moving X and C2 to the other side of the
+    comparison (with opposite signs).  If C1 - C2 happens to overflow,
+    replace the whole expression with either a constant 0 or a constant 1
+    node, depending on the comparison operator and the sign of the overflow.
+    
+    This transformation allows to occasionally save load-immediate /
+    subtraction instructions, e.g. the following statement:
+    
+    10 - (int) x <= 9;
+    
+    now compiles to
+    
+    sgt     a0,a0,zero
+    
+    instead of
+    
+    li      a5,10
+    sub     a0,a5,a0
+    slti    a0,a0,10
+    
+    on 32-bit RISC-V.
+    
+    Additional examples can be found in the newly added test file. This
+    patch has been bootstrapped and regtested on aarch64, x86_64, and
+    i386, and additionally regtested on riscv32.  Existing tests were
+    adjusted where necessary.
+    
+    gcc/ChangeLog:PR tree-optimization/116024* match.pd: New transformation around integer comparison.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/pr116024.c: New test.
+            * gcc.dg/pr67089-6.c: Adjust.
+
+- User: GCC Commits | Time: 2024-10-08 23:56:00 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:65b33d43d29b148e127b1ba997f1bbc2c7028b94commitr15-4187-g65b33d43d29b148e127b1ba997f1bbc2c7028b94Author: Artemiy Volkov <Artemiy.Volkov@synopsys.com>
+Date:   Tue Oct 8 17:54:55 2024 -0600
+
+    tree-optimization/116024 - simplify C1-X cmp C2 for unsigned types
+    
+    Implement a match.pd transformation inverting the sign of X in
+    C1 - X cmp C2, where C1 and C2 are integer constants and X is
+    of an unsigned type, by observing that:
+    
+    (a) If cmp is == or !=, simply move X and C2 to opposite sides of the
+    comparison to arrive at X cmp C1 - C2.
+    
+    (b) If cmp is <:
+            - C1 - X < C2 means that C1 - X spans the range of 0, 1, ..., C2 - 1;
+            - This means that X spans the range of C1 - (C2 - 1),
+              C1 - (C2 - 2), ..., C1;
+            - Subtracting C1 - (C2 - 1), X - (C1 - (C2 - 1)) is one of 0, 1,
+              ..., C1 - (C1 - (C2 - 1));
+            - Simplifying the above, X - (C1 - C2 + 1) is one of 0, 1, ...,
+             C2 - 1;
+            - Summarizing, the expression C1 - X < C2 can be transformed
+              into X - (C1 - C2 + 1) < C2.
+    
+    (c) Similarly, if cmp is <=:
+            - C1 - X <= C2 means that C1 - X is one of 0, 1, ..., C2;
+            - It follows that X is one of C1 - C2, C1 - (C2 - 1), ..., C1;
+            - Subtracting C1 - C2, X - (C1 - C2) has range 0, 1, ..., C2;
+            - Thus, the expression C1 - X <= C2 can be transformed into
+              X - (C1 - C2) <= C2.
+    
+    (d) The >= and > cases are negations of (b) and (c), respectively.
+    
+    This transformation allows to occasionally save load-immediate /
+    subtraction instructions, e.g. the following statement:
+    
+    300 - (unsigned int)f() < 100;
+    
+    now compiles to
+    
+    addi    a0,a0,-201
+    sltiu   a0,a0,100
+    
+    instead of
+    
+    li      a5,300
+    sub     a0,a5,a0
+    sltiu   a0,a0,100
+    
+    on 32-bit RISC-V.
+    
+    Additional examples can be found in the newly added test file.  This
+    patch has been bootstrapped and regtested on aarch64, x86_64, and i386,
+    and additionally regtested on riscv32.
+    
+    gcc/ChangeLog:PR tree-optimization/116024* match.pd: New transformation around integer comparison.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/pr116024-1.c: New test.
+
+- User: GCC Commits | Time: 2024-10-09 00:04:53 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:e5f5cffb8c8243896a9d3bd0e2b8f14c70f8df1ecommitr15-4188-ge5f5cffb8c8243896a9d3bd0e2b8f14c70f8df1eAuthor: Artemiy Volkov <Artemiy.Volkov@synopsys.com>
+Date:   Tue Oct 8 18:04:13 2024 -0600
+
+    tree-optimization/116024 - simplify C1-X cmp C2 for wrapping signed types
+    
+    Implement a match.pd transformation inverting the sign of X in
+    C1 - X cmp C2, where C1 and C2 are integer constants and X is
+    of a wrapping signed type, by observing that:
+    
+    (a) If cmp is == or !=, simply move X and C2 to opposite sides of
+    the comparison to arrive at X cmp C1 - C2.
+    
+    (b) If cmp is <:
+            - C1 - X < C2 means that C1 - X spans the values of -INF,
+              -INF + 1, ..., C2 - 1;
+            - Therefore, X is one of C1 - -INF, C1 - (-INF + 1), ...,
+              C1 - C2 + 1;
+            - Subtracting (C1 + 1), X - (C1 + 1) is one of - (-INF) - 1,
+              - (-INF) - 2, ..., -C2;
+            - Using the fact that - (-INF) - 1 is +INF, derive that
+              X - (C1 + 1) spans the values +INF, +INF - 1, ..., -C2;
+            - Thus, the original expression can be simplified to
+              X - (C1 + 1) > -C2 - 1.
+    
+    (c) Similarly, C1 - X <= C2 is equivalent to X - (C1 + 1) >= -C2 - 1.
+    
+    (d) The >= and > cases are negations of (b) and (c), respectively.
+    
+    (e) In all cases, the expression -C2 - 1 can be shortened to
+    bit_not (C2).
+    
+    This transformation allows to occasionally save load-immediate /
+    subtraction instructions, e.g. the following statement:
+    
+    10 - (int)f() >= 20;
+    
+    now compiles to
+    
+    addi    a0,a0,-11
+    slti    a0,a0,-20
+    
+    instead of
+    
+    li      a5,10
+    sub     a0,a5,a0
+    slti    t0,a0,20
+    xori    a0,t0,1
+    
+    on 32-bit RISC-V when compiled with -fwrapv.
+    
+    Additional examples can be found in the newly added test file.  This
+    patch has been bootstrapped and regtested on aarch64, x86_64, and i386,
+    and additionally regtested on riscv32.
+    
+    gcc/ChangeLog:PR tree-optimization/116024* match.pd: New transformation around integer comparison.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/pr116024-1-fwrapv.c: New test.
+
+- User: GCC Commits | Time: 2024-10-09 00:07:04 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:52fdf1e7eb89a148a9cdd1daade524f4540ab5facommitr15-4189-g52fdf1e7eb89a148a9cdd1daade524f4540ab5faAuthor: Artemiy Volkov <Artemiy.Volkov@synopsys.com>
+Date:   Tue Oct 8 18:06:23 2024 -0600
+
+    tree-optimization/116024 - simplify some cases of X +- C1 cmp C2
+    
+    Whenever C1 and C2 are integer constants, X is of a wrapping type, and
+    cmp is a relational operator, the expression X +- C1 cmp C2 can be
+    simplified in the following cases:
+    
+    (a) If cmp is <= and C2 -+ C1 == +INF(1), we can transform the initial
+    comparison in the following way:
+       X +- C1 <= C2
+       -INF <= X +- C1 <= C2 (add left hand side which holds for any X, C1)
+       -INF -+ C1 <= X <= C2 -+ C1 (add -+C1 to all 3 expressions)
+       -INF -+ C1 <= X <= +INF (due to (1))
+       -INF -+ C1 <= X (eliminate the right hand side since it holds for any X)
+    
+    (b) By analogy, if cmp if >= and C2 -+ C1 == -INF(1), use the following
+    sequence of transformations:
+    
+       X +- C1 >= C2
+       +INF >= X +- C1 >= C2 (add left hand side which holds for any X, C1)
+       +INF -+ C1 >= X >= C2 -+ C1 (add -+C1 to all 3 expressions)
+       +INF -+ C1 >= X >= -INF (due to (1))
+       +INF -+ C1 >= X (eliminate the right hand side since it holds for any X)
+    
+    (c) The > and < cases are negations of (a) and (b), respectively.
+    
+    This transformation allows to occasionally save add / sub instructions,
+    for instance the expression
+    
+    3 + (uint32_t)f() < 2
+    
+    compiles to
+    
+    cmn     w0, #4
+    cset    w0, ls
+    
+    instead of
+    
+    add     w0, w0, 3
+    cmp     w0, 2
+    cset    w0, ls
+    
+    on aarch64.
+    
+    Testcases that go together with this patch have been split into two
+    separate files, one containing testcases for unsigned variables and the
+    other for wrapping signed ones (and thus compiled with -fwrapv).
+    Additionally, one aarch64 test has been adjusted since the patch has
+    caused the generated code to change from
+    
+    cmn     w0, #2
+    csinc   w0, w1, wzr, cc   (x < -2)
+    
+    to
+    
+    cmn     w0, #3
+    csinc   w0, w1, wzr, cs   (x <= -3)
+    
+    This patch has been bootstrapped and regtested on aarch64, x86_64, and
+    i386, and additionally regtested on riscv32.
+    
+    gcc/ChangeLog:PR tree-optimization/116024* match.pd: New transformation around integer comparison.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/tree-ssa/pr116024-2.c: New test.
+            * gcc.dg/tree-ssa/pr116024-2-fwrapv.c: Ditto.
+            * gcc.target/aarch64/gtu_to_ltu_cmp_1.c: Adjust.
+
+- User: Jeffrey A. Law | Time: 2024-10-09 00:12:21 UTC
+  Text: Should be fixed on the trunk now.
+

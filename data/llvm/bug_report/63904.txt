@@ -1,0 +1,124 @@
+Issue Title: [OMPT] Work callback does not report schedule type for loops
+Original Post: # Description
+
+The OpenMP tools interface offers a callback called `ompt_callback_work`. Here, the parameter `work_type` can be used to determine the type of work a thread is doing. There are several different values for loops, which can be used to get the schedule for the OpenMP loops.
+
+Right now, LLVM does not report any schedule type. Instead, the value `ompt_work_loop` is used for every schedule type. 
+From what I was able to gather in the LLVM source code, only `ompt_work_loop` is set and no checks for the schedule type are done:
+- https://github.com/llvm/llvm-project/blob/68f1391a6281488ab52848abc7871b0212fc1dc5/openmp/runtime/src/kmp_dispatch.cpp#L1006
+- https://github.com/llvm/llvm-project/blob/fd2de54920d653eded0260ca7d056ec5ec86fb4d/openmp/runtime/src/kmp_sched.cpp#L116
+- https://github.com/llvm/llvm-project/blob/fd2de54920d653eded0260ca7d056ec5ec86fb4d/openmp/runtime/src/kmp_csupport.cpp#L1922
+
+The test heaader also includes a TODO to handle the schedule types:
+- https://github.com/llvm/llvm-project/blob/fd2de54920d653eded0260ca7d056ec5ec86fb4d/openmp/runtime/test/ompt/callback.h#L835
+
+# Reproducer
+
+You can compile and run the code down below to reproduce the issue. The program will exit with an assertion error because no schedule type was reported. 
+
+```console
+$ clang --version
+clang version 16.0.6 (git@github.com:llvm/llvm-project.git 7cbf1a2591520c2491aa35339f227775f4d3adf6)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/software/software/LLVM/16.0.6/bin
+$ clang -fopenmp error_llvm.c
+$ OMP_NUM_THREADS=1 ./a.out
+ompt_work_loop detected
+ompt_work_loop detected
+ompt_work_loop detected
+ompt_work_loop detected
+ompt_work_loop detected
+ompt_work_loop detected
+a.out: error_llvm.c:46: void ompt_finalize(ompt_data_t *): Assertion `no_schedule == 0' failed.
+[1]    609430 IOT instruction (core dumped)  OMP_NUM_THREADS=1 ./a.out
+```
+
+**Source code:**
+```c
+#include <assert.h>
+#include <omp.h>
+#include <omp-tools.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+static int no_schedule = 1;
+
+void
+callback_ompt_work( ompt_work_t           work_type,
+                    ompt_scope_endpoint_t endpoint,
+                    ompt_data_t*          parallel_data,
+                    ompt_data_t*          task_data,
+                    uint64_t              count,
+                    const void*           codeptr_ra )
+{
+    switch ( work_type )
+    {
+	case ompt_work_loop:
+	    printf("ompt_work_loop detected\n");
+	    break;
+        case ompt_work_loop_static:
+        case ompt_work_loop_dynamic:
+        case ompt_work_loop_guided:
+        case ompt_work_loop_other:
+            no_schedule = 0;
+            break;
+        default:
+            break;
+    }
+}
+
+static int
+ompt_initialize( ompt_function_lookup_t lookup,
+                 int                    initial_device_num,
+                 ompt_data_t*           tool_data )
+{
+    ompt_set_callback_t set_cb = ( ompt_set_callback_t )lookup( "ompt_set_callback" );
+    set_cb( ompt_callback_work, ( ompt_callback_t )&callback_ompt_work );
+    return 1; /* non-zero indicates success for OMPT runtime. */
+}
+
+static void
+ompt_finalize( ompt_data_t* tool_data )
+{
+    assert(no_schedule == 0);
+}
+
+ompt_start_tool_result_t*
+ompt_start_tool( unsigned int omp_version,
+                 const char*  runtime_version )
+{
+    static ompt_start_tool_result_t ompt_start_tool_result = { &ompt_initialize,
+                                                               &ompt_finalize,
+                                                               ompt_data_none };
+    return &ompt_start_tool_result;
+}
+
+int
+main( void )
+{
+#pragma omp parallel for schedule(static)
+    for ( unsigned i = 0; i < 100; ++i )
+    {
+    }
+
+#pragma omp parallel for schedule(dynamic)
+    for ( unsigned i = 0; i < 100; ++i )
+    {
+    }
+
+#pragma omp parallel for schedule(guided)
+    for ( unsigned i = 0; i < 100; ++i )
+    {
+    }
+
+    return 0;
+}
+```
+
+Comment by llvmbot: @llvm/issue-subscribers-openmp
+Comment by Thyre: A trunk `flang-new` actually shows a warning not present with Clang.
+
+> OMP: Warning #189: OMPT: Cannot determine workshare type; using the default (loop) instead. This issue is fixed in an up-to-date compiler.
+
+The second line is not true, as the issue is still present in trunk. 

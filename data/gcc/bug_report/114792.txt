@@ -1,0 +1,112 @@
+Bug Summary: [14 Regression] ICE on valid code at -O1 with "-fno-tree-ccp -fno-tree-copy-prop" on x86_64-linux-gnu: in get_loop_body, at cfgloop.cc:903
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2024-04-21 11:39:55 UTC
+  Text: It appears to be a recent regression and does not reproduce with 13.2. 
+
+Compiler Explorer:https://godbolt.org/z/zzdjrb599[522] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.1 20240421 (experimental) (GCC) 
+[523] % 
+[523] % gcctk -O1 -fno-tree-ccp -fno-tree-copy-prop small.c
+during GIMPLE pass: ch
+small.c: In function ‘main’:
+small.c:2:5: internal compiler error: in get_loop_body, at cfgloop.cc:903
+    2 | int main() {
+      |     ^~~~
+0x7926fd get_loop_body(loop const*)
+	../../gcc-trunk/gcc/cfgloop.cc:903
+0xbfbce9 unloop(loop*, bool*, bitmap_head*)
+	../../gcc-trunk/gcc/cfgloopmanip.cc:1014
+0x12ee996 unloop_loops(vec<loop*, va_heap, vl_ptr>&, vec<int, va_heap, vl_ptr>&, vec<edge_def*, va_heap, vl_ptr>&, bitmap_head*, bool*)
+	../../gcc-trunk/gcc/tree-ssa-loop-ivcanon.cc:688
+0x12dfc84 copy_headers
+	../../gcc-trunk/gcc/tree-ssa-loop-ch.cc:1158
+0x12e02da execute
+	../../gcc-trunk/gcc/tree-ssa-loop-ch.cc:1179
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+[524] % 
+[524] % cat small.c
+int a;
+int main() {
+  int b = -1, c;
+  for (; b >= 0; b++) {
+    for (c = 0; c; c++) {
+    L:
+      while (a)
+        if (a)
+          goto L;
+    }
+  }
+  return 0;
+}
+
+- User: H.J. Lu | Time: 2024-04-21 15:33:40 UTC
+  Text: It is caused byr14-301.
+
+- User: Andrew Pinski | Time: 2024-04-21 20:26:25 UTC
+  Text: Confirmed.
+
+- User: Richard Biener | Time: 2024-04-24 13:04:37 UTC
+  Text: The issue is that unloop_loops doesn't work when to unloop loops are nested.  The unroller takes great care of working on a single loop level at a time, cleaning up the CFG and fixing loops inbetween but we fail to ensure this here.
+
+unlooping in CH is somewhat a wrong tool for the wrong task as it doesn't adhere to constraints present.  There's the possibility this can be salvaged by making unloop_loops more robust, in particular computing loop bodies (Which is fragile) up-front.
+
+But it would be much nicer if unlooping would simply add __builtin_unreachable () as the first stmt into the latch and leave the rest to CFG cleanup.
+
+- User: Richard Biener | Time: 2024-04-24 13:05:45 UTC
+  Text: Createdattachment 58024[details]patch
+
+I quickly tried this which works for the testcase but I'm sure it'll break quickly.
+
+- User: Richard Biener | Time: 2024-04-25 05:45:05 UTC
+  Text: (In reply to Richard Biener fromcomment #4)> Createdattachment 58024[details]> patch
+> 
+> I quickly tried this which works for the testcase but I'm sure it'll break
+> quickly.during GIMPLE pass: cunrolli
+../../../../gcc/libgcc/soft-fp/floatsitf.c: In function '__floatsitf':
+../../../../gcc/libgcc/soft-fp/floatsitf.c:34:1: internal compiler error: in unloop_loops, at tree-ssa-loop-ivcanon.cc:721
+   34 | __floatsitf (SItype i)
+      | ^~~~~~~~~~~
+0x76cde9 _start
+        ../sysdeps/x86_64/start.S:120
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+
+- User: Richard Biener | Time: 2024-04-25 06:14:52 UTC
+  Text: Createdattachment 58033[details]patch
+
+I'm now testing this which is more minimal surgery at least making sure we process loops in similar order as unrolling does.  I'm not 100% convinced this is enough but it restores part of the consistency (unroll also doesn't unloop an outer loop before cleaning up the CFG and rebuilding loops after unlooping an inner loop).
+
+- User: GCC Commits | Time: 2024-04-25 13:20:54 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:59ff81835fee22a9d4c9a481a4d1814583aae945commitr14-10120-g59ff81835fee22a9d4c9a481a4d1814583aae945Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Apr 25 08:08:24 2024 +0200
+
+    tree-optimization/114792 - order loops to unloops in CH
+    
+    When we use unloop_loops we have to make sure to have loops ordered
+    inner to outer as otherwise we can wreck inner loop structure where
+    unlooping relies on that being intact.  The following re-sorts the
+    vector of to unloop loops after copy-header as that adds to the
+    vector in two places and the wrong order.PR tree-optimization/114792* tree-ssa-loop-ch.cc (ch_order_loops): New function.
+            (ch_base::copy_headers): Sort loops to unloop inner-to-outer.
+    
+            * gcc.dg/torture/pr114792.c: New testcase.
+
+- User: Richard Biener | Time: 2024-04-25 13:21:10 UTC
+  Text: Fixed.
+

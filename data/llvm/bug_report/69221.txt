@@ -1,0 +1,255 @@
+Issue Title: Hardware ASAN deep-recursion.c test is flaky on AArch64 Linux
+Original Post: As seen in:
+https://lab.llvm.org/buildbot/#/builders/184/builds/8047
+https://lab.llvm.org/buildbot/#/builders/184/builds/7993
+
+This test case sometimes fails with:
+```
++ env HWASAN_OPTIONS=disable_allocator_tagging=1:random_tags=0:fail_without_syscall_abi=0:stack_history_size=5 not /home/tcwg-buildbot/worker/clang-aarch64-sve-vls/stage1/runtimes/runtimes-bins/compiler-rt/test/hwasan/AARCH64/TestCases/Output/deep-recursion.c.tmp
++ FileCheck /home/tcwg-buildbot/worker/clang-aarch64-sve-vls/llvm/compiler-rt/test/hwasan/TestCases/deep-recursion.c --check-prefix=D5
+FileCheck error: '<stdin>' is empty.
+FileCheck command line:  FileCheck /home/tcwg-buildbot/worker/clang-aarch64-sve-vls/llvm/compiler-rt/test/hwasan/TestCases/deep-recursion.c --check-prefix=D5
+```
+
+This bot runs on a Graviton 3 instance, I reproduced it on an Ampere server by doing the following:
+```
+$ ./bin/clang -fsanitize=hwaddress -O1 ../llvm-project/compiler-rt/test/hwasan/TestCases/deep-recursion.c -o /tmp/test.o -mllvm -hwasan-record-stack-history=libcall
+```
+Then running this shell script:
+```
+num=0
+while [ true ]
+do
+  /tmp/test.o
+  retcode=$?
+  num=$(($num + 1))
+  if [[ $retcode == '0' ]]
+  then
+    echo "Found bug with retcode $retcode on run $num"
+    exit 1
+  fi
+done
+```
+Results:
+```
+Found bug with retcode 0 on run 946
+Found bug with retcode 0 on run 163
+Found bug with retcode 0 on run 11
+Found bug with retcode 0 on run 224
+Found bug with retcode 0 on run 10
+Found bug with retcode 0 on run 469
+Found bug with retcode 0 on run 1095
+```
+From what I gather, the fault should *always* be found. These results also prove that it isn't some sort of pipefail issue in the RUN line.
+
+I tried removing `-hwasan-record-stack-history=libcall` and:
+```
+Found bug with retcode 0 on run 47
+Found bug with retcode 0 on run 128
+Found bug with retcode 0 on run 197
+```
+Clearly that's not enough to say if one is failing to find it more frequently, but you get the idea. Something is going on here.
+
+Comment by DavidSpickett: I suspect that `stack-uar.c` will suffer from the same issue given I've seen it fail in https://lab.llvm.org/buildbot/#/builders/198/builds/5427 and at other times.
+Comment by DavidSpickett: Actually, `stack-uar.c` is holding up, so I do not know why that one fails sometimes. Will keep an eye on the bot for that.
+Comment by vitalybuka: @DavidSpickett Thanks for filing the bug.
+
+@thurstond Would you like to take a look?
+Comment by thurstond: tl;dr The "random" stack tag is sometimes zero, as would be expected roughly 1/256 times. In such cases, the buffer overflow is not caught, because the corresponding tag memory is also zero.
+
+## How the stack base tag is generated
+
+https://github.com/llvm/llvm-project/blob/main/llvm/lib/Transforms/Instrumentation/HWAddressSanitizer.cpp#L1145
+```
+Value *HWAddressSanitizer::getStackBaseTag(IRBuilder<> &IRB) {
+...
+  // Extract some entropy from the stack pointer for the tags.
+  // Take bits 20..28 (ASLR entropy) and xor with bits 0..8 (these differ
+  // between functions).
+  Value *StackPointerLong = IRB.CreatePointerCast(StackPointer, IntptrTy);
+  Value *StackTag =
+      IRB.CreateXor(StackPointerLong, IRB.CreateLShr(StackPointerLong, 20),
+                    "hwasan.stack.base.tag");
+  return StackTag;
+```
+
+Since it's XORing against ASLR entropy, we would expect the result to occasionally be zero, just by chance.
+
+## Empirical demonstration
+
+I modified the test case to print out the address of the out-of-bounds access:
+
+```
+// RUN commands omitted for brevity - same as the original test case
+
+#include <stdio.h>
+#include <stdlib.h>
+// At least -O1 is needed for this function to not have a stack frame on
+// AArch64.
+void USE(void *x) { // pretend_to_do_something(void *x)
+  __asm__ __volatile__("" : : "r" (x) : "memory");
+}
+
+volatile int four = 4;
+
+int* global_OOB;
+
+__attribute__((noinline)) void OOB() { int x[4]; printf ("!!! %p\n", &x[4]); fflush (stdout); x[four] = 0; USE(&x[0]); global_OOB = &x[4]; }
+__attribute__((noinline)) void FUNC1() { int x; USE(&x); OOB(); }
+__attribute__((noinline)) void FUNC2() { int x; USE(&x); FUNC1(); }
+__attribute__((noinline)) void FUNC3() { int x; USE(&x); FUNC2(); }
+__attribute__((noinline)) void FUNC4() { int x; USE(&x); FUNC3(); }
+__attribute__((noinline)) void FUNC5() { int x; USE(&x); FUNC4(); }
+__attribute__((noinline)) void FUNC6() { int x; USE(&x); FUNC5(); }
+__attribute__((noinline)) void FUNC7() { int x; USE(&x); FUNC6(); }
+__attribute__((noinline)) void FUNC8() { int x; USE(&x); FUNC7(); }
+__attribute__((noinline)) void FUNC9() { int x; USE(&x); FUNC8(); }
+__attribute__((noinline)) void FUNC10() { int x; USE(&x); FUNC9(); }
+
+int main() { 
+    FUNC10();
+
+    // Only printed if OOB() did not get caught by HWASan
+    printf ("### %p\n", global_OOB);
+
+    return 0;
+}
+```
+and ran it with:
+```
+for f in `seq 1 10000`; do (/tmp/test.o 2>&1) | tee /tmp/x | grep '###' > /dev/null; if [ $? -eq 0 ]; then cat /tmp/x | grep '^### '; fi; done
+```
+
+Example output:
+```
+### 0xffffdc093dc0
+### 0xffffd40b9b40
+### 0xffffcc0a0fc0
+### 0xffffeb0ac1b0
+### 0xffffef0768f0
+### 0xffffff0469f0
+### 0xffffe00e5300
+...
+```
+
+Three observations:
+- the test case passes roughly 1 out of 256 times, as would be expected by chance
+- the tag value is always zero
+- the recomputed stack base tag is zero e.g., using the first pointer from the example output, then applying the formula from HWAddressSanitizer::getStackBaseTag:
+```
+$ echo '0xffffdc093dc0' | perl -e 'while ($a = <>) { $b = hex ($a); $c = $b ^ ($b >> 20); print ($c & 0xFF); print "\n"; }'
+0
+```
+Comment by thurstond: > I suspect that `stack-uar.c` will suffer from the same issue given I've seen it fail in https://lab.llvm.org/buildbot/#/builders/198/builds/5427 and at other times.
+
+I reproduced the issue with `stack-uar.c`:
+
+```
+char *buggy() {
+  char zzz[0x1000];
+  char *volatile p = zzz;
+  printf ("### %p\n", p); // ADDED THIS LINE
+  return p;
+}
+```
+
+```
+$ build/bin/clang -fsanitize=hwaddress -O1 compiler-rt/test/hwasan/TestCases/stack-uar.c -o /tmp/stack-uar -mllvm -hwasan-record-stack-history=libcall
+$  for f in `seq 1 10000`; do (/tmp/stack-uar 2>&1) > /tmp/x; if [ $? -eq 0 ]; then cat /tmp/x; fi; done | cat -n
+     1  ### 0xffffce0e00e0
+     2  ### 0xffffd7057070
+     3  ### 0xffffed024dd0
+     4  ### 0xffffef074cf0
+     5  ### 0xffffd3002e30
+     6  ### 0xfffffe0d0de0
+     7  ### 0xffffeb0285b0
+     8  ### 0xffffdc0411c0
+     9  ### 0xffffc802f880
+    10  ### 0xffffd3007930
+    11  ### 0xffffc80b0e80
+    12  ### 0xfffff308ed30
+    13  ### 0xffffc1036710
+    14  ### 0xfffff4075540
+    15  ### 0xfffff0032400
+    16  ### 0xffffe6035960
+    17  ### 0xffffe8066280
+    18  ### 0xfffffc0d74c0
+    19  ### 0xffffc2023420
+    20  ### 0xffffdc0b80c0
+    21  ### 0xffffc20c3220
+    22  ### 0xffffe40fec40
+    23  ### 0xffffc80e3380
+    24  ### 0xffffd40c4440
+    25  ### 0xffffee0ae7e0
+    26  ### 0xffffef05b1f0
+    27  ### 0xffffe402c140
+    28  ### 0xffffe900d090
+    29  ### 0xfffff30bf330
+    30  ### 0xffffee0227e0
+    31  ### 0xffffea05dda0
+    32  ### 0xffffc2012520
+    33  ### 0xffffc20a1920
+    34  ### 0xffffee0bf6e0
+
+```
+Same symptoms as deep-recursion.c:
+- it unexpectedly passes roughly 1 out of 256 times
+- tag value of the unexpectedly-passing cases is always zero
+- the recomputed stack base tag value is zero
+Comment by DavidSpickett: Thanks for digging into this. I suspected granule sizing instead but had no idea how to investigate.
+
+I fixed a missing include in the test so it's now running and has been green so far. Give it a few days that'll be enough runs to know it's solid I think.
+Comment by thurstond: @DavidSpickett Thanks for reporting the bug and for fixing the missing include! :-)
+
+Comment by DavidSpickett: Assuming this fix holds, can the same be done for `stack-uar.c`? Being in different stack frames probably makes it more complicated.
+Comment by thurstond: > Assuming this fix holds, can the same be done for `stack-uar.c`? Being in different stack frames probably makes it more complicated.
+
+Yep, I'll do that shortly.
+Comment by thurstond: There's many other test cases that are affected by this stack zero-tag issue e.g., I've also reproduced the issue in:
+- stack-uar-dynamic
+- stack-uar-realign
+- stack-oob
+- use-after-scope
+
+It's probably almost every test that checks for illegal access with a stack-allocated variable (with rare exceptions such as trying to access an adjacent stack-allocated variable in the same stack frame). I'm a bit surprised we don't see more test flake in the buildbots.
+Comment by thurstond: **edit**: ignore the below, this is wrong. e.g., stack-uas is flaky even without -hwasan-record-stack-history=libcall.
+
+----
+
+Ah, most test cases aren't compiled with `-hwasan-record-stack-history=libcall`, which is important for triggering the error.
+
+This narrows down the affected tests to:
+- deep-recursion (fixed)
+- stack-uar (https://github.com/llvm/llvm-project/pull/69374)
+- stack-history-length
+- stack-uas
+so I just need to fix two more, which is manageable.
+
+Comment by thurstond: Why tests are extra-flaky with `-hwasan-record-stack-history=libcall`: the stack base tag is fully randomized, hence stack tags may occasionally be zero. I plan to add the zero-tag workaround to the tests that use this option (stack-history-length, stack-uas).
+
+When the alternative option (`-hwasan-record-stack-history=instr`) is selected, the StackBaseTag is obtained from a value that is not fully randomized.
+
+https://github.com/llvm/llvm-project/blob/main/llvm/lib/Transforms/Instrumentation/HWAddressSanitizer.cpp
+
+```
+void HWAddressSanitizer::emitPrologue(IRBuilder<> &IRB, bool WithFrameRecord) {
+  switch (ClRecordStackHistory) {
+    case libcall: {
+        ...
+        break;
+    }
+    case instr: {
+      ThreadLongMaybeUntagged = getThreadLongMaybeUntagged();
+
+      StackBaseTag = IRB.CreateAShr(ThreadLong, 3); // This prevents the full randomization of stackBaseTag
+    }
+    case none: {
+      llvm_unreachable("A stack history recording mode should've been selected.");
+    }
+```
+
+Comment by DavidSpickett: I'll check the weekend's results and close this on Monday if I haven't seen anything untoward.
+
+Thanks for the quick response and the fixes.
+Comment by DavidSpickett: No flaky tests over the weekend, closing.
+Comment by thurstond: Thank you @DavidSpickett!

@@ -1,0 +1,446 @@
+Bug Summary: [11 Regression] miscompile at `-O3 -fno-vect-cost-model -msse4.2`
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 12.3.1, 13.2.1, 14.0, 9.5.0
+Known to Fail: 10.1.0, 12.3.0, 13.2.0, 14.0
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-02-21 02:06:13 UTC
+  Text: Testcase:
+long a;
+int b[10][7] = {{},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {0, 0, 0, 0, 0, 1},
+                {1, 1, 1, 1, 1, 1},
+                {1, 1, 1, 1, 1, 1}};
+int c;
+int main() {
+  int d;
+  c = 0xFFFFFFFF;
+  for (; a < 6; a++) {
+    d = 0;
+    for (; d < 6; d++) {
+      c ^= -3L;
+      if (b[a + 3][d])
+        continue;
+      c = 0;
+    }
+  }
+
+  if (c == -3) {
+    return 0;
+  } else {
+    return 1;
+  }
+}
+
+
+Commands:> /scratch/tc-testing/tc-feb-20/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -march=rv64gcv -O3 red.c -o red.out
+> /scratch/tc-testing/tc-feb-20-llvm/build/bin/qemu-riscv64 red.out
+> echo $?1> /scratch/tc-testing/tc-feb-20/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc red.c -o red.out
+> /scratch/tc-testing/tc-feb-20-llvm/build/bin/qemu-riscv64 red.out
+> echo $?0
+
+Discovered/tested using g61ab046a327 (not bisected)
+Found using fuzzer
+
+- User: Sam James | Time: 2024-02-21 02:16:18 UTC
+  Text: When this is fixed, this is probably worth putting in the general torture test suite, not just for riscv.
+
+- User: Andrew Pinski | Time: 2024-02-21 02:39:53 UTC
+  Text: Works fine on aarch64 with SVE:
+```
+[apinski@xeond2 upstream-full-cross]$ ./install/bin/aarch64-linux-gnu-gcc -O3 t6.c -static -march=armv9-a+sve2
+[apinski@xeond2 upstream-full-cross]$ ./install-qemu/bin/qemu-aarch64 a.out ;echo $?
+0
+[apinski@xeond2 upstream-full-cross]$ ./install/bin/aarch64-linux-gnu-gcc -O3 t6.c -static -march=armv9-a+sve2 -fno-vect-cost-model
+[apinski@xeond2 upstream-full-cross]$ ./install-qemu/bin/qemu-aarch64 a.out ;echo $?
+0
+```
+
+- User: Li Pan | Time: 2024-02-22 06:39:28 UTC
+  Text: Narrow a little compares to the original test case.
+
+---------------------------------------------------
+int b[10][7] = {{}, // 0
+                {}, // 1
+                {}, // 2
+                {}, // 3
+                {}, // 4
+                {}, // 5
+                {0, 0, 0, 0, 0, 1}, // 6
+                {2, 3, 4, 5, 6, 7}, // 7
+                {8, 8, 8, 8, 8, 8}};// 8
+               //0  1  2  3  4  5
+int c;
+
+int main() {
+  int d = 0, a = 0;
+  c = 0xFFFFFFFF;
+
+  for (a = 0; a < 5; a++) {
+    for (d = 0; d < 6; d++) {
+      c ^= -3L;
+
+      if (b[a + 3][d])
+        continue;
+
+      c = 0;
+    }
+  }
+
+  if (c == -3) {
+    return 0;
+  } else {
+    return 1;
+  }
+}
+---------------------------------------------------
+
+The sematics of the loop acts on 5 * 6 matrix. The upstream currently makes the first 4 * 6 vectorized and then goes scalar for the last 6 elements. The vectorized part may looks like below.
+
+  vect_array.16 = .MASK_LEN_LOAD_LANES (&MEM <int[10][7]> [(void *)&b + 84B], 32B, { -1, ... }, POLY_INT_CST [4, 4], 0);
+  vect__28.17_94 = vect_array.16[0];
+  vect__28.18_95 = vect_array.16[1];
+  vect__28.19_96 = vect_array.16[2];
+  vect__28.20_97 = vect_array.16[3];
+  vect__28.21_98 = vect_array.16[4];
+  vect__28.22_99 = vect_array.16[5];
+  vect_array.16 ={v} {CLOBBER};
+  mask__70.24_102 = vect__28.17_94 != { 0, ... };
+  vect_prephitmp_76.25_104 = .VCOND_MASK (mask__70.24_102, { -1, ... }, { -3, ... });
+  mask__80.26_106 = vect__28.18_95 != { 0, ... };
+  vect_c_lsm.27_108 = .VCOND_MASK (mask__80.26_106, vect_prephitmp_76.25_104, { 0, ... });
+  mask__51.28_110 = vect__28.19_96 != { 0, ... };
+  vect_prephitmp_66.29_112 = .VCOND_MASK (mask__51.28_110, vect_c_lsm.27_108, { -3, ... });
+  mask__16.30_114 = vect__28.20_97 != { 0, ... };
+  vect_c_lsm.31_116 = .VCOND_MASK (mask__16.30_114, vect_prephitmp_66.29_112, { 0, ... });
+  mask__79.32_118 = vect__28.21_98 != { 0, ... };
+  vect_prephitmp_56.33_120 = .VCOND_MASK (mask__79.32_118, vect_c_lsm.31_116, { -3, ... });
+  mask__25.34_122 = vect__28.22_99 != { 0, ... };
+  vect_c_lsm.35_124 = .VCOND_MASK (mask__25.34_122, vect_prephitmp_56.33_120, { 0, ... });
+  _126 = .REDUC_MAX (vect_c_lsm.35_124);
+
+Looks like the last .REDUC_MAX is kind of a surprise here? It is not easy to get the sematics of REDUC_MAX for source code.  Actually the c will depend on the previous iteration.
+
+For example, if b condition is 0, c will be 0 forever. If b condition is 1, the c will be the sequence similar to [-3, 0, -3, 0...].
+
+Not sure if my understanding is correct, will take a look into tree-vect.
+
+- User: Li Pan | Time: 2024-02-22 07:43:07 UTC
+  Text: Just did some hacks from the riscv backend, which is to replace the expanding code of reduc_smax_scal_<mode> to the reduc_xor_scal_<mode>.
+
+diff --git a/gcc/config/riscv/autovec.md b/gcc/config/riscv/autovec.md
+index 3b32369f68c..58424baabd7 100644
+--- a/gcc/config/riscv/autovec.md
++++ b/gcc/config/riscv/autovec.md
+@@ -2107,10 +2107,8 @@ (define_expand "reduc_smax_scal_<mode>"
+    (match_operand:V_VLSI 1 "register_operand")]
+   "TARGET_VECTOR"
+ {
+-  int prec = GET_MODE_PRECISION (<VEL>mode);
+-  rtx min = immed_wide_int_const (wi::min_value (prec, SIGNED), <VEL>mode);
+-  riscv_vector::expand_reduction (UNSPEC_REDUC_MAX, riscv_vector::REDUCE_OP,
+-                                  operands, min);
++  riscv_vector::expand_reduction (UNSPEC_REDUC_XOR, riscv_vector::REDUCE_OP,
++                                  operands, CONST0_RTX (<VEL>mode));
+   DONE;
+ })
+
+My idea would like to prove that the last standard name should be .REDUC_XOR.
+
+Then the test (include the narrowed and the original one) can pass. That may indicates we take .REDUC_MAX by mistake in somewhere. let me try to figure it out.
+
+- User: Robin Dapp | Time: 2024-02-22 08:39:35 UTC
+  Text: To me it looks like we interpret e.g. c_53 = _43 ? prephitmp_13 : 0 as the only reduction statement and simplify to MAX because of the wrong assumption that this is the only reduction statement in the chain when we actually have several. 
+(See "condition expression based on compile time constant").
+
+- User: Robin Dapp | Time: 2024-02-22 08:57:21 UTC
+  Text: Btw this fails on x86 and aarch64 for me with -fno-vect-cost-model.  So it definitely looks generic.
+
+- User: Sam James | Time: 2024-02-22 08:59:11 UTC
+  Text: (In reply to Robin Dapp fromcomment #6)> Btw this fails on x86 and aarch64 for me with -fno-vect-cost-model.  So it
+> definitely looks generic.What args did you use? I can't get it to fail.
+
+- User: Andrew Pinski | Time: 2024-02-22 09:05:22 UTC
+  Text: (In reply to Robin Dapp fromcomment #6)> Btw this fails on x86 and aarch64 for me with -fno-vect-cost-model.  So it
+> definitely looks generic.I still can't reproduce it on x86 with `-O3 -fno-vect-cost-model` nor with `-O3 -fno-vect-cost-model -march=skylake-avx512`, I tried the testcase incomment #0andcomment #3. Did I miss something?
+
+- User: Robin Dapp | Time: 2024-02-22 09:06:52 UTC
+  Text: Argh,  I actually just did a gcc -O3 -march=nativepr114027.c -fno-vect-cost-model on cfarm188 with a recent-ish GCC but realized that I used my slightly modified version and not the original test case.
+
+long a;
+int b[10][8] = {{},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {0, 0, 0, 0, 0, 1, 1},
+        {1, 1, 1, 1, 1, 1, 1},
+        {1, 1, 1, 1, 1, 1, 1}};
+int c;
+int main() {
+        int d;
+        c = 0xFFFFFFFF;
+        for (; a < 6; a++) {
+                d = 0;
+                for (; d < 6; d++) {
+                        c ^= -3L;
+                        if (b[a + 3][d])
+                                continue;
+                        c = 0;
+                }
+        }
+
+        if (c == -3) {
+                return 0;
+        } else {
+                return 1;
+        }
+}
+
+This was from an initial attempt to minimize it further but I didn't really verify if I'm breaking the test case by that (or causing undefined behavior).
+
+With that I get a "1" with default options and "0" with -fno-tree-vectorize.
+Maybe my snippet is broken then?
+
+- User: Andrew Pinski | Time: 2024-02-22 09:13:22 UTC
+  Text: Ok, now I am able to reproduce the failure:
+`-O3 -fno-vect-cost-model -msse4.2` is the exact command line needed.
+For some reason enabling AVX512 causes the loop not to be vectorize ...
+
+- User: Andrew Pinski | Time: 2024-02-22 09:20:50 UTC
+  Text: For x86_64, this seems to have broke between GCC 9 and GCC 10.
+
+- User: Jakub Jelinek | Time: 2024-02-22 09:26:45 UTC
+  Text: #c9 with #c10 options on x86_64 regressed withr10-4170-ge0c4f7fbd6a4ee8e3a1468514044bd941fa28522
+
+- User: Richard Biener | Time: 2024-02-22 09:37:15 UTC
+  Text: We're detecting a COND_REDUCTION with a chain.  It seems to work (and vectorize) with -march=znver4 using AVX sized vectors (but AVX512 style masking).
+
+I think what goes wrong is treating the COND_REDUCTION as MAX reduction
+by only checking the last COND which looks like
+
+  c_lsm.9_18 = _76 ? prephitmp_26 : 0;
+
+but the previous one is
+
+  prephitmp_26 = _69 ? c_lsm.9_30 : -3;
+
+I'm not too familiar with the condition reduction code, the reduction
+is classified as cond_reduc_dt == vect_constant_def and so we run into
+
+      else if (cond_reduc_dt == vect_constant_def)
+        {
+          enum vect_def_type cond_initial_dt;
+          tree cond_initial_val = vect_phi_initial_value (reduc_def_phi);
+          vect_is_simple_use (cond_initial_val, loop_vinfo, &cond_initial_dt);
+          if (cond_initial_dt == vect_constant_def
+              && types_compatible_p (TREE_TYPE (cond_initial_val),
+                                     TREE_TYPE (cond_reduc_val)))
+            {
+              tree e = fold_binary (LE_EXPR, boolean_type_node,
+                                    cond_initial_val, cond_reduc_val);
+              if (e && (integer_onep (e) || integer_zerop (e)))
+                {
+                  if (dump_enabled_p ())
+                    dump_printf_loc (MSG_NOTE, vect_location,
+                                     "condition expression based on "
+                                     "compile time constant.\n");
+                  /* Record reduction code at analysis stage.  */
+                  STMT_VINFO_REDUC_CODE (reduc_info)
+                    = integer_onep (e) ? MAX_EXPR : MIN_EXPR;
+                  STMT_VINFO_REDUC_TYPE (reduc_info) = CONST_COND_REDUCTION;
+                }
+
+and the loop classifying and computing cond_reduc_val just looks at the
+first chain element ...  This should possibly be merged with the loop
+going over all chain stmts but a more conservative fix for the latent(?)
+issue might be the following (but that also cuts out conversions in the
+chain):
+
+diff --git a/gcc/tree-vect-loop.cc b/gcc/tree-vect-loop.cc
+index 5a5865c42fc..e19896eef79 100644
+--- a/gcc/tree-vect-loop.cc
++++ b/gcc/tree-vect-loop.cc
+@@ -7762,14 +7762,16 @@ vectorizable_reduction (loop_vec_info loop_vinfo,
+       if (op.code == COND_EXPR)
+        {
+          /* Record how the non-reduction-def value of COND_EXPR is defined.  */
+-         if (dt == vect_constant_def)
++         if (reduc_chain_length != 1)
++           ;
++         else if (dt == vect_constant_def)
+            {
+              cond_reduc_dt = dt;
+              cond_reduc_val = op.ops[i];
+            }
+-         if (dt == vect_induction_def
+-             && def_stmt_info
+-             && is_nonwrapping_integer_induction (def_stmt_info, loop))
++         else if (dt == vect_induction_def
++                  && def_stmt_info
++                  && is_nonwrapping_integer_induction (def_stmt_info, loop))
+            {
+              cond_reduc_dt = dt;
+              cond_stmt_vinfo = def_stmt_info;
+
+
+I think it's latent even before the bisected rev.
+
+- User: Richard Biener | Time: 2024-02-22 09:48:48 UTC
+  Text: int __attribute__((noipa))
+foo (int *f, int n)
+{
+  int res = 0;
+  for (int i = 0; i < n; ++i)
+    {
+      if (f[2*i])
+        res = 2;
+      if (f[2*i+1])
+        res = -2;
+    }
+  return res;
+}
+
+int f[] = { 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 0 };
+
+int
+main ()
+{
+  if (foo (f, 16) != 2)
+    __builtin_abort ();
+  return 0;
+}
+
+- User: GCC Commits | Time: 2024-02-22 12:14:13 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:549f251f055e3a0b0084189a3012c4f15d635e75commitr14-9134-g549f251f055e3a0b0084189a3012c4f15d635e75Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Feb 22 10:50:12 2024 +0100
+
+    tree-optimization/114027 - conditional reduction chain
+    
+    When we classify a conditional reduction chain as CONST_COND_REDUCTION
+    we fail to verify all involved conditionals have the same constant.
+    That's a quite unlikely situation so the following simply disables
+    such classification when there's more than one reduction statement.PR tree-optimization/114027* tree-vect-loop.cc (vecctorizable_reduction): Use optimized
+            condition reduction classification only for single-element
+            chains.
+    
+            * gcc.dg/vect/pr114027.c: New testcase.
+
+- User: GCC Commits | Time: 2024-03-21 11:49:38 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:bd276b5340563182f7d95c383196fdd6fb7e6a1dcommitr13-8479-gbd276b5340563182f7d95c383196fdd6fb7e6a1dAuthor: Richard Biener <rguenther@suse.de>
+Date:   Thu Feb 22 10:50:12 2024 +0100
+
+    tree-optimization/114027 - conditional reduction chain
+    
+    When we classify a conditional reduction chain as CONST_COND_REDUCTION
+    we fail to verify all involved conditionals have the same constant.
+    That's a quite unlikely situation so the following simply disables
+    such classification when there's more than one reduction statement.PR tree-optimization/114027* tree-vect-loop.cc (vecctorizable_reduction): Use optimized
+            condition reduction classification only for single-element
+            chains.
+    
+            * gcc.dg/vect/pr114027.c: New testcase.
+    
+    (cherry picked from commit 549f251f055e3a0b0084189a3012c4f15d635e75)
+
+- User: chenglulu | Time: 2024-03-26 07:39:10 UTC
+  Text: (In reply to Richard Biener fromcomment #14)> int __attribute__((noipa))
+> foo (int *f, int n)
+> {
+>   int res = 0;
+>   for (int i = 0; i < n; ++i)
+>     {
+>       if (f[2*i])
+>         res = 2;
+>       if (f[2*i+1])
+>         res = -2;Sorry I have a problem, the array f has 16 elements, the value of n is 16, when the value of i is greater than 7, isn't it out of bounds to access f[2*i] and f[2*i+1]?
+
+- User: GCC Commits | Time: 2024-03-26 08:48:03 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:4470611e20f3217ee81647b01fda65b6a62229aacommitr14-9662-g4470611e20f3217ee81647b01fda65b6a62229aaAuthor: Richard Biener <rguenther@suse.de>
+Date:   Tue Mar 26 09:46:06 2024 +0100
+
+    tree-optimization/114027 - fix testcase
+    
+    The following fixes out-of-bounds read in the testcase.PR tree-optimization/114027* gcc.dg/vect/pr114027.c: Fix iteration count.
+
+- User: GCC Commits | Time: 2024-03-26 08:48:44 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:66090b8f438daff7b529f9adae0d6d5be7aa2a1fcommitr13-8497-g66090b8f438daff7b529f9adae0d6d5be7aa2a1fAuthor: Richard Biener <rguenther@suse.de>
+Date:   Tue Mar 26 09:46:06 2024 +0100
+
+    tree-optimization/114027 - fix testcase
+    
+    The following fixes out-of-bounds read in the testcase.PR tree-optimization/114027* gcc.dg/vect/pr114027.c: Fix iteration count.
+    
+    (cherry picked from commit 4470611e20f3217ee81647b01fda65b6a62229aa)
+
+- User: Richard Biener | Time: 2024-03-26 08:49:03 UTC
+  Text: Thanks for reporting.
+
+- User: GCC Commits | Time: 2024-05-16 09:56:30 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:6661a7c098a46eff4afc98b55c89e3a71d63d674commitr12-10450-g6661a7c098a46eff4afc98b55c89e3a71d63d674Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Feb 22 10:50:12 2024 +0100
+
+    tree-optimization/114027 - conditional reduction chain
+    
+    When we classify a conditional reduction chain as CONST_COND_REDUCTION
+    we fail to verify all involved conditionals have the same constant.
+    That's a quite unlikely situation so the following simply disables
+    such classification when there's more than one reduction statement.PR tree-optimization/114027* tree-vect-loop.cc (vecctorizable_reduction): Use optimized
+            condition reduction classification only for single-element
+            chains.
+    
+            * gcc.dg/vect/pr114027.c: New testcase.
+    
+    (cherry picked from commit 549f251f055e3a0b0084189a3012c4f15d635e75)
+
+- User: GCC Commits | Time: 2024-05-16 09:56:35 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:2d650c041d37a3df2bec46a67e42f9976d7fd2bfcommitr12-10451-g2d650c041d37a3df2bec46a67e42f9976d7fd2bfAuthor: Richard Biener <rguenther@suse.de>
+Date:   Tue Mar 26 09:46:06 2024 +0100
+
+    tree-optimization/114027 - fix testcase
+    
+    The following fixes out-of-bounds read in the testcase.PR tree-optimization/114027* gcc.dg/vect/pr114027.c: Fix iteration count.
+    
+    (cherry picked from commit 4470611e20f3217ee81647b01fda65b6a62229aa)
+
+- User: GCC Commits | Time: 2024-06-21 09:22:00 UTC
+  Text: The releases/gcc-11 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:b6a029286d5034d63063ae78f406ba677c37d015commitr11-11520-gb6a029286d5034d63063ae78f406ba677c37d015Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Feb 22 10:50:12 2024 +0100
+
+    tree-optimization/114027 - conditional reduction chain
+    
+    When we classify a conditional reduction chain as CONST_COND_REDUCTION
+    we fail to verify all involved conditionals have the same constant.
+    That's a quite unlikely situation so the following simply disables
+    such classification when there's more than one reduction statement.PR tree-optimization/114027* tree-vect-loop.c (vecctorizable_reduction): Use optimized
+            condition reduction classification only for single-element
+            chains.
+    
+            * gcc.dg/vect/pr114027.c: New testcase.
+    
+    (cherry picked from commit 549f251f055e3a0b0084189a3012c4f15d635e75)
+
+- User: GCC Commits | Time: 2024-06-21 09:22:05 UTC
+  Text: The releases/gcc-11 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:70ebb2ecbbcdfc40e0beff95dd11c9d678694888commitr11-11521-g70ebb2ecbbcdfc40e0beff95dd11c9d678694888Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Mar 26 09:46:06 2024 +0100
+
+    tree-optimization/114027 - fix testcase
+    
+    The following fixes out-of-bounds read in the testcase.PR tree-optimization/114027* gcc.dg/vect/pr114027.c: Fix iteration count.
+    
+    (cherry picked from commit 4470611e20f3217ee81647b01fda65b6a62229aa)
+
+- User: Richard Biener | Time: 2024-06-21 09:36:29 UTC
+  Text: Fixed.
+

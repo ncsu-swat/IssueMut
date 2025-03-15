@@ -1,0 +1,125 @@
+Bug Summary: [15 Regression] RISC-V rv64id_zba_zbkb ICE: could not split insn
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 14.1.0
+Known to Fail: 15.0
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-08-08 05:28:44 UTC
+  Text: Testcase:
+short a;
+long b;
+char c, d;
+void e(int f[][4][24][4], long g[][24][24][24]) {
+  for (unsigned h = 2;; h = 3)
+    for (long i = 0; i < 4; i = 5006368639)
+      for (int j = 0; j < 4; j = 4) {
+        for (long k = -4294967294; k < (c ?: f[0][2][6][j]); k += b)
+          a = g[k][j][0][h];
+        for (; f ? d : 0;)
+          ;
+      }
+}
+
+Command:> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/bin/riscv64-unknown-linux-gnu-gcc -O3 -march=rv64id_zba_zbkb -c -o /dev/null func.cfunc.c: In function 'e':
+func.c:13:1: error: could not split insn
+   13 | }
+      | ^
+(insn 78 136 137 (parallel [
+            (set (reg:DI 15 a5 [orig:196 _16 ] [196])
+                (plus:DI (ashift:DI (reg/v:DI 15 a5 [orig:138 h ] [138])
+                        (const_int 3 [0x3]))
+                    (const_int -474989022978048 [0xfffe500000036000])))
+            (clobber (reg:DI 12 a2 [213]))
+        ]) 466 {*riscv.md:4340}
+     (expr_list:REG_UNUSED (reg:DI 12 a2 [213])
+        (nil)))
+during RTL pass: final
+func.c:13:1: internal compiler error: in final_scan_insn_1, at final.cc:2807
+0x2de6365 internal_error(char const*, ...)
+        ../../../gcc/gcc/diagnostic-global-context.cc:491
+0xc50982 fancy_abort(char const*, int, char const*)
+        ../../../gcc/gcc/diagnostic.cc:1772
+0xae39b5 _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+        ../../../gcc/gcc/rtl-error.cc:108
+0xa70544 final_scan_insn_1
+        ../../../gcc/gcc/final.cc:2807
+0xf61b2f final_scan_insn(rtx_insn*, _IO_FILE*, int, int, int*)
+        ../../../gcc/gcc/final.cc:2886
+0xf61c1c final_1
+        ../../../gcc/gcc/final.cc:1977
+0xf627e8 rest_of_handle_final
+        ../../../gcc/gcc/final.cc:4239
+0xf627e8 execute
+        ../../../gcc/gcc/final.cc:4317
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+Godbolt:https://godbolt.org/z/9EM1fPKh7Found via fuzzer
+
+- User: Jeffrey A. Law | Time: 2024-08-10 00:13:15 UTC
+  Text: Mine.
+
+- User: Jeffrey A. Law | Time: 2024-08-10 14:24:05 UTC
+  Text: I haven't fully debugged, but I strongly suspect this is a case where matching is inconsistent before/after LRA due to the paths through the constant synthesis code which check if we can create new pseudos.  
+
+Furthermore, this will become a bigger problem once we sort through Raphael's constant synthesis improvements for !ZBKB since those improvements add at least  two more paths through the constant synthesis code which will be dependent upon the ability to allocate a scratch register.
+
+The improvement from the problem pattern is pretty marginal; it was supposed to help a case in xz and it did in the heavily reduced testcase.  But it didn't make a bit of difference in practice.  Additionally, I've never been terribly happy with how the pattern's condition works.  I need to ponder this a bit more, but one option is to simply get rid of this problem pattern.
+
+- User: Jeffrey A. Law | Time: 2024-08-12 16:45:21 UTC
+  Text: So yes, this is a problem with the const costing giving two different answers at different times.  That in turn causes the relevant pattern to match at one point and fail to match at another.
+
+It's a bit of a tangled web, but I think I've got it sorted out and I'm doing internal testing of a patch now.
+
+As I mentioned earlier I think this will also affect Raphael's recent submission, though in a very minor way.  There's other questions to work through with that submission, but it is worth noting.
+
+- User: GCC Commits | Time: 2024-08-17 16:11:43 UTC
+  Text: The master branch has been updated by Jeff Law <law@gcc.gnu.org>:https://gcc.gnu.org/g:7aed8dedeb9613925930447bf2457c3fd9972d91commitr15-2971-g7aed8dedeb9613925930447bf2457c3fd9972d91Author: Jeff Law <jlaw@ventanamicro.com>
+Date:   Sat Aug 17 09:52:55 2024 -0600
+
+    [RISC-V][PR target/116282] Stabilize pattern conditions
+    
+    So as expected the core problem with target/116282 is that the cost of certain
+    constant synthesis cases varied depending on whether or not we're allowed to
+    generate new pseudos or not.
+    
+    That in turn meant that in obscure cases an insn might change from recognizable
+    to unrecognizable and triggers the observed failure.
+    
+    So we need to keep the cost stable, at least when called from a pattern's
+    condition.  So we pass another boolean down when necessary. I've tried to keep
+    API fallout minimized.
+    
+    Built and tested  on rv32 in my tester.  Let's see what pre-commit testing has
+    to say though ð
+    
+    Note this will also require a minor change to the in-flight constant synthesis
+    work.PR target/116282gcc/
+            * config/riscv/riscv-protos.h (riscv_const_insns): Add new argument.
+            * config/riscv/riscv.cc (riscv_build_integer): Add new argument
+            ALLOW_NEW_PSEUDOS.  Pass it down to recursive calls and check it
+            before using synthesis which allows new registers to be created.
+            (riscv_split_integer_cost): Pass new argument to riscv_build_integer.
+            (riscv_integer_cost): Add ALLOW_NEW_PSEUDOS argument, pass it down to
+            riscv_build_integer.
+            (riscv_legitimate_constant_p): Pass new argument to riscv_const_insns.
+            (riscv_const_insns): New argment ALLOW_NEW_PSEUDOS.  Pass it down to
+            riscv_integer_cost and riscv_const_insns.
+            (riscv_split_const_insns): Pass new argument to riscv_const_insns.
+            (riscv_move_integer, riscv_rtx_costs): Similarly.
+            * config/riscv/riscv.md (shadd with costly constant): Pass new argument
+            to riscv_const_insns.
+            * config/riscv/bitmanip.md (and with costly constant): Pass new argument
+            to riscv_const_insns.
+    
+    gcc/testsuite/
+            * gcc.target/riscv/pr116282.c: New test.
+
+- User: Jeffrey A. Law | Time: 2024-08-17 16:12:47 UTC
+  Text: Fixed on the trunk.
+

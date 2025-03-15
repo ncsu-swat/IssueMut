@@ -1,0 +1,252 @@
+Bug Summary: [13/14/15 Regression] [loongarch -O1] ICE: maximum number of generated reload insns per insn achieved (90)
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code, inline-asm
+Known to Work: 12.1.0
+Known to Fail: 13.2.0, 14.1.0
+
+Comments:
+- User: chenglulu | Time: 2024-07-02 12:40:14 UTC
+  Text: [loongarch -O1] ICE: maximum number of generated reload insns per insn achieved (90)
+
+- User: chenglulu | Time: 2024-07-02 12:43:12 UTC
+  Text: test.c
+
+extern long double test1 (long double);
+extern long double test2 (long double);
+
+long double
+__ieee754_y1l (long double x, long double xx,
+	       long double z, long double p)
+{
+  if (xx <= 2)
+    {
+      __asm ("" : "+f"(x));
+      p = test1 (x) * test2 (x) + p;
+      return p;
+    }
+  return z;
+}
+
+$ gcc/cc1 test.c -o - -O1
+	.file	"test.c"
+ __ieee754_y1l
+Analyzing compilation unit
+Performing interprocedural optimizations
+ <*free_lang_data> {heap 908k} <visibility> {heap 908k} <build_ssa_passes> {heap 908k} <opt_local_passes> {heap 1180k} <remove_symbols> {heap 1784k} <targetclone> {heap 1784k} <free-fnsummary> {heap 1784k}Streaming LTO
+ <whole-program> {heap 1784k} <profile_estimate> {heap 1784k} <fnsummary> {heap 1784k} <inline> {heap 1784k} <pure-const> {heap 1784k} <modref> {heap 1784k} <free-fnsummary> {heap 1784k} <static-var> {heap 1784k} <single-use> {heap 1784k} <comdats> {heap 1784k}	.text
+Assembling functions:
+ __ieee754_y1lduring RTL pass: reload
+
+test.c: In function '__ieee754_y1l':
+test.c:16:1: internal compiler error: maximum number of generated reload insns per insn achieved (90)
+   16 | }
+      | ^
+0x11d5abd lra_constraints(bool)
+	/home/chenglulu/work/loongisa-toolchain/new_toolchain/src/gcc-upstream-test/gcc/lra-constraints.cc:5402
+0x11bf43f lra(_IO_FILE*, int)
+	/home/chenglulu/work/loongisa-toolchain/new_toolchain/src/gcc-upstream-test/gcc/lra.cc:2442
+0x116c862 do_reload
+	/home/chenglulu/work/loongisa-toolchain/new_toolchain/src/gcc-upstream-test/gcc/ira.cc:5973
+0x116cd16 execute
+	/home/chenglulu/work/loongisa-toolchain/new_toolchain/src/gcc-upstream-test/gcc/ira.cc:6161
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: chenglulu | Time: 2024-07-02 12:49:11 UTC
+  Text: I have one place that I don't understand, and the description of the TARGET_HARD_REGNO_MODE_OK is as follows:
+
+This hook returns true if it is permissible to store a value of mode mode in hard
+register number regno (or in several registers starting with that one). The default definition returns true unconditionally.
+
+On LA, if mode is TFmode and regno is the number of the floating-point register, can this hook return true, or must it return false?
+
+- User: Xi Ruoyao | Time: 2024-07-03 10:49:21 UTC
+  Text: I found some "interesting" thing in alpha.md:
+
+;; Subregs suck for register allocation.  Pretend we can move TFmode
+;; data between general registers until after reload.
+;; ??? Is this still true now that we have the lower-subreg pass?
+
+(define_expand "movtf"
+  [(set (match_operand:TF 0 "nonimmediate_operand")
+    (match_operand:TF 1 "general_operand"))]
+  ""
+{
+  if (MEM_P (operands[0])
+      && ! reg_or_0_operand (operands[1], TFmode))
+    operands[1] = force_reg (TFmode, operands[1]);
+})
+
+Do we need this?  But it really sucks anyway.
+
+- User: Xi Ruoyao | Time: 2024-07-03 11:54:49 UTC
+  Text: Reduced more:
+
+long double
+test (long double xx)
+{
+   __asm ("" :: "f"(xx));
+   return xx + 1;
+}
+
+and this one fails at -O2 & -O3 too.
+
+- User: Xi Ruoyao | Time: 2024-07-03 12:21:42 UTC
+  Text: Interestingly, not happening with 12.
+
+- User: chenglulu | Time: 2024-07-03 12:33:33 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #5)> Interestingly, not happening with 12.Error fromr15-1765,but I think there should have been a problem, it just didn't come out.
+
+- User: chenglulu | Time: 2024-07-03 12:36:03 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #4)> Reduced more:
+> 
+> long double
+> test (long double xx)
+> {
+>    __asm ("" :: "f"(xx));
+>    return xx + 1;
+> }
+> 
+> and this one fails at -O2 & -O3 too.I'm not sure if this should be an error or not...
+
+- User: Xi Ruoyao | Time: 2024-07-03 13:12:50 UTC
+  Text: Started fromr13-1834(which removed movtf).
+
+- User: Xi Ruoyao | Time: 2024-07-03 13:17:41 UTC
+  Text: (In reply to chenglulu fromcomment #2)> On LA, if mode is TFmode and regno is the number of the floating-point
+> register, can this hook return true, or must it return false?To me it can return true, but there's a different question "do we want it return true?".  I cannot see a benefit to store TFmode into a pair of FPRs anyway...
+
+Maybe we need to exclude the last FPR (??) but even if I exclude the last FPR the ICE still triggers.
+
+- User: chenglulu | Time: 2024-07-03 13:24:27 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #9)> (In reply to chenglulu fromcomment #2)
+> 
+> > On LA, if mode is TFmode and regno is the number of the floating-point
+> > register, can this hook return true, or must it return false?
+> 
+> To me it can return true, but there's a different question "do we want it
+> return true?".  I cannot see a benefit to store TFmode into a pair of FPRs
+> anyway...
+> 
+> Maybe we need to exclude the last FPR (??) but even if I exclude the last
+> FPR the ICE still triggers.I think the same way, for TF type calculations are simulated by soft floating-point, so putting two fixed-point registers is probably what we want
+
+- User: chenglulu | Time: 2024-07-03 13:27:05 UTC
+  Text: (In reply to chenglulu fromcomment #7)> (In reply to Xi Ruoyao fromcomment #4)
+> > Reduced more:
+> > 
+> > long double
+> > test (long double xx)
+> > {
+> >    __asm ("" :: "f"(xx));
+> >    return xx + 1;
+> > }
+> > 
+> > and this one fails at -O2 & -O3 too.
+> 
+> I'm not sure if this should be an error or not...So for such an inline assembly, we prefer a compiler output type mismatch error, similar to riscv？
+
+- User: Xi Ruoyao | Time: 2024-07-03 13:42:27 UTC
+  Text: (In reply to chenglulu fromcomment #11)> (In reply to chenglulu fromcomment #7)
+> > (In reply to Xi Ruoyao fromcomment #4)
+> > > Reduced more:
+> > > 
+> > > long double
+> > > test (long double xx)
+> > > {
+> > >    __asm ("" :: "f"(xx));
+> > >    return xx + 1;
+> > > }
+> > > 
+> > > and this one fails at -O2 & -O3 too.
+> > 
+> > I'm not sure if this should be an error or not...
+> 
+> So for such an inline assembly, we prefer a compiler output type mismatch
+> error, similar to riscv？I agree.  But I'm slightly concerned if the ICE will pop out again in some cases using a pair of GPR for TFmode or TImode (I cannot see a difference...)
+
+- User: chenglulu | Time: 2024-07-03 14:30:44 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #12)> (In reply to chenglulu fromcomment #11)
+> > (In reply to chenglulu fromcomment #7)
+> > > (In reply to Xi Ruoyao fromcomment #4)
+> > > > Reduced more:
+> > > > 
+> > > > long double
+> > > > test (long double xx)
+> > > > {
+> > > >    __asm ("" :: "f"(xx));
+> > > >    return xx + 1;
+> > > > }
+> > > > 
+> > > > and this one fails at -O2 & -O3 too.
+> > > 
+> > > I'm not sure if this should be an error or not...
+> > 
+> > So for such an inline assembly, we prefer a compiler output type mismatch
+> > error, similar to riscv？
+> 
+> I agree.  But I'm slightly concerned if the ICE will pop out again in some
+> cases using a pair of GPR for TFmode or TImode (I cannot see a difference...)TI has been deleted by me, so just let TARGET_HARD_REGNO_OK(TFmode, fpreg) return false here and it should be no problem.
+
+- User: GCC Commits | Time: 2024-07-12 02:26:23 UTC
+  Text: The master branch has been updated by LuluCheng <chenglulu@gcc.gnu.org>:https://gcc.gnu.org/g:abeb6c8a62758faa0719e818e6e8a7db15a6793bcommitr15-1986-gabeb6c8a62758faa0719e818e6e8a7db15a6793bAuthor: Lulu Cheng <chenglulu@loongson.cn>
+Date:   Thu Jul 4 10:37:26 2024 +0800
+
+    LoongArch: TFmode is not allowed to be stored in the float register.PR target/115752gcc/ChangeLog:
+    
+            * config/loongarch/loongarch.cc
+            (loongarch_hard_regno_mode_ok_uncached): Replace
+            UNITS_PER_FPVALUE with UNITS_PER_HWFPVALUE.
+            * config/loongarch/loongarch.h (UNITS_PER_FPVALUE): Delete.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/loongarch/pr115752.c: New test.
+
+- User: chenglulu | Time: 2024-07-12 02:28:46 UTC
+  Text: Resolved.
+
+- User: Xi Ruoyao | Time: 2024-07-12 02:30:42 UTC
+  Text: Should we do a backport to 13 and 14?
+
+- User: chenglulu | Time: 2024-07-12 02:41:20 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #16)> Should we do a backport to 13 and 14?Yes, I'm doing test.
+
+- User: GCC Commits | Time: 2024-07-13 06:06:54 UTC
+  Text: The releases/gcc-14 branch has been updated by LuluCheng <chenglulu@gcc.gnu.org>:https://gcc.gnu.org/g:89f9342980b7976f98ba43fac6a64a7a2214b6e6commitr14-10417-g89f9342980b7976f98ba43fac6a64a7a2214b6e6Author: Lulu Cheng <chenglulu@loongson.cn>
+Date:   Thu Jul 4 10:37:26 2024 +0800
+
+    LoongArch: TFmode is not allowed to be stored in the float register.PR target/115752gcc/ChangeLog:
+    
+            * config/loongarch/loongarch.cc
+            (loongarch_hard_regno_mode_ok_uncached): Replace
+            UNITS_PER_FPVALUE with UNITS_PER_HWFPVALUE.
+            * config/loongarch/loongarch.h (UNITS_PER_FPVALUE): Delete.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/loongarch/pr115752.c: New test.
+    
+    (cherry picked from commit abeb6c8a62758faa0719e818e6e8a7db15a6793b)
+
+- User: GCC Commits | Time: 2024-07-13 06:08:32 UTC
+  Text: The releases/gcc-13 branch has been updated by LuluCheng <chenglulu@gcc.gnu.org>:https://gcc.gnu.org/g:616c3290785c204b3019e7aaff8a7d9bb425d336commitr13-8910-g616c3290785c204b3019e7aaff8a7d9bb425d336Author: Lulu Cheng <chenglulu@loongson.cn>
+Date:   Thu Jul 4 10:37:26 2024 +0800
+
+    LoongArch: TFmode is not allowed to be stored in the float register.PR target/115752gcc/ChangeLog:
+    
+            * config/loongarch/loongarch.cc
+            (loongarch_hard_regno_mode_ok_uncached): Replace
+            UNITS_PER_FPVALUE with UNITS_PER_HWFPVALUE.
+            * config/loongarch/loongarch.h (UNITS_PER_FPVALUE): Delete.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/loongarch/pr115752.c: New test.
+    
+    (cherry picked from commit abeb6c8a62758faa0719e818e6e8a7db15a6793b)
+

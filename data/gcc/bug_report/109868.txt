@@ -1,0 +1,255 @@
+Bug Summary: [13/14 regression] ICE: segmentation fault or ICE in min_value with zero sized bitfield
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 12.3.0
+Known to Fail: 13.1.0, 14.0
+
+Comments:
+- User: Sam James | Time: 2023-05-15 22:37:09 UTC
+  Text: I originally reported this athttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=109806#c12.
+
+For me, this crashes on x86_64-gentoo-linux-musl:
+```
+struct SimpleRefCounted {
+  virtual void addRef();
+};
+struct timespec {
+  long tv_nsec;
+  int : 0;
+};
+struct ClockImpl : SimpleRefCounted {
+  timespec _startTime;
+};
+struct Clock {
+  Clock();
+};
+Clock::Clock() { ClockImpl(); }
+```
+
+with:
+```
+# g++ /tmp/foo.cxx -O2 -wrapper valgrind
+==1239523== Memcheck, a memory error detector
+==1239523== Copyright (C) 2002-2022, and GNU GPL'd, by Julian Seward et al.
+==1239523== Using Valgrind-3.21.0 and LibVEX; rerun with -h for copyright info
+==1239523== Command: /usr/libexec/gcc/x86_64-gentoo-linux-musl/13/cc1plus -quiet -D_GNU_SOURCE /tmp/foo.cxx -quiet -dumpdir a- -dumpbase foo.cxx -dumpbase-ext .cxx -mtune=generic -march=x86-64 -O2 -fcf-protection -o /tmp/ccigHfiN.s
+==1239523==
+==1239523== Invalid read of size 1
+==1239523==    at 0x97844C: to_wide (tree.h:6257)
+==1239523==    by 0x97844C: irange::set_varying(tree_node*) (value-range.h:959)
+==1239523==    by 0x10C1A45: range_query::get_tree_range(vrange&, tree_node*, gimple*) (value-query.cc:252)
+==1239523==    by 0x1B52256: gimple_ranger::range_of_stmt(vrange&, gimple*, tree_node*) (gimple-range.cc:298)
+==1239523==    by 0x1B52778: gimple_ranger::register_inferred_ranges(gimple*) (gimple-range.cc:474)
+==1239523==    by 0x109FB19: rvrp_folder::fold_stmt(gimple_stmt_iterator*) (tree-vrp.cc:1079)
+==1239523==    by 0xFA9ED3: substitute_and_fold_dom_walker::before_dom_children(basic_block_def*) (tree-ssa-propagate.cc:848)
+==1239523==    by 0x1B24C2E: dom_walker::walk(basic_block_def*) (domwalk.cc:311)
+==1239523==    by 0xFA9312: substitute_and_fold_engine::substitute_and_fold(basic_block_def*) (tree-ssa-propagate.cc:971)
+==1239523==    by 0x109DB80: execute_ranger_vrp(function*, bool, bool) (tree-vrp.cc:1107)
+==1239523==    by 0xD3A0EA: execute_one_pass(opt_pass*) (passes.cc:2651)
+==1239523==    by 0xD3A9AF: execute_pass_list_1(opt_pass*) (passes.cc:2760)
+==1239523==    by 0xD3A9C1: execute_pass_list_1(opt_pass*) (passes.cc:2761)
+==1239523==  Address 0x4 is not stack'd, malloc'd or (recently) free'd
+==1239523==
+during GIMPLE pass: evrp
+/tmp/foo.cxx: In constructor 'Clock::Clock()':
+/tmp/foo.cxx:14:31: internal compiler error: Segmentation fault
+   14 | Clock::Clock() { ClockImpl(); }
+      |                               ^
+
+0xe10df3 crash_signal
+        /usr/src/debug/sys-devel/gcc-13.1.1_p20230513/gcc-13-20230513/gcc/toplev.cc:314
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://bugs.gentoo.org/> for instructions.
+```
+
+It crashes without valgrind too, just less informative.
+
+- User: Sam James | Time: 2023-05-15 22:40:40 UTC
+  Text: Createdattachment 55088[details]clock.ii.orig
+
+- User: Sam James | Time: 2023-05-15 22:40:54 UTC
+  Text: Createdattachment 55089[details]clock.ii (reduced)
+
+- User: Andrew Pinski | Time: 2023-05-15 22:43:16 UTC
+  Text: Confirmed. I can reproduce it also on normal x86_64-linux-gnu and aarch64-linux-gnu even.
+
+- User: Andrew Pinski | Time: 2023-05-15 22:45:35 UTC
+  Text: Hmm:
+  D.2948._startTime.D.2792 = 0;
+
+That seems wrong.
+
+Reduced further:
+```
+struct SimpleRefCounted {
+  virtual void addRef();
+};
+struct ClockImpl : SimpleRefCounted {
+  long tv_nsec;
+  int : 0;
+};
+void f() { ClockImpl b{}; }
+```
+And yes it is the zero sized bitfield causing issues ...
+
+- User: Andrew Pinski | Time: 2023-05-15 22:52:26 UTC
+  Text: A little more reduced:
+```
+struct ClockImpl  {
+  virtual void addRef();
+  long tv_nsec;
+  int : 0;
+};
+void f() { ClockImpl b{}; }
+```
+
+So maybe this is a gimplifier issue producing the assignment to the zero-sized bitfield:
+
+      b.D.2780 = 0;
+
+What is interesting is GCC 11 didn't produce the assignment but GCC 12 does.
+That might have been caused byr12-1150-g34aae6b561871d. I will look into it soon because we should not be emitting an assignment here ...
+
+- User: Andrew Pinski | Time: 2023-05-15 22:53:49 UTC
+  Text: Seehttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=109806#c15.
+
+- User: Jakub Jelinek | Time: 2023-05-15 22:55:04 UTC
+  Text: I'll have a look tomorrow^H^H^H^H^Hlater today.
+
+- User: Andrew Pinski | Time: 2023-05-15 23:02:35 UTC
+  Text: (In reply to Andrew Pinski fromcomment #5)> That might have been caused byr12-1150-g34aae6b561871d. I will look into
+> it soon because we should not be emitting an assignment here ...Yes it was introduced by that revision, specifically the change of zero_sized_field_decl to is_empty_type. We checked the DECL_SIZE being zero but now we check the size of type being empty but is_empty_type is not considered true for bitfield types of size 0 ...
+
+- User: Jakub Jelinek | Time: 2023-05-15 23:02:44 UTC
+  Text: The ICE started withr13-436-gaf34279921f4bb95b07c0bebut the undesirable store is
+there already sincer12-2975-g32c3a75390623a0470df52.
+
+- User: Sam James | Time: 2023-05-15 23:06:15 UTC
+  Text: fwiw, on glibc, I don't get the oob read w/ valgrind but still the ICE as you've already found.
+
+- User: Andrew Pinski | Time: 2023-05-16 00:13:34 UTC
+  Text: Createdattachment 55090[details]Patch which I came up with
+
+This patch adds back zero_sized_field_decl but keeps the call to is_empty_type too.
+
+- User: Andrew Pinski | Time: 2023-05-16 00:15:13 UTC
+  Text: Jakub, assign this to me if you think we should go down that route unless you want to take the patch further.
+
+- User: Sam James | Time: 2023-05-16 04:25:50 UTC
+  Text: the OOB read seems to go away with --enable-checking=yes,rtl,extra (previously had --enable-checking=release)...? (at least for 13)
+
+- User: Jakub Jelinek | Time: 2023-05-16 08:13:47 UTC
+  Text: Createdattachment 55092[details]gcc14-pr109868.patch
+
+I think the FE shouldn't initialize those, rather than gimplifier fixing it up later.
+In fact, I think we shouldn't initialize any unnamed bitfields, but am not changing that, because zero initialization is supposed to clear all padding bytes and !CONSTRUCTOR_NO_CLEARING certainly doesn't guarantee that in the
+middle-end, I think we need some other CONSTRUCTOR flag and middle-end assurance
+that the padding bits are then cleared.
+
+- User: Andrew Pinski | Time: 2023-05-16 15:47:39 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #14)> Createdattachment 55092[details]> gcc14-pr109868.patch
+> 
+> I think the FE shouldn't initialize those, rather than gimplifier fixing it
+> up later.
+> In fact, I think we shouldn't initialize any unnamed bitfields, but am not
+> changing that, because zero initialization is supposed to clear all padding
+> bytes and !CONSTRUCTOR_NO_CLEARING certainly doesn't guarantee that in the
+> middle-end, I think we need some other CONSTRUCTOR flag and middle-end
+> assurance
+> that the padding bits are then cleared.Yes this looks better.
+
+- User: GCC Commits | Time: 2023-05-17 08:16:45 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:78327cf06e6b65fc9c614622c98f6a3f3bfb7784commitr14-927-g78327cf06e6b65fc9c614622c98f6a3f3bfb7784Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 17 10:15:50 2023 +0200
+
+    c++: Don't try to initialize zero width bitfields in zero initialization [PR109868]
+    
+    My GCC 12 change to avoid removing zero-sized bitfields as they are
+    important for ABI and are needed for layout compatibility traits
+    apparently causes zero sized bitfields to be initialized in the IL,
+    which at least in 13+ results in ICEs in the ranger which is upset
+    about zero precision types.
+    
+    I think we could even avoid initializing other unnamed bitfields, but
+    unfortunately !CONSTRUCTOR_NO_CLEARING doesn't mean in the middle-end
+    clearing of padding bits and until we have some new flag that represents
+    the request to clear padding bits, I think it is better to keep zeroing
+    non-zero sized unnamed bitfields.
+    
+    In addition to skipping those fields, I have changed the logic how
+    UNION_TYPEs are handled, the current code was a little bit weird in that
+    e.g. if first non-static data member had error_mark_node type, we'd happily
+    zero initialize the second non-static data member, etc.
+    
+    2023-05-17  Jakub Jelinek  <jakub@redhat.com>PR c++/109868* init.cc (build_zero_init_1): Don't initialize zero-width bitfields.
+            For unions only initialize the first FIELD_DECL.
+    
+            * g++.dg/init/pr109868.C: New test.
+
+- User: GCC Commits | Time: 2023-05-17 19:27:17 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:72225ff27217b1a060a24d80cb21bdc1e583ef26commitr13-7339-g72225ff27217b1a060a24d80cb21bdc1e583ef26Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 17 10:15:50 2023 +0200
+
+    c++: Don't try to initialize zero width bitfields in zero initialization [PR109868]
+    
+    My GCC 12 change to avoid removing zero-sized bitfields as they are
+    important for ABI and are needed for layout compatibility traits
+    apparently causes zero sized bitfields to be initialized in the IL,
+    which at least in 13+ results in ICEs in the ranger which is upset
+    about zero precision types.
+    
+    I think we could even avoid initializing other unnamed bitfields, but
+    unfortunately !CONSTRUCTOR_NO_CLEARING doesn't mean in the middle-end
+    clearing of padding bits and until we have some new flag that represents
+    the request to clear padding bits, I think it is better to keep zeroing
+    non-zero sized unnamed bitfields.
+    
+    In addition to skipping those fields, I have changed the logic how
+    UNION_TYPEs are handled, the current code was a little bit weird in that
+    e.g. if first non-static data member had error_mark_node type, we'd happily
+    zero initialize the second non-static data member, etc.
+    
+    2023-05-17  Jakub Jelinek  <jakub@redhat.com>PR c++/109868* init.cc (build_zero_init_1): Don't initialize zero-width bitfields.
+            For unions only initialize the first FIELD_DECL.
+    
+            * g++.dg/init/pr109868.C: New test.
+    
+    (cherry picked from commit 78327cf06e6b65fc9c614622c98f6a3f3bfb7784)
+
+- User: Jakub Jelinek | Time: 2023-05-17 19:28:34 UTC
+  Text: Fixed.
+
+- User: GCC Commits | Time: 2023-05-17 19:32:38 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:8618aed89650bbeec450191aecab3037124851b1commitr12-9543-g8618aed89650bbeec450191aecab3037124851b1Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed May 17 10:15:50 2023 +0200
+
+    c++: Don't try to initialize zero width bitfields in zero initialization [PR109868]
+    
+    My GCC 12 change to avoid removing zero-sized bitfields as they are
+    important for ABI and are needed for layout compatibility traits
+    apparently causes zero sized bitfields to be initialized in the IL,
+    which at least in 13+ results in ICEs in the ranger which is upset
+    about zero precision types.
+    
+    I think we could even avoid initializing other unnamed bitfields, but
+    unfortunately !CONSTRUCTOR_NO_CLEARING doesn't mean in the middle-end
+    clearing of padding bits and until we have some new flag that represents
+    the request to clear padding bits, I think it is better to keep zeroing
+    non-zero sized unnamed bitfields.
+    
+    In addition to skipping those fields, I have changed the logic how
+    UNION_TYPEs are handled, the current code was a little bit weird in that
+    e.g. if first non-static data member had error_mark_node type, we'd happily
+    zero initialize the second non-static data member, etc.
+    
+    2023-05-17  Jakub Jelinek  <jakub@redhat.com>PR c++/109868* init.cc (build_zero_init_1): Don't initialize zero-width bitfields.
+            For unions only initialize the first FIELD_DECL.
+    
+            * g++.dg/init/pr109868.C: New test.
+    
+    (cherry picked from commit 78327cf06e6b65fc9c614622c98f6a3f3bfb7784)
+

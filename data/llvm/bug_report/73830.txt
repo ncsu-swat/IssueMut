@@ -1,0 +1,119 @@
+Issue Title: `MallocChecker::MallocMemAux()` uses `State::BindExpr` in a `PostCall` callback
+Original Post: During the review of https://github.com/llvm/llvm-project/pull/72402 we discussed that `MallocChecker` is using `State::BindExpr` to assign `SVal`s to some call expressions within `checkPostCall` callbacks. This breaks the invariant that `BindExpr` should only be used within `evalCall` callbacks (where we won't assign contradicting values because it's guaranteed that only one evaluation will happen). I don't know about any concrete bugs that are caused by this invariant break, but it adds another complication to the already huge codebase of `MallocChecker`, so we should clean this up. 
+
+I tried to create a quick fix commit, but it turns out that `BindExpr` is called in a helper function named `MallocMemAux` which is called from ~20 different locations, so instead of doing this immediately, I'm creating this ticket to track this issue. I may resolve this ticket if I have free time, but I don't have a concrete schedule for it and I'm not opposed to someone else doing it (in fact, I'd be grateful for it).
+
+Also note that while the implementation of `MallocMemAux` claims that
+```
+// Bind the return value to the symbolic value from the heap region.     
+// TODO: We could rewrite post visit to eval call; 'malloc' does not have
+// side effects other than what we model here.                           
+```
+it is not limited to plain 'malloc' or other library functions: if a function is annotated with a "returns ownership" annotation, then the`checkPostCall` callback may use `MallocMemAux` to `BindExpr` a return value to its call.
+
+However, the consequences of this invariant-breaking binding is limited by that `MallocChecker::checkPostCall` starts with the early return statement `if (C.wasInlined) return;` -- so at least it doesn't assign values to functions that were inlined.
+
+
+Comment by llvmbot: 
+@llvm/issue-subscribers-clang-static-analyzer
+
+Author: None (DonatNagyE)
+
+<details>
+During the review of https://github.com/llvm/llvm-project/pull/72402 we discussed that `MallocChecker` is using `State::BindExpr` to assign `SVal`s to some call expressions within `checkPostCall` callbacks. This breaks the invariant that `BindExpr` should only be used within `evalCall` callbacks (where we won't assign contradicting values because it's guaranteed that only one evaluation will happen). I don't know about any concrete bugs that are caused by this invariant break, but it adds another complication to the already huge codebase of `MallocChecker`, so we should clean this up. 
+
+I tried to create a quick fix commit, but it turns out that `BindExpr` is called in a helper function named `MallocMemAux` which is called from ~20 different locations, so instead of doing this immediately, I'm creating this ticket to track this issue. I may resolve this ticket if I have free time, but I don't have a concrete schedule for it and I'm not opposed to someone else doing it (in fact, I'd be grateful for it).
+
+Also note that while the implementation of `MallocMemAux` claims that
+```
+// Bind the return value to the symbolic value from the heap region.     
+// TODO: We could rewrite post visit to eval call; 'malloc' does not have
+// side effects other than what we model here.                           
+```
+it is not limited to plain 'malloc' or other library functions: if a function is annotated with a "returns ownership" annotation, then the`checkPostCall` callback may use `MallocMemAux` to `BindExpr` a return value to its call.
+
+However, the consequences of this invariant-breaking binding is limited by that `MallocChecker::checkPostCall` starts with the early return statement `if (C.wasInlined) return;` -- so at least it doesn't assign values to functions that were inlined.
+
+</details>
+
+Comment by pskrgag: I guess, I met this problem in real life.
+
+My current problem is that `MallocChecker`  ignores `ownership_returns`  for inlined functions (we have specific bump allocator, which is header-only library). 
+
+I've tried to sit down and move `checkPreCall` to `evalC`all, but I found problem I don't know how to solve: `getLine`  is evaluated in 2 checkers: `MallocChecker`  and `StreamChecker`.  I don't really know how to solve it....
+
+I have a draft here https://github.com/pskrgag/llvm-project/commit/24e8e732a6269c0e4465099ba386df3c6d482e1e (some tests still fails, but anyway)
+Comment by NagyDonat: I looked at your draft and it looks very promising. Thanks for going through that bloated source file and propagating the necessary extra information to all the functions!
+
+If you open a pull request for this change, I'd be happy to help with reviewing it. (I will probably have several small nitpicks, but I don't expect any major issues.)
+
+As a generic architectural remark, I note that you can probably migrate all of the `postCall` callback into the newly created `evalCall`, because I don't think that there is a reason to keep those parts separate. (However, this would be just a reduction of code complexity, I don't think that the separate `postCall` would introduce any problematic behavior.)
+
+> I found problem I don't know how to solve: getLine is evaluated in 2 checkers: MallocChecker and StreamChecker. I don't really know how to solve it....
+
+I checked the code of StreamChecker and it seems that it doesn't _need_ to evaluate `getline()`: most of its `getline()`-specific logic should belong to a `postCall` callback (instead of the current `evalCall`).
+
+In practical terms, there are three differences between `evalCall` (= "we are running this function right now") and `postCall` (= "this function was executed recently"):
+1. activating more than one `evalCall` is an error; while there may be multiple `postCall()` callbacks;
+2. calling `BindExpr()` in a `postCall` is problematic (e.g. it may happen that `postCall` callback thinks that a function call returned symbol $X$, then a second `postCall` callback rebinds the return value to a different symbol $Y$, and the information stored about $X$ is left dangling);
+3. if there is no `evalCall` callback and the source code of the function is not visible, the engine will do a conservative evaluation (`ExprEngine::conservativeEvalCall()`), which (A) binds a generic placeholder to the return value and also (B) invalidates the information (e.g. values stored in globals) which might have been overwritten by the called opaque function. 
+
+In MallocChecker we _need_ to run our own `evalCall` to replace part (A) of the conservative evaluation with our specific logic that creates a `SymbolicRegion` on the heap (or an `AllocaRegion`), because the generic placeholder return value cannot be modified in a way that would record this information.
+
+On the other hand, StreamChecker only runs its own `evalCall` because it wants to avoid part (B) of the conservative evaluation (that is, it records that the standard stream functions don't pollute arbitrary memory locations). Its actual `BindExpr` call basically duplicates part (A) of the default evaluation logic.
+
+To resolve this issue, I'd probably
+- move most of StreamChecker's `evalCall` logic into a `postCall` callback,
+- introduce a new `evalSideEffects` callback, which will be called by the conservative evaluation routine to potentially replace part (B). StreamChecker will be able to use this new callback to prevent the unnecessary invalidation without interfering with an `evalCall` callback.
+
+On the next week (≈ aug 12-14), I'll try to create a PR that implements the callback `evalSideEffects` (name may change) and refactors StreamChecker.
+
+EDIT: I edited this comment because my remarks about the different kinds of evaluation were inaccurate (I wrote about "default evaluation" when I meant "conservative evaluation"). To clarify any lingering confusion, I'm summarizing the function evaluation logic here:
+- (1) `CheckerManager::runCheckersForEvalCall` tries to find an `evalCall` callback of some checker which recognizes it,
+- (2) otherwise, `ExprEngine::defaultEvalCall` tries to "inline" it and analyze the source code (if it's available and not too complex)
+- (3) otherwise, it will be handled by `ExprEngine::conservativeEvalCall` which (A) binds a symbol to the return value and (B) invalidates the regions which might have been modified by the call.
+
+Comment by pskrgag: Thank you so much for detailed expiation! Now semantics of `evalCall` and friends is a way cleaner for me.
+
+I am planning to come back to `MallocChecker` refactoring at the middle of the  week (~14-15 aug) and will open a pr Thanks for initial review!
+Comment by NagyDonat: As started to work on implementing the plan that I proposed, I had several alternative ideas that seem to be better than the one that I proposed on Friday.
+
+I described these potential plans [in a discourse write-up](https://discourse.llvm.org/t/preventing-invalidation-and-fallback-evalcall-callbacks/80674) and asked for the opinions of the code owners and other relevant developers. (If there are no strong opinions about the issue, I'll start to implement one of the plans that I listed, probably (B).)
+Comment by pskrgag: Oh, I found another problem... (Maybe I just miss some API). 
+
+While all checks was in `checkPostCall`, it was possible to skip inlined functions and process them as normal. If we move to `evalCall` then `C.wasInlined` does not work and we assume function behave as they should (which may be not the case).
+
+I think, previous behavior does make sense, since in freestanding environment, POSIX functions may have different meaning, but with `evalCall`  its no longer possible.
+Comment by NagyDonat: > I think, previous behavior does make sense, since in freestanding environment, POSIX functions may have different meaning, but with evalCall its no longer possible.
+
+Even in a freestanding environment where the source code of `malloc` is part of the project
+1. we can only inline `malloc` if either it's in the current translation unit or the user enabled the (off-by-default) cross-translation-unit ("CTU") analysis; and
+2. the implementation of `malloc` is probably brutally optimized, so the analyzer won't be able to understand it and handle it properly (note that in some cases like C++ STL classes, we explicitly need to prevent the inlining of optimized library code, because it would produce lots of false positives).
+
+Therefore I think that "act as if `malloc` is a standard POSIX malloc" is probably the best behavior even for a freestanding project, unless the user is explicitly trying to find bugs in a library code that implements `malloc` itself. In that very specific case the user should just disable MallocChecker, because it is not relevant for him.
+
+I think the `C.wasInlined` check was probably added as a paranoid defense against crashes or wildly incorrect behavior. If you move the code to a proper `evalCall` callback, you won't need this check because `evalCall` is checked before the inlining and if an `evalCall` recognizes and accepts the function call (i.e. it returns `true`), then the analyzer won't even try to inline the function.
+Comment by pskrgag: > Therefore I think that "act as if malloc is a standard POSIX malloc" is probably the best behavior even for a freestanding project, unless the user is explicitly trying to find bugs in a library code that implements malloc itself. In that very specific case the user should just disable MallocChecker, because it is not relevant for him.
+
+I had similar idea until I found `malloc-interprocedural.c::useStrndup`  test. I'd suspect that not inlining allocation function might be a breaking change (which, IMO, is fine, since in real life allocation functions behave as the should, maybe except for mocks for testing)
+Comment by NagyDonat: Yes, I agree that this "not inlining allocation functions" change is a breaking change, but it is a _good_ breaking change a.k.a. a feature :smile:.
+Comment by NagyDonat: RE: the conflict between the StreamChecker and MallocChecker callbacks -- I realized that my plans were completely wrong, because I probably misread the StreamChecker code.
+
+I'll try to find a new solution.
+Comment by NagyDonat: In fact, the solution for the StreamChecker/MallocChecker conflict is really simple: we should just leave the method `MallocChecker::checkGetdelim` (which handles `getline` and `getdelim`) within a `postCall` callback (while we move most other handlers to `evalCall` callbacks).
+
+This difference is warranted because unlike most memory allocation functions, `getline` and `getdelim` return the allocated buffer through the out-parameter `char **lineptr`:
+```c
+ssize_t getline(char **lineptr, size_t *n, FILE *stream);
+ssize_t getdelim(char **lineptr, size_t *n, int delim, FILE *stream);
+```
+This means that in this case `MallocChecker` doesn't use `BindExpr` to specify the return value of the function -- it only updates the dynamic extent information (recording that the extent of `*lineptr` is `*n` after the call) and that `*lineptr` is in an "allocated by malloc" state after this point.
+
+On the other hand, the handler `StreamChecker::evalGetdelim` (which is called from an `evalCall` callback) does a proper evaluation of `getline()` and `getdelim()` calls: it models a success/failure state split, records various known relationships between the outputs and uses `BindExpr` to record a return value (either a fresh symbolic value, or a constant -1 on a failure branch).
+
+As far as I see, in the case of these functions the `postCall` provided by MallocChecker is compatible with the `evalCall` from StreamChecker: they are modelling different aspects of the function call, they can work well together, but either of them can work alone as well if the other checker is disabled.
+
+This solution introduces a slight discrepancy that usually `MallocChecker` introduces symbolic memory regions that are located on the heap, while in the case of `getdelim()/getline()` modeling it attaches its metadata to the symbolic regions that were introduced by invalidation (which was done either by the conservative evaluation or by the StreamChecker callback) -- and those symbolic regions are in unknown space. However, I think that this is a low priority issue, and we don't have to bother with fixing it ASAP.
+Comment by haoNoQ: Yes, effectively, the only correct way to use `BindExpr` from inside a checker, is to bind the evaluated call's return value from inside `evalCall()`. Every other use of `BindExpr` can (and should) be banned by asserting that the Environment didn't change after a checker callback. We could refactor `evalCall()` to pass the return value separately (eg. make the callback return an `optional<SVal>`) and then we'll never see `BindExpr` in a checker again. (The Store is a different story. An overwritten global variable is a valid possible outcome of a call so the checker should be able to do that.)
+
+Additionally, `BindExpr` should never be allowed to overwrite an existing value. Expressions don't represent the value that may "change over time". They're computed, used, and immediately discarded. This can also easily be an assertion. However, the amount of sudden breakages I've seen trying to introduce this assertion has eventually demotivated me. (As in, like, folks temporarily put a wrong value into the returned `ProgramStateRef` because they were too lazy to return a `std::pair<ProgramStateRef, Seal>` instead. Then their caller overwrites it with the correct value once they're finished computing it.)

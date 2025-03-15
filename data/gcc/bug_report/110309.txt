@@ -1,0 +1,207 @@
+Bug Summary: Wrong code for masked load expansion
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 13.1.1, 14.0
+Known to Fail: 13.1.0
+
+Comments:
+- User: Richard Biener | Time: 2023-06-19 09:53:16 UTC
+  Text: For
+
+void foo (int * __restrict a, int *b)
+{
+  for (int i = 0; i < 6; ++i)
+    a[i] = b[i] + 42;
+}
+
+with -O3 --param vect-partial-vector-usage=1 -march=znver4 -mprefer-vector-width=256 we get
+
+foo:
+.LFB0:
+        .cfi_startproc
+        movl    $42, %eax
+        vpxor   %xmm0, %xmm0, %xmm0
+        vpblendd        $63, (%rsi), %ymm0, %ymm0
+        kmovb   .LC1(%rip), %k1
+        vpbroadcastd    %eax, %ymm1
+        vpaddd  %ymm1, %ymm0, %ymm0
+        vmovdqu32       %ymm0, (%rdi){%k1}
+        vzeroupper
+        ret
+
+note how the .MASK_LOAD (b_10(D), 32B, { -1, -1, -1, -1, -1, -1, 0, 0 }) is
+expanded as vpblendd without a mask, performing a full 32byte load from
+(%rsi) which isn't aligned and thus can trap.
+
+;; vect__4.6_8 = .MASK_LOAD (b_10(D), 32B, { -1, -1, -1, -1, -1, -1, 0, 0 });
+ 
+(insn 7 6 8 (set (reg:QI 86)
+        (const_int 63 [0x3f])) "t2.c":4:13 -1
+     (nil))
+
+(insn 8 7 0 (set (reg:V8SI 82 [ vect__4.6 ])
+        (vec_merge:V8SI (mem:V8SI (reg/v/f:DI 85 [ b ]) [1 MEM <vector(8) int> [(int *)b_10(D)]+0 S32 A32])
+            (reg:V8SI 82 [ vect__4.6 ])
+            (reg:QI 86))) "t2.c":4:13 -1
+     (nil))
+
+- User: Richard Biener | Time: 2023-06-19 10:29:13 UTC
+  Text: I think the two
+
+(define_expand "maskload<mode><avx512fmaskmodelower>"
+  [(set (match_operand:V48H_AVX512VL 0 "register_operand")
+    (vec_merge:V48H_AVX512VL
+      (match_operand:V48H_AVX512VL 1 "memory_operand")
+      (match_dup 0)
+      (match_operand:<avx512fmaskmode> 2 "register_operand")))]
+  "TARGET_AVX512F")
+
+(define_expand "maskload<mode><avx512fmaskmodelower>"
+  [(set (match_operand:VI12_AVX512VL 0 "register_operand")
+    (vec_merge:VI12_AVX512VL
+      (match_operand:VI12_AVX512VL 1 "memory_operand")
+      (match_dup 0)
+      (match_operand:<avx512fmaskmode> 2 "register_operand")))]
+  "TARGET_AVX512BW")
+
+patterns are wrong (all others use UNSPEC_MASKMOV)
+
+- User: Hongtao.liu | Time: 2023-06-20 06:04:50 UTC
+  Text: (In reply to Richard Biener fromcomment #1)> I think the two
+> 
+> (define_expand "maskload<mode><avx512fmaskmodelower>"
+>   [(set (match_operand:V48H_AVX512VL 0 "register_operand")
+>     (vec_merge:V48H_AVX512VL
+>       (match_operand:V48H_AVX512VL 1 "memory_operand")
+>       (match_dup 0)
+>       (match_operand:<avx512fmaskmode> 2 "register_operand")))]
+>   "TARGET_AVX512F")
+> 
+> (define_expand "maskload<mode><avx512fmaskmodelower>"
+>   [(set (match_operand:VI12_AVX512VL 0 "register_operand")
+>     (vec_merge:VI12_AVX512VL
+>       (match_operand:VI12_AVX512VL 1 "memory_operand")
+>       (match_dup 0)
+>       (match_operand:<avx512fmaskmode> 2 "register_operand")))]
+>   "TARGET_AVX512BW")
+> 
+> patterns are wrong (all others use UNSPEC_MASKMOV)UNSPEC_MASKMOV is used for MASKMOV, UNSPEC_MASK_LOAD is used for avx512 mask,
+
+5;; If mem_addr points to a memory region with less than whole vector size bytes
+ 1386;; of accessible memory and k is a mask that would prevent reading the inaccessible
+ 1387;; bytes from mem_addr, add UNSPEC_MASKLOAD to prevent it to be transformed to vpblendd
+ 1388;; Seepr97642.
+ 1389(define_expand "<avx512>_load<mode>_mask"
+ 1390  [(set (match_operand:V48_AVX512VL 0 "register_operand")
+ 1391        (vec_merge:V48_AVX512VL
+ 1392          (match_operand:V48_AVX512VL 1 "nonimmediate_operand")
+ 1393          (match_operand:V48_AVX512VL 2 "nonimm_or_0_operand")
+ 1394          (match_operand:<avx512fmaskmode> 3 "register_or_constm1_operand")))]
+ 1395  "TARGET_AVX512F"
+ 1396{
+ 1397  if (CONST_INT_P (operands[3]))
+ 1398    {
+ 1399      emit_insn (gen_rtx_SET (operands[0], operands[1]));
+ 1400      DONE;
+ 1401    }
+ 1402  else if (MEM_P (operands[1]))
+ 1403    operands[1] = gen_rtx_UNSPEC (<MODE>mode,
+ 1404                                 gen_rtvec(1, operands[1]),
+ 1405                                 UNSPEC_MASKLOAD);
+ 1406})
+ 1407
+
+Yes, those 2 patterns needs to be fixed.
+
+- User: GCC Commits | Time: 2023-06-25 04:06:37 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:c79476da46728e2ab17e0e546262d2f6377081aacommitr14-2070-gc79476da46728e2ab17e0e546262d2f6377081aaAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Tue Jun 20 15:41:00 2023 +0800
+
+    Refine maskloadmn pattern with UNSPEC_MASKLOAD.
+    
+    If mem_addr points to a memory region with less than whole vector size
+    bytes of accessible memory and k is a mask that would prevent reading
+    the inaccessible bytes from mem_addr, add UNSPEC_MASKLOAD to prevent
+    it to be transformed to vpblendd.
+    
+    gcc/ChangeLog:PR target/110309* config/i386/sse.md (maskload<mode><avx512fmaskmodelower>):
+            Refine pattern with UNSPEC_MASKLOAD.
+            (maskload<mode><avx512fmaskmodelower>): Ditto.
+            (*<avx512>_load<mode>_mask): Extend mode iterator to
+            VI12HFBF_AVX512VL.
+            (*<avx512>_load<mode>): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110309.c: New test.
+
+- User: Hongtao.liu | Time: 2023-06-25 04:08:48 UTC
+  Text: Fixed for GCC14.
+
+Note: unspec is not added to maskstore since vpblendd doesn't support memeory dest, so there's no chance for a maskstore be optimized to vpblendd?
+
+- User: GCC Commits | Time: 2023-06-29 01:27:15 UTC
+  Text: The releases/gcc-11 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:f59565f5dc2cdb5ac5a0b2b75404a36771232f86commitr11-10883-gf59565f5dc2cdb5ac5a0b2b75404a36771232f86Author: liuhongt <hongtao.liu@intel.com>
+Date:   Tue Jun 20 15:41:00 2023 +0800
+
+    Refine maskloadmn pattern with UNSPEC_MASKLOAD.
+    
+    If mem_addr points to a memory region with less than whole vector size
+    bytes of accessible memory and k is a mask that would prevent reading
+    the inaccessible bytes from mem_addr, add UNSPEC_MASKLOAD to prevent
+    it to be transformed to vpblendd.
+    
+    gcc/ChangeLog:PR target/110309* config/i386/sse.md (maskload<mode><avx512fmaskmodelower>):
+            Refine pattern with UNSPEC_MASKLOAD.
+            (maskload<mode><avx512fmaskmodelower>): Ditto.
+
+- User: GCC Commits | Time: 2023-06-29 01:28:19 UTC
+  Text: The releases/gcc-12 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:1f5591a9578b8cacda9d4c73a25d93598d68e028commitr12-9742-g1f5591a9578b8cacda9d4c73a25d93598d68e028Author: liuhongt <hongtao.liu@intel.com>
+Date:   Tue Jun 20 15:41:00 2023 +0800
+
+    Refine maskloadmn pattern with UNSPEC_MASKLOAD.
+    
+    If mem_addr points to a memory region with less than whole vector size
+    bytes of accessible memory and k is a mask that would prevent reading
+    the inaccessible bytes from mem_addr, add UNSPEC_MASKLOAD to prevent
+    it to be transformed to vpblendd.
+    
+    gcc/ChangeLog:PR target/110309* config/i386/sse.md (maskload<mode><avx512fmaskmodelower>):
+            Refine pattern with UNSPEC_MASKLOAD.
+            (maskload<mode><avx512fmaskmodelower>): Ditto.
+            (*<avx512>_load<mode>_mask): Extend mode iterator to
+            VI12HF_AVX512VL.
+            (*<avx512>_load<mode>): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110309.c: New test.
+
+- User: GCC Commits | Time: 2023-06-29 01:29:14 UTC
+  Text: The releases/gcc-13 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:ecc1af1f5b2c0fbcfa8840c79aa6102d413850b2commitr13-7499-gecc1af1f5b2c0fbcfa8840c79aa6102d413850b2Author: liuhongt <hongtao.liu@intel.com>
+Date:   Tue Jun 20 15:41:00 2023 +0800
+
+    Refine maskloadmn pattern with UNSPEC_MASKLOAD.
+    
+    If mem_addr points to a memory region with less than whole vector size
+    bytes of accessible memory and k is a mask that would prevent reading
+    the inaccessible bytes from mem_addr, add UNSPEC_MASKLOAD to prevent
+    it to be transformed to vpblendd.
+    
+    gcc/ChangeLog:PR target/110309* config/i386/sse.md (maskload<mode><avx512fmaskmodelower>):
+            Refine pattern with UNSPEC_MASKLOAD.
+            (maskload<mode><avx512fmaskmodelower>): Ditto.
+            (*<avx512>_load<mode>_mask): Extend mode iterator to
+            VI12HFBF_AVX512VL.
+            (*<avx512>_load<mode>): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr110309.c: New test.
+
+- User: Richard Biener | Time: 2023-07-31 11:32:50 UTC
+  Text: Fixed.
+

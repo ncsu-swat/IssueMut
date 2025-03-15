@@ -1,0 +1,310 @@
+Bug Summary: [13/14 Regression] Function attribute optimize() might make ISA target attribute broken
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: rejects-valid
+Known to Work: 15.0
+Known to Fail: 
+
+Comments:
+- User: Haochen Jiang | Time: 2024-07-24 03:33:25 UTC
+  Text: When we compiled the code following:
+
+#include <immintrin.h>
+
+__m256 a[10], b[10], c[10];
+
+void __attribute__((target ("avx"), optimize(3)))
+bar (void)
+{
+  a[0] = _mm256_and_ps (b[0], c[0]);
+}
+
+with -O0 -msse -mno-avx, it will report ABI warning and target option mismatch. -O1 will also fail, -O2 would be ok. It failed since GCC13.1.
+
+Original testcase:https://godbolt.org/z/YbPKen7P5I tested with different combinations, -O0/-O1 will only work with optimize(0/1) and -O2/-O3 will only work with optimize(2/3). Otherwise, it will fail.
+
+Also, if we put optimize() before target attribute, it will always pass.
+
+- User: Andrew Pinski | Time: 2024-07-24 04:05:11 UTC
+  Text: Confirmed.
+
+It also happens for aarch64 with:
+```
+#include <arm_sve.h>
+
+int __attribute__((target ("+sve"), optimize(3)))
+bar (void)
+{
+  svfloat32_t xseg;
+  return svlen_f32(xseg);
+}
+```
+
+Which makes me think this is not target specific. Same behavior at x86_64 testcase with the optimization levels too.
+
+- User: Richard Biener | Time: 2024-07-24 11:28:53 UTC
+  Text: "Reduced":
+
+#ifndef __AVX__
+#pragma GCC push_options
+#pragma GCC target("avx")
+#define __DISABLE_AVX__
+#endif /* __AVX__ */
+
+extern inline double __attribute__((__gnu_inline__,__always_inline__))
+     foo (double x) { return x; }
+
+#ifdef __DISABLE_AVX__
+#undef __DISABLE_AVX__
+#pragma GCC pop_options
+#endif /* __DISABLE_AVX__ */
+
+void __attribute__((target ("avx"), optimize(3)))
+bar (double *p)
+{
+  *p = foo (*p);
+}
+
+works with -mavx _or_ with -O[23], fails without.  Fails(!?) with -O1
+as well.
+
+So it's somehow the interaction between optimize and target.
+
+Somebody needs to sit down and trace differences between -O2 and -O1
+for example.
+
+- User: Haochen Jiang | Time: 2024-07-25 05:59:24 UTC
+  Text: Maybe I could first start with a bisect since GCC12.1 is known to ok and GCC13.1 is known to fail.
+
+- User: Haochen Jiang | Time: 2024-07-25 08:21:58 UTC
+  Text: It seems to me gcc-13-3950-g071e428c24e is the guilty commit.
+
+071e428c24ee8c1ed062597a093708bba29509c9 is the first bad commit
+commit 071e428c24ee8c1ed062597a093708bba29509c9
+Author: Hongyu Wang <hongyu.wang@intel.com>
+Date:   Thu Sep 8 16:52:02 2022 +0800
+
+    Enable small loop unrolling for O2
+
+    Modern processors has multiple way instruction decoders
+    For x86, icelake/zen3 has 5 uops, so for small loop with <= 4
+    instructions (usually has 3 uops with a cmp/jmp pair that can be
+    macro-fused), the decoder would have 2 uops bubble for each iteration
+    and the pipeline could not be fully utilized.
+
+    Therefore, this patch enables loop unrolling for small size loop at O2
+    to fullfill the decoder as much as possible. It turns on rtl loop
+    unrolling when targetm.loop_unroll_adjust exists and O2 plus speed only.
+    In x86 backend the default behavior is to unroll small loops with less
+    than 4 insns by 1 time.
+
+    This improves 548.exchange2 by 9% on icelake and 7.4% on zen3 with
+    0.9% codesize increment. For other benchmarks the variants are minor
+    and overall codesize increased by 0.2%.
+
+    The kernel image size increased by 0.06%, and no impact on eembc.
+
+    gcc/ChangeLog:
+
+            * common/config/i386/i386-common.cc (ix86_optimization_table):
+            Enable small loop unroll at O2 by default.
+            * config/i386/i386.cc (ix86_loop_unroll_adjust): Adjust unroll
+            factor if -munroll-only-small-loops enabled and -funroll-loops/
+            -funroll-all-loops are disabled.
+            * config/i386/i386.h (struct processor_costs): Add 2 field
+            small_unroll_ninsns and small_unroll_factor.
+            * config/i386/i386.opt: Add -munroll-only-small-loops.
+            * doc/gcc/gcc-command-options/machine-dependent-options/x86-options.rst:
+            Document -munroll-only-small-loops.
+            * doc/gcc/gcc-command-options/option-summary.rst: Likewise.
+            * loop-init.cc (pass_rtl_unroll_loops::gate): Enable rtl
+            loop unrolling for -O2-speed and above if target hook
+            loop_unroll_adjust exists.
+            (pass_rtl_unroll_loops::execute): Set UAP_UNROLL flag
+            when target hook loop_unroll_adjust exists.
+            * config/i386/x86-tune-costs.h: Update all processor costs
+            with small_unroll_ninsns = 4 and small_unroll_factor = 2.
+
+    gcc/testsuite/ChangeLog:
+
+            * gcc.dg/guality/loop-1.c: Add additional option
+            -mno-unroll-only-small-loops.
+            * gcc.target/i386/pr86270.c: Add -mno-unroll-only-small-loops.
+            * gcc.target/i386/pr93002.c: Likewise.
+
+- User: Andrew Pinski | Time: 2024-07-25 08:36:53 UTC
+  Text: then if that is the case then aarch64 started withr14-6290-g9f0f7d802482a8(which added OPT_mearly_ra_ to aarch_option_optimization_table).
+
+What happens if you mark -munroll-only-small-loops as Optimization ?
+if that works, then aarch64 fix is to mark -mearly-ra= as Optimization too.
+
+- User: Andrew Pinski | Time: 2024-07-25 08:44:18 UTC
+  Text: (In reply to Andrew Pinski fromcomment #5)> then if that is the case then aarch64 started withr14-6290-g9f0f7d802482a8> (which added OPT_mearly_ra_ to aarch_option_optimization_table).
+> 
+> What happens if you mark -munroll-only-small-loops as Optimization ?
+> if that works, then aarch64 fix is to mark -mearly-ra= as Optimization too.Yes this fixes aarch64 testcase:
+```
+diff --git a/gcc/config/aarch64/aarch64.opt b/gcc/config/aarch64/aarch64.opt
+index 2f90f10352a..6229bcb371e 100644
+--- a/gcc/config/aarch64/aarch64.opt
++++ b/gcc/config/aarch64/aarch64.opt
+@@ -256,7 +256,7 @@ EnumValue
+ Enum(early_ra_scope) String(none) Value(AARCH64_EARLY_RA_NONE)
+
+ mearly-ra=
+-Target RejectNegative Joined Enum(early_ra_scope) Var(aarch64_early_ra) Init(AARCH64_EARLY_RA_NONE) Save
++Target RejectNegative Joined Enum(early_ra_scope) Var(aarch64_early_ra) Init(AARCH64_EARLY_RA_NONE) Optimization
+ Specify when to enable an early register allocation pass.  The possibilities
+ are: all functions, functions that have access to strided multi-register
+ instructions, and no functions.
+
+```
+
+So yes adding Optimization to -munroll-only-small-loops should fix that too.
+
+- User: Hongyu Wang | Time: 2024-07-25 08:55:49 UTC
+  Text: (In reply to Andrew Pinski fromcomment #6)> (In reply to Andrew Pinski fromcomment #5)
+> > then if that is the case then aarch64 started withr14-6290-g9f0f7d802482a8> > (which added OPT_mearly_ra_ to aarch_option_optimization_table).
+> > 
+> > What happens if you mark -munroll-only-small-loops as Optimization ?
+> > if that works, then aarch64 fix is to mark -mearly-ra= as Optimization too.
+> 
+> Yes this fixes aarch64 testcase:
+> ```
+> diff --git a/gcc/config/aarch64/aarch64.opt b/gcc/config/aarch64/aarch64.opt
+> index 2f90f10352a..6229bcb371e 100644
+> --- a/gcc/config/aarch64/aarch64.opt
+> +++ b/gcc/config/aarch64/aarch64.opt
+> @@ -256,7 +256,7 @@ EnumValue
+>  Enum(early_ra_scope) String(none) Value(AARCH64_EARLY_RA_NONE)
+> 
+>  mearly-ra=
+> -Target RejectNegative Joined Enum(early_ra_scope) Var(aarch64_early_ra)
+> Init(AARCH64_EARLY_RA_NONE) Save
+> +Target RejectNegative Joined Enum(early_ra_scope) Var(aarch64_early_ra)
+> Init(AARCH64_EARLY_RA_NONE) Optimization
+>  Specify when to enable an early register allocation pass.  The possibilities
+>  are: all functions, functions that have access to strided multi-register
+>  instructions, and no functions.
+> 
+> ```
+> 
+> So yes adding Optimization to -munroll-only-small-loops should fix that too.Confirmed, append Optimization fixed this issue in x86.
+I'm quite confused by how the unmarked Optimization seems resets the flags, the target attribute was overrided and the error reports like isa flag mismatched.
+
+- User: rguenther@suse.de | Time: 2024-07-25 12:09:12 UTC
+  Text: On Thu, 25 Jul 2024, hongyuw at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=116065> 
+> ---Comment #7from Hongyu Wang <hongyuw at gcc dot gnu.org> ---
+> (In reply to Andrew Pinski fromcomment #6)
+> > (In reply to Andrew Pinski fromcomment #5)
+> > > then if that is the case then aarch64 started withr14-6290-g9f0f7d802482a8> > > (which added OPT_mearly_ra_ to aarch_option_optimization_table).
+> > > 
+> > > What happens if you mark -munroll-only-small-loops as Optimization ?
+> > > if that works, then aarch64 fix is to mark -mearly-ra= as Optimization too.
+> > 
+> > Yes this fixes aarch64 testcase:
+> > ```
+> > diff --git a/gcc/config/aarch64/aarch64.opt b/gcc/config/aarch64/aarch64.opt
+> > index 2f90f10352a..6229bcb371e 100644
+> > --- a/gcc/config/aarch64/aarch64.opt
+> > +++ b/gcc/config/aarch64/aarch64.opt
+> > @@ -256,7 +256,7 @@ EnumValue
+> >  Enum(early_ra_scope) String(none) Value(AARCH64_EARLY_RA_NONE)
+> > 
+> >  mearly-ra=
+> > -Target RejectNegative Joined Enum(early_ra_scope) Var(aarch64_early_ra)
+> > Init(AARCH64_EARLY_RA_NONE) Save
+> > +Target RejectNegative Joined Enum(early_ra_scope) Var(aarch64_early_ra)
+> > Init(AARCH64_EARLY_RA_NONE) Optimization
+> >  Specify when to enable an early register allocation pass.  The possibilities
+> >  are: all functions, functions that have access to strided multi-register
+> >  instructions, and no functions.
+> > 
+> > ```
+> > 
+> > So yes adding Optimization to -munroll-only-small-loops should fix that too.
+> 
+> Confirmed, append Optimization fixed this issue in x86.
+> I'm quite confused by how the unmarked Optimization seems resets the flags, the
+> target attribute was overrided and the error reports like isa flag mismatched.It's because the change in optimization level enables a target flag
+and as the target doesn't allow a difference in that inlining fails.
+When marked as 'Optimization' it's not considered a "target" flag.
+
+- User: Andrew Pinski | Time: 2024-07-25 17:02:00 UTC
+  Text: So readinghttps://gcc.gnu.org/onlinedocs/gccint/Option-properties.htmldoes make Optimization or PerFunction correct here.
+aarch64.opt already has a few with Optimization too:
+```
+mlow-precision-div
+Target Var(flag_mlow_precision_div) Optimization
+...
+mearly-ldp-fusion
+Target Var(flag_aarch64_early_ldp_fusion) Optimization Init(1)
+```
+
+- User: Andrew Pinski | Time: 2024-07-26 03:07:24 UTC
+  Text: Note I submitted the aarch64 patch here:https://gcc.gnu.org/pipermail/gcc-patches/2024-July/658287.html
+
+- User: GCC Commits | Time: 2024-07-26 16:55:48 UTC
+  Text: The trunk branch has been updated by Andrew Pinski <pinskia@gcc.gnu.org>:https://gcc.gnu.org/g:8a5f528fba788f2af40a15a999bb63a2a0f6f455commitr15-2344-g8a5f528fba788f2af40a15a999bb63a2a0f6f455Author: Andrew Pinski <quic_apinski@quicinc.com>
+Date:   Thu Jul 25 09:37:49 2024 -0700
+
+    aarch64: Fix target/optimize option handling with transiting between O1 to O2
+    
+    The problem here is the aarch64 backend enables -mearly-ra at -O2 and above but
+    it is not marked as an Optimization in the .opt file so enabling it sometimes
+    reset the target options when going from -O1 to -O2 for the first time.
+    
+    Build and tested for aarch64-linux-gnu with no regressions.PR target/116065gcc/ChangeLog:
+    
+            * config/aarch64/aarch64.opt (mearly-ra=): Mark as Optimization rather
+            than Save.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/aarch64/sve/target_optimization-1.c: New test.
+    
+    Signed-off-by: Andrew Pinski <quic_apinski@quicinc.com>
+
+- User: GCC Commits | Time: 2024-07-31 08:56:58 UTC
+  Text: The master branch has been updated by Hongyu Wang <hongyuw@gcc.gnu.org>:https://gcc.gnu.org/g:a59c4e496fa916cb9a484a649aa1b4cebd6550f2commitr15-2430-ga59c4e496fa916cb9a484a649aa1b4cebd6550f2Author: Hongyu Wang <hongyu.wang@intel.com>
+Date:   Fri Jul 26 08:27:01 2024 +0800
+
+    i386: Mark target option with optimization when enabled with opt level [PR116065]
+    
+    When introducing munroll-only-small-loops, the option was marked as
+    Target Save and added to -O2 default which makes attribute(optimize)
+    resets target option and causing error when cmdline has O1 and
+    funciton attribute has O2 and other target options. Mark this option
+    as Optimization to fix.
+    
+    gcc/ChangeLogPR target/116065* config/i386/i386.opt (munroll-only-small-loops): Mark as
+            Optimization instead of Save.
+    
+    gcc/testsuite/ChangeLogPR target/116065* gcc.target/i386/pr116065.c: New test.
+
+- User: Richard Biener | Time: 2024-10-13 13:23:07 UTC
+  Text: Fixed on trunk sofar(?)
+
+- User: Haochen Jiang | Time: 2024-10-14 01:58:27 UTC
+  Text: (In reply to Richard Biener fromcomment #13)> Fixed on trunk sofar(?)Yes, could be closed if only aarch64 and x86_64 are affected.
+
+- User: Sam James | Time: 2024-10-14 01:59:14 UTC
+  Text: (In reply to Haochen Jiang fromcomment #14)> (In reply to Richard Biener fromcomment #13)
+> > Fixed on trunk sofar(?)
+> 
+> Yes, could be closed if only aarch64 and x86_64 are affected.But what about backporting? It was a regression.
+
+- User: Andrew Pinski | Time: 2024-10-14 02:04:01 UTC
+  Text: (In reply to Sam James fromcomment #15)> (In reply to Haochen Jiang fromcomment #14)
+> > (In reply to Richard Biener fromcomment #13)
+> > > Fixed on trunk sofar(?)
+> > 
+> > Yes, could be closed if only aarch64 and x86_64 are affected.
+> 
+> But what about backporting? It was a regression.Backporting requires to bump the lto minor version; I know this was mentioned but maybe only on the patches mailing list. This is why I decided against backporting it. Note it also breaks offloading (fixed viar15-3034-gdb2e9a2a46f64b).
+
+- User: Sam James | Time: 2024-10-14 02:43:21 UTC
+  Text: Ah, fair enough - thanks!
+

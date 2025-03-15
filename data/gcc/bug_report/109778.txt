@@ -1,0 +1,444 @@
+Bug Summary: [10/11/12/13 Regression] Wrong code at -O1 and above on x86_64-linux-gnu
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 12.2.0
+Known to Fail: 13.1.0
+
+Comments:
+- User: Shaohua Li | Time: 2023-05-08 19:18:28 UTC
+  Text: gcc trunk at -O3 emits wrong code. This seems to be a bug since gcc-12.2
+
+Compiler explorer:https://godbolt.org/z/E5aqnMK6Y$ cat a.c
+int printf(const char *, ...);
+int a, b, c, d;
+int *e = &c;
+unsigned f(unsigned char g) {
+  g = 1 | g << 1;
+  g = g >> 4 | g << 4;
+  return g;
+}
+void h(unsigned g) { *e = 8 > f(g + 86) - 86; }
+int main() {
+  d = a && b;
+  h(d + 4);
+  printf("%d\n", c);
+}
+$
+$ gcc-tk -O0 a.c && ./a.out
+1
+$ gcc-tk -O3 a.c && ./a.out
+0
+$
+$ gcc-tk -v
+Using built-in specs.
+COLLECT_GCC=gcc-tk
+COLLECT_LTO_WRAPPER=/zdata/shaoli/compilers/ccbuilder-compilers/gcc-b7fe38c14e5f1bc32950c7b2ffc8537c7c381af4/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../configure --disable-multilib --disable-bootstrap --enable-languages=c,c++ --prefix=/zdata/shaoli/compilers/ccbuilder-compilers/gcc-b7fe38c14e5f1bc32950c7b2ffc8537c7c381af4
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20230506 (experimental) (GCC)
+$
+
+- User: Andrew Pinski | Time: 2023-05-08 19:30:38 UTC
+  Text: ccp2:
+Visiting statement:
+_16 = (unsigned intD.9) g_15;
+which is likely CONSTANT
+Lattice value changed to CONSTANT 0xdb (0x20).  Adding SSA edges to worklist.
+marking stmt to be not simulated again
+
+Visiting statement:
+_17 = _16 + 4294967210;
+which is likely CONSTANT
+Lattice value changed to CONSTANT 0x85 (0x20).  Adding SSA edges to worklist.
+marking stmt to be not simulated again
+
+Visiting statement:
+_18 = _17 <= 7;
+which is likely CONSTANT
+Lattice value changed to CONSTANT 0.  Adding SSA edges to worklist.
+marking stmt to be not simulated again
+
+
+Note this is with -O1 with:
+```
+
+int printf(const char *, ...);
+int a, b, c, d;
+int *e = &c;
+static inline unsigned f(unsigned char g) {
+  g = 1 | g << 1;
+  g = g >> 4 | g << 4;
+  return g;
+}
+static inline void h(unsigned g) { *e = 8 > f(g + 86) - 86; }
+int main() {
+  d = a && b;
+  h(d + 4);
+  printf("%d\n", c);
+}
+```
+
+- User: Jakub Jelinek | Time: 2023-05-08 19:36:43 UTC
+  Text: Bisected tor13-1100-gacb1e6f43dc2bbedd1248ea61c
+
+- User: Jakub Jelinek | Time: 2023-05-08 22:09:16 UTC
+  Text: Looking at the #c1 -O3 differences, before that the ranger is able to handle all ranges nicely, as f is being called with [90, 91], which results in [181, 183] before the rotate (which previously wasn't used, but 2 shifts + or), and because the values in that range are 0xb5, 0xb6 and 0xb7 and that rotated by 4 is 0x5b, 0x6b, 0x7b we made [0x5b, 0x7b] range out of that (i.e. [91, 123]) and that minus 86 is [5, 37].
+Now, with the above mentioned commit, we instead have r>>= 4 in the code, apparently
+that is something range-op.cc doesn't handle (but could, worst case with pretending it is 2 shifts plus or).  So that is one thing that should be done.
+
+The other is a bug in the wi::[lr]rotate implementation, tree-ssa-ccp.cc is the only caller of those which passes non-zero width and that is what isn't handled correctly.
+
+--- gcc/wide-int.h.jj	2023-04-18 11:00:39.926725744 +0200
++++ gcc/wide-int.h	2023-05-08 23:36:41.104412818 +0200
+@@ -3187,9 +3187,11 @@ wi::lrotate (const T1 &x, const T2 &y, u
+     width = precision;
+   WI_UNARY_RESULT (T2) ymod = umod_trunc (y, width);
+   WI_UNARY_RESULT (T1) left = wi::lshift (x, ymod);
+-  WI_UNARY_RESULT (T1) right = wi::lrshift (x, wi::sub (width, ymod));
++  WI_UNARY_RESULT (T1) right
++    = wi::lrshift (width != precision ? wi::zext (x, width) : x,
++		   wi::sub (width, ymod));
+   if (width != precision)
+-    return wi::zext (left, width) | wi::zext (right, width);
++    return wi::zext (left, width) | right;
+   return left | right;
+ }
+ 
+@@ -3204,10 +3206,11 @@ wi::rrotate (const T1 &x, const T2 &y, u
+   if (width == 0)
+     width = precision;
+   WI_UNARY_RESULT (T2) ymod = umod_trunc (y, width);
+-  WI_UNARY_RESULT (T1) right = wi::lrshift (x, ymod);
++  WI_UNARY_RESULT (T1) right
++    = wi::lrshift (width != precision ? wi::zext (x, width) : x, ymod);
+   WI_UNARY_RESULT (T1) left = wi::lshift (x, wi::sub (width, ymod));
+   if (width != precision)
+-    return wi::zext (left, width) | wi::zext (right, width);
++    return wi::zext (left, width) | right;
+   return left | right;
+ }
+ 
+fixes it but I wonder if we shouldn't return if (width != precision) wi::sext (left | right, width); instead or do that depending on is_sign_extended, or do the extension in the caller (tree-ssa-ccp.cc).
+
+- User: Richard Biener | Time: 2023-05-09 07:38:15 UTC
+  Text: It's definitely "odd" API, are you sure it's only used from CCP?  It was present forever ...
+
+The fix looks good to me of course.
+
+- User: GCC Commits | Time: 2023-05-09 10:11:56 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:a8302d2a4669984c7c287d12ef5b37cde6699c80commitr14-602-ga8302d2a4669984c7c287d12ef5b37cde6699c80Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 9 12:10:07 2023 +0200
+
+    tree-ssa-ccp, wide-int: Fix up handling of [LR]ROTATE_EXPR in bitwise ccp [PR109778]
+    
+    The following testcase is miscompiled, because bitwise ccp2 handles
+    a rotate with a signed type incorrectly.
+    Seems tree-ssa-ccp.cc has the only callers of wi::[lr]rotate with 3
+    arguments, all other callers just rotate in the right precision and
+    I think work correctly.  ccp works with widest_ints and so rotations
+    by the excessive precision certainly don't match what it wants
+    when it sees a rotate in some specific bitsize.  Still, if it is
+    unsigned rotate and the widest_int is zero extended from width,
+    the functions perform left shift and logical right shift on the value
+    and then at the end zero extend the result of left shift and uselessly
+    also the result of logical right shift and return | of that.
+    On the testcase we the signed char rrotate by 4 argument is
+    CONSTANT -75 i.e. 0xffffffff....fffffb5 with mask 2.
+    The mask is correctly rotated to 0x20, but because the 8-bit constant
+    is sign extended to 192-bit one, the logical right shift by 4 doesn't
+    yield expected 0xb, but gives 0xfffffffffff....ffffb, and then
+    return wi::zext (left, width) | wi::zext (right, width); where left is
+    0xfffffff....fb50, so we return 0xfb instead of the expected
+    0x5b.
+    
+    The following patch fixes that by doing the zero extension in case of
+    the right variable before doing wi::lrshift rather than after it.
+    
+    Also, wi::[lr]rotate widht width < precision always zero extends
+    the result.  I'm afraid it can't do better because it doesn't know
+    if it is done for an unsigned or signed type, but the caller in this
+    case knows that very well, so I've done the extension based on sgn
+    in the caller.  E.g. 0x5b rotated right (or left) by 4 with width 8
+    previously gave 0xb5, but sgn == SIGNED in widest_int it should be
+    0xffffffff....fffb5 instead.
+    
+    2023-05-09  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109778* wide-int.h (wi::lrotate, wi::rrotate): Call wi::lrshift on
+            wi::zext (x, width) rather than x if width != precision, rather
+            than using wi::zext (right, width) after the shift.
+            * tree-ssa-ccp.cc (bit_value_binop): Call wi::ext on the results
+            of wi::lrotate or wi::rrotate.
+    
+            * gcc.c-torture/execute/pr109778.c: New test.
+
+- User: GCC Commits | Time: 2023-05-09 10:19:38 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:c2cf2dc988eb93551fa1c01d3f8d73ef21f39dc5commitr14-603-gc2cf2dc988eb93551fa1c01d3f8d73ef21f39dc5Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 9 12:14:18 2023 +0200
+
+    testsuite: Add further testcase for already fixed PR [PR109778]
+    
+    I came up with a testcase which reproduces all the way tor10-7469.
+    LTO to avoid early inlining it, so that ccp handles rotates and not
+    shifts before they are turned into rotates.
+    
+    2023-05-09  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109778* gcc.dg/lto/pr109778_0.c: New test.
+            * gcc.dg/lto/pr109778_1.c: New file.
+
+- User: Jakub Jelinek | Time: 2023-05-09 10:23:00 UTC
+  Text: The above committed testcase fails already starting withr10-7469-g56f0b32476c0c261c8e08, so we should fix this also on those release branches.
+
+- User: GCC Commits | Time: 2023-05-09 10:49:22 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:97f404d53e0f47013afd728e617d03ecc585c6b7commitr13-7310-g97f404d53e0f47013afd728e617d03ecc585c6b7Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 9 12:10:07 2023 +0200
+
+    tree-ssa-ccp, wide-int: Fix up handling of [LR]ROTATE_EXPR in bitwise ccp [PR109778]
+    
+    The following testcase is miscompiled, because bitwise ccp2 handles
+    a rotate with a signed type incorrectly.
+    Seems tree-ssa-ccp.cc has the only callers of wi::[lr]rotate with 3
+    arguments, all other callers just rotate in the right precision and
+    I think work correctly.  ccp works with widest_ints and so rotations
+    by the excessive precision certainly don't match what it wants
+    when it sees a rotate in some specific bitsize.  Still, if it is
+    unsigned rotate and the widest_int is zero extended from width,
+    the functions perform left shift and logical right shift on the value
+    and then at the end zero extend the result of left shift and uselessly
+    also the result of logical right shift and return | of that.
+    On the testcase we the signed char rrotate by 4 argument is
+    CONSTANT -75 i.e. 0xffffffff....fffffb5 with mask 2.
+    The mask is correctly rotated to 0x20, but because the 8-bit constant
+    is sign extended to 192-bit one, the logical right shift by 4 doesn't
+    yield expected 0xb, but gives 0xfffffffffff....ffffb, and then
+    return wi::zext (left, width) | wi::zext (right, width); where left is
+    0xfffffff....fb50, so we return 0xfb instead of the expected
+    0x5b.
+    
+    The following patch fixes that by doing the zero extension in case of
+    the right variable before doing wi::lrshift rather than after it.
+    
+    Also, wi::[lr]rotate widht width < precision always zero extends
+    the result.  I'm afraid it can't do better because it doesn't know
+    if it is done for an unsigned or signed type, but the caller in this
+    case knows that very well, so I've done the extension based on sgn
+    in the caller.  E.g. 0x5b rotated right (or left) by 4 with width 8
+    previously gave 0xb5, but sgn == SIGNED in widest_int it should be
+    0xffffffff....fffb5 instead.
+    
+    2023-05-09  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109778* wide-int.h (wi::lrotate, wi::rrotate): Call wi::lrshift on
+            wi::zext (x, width) rather than x if width != precision, rather
+            than using wi::zext (right, width) after the shift.
+            * tree-ssa-ccp.cc (bit_value_binop): Call wi::ext on the results
+            of wi::lrotate or wi::rrotate.
+    
+            * gcc.c-torture/execute/pr109778.c: New test.
+    
+    (cherry picked from commit a8302d2a4669984c7c287d12ef5b37cde6699c80)
+
+- User: GCC Commits | Time: 2023-05-09 10:49:27 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:5fd2537b36d7ad32e9cb64ddf196105172f919f5commitr13-7311-g5fd2537b36d7ad32e9cb64ddf196105172f919f5Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 9 12:14:18 2023 +0200
+
+    testsuite: Add further testcase for already fixed PR [PR109778]
+    
+    I came up with a testcase which reproduces all the way tor10-7469.
+    LTO to avoid early inlining it, so that ccp handles rotates and not
+    shifts before they are turned into rotates.
+    
+    2023-05-09  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109778* gcc.dg/lto/pr109778_0.c: New test.
+            * gcc.dg/lto/pr109778_1.c: New file.
+    
+    (cherry picked from commit c2cf2dc988eb93551fa1c01d3f8d73ef21f39dc5)
+
+- User: GCC Commits | Time: 2023-05-09 10:56:06 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:2835feb9c29de9167c7af19209065357899b808dcommitr12-9523-g2835feb9c29de9167c7af19209065357899b808dAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 9 12:10:07 2023 +0200
+
+    tree-ssa-ccp, wide-int: Fix up handling of [LR]ROTATE_EXPR in bitwise ccp [PR109778]
+    
+    The following testcase is miscompiled, because bitwise ccp2 handles
+    a rotate with a signed type incorrectly.
+    Seems tree-ssa-ccp.cc has the only callers of wi::[lr]rotate with 3
+    arguments, all other callers just rotate in the right precision and
+    I think work correctly.  ccp works with widest_ints and so rotations
+    by the excessive precision certainly don't match what it wants
+    when it sees a rotate in some specific bitsize.  Still, if it is
+    unsigned rotate and the widest_int is zero extended from width,
+    the functions perform left shift and logical right shift on the value
+    and then at the end zero extend the result of left shift and uselessly
+    also the result of logical right shift and return | of that.
+    On the testcase we the signed char rrotate by 4 argument is
+    CONSTANT -75 i.e. 0xffffffff....fffffb5 with mask 2.
+    The mask is correctly rotated to 0x20, but because the 8-bit constant
+    is sign extended to 192-bit one, the logical right shift by 4 doesn't
+    yield expected 0xb, but gives 0xfffffffffff....ffffb, and then
+    return wi::zext (left, width) | wi::zext (right, width); where left is
+    0xfffffff....fb50, so we return 0xfb instead of the expected
+    0x5b.
+    
+    The following patch fixes that by doing the zero extension in case of
+    the right variable before doing wi::lrshift rather than after it.
+    
+    Also, wi::[lr]rotate widht width < precision always zero extends
+    the result.  I'm afraid it can't do better because it doesn't know
+    if it is done for an unsigned or signed type, but the caller in this
+    case knows that very well, so I've done the extension based on sgn
+    in the caller.  E.g. 0x5b rotated right (or left) by 4 with width 8
+    previously gave 0xb5, but sgn == SIGNED in widest_int it should be
+    0xffffffff....fffb5 instead.
+    
+    2023-05-09  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109778* wide-int.h (wi::lrotate, wi::rrotate): Call wi::lrshift on
+            wi::zext (x, width) rather than x if width != precision, rather
+            than using wi::zext (right, width) after the shift.
+            * tree-ssa-ccp.cc (bit_value_binop): Call wi::ext on the results
+            of wi::lrotate or wi::rrotate.
+    
+            * gcc.c-torture/execute/pr109778.c: New test.
+    
+    (cherry picked from commit a8302d2a4669984c7c287d12ef5b37cde6699c80)
+
+- User: GCC Commits | Time: 2023-05-09 10:56:11 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:7408a0b93e6f6b3ce9b6be17bb9b5d2307f5ecf1commitr12-9524-g7408a0b93e6f6b3ce9b6be17bb9b5d2307f5ecf1Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 9 12:14:18 2023 +0200
+
+    testsuite: Add further testcase for already fixed PR [PR109778]
+    
+    I came up with a testcase which reproduces all the way tor10-7469.
+    LTO to avoid early inlining it, so that ccp handles rotates and not
+    shifts before they are turned into rotates.
+    
+    2023-05-09  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109778* gcc.dg/lto/pr109778_0.c: New test.
+            * gcc.dg/lto/pr109778_1.c: New file.
+    
+    (cherry picked from commit c2cf2dc988eb93551fa1c01d3f8d73ef21f39dc5)
+
+- User: GCC Commits | Time: 2023-05-09 11:04:38 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:817d1496e17806bdefab1e0fb06abdf56df58cbdcommitr11-10753-g817d1496e17806bdefab1e0fb06abdf56df58cbdAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 9 12:10:07 2023 +0200
+
+    tree-ssa-ccp, wide-int: Fix up handling of [LR]ROTATE_EXPR in bitwise ccp [PR109778]
+    
+    The following testcase is miscompiled, because bitwise ccp2 handles
+    a rotate with a signed type incorrectly.
+    Seems tree-ssa-ccp.cc has the only callers of wi::[lr]rotate with 3
+    arguments, all other callers just rotate in the right precision and
+    I think work correctly.  ccp works with widest_ints and so rotations
+    by the excessive precision certainly don't match what it wants
+    when it sees a rotate in some specific bitsize.  Still, if it is
+    unsigned rotate and the widest_int is zero extended from width,
+    the functions perform left shift and logical right shift on the value
+    and then at the end zero extend the result of left shift and uselessly
+    also the result of logical right shift and return | of that.
+    On the testcase we the signed char rrotate by 4 argument is
+    CONSTANT -75 i.e. 0xffffffff....fffffb5 with mask 2.
+    The mask is correctly rotated to 0x20, but because the 8-bit constant
+    is sign extended to 192-bit one, the logical right shift by 4 doesn't
+    yield expected 0xb, but gives 0xfffffffffff....ffffb, and then
+    return wi::zext (left, width) | wi::zext (right, width); where left is
+    0xfffffff....fb50, so we return 0xfb instead of the expected
+    0x5b.
+    
+    The following patch fixes that by doing the zero extension in case of
+    the right variable before doing wi::lrshift rather than after it.
+    
+    Also, wi::[lr]rotate widht width < precision always zero extends
+    the result.  I'm afraid it can't do better because it doesn't know
+    if it is done for an unsigned or signed type, but the caller in this
+    case knows that very well, so I've done the extension based on sgn
+    in the caller.  E.g. 0x5b rotated right (or left) by 4 with width 8
+    previously gave 0xb5, but sgn == SIGNED in widest_int it should be
+    0xffffffff....fffb5 instead.
+    
+    2023-05-09  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109778* wide-int.h (wi::lrotate, wi::rrotate): Call wi::lrshift on
+            wi::zext (x, width) rather than x if width != precision, rather
+            than using wi::zext (right, width) after the shift.
+            * tree-ssa-ccp.c (bit_value_binop): Call wi::ext on the results
+            of wi::lrotate or wi::rrotate.
+    
+            * gcc.c-torture/execute/pr109778.c: New test.
+    
+    (cherry picked from commit a8302d2a4669984c7c287d12ef5b37cde6699c80)
+
+- User: GCC Commits | Time: 2023-05-09 11:04:43 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:5aa649c98dcf58240299029f7dce02ee29ba6296commitr11-10754-g5aa649c98dcf58240299029f7dce02ee29ba6296Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 9 12:14:18 2023 +0200
+
+    testsuite: Add further testcase for already fixed PR [PR109778]
+    
+    I came up with a testcase which reproduces all the way tor10-7469.
+    LTO to avoid early inlining it, so that ccp handles rotates and not
+    shifts before they are turned into rotates.
+    
+    2023-05-09  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109778* gcc.dg/lto/pr109778_0.c: New test.
+            * gcc.dg/lto/pr109778_1.c: New file.
+    
+    (cherry picked from commit c2cf2dc988eb93551fa1c01d3f8d73ef21f39dc5)
+
+- User: GCC Commits | Time: 2023-05-09 11:10:06 UTC
+  Text: The releases/gcc-10 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:f06a5c09287ad4606872403c6f8b01d1fe2f5540commitr10-11398-gf06a5c09287ad4606872403c6f8b01d1fe2f5540Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 9 12:10:07 2023 +0200
+
+    tree-ssa-ccp, wide-int: Fix up handling of [LR]ROTATE_EXPR in bitwise ccp [PR109778]
+    
+    The following testcase is miscompiled, because bitwise ccp2 handles
+    a rotate with a signed type incorrectly.
+    Seems tree-ssa-ccp.cc has the only callers of wi::[lr]rotate with 3
+    arguments, all other callers just rotate in the right precision and
+    I think work correctly.  ccp works with widest_ints and so rotations
+    by the excessive precision certainly don't match what it wants
+    when it sees a rotate in some specific bitsize.  Still, if it is
+    unsigned rotate and the widest_int is zero extended from width,
+    the functions perform left shift and logical right shift on the value
+    and then at the end zero extend the result of left shift and uselessly
+    also the result of logical right shift and return | of that.
+    On the testcase we the signed char rrotate by 4 argument is
+    CONSTANT -75 i.e. 0xffffffff....fffffb5 with mask 2.
+    The mask is correctly rotated to 0x20, but because the 8-bit constant
+    is sign extended to 192-bit one, the logical right shift by 4 doesn't
+    yield expected 0xb, but gives 0xfffffffffff....ffffb, and then
+    return wi::zext (left, width) | wi::zext (right, width); where left is
+    0xfffffff....fb50, so we return 0xfb instead of the expected
+    0x5b.
+    
+    The following patch fixes that by doing the zero extension in case of
+    the right variable before doing wi::lrshift rather than after it.
+    
+    Also, wi::[lr]rotate widht width < precision always zero extends
+    the result.  I'm afraid it can't do better because it doesn't know
+    if it is done for an unsigned or signed type, but the caller in this
+    case knows that very well, so I've done the extension based on sgn
+    in the caller.  E.g. 0x5b rotated right (or left) by 4 with width 8
+    previously gave 0xb5, but sgn == SIGNED in widest_int it should be
+    0xffffffff....fffb5 instead.
+    
+    2023-05-09  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109778* wide-int.h (wi::lrotate, wi::rrotate): Call wi::lrshift on
+            wi::zext (x, width) rather than x if width != precision, rather
+            than using wi::zext (right, width) after the shift.
+            * tree-ssa-ccp.c (bit_value_binop): Call wi::ext on the results
+            of wi::lrotate or wi::rrotate.
+    
+            * gcc.c-torture/execute/pr109778.c: New test.
+    
+    (cherry picked from commit a8302d2a4669984c7c287d12ef5b37cde6699c80)
+
+- User: GCC Commits | Time: 2023-05-09 11:10:11 UTC
+  Text: The releases/gcc-10 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d68d989286340c20bc0f713addf44dc0f0d77ac3commitr10-11399-gd68d989286340c20bc0f713addf44dc0f0d77ac3Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue May 9 12:14:18 2023 +0200
+
+    testsuite: Add further testcase for already fixed PR [PR109778]
+    
+    I came up with a testcase which reproduces all the way tor10-7469.
+    LTO to avoid early inlining it, so that ccp handles rotates and not
+    shifts before they are turned into rotates.
+    
+    2023-05-09  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/109778* gcc.dg/lto/pr109778_0.c: New test.
+            * gcc.dg/lto/pr109778_1.c: New file.
+    
+    (cherry picked from commit c2cf2dc988eb93551fa1c01d3f8d73ef21f39dc5)
+
+- User: Jakub Jelinek | Time: 2023-05-21 16:56:56 UTC
+  Text: Fixed.
+

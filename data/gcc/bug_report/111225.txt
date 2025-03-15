@@ -1,0 +1,130 @@
+Bug Summary: ICE in curr_insn_transform, unable to generate reloads for xor, since r14-2447-g13c556d6ae84be
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code, ra
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Martin Jambor | Time: 2023-08-29 13:01:23 UTC
+  Text: On GCC 14 development master, since revisionr14-2447-g13c556d6ae84be, I get
+an ICE when compiling our testcase
+gcc/testsuite/gcc.target/i386/avx-vptest-5.c with options -fsanitize=thread
+-O1 -mforce-drap -mavx512cd:
+
+$ ~/gcc/small/inst/bin/gcc /home/mjambor/gcc/trunk/src/gcc/testsuite/gcc.target/i386/avx-vptest-5.c -fsanitize=thread -O1 -mforce-drap -mavx512cd
+/home/mjambor/gcc/trunk/src/gcc/testsuite/gcc.target/i386/avx-vptest-5.c: In function ‘foo’:
+/home/mjambor/gcc/trunk/src/gcc/testsuite/gcc.target/i386/avx-vptest-5.c:10:1: error: unable to generate reloads for:
+   10 | }
+      | ^
+(insn 11 10 12 2 (set (reg:V4DI 91)
+        (xor:V4DI (mem/c:V4DI (plus:DI (reg/f:DI 19 frame)
+                    (const_int -80 [0xffffffffffffffb0])) [1 %sfp+-64 S32 A256])
+            (const_vector:V4DI [
+                    (const_int -1 [0xffffffffffffffff]) repeated x4
+                ]))) "/home/mjambor/gcc/trunk/src/gcc/testsuite/gcc.target/i386/avx-vptest-5.c":8:19 6853 {*one_cmplv4di2}   
+     (expr_list:REG_DEAD (reg/v:V4DI 89 [ y ])
+        (nil)))
+during RTL pass: reload
+/home/mjambor/gcc/trunk/src/gcc/testsuite/gcc.target/i386/avx-vptest-5.c:10:1: internal compiler error: in curr_insn_transform, at lra-constraints.cc:4259
+0x7cd910 _fatal_insn(char const*, rtx_def const*, char const*, int, char const*)
+        /home/mjambor/gcc/small/src/gcc/rtl-error.cc:108
+0x7a42c0 curr_insn_transform
+        /home/mjambor/gcc/small/src/gcc/lra-constraints.cc:4259
+0xdcda7e lra_constraints(bool)
+        /home/mjambor/gcc/small/src/gcc/lra-constraints.cc:5430
+0xdb99c2 lra(_IO_FILE*)
+        /home/mjambor/gcc/small/src/gcc/lra.cc:2396
+0xd715f1 do_reload
+        /home/mjambor/gcc/small/src/gcc/ira.cc:5967
+0xd715f1 execute
+        /home/mjambor/gcc/small/src/gcc/ira.cc:6153
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+
+
+As noted earlier, I have bisected this down to:
+
+commit 13c556d6ae84be3ee2bc245a56eafa58221de86a (HEAD)
+Author: liuhongt <hongtao.liu@intel.com>
+Date:   Thu Jun 29 14:25:28 2023 +0800
+
+    Break false dependence for vpternlog by inserting vpxor or setting constraint of input operand to '0'
+
+    False dependency happens when destination is only updated by
+    pternlog. There is no false dependency when destination is also used
+    in source. So either a pxor should be inserted, or input operand
+    should be set with constraint '0'.
+
+    gcc/ChangeLog:PR target/110438PR target/110202* config/i386/predicates.md
+            (int_float_vector_all_ones_operand): New predicate.
+            * config/i386/sse.md (*vmov<mode>_constm1_pternlog_false_dep): New
+            define_insn.
+            (*<avx512>_cvtmask2<ssemodesuffix><mode>_pternlog_false_dep):
+            Ditto.
+            (*<avx512>_cvtmask2<ssemodesuffix><mode>_pternlog_false_dep):
+            Ditto.
+            (*<avx512>_cvtmask2<ssemodesuffix><mode>): Adjust to
+            define_insn_and_split to avoid false dependence.
+            (*<avx512>_cvtmask2<ssemodesuffix><mode>): Ditto.
+            (<mask_codefor>one_cmpl<mode>2<mask_name>): Adjust constraint
+            of operands 1 to '0' to avoid false dependence.
+            (*andnot<mode>3): Ditto.
+            (iornot<mode>3): Ditto.
+            (*<nlogic><mode>3): Ditto.
+
+- User: Hongtao.liu | Time: 2023-08-30 02:12:27 UTC
+  Text: So reload thought CT_SPECIAL_MEMORY is always win for spilled_pesudo_p, but here Br should be a vec_dup:mem which doesn't match spilled_pseduo_p.
+ 
+		    case CT_SPECIAL_MEMORY:
+		      if (satisfies_memory_constraint_p (op, cn))
+			win = true;
+		      else if (spilled_pseudo_p (op))
+			win = true;
+		      break;
+
+- User: Hongtao.liu | Time: 2023-08-30 02:16:44 UTC
+  Text: (In reply to Hongtao.liu fromcomment #1)> So reload thought CT_SPECIAL_MEMORY is always win for spilled_pesudo_p, but
+> here Br should be a vec_dup:mem which doesn't match spilled_pseduo_p.
+>  
+> 		    case CT_SPECIAL_MEMORY:
+> 		      if (satisfies_memory_constraint_p (op, cn))
+> 			win = true;
+> 		      else if (spilled_pseudo_p (op))
+> 			win = true;
+> 		      break;vmBr constraint is ok as long as m is matched before Br, but here m in invalid then exposed the problem.
+The backend walkaround is disabling Br when m is not availble.
+
+Or the middle-end fix should be removing win for spilled_pseudo_p (op) in CT_SPECIAL_MEMORY.
+
+- User: Vladimir Makarov | Time: 2023-08-30 21:31:12 UTC
+  Text: I've reproduced the bug.
+
+Just removing `else if (spilled_pseudo_p (op))` for CT_SPECIAL_MEMORY will break a lot targets but this is right that this code is a reason for the bug.
+
+I have ideas how to fix it and I'll fix it on the next week.
+
+- User: GCC Commits | Time: 2023-09-07 14:04:41 UTC
+  Text: The master branch has been updated by Vladimir Makarov <vmakarov@gcc.gnu.org>:https://gcc.gnu.org/g:f7bca44d97ad01b39f9d6e7809df7bf517eeb2fbcommitr14-3783-gf7bca44d97ad01b39f9d6e7809df7bf517eeb2fbAuthor: Vladimir N. Makarov <vmakarov@redhat.com>
+Date:   Thu Sep 7 09:59:10 2023 -0400
+
+    [LRA]: Don't reuse chosen insn alternative with special memory constraint
+    
+    To speed up GCC, LRA reuses chosen alternative from previous
+    constraint subpass.  A spilled pseudo is considered ok for any memory
+    constraint although stack slot assigned to the pseudo later might not
+    satisfy the chosen alternative constraint.  As we don't consider all insn
+    alternatives on the subsequent LRA sub-passes, it might result in LRA failure
+    to generate the correct insn.  This patch solves the problem.
+    
+    gcc/ChangeLog:PR target/111225* lra-constraints.cc (goal_reuse_alt_p): New global flag.
+            (process_alt_operands): Set up the flag.  Clear flag for chosen
+            alternative with special memory constraints.
+            (process_alt_operands): Set up used insn alternative depending on the flag.
+    
+    gcc/testsuite/ChangeLog:PR target/111225* gcc.target/i386/pr111225.c: New test.
+
+- User: Hongtao Liu | Time: 2023-11-30 10:46:26 UTC
+  Text: .
+

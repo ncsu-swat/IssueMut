@@ -1,0 +1,232 @@
+Bug Summary: [11/12/13/14 Regression] ICE in cp with -O2 -fno-tree-fre
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 9.5.0
+Known to Fail: 10.1.0, 10.5.0, 11.3.0, 12.2.0, 13.2.0
+
+Comments:
+- User: wierton | Time: 2023-10-22 16:38:25 UTC
+  Text: Compiler Explorer: [https://gcc.godbolt.org/z/EoPGKa9r8](https://gcc.godbolt.org/z/EoPGKa9r8)
+
+The code that triggers the crash is somewhat extensive. I've attempted to minimize it, but the underlying cause seems to be complex. Here's the code:
+
+```c
+void f2(void);
+struct T1 { int w; };
+struct T2 { struct T1 *wi; int a; } v;
+
+static int f1(dpy, wi)
+    struct T3 *dpy;
+    struct T1 *wi;
+{
+  (v.a = v.wi->w) || (v.a = v.wi->w);
+  f2();
+}
+
+static void f3(int wi, int c) {
+  int b = f1(0, ~wi);
+  fn4(0, 0, v.a);
+}
+
+void f5() { f3(0, 0); }
+```
+
+Compiling this program with `-O2 -fno-tree-fre` causes GCC to crash.
+
+Some interesting observations about this crash:
+1. The crash only occurs when the function `f1` is declared using the old-style function declaration. If it is converted to the modern style, the crash doesn't occur.
+2. If any statement in the code is commented out, even if it's just half of the logic or expression inside `f1`, the crash disappears.
+
+The full stack dump:
+```
+<source>: In function 'f3':
+<source>:15:3: warning: implicit declaration of function 'fn4' [-Wimplicit-function-declaration]
+   15 |   fn4(0, 0, v.a);
+      |   ^~~
+during IPA pass: cp
+<source>: At top level:
+<source>:18:1: internal compiler error: in decompose, at wide-int.h:1049
+   18 | void f5() { f3(0, 0); }
+      | ^~~~
+0x231f49e internal_error(char const*, ...)
+	???:0
+0xa00958 fancy_abort(char const*, int, char const*)
+	???:0
+0x103701e range_operator::wi_fold_in_parts(irange&, tree_node*, generic_wide_int<wide_int_storage> const&, generic_wide_int<wide_int_storage> const&, generic_wide_int<wide_int_storage> const&, generic_wide_int<wide_int_storage> const&) const
+	???:0
+0x1037b64 range_operator::fold_range(irange&, tree_node*, irange const&, irange const&, relation_trio) const
+	???:0
+0x1023768 operator_bitwise_not::fold_range(irange&, tree_node*, irange const&, irange const&, relation_trio) const
+	???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+```
+
+- User: wierton | Time: 2023-10-22 16:39:10 UTC
+  Text: Compiler Explorer:https://gcc.godbolt.org/z/EoPGKa9r8The link above seems broken.
+
+- User: Andrew Pinski | Time: 2023-10-22 16:41:41 UTC
+  Text: Confirmed.
+
+- User: Martin Jambor | Time: 2023-10-23 16:51:26 UTC
+  Text: I'm adding this to the things to look at.  But if our bisecting script is correct te ICE has been introduced byr10-3604-g38a734350fd787, so let me CC Aldy as well.
+
+- User: Jakub Jelinek | Time: 2023-11-22 14:27:14 UTC
+  Text: Slightly cleaned up:
+void f2 (void);
+void f4 (int, int, int);
+struct A { int a; };
+struct B { struct A *b; int c; } v;
+
+static int
+f1 (x, y)
+  struct C *x;
+  struct A *y;
+{
+  (v.c = v.b->a) || (v.c = v.b->a);
+  f2 ();
+}
+
+static void
+f3 (int x, int y)
+{
+  int b = f1 (0, ~x);
+  f4 (0, 0, v.c);
+}
+
+void
+f5 (void)
+{
+  f3 (0, 0);
+}
+
+The problem is in the f1 call, given it uses the K&R definition style and the caller invokes UB by using incompatible types (int vs. pointers), I think IPA-VRP should punt somewhere on the type mismatch.
+
+I think
+      Value_Range vr (operand_type);
+      if (TREE_CODE_CLASS (operation) == tcc_unary)
+        ipa_vr_operation_and_type_effects (vr,
+                                           src_lats->m_value_range.m_vr,
+                                           operation, param_type,
+                                           operand_type);
+should be avoided if param_type is not a compatible type to operand_type, unless operation is some cast operation (NOP_EXPR, CONVERT_EXPR, dunno if the float to integral or vice versa ops as well but vrp probably doesn't handle that yet).
+In the above case, param_type is struct A *, i.e. pointer, while operand_type is int.
+
+- User: Andrew Macleod | Time: 2023-11-22 16:25:33 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #4)> 
+> I think
+>       Value_Range vr (operand_type);
+>       if (TREE_CODE_CLASS (operation) == tcc_unary)
+>         ipa_vr_operation_and_type_effects (vr,
+>                                            src_lats->m_value_range.m_vr,
+>                                            operation, param_type,
+>                                            operand_type);
+> should be avoided if param_type is not a compatible type to operand_type,
+> unless operation is some cast operation (NOP_EXPR, CONVERT_EXPR, dunno if
+> the float to integral or vice versa ops as well but vrp probably doesn't
+> handle that yet).
+> In the above case, param_type is struct A *, i.e. pointer, while
+> operand_type is int.the root of the issue is that the precisions are different, and we're invoking an operation which expects the precisions to be the same (minus in this case).   we can't deal with this in dispatch because some operations allow the LH and RH to be different precisions or even types.
+
+It also seems like overkill to have every operation check the incoming precision, but perhaps not... we could limit it to the wi_fold() subsets.. let me have a look. if we get incompatible types, perhaps returning VARYING should be OK?
+
+- User: Jakub Jelinek | Time: 2023-11-22 16:32:40 UTC
+  Text: I don't know the IPA code enough to know whether different operand_type vs. param_type (in the !types_compatible_p sense) means just user bug (in that case returning VARYING is perfectly fine), or if it can happen also on valid code, where say caller has one type of argument and callee a different and there is an implicit (or explicit) cast in between the two.  The latter case would be nice to get handled without giving up.
+I mean something like
+void
+foo (int x)
+{
+  asm volatile ("" : "+r" (x));
+}
+
+void
+bar (long x)
+{
+  foo (x);
+}
+
+void
+baz (long x)
+{
+  if (x < -42 || x >= 185)
+    return;
+  bar (x);
+}
+kind of thing (but making sure we don't inline and IPA-VRP tries to propagate something etc.).
+
+- User: Andrew Macleod | Time: 2023-11-22 17:29:44 UTC
+  Text: Explicit casts would be no problem as they go through the proper machinery. The IL for that case has an explicit cast in it.
+
+  _1 = (int) x_2(D);
+  foo (_1);
+
+its when that cast is not present,and we try to, say subtract two values, that we have a problem.  we expect the compiler to promote things to be compatible when they are suppose to be. This would apply to dual operand arithmetic like +, -, /, *, bitwise ops, etc.
+
+The testcase in particular is a bitwise not... but it has a return type that is 64 bits and a operand type that is 32.  It was expected that the compiler would promote the operand to 64 bits if it expects a 64 bit result. At least for those tree codes which expect compatible types..
+
+I don't think we want to get into overruling decisions at the range-ops level..  So we decide whether to trap (which would be the same result as we see now :-P), or handle it some other way.  returning VARYING was my thought.. because it means something is amuck so say we dont know anything.
+
+Alternatively, if IPA could figure out when things need promoting..  GCC must already do it, although I suppose thats in the front ends :-P
+
+- User: Jakub Jelinek | Time: 2023-11-22 17:34:59 UTC
+  Text: (In reply to Andrew Macleod fromcomment #7)> Alternatively, if IPA could figure out when things need promoting..  GCC
+> must already do it, although I suppose thats in the front ends :-PWell, in this case the user explicitly told compiler not to do that by not using a prototype and syntax which doesn't provide one from the definition.
+It is like using
+int f1 (struct C *x, struct A *y)
+{
+  ...
+}
+definition in one TU, and
+int f1 (int, int);
+prototype and
+f1 (0, ~x)
+call in another one + using LTO.  What I meant is how to do decide if the param_type vs. operand_type mismatch is ok or not.
+
+- User: Andrew Macleod | Time: 2023-11-22 17:42:11 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #8)> Well, in this case the user explicitly told compiler not to do that by not
+> using a prototype and syntax which doesn't provide one from the definition.
+> It is like using
+> int f1 (struct C *x, struct A *y)
+> {
+>   ...
+> }
+> definition in one TU, and
+> int f1 (int, int);
+> prototype and
+> f1 (0, ~x)
+> call in another one + using LTO.  What I meant is how to do decide if the
+> param_type vs. operand_type mismatch is ok or not.I vote we do nothing extra for those clowns! Just return VARYING for a range :-)
+
+it seems like the safest thing to do?
+
+- User: GCC Commits | Time: 2023-11-29 16:51:48 UTC
+  Text: The master branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:634cf26c94de620e66aa124b8ec4d6c2be4b74b2commitr14-5973-g634cf26c94de620e66aa124b8ec4d6c2be4b74b2Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Tue Nov 28 13:02:35 2023 -0500
+
+    Check operands before invoking fold_range.
+    
+    Call check_operands_p before fold_range to make sure it is a valid operation.PR tree-optimization/111922gcc/
+            * ipa-cp.cc (ipa_vr_operation_and_type_effects): Check the
+            operands are valid before calling fold_range.
+    
+            gcc/testsuite/
+            * gcc.dg/pr111922.c: New.
+
+- User: Andrew Macleod | Time: 2023-11-29 16:52:52 UTC
+  Text: fixed.
+
+- User: Sam James | Time: 2023-11-29 23:22:00 UTC
+  Text: Is the plan to backport to 11/12/13 or to leave it?
+
+- User: Andrew Macleod | Time: 2023-11-30 18:31:09 UTC
+  Text: Createdattachment 56735[details]patch
+
+(In reply to Sam James fromcomment #12)> Is the plan to backport to 11/12/13 or to leave it?hmm. I don't think I would apply the same patch  (it wouldn't work as is anyway), but if we wanted to fix this in earlier releases we could simply have the custom fold_ranges return false when the precision doesn't match...  it would at least avoid most of these traps in earlier releases...?
+
+The attached patch for instance would probably apply to GCC 13, 12 and 11..   
+I  can test these if we want to do that...
+

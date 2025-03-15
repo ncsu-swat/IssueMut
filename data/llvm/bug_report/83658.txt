@@ -1,0 +1,107 @@
+Issue Title: Type definitions should be allowed inside of the offsetof type
+Original Post: Clang does not accept type definitions inside of the type provided to offsetof. However, I don't see any wording which forbids this. Here is an example program (Clang 16 and newer don't seem to accept this):
+
+```c
+#include<stddef.h>
+int main(void){
+    offsetof(struct{int a;},a);
+}
+```
+
+There was a proposal (N2350) which added some text to make this UB, but that has been changed since by DE-137 (N3148) which removes this restriction and only makes it UB if there is an unparenthesized comma inside of offsetof. N3167 includes discussion about accepting DE-137.
+
+Comment by llvmbot: 
+@llvm/issue-subscribers-clang-frontend
+
+Author: None (Halalaluyafail3)
+
+<details>
+Clang does not accept type definitions inside of the type provided to offsetof. However, I don't see any wording which forbids this. Here is an example program (Clang 16 and newer don't seem to accept this):
+
+```c
+#include&lt;stddef.h&gt;
+int main(void){
+    offsetof(struct{int a;},a);
+}
+```
+
+There was a proposal (N2350) which added some text to make this UB, but that has been changed since by DE-137 (N3148) which removes this restriction and only makes it UB if there is an unparenthesized comma inside of offsetof. N3167 includes discussion about accepting DE-137.
+</details>
+
+Comment by Sirraide: So C23 makes this UB. Furthermore, the C++ standard [cstddef.syn] states that ‘The contents and meaning of the header `<cstddef>` are the same as the C standard library header `<stddef.h>`’, and [support.types.layout] states that ‘The macro `offsetof(type, member-designator)` has the same semantics as the corresponding macro in the C standard library header `<stddef.h>`’.
+
+I would interpret this to mean that it’s definitely UB now; and even though it wasn’t UB before, I don’t think there is a particularly strong case for supporting type definitions in `offsetof` (at least I don’t see much of a use case for this, but correct me if I’m wrong). GCC doesn’t accept this either, and MSVC straight-up ICEs.
+
+@AaronBallman Do you think it would make sense to support this?
+Comment by Sirraide: > that has been changed since by DE-137 (N3148) which removes this restriction
+
+Hmm, that’s a good point; the version of the C standard I was checking seems to be from January 2023.
+Comment by Sirraide: (Also, my comments are all wrt C++ in case that’s not clear; we *do* in fact support this in C)
+Comment by shafik: I can not reproduce this: https://godbolt.org/z/4813W317z
+Comment by Halalaluyafail3: > we *do* in fact support this in C
+
+When I tried it, it was generating an error from -pedantic-errors saying that it was a Clang extension: https://godbolt.org/z/co8sWWjoP
+Comment by Sirraide: > I can not reproduce this: https://godbolt.org/z/4813W317z
+
+Yeah, Clang and GCC both seem to support it in C; it’s in C++ that you get an error about it. (and apparently in C w/ `-pedantic-errors`)
+Comment by pinskia: Note I know this works in C for both clang and GCC because GCC/binutils/gdb's libiberty/sha1.c contains this kind of code. See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109398 there. Yes GCC should remove it but nobody has got around to it yet ...
+Comment by AaronBallman: Prior to C23, this was an extension (UB by omission) which is why we diagnose in `-pedantic` mode. In C23, this is now allowed only so long as the type doesn't include any commas. We need the code to continue to work in C mode, but the pedantic diagnostic should be changed. In C23 and later, it should be silenced and in C17 and earlier, it should call it a C23 extension instead of a GNU extension.
+
+In C++, it is an error to define a type where a type specifier is required unless a defining type specifier is allowed (https://eel.is/c++draft/dcl.dcl#nt:defining-type-specifier).
+Comment by frederick-vs-ja: > Prior to C23, this was an extension (UB by omission) which is why we diagnose in `-pedantic` mode. In C23, this is now allowed only so long as the type doesn't include any commas.
+
+The wording changes seemingly only added a new kind of UB.
+
+C17
+> (If the specified specified member is bit-field, the behavior is undefined.)
+
+C23 (after N2350 and DE-137)
+> If the specified type name contains a comma not between matching parentheses or if the specified member is a bit-field, the behavior is undefined.
+
+@AaronBallman But according to your reading UB is reduced, which looks somehow paradoxical.
+Comment by Halalaluyafail3: If this was UB prior to C23 because no mention of it being valid was made, would using `va_arg` with a type definition inside of it be UB as well? For example: `va_arg(v,struct{int a;})` or `va_arg(v,typeof(int(*)[sizeof(struct{int a;})]))`
+Comment by AaronBallman: > > Prior to C23, this was an extension (UB by omission) which is why we diagnose in `-pedantic` mode. In C23, this is now allowed only so long as the type doesn't include any commas.
+> 
+> The wording changes seemingly only added a new kind of UB.
+> 
+> C17
+> 
+> > (If the specified specified member is bit-field, the behavior is undefined.)
+> 
+> C23 (after N2350 and DE-137)
+> 
+> > If the specified type name contains a comma not between matching parentheses or if the specified member is a bit-field, the behavior is undefined.
+> 
+> @AaronBallman But according to your reading UB is reduced, which looks somehow paradoxical.
+
+The UB has been made explicit and reduced. It used to be UB to define a type at all. Now it's not UB to define a type unless the type has a comma in its definition.
+
+> If this was UB prior to C23 because no mention of it being valid was made, would using `va_arg` with a type definition inside of it be UB as well? For example: `va_arg(v,struct{int a;})` or `va_arg(v,typeof(int(*)[sizeof(struct{int a;})]))`
+
+Yes (often) and no/maybe.
+
+Maybe not UB: `The parameter type shall be an object type name.`
+In C, unlike C++, we have a confusing form of specification where grammar terms in prose are not unambiguously spelled as grammar terms. e.g., `type-name` is the grammar term, and `type name` is the term referencing the grammar from prose. If this is intended to be read as a grammar term in prose, then defining a type is allowed and will have the exact same issue as with `offsetof`. I think there's a standards defect here in that case. If this is not intended to be read as a grammar term in prose, then the signature of the macro uses `type` which isn't a grammar term and thus it would be UB (by omission) to define a type there.
+
+Yes, often UB: defining a type in `va_arg` is dangerous in that it's up to the type compatibility rules as to whether the caller of the variadic function is passing in a type that's compatible with the one being defined in the `va_arg` macro. e.g., this is definitely UB:
+```
+void func(int a, ...) {
+  va_list list;
+  va_start(list);
+  auto blah = va_arg(list, struct S { int a; });
+  va_end(list);
+}
+
+void caller() {
+  struct S {
+    int b; // note how the name of this field is different from the name in func().
+  } s;
+  func(10, s);
+}
+```
+
+
+Comment by Halalaluyafail3: Yeah it would be pretty hard to use a `va_arg` expression that includes such a structure type. Even if you name the member `a` in caller it would still be UB because two structure types can't be compatible in the same translation unit. The only way to make this work would be to have two separate translation units or to use recursion so that the name of the structure type could be visible. Perhaps using a pointer type would be a better example, since it would be OK to pass `nullptr` if the representation and alignment requirements of pointers to structures were the same as pointers to void.
+Comment by AaronBallman: > Yeah it would be pretty hard to use a `va_arg` expression that includes such a structure type. Even if you name the member `a` in caller it would still be UB because two structure types can't be compatible in the same translation unit.
+
+We actually relaxed that in C23: https://www.open-std.org/jtc1/sc22/wg14/www/docs/n3037.pdf, so it's a bit more plausible.

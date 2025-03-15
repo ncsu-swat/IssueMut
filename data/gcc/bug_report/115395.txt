@@ -1,0 +1,120 @@
+Bug Summary: [15 regression] libarchive miscompiled with -O2 -march=znver2 -fno-vect-cost-model since r15-1006-gd93353e6423eca
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sam James | Time: 2024-06-08 12:24:29 UTC
+  Text: Createdattachment 58382[details]bad.c
+
+libarchive fails several tests with -O3 -march=znver2 -fno-vect-cost-model. I picked 'libarchive_test_read_format_rar_multivolume_seek_data' to reduce.
+
+```
+$ gcc-15 test.c -o /tmp/test -O2 -march=znver2 && /tmp/test ; echo $?
+0
+
+$ gcc-15 test.c -o /tmp/test -O2 -fno-vect-cost-model -march=znver2 && /tmp/test && echo $?
+aborting on wrong offset=214
+Aborted (core dumped)
+134
+```
+
+--
+
+Using built-in specs.
+COLLECT_GCC=gcc
+COLLECT_LTO_WRAPPER=/usr/libexec/gcc/x86_64-pc-linux-gnu/15/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /var/tmp/portage/sys-devel/gcc-15.0.9999/work/gcc-15.0.9999/configure --host=x86_64-pc-linux-gnu --build=x86_64-pc-linux-gnu --prefix=/usr --bindir=/usr/x86_64-pc-linux-gnu/gcc-bin/15 --includedir=/usr/lib/gcc/x86_64-pc-linux-gnu/15/include --datadir=/usr/share/gcc-data/x86_64-pc-linux-gnu/15 --mandir=/usr/share/gcc-data/x86_64-pc-linux-gnu/15/man --infodir=/usr/share/gcc-data/x86_64-pc-linux-gnu/15/info --with-gxx-include-dir=/usr/lib/gcc/x86_64-pc-linux-gnu/15/include/g++-v15 --disable-silent-rules --disable-dependency-tracking --with-python-dir=/share/gcc-data/x86_64-pc-linux-gnu/15/python --enable-languages=c,c++,fortran,rust --enable-obsolete --enable-secureplt --disable-werror --with-system-zlib --enable-nls --without-included-gettext --disable-libunwind-exceptions --enable-checking=yes,extra,rtl --with-bugurl=https://bugs.gentoo.org/--with-pkgversion='Gentoo Hardened 15.0.9999 p, commit 9a866462097fe24696c924a3874fd307c775e860' --with-gcc-major-version-only --enable-libstdcxx-time --enable-lto --disable-libstdcxx-pch --enable-shared --enable-threads=posix --enable-__cxa_atexit --enable-clocale=gnu --enable-multilib --with-multilib-list=m32,m64 --disable-fixed-point --enable-targets=all --enable-libgomp --disable-libssp --disable-libada --disable-cet --disable-systemtap --enable-valgrind-annotations --disable-vtable-verify --disable-libvtv --with-zstd --with-isl --disable-isl-version-check --enable-default-pie --enable-host-pie --enable-host-bind-now --enable-default-ssp --disable-fixincludes --with-build-config='bootstrap-O3 bootstrap-lto'
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 15.0.0 20240607 (experimental) a3d68b5155018817dd7eef5abbaeadf3959b8e5e (Gentoo Hardened 15.0.9999 p, commit 9a866462097fe24696c924a3874fd307c775e860)
+
+- User: Andrew Pinski | Time: 2024-06-08 12:37:52 UTC
+  Text: Confirmed.
+
+Looks like it is doing the add twice:
+```
+  vect_offset_14.29_104 = _84 + vect__18.28_103;
+  _106 = .REDUC_PLUS (vect_offset_14.29_104);
+  _107 = offset_9 + _106;
+```
+
+Once before the reduction and once after.
+
+- User: Sam James | Time: 2024-06-08 13:45:13 UTC
+  Text: r15-1006-gd93353e6423eca
+
+- User: Sam James | Time: 2024-06-08 16:11:42 UTC
+  Text: Tidied up a bit:
+```
+struct {
+  long header_size;
+  long start_offset;
+  long end_offset;
+} myrar_dbo[5] = {{0, 87, 6980}, {0, 7087, 13980}, {0, 14087, 0}};
+
+int i;
+long offset;
+
+int main() {
+  offset += myrar_dbo[0].start_offset;
+  while (i < 2) {
+    i++;
+    offset += myrar_dbo[i].start_offset - myrar_dbo[i - 1].end_offset;
+  }
+  if (offset != 301)
+    __builtin_abort();
+}
+```
+
+- User: Richard Biener | Time: 2024-06-10 06:39:01 UTC
+  Text: Mine.
+
+- User: Richard Biener | Time: 2024-06-10 07:31:51 UTC
+  Text: It needs epilogue vectorization to trigger and it's the path re-using the
+vector accumulator from the earlier loop that goes wrong when the main
+vector loop is skipped.
+
+We apply the initial value adjustment to the scalar result but the
+continuation fails to do this and the epilogue vector epilogue expects
+the earlier code to have done it.
+
+IIRC we force "optimization" of this to be disabled but obviously somehow
+fail to do this for SLP.
+
+- User: Richard Biener | Time: 2024-06-10 08:03:14 UTC
+  Text: In fact, the main loop ends up not using SLP but the epilogue one does and
+we end up setting STMT_VINFO_REDUC_EPILOGUE_ADJUSTMENT which we do not
+support for SLP.
+
+The question is whether to add that support or simply fail (but this is
+code generation).  It's probably easiest to transitionally implement
+support and rip it out again later.
+
+- User: GCC Commits | Time: 2024-06-10 09:39:00 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:4ed9c5df7efeb98e190573cca42a4fd40666c45fcommitr15-1160-g4ed9c5df7efeb98e190573cca42a4fd40666c45fAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Jun 10 10:12:52 2024 +0200
+
+    tree-optimization/115395 - wrong-code with SLP reduction in epilog
+    
+    When we continue a non-SLP reduction from the main loop in the
+    epilog with a SLP reduction we currently fail to handle an
+    adjustment by the initial value because that's not a thing with SLP.
+    As long as we have the possibility to mix SLP and non-SLP we have
+    to handle it though.PR tree-optimization/115395* tree-vect-loop.cc (vect_create_epilog_for_reduction):
+            Handle STMT_VINFO_REDUC_EPILOGUE_ADJUSTMENT also for SLP
+            reductions of group_size one.
+    
+            * gcc.dg/vect/pr115395.c: New testcase.
+
+- User: Richard Biener | Time: 2024-06-10 09:49:55 UTC
+  Text: Fixed.
+
+- User: Sam James | Time: 2024-06-10 11:20:29 UTC
+  Text: Thanks for the quick fix! We had another issue which bisected to the same, but it was far harder to reduce so we decided to wait. Hopefully fixed by this too.
+

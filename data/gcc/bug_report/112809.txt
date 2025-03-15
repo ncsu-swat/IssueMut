@@ -1,0 +1,113 @@
+Bug Summary: during GIMPLE pass: bitintlower ICE: in limb_access_type, at gimple-lower-bitint.cc:563 at -O1 and above
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-12-01 11:05:59 UTC
+  Text: Createdattachment 56752[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O testcase.c 
+during GIMPLE pass: bitintlower
+testcase.c: In function 'foo':
+testcase.c:6:1: internal compiler error: in limb_access_type, at gimple-lower-bitint.cc:563
+    6 | foo (void)
+      | ^~~
+0xd520e1 limb_access_type
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:563
+0x2535e97 limb_access_type
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:559
+0x2535e97 limb_access
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:578
+0x2546609 lower_mergeable_stmt
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:2693
+0x254af8d lower_stmt
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:5265
+0x254d626 gimple_lower_bitint
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:6394
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-6051-20231201105652-gb1fe98dee21-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-6051-20231201105652-gb1fe98dee21-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20231201 (experimental) (GCC)
+
+- User: Zdenek Sojka | Time: 2023-12-04 19:42:22 UTC
+  Text: Createdattachment 56791[details]a simpler testcase using only two variables
+
+$ x86_64-pc-linux-gnu-gcc -O testcase.c
+during GIMPLE pass: bitintlower
+testcase.c: In function 'foo':
+testcase.c:5:1: internal compiler error: in limb_access_type, at gimple-lower-bitint.cc:563
+    5 | foo (void)
+      | ^~~
+0xd52c07 limb_access_type
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:563
+0x25351a7 limb_access_type
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:559
+0x25351a7 limb_access
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:578
+0x2545989 lower_mergeable_stmt
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:2693
+0x254a30d lower_stmt
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:5268
+0x254c9a6 gimple_lower_bitint
+        /repo/gcc-trunk/gcc/gimple-lower-bitint.cc:6397
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: Jakub Jelinek | Time: 2023-12-05 18:11:40 UTC
+  Text: Createdattachment 56806[details]gcc14-pr112809.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2023-12-06 08:56:37 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:0ca64f846edce3c7b7f26bcc5978118e560e65b1commitr14-6209-g0ca64f846edce3c7b7f26bcc5978118e560e65b1Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Dec 6 09:55:30 2023 +0100
+
+    lower-bitint: Fix arithmetics followed by extension by many bits [PR112809]
+    
+    A zero or sign extension from result of some upwards_2limb operation
+    is implemented in lower_mergeable_stmt as an extra loop which fills in
+    the extra bits with 0s or 1s.
+    If the delta of extended vs. unextended bit count is small, the code
+    doesn't use a loop and emits up to a couple of stores to constant indexes,
+    but if the delta is large, it uses
+              cnt = (bo_bit != 0) + 1 + (rem != 0);
+    statements.  bo_bit is non-zero for bit-field loads and is done in that
+    case as straight line, the unconditional 1 in there is for a loop which
+    handles most of the limbs in the delta and finally (rem != 0) is for the
+    case when the extended precision is not a multiple of limb_prec and is
+    again done in straight line code (after the loop).
+    The testcase ICEs because the decision what idx to use was incorrect
+    for kind == bitint_prec_huge (i.e. when the precision delta is very large)
+    and rem == 0 (i.e. the extended precision is multiple of limb_prec).
+    In that case cnt is either 1 (if bo_bit == 0) or 2, and idx should
+    be either first size_int (start) and then result of create_loop (for bo_bit
+    != 0) or just result of create_loop, but by mistake the last case
+    was size_int (end), which means when precision is multiple of limb_prec
+    storing above the precision (which ICEs; but also not emitting the loop
+    which is needed).
+    
+    2023-12-06  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/112809* gimple-lower-bitint.cc (bitint_large_huge::lower_mergeable_stmt): For
+            separate_ext in kind == bitint_prec_huge mode if rem == 0, create for
+            i == cnt - 1 the loop rather than using size_int (end).
+    
+            * gcc.dg/bitint-48.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-12-06 09:00:45 UTC
+  Text: Should be fixed now.
+

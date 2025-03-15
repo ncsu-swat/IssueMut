@@ -1,0 +1,368 @@
+Bug Summary: [12 Regression] wrong code at -O3 on x86_64-linux-gnu since r12-2097-g9f34b780b0461e
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 10.1.0, 11.1.0, 12.3.1, 13.2.1, 14.0, 8.1.0
+Known to Fail: 12.1.0, 12.3.0, 13.2.0
+
+Comments:
+- User: Zhendong Su | Time: 2023-10-29 20:51:13 UTC
+  Text: This is a regression from 11.*, and affects 12.* and later. It should be distinct from those couple of open issues with loop splitting. 
+
+Compiler Explorer:https://godbolt.org/z/1anT983Td[573] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20231029 (experimental) (GCC) 
+[574] % 
+[574] % gcctk -O2 small.c; ./a.out
+[575] % 
+[575] % gcctk -O3 small.c; ./a.out
+Aborted
+[576] % gcctk -O3 -fno-split-loops small.c; ./a.out
+Aborted
+[577] % 
+[577] % cat small.c
+struct {
+  int : 8;
+  int a;
+} b, d[4] = {{0}, {0}, {0}, {5}};
+int c, e;
+int main() {
+  for (c = 2; c; c--)
+    for (e = 0; e < 2; e++) {
+      d[c] = b = d[c + 1];
+      d[c + 1].a = 0;
+    }
+  if (b.a != 0)
+    __builtin_abort();
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2023-10-29 21:20:54 UTC
+  Text: -fno-tree-loop-distribution fixes the issue.
+
+Looks like loop distribution is pulling out the assignment of `b = d[c + 1];` from the loop even though the loop does assignment to a field of that `d[c + 1].a = 0;`.
+
+- User: Andrew Pinski | Time: 2023-10-29 21:21:04 UTC
+  Text: Confirmed.
+
+- User: Sam James | Time: 2023-10-30 07:04:50 UTC
+  Text: Doesn't happen with -fharden-control-flow-redundancy on trunk.
+
+- User: Sam James | Time: 2023-10-30 08:57:54 UTC
+  Text: 9f34b780b0461ec7b2b2defe96e44ab616ea2aa3 is the first bad commit
+commit 9f34b780b0461ec7b2b2defe96e44ab616ea2aa3
+Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Jul 7 11:41:03 2021 +0200
+
+    tree-optimization/99728 - improve LIM for loops with aggregate copies
+
+i.e.r12-2097-g9f34b780b0461eThat commit also came up inPR111554.
+
+- User: Richard Biener | Time: 2023-10-30 14:21:11 UTC
+  Text: Possibly a mixup of dependence direction somewhere.  If c would not iterate
+backwards the transform would be correct.
+
+We compute
+
+(build_classic_dist_vector
+  dist_vector = (1 0
+  )
+
+and then possibly get partition order wrong.  With 11 we had fixes there,
+possibly this broke it.
+
+I will have a look.  At some point ...
+
+- User: Richard Biener | Time: 2023-11-14 10:38:50 UTC
+  Text: ldist distributes the loop nest where which looks like
+
+  <bb 3> [local count: 118111600]:
+  # c.6_23 = PHI <_4(9), 2(2)>
+  # ivtmp_1 = PHI <ivtmp_27(9), 2(2)>
+  _13 = c.6_23 + 1;
+
+  <bb 4> [local count: 955630224]:
+  # e.4_22 = PHI <_2(10), 0(3)>
+  # ivtmp_28 = PHI <ivtmp_3(10), 2(3)>
+  b = d[_13];
+  d[c.6_23] = b;
+  d[_13].a = 0;
+  _2 = e.4_22 + 1;
+  ivtmp_3 = ivtmp_28 - 1;
+  if (ivtmp_3 != 0)
+    goto <bb 10>; [89.00%]
+  else
+    goto <bb 5>; [11.00%]
+
+  <bb 10> [local count: 850510900]:
+  goto <bb 4>; [100.00%]
+
+  <bb 5> [local count: 118111600]:
+  _4 = c.6_23 + -1;
+  ivtmp_27 = ivtmp_1 - 1;
+  if (ivtmp_27 != 0)
+    goto <bb 9>; [89.00%]
+  else
+    goto <bb 6>; [11.00%]
+
+  <bb 9> [local count: 105119324]:
+  goto <bb 3>; [100.00%]
+
+so there is no evolution of the DR indices in the inner loop.  _4 is also
+dead and is eliminated by the transform.  -fdisable-tree-ivcanon avoids
+the dead code but doesn't change the fact we miscompile this.
+
+One interesting fact is that we have
+
+Creating dr for d[c.6_23]
+...
+        base_object: d
+        Access function 0: {2, +, -1}_1
+
+but
+
+Creating dr for d[_13].a
+...
+        base_object: d
+        Access function 0: 32
+        Access function 1: {3, +, -1}_1
+
+but we do seem to get along here, computing
+
+(compute_affine_dependence
+  ref_a: d[c.6_23], stmt_a: d[c.6_23] = b;
+  ref_b: d[_13].a, stmt_b: d[_13].a = 0;
+(analyze_overlapping_iterations
+  (chrec_a = {2, +, -1}_1)
+  (chrec_b = {3, +, -1}_1)
+(analyze_siv_subscript
+(analyze_subscript_affine_affine
+  (overlaps_a = [0 + 1 * x_1])
+  (overlaps_b = [1 + 1 * x_1]))
+)
+  (overlap_iterations_a = [0 + 1 * x_1])
+  (overlap_iterations_b = [1 + 1 * x_1]))
+(analyze_overlapping_iterations
+  (chrec_a = {3, +, -1}_1)
+  (chrec_b = {2, +, -1}_1)
+(analyze_siv_subscript
+(analyze_subscript_affine_affine
+  (overlaps_a = [1 + 1 * x_1])
+  (overlaps_b = [0 + 1 * x_1]))
+)
+  (overlap_iterations_a = [1 + 1 * x_1])
+  (overlap_iterations_b = [0 + 1 * x_1]))
+(build_classic_dist_vector
+  dist_vector = (1 0
+  )
+)
+
+(reversed)
+
+OTOH for we compute the same distance for
+
+(compute_affine_dependence
+  ref_a: d[_13], stmt_a: b = d[_13];
+  ref_b: d[c.6_23], stmt_b: d[c.6_23] = b;
+(analyze_overlapping_iterations
+  (chrec_a = {3, +, -1}_1)
+  (chrec_b = {2, +, -1}_1)
+(analyze_siv_subscript
+(analyze_subscript_affine_affine
+  (overlaps_a = [1 + 1 * x_1])
+  (overlaps_b = [0 + 1 * x_1]))
+)
+  (overlap_iterations_a = [1 + 1 * x_1])
+  (overlap_iterations_b = [0 + 1 * x_1]))
+(analyze_overlapping_iterations
+  (chrec_a = {2, +, -1}_1)
+  (chrec_b = {3, +, -1}_1)
+(analyze_siv_subscript
+(analyze_subscript_affine_affine
+  (overlaps_a = [0 + 1 * x_1])
+  (overlaps_b = [1 + 1 * x_1]))
+)
+  (overlap_iterations_a = [0 + 1 * x_1])
+  (overlap_iterations_b = [1 + 1 * x_1]))
+(build_classic_dist_vector
+  dist_vector = (1 0
+  )
+)
+
+I think that
+
+              /* If the overlap is exact preserve stmt order.  */
+              else if (lambda_vector_zerop (DDR_DIST_VECT (ddr, 0),
+                                            DDR_NB_LOOPS (ddr)))
+                ;
+
+is not good enough.  If the dependence distance is zero between any two
+iterations we have to preserve execution order.  That means the innermost
+loop may not have zero dependence distance.  This was adjusted also forPR87022.
+
+- User: GCC Commits | Time: 2023-11-14 12:50:08 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:5ea2965b499f9e491e45db19fedbccfccb75076acommitr14-5444-g5ea2965b499f9e491e45db19fedbccfccb75076aAuthor: Richard Biener <rguenther@suse.de>
+Date:   Tue Nov 14 11:37:13 2023 +0100
+
+    tree-optimization/112281 - loop distribution and zero dependence distances
+    
+    We currently distribute
+    
+      for (c = 2; c; c--)
+        for (e = 0; e < 2; e++) {
+          d[c] = b = d[c + 1];
+          d[c + 1].a = 0;
+        }
+    
+    in a wrong way where the inner loop zero dependence distance should
+    make us preserve stmt execution order.  We fail to do so since we
+    only look for a fully zero distance vector rather than looking at
+    the innermost loop distance.  This is somewhat similar toPR87022where we instead looked at the outermost loop distance and changed
+    this to what we do now.  The following switches us to look at the
+    innermost loop distance.PR tree-optimization/112281* tree-loop-distribution.cc (pg_add_dependence_edges):
+            Preserve stmt order when the innermost loop has exact
+            overlap.
+    
+            * gcc.dg/torture/pr112281.c: New testcase.
+
+- User: Richard Biener | Time: 2023-11-14 12:54:13 UTC
+  Text: Fixed on trunk sofar.
+
+- User: Richard Biener | Time: 2023-11-17 13:51:37 UTC
+  Text: The fix was wrong and reverted.
+
+- User: Richard Biener | Time: 2023-11-20 12:38:26 UTC
+  Text: So the aggregate vs part of aggregate access is to confuse the cost modeling
+(prevent merging of the partitions due to shared memory references) only.
+With a GIMPLE testcase and commenting out the cost model in the source
+the following inner loop fails the same way:
+
+  __BB(4,loop_header(2),guessed_local(955630224)):
+  _20 = __PHI (__BB4: _2, __BB3: 0);
+  _22 = d[_11].a;
+  b.a = _22;
+  _23 = b.a;
+  d[_21].a = _23;
+// ^ the two partitions v
+  d[_11].a = 0;
+  _2 = _20 + 1;
+  if (_2 <= 1)
+    goto __BB4(guessed(119453778));
+  else
+    goto __BB5(guessed(14763950));
+
+we're still computing
+
+  distance_vector: 1 0 
+  direction_vector:     +    =
+(gdb) p $14->reversed_p 
+$17 = true
+
+for the dependence of d[_21].a = _23; vs. d[_11].a = 0;
+(for _22 = d[_11].a; vs. d[_21].a = _23; we compute the same but not reversed)
+
+
+The same testcase is also broken with just forward evolving indices:
+
+struct {
+  int : 8;
+  int a;
+} b, d[4] = {{5}, {0}, {0}, {0}};
+int c, e;
+int main() {
+  for (c = 0; c < 2; c++)
+    for (e = 0; e < 2; e++) {
+      d[c + 1] = b = d[c];
+      d[c].a = 0;
+    }
+  if (b.a != 0)
+    __builtin_abort();
+  return 0;
+}
+
+
+And despite that I had to revert the patch the issue _is_ the conflict
+in the inner loop where we have the zero distance.  We're re-ordering
+
+      d[c + 1] = b = d[c];
+      d[c].a = 0;           (A)
+      d[c + 1] = b = d[c];  (B)
+      d[c].a = 0;
+
+as
+
+      d[c + 1] = b = d[c];
+      d[c + 1] = b = d[c];
+      d[c].a = 0;
+      d[c].a = 0;
+
+breaking the dependence between (A) d[c].a = 0; and (B) b = d[c].a;
+
+Note there's a dependence in both directions in the unrolled form.
+
+- User: GCC Commits | Time: 2023-11-20 14:01:52 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:3b34902417259031823bff7f853f615a60464bbdcommitr14-5626-g3b34902417259031823bff7f853f615a60464bbdAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Nov 20 13:39:52 2023 +0100
+
+    tree-optimization/112281 - loop distribution and zero dependence distances
+    
+    The following fixes an omission in dependence testing for loop
+    distribution.  When the overall dependence distance is not zero but
+    the dependence direction in the innermost common loop is = there is
+    a conflict between the partitions and we have to merge them.PR tree-optimization/112281* tree-loop-distribution.cc
+            (loop_distribution::pg_add_dependence_edges): For = in the
+            innermost common loop record a partition conflict.
+    
+            * gcc.dg/torture/pr112281-1.c: New testcase.
+            * gcc.dg/torture/pr112281-2.c: Likewise.
+
+- User: Richard Biener | Time: 2023-11-20 14:02:47 UTC
+  Text: Next try ;)
+
+- User: GCC Commits | Time: 2024-05-08 11:50:10 UTC
+  Text: The releases/gcc-13 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:0b409fc34e9b1ff7f90456e73128e38970c1532bcommitr13-8720-g0b409fc34e9b1ff7f90456e73128e38970c1532bAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Nov 20 13:39:52 2023 +0100
+
+    tree-optimization/112281 - loop distribution and zero dependence distances
+    
+    The following fixes an omission in dependence testing for loop
+    distribution.  When the overall dependence distance is not zero but
+    the dependence direction in the innermost common loop is = there is
+    a conflict between the partitions and we have to merge them.PR tree-optimization/112281* tree-loop-distribution.cc
+            (loop_distribution::pg_add_dependence_edges): For = in the
+            innermost common loop record a partition conflict.
+    
+            * gcc.dg/torture/pr112281-1.c: New testcase.
+            * gcc.dg/torture/pr112281-2.c: Likewise.
+    
+    (cherry picked from commit 3b34902417259031823bff7f853f615a60464bbd)
+
+- User: GCC Commits | Time: 2024-05-17 11:12:16 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:5db4b5449df8f59a61438f8db1836dbc9b53f02ecommitr12-10456-g5db4b5449df8f59a61438f8db1836dbc9b53f02eAuthor: Richard Biener <rguenther@suse.de>
+Date:   Mon Nov 20 13:39:52 2023 +0100
+
+    tree-optimization/112281 - loop distribution and zero dependence distances
+    
+    The following fixes an omission in dependence testing for loop
+    distribution.  When the overall dependence distance is not zero but
+    the dependence direction in the innermost common loop is = there is
+    a conflict between the partitions and we have to merge them.PR tree-optimization/112281* tree-loop-distribution.cc
+            (loop_distribution::pg_add_dependence_edges): For = in the
+            innermost common loop record a partition conflict.
+    
+            * gcc.dg/torture/pr112281-1.c: New testcase.
+            * gcc.dg/torture/pr112281-2.c: Likewise.
+    
+    (cherry picked from commit 3b34902417259031823bff7f853f615a60464bbd)
+
+- User: Richard Biener | Time: 2024-05-17 11:13:14 UTC
+  Text: Fixed.
+

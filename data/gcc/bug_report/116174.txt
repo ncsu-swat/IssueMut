@@ -1,0 +1,187 @@
+Bug Summary: [14/15 regression] Alignment request is added before endbr with -fcf-protection=branch since r15-888-gb644126237a1aa
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 13.3.1
+Known to Fail: 14.2.0, 15.0
+
+Comments:
+- User: Sebastian Andrzej Siewior | Time: 2024-08-01 15:20:59 UTC
+  Text: The file lib_str.c:
+
+char *stpcpy(char *dest, const char *src)
+{
+        while ((*dest++ = *src++) != '\0')
+                /* nothing */;
+        return --dest;
+}
+
+----
+ gcc -nostdinc -fno-common -fno-PIE \
+         -fcf-protection=branch -fno-jump-tables -m64 -falign-jumps=1 -falign-loops=1 \
+         -fno-asynchronous-unwind-tables -mindirect-branch=thunk-extern \
+         -mfunction-return=thunk-extern -O2 \
+         -S -o lib_str.s lib_str.c
+-----
+
+Output:
+        .text
+        .p2align 4
+        .globl  stpcpy
+        .type   stpcpy, @function
+stpcpy: 
+        .p2align 5
+        endbr64
+.L2:
+        movzbl  (%rsi), %eax
+…
+------
+
+The problem is that this .p2align macro before endbr64 results in 16 nops (11 byte nop + 5 byte nop) before endbr on function entry.
+
+I see this with 
+- gcc version 14.1.0 (Debian 14.1.0-5) 
+- gcc version 15.0.0 20240717 (experimental) [masterr15-2089-gecc2c3cb723] (Debian 20240717-1) 
+
+I don't see this with gcc-13.
+
+Sebastian
+
+- User: Richard Biener | Time: 2024-08-02 07:24:57 UTC
+  Text: Confirmed with just -fcf-protection=branch -O2
+
+        .p2align 4
+        .globl  stpcpy
+        .type   stpcpy, @function
+stpcpy:
+.LFB0:
+        .cfi_startproc
+        .p2align 5
+        endbr64
+
+- User: H.J. Lu | Time: 2024-08-02 08:47:30 UTC
+  Text: (In reply to Richard Biener fromcomment #1)> Confirmed with just -fcf-protection=branch -O2
+> 
+>         .p2align 4
+>         .globl  stpcpy
+>         .type   stpcpy, @function
+> stpcpy:
+> .LFB0:
+>         .cfi_startproc
+>         .p2align 5It is wrong to place .p2align after label.>         endbr64
+
+- User: Sebastian Andrzej Siewior | Time: 2024-08-02 22:06:38 UTC
+  Text: bisect says:
+
+commit b644126237a1aa8599f767a5e0bbada1d7286f44
+Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed May 29 11:14:26 2024 +0800
+
+    Align tight&hot loop without considering max skipping bytes.
+    
+    When hot loop is small enough to fix into one cacheline, we should align
+    the loop with ceil_log2 (loop_size) without considering maximum
+    skipp bytes. It will help code prefetch.
+
+- User: Sam James | Time: 2024-08-08 09:42:30 UTC
+  Text: https://lore.kernel.org/lkml/ea203f8e-8dd4-46f6-ada5-a2bf5ea8185e@app.fastmail.com/
+
+- User: Sam James | Time: 2024-08-08 09:45:48 UTC
+  Text: (In reply to Sam James fromcomment #4)>https://lore.kernel.org/lkml/ea203f8e-8dd4-46f6-ada5-a2bf5ea8185e@app.
+> fastmail.com/.. and the original thread from Sebastian washttps://lore.kernel.org/lkml/20240801152836.xOJc9iaY@linutronix.de/.
+
+- User: H.J. Lu | Time: 2024-08-08 15:48:50 UTC
+  Text: Createdattachment 58876[details]A patch
+
+Here is a patch.  Hongtao, please take a look and add a testcase.  Thanks.
+
+- User: Arnd Bergmann | Time: 2024-08-09 09:00:21 UTC
+  Text: I confirmed that the patch fromcomment #6addresses the build warnings I see in the kernel.
+
+- User: GCC Commits | Time: 2024-08-14 01:29:00 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:c3c83d22d212a35cb1bfb8727477819463f0dcd8commitr15-2906-gc3c83d22d212a35cb1bfb8727477819463f0dcd8Author: liuhongt <hongtao.liu@intel.com>
+Date:   Mon Aug 12 14:35:31 2024 +0800
+
+    Move ix86_align_loops into a separate pass and insert the pass after pass_endbr_and_patchable_area.
+    
+    gcc/ChangeLog:PR target/116174* config/i386/i386.cc (ix86_align_loops): Move this to ..
+            * config/i386/i386-features.cc (ix86_align_loops): .. here.
+            (class pass_align_tight_loops): New class.
+            (make_pass_align_tight_loops): New function.
+            * config/i386/i386-passes.def: Insert pass_align_tight_loops
+            after pass_insert_endbr_and_patchable_area.
+            * config/i386/i386-protos.h (make_pass_align_tight_loops): New
+            declare.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr116174.c: New test.
+
+- User: Hongtao Liu | Time: 2024-08-15 04:47:34 UTC
+  Text: (In reply to Arnd Bergmann fromcomment #7)> I confirmed that the patch fromcomment #6addresses the build warnings I
+> see in the kernel.Does the commit also fix the issue? If so I'll backport the patch to GCC14 release branch
+
+- User: H.J. Lu | Time: 2024-08-15 13:16:26 UTC
+  Text: (In reply to Hongtao Liu fromcomment #9)> (In reply to Arnd Bergmann fromcomment #7)
+> > I confirmed that the patch fromcomment #6addresses the build warnings I
+> > see in the kernel.
+> 
+> Does the commit also fix the issue? If so I'll backport the patch to GCC14
+> release branchI verified that it fixed:
+
+vmlinux.o: warning: objtool: .export_symbol+0x349a8: data relocation to !ENDBR: stpcpy+0x0
+
+in x86-64 Linux kernel build.
+
+- User: GCC Commits | Time: 2024-08-16 04:10:25 UTC
+  Text: The releases/gcc-14 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:4e7735a8d87559bbddfe3a985786996e22241f8dcommitr14-10588-g4e7735a8d87559bbddfe3a985786996e22241f8dAuthor: liuhongt <hongtao.liu@intel.com>
+Date:   Mon Aug 12 14:35:31 2024 +0800
+
+    Move ix86_align_loops into a separate pass and insert the pass after pass_endbr_and_patchable_area.
+    
+    gcc/ChangeLog:PR target/116174* config/i386/i386.cc (ix86_align_loops): Move this to ..
+            * config/i386/i386-features.cc (ix86_align_loops): .. here.
+            (class pass_align_tight_loops): New class.
+            (make_pass_align_tight_loops): New function.
+            * config/i386/i386-passes.def: Insert pass_align_tight_loops
+            after pass_insert_endbr_and_patchable_area.
+            * config/i386/i386-protos.h (make_pass_align_tight_loops): New
+            declare.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr116174.c: New test.
+    
+    (cherry picked from commit c3c83d22d212a35cb1bfb8727477819463f0dcd8)
+
+- User: Hongtao Liu | Time: 2024-08-16 05:00:15 UTC
+  Text: Fixed in GCC14.3 and GCC15
+
+- User: GCC Commits | Time: 2024-08-27 14:18:38 UTC
+  Text: The master branch has been updated by H.J. Lu <hjl@gcc.gnu.org>:https://gcc.gnu.org/g:d6bb1e257fc414d21bc31faa7ddecbc93a197e3ccommitr15-3222-gd6bb1e257fc414d21bc31faa7ddecbc93a197e3cAuthor: H.J. Lu <hjl.tools@gmail.com>
+Date:   Tue Aug 27 07:03:22 2024 -0700
+
+    Extend check-function-bodies to allow label and directives
+    
+    AsPR target/116174shown, we may need to verify labels and the directive
+    order.  Extend check-function-bodies to support matched output lines to
+    allow label and directives.
+    
+    gcc/
+    
+            * doc/sourcebuild.texi (check-function-bodies): Add an optional
+            argument for matched output lines.
+    
+    gcc/testsuite/
+    
+            * gcc.target/i386/pr116174.c: Use check-function-bodies.
+            * lib/scanasm.exp (parse_function_bodies): Append the line if
+            $up_config(matched) matches the line.
+            (check-function-bodies): Add an argument for matched.  Set
+            up_config(matched) to $matched.  Append the expected line without
+            $config(line_prefix) to function_regexp if it starts with ".L".
+    
+    Signed-off-by: H.J. Lu <hjl.tools@gmail.com>
+

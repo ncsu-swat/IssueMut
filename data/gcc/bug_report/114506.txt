@@ -1,0 +1,138 @@
+Bug Summary: RISC-V: expect M8 but M4 generated with dynamic LMUL
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Demin Han | Time: 2024-03-28 03:20:07 UTC
+  Text: we expect M8 when using following code and options, but M4 generated.
+
+-march=rv64gcv_zba_zbb_zvl256b -mabi=lp64d -mrvv-max-lmul=dynamic -O3 
+
+float a[32000],b[32000],c[32000],d[32000];
+float aa[256][256],bb[256][256],cc[256][256];
+
+void s2275()
+{
+        for (int i = 0; i < 256; i++) {
+            for (int j = 0; j < 256; j++) {
+                aa[j][i] = aa[j][i] + bb[j][i] * cc[j][i];
+            }
+           a[i] = b[i] + c[i] * d[i];
+        }
+}
+
+generated asm:
+.L2:
+	vsetvli	a4,s0,e32,m4,ta,ma
+	slli	t4,a4,2
+	li	a5,0
+.L3:
+	add	a3,a7,a5
+	add	a1,a0,a5
+	add	a2,a6,a5
+	vle32.v	v4,0(a3)
+	vle32.v	v8,0(a1)
+	vle32.v	v12,0(a2)
+	add	a3,t1,a5
+	addi	a5,a5,1024
+	vfmadd.vv	v4,v12,v8
+	vse32.v	v4,0(a3)
+	bne	a5,t3,.L3
+	vle32.v	v8,0(t6)
+	vle32.v	v4,0(t0)
+	vle32.v	v12,0(t2)
+	sub	s0,s0,a4
+	add	a0,a0,t4
+	add	a6,a6,t4
+	add	a7,a7,t4
+	add	t1,t1,t4
+	vfmadd.vv	v4,v12,v8
+	add	t6,t6,t4
+	add	t0,t0,t4
+	add	t2,t2,t4
+	vse32.v	v4,0(t5)
+	add	t5,t5,t4
+	bne	s0,zero,.L2
+
+- User: Andrew Pinski | Time: 2024-03-28 05:28:47 UTC
+  Text: /app/example.cpp:7:27: note:  Comparing two main loops (RVVM1QI at VF 32 vs RVVM8SF at VF 64)
+/app/example.cpp:7:27: note:  Preferring smaller LMUL loop because it has unexpected spills
+
+- User: Andrew Pinski | Time: 2024-03-28 05:33:48 UTC
+  Text: Using -fno-vect-cost-model forces the use of M8 though.
+
+I have no idea how this cost model is trying to prove here.
+
+- User: N/A | Time: 2024-03-28 05:36:53 UTC
+  Text: Hi,
+I'm trying to fix this.
+
+The reason is unnecessary live_range added in cost model> -----Original Message-----
+> From: pinskia at gcc dot gnu.org <gcc-bugzilla@gcc.gnu.org>
+> Sent: 2024年3月28日 13:34
+> To:deminhan@gcc.gnu.org> Subject: [Bug target/114506] RISC-V: expect M8 but M4 generated with
+> dynamic LMUL
+> 
+>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=114506> 
+> Andrew Pinski <pinskia at gcc dot gnu.org> changed:
+> 
+>            What    |Removed                     |Added
+> ----------------------------------------------------------------------------
+>            Keywords|
+> |missed-optimization
+>              Target|                            |riscv
+> 
+> ---Comment #2from Andrew Pinski <pinskia at gcc dot gnu.org> --- Using
+> -fno-vect-cost-model forces the use of M8 though.
+> 
+> I have no idea how this cost model is trying to prove here.
+> 
+> --
+> You are receiving this mail because:
+> You reported the bug.
+
+- User: JuzheZhong | Time: 2024-03-28 10:49:12 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> Using -fno-vect-cost-model forces the use of M8 though.
+> 
+> I have no idea how this cost model is trying to prove here.We shouldn't force M8.
+
+We have support dynamic LMUL cost model heuristically analyze the vector register
+pressure in SSA level. So that we could pick the optimal LMUL.
+
+This PR presents shows that RVV dynamic LMUL cost model pick LMUL 4 instead of LMUL 8 unexpectedly.
+
+So we should adjust the dynamic LMUL cost model to fix this issue.
+
+- User: GCC Commits | Time: 2024-04-29 11:19:45 UTC
+  Text: The master branch has been updated by Demin Han <deminhan@gcc.gnu.org>:https://gcc.gnu.org/g:ca2f531cc5db4f1020d4329976610356033e0246commitr15-47-gca2f531cc5db4f1020d4329976610356033e0246Author: demin.han <demin.han@starfivetech.com>
+Date:   Tue Mar 26 16:52:12 2024 +0800
+
+    RISC-V: Refine the condition for add additional vars in RVV cost model
+    
+    The adjacent_dr_p is sufficient and unnecessary condition for contiguous access.
+    So unnecessary live-ranges are added and result in smaller LMUL.
+    
+    This patch uses MEMORY_ACCESS_TYPE as condition and constrains segment
+    load/store.
+    
+    Tested on RV64 and no regression.PR target/114506gcc/ChangeLog:
+    
+            * config/riscv/riscv-vector-costs.cc (non_contiguous_memory_access_p): Rename
+            (need_additional_vector_vars_p): Rename and refine condition
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/vect/costmodel/riscv/rvv/pr114506.c: New test.
+    
+    Signed-off-by: demin.han <demin.han@starfivetech.com>
+
+- User: Jeffrey A. Law | Time: 2024-04-29 15:10:17 UTC
+  Text: Fixed on the trunk.  I would not suggest backporting to the gcc-14 tree as it does not fix a regression.
+
+I do expect we'll have a gcc-14 riscv coordination branch much like we did for gcc-13 and this patch would be included on that branch.  I guess I'll likely set that up sometime in the next week or two and start cherry-picking appropriate code.
+

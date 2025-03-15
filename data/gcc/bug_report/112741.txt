@@ -1,0 +1,137 @@
+Bug Summary: ICE: in gimplify_var_or_parm_decl, at gimplify.cc:3261
+Product: gcc
+Component: sanitizer
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Anonymous | Time: 2023-11-28 07:39:22 UTC
+  Text: *******************************************************************************
+OS and Platform:
+$ uname -a:
+Linux ubuntu 4.15.0-213-generic #224-Ubuntu SMP Mon Jun 19 13:30:12 UTC 2023 x86_64 x86_64 x86_64 GNU/Linux
+*******************************************************************************
+gcc version:
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=/root/gcc_set/202311021000/bin/gcc
+COLLECT_LTO_WRAPPER=/root/gcc_set/202311021000/libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc/configure --prefix=/root/gcc_set/202311021000 --with-gmp=/root/build_essential --with-mpfr=/root/build_essential --with-mpc=/root/build_essential --enable-languages=c,c++ --disable-multilib --with-sanitizer=address,undefined,thread,leak
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20231102 (experimental) (GCC)
+
+git version: d508a94167c186b2baacc679896e2809554c0b99
+*******************************************************************************
+Program:
+$ cat mutant.c
+int __GIMPLE(ssa) foo(int j)
+{
+  int c[1][10][1];
+  int _1;
+
+__BB(2):
+  c[0][1][0] = 1;
+  c[0][1] = _Literal (int[1]) {};
+  _1 = c[0][j_2(D)][0];
+  return _1;
+}
+
+int main()
+{
+  if (foo (1) != 0)
+    __builtin_abort ();
+  return 0;
+}
+
+*******************************************************************************
+Command Lines:
+$ gcc -fgimple -fsanitize=undefined mutant.c
+during GIMPLE pass: ubsan
+mutant.c: In function ‘foo’:
+mutant.c:9:20: internal compiler error: in gimplify_var_or_parm_decl, at gimplify.cc:3261
+    9 |   _1 = c[0][j_2(D)][0];
+      |        ~~~~~~~~~~~~^~~
+0x78d031 gimplify_var_or_parm_decl
+        ../../gcc/gcc/gimplify.cc:3261
+0xcd5ba0 gimplify_compound_lval
+        ../../gcc/gcc/gimplify.cc:3381
+0xccfcd3 gimplify_expr(tree_node**, gimple**, gimple**, bool (*)(tree_node*), int)
+        ../../gcc/gcc/gimplify.cc:16648
+0xcd7ef0 gimplify_addr_expr
+        ../../gcc/gcc/gimplify.cc:6788
+0xcd0c64 gimplify_expr(tree_node**, gimple**, gimple**, bool (*)(tree_node*), int)
+        ../../gcc/gcc/gimplify.cc:16743
+0xcd0316 gimplify_expr(tree_node**, gimple**, gimple**, bool (*)(tree_node*), int)
+        ../../gcc/gcc/gimplify.cc:17001
+0xccff17 gimplify_expr(tree_node**, gimple**, gimple**, bool (*)(tree_node*), int)
+        ../../gcc/gcc/gimplify.cc:17482
+0xccff17 gimplify_expr(tree_node**, gimple**, gimple**, bool (*)(tree_node*), int)
+        ../../gcc/gcc/gimplify.cc:17482
+0xcf598b force_gimple_operand_1(tree_node*, gimple**, bool (*)(tree_node*), tree_node*)
+        ../../gcc/gcc/gimplify-me.cc:78
+0xcf5abf force_gimple_operand_gsi_1(gimple_stmt_iterator*, tree_node*, bool (*)(tree_node*), tree_node*, bool, gsi_iterator_update)
+        ../../gcc/gcc/gimplify-me.cc:115
+0xcf5abf force_gimple_operand_gsi(gimple_stmt_iterator*, tree_node*, bool, tree_node*, bool, gsi_iterator_update)
+        ../../gcc/gcc/gimplify-me.cc:141
+0x1023f9c instrument_object_size
+        ../../gcc/gcc/ubsan.cc:2306
+0x1028f15 execute
+        ../../gcc/gcc/ubsan.cc:2500
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+- User: Sam James | Time: 2023-11-28 07:46:25 UTC
+  Text: I believe there's not much interest in fuzzing the gimple FE as it's purely for debugging/test cases.
+
+- User: Richard Biener | Time: 2023-11-28 11:46:32 UTC
+  Text: Confirmed.  The gimplifier asserts here:
+
+3267      /* ??? If this is a local variable, and it has not been seen in any
+3268         outer BIND_EXPR, then it's probably the result of a duplicate
+3269         declaration, for which we've already issued an error.  It would
+3270         be really nice if the front end wouldn't leak these at all.
+3271         Currently the only known culprit is C++ destructors, as seen
+3272         in g++.old-deja/g++.jason/binding.C.
+3273         Another possible culpit are size expressions for variably modified
+3274         types which are lost in the FE or not gimplified correctly.  */
+3275      if (VAR_P (decl)
+3276          && !DECL_SEEN_IN_BIND_EXPR_P (decl)
+3277          && !TREE_STATIC (decl) && !DECL_EXTERNAL (decl)
+3278          && decl_function_context (decl) == current_function_decl)
+3279        {
+3280          gcc_assert (seen_error ());
+3281          return GS_ERROR;
+3282        }
+
+as we gimplify '((unsigned long) &c[0][j_2(D)][0] - (unsigned long) &c) + 4'
+during instrument_object_size.  The GIMPLE frontend, when bypassing
+gimplification, doesn't set DECL_SEEN_IN_BIND_EXPR_P given there are no
+such things in GIMPLE.  But it probably should set the flag anyway.
+
+Testing a patch.
+
+- User: GCC Commits | Time: 2023-11-28 15:58:52 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:f45d5e30bd98ea1d8dc29841a06b2cfa5662deb5commitr14-5935-gf45d5e30bd98ea1d8dc29841a06b2cfa5662deb5Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Nov 28 12:49:35 2023 +0100
+
+    middle-end/112741 - ICE with gimple FE and later regimplification
+    
+    The GIMPLE frontend, when bypassing gimplification, doesn't set
+    DECL_SEEN_IN_BIND_EXPR_P given there are no such things in GIMPLE.
+    But it probably should set the flag anyway to avoid later ICEs
+    when regimplifying.PR middle-end/112741gcc/c/
+            * gimple-parser.cc (c_parser_parse_gimple_body): Also
+            set DECL_SEEN_IN_BIND_EXPR_Pfor locals.
+    
+    gcc/testsuite/
+            * gcc.dg/ubsan/pr112741.c: New testcase.
+
+- User: Richard Biener | Time: 2023-11-28 15:59:17 UTC
+  Text: Fixed on trunk.
+

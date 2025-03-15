@@ -1,0 +1,186 @@
+Bug Summary: assume create spurious load for volatile variable
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Martin Uecker | Time: 2023-07-20 19:16:39 UTC
+  Text: With optimization, using assume with volatile create spurious loads:
+
+int bar(int p)
+{
+    volatile int n = p;
+    [[assume (1 == n)]];
+    return 1 + n;
+}
+
+
+bar(int):
+        mov     DWORD PTR [rsp-4], edi
+        mov     eax, DWORD PTR [rsp-4]
+        mov     eax, DWORD PTR [rsp-4]
+        add     eax, 1
+        ret
+
+- User: Xi Ruoyao | Time: 2023-07-20 22:34:16 UTC
+  Text: It happens w/o assume:
+
+int bar(int p)
+{
+    volatile int n = p;
+    if (1 == n)
+		__builtin_unreachable();
+    return 1 + n;
+}
+
+Is this a bug?  The standard defines accessing volatile objects as side-effects so it's not allowed to merge volatile loads, AFAIU.
+
+- User: Andrew Pinski | Time: 2023-07-20 22:42:02 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #1)> Is this a bug?  The standard defines accessing volatile objects as
+> side-effects so it's not allowed to merge volatile loads, AFAIU.Yes because assume attribute is defined not to have any side effects.
+
+Confirmed.
+
+gimplifier produces:
+
+  [[assume (D.2786)]]
+    {
+      {
+        int n.0;
+
+        n.0 = n;
+        D.2786 = n.0 == 1;
+      }
+    }
+
+And then lowering produces:
+  _2 = n;
+  .ASSUME (_Z3bari._assume.0, _2);
+
+But really it should have passed the address of n rather than the value since n is volatile here .
+
+- User: Andrew Pinski | Time: 2023-07-20 22:44:17 UTC
+  Text: Seems like lowering passes everything via value rather than some stuff by reference ....
+
+- User: Xi Ruoyao | Time: 2023-07-20 22:45:10 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> (In reply to Xi Ruoyao fromcomment #1)
+> > Is this a bug?  The standard defines accessing volatile objects as
+> > side-effects so it's not allowed to merge volatile loads, AFAIU.
+> 
+> Yes because assume attribute is defined not to have any side effects.
+> 
+> Confirmed.
+> 
+> gimplifier produces:
+> 
+>   [[assume (D.2786)]]
+>     {
+>       {
+>         int n.0;
+> 
+>         n.0 = n;
+>         D.2786 = n.0 == 1;
+>       }
+>     }
+> 
+> And then lowering produces:
+>   _2 = n;
+>   .ASSUME (_Z3bari._assume.0, _2);
+> 
+> But really it should have passed the address of n rather than the value
+> since n is volatile here .Alright, I mistakenly believed [[assume(x)]]; is same as if (!x) unreachable();.
+
+- User: Richard Biener | Time: 2023-07-21 06:44:50 UTC
+  Text: An assumption like this is quite useless anyway, but ...
+
+- User: Martin Uecker | Time: 2023-07-21 08:33:10 UTC
+  Text: One should check whether there is a similar issue with atomics, at least regarding accidentally introducing memory ordering or so.
+
+- User: Jakub Jelinek | Time: 2024-02-09 09:15:10 UTC
+  Text: For volatile I'm afraid we can't pass n as an argument to the magic function, perhaps
+we could pass its address to it and do the load in there.  Perhaps ditto for the atomics (that is C only of course), but that likely is what happens already.
+Sure, most likely such assumptions won't be really useful for anything, but
+one could still say
+volatile int n = p;
+int m = 0;
+[[assume (p == (n & m))]];
+if (p != 0)
+  ...
+or similar.
+
+- User: Jakub Jelinek | Time: 2024-02-09 15:00:44 UTC
+  Text: Createdattachment 57373[details]gcc14-pr110754.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-02-10 10:28:48 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:39920447f876128ff7942a9cd931021800865894commitr14-8910-g39920447f876128ff7942a9cd931021800865894Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Sat Feb 10 11:28:00 2024 +0100
+
+    gimple-low: Fix up handling of volatile automatic vars in assume attribute [PR110754]
+    
+    As the following testcases show, the gimple-low outlining of assume
+    magic functions handled volatile automatic vars (including
+    parameters/results) like non-volatile ones except it copied volatile
+    to the new PARM_DECL, which has the undesirable effect that a load
+    from the volatile var is passed to IFN_ASSUME and so there is a
+    side-effect there even when side-effects of the assume attribute
+    shouldn't be evaluated.
+    
+    The following patch fixes that by passing address of the volatile
+    variables/parameters/results instead and doing loads or stores from it
+    or to it where it was originally accessed in the assume attribute
+    expression.
+    
+    2024-02-10  Jakub Jelinek  <jakub@redhat.com>PR middle-end/110754* gimple-low.cc (assumption_copy_decl): For TREE_THIS_VOLATILE
+            decls create PARM_DECL with pointer to original type, set
+            TREE_READONLY and keep TREE_THIS_VOLATILE, TREE_ADDRESSABLE,
+            DECL_NOT_GIMPLE_REG_P and DECL_BY_REFERENCE cleared.
+            (adjust_assumption_stmt_op): For remapped TREE_THIS_VOLATILE decls
+            wrap PARM_DECL into a simple TREE_THIS_NO_TRAP MEM_REF.
+            (lower_assumption): For TREE_THIS_VOLATILE vars pass ADDR_EXPR
+            of the var as argument.
+    
+            * gcc.dg/attr-assume-6.c: New test.
+            * g++.dg/cpp23/attr-assume12.C: New test.
+
+- User: GCC Commits | Time: 2024-03-02 00:38:48 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:e084a6406ea0587beda62684b9d4856292acacfacommitr13-8389-ge084a6406ea0587beda62684b9d4856292acacfaAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Sat Feb 10 11:28:00 2024 +0100
+
+    gimple-low: Fix up handling of volatile automatic vars in assume attribute [PR110754]
+    
+    As the following testcases show, the gimple-low outlining of assume
+    magic functions handled volatile automatic vars (including
+    parameters/results) like non-volatile ones except it copied volatile
+    to the new PARM_DECL, which has the undesirable effect that a load
+    from the volatile var is passed to IFN_ASSUME and so there is a
+    side-effect there even when side-effects of the assume attribute
+    shouldn't be evaluated.
+    
+    The following patch fixes that by passing address of the volatile
+    variables/parameters/results instead and doing loads or stores from it
+    or to it where it was originally accessed in the assume attribute
+    expression.
+    
+    2024-02-10  Jakub Jelinek  <jakub@redhat.com>PR middle-end/110754* gimple-low.cc (assumption_copy_decl): For TREE_THIS_VOLATILE
+            decls create PARM_DECL with pointer to original type, set
+            TREE_READONLY and keep TREE_THIS_VOLATILE, TREE_ADDRESSABLE,
+            DECL_NOT_GIMPLE_REG_P and DECL_BY_REFERENCE cleared.
+            (adjust_assumption_stmt_op): For remapped TREE_THIS_VOLATILE decls
+            wrap PARM_DECL into a simple TREE_THIS_NO_TRAP MEM_REF.
+            (lower_assumption): For TREE_THIS_VOLATILE vars pass ADDR_EXPR
+            of the var as argument.
+    
+            * gcc.dg/attr-assume-6.c: New test.
+            * g++.dg/cpp23/attr-assume12.C: New test.
+    
+    (cherry picked from commit 39920447f876128ff7942a9cd931021800865894)
+
+- User: Jakub Jelinek | Time: 2024-03-04 12:09:25 UTC
+  Text: Should be now fixed for GCC 13.3+ too.
+

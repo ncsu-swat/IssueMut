@@ -1,0 +1,176 @@
+Bug Summary: [15 Regression] vectorizable_reduction ICEs after g:d66b820f392aa9a7c34d3cddaf3d7c73bf23f82d
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Tamar Christina | Time: 2024-06-18 11:12:05 UTC
+  Text: testcase:
+
+---
+char *a;
+int b;
+void c() {
+  int d = 0, e = 0, f;
+  for (; f; ++f)
+    if (a[f] == 5)
+      ;
+    else if (a[f])
+      e = 1;
+    else
+      d = 1;
+  if (d)
+    if (e)
+      b = 0;
+}
+---
+
+compiled with -mcpu=neoverse-v1 -O3 produces the following ICE:
+
+during GIMPLE pass: vect
+pngrtran.i: In function 'c':
+pngrtran.i:3:6: internal compiler error: in vectorizable_reduction, at tree-vect-loop.cc:8335
+    3 | void c() {
+      |      ^
+0xff74ff vectorizable_reduction(_loop_vec_info*, _stmt_vec_info*, _slp_tree*, _slp_instance*, vec<stmt_info_for_cost, va_heap, vl_ptr>*)
+        /opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-loop.cc:8335
+0x1b598f7 vect_analyze_stmt(vec_info*, _stmt_vec_info*, bool*, _slp_tree*, _slp_instance*, vec<stmt_info_for_cost, va_heap, vl_ptr>*)
+        /opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-stmts.cc:13353
+0x10225df vect_slp_analyze_node_operations_1
+        /opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-slp.cc:6457
+0x10225df vect_slp_analyze_node_operations
+        /opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-slp.cc:6656
+0x102253f vect_slp_analyze_node_operations
+        /opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-slp.cc:6635
+0x1023ec3 vect_slp_analyze_operations(vec_info*)
+        /opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-slp.cc:7053
+0xff816f vect_analyze_loop_2
+        /opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-loop.cc:2953
+0xff9fb7 vect_analyze_loop_1
+        /opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-loop.cc:3484
+0xffa6f7 vect_analyze_loop(loop*, vec_info_shared*)
+        /opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vect-loop.cc:3642
+0x1035547 try_vectorize_loop_1
+        /opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vectorizer.cc:1067
+0x1035547 try_vectorize_loop
+        /opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vectorizer.cc:1183
+0x1035a5b execute
+        /opt/buildAgent/work/5c94c4ced6ebfcd0/gcc/tree-vectorizer.cc:1299
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+after:
+
+commit d66b820f392aa9a7c34d3cddaf3d7c73bf23f82d
+Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Jun 13 14:42:25 2024 +0200
+
+    Support single def-use cycle optimization for SLP reduction vectorization
+    
+    We can at least mimic single def-use cycle optimization when doing
+    single-lane SLP reductions and that's required to avoid regressing
+    compared to non-SLP.
+    
+            * tree-vect-loop.cc (vectorizable_reduction): Allow
+            single-def-use cycles with SLP.
+            (vect_transform_reduction): Handle SLP single def-use cycles.
+            (vect_transform_cycle_phi): Likewise.
+    
+            * gcc.dg/vect/slp-reduc-12.c: New testcase.
+
+ gcc/testsuite/gcc.dg/vect/slp-reduc-12.c | 18 +++++++++++++
+ gcc/tree-vect-loop.cc                    | 45 +++++++++++++++++++-------------
+ 2 files changed, 45 insertions(+), 18 deletions(-)
+ create mode 100644 gcc/testsuite/gcc.dg/vect/slp-reduc-12.c
+bisect run success
+
+looks like it's hitting the assert:
+
+      gcc_assert (op.code != COND_EXPR);
+
+- User: Richard Biener | Time: 2024-06-18 11:46:25 UTC
+  Text: I will have a look.
+
+- User: Richard Biener | Time: 2024-06-18 12:00:20 UTC
+  Text: So w/o SLP we reject this with
+
+  if ((double_reduc || reduction_type != TREE_CODE_REDUCTION)
+      && ncopies > 1)
+    {         
+      if (dump_enabled_p ())
+        dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
+                         "multiple types in double reduction or condition "
+                         "reduction or fold-left reduction.\n");
+      return false;
+
+reduction_type is EXTRACT_LAST_REDUCTION here.  For SLP we only disallow
+
+  if ((reduction_type == COND_REDUCTION
+       || reduction_type == INTEGER_INDUC_COND_REDUCTION
+       || reduction_type == CONST_COND_REDUCTION)
+      && slp_node
+      && SLP_TREE_NUMBER_OF_VEC_STMTS (slp_node) > 1)
+    {                            
+      if (dump_enabled_p ())
+        dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
+                         "multiple types in condition reduction reduction.\n");
+      return false;
+    }
+
+I've recently fixed a fold-left reduction case with multiple types
+which we handle just fine.  I have a patch amending the above condition
+(EXTRACT_LAST is an optimized COND_REDUCTION).
+
+- User: GCC Commits | Time: 2024-06-18 13:28:02 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:7f9be55a4630134a237219af9cc8143e02080380commitr15-1407-g7f9be55a4630134a237219af9cc8143e02080380Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Jun 18 14:00:52 2024 +0200
+
+    tree-optimization/115537 - ICE with SLP condition reduction vectorization
+    
+    The condition rejecting "multiple-type" SLP condition reduction lacks
+    handling EXTRACT_LAST reductions.PR tree-optimization/115537* tree-vect-loop.cc (vectorizable_reduction): Also reject
+            SLP condition reductions of EXTRACT_LAST kind when multiple
+            statement copies are involved.
+    
+            * gcc.dg/vect/pr115537.c: New testcase.
+
+- User: Richard Biener | Time: 2024-06-18 13:28:16 UTC
+  Text: Fixed.
+
+- User: Tamar Christina | Time: 2024-06-18 14:11:05 UTC
+  Text: Thanks for the fix!
+
+I think the testcase needs SVE enabled to ICE no?
+shouldn't that be -mcpu=neoverse-v1 and not -mcpu=neoverse-n1?
+
+- User: rguenther@suse.de | Time: 2024-06-18 15:29:17 UTC
+  Text: > Am 18.06.2024 um 16:11 schrieb tnfchris at gcc dot gnu.org <gcc-bugzilla@gcc.gnu.org>:
+> 
+> ﻿https://gcc.gnu.org/bugzilla/show_bug.cgi?id=115537> 
+> ---Comment #5from Tamar Christina <tnfchris at gcc dot gnu.org> ---
+> Thanks for the fix!
+> 
+> I think the testcase needs SVE enabled to ICE no?
+> shouldn't that be -mcpu=neoverse-v1 and not -mcpu=neoverse-n1?I intended to copy from the PR options, in case I mistyped feel free to correct> --
+> You are receiving this mail because:
+> You are on the CC list for the bug.
+> You are the assignee for the bug.
+
+- User: GCC Commits | Time: 2024-07-04 10:22:21 UTC
+  Text: The master branch has been updated by Tamar Christina <tnfchris@gcc.gnu.org>:https://gcc.gnu.org/g:adcfb4fb8fb20a911c795312ff5f5284dba05275commitr15-1842-gadcfb4fb8fb20a911c795312ff5f5284dba05275Author: Tamar Christina <tamar.christina@arm.com>
+Date:   Thu Jul 4 11:19:20 2024 +0100
+
+    testsuite: Update test forPR115537to use SVE .
+    
+    The PR was about SVE codegen, the testcase accidentally used neoverse-n1
+    instead of neoverse-v1 as was the original report.
+    
+    This updates the tool options.
+    
+    gcc/testsuite/ChangeLog:PR tree-optimization/115537* gcc.dg/vect/pr115537.c: Update flag from neoverse-n1 to neoverse-v1.
+

@@ -1,0 +1,287 @@
+Issue Title: [LTO] Fat LTO pipeline miss-optimizes indirect goto.
+Original Post: test-suite test `SingleSource/Regression/C/2004-03-15-IndirectGoto.c` exhibits the problem.
+
+Input:
+```
+#include <stdio.h>
+int main() {
+  static const void *L[] = {&&L1, &&L2, &&L3, &&L4, 0 };
+  unsigned i = 0;
+  printf("A\n");
+L1:
+  printf("B\n");
+L2:
+  printf("C\n");
+L3:
+  printf("D\n");
+  goto *L[i++];
+L4:
+  printf("E\n");
+  return 0;
+}
+```
+
+Compile commands to reproduce:
+```
+clang -flto -ffat-lto-objects -O2 -c IndirectGoto.c 
+clang -flto IndirectGoto.o -o no_clone.out
+clang -flto -ffat-lto-objects IndirectGoto.o -o clone.out
+./no_clone.out 
+A
+B
+C
+D
+B
+C
+D
+C
+D
+D
+E
+ ./clone.out 
+A
+B
+C
+D
+Illegal instruction (core dumped)
+```
+
+test-suite test `SingleSource/Benchmarks/Misc/evalloop.c` is also failing likely due to the same underlying issue.
+
+Comment by mandlebug: The simplify cfg pass introduces the crash in `simplifyIndirectBr`- it converts the incoming IR
+```
+; *** IR Dump After InstCombinePass on main ***
+; Function Attrs: nounwind
+define signext i32 @main() #0 {
+entry:
+  %puts = call i32 @puts(ptr nonnull dereferenceable(1) @str)
+  br label %L1
+
+L1:                                               ; preds = %L3, %entry
+  %i.0 = phi i32 [ 0, %entry ], [ %inc, %L3 ]
+  %puts1 = call i32 @puts(ptr nonnull dereferenceable(1) @str.1)
+  br label %L2
+
+L2:                                               ; preds = %L3, %L1
+  %i.1 = phi i32 [ %i.0, %L1 ], [ %inc, %L3 ]
+  %puts2 = call i32 @puts(ptr nonnull dereferenceable(1) @str.2)
+  br label %L3
+
+L3:                                               ; preds = %L3, %L2
+  %i.2 = phi i32 [ %i.1, %L2 ], [ %inc, %L3 ]
+  %puts3 = call i32 @puts(ptr nonnull dereferenceable(1) @str.3)
+  %inc = add i32 %i.2, 1
+  %idxprom = zext i32 %i.2 to i64
+  %arrayidx = getelementptr inbounds [5 x ptr], ptr @main.L, i64 0, i64 %idxprom
+  %0 = load ptr, ptr %arrayidx, align 8, !tbaa !5
+  indirectbr ptr %0, [label %L1, label %L2, label %L3, label %L4]
+
+L4:                                               ; preds = %L3
+  %puts4 = call i32 @puts(ptr nonnull dereferenceable(1) @str.4)
+  ret i32 0
+}
+```
+to 
+```
+; *** IR Dump After SimplifyCFGPass on main ***
+; Function Attrs: nounwind
+define signext i32 @main() #0 {
+entry:
+  %puts = call i32 @puts(ptr nonnull dereferenceable(1) @str)
+  %puts1 = call i32 @puts(ptr nonnull dereferenceable(1) @str.1)
+  %puts2 = call i32 @puts(ptr nonnull dereferenceable(1) @str.2)
+  %puts3 = call i32 @puts(ptr nonnull dereferenceable(1) @str.3)
+  unreachable
+}
+```
+because the destinations don't have their addresses taken.
+
+I'm guessing this is a duplicate of https://github.com/llvm/llvm-project/issues/55991, and maybe https://github.com/llvm/llvm-project/issues/47769 just with the problem manifesting in the fat-lto pipeline because we clone the module to embed in the IR.
+Comment by ilovepi: Sorry that I didn't see this, between vacation and being terrible setting up github notifications.
+
+This is unfortunate, and I agree w/ your suspicions that this looks to be due to cloning the module. 
+
+We can potentially change the FatLTO pipeline to avoid cloning the module, which we wanted to do anyway.
+
+I don't think that https://reviews.llvm.org/D148010 is close to landing, but it was what I was hoping would allow us to go to a unified way to do ModuleSimpilfication followed by ModuleOptimization uniformly w/ existing pipelines.
+
+Maybe a better way to go about this for now is to use UnfiedLTO, so we can defer the Full/Thin decision until link-time. Then we can use the PreLinkThinLTO pipeline to emit the IR section which would work w/ both Full and Thin LTO. 
+
+I'm not sure if we can get away w/ only running ModuleOptimization after that, or we should conservativly run the PostLinkThinLTO pipeline to generate the object code. I think that probably still does too much work, but that is probably preferable to having a codgen bug like this in a supported pipeline.
+
+@nikic @teresajohnson Do either of you have thoughts here? We've luckily not hit this in Fuchsia yet, but given that this leads to miscompiles, I'd like to address this ASAP.
+Comment by ilovepi: https://github.com/llvm/llvm-project/pull/72180 is a potential fix, though I'm unsure if the pipeline changes are exactly the way we want them. 
+Comment by mandlebug: Thanks for looking at this.
+
+I did a little bit of poking at the cloning code, its confusing because we have code [like this](https://github.com/llvm/llvm-project/blob/e3f16de9a33d48f6a9d8035a9aebfdb0e3a16ea5/llvm/lib/Transforms/Utils/CloneFunction.cpp#L207C32-L207C32) to patch up the BranchAddresses when cloning to a new function that explicitly states its illegal to clone code where a basic block address leaks out of the function, but it seems the initializers for the arrays of block addresses get mapped to BlockAddress values from the cloned module anyway 🤷 . It seems like it's the IndirectBrInst that has invalid operands, but I haven't had time to look into it any deeper to determine if we could update the operands to the correct ones to fix the problem. With the comments it seems it might be best to consider dropping cloning like your PR does.
+
+I've had a look at the proposed fix. I think you are right about  https://reviews.llvm.org/D148010 not helping as it seems there are a number of ordering issues that need to be worked out first. Don't we have a somewhat similar situation with #72180 if we are using the fat objects to feed a monolithic LTO link though? Since we are always running the thin-lto prelink pipeline I assume we miss the same opportunities. Is the cloning necessary for us to run the fat lto pipeline?
+Comment by teresajohnson: On Mon, Nov 27, 2023 at 11:31 AM Sean Fertile ***@***.***>
+wrote:
+
+> Thanks for looking at this.
+>
+> I did a little bit of poking at the cloning code, its confusing because we
+> have code like this
+> <https://github.com/llvm/llvm-project/blob/e3f16de9a33d48f6a9d8035a9aebfdb0e3a16ea5/llvm/lib/Transforms/Utils/CloneFunction.cpp#L207C32-L207C32>
+> to patch up the BranchAddresses when cloning to a new function that
+> explicitly states its illegal to clone code where a basic block address
+> leaks out of the function, but it seems the initializers for the arrays of
+> block addresses get mapped to BlockAddress values from the cloned module
+> anyway 🤷 . It seems like it's the IndirectBrInst that has invalid
+> operands, but I haven't had time to look into it any deeper to determine if
+> we could update the operands to the correct ones to fix the problem. With
+> the comments it seems it might be best to consider dropping cloning like
+> your PR does.
+>
+> I've had a look at the proposed fix. I think you are right about
+> https://reviews.llvm.org/D148010 not helping as it seems there are a
+> number of ordering issues that need to be worked out first. Don't we have a
+> somewhat similar situation with #72180
+> <https://github.com/llvm/llvm-project/pull/72180> if we are using the fat
+> objects to feed a monolithic LTO link though?
+>
+It sounds like the issue relates to cloning, which should go away with that
+fix. Using the unified LTO approach works with either ThinLTO or monolithic
+LTO links.
+
+> Since we are always running the thin-lto prelink pipeline I assume we miss
+> the same opportunities. Is the cloning necessary for us to run the fat lto
+> pipeline?
+>
+I can't recall exactly why FatLTO started cloning the module - iirc it was
+related to some concerns about the optimization of the non-LTO native
+objects, but I don't recall why the decision was to clone instead of using
+ThinLTO pre+post link pipelines as the fix does. Perhaps this was before
+Unified LTO was ready?
+
+
+> —
+> Reply to this email directly, view it on GitHub
+> <https://github.com/llvm/llvm-project/issues/70703#issuecomment-1828477599>,
+> or unsubscribe
+> <https://github.com/notifications/unsubscribe-auth/AE37ZQ553ORSGKWIAO3IMD3YGTS7RAVCNFSM6AAAAAA6WPTULCVHI2DSMVQWIX3LMV43OSLTON2WKQ3PNVWWK3TUHMYTQMRYGQ3TONJZHE>
+> .
+> You are receiving this because you were mentioned.Message ID:
+> ***@***.***>
+>
+
+
+-- 
+Teresa Johnson |  Software Engineer |  ***@***.*** |
+
+Comment by ilovepi: 
+> I can't recall exactly why FatLTO started cloning the module - iirc it was related to some concerns about the optimization of the non-LTO native objects, but I don't recall why the decision was to clone instead of using ThinLTO pre+post link pipelines as the fix does. Perhaps this was before Unified LTO was ready?
+
+The big issue that I remember was that we couldn't pin down a good/efficient way to be sure the pre-link pipeline would run and then get optimized correctly for the non-lto object code, e.g. because once you start adding instrumentation or certain other passes to the pre-link pipeline, you can't "just" run `ModuleOptimiztion` and be sure it's correct unless you're really careful. There was a fairly lengthy discussion on https://reviews.llvm.org/D146776. Cloning was pretty naive, but (at least in theory) should have been correct no matter what we did.
+
+IIRC this landed about the same time as UnifiedLTO. I think we landed the pipeline changes before UnifiedLTO was ready, but the linker support and maybe one of the Clang changes landed after UnifiedLTO.
+Comment by ilovepi: @mandlebug  I tested #72180 against the test code above, but I'd like to confirm this is actually fixed with you before marking this as closed.
+Comment by mandlebug: Thanks for fixing this, the reproducer does work now. I tired running test-suite though as there was one other related failure which I didn't bother extracting the source/compile/link commands for. I am seeing a number of crashes during the build step now. Some example output:
+```
+ld.lld: error: Expected at most one ThinLTO module per bitcode file
+ld.lld: /scratch/sfertile/LLVM/llvm-project/llvm/lib/Linker/IRMover.cpp:1618: llvm::Error {anonymous}::IRLinker::run(): Assertion `!GV->isDeclaration()' failed.
+PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace.
+ #0 0x0000000010510d30 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/scratch/sfertile/LLVM/AssertsInstall/bin/ld.lld+0x10510d30)
+```
+
+Setup is simply a release build of test-suite using ninja and `-DCMAKE_C_FLAGS="-flto -ffat-lto-objects" -DCMAKE_CXX_FLAGS="-flto -ffat-lto-objects"`
+
+Comment by ilovepi: There also seems to be an issue with using UnifiedLTO. `-DCMAKE_C_FLAGS="-flto -funified-lto" -DCMAKE_CXX_FLAGS="-flto -funified-lto"`. The failure modes are slightly different though, and UnifiedLTO hits an assert in [ThinLTOBitcodeWritter.cpp:280](https://github.com/llvm/llvm-project/blob/989e8f9d51e6945905b0e26148574c8e1fa88c84/llvm/lib/Transforms/IPO/ThinLTOBitcodeWriter.cpp#L280). 
+
+I have a feeling the issues are related, but I'm not completely sure. I'll need to dig some more.
+
+I've included the reproducer in case you want to look.
+
+[repro.zip](https://github.com/llvm/llvm-project/files/13565710/repro.zip)
+
+Comment by ilovepi: It seems like if I add the options in a new cmake cache file things work as expected. I'm not too familiar with the test suite build. Any thoughts on why adding the options to  `OPTSFLAG` works, but runs into trouble w/ `CFLAGS`/`CXXFLAGS`? I guess that the `_RELEASE` suffix on the variables in the cache files is significant?
+
+Here's the diff I added, and I just pointed my build at that cache file instead of using the existing `O3.cmake` like the https://llvm.org/docs/TestSuiteGuide.html reccomends.
+
+```
+diff --git a/cmake/caches/ReleaseFatLTO.cmake b/cmake/caches/ReleaseFatLTO.cmake
+new file mode 100644
+index 00000000..eaa482c1
+--- /dev/null
++++ b/cmake/caches/ReleaseFatLTO.cmake
+@@ -0,0 +1,8 @@
++set(OPTFLAGS "${OPTFLAGS} -O3 -fomit-frame-pointer -flto=thin -ffat-lto-objects -DNDEBUG")
++if(APPLE)
++  set(OPTFLAGS "${OPTFLAGS} -mdynamic-no-pic")
++endif()
++
++set(CMAKE_C_FLAGS_RELEASE "${OPTFLAGS}" CACHE STRING "")
++set(CMAKE_CXX_FLAGS_RELEASE "${OPTFLAGS}" CACHE STRING "")
++set(CMAKE_BUILD_TYPE "Release" CACHE STRING "")
+```
+
+Here's my cmake invocation
+
+```
+# CMake invocation
+cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=${CLANG_TOOLCHAIN_PREFIX}/clang \
+  -DCMAKE_CXX_COMPILER=${CLANG_TOOLCHAIN_PREFIX}/clang++ \
+  -C ${LLVM_TESTSUITE_DIR}/cmake/caches/ReleaseFatLTO.cmake \
+  ${LLVM_TESTSUITE_DIR}
+```
+Comment by mandlebug: > It seems like if I add the options in a new cmake cache file things work as expected.
+
+I used the same  `ReleaseFatLTO.cmake` and the same cmake invocation but don't see any difference in behaviour. I tried with full LTO and unified as well with their own respective cmake caches but all have the same crashes I see without using a cache file. If you build with ninja -v do you see the fat-lto-objects option on both the compile and link steps? Does the clang/clang++ you are using have assertions enabled?
+
+Comment by ilovepi: 
+
+
+
+> > It seems like if I add the options in a new cmake cache file things work as expected.
+> 
+> I used the same `ReleaseFatLTO.cmake` and the same cmake invocation but don't see any difference in behaviour. I tried with full LTO and unified as well with their own respective cmake caches but all have the same crashes I see without using a cache file. If you build with ninja -v do you see the fat-lto-objects option on both the compile and link steps? 
+
+Yes, both the `compile_commands.json` I generated, and `ninja -v` have the expected flags, though I didn't check *all* the invocation lines.
+
+> Does the clang/clang++ you are using have assertions enabled?
+
+I was testing with an asserts enabled build of the complete toolchain (compiler, linker, and runtimes). 
+
+I've found a similar issue in a much larger project, though. I was able to reduce it down to almost nothing, but I'm seeing a difference in how the bitcode section is generated  with "-debug-info-kind=constructor". I haven't run it down yet, though.
+
+I also think there may be some conflict with how we're setting the "ThinLTO" module flag in clang. I definitly get further in with out setting that flag, and more cases seem to work.
+
+However, I seem to be runing afoul of an assert in ThinLTOBitcodeWriter now. https://github.com/llvm/llvm-project/blob/0cd308aebcde8af4d8b11084a82c8e64b6a828c6/llvm/lib/Transforms/IPO/ThinLTOBitcodeWriter.cpp#L280
+
+@ormris do you remember why this assert should hold? In FatLTO, we're using the ThinLTOPreLinkPipeline, and setting the  UnifiedLTO module flag, so I'm unclear on why we'd run into trouble with FatLTO but not UnifiedLTO. For whatever reason my toy example ends up with an empty ModuleID. I don't fully understand the reason this can't/shouldn't ever happen for unified LTO. I think I'm missing some context.
+
+[assert-repro.zip](https://github.com/llvm/llvm-project/files/13592691/assert-repro.zip)
+
+Comment by nikic: If we're setting the `UnifiedLTO` flag, I believe we're not supposed to set the `ThinLTO` flag. At least the normal (non-fat LTO) code path doesn't do it either.
+Comment by ilovepi: > If we're setting the `UnifiedLTO` flag, I believe we're not supposed to set the `ThinLTO` flag. At least the normal (non-fat LTO) code path doesn't do it either.
+
+That was one of my thoughts, but when I tried that I'm still hitting the assert I mentioned above. I plan to post a patch to stop setting the ThinLTO flag once I can work around the remaining issue.
+
+Do you happen to know why they're incompatible? I guess because the point is to defer the decision until later.
+
+
+Comment by teresajohnson: > > If we're setting the `UnifiedLTO` flag, I believe we're not supposed to set the `ThinLTO` flag. At least the normal (non-fat LTO) code path doesn't do it either.
+> 
+> That was one of my thoughts, but when I tried that I'm still hitting the assert I mentioned above. I plan to post a patch to stop setting the ThinLTO flag once I can work around the remaining issue.
+> 
+> Do you happen to know why they're incompatible? I guess because the point is to defer the decision until later.
+
+It would be good to understand why that assert is there. I have a vague recollection that with UnifiedLTO there was more info used to compute the module hash checked there, but I'd have to dig up the old patches to confirm.
+Comment by teresajohnson: @ormris can you give some context here?
+
+The patch I was thinking of was never accepted: https://reviews.llvm.org/D123969. So I'm still not sure why this assert was added. Hmm, the Unified LTO LLVM patch (https://reviews.llvm.org/D123803) says in the summary that it includes "Make sure that the ModuleID is generated by incorporating more types of symbols." But I have skimmed that patch right now and don't see this. This is the patch that added the assert.
+Comment by ilovepi: Thanks for the context. I was also going through https://reviews.llvm.org/D123803 and didn't understand why the assert would be there at all, but it makes a lot more sense with https://reviews.llvm.org/D123969. 
+
+Since that hasn't landed yet, do you think it makes sense to change the behavior back to account for UnifiedLTO? So something like https://reviews.llvm.org/D123803?id=527693#inline-1475183, where we just pass the `UnifiedLTO` state to `WriteBitcodeToFile`?
+
+
+
+
+Comment by ormris: > @ormris do you remember why this assert should hold?
+
+If you run Unified LTO with split LTO units enabled, empty module IDs mean that some modules will be written as regular LTO modules, and some will be written as ThinLTO modules. Unified LTO wants all modules to be either ThinLTO or regular LTO modules so that the whole program can be optimized as one piece. At SIE, we patched getUniqueModuleId to ensure it could produce a ModuleID in almost all circumstances. All of our changes are in https://reviews.llvm.org/D123969. If there's interest, I'd be happy to re-open that review as a PR. Otherwise, disabling split LTO units could also work, assuming that ThinLTO CFI support isn't needed.
+
+Comment by mandlebug: Closing this as it was fixed with https://github.com/llvm/llvm-project/pull/72180. Thanks for the fix @ilovepi . Do we need a new issue for tracking the problem with unified-lto and split-lto-units?
+Comment by ilovepi: Thanks. I've filed https://github.com/llvm/llvm-project/issues/77524 to track that.

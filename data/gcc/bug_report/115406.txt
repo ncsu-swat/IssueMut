@@ -1,0 +1,197 @@
+Bug Summary: [15 Regression] wrong code with vector compare at -O0 with -mavx512f since r15-920-gb6c6d5abf0d31c
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 14.1.1
+Known to Fail: 15.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-06-09 11:29:47 UTC
+  Text: Createdattachment 58390[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -O0 testcase.c -mavx512f
+$ ./a.out
+Aborted
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r15-1122-20240609121028-g8bb6b2f4ae1-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r15-1122-20240609121028-g8bb6b2f4ae1-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 15.0.0 20240609 (experimental) (GCC)
+
+- User: Sam James | Time: 2024-06-10 12:32:14 UTC
+  Text: r15-920-gb6c6d5abf0d31c
+
+- User: Hongtao Liu | Time: 2024-06-11 00:57:45 UTC
+  Text: I'll take a look.
+
+- User: Hongtao Liu | Time: 2024-06-11 02:55:15 UTC
+  Text: typedef __attribute__((__vector_size__ (1))) char V;
+
+char
+foo (V v)
+{
+  return ((V) v == v)[0];
+}
+
+int
+main ()
+{
+  char x = foo ((V) { });
+  if (x != -1)
+    __builtin_abort ();
+}
+
+w/ vcond_mask_qiqi, it's not lowered by veclower, and we get
+
+char foo (V v)
+{
+  vector(1) signed char D.5142;
+  char D.5141;
+  vector(1) <signed-boolean:8> _1;
+  vector(1) signed char _2;
+  char _5;
+
+  <bb 2> :
+  _1 = { -1 };
+  _2 = VEC_COND_EXPR <_1, { -1 }, { 0 }>;
+  D.5142 = _2;
+  _5 = VIEW_CONVERT_EXPR<char>(D.5142);
+
+  <bb 3> :
+<L0>:
+  return _5;
+}
+
+But it's further simplified to 
+
+char foo (V v)
+{
+  vector(1) signed char D.3765;
+  char D.3764;
+  vector(1) <signed-boolean:8> _1;
+  vector(1) signed char _2;
+  char _5;
+
+  <bb 2> :
+  _1 = { -1 };
+  _2 = VIEW_CONVERT_EXPR<vector(1) signed char>(_1);
+  D.3765 = _2;
+  _5 = VIEW_CONVERT_EXPR<char>(D.3765);
+
+  <bb 3> :
+<L0>:
+  return _5;
+
+}
+
+by isel
+
+and for _2 = VIEW_CONVERT_EXPR<vector(1) signed char>(_1); we explicitly clear the upper bits due toPR113576, and then we get 1 hit the abort.
+
+It sound to me 
+  _1 = { -1 };
+  _2 = VEC_COND_EXPR <_1, { -1 }, { 0 }>;
+shouldn't be simplified to 
+_2 = VIEW_CONVERT_EXPR<vector(1) signed char>(_1);
+
+when nunits is less than mode precision since the upper bit will be cleared.
+
+- User: Hongtao Liu | Time: 2024-06-11 03:39:58 UTC
+  Text: > 
+> and for _2 = VIEW_CONVERT_EXPR<vector(1) signed char>(_1); we explicitly
+> clear the upper bits due toPR113576, and then we get 1 hit the abort.It's not VIEW_CONVERT_EXPR clear the uppper bits, but _1 = { -1 };
+
+- User: Hongtao Liu | Time: 2024-06-11 03:48:11 UTC
+  Text: >   _2 = VEC_COND_EXPR <_1, { -1 }, { 0 }>;Hmm, it should check vcond_mask_qiv1qi instead of vcond_mask_qiqi, I guess since the backend doesn't supports v1qi, TYPE_MODE of V is QImode, then it wrongly checked vcond_mask_qiqi.
+
+- User: Hongtao Liu | Time: 2024-06-11 04:36:49 UTC
+  Text: For 1 element vector, when backend doesn't support it's vector mode, the scalar mode is used for the type, which makes expand_vec_cond_expr_p use QImode for icode check.(vcond_mask_qiqi)
+
+It could also be the case when both data type and cmp_type are vector_boolean_type.
+
+It looks like vcond_mask_qiqi is dichotomous.
+For the former, it should be 
+  operands[3] == 1 ? operands[1] : operands[2]
+
+since mask is vector 1 boolean.
+
+For the latter, it should be
+ (operand[1] & operand[3]) | (operand[2] & ~operand[3]) 
+
+
+BTW, when assign -1 to vector(1) <signed-boolean:8>, should the upper bit be cleared? Look like only 1 element boolean vector is cleared, but not vector(2) <signed-boolean:8>.
+If the upper bits are not cleared, both 2 cases are equal.
+
+- User: Hongtao Liu | Time: 2024-06-24 03:03:32 UTC
+  Text: > 
+> BTW, when assign -1 to vector(1) <signed-boolean:8>, should the upper bit be
+> cleared? Look like only 1 element boolean vector is cleared, but not
+> vector(2) <signed-boolean:8>.
+> If the upper bits are not cleared, both 2 cases are equal.diff --git a/gcc/fold-const.cc b/gcc/fold-const.cc
+index 710d697c021..0f045f851d1 100644
+--- a/gcc/fold-const.cc
++++ b/gcc/fold-const.cc
+@@ -8077,7 +8077,7 @@ native_encode_vector_part (const_tree expr, unsigned char *ptr, int len,
+ {
+   tree itype = TREE_TYPE (TREE_TYPE (expr));
+   if (VECTOR_BOOLEAN_TYPE_P (TREE_TYPE (expr))
+-      && TYPE_PRECISION (itype) <= BITS_PER_UNIT)
++      && TYPE_PRECISION (itype) < BITS_PER_UNIT)
+     {
+       /* This is the only case in which elements can be smaller than a byte.
+         Element 0 is always in the lsb of the containing byte.  */
+
+
+Can fix this.
+
+It looks like it supposed to handle for itype *less than* but not *less equal* BITS_PER_UNIT?
+
+- User: Richard Biener | Time: 2024-07-18 11:46:17 UTC
+  Text: IIRC Richard S. had a patch to native_encode_vector_part to fix this by making it set all bits instead of just the LSB?
+
+- User: GCC Commits | Time: 2024-07-19 18:09:55 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:348d890c287a7ec4c88d3082ae6105537bd39398commitr15-2161-g348d890c287a7ec4c88d3082ae6105537bd39398Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Fri Jul 19 19:09:37 2024 +0100
+
+    Treat boolean vector elements as 0/-1 [PR115406]
+    
+    Previously we built vector boolean constants using 1 for true
+    elements and 0 for false elements.  This matches the predicates
+    produced by SVE's PTRUE instruction, but leads to a miscompilation
+    on AVX, where all bits of a boolean element should be set.
+    
+    One option for RTL would be to make this target-configurable.
+    But that isn't really possible at the tree level, where vectors
+    should work in a more target-independent way.  (There is currently
+    no way to create a "generic" packed boolean vector, but never say
+    never :))  And, if we were going to pick a generic behaviour,
+    it would make sense to use 0/-1 rather than 0/1, for consistency
+    with integer vectors.
+    
+    Both behaviours should work with SVE on read, since SVE ignores
+    the upper bits in each predicate element.  And the choice shouldn't
+    make much difference for RTL, since all SVE predicate modes are
+    expressed as vectors of BI, rather than of multi-bit booleans.
+    
+    I suspect there might be some fallout from this change on SVE.
+    But I think we should at least give it a go, and see whether any
+    fallout provides a strong counterargument against the approach.
+    
+    gcc/PR middle-end/115406* fold-const.cc (native_encode_vector_part): For vector booleans,
+            check whether an element is nonzero and, if so, set all of the
+            correspending bits in the target image.
+            * simplify-rtx.cc (native_encode_rtx): Likewise.
+    
+    gcc/testsuite/PR middle-end/115406* gcc.dg/torture/pr115406.c: New test.
+
+- User: Richard Sandiford | Time: 2024-07-19 18:11:54 UTC
+  Text: Fixed.  Although the problem is latent on branches, I think we should only consider a backport after a few months, to give plenty of time for fallout to be detected.
+

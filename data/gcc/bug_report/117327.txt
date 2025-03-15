@@ -1,0 +1,283 @@
+Bug Summary: delay slot scheduling miscompiles function containing __builtin_unreachable
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Brad Moody | Time: 2024-10-28 07:51:04 UTC
+  Text: Createdattachment 59468[details]Minimized reproducer
+
+Reproducer program test.c:
+
+int printf(const char *restrict, ...);
+
+__attribute__((noinline))
+void foo(int *self, int *x) {
+    printf("foo\n");
+    if (x) {
+        while (1) {
+            ++*self;
+            if (*self == 6) break;
+            if (*self == 7) __builtin_unreachable();
+        }
+    }
+}
+int main() {
+    int y = 0;
+    foo(&y, 0);
+}   
+
+======================
+
+Steps to reproduce, on a SPARC machine, using gcc 13:
+
+gcc -O1 test.c -o test
+./test
+
+The program prints foo repeatedly before segfaulting (I believe due to overflowing the stack). I've only been able to reproduce the issue on SPARC. Reproduces with -m32 and -m64. Does not reproduce with -O3, but other less minimized inputs did show the problem at -O3.
+
+From examining the resulting assembly, I believe this is a miscompile. The assembly output:
+
+    .file   "a.c"
+    .section    ".text"
+    .section    .rodata.str1.8,"aMS",@progbits,1
+    .align 8
+.LLC0:
+    .asciz  "foo"
+    .section    ".text"
+    .align 4
+    .global foo
+    .type   foo, #function
+    .proc   020
+foo:
+    save    %sp, -176, %sp
+    sethi   %h44(.LLC0), %o0
+    or  %o0, %m44(.LLC0), %o0
+    sllx    %o0, 12, %o0
+    call    puts, 0
+     or %o0, %l44(.LLC0), %o0
+    brz,pn  %i1, .LL6
+     nop
+    ba,pt   %xcc, .LL4
+     lduw   [%i0], %g1
+.LL7:
+    be,a,pn %icc, .LL8
+     st %g1, [%i0]
+.LL4:
+    add %g1, 1, %g1
+    cmp %g1, 6
+    bne,pt  %icc, .LL7
+     cmp    %g1, 7
+    mov 6, %g1
+    st  %g1, [%i0]
+.LL8:
+    return  %i7+8
+     nop
+.LL6:
+    .size   foo, .-foo
+    .align 4
+    .global main
+    .type   main, #function
+    .proc   04
+main:
+    save    %sp, -192, %sp
+    st  %g0, [%fp+2043]
+    mov 0, %o1
+    call    foo, 0
+     add    %fp, 2043, %o0
+    return  %i7+8
+     mov    0, %o0
+    .size   main, .-main
+    .ident  "GCC: (GNU) 13.2.0"
+
+The branch for `if (x)` to .LL6 is off the end of the function - it should be to .LL8. Removing the call to __builtin_unreachable causes the problem to disappear.
+
+I don't have any other SPARC gcc installs on hand to test, but I did experiment with other versions using Compiler Explorer. gcc 12.4, appears to reproduce the problem at -O1, -O2 and -O3. gcc 14.1 doesn't appear to reproduce the problem at all, but I think the bug could very well still be present in gcc 14 and just not manifesting for this specific reproducer program.
+
+======================
+
+Other info:
+
+The OS is Solaris 11.4.74.176.3
+
+gcc -v output:
+
+Using built-in specs.
+COLLECT_GCC=gcc
+Target: sparcv9-sun-solaris2.11
+Configured with: /builds/11.4-SRU/11.4.72.0.1.176.0/components/gcc13/gcc-13.2.0/configure --prefix=/usr/gcc/13 --mandir=/usr/gcc/13/share/man --bindir=/usr/gcc/13/bin --sbindir=/usr/gcc/13/sbin --libdir=/usr/gcc/13/lib --infodir=/usr/gcc/13/share/info --libexecdir=/usr/gcc/13/lib --enable-languages=ada,c,c++,fortran,go,objc --enable-shared --enable-initfini-array --disable-rpath --with-system-zlib --with-build-config=no --without-gnu-ld --with-ld=/usr/bin/ld --with-gnu-as --with-as=/usr/gnu/bin/as --disable-bootstrap 'BOOT_CFLAGS=-g -O2' sparcv9-sun-solaris2.11
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 13.2.0 (GCC) 
+COLLECT_GCC_OPTIONS='-v' '-O1' '-c' '-mcpu=v9'
+ /usr/gcc/13/lib/gcc/sparcv9-sun-solaris2.11/13.2.0/cc1 -quiet -v -D__arch64__ -D__sparcv9 a.c -quiet -dumpbase a.c -dumpbase-ext .c -mcpu=v9 -O1 -version -o /var/tmp//ccj8.0wb.s
+GNU C17 (GCC) version 13.2.0 (sparcv9-sun-solaris2.11)
+        compiled by GNU C version 13.2.0, GMP version 6.3.0, MPFR version 4.2.1, MPC version 1.3.1, isl version isl-0.26-GMP
+
+GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072
+ignoring nonexistent directory "/usr/local/include"
+ignoring nonexistent directory "/usr/gcc/13/lib/gcc/sparcv9-sun-solaris2.11/13.2.0/../../../../sparcv9-sun-solaris2.11/include"
+#include "..." search starts here:
+#include <...> search starts here:
+ /usr/gcc/13/lib/gcc/sparcv9-sun-solaris2.11/13.2.0/include
+ /usr/gcc/13/include
+ /usr/gcc/13/lib/gcc/sparcv9-sun-solaris2.11/13.2.0/include-fixed
+ /usr/include
+End of search list.
+Compiler executable checksum: 92a7a4e1db50327821c291fc4325641f
+COLLECT_GCC_OPTIONS='-v' '-O1' '-c' '-mcpu=v9'
+ /usr/gnu/bin/as -v -V -Qy -s -xarch=v9 -64 -no-undeclared-regs -o a.o /var/tmp//ccj8.0wb.s
+GNU assembler version 2.40 (sparcv9-sun-solaris2.11) using BFD version (GNU Binutils) 2.40
+COMPILER_PATH=/usr/gcc/13/lib/gcc/sparcv9-sun-solaris2.11/13.2.0/:/usr/gcc/13/lib/gcc/sparcv9-sun-solaris2.11/13.2.0/:/usr/gcc/13/lib/gcc/sparcv9-sun-solaris2.11/:/usr/gcc/13/lib/gcc/sparcv9-sun-solaris2.11/13.2.0/:/usr/gcc/13/lib/gcc/sparcv9-sun-solaris2.11/:/usr/ccs/bin/
+LIBRARY_PATH=/usr/gcc/13/lib/gcc/sparcv9-sun-solaris2.11/13.2.0/:/usr/gcc/13/lib/gcc/sparcv9-sun-solaris2.11/13.2.0/../../../sparcv9/:/lib/sparcv9/:/usr/lib/sparcv9/:/usr/gcc/13/lib/gcc/sparcv9-sun-solaris2.11/13.2.0/../../../:/lib/:/usr/lib/
+COLLECT_GCC_OPTIONS='-v' '-O1' '-c' '-mcpu=v9'
+
+- User: Andrew Pinski | Time: 2024-10-28 08:12:07 UTC
+  Text: Looks like it is delay slot scheduling related ...
+
+- User: Eric Botcazou | Time: 2024-10-28 09:18:18 UTC
+  Text: Confirmed as a delay slot scheduling issue, so -fno-delayed-branch is a workaround (although the questionable branch is still present in the assembly, but only executed if the unreachable path is reached).
+
+- User: Eric Botcazou | Time: 2024-10-28 09:18:45 UTC
+  Text: Investigating.
+
+- User: Eric Botcazou | Time: 2024-10-28 17:09:57 UTC
+  Text: The problem is in find_end_label, namely:
+
+  /* Otherwise, see if there is a label at the end of the function.  If there
+     is, it must be that RETURN insns aren't needed, so that is our return
+     label and we don't have to do anything else.  */
+
+That was correct 20 years ago (by the time ofPR boottstrap/16326) but no longer is because of __builtin_unreachable and the like.
+
+- User: Eric Botcazou | Time: 2024-10-28 17:11:56 UTC
+  Text: Createdattachment 59480[details]Tentative fix
+
+To be properly tested.
+
+- User: GCC Commits | Time: 2024-10-29 20:44:40 UTC
+  Text: The master branch has been updated by Eric Botcazou <ebotcazou@gcc.gnu.org>:https://gcc.gnu.org/g:7211155732244ac527c075d033164ec253ee0971commitr15-4755-g7211155732244ac527c075d033164ec253ee0971Author: Eric Botcazou <ebotcazou@adacore.com>
+Date:   Tue Oct 29 21:40:34 2024 +0100
+
+    Fix miscompilation of function containing __builtin_unreachable
+    
+    This is a wrong-code generation on the SPARC for a function containing
+    a call to __builtin_unreachable caused by the delay slot scheduling pass,
+    and more specifically the find_end_label function which has these lines:
+    
+      /* Otherwise, see if there is a label at the end of the function. If there
+         is, it must be that RETURN insns aren't needed, so that is our return
+         label and we don't have to do anything else.  */
+    
+    The comment was correct 20 years ago but no longer is nowadays in the
+    presence of RTL epilogues and calls to __builtin_unreachable, so the
+    patch just removes the associated two lines of code:
+    
+      else if (LABEL_P (insn))
+        *plabel = as_a <rtx_code_label *> (insn);
+    
+    and otherwise contains just adjustments to the commentary.
+    
+    gcc/PR rtl-optimization/117327* reorg.cc (find_end_label): Do not return a dangling label at the
+            end of the function and adjust commentary.
+    
+    gcc/testsuite/
+            * gcc.c-torture/execute/20241029-1.c: New test.
+
+- User: GCC Commits | Time: 2024-10-29 20:52:23 UTC
+  Text: The releases/gcc-14 branch has been updated by Eric Botcazou <ebotcazou@gcc.gnu.org>:https://gcc.gnu.org/g:0ea3dca7946a1bce072ae5f732a873ce6f207beecommitr14-10850-g0ea3dca7946a1bce072ae5f732a873ce6f207beeAuthor: Eric Botcazou <ebotcazou@adacore.com>
+Date:   Tue Oct 29 21:40:34 2024 +0100
+
+    Fix miscompilation of function containing __builtin_unreachable
+    
+    This is a wrong-code generation on the SPARC for a function containing
+    a call to __builtin_unreachable caused by the delay slot scheduling pass,
+    and more specifically the find_end_label function which has these lines:
+    
+      /* Otherwise, see if there is a label at the end of the function. If there
+         is, it must be that RETURN insns aren't needed, so that is our return
+         label and we don't have to do anything else.  */
+    
+    The comment was correct 20 years ago but no longer is nowadays in the
+    presence of RTL epilogues and calls to __builtin_unreachable, so the
+    patch just removes the associated two lines of code:
+    
+      else if (LABEL_P (insn))
+        *plabel = as_a <rtx_code_label *> (insn);
+    
+    and otherwise contains just adjustments to the commentary.
+    
+    gcc/PR rtl-optimization/117327* reorg.cc (find_end_label): Do not return a dangling label at the
+            end of the function and adjust commentary.
+    
+    gcc/testsuite/
+            * gcc.c-torture/execute/20241029-1.c: New test.
+
+- User: GCC Commits | Time: 2024-10-29 20:55:00 UTC
+  Text: The releases/gcc-13 branch has been updated by Eric Botcazou <ebotcazou@gcc.gnu.org>:https://gcc.gnu.org/g:4bcc87a66bf265805fba308593b6c7ef03aab3d3commitr13-9155-g4bcc87a66bf265805fba308593b6c7ef03aab3d3Author: Eric Botcazou <ebotcazou@adacore.com>
+Date:   Tue Oct 29 21:40:34 2024 +0100
+
+    Fix miscompilation of function containing __builtin_unreachable
+    
+    This is a wrong-code generation on the SPARC for a function containing
+    a call to __builtin_unreachable caused by the delay slot scheduling pass,
+    and more specifically the find_end_label function which has these lines:
+    
+      /* Otherwise, see if there is a label at the end of the function. If there
+         is, it must be that RETURN insns aren't needed, so that is our return
+         label and we don't have to do anything else.  */
+    
+    The comment was correct 20 years ago but no longer is nowadays in the
+    presence of RTL epilogues and calls to __builtin_unreachable, so the
+    patch just removes the associated two lines of code:
+    
+      else if (LABEL_P (insn))
+        *plabel = as_a <rtx_code_label *> (insn);
+    
+    and otherwise contains just adjustments to the commentary.
+    
+    gcc/PR rtl-optimization/117327* reorg.cc (find_end_label): Do not return a dangling label at the
+            end of the function and adjust commentary.
+    
+    gcc/testsuite/
+            * gcc.c-torture/execute/20241029-1.c: New test.
+
+- User: GCC Commits | Time: 2024-10-29 20:55:52 UTC
+  Text: The releases/gcc-12 branch has been updated by Eric Botcazou <ebotcazou@gcc.gnu.org>:https://gcc.gnu.org/g:0711e018b77eac34efc6d2e1e66cdf16e01b47c0commitr12-10791-g0711e018b77eac34efc6d2e1e66cdf16e01b47c0Author: Eric Botcazou <ebotcazou@adacore.com>
+Date:   Tue Oct 29 21:40:34 2024 +0100
+
+    Fix miscompilation of function containing __builtin_unreachable
+    
+    This is a wrong-code generation on the SPARC for a function containing
+    a call to __builtin_unreachable caused by the delay slot scheduling pass,
+    and more specifically the find_end_label function which has these lines:
+    
+      /* Otherwise, see if there is a label at the end of the function. If there
+         is, it must be that RETURN insns aren't needed, so that is our return
+         label and we don't have to do anything else.  */
+    
+    The comment was correct 20 years ago but no longer is nowadays in the
+    presence of RTL epilogues and calls to __builtin_unreachable, so the
+    patch just removes the associated two lines of code:
+    
+      else if (LABEL_P (insn))
+        *plabel = as_a <rtx_code_label *> (insn);
+    
+    and otherwise contains just adjustments to the commentary.
+    
+    gcc/PR rtl-optimization/117327* reorg.cc (find_end_label): Do not return a dangling label at the
+            end of the function and adjust commentary.
+    
+    gcc/testsuite/
+            * gcc.c-torture/execute/20241029-1.c: New test.
+
+- User: Eric Botcazou | Time: 2024-10-29 20:57:40 UTC
+  Text: Fixed on mainline, 14, 13 and 12 branches.  Thanks for reporting the problem and for the reduced testcase.
+
+- User: Brad Moody | Time: 2024-10-29 23:31:09 UTC
+  Text: Thank you for the quick turnaround!
+

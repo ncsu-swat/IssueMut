@@ -1,0 +1,214 @@
+Bug Summary: [14 Regression] wrong code on x365-3.5, -O3, sign extraction
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 14.0
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2023-07-28 07:33:58 UTC
+  Text: Initially observed as SSE4 test failures on x365-3.5 on gccr14-2829-g31d18ff44244d1.
+
+Extracted self-contained reproducer:
+
+// $ cat bug.cc
+typedef unsigned  int uint32_t;
+typedef unsigned char uint8_t;
+typedef   signed char  int8_t;
+typedef uint8_t pixel;
+
+/* get the sign of input variable (TODO: this is a dup, make common) */
+inline int8_t signOf(int x)
+{
+    return (x >> 31) | ((int)((((uint32_t)-x)) >> 31));
+}
+
+__attribute__((noipa))
+static void calSign_bug(int8_t *dst, const pixel *src1, const pixel *src2, const int endX)
+{
+    for (int x = 0; x < endX; x++)
+        dst[x] = signOf(src1[x] - src2[x]);
+}
+
+__attribute__((noipa, optimize(0)))
+static void calSign_ok(int8_t *dst, const pixel *src1, const pixel *src2, const int endX)
+{
+    for (int x = 0; x < endX; x++)
+        dst[x] = signOf(src1[x] - src2[x]);
+}
+
+__attribute__((noipa, optimize(0)))
+int main(void)
+{
+    const pixel s1[9] = { 0xcd, 0x33, 0xd4, 0x3e, 0xb0, 0xfb, 0x95, 0x64, 0x70, };
+    const pixel s2[9] = { 0xba, 0x9f, 0xab, 0xa1, 0x3b, 0x29, 0xb1, 0xbd, 0x64, };
+    int endX = 9;
+    int8_t dst[9];
+    int8_t dst_ok[9];
+
+    calSign_bug(dst, s1, s2, endX);
+    calSign_ok(dst_ok, s1, s2, endX);
+
+    if (__builtin_memcmp(dst, dst_ok, endX) != 0) __builtin_trap();
+}
+
+Triggering:
+
+$ g++ bug.cc -o bug -O2 && ./bug
+# ok
+$ g++ bug.cc -o bug -O3 && ./bug
+Illegal instruction (core dumped)
+
+$ g++ -v
+Using built-in specs.
+COLLECT_GCC=/<<NIX>>/gcc-14.0.0/bin/g++
+COLLECT_LTO_WRAPPER=/<<NIX>>/gcc-14.0.0/libexec/gcc/x86_64-unknown-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-unknown-linux-gnu
+Configured with: ../source/configure --prefix=/<<NIX>>/gcc-14.0.0 --with-gmp-include=/<<NIX>>/gmp-6.2.1-dev/include --with-gmp-lib=/<<NIX>>/gmp-6.2.1/lib --with-mpfr-include=/<<NIX>>/mpfr-4.2.0-dev/include --with-mpfr-lib=/<<NIX>>/mpfr-4.2.0/lib --with-mpc=/<<NIX>>/libmpc-1.3.1 --with-native-system-header-dir=/<<NIX>>/glibc-2.37-8-dev/include --with-build-sysroot=/ --program-prefix= --enable-lto --disable-libstdcxx-pch --without-included-gettext --with-system-zlib --enable-checking=release --enable-static --enable-languages=c,c++ --disable-multilib --enable-plugin --disable-libcc1 --with-isl=/<<NIX>>/isl-0.20 --disable-bootstrap --build=x86_64-unknown-linux-gnu --host=x86_64-unknown-linux-gnu --target=x86_64-unknown-linux-gnu
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 99999999 (experimental) (GCC)
+
+- User: Sergei Trofimovich | Time: 2023-07-28 07:59:10 UTC
+  Text: Bisect claims it'sr14-2821-gd1c072a1c3411acommit d1c072a1c3411a6fe29900750b38210af8451eeb
+Date:   Thu Jul 27 13:08:32 2023 +0200
+
+    tree-optimization/91838 - fix FAIL of g++.dg/opt/pr91838.C
+
+- User: Richard Biener | Time: 2023-07-28 07:59:28 UTC
+  Text: => 0x00000000004009ae <+126>:   ud2    
+
+confirmed.
+
+(gdb) p dst_ok
+$1 = "\001\377\001\377\001\001\377\377\001"
+(gdb) p dst
+$2 = "\001\000\001\000\001\001\000\000\001"
+
+I think we have a bug somewhere about a bug in pattern matching with a widening op.
+
+- User: Richard Biener | Time: 2023-07-28 08:01:43 UTC
+  Text: I will have a look.
+
+- User: Richard Biener | Time: 2023-07-28 08:08:21 UTC
+  Text: Indeed we have
+
+vector(8) signed short << 31
+
+here, so it looks like a bug in the vectorizer to me, now only find the dup...
+
+- User: Richard Biener | Time: 2023-07-28 12:04:23 UTC
+  Text: t.c:15:23: note:   can narrow to signed:9 without loss of precision: _17 = _8 >> 31;
+t.c:15:23: note:   only the low 9 bits of _8 are significant
+
+- User: Richard Biener | Time: 2023-07-31 11:58:21 UTC
+  Text: I have a patch.
+
+- User: Sergei Trofimovich | Time: 2023-08-01 08:37:51 UTC
+  Text: Testedhttps://gcc.gnu.org/pipermail/gcc-patches/2023-July/625868.htmlagainst x265-3.5 test suite. All passes.
+
+Thank you!
+
+- User: GCC Commits | Time: 2023-08-03 12:53:13 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:29370f1387274ad5a35a020db6a5d06c0324e6c1commitr14-2952-g29370f1387274ad5a35a020db6a5d06c0324e6c1Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Jul 31 14:44:52 2023 +0200
+
+    tree-optimization/110838 - vectorization of widened shifts
+    
+    The following makes sure to limit the shift operand when vectorizing
+    (short)((int)x >> 31) via (short)x >> 31 as the out of bounds shift
+    operand otherwise invokes undefined behavior.  When we determine
+    whether we can demote the operand we know we at most shift in the
+    sign bit so we can adjust the shift amount.
+    
+    Note this has the possibility of un-CSEing common shift operands
+    as there's no good way to share pattern stmts between patterns.
+    We'd have to separately pattern recognize the definition.PR tree-optimization/110838* tree-vect-patterns.cc (vect_recog_over_widening_pattern):
+            Adjust the shift operand of RSHIFT_EXPRs.
+    
+            * gcc.dg/torture/pr110838.c: New testcase.
+
+- User: Richard Biener | Time: 2023-08-03 13:01:15 UTC
+  Text: Fixed on trunk.  I think the issue is present on the branches as well in that
+we generate
+
+  vect_patt_48.21_145 = VIEW_CONVERT_EXPR<vector(8) signed short>(vect_patt_49.20_143);
+  vect_patt_48.21_146 = VIEW_CONVERT_EXPR<vector(8) signed short>(vect_patt_49.20_144);
+  vect_patt_46.22_147 = vect_patt_48.21_145 >> 31;
+  vect_patt_46.22_148 = vect_patt_48.21_146 >> 31;
+
+and
+
+        psraw   $31, %xmm3
+        psraw   $31, %xmm2
+
+so we have out-of-bound arithmetic vector shifts here which might or might
+not cause issues on other targets than x86.  psraw documents
+"If the value specified by the count operand is greater than 15 (for words)
+[...], each destination data element is fille with the initial value of
+the sign bit of the element." which is what we intended to compute.
+
+- User: GCC Commits | Time: 2023-08-04 10:16:30 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:04aa0edcace22a7815cfc57575f1f7b1f166ac10commitr14-2985-g04aa0edcace22a7815cfc57575f1f7b1f166ac10Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Aug 4 11:24:49 2023 +0200
+
+    tree-optimization/110838 - less aggressively fold out-of-bound shifts
+    
+    The following adjusts the shift simplification patterns to avoid
+    touching out-of-bound shift value arithmetic right shifts of
+    possibly negative values.  While simplifying those to zero isn't
+    wrong it's violating the principle of least surprise.PR tree-optimization/110838* match.pd (([rl]shift @0 out-of-bounds) -> zero): Restrict
+            the arithmetic right-shift case to non-negative operands.
+
+- User: GCC Commits | Time: 2023-08-04 11:15:17 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:1a599caab86464006ea8c9501aff6c6638e891ebcommitr14-2987-g1a599caab86464006ea8c9501aff6c6638e891ebAuthor: Richard Biener <rguenther@suse.de>
+Date:   Fri Aug 4 12:11:45 2023 +0200
+
+    tree-optimization/110838 - vectorization of widened right shifts
+    
+    The following fixes a problem with my last attempt of avoiding
+    out-of-bound shift values for vectorized right shifts of widened
+    operands.  Instead of truncating the shift amount with a bitwise
+    and we actually need to saturate it to the target precision.
+    
+    The following does that and adds test coverage for the constant
+    and invariant but variable case that would previously have failed.PR tree-optimization/110838* tree-vect-patterns.cc (vect_recog_over_widening_pattern):
+            Fix right-shift value sanitizing.  Properly emit external
+            def mangling in the preheader rather than in the pattern
+            def sequence where it will fail vectorizing.
+    
+            * gcc.dg/vect/pr110838.c: New testcase.
+
+- User: Richard Biener | Time: 2023-10-17 12:21:01 UTC
+  Text: Fixed.
+
+- User: GCC Commits | Time: 2024-03-26 14:58:57 UTC
+  Text: The releases/gcc-13 branch has been updated by Andre Simoes Dias Vieira <avieira@gcc.gnu.org>:https://gcc.gnu.org/g:b170ab1d051dc97b2e5c03984dbe406939364adccommitr13-8499-gb170ab1d051dc97b2e5c03984dbe406939364adcAuthor: Richard Biener <rguenther@suse.de>
+Date:   Fri Aug 4 11:24:49 2023 +0200
+
+    tree-optimization/110838 - less aggressively fold out-of-bound shifts
+    
+    The following adjusts the shift simplification patterns to avoid
+    touching out-of-bound shift value arithmetic right shifts of
+    possibly negative values.  While simplifying those to zero isn't
+    wrong it's violating the principle of least surprise.PR tree-optimization/110838* match.pd (([rl]shift @0 out-of-bounds) -> zero): Restrict
+            the arithmetic right-shift case to non-negative operands.
+    
+    (cherry picked from commit 04aa0edcace22a7815cfc57575f1f7b1f166ac10)
+
+- User: GCC Commits | Time: 2024-03-26 15:05:32 UTC
+  Text: The releases/gcc-12 branch has been updated by Andre Simoes Dias Vieira <avieira@gcc.gnu.org>:https://gcc.gnu.org/g:d0eed43ff39a0bad4a02f8af7a4795e06aea6f80commitr12-10294-gd0eed43ff39a0bad4a02f8af7a4795e06aea6f80Author: Richard Biener <rguenther@suse.de>
+Date:   Fri Aug 4 11:24:49 2023 +0200
+
+    tree-optimization/110838 - less aggressively fold out-of-bound shifts
+    
+    The following adjusts the shift simplification patterns to avoid
+    touching out-of-bound shift value arithmetic right shifts of
+    possibly negative values.  While simplifying those to zero isn't
+    wrong it's violating the principle of least surprise.PR tree-optimization/110838* match.pd (([rl]shift @0 out-of-bounds) -> zero): Restrict
+            the arithmetic right-shift case to non-negative operands.
+    
+    (cherry picked from commit 04aa0edcace22a7815cfc57575f1f7b1f166ac10)
+

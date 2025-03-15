@@ -1,0 +1,150 @@
+Bug Summary: -Wanalyzer-deref-before-check false positives seen in haproxy's cfgparse.c: parse_process_number
+Product: gcc
+Component: analyzer
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Malcolm | Time: 2023-03-07 21:45:55 UTC
+  Text: Createdattachment 54603[details]Reproducerhttps://godbolt.org/z/qnd1TrWshTrunk falsely emits this on the attached file:
+
+$ ./xgcc -B. -S -fanalyzer -Wall ../../src/haproxy-cfgparse.c 
+../../src/haproxy-cfgparse.c: In function ‘parse_process_number’:
+../../src/haproxy-cfgparse.c:58:21: warning: check of ‘dash’ for NULL after already dereferencing it [-Wanalyzer-deref-before-check]
+   58 |       if (*p == '-' && !dash)
+      |           ~~~~~~~~~~^~~~~~~~
+  ‘parse_process_number’: events 1-16
+    |
+    |   47 |   if (strcmp(arg, "all") == 0)
+    |      |      ~^~~~~~~~~~~~~~~~~~
+    |      |      ||
+    |      |      |(1) pointer ‘dash’ is dereferenced here
+    |      |      (2) following ‘false’ branch (when the strings are non-equal)...
+    |   48 |     *proc |= ~0UL;
+    |   49 |   else if (strcmp(arg, "odd") == 0)
+    |      |           ~~~~~~~~~~~~~~~~~~~
+    |      |           ||
+    |      |           |(3) ...to here
+    |      |           (4) following ‘false’ branch (when the strings are non-equal)...
+    |   50 |     *proc |= ~0UL / 3UL;
+    |   51 |   else if (strcmp(arg, "even") == 0)
+    |      |           ~~~~~~~~~~~~~~~~~~~~
+    |      |           ||
+    |      |           |(5) ...to here
+    |      |           (6) following ‘false’ branch (when the strings are non-equal)...
+    |......
+    |   54 |     const char *p, *dash = ((void*)0);
+    |      |                     ~~~~
+    |      |                     |
+    |      |                     (7) ...to here
+    |......
+    |   57 |     for (p = arg; *p; p++) {
+    |      |                   ~
+    |      |                   |
+    |      |                   (8) following ‘true’ branch...
+    |      |                   (12) following ‘true’ branch...
+    |   58 |       if (*p == '-' && !dash)
+    |      |          ~~~~~~~~~~~~~~~~~~~
+    |      |          ||         |
+    |      |          ||         (10) following ‘true’ branch (when ‘dash’ is NULL)...
+    |      |          ||         (15) ...to here
+    |      |          ||         (16) pointer ‘dash’ is checked for NULL here but it was already dereferenced at (1)
+    |      |          |(9) ...to here
+    |      |          |(13) ...to here
+    |      |          (14) following ‘true’ branch...
+    |   59 |         dash = p;
+    |      |         ~~~~~~~~
+    |      |              |
+    |      |              (11) ...to here
+    |
+../../src/haproxy-cfgparse.c:68:8: warning: check of ‘dash’ for NULL after already dereferencing it [-Wanalyzer-deref-before-check]
+   68 |     if (dash)
+      |        ^
+  ‘parse_process_number’: events 1-12
+    |
+    |   47 |   if (strcmp(arg, "all") == 0)
+    |      |      ~^~~~~~~~~~~~~~~~~~
+    |      |      ||
+    |      |      |(1) pointer ‘dash’ is dereferenced here
+    |      |      (2) following ‘false’ branch (when the strings are non-equal)...
+    |   48 |     *proc |= ~0UL;
+    |   49 |   else if (strcmp(arg, "odd") == 0)
+    |      |           ~~~~~~~~~~~~~~~~~~~
+    |      |           ||
+    |      |           |(3) ...to here
+    |      |           (4) following ‘false’ branch (when the strings are non-equal)...
+    |   50 |     *proc |= ~0UL / 3UL;
+    |   51 |   else if (strcmp(arg, "even") == 0)
+    |      |           ~~~~~~~~~~~~~~~~~~~~
+    |      |           ||
+    |      |           |(5) ...to here
+    |      |           (6) following ‘false’ branch (when the strings are non-equal)...
+    |......
+    |   54 |     const char *p, *dash = ((void*)0);
+    |      |                     ~~~~
+    |      |                     |
+    |      |                     (7) ...to here
+    |......
+    |   57 |     for (p = arg; *p; p++) {
+    |      |                   ~
+    |      |                   |
+    |      |                   (8) following ‘true’ branch...
+    |   58 |       if (*p == '-' && !dash)
+    |      |           ~~~~~~~~~~~~~~~~~~
+    |      |           |         |
+    |      |           |         (10) following ‘true’ branch (when ‘dash’ is NULL)...
+    |      |           (9) ...to here
+    |   59 |         dash = p;
+    |      |         ~~~~~~~~
+    |      |              |
+    |      |              (11) ...to here
+    |......
+    |   68 |     if (dash)
+    |      |        ~
+    |      |        |
+    |      |        (12) pointer ‘dash’ is checked for NULL here but it was already dereferenced at (1)
+    |
+
+- User: GCC Commits | Time: 2023-03-10 13:22:42 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:c4fd232f9843bb800548a906653aeb0723cdb411commitr13-6581-gc4fd232f9843bb800548a906653aeb0723cdb411Author: David Malcolm <dmalcolm@redhat.com>
+Date:   Fri Mar 10 08:20:10 2023 -0500
+
+    analyzer: fix deref-before-check false +ves seen in haproxy [PR108475,PR109060]
+    
+    Integration testing showed various false positives from
+    -Wanalyzer-deref-before-check where the expression that's dereferenced
+    is different from the one that's checked, but the diagnostic is emitted
+    because they both evaluate to the same symbolic value.
+    
+    This patch rejects such warnings, unless we have tree expressions for
+    both and that both tree expressions are "spelled the same way" i.e.
+    would be printed to the same user-facing string.
+    
+    gcc/analyzer/ChangeLog:PR analyzer/108475PR analyzer/109060* sm-malloc.cc (deref_before_check::deref_before_check):
+            Initialize new field m_deref_expr.  Assert that arg is non-NULL.
+            (deref_before_check::emit): Reject cases where the spelling of the
+            thing that was dereferenced differs from that of what is checked,
+            or if the dereference expression was not found.  Remove code to
+            handle NULL m_arg.
+            (deref_before_check::describe_state_change): Remove code to handle
+            NULL m_arg.
+            (deref_before_check::describe_final_event): Likewise.
+            (deref_before_check::sufficiently_similar_p): New.
+            (deref_before_check::m_deref_expr): New field.
+            (malloc_state_machine::maybe_complain_about_deref_before_check):
+            Don't warn if the diag_ptr is NULL.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/108475PR analyzer/109060* gcc.dg/analyzer/deref-before-check-pr108475-1.c: New test.
+            * gcc.dg/analyzer/deref-before-check-pr108475-haproxy-tcpcheck.c:
+            New test.
+            * gcc.dg/analyzer/deref-before-check-pr109060-haproxy-cfgparse.c:
+            New test.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2023-03-10 13:58:03 UTC
+  Text: Should be fixed by the above patch.
+

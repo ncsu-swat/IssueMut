@@ -1,0 +1,175 @@
+Bug Summary: [13 Regression] Dead Code Elimination Regression at -Os since r13-1162-g9991d84d2a8435
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Yann Girsberger | Time: 2023-01-10 13:07:47 UTC
+  Text: Createdattachment 54234[details]presented code as file
+
+cat case.c #864
+int b = 10;
+int c;
+char e;
+void foo();
+static char(a)(char f, char g) { return f && g == 1 ? 0 : f % g; }
+short(d)(short f, short g) { return f * g; }
+int main() {
+  short h;
+  int i;
+  unsigned j;
+  h = d(b && c, 5);
+  j = h;
+  i = a(h, 237);
+  unsigned k = i;
+  e = i < 0 || k >= 32 ? 0 : i >> k;
+  if (e) {
+    c = 0;
+    foo();
+  }
+}
+
+`gcc-cb93c5f8008b95743b741d6f1842f9be50c6985c (trunk) -Os` can not eliminate `foo` but `gcc-releases/gcc-12.2.0 -Os` can.
+
+`gcc-cb93c5f8008b95743b741d6f1842f9be50c6985c (trunk) -Os -S -o /dev/stdout case.c`
+--------- OUTPUT ---------
+main:
+.LFB2:
+	.cfi_startproc
+	movl	b(%rip), %eax
+	testl	%eax, %eax
+	je	.L3
+	xorl	%eax, %eax
+	cmpl	$0, c(%rip)
+	setne	%al
+.L3:
+	movb	$5, %dl
+	imull	%edx, %eax
+	movsbl	%al, %edx
+	movl	%eax, %ecx
+	sarl	%cl, %edx
+	movb	%dl, e(%rip)
+	testl	%edx, %edx
+	je	.L12
+	pushq	%rax
+	.cfi_def_cfa_offset 16
+	xorl	%edx, %edx
+	xorl	%eax, %eax
+	movl	%edx, c(%rip)
+	call	foo
+	xorl	%eax, %eax
+	popq	%rcx
+	.cfi_def_cfa_offset 8
+	ret
+.L12:
+	xorl	%eax, %eax
+	ret
+---------- END OUTPUT ---------
+
+
+`gcc-releases/gcc-12.2.0 -Os -S -o /dev/stdout case.c`
+--------- OUTPUT ---------
+main:
+.LFB2:
+	.cfi_startproc
+	movb	$0, e(%rip)
+	xorl	%eax, %eax
+	ret
+---------- END OUTPUT ---------
+
+
+Bisects to:https://gcc.gnu.org/git/?p=gcc.git;a=commit;h=9991d84d2a84355fd3fc9afc89a963f45991bfa9
+
+- User: Jakub Jelinek | Time: 2023-01-10 19:42:04 UTC
+  Text: r13-1162causes the multiplication by 5 be done in short int rather than unsigned short int type.
+And that makes threadfull1 do a different decision apparently.
+
+- User: Jakub Jelinek | Time: 2023-01-10 19:43:33 UTC
+  Text: Note, i and k are [0,0] U [5,5], so e is 0>>0 or 5>>5 and so always 0.
+
+- User: Jakub Jelinek | Time: 2023-01-10 19:51:20 UTC
+  Text: I bet to solve this on the ranger side rather than threader, we'd need to determine that
+  # RANGE [0, 5] NONZERO 5
+  f_21 = _29 * 5;
+  # RANGE [0, 5] NONZERO 5
+  _25 = (int) f_21;
+  # RANGE [0, 5] NONZERO 5
+  k_15 = (unsigned int) f_21;
+  # RANGE [0, 5] NONZERO 7
+  _9 = _25 >> k_15;
+on the right shift _25 and k_15 are actually equivalent (yes, they have different types, but given the known ranges for it the casts don't really matter for the value), make sure that the fact that rhs1 is equal to rhs2 is told to the handler and special case the shift.  Either if we know the range is [0, 0] U [5, 5] and operands equal, then it is 0 >> 0 or 5 >> 5, both 0, or for [0, 5] it is 0 >> 0, 1 >> 1, 2 >> 2, 3 >> 3, 4 >> 4 or 5 >> 5, all of which are also [0, 0].  For shifts we know only a handful of shift counts are valid and we can try them all and compute the range as union of results for each possible value.
+
+- User: Andrew Macleod | Time: 2023-01-10 21:01:22 UTC
+  Text: Well, range does know there is a relationship.. or at least could know:
+
+Partial equiv (i_23 pe8 _35)
+Partial equiv (k_24 pe8 _35)
+
+It knows they are both 8 bit equivalences of _35.   I don't remember if it will then elide that they are equal... I *think* it will.
+
+It also knows their range is:
+i_23 : [irange] int [0, 0][5, 5] NONZERO 0x5
+k_24 : [irange] unsigned int [0, 0][5, 5] NONZERO 0x5
+
+Looking at the call to operator_rshift::fold_range, I see the relation passed in:
+
+(gdb) p rel.op1_op2()
+$3 = VREL_PE8
+
+(gdb) p op1.dump(stderr)
+[irange] int [0, 0][5, 5] NONZERO 0x5
+
+(gdb) p op2.dump(stderr)
+[irange] unsigned int [0, 0][5, 5] NONZERO 0x5
+
+We know that 0 and 5 are both within the 8 bit equivalence, so the information is already there now to decide that the result would be 0 >> 0 or 5 >> 5.
+
+In fact, we could go one further.  wi_fold_in_parts already breaks this down and invokes operator_rshift::wi_fold on  [0,0],[0,0]  [0, 0],[5, 5] [5,5],[0,0] and [5,5],[5,5]
+
+All we really need to do is teach range_operator::fold_range that rather than invoking wi_fold_in_parts() on every combination, that if there is an op1_op2 relation we may only need a subset..
+
+- User: Andrew Macleod | Time: 2023-01-10 21:19:09 UTC
+  Text: Createdattachment 54240[details]sample implementation
+
+In fact that appears to work...   The attached (untested) patch simply does that at the higher level, and produces:
+
+ Folding statement: _11 = i_23 >> k_24;
+ folding with relation i_23 pe8 k_24
+ Registering value_relation (_11 <= i_23) (bb6) at _11 = i_23 >> k_24;
+Queued stmt for removal.  Folds to: 0
+
+
+We'd probably want to push the equivalence relation deeper into wi_fold_in_parts as well so that if it was given [0,5] >> [0,5]  it would also do the right thing.  
+
+The current patch works because it is providing wi_fold_in_parts the higher level pairs   [0,0] and [5,5].     if it was presented with [0,5] [0,5] if would simply do the normal fold.   we'd also want wi_fold_in_parts to DTRT when we give it an equivalence and break it down into components. 
+
+NOt sure we want to do that for this release tho...?
+
+- User: Jakub Jelinek | Time: 2023-01-11 09:47:51 UTC
+  Text: (In reply to Andrew Macleod fromcomment #5)> NOt sure we want to do that for this release tho...?Why not?  Regression fixes are fine even in stage4, we are still in stage3.
+I'd go with something like your patch if it fixes this regression and defer more detailed handling of equality shifts for stage1.
+
+- User: GCC Commits | Time: 2023-01-31 14:58:06 UTC
+  Text: The master branch has been updated by Andrew Macleod <amacleod@gcc.gnu.org>:https://gcc.gnu.org/g:809d661aff99ae0287baf4a52269425de62381e6commitr13-5578-g809d661aff99ae0287baf4a52269425de62381e6Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Tue Jan 17 11:14:41 2023 -0500
+
+    Utilize op1 == op2 when invoking range-ops folding.
+    
+    If there exists an equivalence relationship between op1 and op2,
+    any binary operation can be broken into individual operations and
+    unioned if there are sufficently few elements in the set.PR tree-optimization/108359gcc/
+            * range-op.cc (range_operator::wi_fold_in_parts_equiv): New.
+            (range_operator::fold_range): If op1 is equivalent to op2 then
+            invoke new fold_in_parts_equiv to operate on sub-components.
+            * range-op.h (wi_fold_in_parts_equiv): New prototype.
+    
+            gcc/testsuite/
+            * gcc.dg/pr108359.c: New.
+
+- User: Andrew Macleod | Time: 2023-01-31 14:58:24 UTC
+  Text: fixed
+

@@ -1,0 +1,278 @@
+Bug Summary: [14 Regression] Dead Code Elimination Regression since r14-2946-g46c8c225455
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Theodoros Theodoridis | Time: 2023-08-09 19:42:55 UTC
+  Text: https://godbolt.org/z/devdMf1qdGiven the following code:
+
+void foo(void);
+static int c = 76, f, g;
+static int *h, *j, *k = &g;
+static int **i = &h;
+static short a;
+static char(l)(char b) {
+    if (!(((b) >= 77) && ((b) <= 77))) {
+        __builtin_unreachable();
+    }
+    return 0;
+}
+static short(m)(short d, short e) { return d + e; }
+static short n(char) {
+    j = *i;
+    if (j == 0)
+        ;
+    else
+        *i = 0;
+    *k = 0;
+    return 0;
+}
+static char o() {
+    l(0);
+    return 0;
+}
+static char p(int ad) {
+    a = m(!0, ad);
+    l(a);
+    if (f) {
+        *i &&n(o());
+        *i = 0;
+    } else
+        n(0);
+    if (h == &f || h == 0)
+        ;
+    else
+        foo();
+    return 0;
+}
+int main() {
+    p(c);
+    c = 8;
+}
+
+gcc-trunk -O3 does not eliminate the call to foo:
+
+main:
+	movl	f(%rip), %edi
+	testl	%edi, %edi
+	je	.L11
+.L7:
+	movl	$8, c(%rip)
+	xorl	%eax, %eax
+	ret
+.L11:
+	cmpq	$0, h(%rip)
+	je	.L4
+	xorl	%esi, %esi
+	movq	%rsi, h(%rip)
+.L4:
+	movq	h(%rip), %rax
+	xorl	%ecx, %ecx
+	movl	%ecx, g(%rip)
+	testq	%rax, %rax
+	je	.L7
+	cmpq	$f, %rax
+	je	.L7
+	pushq	%rax
+	call	foo
+	xorl	%eax, %eax
+	movl	$8, c(%rip)
+	popq	%rdx
+	ret
+
+gcc-13.2.0 -O3 eliminates the call to foo:
+
+main:
+	movl	f(%rip), %ecx
+	movq	h(%rip), %rax
+	testl	%ecx, %ecx
+	jne	.L3
+	testq	%rax, %rax
+	je	.L4
+	xorl	%edx, %edx
+	movq	%rdx, h(%rip)
+.L4:
+	xorl	%eax, %eax
+	movl	%eax, g(%rip)
+.L3:
+	movl	$8, c(%rip)
+	xorl	%eax, %eax
+	ret
+
+Bisects tor14-2946-g46c8c225455
+
+- User: Andrew Pinski | Time: 2023-08-09 19:52:59 UTC
+  Text: Confirmed.
+PRE seems to have missed an obvious redundant load here though:
+The IR after PRE:
+```
+  pretmp_12 = h;
+  if (f.2_9 != 0)
+    goto <bb 3>; [50.00%]
+  else
+    goto <bb 6>; [50.00%]
+...
+  <bb 6> [local count: 536870912]:
+  if (pretmp_12 == 0B)
+    goto <bb 8>; [30.00%]
+  else
+    goto <bb 7>; [70.00%]
+
+  <bb 7> [local count: 375809640]:
+  h = 0B;
+
+  <bb 8> [local count: 536870912]:
+  g = 0;
+  h.6_15 = h;
+```
+
+The IR before PRE:
+```
+  <bb 2> [local count: 1073741824]:
+  # VUSE <.MEM_2(D)>
+  f.2_9 = f;
+  if (f.2_9 != 0)
+    goto <bb 3>; [50.00%]
+  else
+    goto <bb 5>; [50.00%]
+
+  <bb 3> [local count: 536870912]:
+  # VUSE <.MEM_2(D)>
+  _11 = h;
+  if (_11 != 0B)
+    goto <bb 4>; [0.00%]
+  else
+    goto <bb 9>; [100.00%]
+...
+  <bb 5> [local count: 536870912]:
+  # VUSE <.MEM_2(D)>
+  _13 = h;
+  if (_13 == 0B)
+    goto <bb 7>; [30.00%]
+  else
+    goto <bb 6>; [70.00%]
+
+  <bb 6> [local count: 375809640]:
+  # .MEM_20 = VDEF <.MEM_2(D)>
+  h = 0B;
+
+  <bb 7> [local count: 536870912]:
+  # .MEM_16 = PHI <.MEM_2(D)(5), .MEM_20(6)>
+  # .MEM_21 = VDEF <.MEM_16>
+  g = 0;
+  # VUSE <.MEM_21>
+  h.6_15 = h;
+```
+
+- User: Richard Biener | Time: 2023-08-10 06:51:13 UTC
+  Text: I will have a look.
+
+- User: Richard Biener | Time: 2023-08-10 11:18:11 UTC
+  Text: So we're now doing an additional sinking:
+
+Sinking # VUSE <.MEM_2(D)>
+pretmp_12 = h;
+ from bb 2 to bb 4
+Removing basic block 9
+
+that's the only IL difference on GIMPLE, without this we optimize away foo during RTL optimization during RTL PRE.
+
+- User: Richard Biener | Time: 2023-08-10 11:47:54 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> Confirmed.
+> PRE seems to have missed an obvious redundant load here though:Skipping partial redundancy for expression {mem_ref<0B>,addr_expr<&h>}@.MEM_21 (0008), no redundancy on to be optimized for speed edge
+
+renaming 'main' into 'bar' fixes this:
+
+Found partial redundancy for expression {mem_ref<0B>,addr_expr<&h>}@.MEM_22 (0007)
+Created phi prephitmp_7 = PHI <_10(11), 0B(6)>
+ in block 7 (0007)
+...
+
+
+then the call to 'foo' is eliminated already in FRE5 (before the sinking pass affected byr14-2946-g46c8c225455).
+
+IMHO this isn't a bug worth pursuing.
+
+Alternatively you can put __attribute__((hot)) on 'main' which we otherwise
+consider cold.  Maybe that's a good idea for future DCE regression searches?
+
+Maybe we can consider the special case worthwhile also when optimizing for
+size.
+
+- User: Theodoros Theodoridis | Time: 2023-08-10 12:13:50 UTC
+  Text: (In reply to Richard Biener fromcomment #4)> Alternatively you can put __attribute__((hot)) on 'main' which we otherwise
+> consider cold.  Maybe that's a good idea for future DCE regression searches?Thanks for the feedback. IIRC, I have reported at least one more case where renaming 'main' would make the issue go away. So if adding __attribute__((hot)) makes sense, then I'll include it when searching.
+
+- User: rguenther@suse.de | Time: 2023-08-10 12:20:13 UTC
+  Text: On Thu, 10 Aug 2023, theodort at inf dot ethz.ch wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=110963> 
+> ---Comment #5from Theodoros Theodoridis <theodort at inf dot ethz.ch> ---
+> (In reply to Richard Biener fromcomment #4)
+> > Alternatively you can put __attribute__((hot)) on 'main' which we otherwise
+> > consider cold.  Maybe that's a good idea for future DCE regression searches?
+> 
+> 
+> Thanks for the feedback. IIRC, I have reported at least one more case where
+> renaming 'main' would make the issue go away. So if adding __attribute__((hot))
+> makes sense, then I'll include it when searching.I think it makes sense, it properly distinguishes -Os from -O2 where
+otherwise those would behave too similar.
+
+- User: Jan Hubicka | Time: 2023-08-10 12:24:23 UTC
+  Text: We don't consider main cold, but executed once: code out of loops is optimized for size, but anything in loops is optimized according to -O setting.  I did not really think of users overwriting it by hot attribute, but looking into implementation it will work :)
+
+- User: GCC Commits | Time: 2023-08-15 09:23:48 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:4d6132e59327e809a4d4e39fb9465dbd43775b7ccommitr14-3217-g4d6132e59327e809a4d4e39fb9465dbd43775b7cAuthor: Richard Biener <rguenther@suse.de>
+Date:   Thu Aug 10 13:55:36 2023 +0200
+
+    tree-optimization/110963 - more PRE when optimizing for size
+    
+    The following adjusts the heuristic when we perform PHI insertion
+    during GIMPLE PRE from requiring at least one edge that is supposed
+    to be optimized for speed to also doing insertion when the expression
+    is available on all edges (but possibly with different value) and
+    we'd at most have one copy from a constant.  The first ensures
+    we optimize two computations on all paths to one plus a possible
+    copy due to the PHI, the second makes sure we do not need to insert
+    many possibly large copies from constants, disregarding the
+    cummulative size cost of the register copies when they are not
+    coalesced.
+    
+    The case in the testcase is
+    
+      <bb 5>
+      _14 = h;
+      if (_14 == 0B)
+        goto <bb 7>;
+      else
+        goto <bb 6>;
+    
+      <bb 6>
+      h = 0B;
+    
+      <bb 7>
+      h.6_12 = h;
+    
+    and we want to optimize that to
+    
+      <bb 7>
+      # h.6_12 = PHI <_14(5), 0B(6)>
+    
+    If we want to consider the cost of the register copies I think the
+    only simplistic enough way would be to restrict the special-case to
+    two incoming edges - we'd assume one register copy is coalesced
+    leaving one copy from a register or from a constant.
+    
+    As with every optimization the downstream effects are probably
+    bigger than what we can locally estimate.PR tree-optimization/110963* tree-ssa-pre.cc (do_pre_regular_insertion): Also insert
+            a PHI node when the expression is available on all edges
+            and we insert at most one copy from a constant.
+    
+            * gcc.dg/tree-ssa/ssa-pre-34.c: New testcase.
+
+- User: Richard Biener | Time: 2023-08-15 09:24:55 UTC
+  Text: Fixed nevertheless.
+

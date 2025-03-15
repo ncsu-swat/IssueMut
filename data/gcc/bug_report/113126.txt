@@ -1,0 +1,116 @@
+Bug Summary: [14 Regression] ICE: in gimple_expand_vec_cond_expr, at gimple-isel.cc:325 at -O1
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 10.5.0, 11.4.1, 12.3.1, 13.2.1
+Known to Fail: 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2023-12-24 08:27:19 UTC
+  Text: Createdattachment 56929[details]reduced testcase
+
+Compiler output:
+$ x86_64-pc-linux-gnu-gcc -O1 testcase.c
+during GIMPLE pass: isel
+testcase.c: In function 'foo':
+testcase.c:8:1: internal compiler error: in gimple_expand_vec_cond_expr, at gimple-isel.cc:325
+    8 | foo (void)
+      | ^~~
+0x885994 gimple_expand_vec_cond_expr
+        /repo/gcc-trunk/gcc/gimple-isel.cc:325
+0x885994 execute
+        /repo/gcc-trunk/gcc/gimple-isel.cc:389
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-6818-20231224094952-gbd901d76734-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-6818-20231224094952-gbd901d76734-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.0 20231224 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2023-12-24 08:39:47 UTC
+  Text: 13:
+
+  h_6 = (G) f.0_1;
+  _2 = h_6 <= h_6;
+  _3 = VEC_COND_EXPR <_2, { -1, -1 }, { 0, 0 }>;
+  _4 = VIEW_CONVERT_EXPR<G>(_3);
+
+
+14:
+
+  _2 = f.0_1 <= f.0_1;
+  _3 = VEC_COND_EXPR <_2, { -1, -1 }, { 0, 0 }>;
+  _4 = VIEW_CONVERT_EXPR<G>(_3);
+
+Funny it was introduced accident byr14-2040-g6b32400e19a702which is there to fix a TYPE_PRECISION issue.
+
+The result of `vector(2) float` is `vector(2) <signed-boolean:32>` but match messes up here ...
+
+Which means the patterns here are only valid for scalar conversions and not vector based conversions or they need to add an conversion between the resulting `vector boolean` types ...
+
+- User: Richard Biener | Time: 2024-01-08 14:00:18 UTC
+  Text: Mine.
+
+- User: Richard Biener | Time: 2024-01-11 11:07:22 UTC
+  Text: diff --git a/gcc/match.pd b/gcc/match.pd
+index 876a9d1c06e..abbd03742f9 100644
+--- a/gcc/match.pd
++++ b/gcc/match.pd
+@@ -6792,11 +6792,12 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
+               && exact_real_truncate (TYPE_MODE (double_type_node), &orig))
+             type1 = double_type_node;
+         }
+-      tree newtype
+-        = (element_precision (TREE_TYPE (@00)) > element_precision (type1)
+-          ? TREE_TYPE (@00) : type1);
++       tree newtype
++        = (element_precision (TREE_TYPE (@00)) > element_precision (type1)
++           ? TREE_TYPE (@00) : type1);
+      }
+-     (if (element_precision (TREE_TYPE (@0)) > element_precision (newtype))
++     (if (element_precision (TREE_TYPE (@0)) > element_precision (newtype)
++         && is_truth_type_for (newtype, type))
+       (cmp (convert:newtype @00) (convert:newtype @10))))))))
+ 
+ 
+as I thought with AVX512VL we can handle this, but for V2SFmode we get
+V2SImode as mask_mode.  And changing the test to V4SF/V4DFmode reveals
+that we don't use float-extend (I'd have to trace vector lowering and
+forwprop).  There might be an opportunity to improve what we do
+for convertvector.
+
+But it fixes the testcase.
+
+- User: GCC Commits | Time: 2024-01-11 14:13:29 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:897b95a12b7fe549ec2cb8ef3a3f0e4fbabf9737commitr14-7139-g897b95a12b7fe549ec2cb8ef3a3f0e4fbabf9737Author: Richard Biener <rguenther@suse.de>
+Date:   Thu Jan 11 12:02:43 2024 +0100
+
+    tree-optimization/113126 - vector extension compare optimization
+    
+    The following makes sure the resulting boolean type is the same
+    when eliding a float extension.PR tree-optimization/113126* match.pd ((double)float CMP (double)float -> float CMP float):
+            Make sure the boolean type is the same.
+            * fold-const.cc (fold_binary_loc): Likewise.
+    
+            * gcc.dg/torture/pr113126.c: New testcase.
+
+- User: Richard Biener | Time: 2024-01-11 14:14:57 UTC
+  Text: Fixed.
+
+- User: Hongtao Liu | Time: 2024-01-12 07:21:24 UTC
+  Text: > as I thought with AVX512VL we can handle this, but for V2SFmode we get
+> V2SImode as mask_mode.  And changing the test to V4SF/V4DFmode reveals
+> that we don't use float-extend (I'd have to trace vector lowering and
+> forwprop).  There might be an opportunity to improve what we do
+> for convertvector.Yes, it'shttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=107432> 
+> But it fixes the testcase.
+

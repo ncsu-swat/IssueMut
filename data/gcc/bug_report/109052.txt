@@ -1,0 +1,255 @@
+Bug Summary: Unnecessary reload with -mfpmath=both
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: ra
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Uroš Bizjak | Time: 2023-03-07 12:57:37 UTC
+  Text: Following testcase:
+
+--cut here--
+double foo (double a)
+{
+  double tmp = a;
+  asm ("" : "+t" (tmp));
+  return a * tmp;
+}
+--cut here--
+
+compiles with -O2 -mfpmath=both -msse2 to:
+
+foo:
+        movsd   %xmm0, -8(%rsp)
+        fldl    -8(%rsp)
+        fstpl   -8(%rsp)
+-->     movsd   -8(%rsp), %xmm1
+        mulsd   %xmm1, %xmm0
+        ret
+
+There is no need to reload from -8(%rsp) to %xmm1, mulsd accepts memory operands. Optimal code would be:
+
+foo:
+        movsd   %xmm0, -8(%rsp)
+        fldl    -8(%rsp)
+        fstpl   -8(%rsp)
+        mulsd   -8(%rsp), %xmm0
+        ret
+
+Please note that with -mfpmath=sse, expected code is generated.
+
+The insns pattern is defined in i386.md:
+
+(define_insn "*fop_<mode>_comm"
+  [(set (match_operand:MODEF 0 "register_operand" "=f,x,v")
+	(match_operator:MODEF 3 "binary_fp_operator"
+	  [(match_operand:MODEF 1 "nonimmediate_operand" "%0,0,v")
+	   (match_operand:MODEF 2 "nonimmediate_operand" "fm,xm,vm")]))]
+  "((SSE_FLOAT_MODE_P (<MODE>mode) && TARGET_SSE_MATH)
+    || (TARGET_80387 && X87_ENABLE_ARITH (<MODE>mode)))
+   && COMMUTATIVE_ARITH_P (operands[3])
+   && !(MEM_P (operands[1]) && MEM_P (operands[2]))"
+  "* return output_387_binary_op (insn, operands);"
+  [(set (attr "type")
+	(if_then_else (eq_attr "alternative" "1,2")
+	   (if_then_else (match_operand:MODEF 3 "mult_operator")
+	      (const_string "ssemul")
+	      (const_string "sseadd"))
+	   (if_then_else (match_operand:MODEF 3 "mult_operator")
+	      (const_string "fmul")
+	      (const_string "fop"))))
+   (set_attr "isa" "*,noavx,avx")
+   (set_attr "prefix" "orig,orig,vex")
+   (set_attr "mode" "<MODE>")
+   (set (attr "enabled")
+     (if_then_else
+       (match_test ("SSE_FLOAT_MODE_P (<MODE>mode) && TARGET_SSE_MATH"))
+       (if_then_else
+	 (eq_attr "alternative" "0")
+	 (symbol_ref "TARGET_MIX_SSE_I387
+		      && X87_ENABLE_ARITH (<MODE>mode)")
+	 (const_string "*"))
+       (if_then_else
+	 (eq_attr "alternative" "0")
+	 (symbol_ref "true")
+	 (symbol_ref "false"))))])
+
+The difference between -mfpmath=both and -mfpmath=sse is in alternative 0, which is enabled with -mfpmath=both and disabled with -mpmath=sse. Using -mavx instead of -msse2 with -mfpmath=both does not solve the problem.
+
+- User: Uroš Bizjak | Time: 2023-03-07 12:58:45 UTC
+  Text: Looks like RA problem. CC added.
+
+- User: Uroš Bizjak | Time: 2023-03-07 13:58:55 UTC
+  Text: The original testcase is:
+
+double foo (double a, double b)
+{
+  double z = __builtin_fmod (a, 3.14);
+  return z * b;
+}
+
+-O2 -fno-math-errno:
+
+foo:
+        fldl    .LC0(%rip)
+        movsd   %xmm0, -8(%rsp)
+        fldl    -8(%rsp)
+.L2:
+        fprem
+        fnstsw  %ax
+        testb   $4, %ah
+        jne     .L2
+        fstp    %st(1)
+        fstpl   -8(%rsp)
+-->     movsd   -8(%rsp), %xmm0
+        mulsd   %xmm1, %xmm0
+        ret
+
+and with -mavx:
+
+foo:
+        fldl    .LC0(%rip)
+        vmovsd  %xmm0, -8(%rsp)
+        fldl    -8(%rsp)
+.L2:
+        fprem
+        fnstsw  %ax
+        testb   $4, %ah
+        jne     .L2
+        fstp    %st(1)
+        fstpl   -8(%rsp)
+-->     vmovsd  -8(%rsp), %xmm0
+        vmulsd  %xmm1, %xmm0, %xmm0
+        ret
+
+- User: GCC Commits | Time: 2023-03-17 13:07:36 UTC
+  Text: The master branch has been updated by Vladimir Makarov <vmakarov@gcc.gnu.org>:https://gcc.gnu.org/g:57688950b9328cbb4a9c21eb3199f9132b5119d3commitr13-6736-g57688950b9328cbb4a9c21eb3199f9132b5119d3Author: Vladimir N. Makarov <vmakarov@redhat.com>
+Date:   Fri Mar 17 08:58:58 2023 -0400
+
+    LRA: Implement combining secondary memory reload and original insn
+    
+    LRA creates secondary memory reload insns but do not try to combine it
+    with the original insn.  This patch implements a simple insn combining
+    for such cases in LRA.PR rtl-optimization/109052gcc/ChangeLog:
+    
+            * lra-constraints.cc: Include hooks.h.
+            (combine_reload_insn): New function.
+            (lra_constraints): Call it.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr109052.c: New.
+
+- User: Vladimir Makarov | Time: 2023-03-17 13:21:18 UTC
+  Text: The complete solution would be running combine pass also after LRA. I am not sure how frequently the 2nd pass will improve the code.  Also probably it might create some troubles the fix of which will require another LRA pass.  The most generalized solution would be an approach of combined optimizations (integrated insn scheduling, RA, and code selection) but in practice it makes the integrated optimization too complicated.
+
+Less complicated solution could be implementation of combining secondary memory reload insns in postreload pass but implementing this in LRA is better because we increase possibility to assign hard regs to other pseudos as we don't need to allocate hard register to a pseudo which goes away. 
+
+So I think the current patch is probably an adequate solution.
+
+- User: Uroš Bizjak | Time: 2023-03-17 14:12:15 UTC
+  Text: (In reply to Vladimir Makarov fromcomment #4)> So I think the current patch is probably an adequate solution.Perhaps the compiler should also try to swap input operands to fit the combined insn when commutative operands are allowed. This would solve the testcase fromComment #2:
+
+double foo (double a, double b)
+{
+  double z = __builtin_fmod (a, 3.14);
+  return z * b;
+}
+
+gcc -O2 -mfpmath=both -mavx:
+
+    Failed combined insn:
+   24: r90:DF=r96:DF*r85:DF
+      REG_DEAD r85:DF
+      REG_DEAD r82:DF
+    Restoring insn after failed combining:
+
+(^^^ shouldn't there be a memory operand mentioned in the above RTX dump?)
+
+...
+(insn 42 41 24 6 (set (reg/v:DF 23 xmm3 [orig:82 z ] [82])
+        (mem/c:DF (plus:DI (reg/f:DI 7 sp)
+                (const_int 8 [0x8])) [1 %sfp+-24 S8 A64])) "fmod.c":4:12 145 {*movdf_internal}
+     (nil))
+(insn 24 42 30 6 (set (reg:DF 20 xmm0 [90])
+        (mult:DF (reg/v:DF 23 xmm3 [orig:82 z ] [82])
+            (reg/v:DF 22 xmm2 [orig:85 b ] [85]))) "fmod.c":4:12 1189 {*fop_df_comm}
+     (nil))
+...
+
+As can be seen in the above dump, swapped input operands would fit alternative (v,v,vm) in the insn pattern:
+
+  [(set (match_operand:MODEF 0 "register_operand" "=f,x,v")
+	(match_operator:MODEF 3 "binary_fp_operator"
+	  [(match_operand:MODEF 1 "nonimmediate_operand" "%0,0,v")
+	   (match_operand:MODEF 2 "nonimmediate_operand" "fm,xm,vm")]))]
+
+- User: Vladimir Makarov | Time: 2023-03-17 14:39:48 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #5)> (In reply to Vladimir Makarov fromcomment #4)
+> 
+> > So I think the current patch is probably an adequate solution.
+> 
+> Perhaps the compiler should also try to swap input operands to fit the
+> combined insn when commutative operands are allowed. This would solve the
+> testcase fromComment #2:
+>Yes.  I am agree.  The base code can be improved further.
+Another improvement could be combining secondary memory reload for output.
+
+I'd like to watch what the effect of the current patch would be first.   Although I tested the patch on many targets as usually for LRA the patch might result in some troubles on some targets.  But I hope nothing bad will happen.
+
+- User: Peter Bergner | Time: 2023-03-17 19:51:39 UTC
+  Text: (In reply to Vladimir Makarov fromcomment #6)> I'd like to watch what the effect of the current patch would be first.  
+> Although I tested the patch on many targets as usually for LRA the patch
+> might result in some troubles on some targets.  But I hope nothing bad will
+> happen.I hit a bootstrap issue on powerpc64le-linux and it looks (still confirming) that this is probably the patch that caused it, since we're ICEing in your new combine_reload_insn() function.
+
+I openedPR109179for the ICE.
+
+
+during RTL pass: reload
+addkf3-sw.c: In function ‘__addkf3_sw’:
+addkf3-sw.c:51:1: internal compiler error: RTL check: expected elt 3 type 'e' or 'u', have '0' (rtx note) in PATTERN, at rtl.h:1509
+   51 | }
+      | ^
+0x1148c663 rtl_check_failed_type2(rtx_def const*, int, int, int, char const*, int, char const*)
+	/home/bergner/gcc/gcc-fsf-mainline-chip-ice-base/gcc/rtl.cc:907
+0x10a0a207 PATTERN(rtx_def*)
+	/home/bergner/gcc/gcc-fsf-mainline-chip-ice-base/gcc/rtl.h:1509
+0x1278c12b insn_extract(rtx_insn*)
+	/home/bergner/gcc/build/gcc-fsf-mainline-chip-ice-base-regtest/gcc/insn-extract.cc:23
+0x1118c9e7 lra_set_insn_recog_data(rtx_insn*)
+	/home/bergner/gcc/gcc-fsf-mainline-chip-ice-base/gcc/lra.cc:1059
+0x11194f23 lra_get_insn_recog_data(rtx_insn*)
+	/home/bergner/gcc/gcc-fsf-mainline-chip-ice-base/gcc/lra-int.h:493
+0x111b8de7 combine_reload_insn
+	/home/bergner/gcc/gcc-fsf-mainline-chip-ice-base/gcc/lra-constraints.cc:5017
+0x111b9e4b lra_constraints(bool)
+	/home/bergner/gcc/gcc-fsf-mainline-chip-ice-base/gcc/lra-constraints.cc:5231
+0x111942a3 lra(_IO_FILE*)
+	/home/bergner/gcc/gcc-fsf-mainline-chip-ice-base/gcc/lra.cc:2375
+0x110fdd77 do_reload
+	/home/bergner/gcc/gcc-fsf-mainline-chip-ice-base/gcc/ira.cc:5963
+0x110fe5df execute
+	/home/bergner/gcc/gcc-fsf-mainline-chip-ice-base/gcc/ira.cc:6149
+
+- User: GCC Commits | Time: 2023-03-31 15:05:56 UTC
+  Text: The master branch has been updated by Vladimir Makarov <vmakarov@gcc.gnu.org>:https://gcc.gnu.org/g:e9910e002d610db6e08230583c2976c9a557131bcommitr13-6959-ge9910e002d610db6e08230583c2976c9a557131bAuthor: Vladimir N. Makarov <vmakarov@redhat.com>
+Date:   Fri Mar 31 11:04:44 2023 -0400
+
+    LRA: Implement commutative operands exchange for combining secondary memory reload and original insn
+    
+    The patch implements trying commutative operands exchange for
+    combining secondary memory reload and original insn.PR rtl-optimization/109052gcc/ChangeLog:
+    
+            * lra-constraints.cc: (combine_reload_insn): New function.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr109052-2.c: New.
+
+- User: Uroš Bizjak | Time: 2024-01-08 09:10:01 UTC
+  Text: Implemented for gcc-14.
+

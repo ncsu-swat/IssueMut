@@ -1,0 +1,140 @@
+Bug Summary: vector epilogue handling is inefficient
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Richard Biener | Time: 2023-06-19 11:00:36 UTC
+  Text: It looks like we apply some analysis only when transforming the main vector loop.  In particular vect_do_peeling does the following which elides a
+vector epilogue after costing.
+
+  /* If we know the number of scalar iterations for the main loop we should
+     check whether after the main loop there are enough iterations left over
+     for the epilogue.  */
+  if (vect_epilogues
+      && LOOP_VINFO_NITERS_KNOWN_P (loop_vinfo)
+      && prolog_peeling >= 0
+      && known_eq (vf, lowest_vf))
+    {
+      unsigned HOST_WIDE_INT eiters
+        = (LOOP_VINFO_INT_NITERS (loop_vinfo)
+           - LOOP_VINFO_PEELING_FOR_GAPS (loop_vinfo));
+
+      eiters -= prolog_peeling;
+      eiters
+        = eiters % lowest_vf + LOOP_VINFO_PEELING_FOR_GAPS (loop_vinfo);
+
+      while (!vect_update_epilogue_niters (epilogue_vinfo, eiters))
+        {
+          delete epilogue_vinfo;
+          epilogue_vinfo = NULL;
+          if (loop_vinfo->epilogue_vinfos.length () == 0)
+            {
+              vect_epilogues = false;
+              break;
+            }
+          epilogue_vinfo = loop_vinfo->epilogue_vinfos[0];
+          loop_vinfo->epilogue_vinfos.ordered_remove (0);
+        }
+      vect_epilogues_updated_niters = true;
+
+So for example for the loop
+
+void foo (int * __restrict a, int *b)
+{
+  for (int i = 0; i < 20; ++i)
+    a[i] = b[i] + 42;
+}
+
+we end up with no vectorized epilogue when using AVX512 but instead of the
+AVX2 epilogue which is discarded we'd like to use a SSE2 epilogue.  It
+seems that vect_determine_partial_vectors_and_peeling as called from
+vect_update_epilogue_niters should have been already determined when
+analyzing the epilogue, but during the epilogue costing the loop_vinfo
+still inherits the main loop NITER.
+
+For the testcase at hand we're somewhat saved by BB vectorization but when
+doing partial loop vectorization we unnecessarily get a AVX512 masked
+epilogue here and the cost model doesn't get a chance to see the updated
+known niter for the epilogue nor would there be a meaningful way to
+do this when costs are compared because we have no way of estimating the
+number of masked out lanes for example.
+
+- User: Richard Biener | Time: 2023-06-19 11:01:35 UTC
+  Text: I don't remember why that epilogue niter updating is only done during transform?
+
+- User: N/A | Time: 2023-06-22 09:35:08 UTC
+  Text: I can't remember the exact reason either, though I do vaguely remember niter updating being something that we felt 'needed more future work' at the time.
+
+Just a side question, AVX512 has predication right? So how come you are expecting an epilogue?
+
+I'm also curious about the condition on that snippet of code, 'known_eq (vf, lowest_vf)' seems odd.. lowest_vf is by definition constant, so known_eq only succeeds if vf is constant and the same as lowest_vf, but lowest_vf is the constant lower bound of vf, i.e. that seems like a very convoluted way of doing vf.is_constant (&lowest_vf)? Maybe this helper function wasn't around back then. Either way, it feels like we shouldn't be doing this if loop_vinfo is predicated? But I also agree that we probably want to be doing all of this during analysis, seems odd to be ruling out loop_vinfo's during transformation.
+
+- User: rguenther@suse.de | Time: 2023-06-22 12:03:50 UTC
+  Text: On Thu, 22 Jun 2023, avieira at gcc dot gnu.org wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=110310> 
+> ---Comment #2from avieira at gcc dot gnu.org ---
+> I can't remember the exact reason either, though I do vaguely remember niter
+> updating being something that we felt 'needed more future work' at the time.
+> 
+> Just a side question, AVX512 has predication right? So how come you are
+> expecting an epilogue?I'm asking to only predicate the epilogues.> I'm also curious about the condition on that snippet of code, 'known_eq (vf,
+> lowest_vf)' seems odd.. lowest_vf is by definition constant, so known_eq only
+> succeeds if vf is constant and the same as lowest_vf, but lowest_vf is the
+> constant lower bound of vf, i.e. that seems like a very convoluted way of doing
+> vf.is_constant (&lowest_vf)? Maybe this helper function wasn't around back
+> then. Either way, it feels like we shouldn't be doing this if loop_vinfo is
+> predicated? But I also agree that we probably want to be doing all of this
+> during analysis, seems odd to be ruling out loop_vinfo's during transformation.OK, so I take away from this that you don't think this is done the way
+it is on purpose.
+
+- User: N/A | Time: 2023-06-22 14:30:24 UTC
+  Text: > OK, so I take away from this that you don't think this is done the wayit is on purpose.
+
+I don't think so, I think I just found a place where it was safe to do so, i.e. where we knew the vectorization factor would not change after. 
+
+I have a vague recollection that vect_analyze_loop used to be somewhat more complex, but given the now clear separation between main loop and epilogue vinfo selection we have now, we could probably do this as we analyze loop_vinfos for epilogue?
+
+Assuming that during analysis we've had determined vf, peeling and use of masks, which I'm pretty sure we have.
+
+Might be worth asking Richard Sandiford if he can think of anything that we might not be 'fixing' during analysis.
+
+- User: Richard Biener | Time: 2023-07-03 09:01:29 UTC
+  Text: I will see if I can fix this.
+
+- User: GCC Commits | Time: 2023-07-04 07:08:09 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:0682a32c026f1e246eb07bb8066abca4636f01d8commitr14-2281-g0682a32c026f1e246eb07bb8066abca4636f01d8Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Jul 3 13:59:33 2023 +0200
+
+    tree-optimization/110310 - move vector epilogue disabling to analysis phase
+    
+    The following removes late deciding to elide vectorized epilogues to
+    the analysis phase and also avoids altering the epilogues niter.
+    The costing part from vect_determine_partial_vectors_and_peeling is
+    moved to vect_analyze_loop_costing where we use the main loop
+    analysis to constrain the epilogue scalar iterations.
+    
+    I have not tried to integrate this with vect_known_niters_smaller_than_vf.
+    
+    It seems the for_epilogue_p parameter in
+    vect_determine_partial_vectors_and_peeling is largely useless and
+    we could compute that in the function itself.PR tree-optimization/110310* tree-vect-loop.cc (vect_determine_partial_vectors_and_peeling):
+            Move costing part ...
+            (vect_analyze_loop_costing): ... here.  Integrate better
+            estimate for epilogues from ...
+            (vect_analyze_loop_2): Call vect_determine_partial_vectors_and_peeling
+            with actual epilogue status.
+            * tree-vect-loop-manip.cc (vect_do_peeling): ... here and
+            avoid cancelling epilogue vectorization.
+            (vect_update_epilogue_niters): Remove.  No longer update
+            epilogue LOOP_VINFO_NITERS.
+    
+            * gcc.target/i386/pr110310.c: New testcase.
+            * gcc.dg/vect/slp-perm-12.c: Disable epilogue vectorization.
+
+- User: Richard Biener | Time: 2023-07-04 07:08:29 UTC
+  Text: Fixed.
+

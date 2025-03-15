@@ -1,0 +1,134 @@
+Bug Summary: Many -Wanalyzer-use-of-uninitialized-value false positives seen in qemu's softfloat.c
+Product: gcc
+Component: analyzer
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: David Malcolm | Time: 2023-02-07 23:13:14 UTC
+  Text: Createdattachment 54425[details]Reduced reproducer
+
+Trunk shows many (dozens?) of -Wanalyzer-use-of-uninitialized-value false positives on qemu's softfloat.chttps://godbolt.org/z/MTe9597Ehshows:
+
+<source>: In function 'test':
+<source>:27:9: warning: use of uninitialized value 'fp0' [CWE-457] [-Wanalyzer-use-of-uninitialized-value]
+   27 |   fp0 = floatx80_add(fp0, float32_to_floatx80((0x3F800000)));
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  'test': events 1-3
+    |
+    |   24 |   floatx80 fp0;
+    |      |            ^~~
+    |      |            |
+    |      |            (1) region created on stack here
+    |      |            (2) capacity: 16 bytes
+    |......
+    |   27 |   fp0 = floatx80_add(fp0, float32_to_floatx80((0x3F800000)));
+    |      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    |      |         |
+    |      |         (3) use of uninitialized value 'fp0' here
+    |
+Compiler returned: 0
+
+where fp0 appears to have been initialized on the line above.
+
+- User: David Malcolm | Time: 2023-02-07 23:14:00 UTC
+  Text: Doesn't seem to affect gcc 12.2 so marking as a regression.
+
+- User: David Malcolm | Time: 2023-02-07 23:30:38 UTC
+  Text: Adding -fno-analyzer-state-purge fixes the false positive, looks like it's erroneously pruning the value of fp0 immediately after the first assignment.
+
+- User: GCC Commits | Time: 2023-02-08 18:48:31 UTC
+  Text: The master branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:77bb54b1b07add45007c664724b726541d672ef3commitr13-5745-g77bb54b1b07add45007c664724b726541d672ef3Author: David Malcolm <dmalcolm@redhat.com>
+Date:   Wed Feb 8 13:47:36 2023 -0500
+
+    analyzer: fix overzealous state purging with on-stack structs [PR108704]PR analyzer/108704reports many false positives seen from
+    -Wanalyzer-use-of-uninitialized-value on qemu's softfloat.c on code like
+    the following:
+    
+       struct st s;
+       s = foo ();
+       s = bar (s); // bogusly reports that s is uninitialized here
+    
+    where e.g. "struct st" is "floatx80" in the qemu examples.
+    
+    The root cause is overzealous purging of on-stack structs in the code I
+    added inr12-7718-gfaacafd2306ad7, where at:
+    
+            s = bar (s);
+    
+    state_purge_per_decl::process_point_backwards "sees" the assignment to 's'
+    and stops processing, effectively treating 's' as unneeded before this
+    stmt, not noticing the use of 's' in the argument.
+    
+    Fixed thusly.
+    
+    The patch greatly reduces the number of
+    -Wanalyzer-use-of-uninitialized-value warnings from my integration tests:
+      ImageMagick-7.1.0-57:  10 ->  6   (-4)
+                  qemu-7.2: 858 -> 87 (-771)
+             haproxy-2.7.1:   1 ->  0   (-1)
+    All of the above that I've examined appear to be false positives.
+    
+    gcc/analyzer/ChangeLog:PR analyzer/108704* state-purge.cc (state_purge_per_decl::process_point_backwards):
+            Don't stop processing the decl if it's fully overwritten by
+            this stmt if it's also used by this stmt.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/108704* gcc.dg/analyzer/uninit-7.c: New test.
+            * gcc.dg/analyzer/uninit-pr108704.c: New test.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2023-02-08 18:58:29 UTC
+  Text: Should be fixed on trunk for GCC 13 by the above commit.
+
+I introduced the bug inr12-7718-gfaacafd2306ad7so in theory it affects GCC 12 as well, but I haven't been able to reproduce it there.  The bug is probably present there but latent, so I'm keeping this bug open to track backporting the fix to the gcc 12 branch.
+
+- User: GCC Commits | Time: 2023-03-29 18:19:01 UTC
+  Text: The releases/gcc-12 branch has been updated by David Malcolm <dmalcolm@gcc.gnu.org>:https://gcc.gnu.org/g:5da2126c4df8d83c2b2f9de7bb393ab4f5832840commitr12-9364-g5da2126c4df8d83c2b2f9de7bb393ab4f5832840Author: David Malcolm <dmalcolm@redhat.com>
+Date:   Wed Mar 29 14:16:48 2023 -0400
+
+    analyzer: fix overzealous state purging with on-stack structs [PR108704]PR analyzer/108704reports many false positives seen from
+    -Wanalyzer-use-of-uninitialized-value on qemu's softfloat.c on code like
+    the following:
+    
+       struct st s;
+       s = foo ();
+       s = bar (s); // bogusly reports that s is uninitialized here
+    
+    where e.g. "struct st" is "floatx80" in the qemu examples.
+    
+    The root cause is overzealous purging of on-stack structs in the code I
+    added inr12-7718-gfaacafd2306ad7, where at:
+    
+            s = bar (s);
+    
+    state_purge_per_decl::process_point_backwards "sees" the assignment to 's'
+    and stops processing, effectively treating 's' as unneeded before this
+    stmt, not noticing the use of 's' in the argument.
+    
+    Fixed thusly.
+    
+    The patch greatly reduces the number of
+    -Wanalyzer-use-of-uninitialized-value warnings from my integration tests:
+      ImageMagick-7.1.0-57:  10 ->  6   (-4)
+                  qemu-7.2: 858 -> 87 (-771)
+             haproxy-2.7.1:   1 ->  0   (-1)
+    All of the above that I've examined appear to be false positives.
+    
+    Cherrypicked fromr13-5745-g77bb54b1b07add.
+    
+    gcc/analyzer/ChangeLog:PR analyzer/108704* state-purge.cc (state_purge_per_decl::process_point_backwards):
+            Don't stop processing the decl if it's fully overwritten by
+            this stmt if it's also used by this stmt.
+    
+    gcc/testsuite/ChangeLog:PR analyzer/108704* gcc.dg/analyzer/uninit-7.c: New test.
+            * gcc.dg/analyzer/uninit-pr108704.c: New test.
+    
+    Signed-off-by: David Malcolm <dmalcolm@redhat.com>
+
+- User: David Malcolm | Time: 2023-03-29 19:31:07 UTC
+  Text: Should be fixed on gcc 12 branch by the above (for the eventual gcc 12.3 release); marking as resolved.
+

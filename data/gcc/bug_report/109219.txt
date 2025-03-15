@@ -1,0 +1,129 @@
+Bug Summary: [12 Regression] csmith: ice in vect_slp_analyze_node_operations_1, at tree-vect-slp.cc:5954 since r13-1106-g8c2733e16ec1c0cd
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 11.3.0, 12.1.0, 12.2.1, 13.0
+Known to Fail: 12.2.0
+
+Comments:
+- User: David Binderman | Time: 2023-03-20 20:22:59 UTC
+  Text: For this C code:
+
+safe_lshift_func_int32_t_s_s_left, safe_lshift_func_int32_t_s_s_right,
+    safe_sub_func_uint64_t_u_u_ui2, safe_mul_func_uint64_t_u_u_ui2, g_79_2,
+    g_97_l_439;
+g_97() {
+  unsigned short __trans_tmp_16;
+  long __trans_tmp_15;
+  int __trans_tmp_14, __trans_tmp_7;
+  int *l_437 = g_97;
+  for (; g_97_l_439; g_97_l_439 += 1) {
+    char l_502 = 0;
+    for (; l_502 < 4; l_502++) {
+      __trans_tmp_14 = safe_lshift_func_int32_t_s_s_right >= 2 ||
+                               safe_lshift_func_int32_t_s_s_left
+                           ?: safe_lshift_func_int32_t_s_s_right;
+      __trans_tmp_15 = __trans_tmp_14 * safe_mul_func_uint64_t_u_u_ui2;
+      __trans_tmp_16 = -__trans_tmp_15;
+      __trans_tmp_7 =
+          (__trans_tmp_16 ^ 65535UL) - safe_sub_func_uint64_t_u_u_ui2;
+      *l_437 ^= (short)(__trans_tmp_7 ^ g_79_2);
+    }
+  }
+}
+main() {}
+
+when compiled by recent gcc trunk and compiler flag -O3, does this:
+
+$ ~/gcc/results/bin/gcc -c -w -O3bug900.c
+during GIMPLE pass: vectbug900.c: In function ‘g_97’:bug900.c:4:1: internal compiler error: in vect_slp_analyze_node_operations_1, at tree-vect-slp.cc:5954
+    4 | g_97() {
+      | ^~~~
+0x7d6a29 vect_slp_analyze_node_operations_1
+	../../trunk.year/gcc/tree-vect-slp.cc:5954
+0x7d6a29 vect_slp_analyze_node_operations
+	../../trunk.year/gcc/tree-vect-slp.cc:6147
+0x119b14f vect_slp_analyze_node_operations
+	../../trunk.year/gcc/tree-vect-slp.cc:6126
+0x119b14f vect_slp_analyze_node_operations
+	../../trunk.year/gcc/tree-vect-slp.cc:6126
+
+It is fine at -O2:
+
+$ ~/gcc/results/bin/gcc -c -w -O2bug900.c
+$ 
+
+The bug has existed since sometime before 20220403.
+
+- User: Andrew Pinski | Time: 2023-03-20 20:28:52 UTC
+  Text: Confirmed.
+
+- User: Richard Biener | Time: 2023-03-21 08:19:41 UTC
+  Text: I will have a look - the representative looks out-of sync:
+
+t.c:4:1: note: node 0x41d6f00 (max_nunits=8, refcnt=1) vector(8) unsigned short
+t.c:4:1: note: op template: _68 = _70 + 65535;
+t.c:4:1: note:  stmt 0 patt_20 = _68 - patt_23;
+t.c:4:1: note:  stmt 1 patt_77 = _9 - patt_101;
+t.c:4:1: note:  children 0x41d7340 0x41d7098
+
+- User: Martin Liška | Time: 2023-03-21 10:55:04 UTC
+  Text: Started withr13-1106-g8c2733e16ec1c0cd(and it's backported to gcc-12 branch).
+
+- User: Richard Biener | Time: 2023-03-21 11:35:44 UTC
+  Text: (In reply to Richard Biener fromcomment #2)> I will have a look - the representative looks out-of sync:
+> 
+> t.c:4:1: note: node 0x41d6f00 (max_nunits=8, refcnt=1) vector(8) unsigned
+> short
+> t.c:4:1: note: op template: _68 = _70 + 65535;
+> t.c:4:1: note:  stmt 0 patt_20 = _68 - patt_23;
+> t.c:4:1: note:  stmt 1 patt_77 = _9 - patt_101;
+> t.c:4:1: note:  children 0x41d7340 0x41d7098Thinking about it, the representative STMT_SLP_TYPE isn't really relevant
+for anything and we shouldn't check it from SLP code.  The only valid case
+is for loop vect to check whether a stmt is relevant for it.
+
+- User: GCC Commits | Time: 2023-03-21 13:04:43 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:26adc870e3675591050f37edab46850b97a3c122commitr13-6786-g26adc870e3675591050f37edab46850b97a3c122Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Mar 21 12:49:36 2023 +0100
+
+    tree-optimization/109219 - avoid looking at STMT_SLP_TYPE
+    
+    The following avoids looking at STMT_SLP_TYPE apart from the only
+    place needing it - transform and analysis of non-SLP loop stmts.
+    In particular it doesn't have a reliable meaning on SLP representatives
+    which are also passed as stmt_vinfo to vectorizable_* routines.  The
+    proper way to check in those is to look for the slp_node argument
+    instead.PR tree-optimization/109219* tree-vect-loop.cc (vectorizable_reduction): Check
+            slp_node, not STMT_SLP_TYPE.
+            * tree-vect-stmts.cc (vectorizable_condition): Likewise.
+            * tree-vect-slp.cc (vect_slp_analyze_node_operations_1):
+            Remove assertion on STMT_SLP_TYPE.
+    
+            * gcc.dg/torture/pr109219.c: New testcase.
+
+- User: GCC Commits | Time: 2023-04-17 09:14:35 UTC
+  Text: The releases/gcc-12 branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:c2ab46f377313da5336748eb4fdc20020c047445commitr12-9409-gc2ab46f377313da5336748eb4fdc20020c047445Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Mar 21 12:49:36 2023 +0100
+
+    tree-optimization/109219 - avoid looking at STMT_SLP_TYPE
+    
+    The following avoids looking at STMT_SLP_TYPE apart from the only
+    place needing it - transform and analysis of non-SLP loop stmts.
+    In particular it doesn't have a reliable meaning on SLP representatives
+    which are also passed as stmt_vinfo to vectorizable_* routines.  The
+    proper way to check in those is to look for the slp_node argument
+    instead.PR tree-optimization/109219* tree-vect-loop.cc (vectorizable_reduction): Check
+            slp_node, not STMT_SLP_TYPE.
+            * tree-vect-stmts.cc (vectorizable_condition): Likewise.
+            * tree-vect-slp.cc (vect_slp_analyze_node_operations_1):
+            Remove assertion on STMT_SLP_TYPE.
+    
+            * gcc.dg/torture/pr109219.c: New testcase.
+    
+    (cherry picked from commit 26adc870e3675591050f37edab46850b97a3c122)
+
+- User: Richard Biener | Time: 2023-04-17 09:15:58 UTC
+  Text: Fixed.
+

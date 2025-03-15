@@ -1,0 +1,142 @@
+Bug Summary: Is there a way to disable cpymem pass for rvv
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Huaqi | Time: 2023-11-15 03:07:09 UTC
+  Text: Seehttps://gcc.gnu.org/git/?p=gcc.git;a=blob;f=gcc/testsuite/gcc.target/riscv/rvv/base/cpymem-2.c;h=7b706b6ef52544cabdce2007256c9e67b72ccd79;hb=9464e72bcc9123b619215af8cfef491772a3ebd9this case, if I pass -march=rv64imafdcv to compile code like this, it will generate vector related code, which I think it should only be enabled when --param=riscv-autovec-preference=scalable is enabled, but actually it is auto enable d even I pass  --param=riscv-autovec-preference=none, seehttps://godbolt.org/z/TazWKEjzMIs there a way to disable it, since if vector load and store for smaller structure assign is costable and harmfull to cpu pipeline.
+
+Thanks
+
+- User: Andrew Pinski | Time: 2023-11-15 03:13:38 UTC
+  Text: >since if vector load and store for smaller structure assign is costable and harmfull to cpu pipeline.This depends on the Pipeline. Seems like there is a missing cost model for your cpu somewhere.
+
+- User: JuzheZhong | Time: 2023-11-15 04:45:10 UTC
+  Text: Currently, we don't have a compile option to disable cpymem by RVV.
+
+I can tell how to disable it:
+
+in riscv.md:
+
+(define_expand "cpymem<mode>"
+  [(parallel [(set (match_operand:BLK 0 "general_operand")
+		   (match_operand:BLK 1 "general_operand"))
+	      (use (match_operand:P 2 ""))
+	      (use (match_operand:SI 3 "const_int_operand"))])]
+  ""
+{
+  if (riscv_vector::expand_block_move (operands[0], operands[1], operands[2]))
+    DONE;
+  else if (riscv_expand_block_move (operands[0], operands[1], operands[2]))
+    DONE;
+  else
+    FAIL;
+})
+
+remove 
+if (riscv_vector::expand_block_move (operands[0], operands[1], operands[2]))
+    DONE;
+
+Then it will be disabled.
+
+- User: Huaqi | Time: 2023-11-15 05:03:24 UTC
+  Text: Hi Juzhe, thanks for the help, could it be controlled by --param=riscv-autovec-preference= option, so if I want to enable cpymem optimization, I can enable it by auto vectorzation.
+
+Thanks
+
+- User: JuzheZhong | Time: 2023-11-15 05:05:30 UTC
+  Text: You mean you want to disable it when disabling auto-vectorization ?
+
+- User: Huaqi | Time: 2023-11-15 05:14:23 UTC
+  Text: (In reply to JuzheZhong fromcomment #4)> You mean you want to disable it when disabling auto-vectorization ?Yes, I think this could be better, so we can control whether vector instruction should be generated, and if auto generated rvv instruction is not good, we can enable it via gcc pragma control for selected code block.
+
+Thanks
+
+- User: JuzheZhong | Time: 2023-11-15 05:17:05 UTC
+  Text: We can add 
+
+  if (!flag_tree_vectorize)
+    return false;
+
+in riscv_vector::expand_block_move
+
+But I am not sure whether other RISC-V folks is happy with that.
+
+CCing other folks to see whether they allow it.
+
+- User: Andrew Pinski | Time: 2023-11-15 05:53:33 UTC
+  Text: ***Bug 112538has been marked as a duplicate of this bug. ***
+
+- User: Kito Cheng | Time: 2023-11-15 06:42:53 UTC
+  Text: That remind me we may need one option like something -mgeneral-regs-only in aarch64 and also for target attribute.
+
+BTW, clang has an generic option called -mno-implicit-float can did similar thing
+
+- User: JuzheZhong | Time: 2023-11-15 06:44:26 UTC
+  Text: I think we can use -fno-tree-vectorize or --param=riscv-autovec-preference=none to
+disable it.
+
+- User: JuzheZhong | Time: 2023-11-15 07:12:46 UTC
+  Text: This following patch:
+
+diff --git a/gcc/config/riscv/riscv-string.cc b/gcc/config/riscv/riscv-string.cc
+index 57e8ad698d7..c135d4efdb2 100644
+--- a/gcc/config/riscv/riscv-string.cc
++++ b/gcc/config/riscv/riscv-string.cc
+@@ -773,7 +773,7 @@ expand_block_move (rtx dst_in, rtx src_in, rtx length_in)
+        bnez a2, loop                   # Any more?
+        ret                             # Return
+   */
+-  if (!TARGET_VECTOR)
++  if (!TARGET_VECTOR || riscv_autovec_preference == NO_AUTOVEC || !flag_tree_vectorize)
+     return false;
+   HOST_WIDE_INT potential_ew
+     = (MIN (MIN (MEM_ALIGN (src_in), MEM_ALIGN (dst_in)), BITS_PER_WORD)
+
+
+Can fix this issue. Is it OK ?
+
+- User: Kito Cheng | Time: 2023-11-15 07:34:02 UTC
+  Text: It's not scope of auto vectorization, so I would suggest add something like `-mstringop-strategy=*` or `-mmemcpy-strategy=*` (from x86) or `-param=riscv-mops-memcpy-size-threshold=` (from aarch64).
+
+Personally I prefer x86 approach.
+
+- User: Jorn Wolfgang Rennecke | Time: 2023-11-17 13:23:50 UTC
+  Text: (In reply to JuzheZhong fromcomment #2)> Currently, we don't have a compile option to disable cpymem by RVV.If you don't want any vector instructions to be emitted, why do you tell the compiler to enable the 'v' extsnsion of the architecture?
+
+- User: Jorn Wolfgang Rennecke | Time: 2023-11-17 13:27:37 UTC
+  Text: Before we can consider any costs, we first have to know what they are.  Is there any manual for a hardware implementation that specifies costs?
+
+- User: GCC Commits | Time: 2023-11-20 02:50:54 UTC
+  Text: The master branch has been updated by Li Xu <xuli@gcc.gnu.org>:https://gcc.gnu.org/g:e6269bb69c0734a5af716bfbded3621de6ca351dcommitr14-5602-ge6269bb69c0734a5af716bfbded3621de6ca351dAuthor: xuli <xuli1@eswincomputing.com>
+Date:   Fri Nov 17 04:48:47 2023 +0000
+
+    RISC-V: Implement -mmemcpy-strategy= options[PR112537]https://gcc.gnu.org/bugzilla/show_bug.cgi?id=112537-mmemcpy-strategy=[auto|libcall|scalar|vector]
+    
+    auto: Current status, use scalar or vector instructions.
+    libcall: Always use a library call.
+    scalar: Only use scalar instructions.
+    vector: Only use vector instructions.PR target/112537gcc/ChangeLog:
+    
+            * config/riscv/riscv-opts.h (enum riscv_stringop_strategy_enum): Strategy enum.
+            * config/riscv/riscv-string.cc (riscv_expand_block_move): Disabled based on options.
+            (expand_block_move): Ditto.
+            * config/riscv/riscv.opt: Add -mmemcpy-strategy=.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/riscv/rvv/base/cpymem-strategy-1.c: New test.
+            * gcc.target/riscv/rvv/base/cpymem-strategy-2.c: New test.
+            * gcc.target/riscv/rvv/base/cpymem-strategy-3.c: New test.
+            * gcc.target/riscv/rvv/base/cpymem-strategy-4.c: New test.
+            * gcc.target/riscv/rvv/base/cpymem-strategy-5.c: New test.
+            * gcc.target/riscv/rvv/base/cpymem-strategy.h: New test.
+
+- User: Jeffrey A. Law | Time: 2024-07-02 17:35:12 UTC
+  Text: Fixed on the trunk with an option to adjust the stringop expansion strategy.
+

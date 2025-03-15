@@ -1,0 +1,398 @@
+Bug Summary: [12 Regression] Incorrect optimization of by-reference closure fields by fre1 pass since r12-5113-gd70ef65692fced
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: alias, wrong-code
+Known to Work: 12.4.1, 13.3.1, 14.1.1, 15.0
+Known to Fail: 12.4.0, 13.3.0, 14.1.0
+
+Comments:
+- User: Spenser | Time: 2024-05-10 13:59:54 UTC
+  Text: ## Description
+
+I am seeing a wrong answer produced by code involving a by-reference captured boolean value in a lambda. The code looks like the following:
+
+```cpp
+// Compute result shape
+bool resultIsStatic = true;
+auto resultShape = llvm::map_to_vector(newShape, [&](int64_t size) {
+    // This branch is taken, but the update to resultIsStatic is not
+    // propagated to the usage outside of the lambda.
+    if (!inputIsStatic) {
+      resultIsStatic = false;
+      return ShapedType::kDynamic;
+    }
+
+	// do something else
+});
+
+// This branch is never taken
+if (resultIsStatic) {
+    // do the right thing
+    return;
+}
+
+// do the wrong thing
+return;
+```
+
+In the failing example, a lambda is mapped across a range of values, producing a new vector-like container. During the map, the `resultIsStatic` value captured by reference is updated in the lambda, and that updated value is not reflected in the later usage of `resultIsStatic`.
+
+## Analysis
+
+The attached pre-processed source file is still large, so I just want to narrow down where I think the problem is. The mal-optimization occurs in the `inferReshapeExpandedType` function at the end of the pre-processed source file.
+
+Looking at the dumped IR, I believe the bug is introduced by the `fre1` pass. I see between `ealias` and `fre1` that the branch on the value of `resultIsStatic` is eliminated. This seems a likely cause for the bug I am seeing, but I am not very familiar with GCC's IR.
+
+## GCC Invocation
+
+Full command producing the issue:
+
+```
+g++ -O2 -fPIC -fno-semantic-interposition -fvisibility-inlines-hidden -Werror=date-time -fno-lifetime-dse -Wall -Wextra -Wno-unused-parameter -Wwrite-strings -Wcast-qual -Wno-missing-field-initializers -pedantic -Wno-long-long -Wimplicit-fallthrough -Wno-maybe-uninitialized -Wno-nonnull -Wno-class-memaccess -Wno-redundant-move -Wno-pessimizing-move -Wno-noexcept-type -Wdelete-non-virtual-dtor -Wsuggest-override -Wno-comment -Wno-misleading-indentation -Wctad-maybe-unsupported -fdiagnostics-color -ffunction-sections -fdata-sections -Wundef -O2 -std=c++17  -fno-exceptions -funwind-tables -fno-rtti -c <source-file>
+```
+
+For reference, this bug is affecting parts of LLVM, the pull request with the workaround and description of the problem can be found here:https://github.com/llvm/llvm-project/pull/91521## GCC -v and System Information
+
+This bug is reproducible in GCC 12 and GCC 13. I was unable to reproduce in GCC 11.
+
+The GCC versions below are taken from a NixOS machine used to reproduce the bug and track it down. It also reproduces on Debian with GCC 12. I can provide that information as well if it will be helpful.
+
+GCC 12 `-v` output:
+
+```
+Using built-in specs.
+COLLECT_GCC=/nix/store/7b2bbh09d569jb60j3vc5icjr3wdhw3m-gcc-12.3.0/bin/gcc
+COLLECT_LTO_WRAPPER=/nix/store/7b2bbh09d569jb60j3vc5icjr3wdhw3m-gcc-12.3.0/libexec/gcc/x86_64-unknown-linux-gnu/12.3.0/lto-wrapper
+Target: x86_64-unknown-linux-gnu
+Configured with: ../gcc-12.3.0/configure --prefix=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gcc-12.3.0 --with-gmp-include=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gmp-with-cxx-6.3.0-dev/include --with-gmp-lib=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gmp-with-cxx-6.3.0/lib --with-mpfr-include=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-mpfr-4.2.1-dev/include --with-mpfr-lib=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-mpfr-4.2.1/lib --with-mpc=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-libmpc-1.3.1 --with-native-system-header-dir=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-2.39-31-dev/include --with-build-sysroot=/ --with-gxx-include-dir=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gcc-12.3.0/include/c++/12.3.0/ --program-prefix= --enable-lto --disable-libstdcxx-pch --without-included-gettext --with-system-zlib --enable-static --enable-languages=c,c++ --disable-multilib --enable-plugin --with-isl=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-isl-0.20 --disable-bootstrap --build=x86_64-unknown-linux-gnu --host=x86_64-unknown-linux-gnu --target=x86_64-unknown-linux-gnu
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 12.3.0 (GCC)
+```
+
+GCC 13 `-v` output:
+
+```
+Using built-in specs.
+COLLECT_GCC=/nix/store/9hgsinpfgyvsd92v0wlvmxv9wnaal68r-gcc-13.2.0/bin/gcc
+COLLECT_LTO_WRAPPER=/nix/store/9hgsinpfgyvsd92v0wlvmxv9wnaal68r-gcc-13.2.0/libexec/gcc/x86_64-unknown-linux-gnu/13.2.0/lto-wrapper
+Target: x86_64-unknown-linux-gnu
+Configured with: ../gcc-13.2.0/configure --prefix=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gcc-13.2.0 --with-gmp-include=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gmp-6.3.0-dev/include --with-gmp-lib=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gmp-6.3.0/lib --with-mpfr-include=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-mpfr-4.2.1-dev/include --with-mpfr-lib=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-mpfr-4.2.1/lib --with-mpc=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-libmpc-1.3.1 --with-native-system-header-dir=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-2.39-31-dev/include --with-build-sysroot=/ --with-gxx-include-dir=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gcc-13.2.0/include/c++/13.2.0/ --program-prefix= --enable-lto --disable-libstdcxx-pch --without-included-gettext --with-system-zlib --enable-static --enable-languages=c,c++ --disable-multilib --enable-plugin --disable-libcc1 --with-isl=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-isl-0.20 --disable-bootstrap --build=x86_64-unknown-linux-gnu --host=x86_64-unknown-linux-gnu --target=x86_64-unknown-linux-gnu
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 13.2.0 (GCC)
+```
+
+- User: Andrew Pinski | Time: 2024-05-10 14:04:17 UTC
+  Text: Please attach the preprocessed source rather than just a snippet of code.
+
+- User: Spenser | Time: 2024-05-10 14:43:06 UTC
+  Text: Createdattachment 58178[details]Pre-processed C++ reproducer
+
+- User: Spenser | Time: 2024-05-10 14:50:03 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> Please attach the preprocessed source rather than just a snippet of code.Sorry about that. Thought I added it when submitting the report, but I think the file was too large. I've stripped out some of the dead code and reattached.
+
+- User: Richard Biener | Time: 2024-05-13 09:23:02 UTC
+  Text: resultIsStatic = 1;
+  D.39198.__inputIsStatic = &inputIsStatic;
+  D.39198.__resultIsStatic = &resultIsStatic;
+  D.39198.__newShape = &newShape;
+  D.39198.__totalSize = &totalSize;
+  resultShape = llvm::map_to_vector<llvm::ArrayRef<long int>&, inferReshapeExpandedType(llvm::ArrayRef<long int>, llvm::ArrayRef<long int>)::<lambda(int64_t)> > (&newShape, &D.39198); [return slot optimization]
+  D.39198 ={v} {CLOBBER(eol)};
+  inputIsStatic.3_7 = inputIsStatic;
+  _8 = ~inputIsStatic.3_7;
+  if (inputIsStatic.3_7 != 0)
+    goto <bb 14>; [INV]
+  else
+    goto <bb 10>; [INV]
+
+  <bb 10> :
+  resultIsStatic.4_9 = resultIsStatic;
+
+I don't see how llvm::map_to_vector modifies 'resultIsStatic' so it seems
+like a correct optimization to assume it is 1?  Or maybe I am misunderstanding
+the call.  We end up in
+
+struct SmallVector llvm::map_to_vector<llvm::ArrayRef<long int>&, inferReshapeExpandedType(llvm::ArrayRef<long int>, llvm::ArrayRef<long int>)::<lambda(int64_t)> > (struct ArrayRef & C, struct ._anon_81 & F)
+
+where I can see a struct .anon_81 (that's from the lambda I guess).
+
+The source seems to be
+
+  bool resultIsStatic = true;
+  auto resultShape = llvm::map_to_vector(newShape, [&](int64_t size) -> int64_t {
+
+    if (size >= 0)
+      return size;
+
+    if (!inputIsStatic) {
+      resultIsStatic = false;
+      return kDynamic;
+...
+
+so it might be interesting to try reducing it further.  I'll note that
+using -fno-ipa-modref avoids FRE doing the CSE but -fno-strict-aliasing
+doesn't.  So maybe it's a genuine modref bug.  IIRC there are some
+that might be fixed in GCC 14 but not yet earlier.
+
+- User: Richard Biener | Time: 2024-05-13 09:24:43 UTC
+  Text: Btw, GCC 14 was just released and the bug seems to reproduce there, too (if it is a bug).
+
+- User: Richard Biener | Time: 2024-06-20 09:15:26 UTC
+  Text: GCC 12.4 is being released, retargeting bugs to GCC 12.5.
+
+- User: Andrew Pinski | Time: 2024-06-23 01:02:07 UTC
+  Text: Trying to reduce it ...
+
+- User: Andrew Pinski | Time: 2024-06-23 01:15:22 UTC
+  Text: Createdattachment 58489[details]First step at reducing
+
+Keeps map_to_vector the same, changes the lamdba just to set resultIsStatic to false and removes the rest of the function. (also removes some unused code too).
+Changes the to use __built_trap after the function call to make it easier to test it.
+
+The bug is still hit.
+
+- User: Andrew Pinski | Time: 2024-06-23 01:30:55 UTC
+  Text: If I manually inline map_range into map_to_vector, it works ...
+
+- User: Andrew Pinski | Time: 2024-06-23 01:50:40 UTC
+  Text: (In reply to Andrew Pinski fromcomment #9)> If I manually inline map_range into map_to_vector, it works ...I take that back, it still fails. I must have been testing something else.
+
+- User: Andrew Pinski | Time: 2024-06-23 02:09:31 UTC
+  Text: Createdattachment 58490[details]Further
+
+Removed SmallVector and ArrayRef.
+Should have a run time test soon.
+
+Note for this code, I need to add `-fno-early-inlining` to get the failure.
+
+- User: Andrew Pinski | Time: 2024-06-23 02:16:36 UTC
+  Text: Createdattachment 58491[details]Runtime testcase
+
+Works at -O0 and -O2 but fails at `-O2 -fno-early-inlining`.
+
+- User: Andrew Pinski | Time: 2024-06-23 02:18:08 UTC
+  Text: Confirmed with my reduced testcase.
+
+Note the header files are still needed, I didn't try to get rid of std::move or std::forward just yet.
+The other 2 header files are just for uint64_t/int64_t/size_t .
+
+- User: Andrew Pinski | Time: 2024-06-23 02:32:54 UTC
+  Text: Createdattachment 58493[details]Reduced all the way, removing std::forward/std::move
+
+This now fails at -O2 (since I marked the functions that needed not to be inlined).
+
+- User: Andrew Pinski | Time: 2024-06-23 02:50:42 UTC
+  Text: Createdattachment 58494[details]Removing the lamdba and making it C
+
+This is an alternative which removes the lamdba and makes it a GNU C testcase.
+
+- User: Sam James | Time: 2024-06-23 02:56:03 UTC
+  Text: (In reply to Richard Biener fromcomment #4)> so it might be interesting to try reducing it further.  I'll note that
+> using -fno-ipa-modref avoids FRE doing the CSE but -fno-strict-aliasing
+> doesn't.  So maybe it's a genuine modref bug.  IIRC there are some
+> that might be fixed in GCC 14 but not yet earlier.It also looks similar to one of the tblgen issues we had before but couldn't make standalone.
+
+- User: Richard Biener | Time: 2024-06-24 11:12:24 UTC
+  Text: int resultIsStatic = 1;
+  func t ={&resultIsStatic};
+  map_to_vector(&t);
+
+  if (resultIsStatic)
+
+we disambiguate the call against the load via modref data.  The call summary
+for early modref at -O1 is
+
+  loads:
+      Base 0: alias set 0
+        Ref 0: alias set 0
+          access: Parm 0 param offset:0 offset:0 size:64 max_size:64
+  stores:
+    Every base
+  Global memory written
+  parm 0 flags: no_direct_clobber no_indirect_clobber no_direct_escape no_indirect_escape no_indirect_read
+
+where obviously no_{indirect,}_clobber isn't correct(?).  Note this seems
+to result in PTA computing a stmt call clobber set that's
+
+$20 = {anything = 0, nonlocal = 1, escaped = 1, ipa_escaped = 0, null = 0, 
+  const_pool = 0, vars_contains_nonlocal = 0, vars_contains_escaped = 0, 
+  vars_contains_escaped_heap = 0, vars_contains_restrict = 0, 
+  vars_contains_interposable = 0, vars = 0x7ffff71b7b80}
+
+which relies on us having 't' as escaped, but it's not (due to modref).
+
+While modref analysis doesn't do the disambiguation the last resort check
+of the call clobber set does.  In particular we create constaints:
+
+t = &resultIsStatic
+callescape(12) = &NONLOCAL
+CALLUSED(13) = callescape(12)
+callarg(15) = &t
+callarg(15) = callarg(15) + UNKNOWN
+CALLUSED(13) = callarg(15)
+resultIsStatic.0_1 = resultIsStatic
+
+so points-to doesn't consider anything call clobbered or escaped.
+
+In particular this looks at gimpl_call_arg_flags which is computed to
+EAF_NO_INDIRECT_READ | EAF_NO_DIRECT_ESCAPE | EAF_NO_INDIRECT_ESCAPE
+| EAF_NO_DIRECT_CLOBBER | EAF_NO_INDIRECT_CLOBBER which again is wrong
+since indirect clobber should be here.
+
+I think the analysis of map_to_vector goes wrong:
+
+ - Analyzing store: t
+   - Read-only or local, ignoring.
+ - Analyzing load: *F_2(D)
+   - Recording base_set=0 ref_set=0  Parm 0 param offset:0 offset:0 size:64 max_size:64
+ - Analyzing call:t = map_iterator (*F_2(D));
+ - ECF_CONST | ECF_NOVOPS, ignoring all stores and all loads except for args.
+^^^^
+ - Analyzing call:ff (&t.F);
+ - Merging side effects of ff/0
+   Parm map: -5
+ - Analyzing store: t
+   - Read-only or local, ignoring.
+
+missing that the t = map_iterator stmt copies *F to t, making t to contain
+references to non-local vars which ff indirectly clobbers.
+
+
+Honza?
+
+- User: Jan Hubicka | Time: 2024-07-22 14:44:11 UTC
+  Text: modref_eaf_analysis::analyze_ssa_name misinterprets EAF flags.  If dereferenced
+parameter is passed (to map_iterator in the testcase) it can be returned
+indirectly which in turn makes it to escape into the next function call.
+
+I am testing:
+
+diff --git a/gcc/ipa-modref.cc b/gcc/ipa-modref.cc
+index a5adce8ea39..a4e3cc34b4d 100644
+--- a/gcc/ipa-modref.cc
++++ b/gcc/ipa-modref.cc
+@@ -2571,8 +2571,7 @@ modref_eaf_analysis::analyze_ssa_name (tree name, bool deferred)
+                    int call_flags = deref_flags
+                            (gimple_call_arg_flags (call, i), ignore_stores);
+                    if (!ignore_retval && !(call_flags & EAF_UNUSED)
+-                       && !(call_flags & EAF_NOT_RETURNED_DIRECTLY)
+-                       && !(call_flags & EAF_NOT_RETURNED_INDIRECTLY))
++                       && !(call_flags & (EAF_NOT_RETURNED_DIRECTLY || EAF_NOT_RETURNED_INDIRECTLY)))
+                      merge_call_lhs_flags (call, i, name, false, true);
+                    if (ecf_flags & (ECF_CONST | ECF_NOVOPS))
+                      m_lattice[index].merge_direct_load ();
+
+- User: Andrew Pinski | Time: 2024-07-22 14:59:50 UTC
+  Text: (In reply to Jan Hubicka fromcomment #18)> modref_eaf_analysis::analyze_ssa_name misinterprets EAF flags.  If
+> dereferenced
+> parameter is passed (to map_iterator in the testcase) it can be returned
+> indirectly which in turn makes it to escape into the next function call.
+> 
+> I am testing:
+> 
+> diff --git a/gcc/ipa-modref.cc b/gcc/ipa-modref.cc
+> index a5adce8ea39..a4e3cc34b4d 100644
+> --- a/gcc/ipa-modref.cc
+> +++ b/gcc/ipa-modref.cc
+> @@ -2571,8 +2571,7 @@ modref_eaf_analysis::analyze_ssa_name (tree name, bool
+> deferred)
+>                     int call_flags = deref_flags
+>                             (gimple_call_arg_flags (call, i), ignore_stores);
+>                     if (!ignore_retval && !(call_flags & EAF_UNUSED)
+> -                       && !(call_flags & EAF_NOT_RETURNED_DIRECTLY)
+> -                       && !(call_flags & EAF_NOT_RETURNED_INDIRECTLY))
+> +                       && !(call_flags & (EAF_NOT_RETURNED_DIRECTLY ||
+> EAF_NOT_RETURNED_INDIRECTLY)))`||` looks wrong, I suspect it should be `|`.>                       merge_call_lhs_flags (call, i, name, false, true);
+>                     if (ecf_flags & (ECF_CONST | ECF_NOVOPS))
+>                       m_lattice[index].merge_direct_load ();
+
+- User: GCC Commits | Time: 2024-07-22 16:08:29 UTC
+  Text: The master branch has been updated by Jan Hubicka <hubicka@gcc.gnu.org>:https://gcc.gnu.org/g:cf8ffc58aad3127031c229a75cc4b99c8ace25e0commitr15-2202-gcf8ffc58aad3127031c229a75cc4b99c8ace25e0Author: Jan Hubicka <hubicka@ucw.cz>
+Date:   Mon Jul 22 18:08:08 2024 +0200
+
+    Fix modref_eaf_analysis::analyze_ssa_name handling of values dereferenced to function call parameters
+    
+    modref_eaf_analysis::analyze_ssa_name misinterprets EAF flags.  If dereferenced
+    parameter is passed (to map_iterator in the testcase) it can be returned
+    indirectly which in turn makes it to escape into the next function call.PR ipa/115033gcc/ChangeLog:
+    
+            * ipa-modref.cc (modref_eaf_analysis::analyze_ssa_name): Fix checking of
+            EAF flags when analysing values dereferenced as function parameters.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/execute/pr115033.c: New test.
+
+- User: GCC Commits | Time: 2024-07-22 16:55:57 UTC
+  Text: The releases/gcc-14 branch has been updated by Jan Hubicka <hubicka@gcc.gnu.org>:https://gcc.gnu.org/g:27ef3a0779e551ca116c56c431436c8d2191b253commitr14-10489-g27ef3a0779e551ca116c56c431436c8d2191b253Author: Jan Hubicka <hubicka@ucw.cz>
+Date:   Mon Jul 22 18:08:08 2024 +0200
+
+    Fix modref_eaf_analysis::analyze_ssa_name handling of values dereferenced to function call parameters
+    
+    modref_eaf_analysis::analyze_ssa_name misinterprets EAF flags.  If dereferenced
+    parameter is passed (to map_iterator in the testcase) it can be returned
+    indirectly which in turn makes it to escape into the next function call.PR ipa/115033gcc/ChangeLog:
+    
+            * ipa-modref.cc (modref_eaf_analysis::analyze_ssa_name): Fix checking of
+            EAF flags when analysing values dereferenced as function parameters.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/execute/pr115033.c: New test.
+    
+    (cherry picked from commit cf8ffc58aad3127031c229a75cc4b99c8ace25e0)
+
+- User: Jan Hubicka | Time: 2024-07-22 16:58:03 UTC
+  Text: Fixed on 14/15 so far
+
+- User: Sam James | Time: 2024-09-22 13:16:17 UTC
+  Text: Honza, would you mind doing the older branches too?
+
+- User: Sam James | Time: 2024-09-22 13:16:38 UTC
+  Text: (In reply to Sam James fromcomment #23)> Honza, would you mind doing the older branches too?... or I can if you're fine with it.
+
+- User: GCC Commits | Time: 2024-10-14 17:44:37 UTC
+  Text: The releases/gcc-13 branch has been updated by Sam James <sjames@gcc.gnu.org>:https://gcc.gnu.org/g:55b3fc2ab64594c4ac50925ce3d3cfdbb2a53374commitr13-9110-g55b3fc2ab64594c4ac50925ce3d3cfdbb2a53374Author: Jan Hubicka <hubicka@ucw.cz>
+Date:   Mon Jul 22 18:08:08 2024 +0200
+
+    Fix modref_eaf_analysis::analyze_ssa_name handling of values dereferenced to function call parameters
+    
+    modref_eaf_analysis::analyze_ssa_name misinterprets EAF flags.  If dereferenced
+    parameter is passed (to map_iterator in the testcase) it can be returned
+    indirectly which in turn makes it to escape into the next function call.PR ipa/115033gcc/ChangeLog:
+    
+            * ipa-modref.cc (modref_eaf_analysis::analyze_ssa_name): Fix checking of
+            EAF flags when analysing values dereferenced as function parameters.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/execute/pr115033.c: New test.
+    
+    (cherry picked from commit cf8ffc58aad3127031c229a75cc4b99c8ace25e0)
+
+- User: GCC Commits | Time: 2024-10-14 21:14:22 UTC
+  Text: The releases/gcc-12 branch has been updated by Sam James <sjames@gcc.gnu.org>:https://gcc.gnu.org/g:f2686f12e9345d95a2d6b7291bd777501d197869commitr12-10768-gf2686f12e9345d95a2d6b7291bd777501d197869Author: Jan Hubicka <hubicka@ucw.cz>
+Date:   Mon Jul 22 18:08:08 2024 +0200
+
+    Fix modref_eaf_analysis::analyze_ssa_name handling of values dereferenced to function call parameters
+    
+    modref_eaf_analysis::analyze_ssa_name misinterprets EAF flags.  If dereferenced
+    parameter is passed (to map_iterator in the testcase) it can be returned
+    indirectly which in turn makes it to escape into the next function call.PR ipa/115033gcc/ChangeLog:
+    
+            * ipa-modref.cc (modref_eaf_analysis::analyze_ssa_name): Fix checking of
+            EAF flags when analysing values dereferenced as function parameters.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.c-torture/execute/pr115033.c: New test.
+    
+    (cherry picked from commit cf8ffc58aad3127031c229a75cc4b99c8ace25e0)
+
+- User: Sam James | Time: 2024-10-14 21:15:42 UTC
+  Text: Fixed (backporting done perhttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=111613#c13) for 12.5 too.
+

@@ -1,0 +1,273 @@
+Bug Summary: [14 Regression] GCC, ICE: internal compiler error: in verify_range, at value-range.cc:1104 since r14-255
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: wierton | Time: 2023-07-09 11:34:35 UTC
+  Text: The testing program:
+```
+typedef long unsigned int size_t;
+void *memcpy(void *, const void *, size_t);
+int snprintf(char *restrict, size_t, const char *restrict, ...);
+
+extern char a[2];
+void test_func_on_line_62(void) {
+  memcpy(a, "12", sizeof("12") - 1);
+  const int res = snprintf(0, 0, "%s", a);
+  if (res <= 3)
+    do {
+      extern void f(void);
+      f();
+    } while (0);
+}
+```
+
+When attempting to compile it with `gcc-14 -O2 small.c`, gcc-14 crashes:
+```
+during GIMPLE pass: strlen
+<source>: In function 'test_func_on_line_62':
+<source>:6:6: internal compiler error: in verify_range, at value-range.cc:1104
+    6 | void test_func_on_line_62(void) {
+      |      ^~~~~~~~~~~~~~~~~~~~
+0x213b0ee internal_error(char const*, ...)
+	???:0
+0x9ca9f8 fancy_abort(char const*, int, char const*)
+	???:0
+0x13df0f7 irange::set(tree_node*, generic_wide_int<wide_int_storage> const&, generic_wide_int<wide_int_storage> const&, value_range_kind)
+	???:0
+0x1e24a5d handle_printf_call(gimple_stmt_iterator*, pointer_query&)
+	???:0
+0x12d3d86 strlen_pass::check_and_optimize_call(bool*)
+	???:0
+0x12d4109 strlen_pass::check_and_optimize_stmt(bool*)
+	???:0
+0x12d4494 strlen_pass::before_dom_children(basic_block_def*)
+	???:0
+0x1d98997 dom_walker::walk(basic_block_def*)
+	???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+```
+
+This crash can be verified athttps://gcc.godbolt.org/z/439GM47z9
+
+- User: Richard Biener | Time: 2023-07-10 06:36:01 UTC
+  Text: Confirmed.
+
+(gdb) p lb
+$1 = {<wide_int_storage> = {val = {2, 45595810, 140737488342608, 
+      140737488342672, 140737488341240, 2147483664, 8, 140737339338752, 0}, 
+    len = 1, precision = 32}, static is_sign_extended = true}
+(gdb) p ub
+$2 = {<wide_int_storage> = {val = {1, 1, 1, 1, 140737488341320, 2147483664, 
+      140737471578113, 0, 140735340871686}, len = 1, precision = 32}, 
+  static is_sign_extended = true}
+
+from
+
+#4  0x0000000002b7c5d7 in (anonymous namespace)::try_substitute_return_value (
+    gsi=0x7fffffffda18, info=..., res=...)
+    at /space/rguenther/src/gcc/gcc/gimple-ssa-sprintf.cc:4254
+
+  else if (lhs && types_compatible_p (TREE_TYPE (lhs), integer_type_node))
+    {
+      bool setrange = false;
+
+      if (safe
+          && (info.bounded || retval[1] < info.objsize)
+          && (retval[0] < target_int_max ()
+              && retval[1] < target_int_max ()))
+        { 
+          /* If the result is in a valid range bounded by the size of
+             the destination set it so that it can be used for subsequent
+             optimizations.  */
+          int prec = TYPE_PRECISION (integer_type_node);
+
+          wide_int min = wi::shwi (retval[0], prec);
+          wide_int max = wi::shwi (retval[1], prec);
+          value_range r (TREE_TYPE (lhs), min, max);
+          set_range_info (lhs, r); 
+
+
+The issue is likely older but only triggered with recent ranger changes
+(on the verifier side?).
+
+- User: Matthias Klose | Time: 2024-01-02 20:39:15 UTC
+  Text: also seen with 20240101 trunk, building the python-confluent-kafka package:
+
+$ cat confluent_kafka.i
+long _init_cimpl_dof;
+char _init_cimpl_dash[1], _init_cimpl_eq[1];
+char PyInit_cimpl_tmpdoc[512];
+int snprintf(char *, unsigned long, char *, ...);
+void *memset();
+void PyInit_cimpl() {
+  memset(_init_cimpl_eq, '=', sizeof(_init_cimpl_eq));
+  long _len = snprintf(PyInit_cimpl_tmpdoc, sizeof(PyInit_cimpl_tmpdoc),
+                       "+-%.*s-+-%.*s-+\n"
+                       "| %-*.*s | %-*.*s |\n"
+                       "+=%.*s=+=%.*s=+\n",
+                       0, _init_cimpl_dash, 0, _init_cimpl_dash, 0, 0, "", 0, 0,
+                       "", 50, _init_cimpl_eq, 0, _init_cimpl_eq);
+  _init_cimpl_dof += _len;
+}
+
+$ gcc -c -O2 -fno-strict-overflow -fstack-protector-strong -fcf-protection=full -fwrapv confluent_kafka.i
+during GIMPLE pass: strlen
+confluent_kafka.i: In function 'PyInit_cimpl':
+confluent_kafka.i:6:6: internal compiler error: in verify_range, at value-range.cc:1132
+    6 | void PyInit_cimpl() {
+      |      ^~~~~~~~~~~~
+0x6eec19 irange::verify_range()
+        ../../src/gcc/value-range.cc:1132
+0x1b52550 irange::set(tree_node*, generic_wide_int<wide_int_storage> const&, generic_wide_int<wide_int_storage> const&, value_range_kind)
+        ../../src/gcc/value-range.cc:1076
+0x1eb42ad try_substitute_return_value
+        ../../src/gcc/gimple-ssa-sprintf.cc:4261
+0x1eb42ad handle_printf_call(gimple_stmt_iterator*, pointer_query&)
+        ../../src/gcc/gimple-ssa-sprintf.cc:4764
+0x1eb2193 strlen_pass::check_and_optimize_call(bool*)
+        ../../src/gcc/tree-ssa-strlen.cc:5452
+0x1cfe639 strlen_pass::check_and_optimize_stmt(bool*)
+        ../../src/gcc/tree-ssa-strlen.cc:5656
+0x1cfe094 strlen_pass::before_dom_children(basic_block_def*)
+        ../../src/gcc/tree-ssa-strlen.cc:5840
+0x1c7fd13 dom_walker::walk(basic_block_def*)
+        ../../src/gcc/domwalk.cc:311
+0x950ef1 printf_strlen_execute
+        ../../src/gcc/tree-ssa-strlen.cc:5899
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+
+- User: Jakub Jelinek | Time: 2024-01-09 18:06:45 UTC
+  Text: Started withr14-255-g04e5ddf8a313e85348a05c27708c845cc45e2e83Aldy, do you think you could have a look?
+
+- User: Aldy Hernandez | Time: 2024-01-10 10:31:28 UTC
+  Text: (In reply to wierton fromcomment #0)> The testing program:
+> ```
+> typedef long unsigned int size_t;
+> void *memcpy(void *, const void *, size_t);
+> int snprintf(char *restrict, size_t, const char *restrict, ...);
+> 
+> extern char a[2];
+> void test_func_on_line_62(void) {
+>   memcpy(a, "12", sizeof("12") - 1);
+>   const int res = snprintf(0, 0, "%s", a);
+>   if (res <= 3)
+>     do {
+>       extern void f(void);
+>       f();
+>     } while (0);
+> }The sprintf pass is ICEing because it's trying to build a nonsensical range of [2,1].  Legacy irange tried harder with swapped ranges, but in the above case it would actually drop to VARYING:
+
+-      /* There's one corner case, if we had [C+1, C] before we now have
+-        that again.  But this represents an empty value range, so drop
+-        to varying in this case.  */
+
+Which would cause the sprintf pass to set a global range of VARYING.  I can't remember whether this meant nuking the known global range, or ignoring it altogether (the semantics changed in the last release or two).  My guess is the later, since set_range_info() improves ranges, never pessimizes them.
+
+Now the reason we're passing swapped endpoints seems to originate in get_range_strlen_dynamic().  It is setting a min of 2, courtesy of the nonzero characters in the memcpy:
+
+memcpy(a, "12", sizeof("12") - 1);
+
+This comes from tree-ssa-strlen.c:
+      if (!pdata->minlen && si->nonzero_chars)
+	{
+	  if (TREE_CODE (si->nonzero_chars) == INTEGER_CST)
+	    pdata->minlen = si->nonzero_chars;
+
+
+Further down we set a max of 1, stemming from the size of a[2] minus 1 for the terminating null:
+
+	      if (TREE_CODE (size) == INTEGER_CST)
+		{
+		  ++off;   /* Increment for the terminating nul.  */
+		  tree toffset = build_int_cst (size_type_node, off);
+		  pdata->maxlen = fold_build2 (MINUS_EXPR, size_type_node, size,
+					       toffset);
+		  pdata->maxbound = pdata->maxlen;
+		}
+
+I don't understand this code enough to opine, but at the worst we could bail if the ends are swapped.  It's no worse than what we had before.
+
+- User: Jakub Jelinek | Time: 2024-01-23 11:16:39 UTC
+  Text: (In reply to Aldy Hernandez fromcomment #4)> Now the reason we're passing swapped endpoints seems to originate in
+> get_range_strlen_dynamic().  It is setting a min of 2, courtesy of the
+> nonzero characters in the memcpy:
+> 
+> memcpy(a, "12", sizeof("12") - 1);Guess in a program without UB both the bounds are valid, a zero terminated string in
+char[2] array can't have strlen longer than 1 and when '1' and '2' characters are memcpyed at the start of some buffer then the string length will be at least 2.
+But the program would invoke UB if this code is reached, so the question is how to resolve it.
+The old behavior of VRP/ranger with swapping the boundaries avoided the ICE but wasn't
+right, this case isn't that the string length will be in [1, 2] range, but that the argument will never be a valid zero terminated string.
+So, guess either we shouldn't set minlen or maxlen (whatever is found second) if it violates the other bound, or check it after the fact and pick just one of them or set the other to one of them.
+
+- User: Jakub Jelinek | Time: 2024-01-27 12:48:40 UTC
+  Text: Createdattachment 57238[details]gcc14-pr110603.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-01-29 09:21:23 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:b338fdbc2b74f25c07da263a1f5983421fac1a53commitr14-8487-gb338fdbc2b74f25c07da263a1f5983421fac1a53Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Mon Jan 29 10:20:32 2024 +0100
+
+    tree-ssa-strlen: Fix pdata->maxlen computation [PR110603]
+    
+    On the following testcase we emit an invalid range of [2, 1] due to
+    UB in the source.  Older VRP code silently swapped the boundaries and
+    made [1, 2] range out of it, but newer code just ICEs on it.
+    
+    The reason for pdata->minlen 2 is that we see a memcpy in this case
+    setting both elements of the array to non-zero value, so strlen (a)
+    can't be smaller than 2.  The reason for pdata->maxlen 1 is that in
+    char a[2] array without UB there can be at most 1 non-zero character
+    because there needs to be '\0' termination in the buffer too.
+    
+    IMHO we shouldn't create invalid ranges like that and even creating
+    for that case a range [1, 2] looks wrong to me, so the following patch
+    just doesn't set maxlen in that case to the array size - 1, matching
+    what will really happen at runtime when triggering such UB (strlen will
+    be at least 2, perhaps more or will crash).
+    This is what the second hunk of the patch does.
+    
+    The first hunk fixes a fortunately harmless thinko.
+    If the strlen pass knows the string length (i.e. get_string_length
+    function returns non-NULL), we take a different path, we get to this
+    only if all we know is that there are certain number of non-zero
+    characters but we don't know what it is followed with, whether further
+    non-zero characters or zero termination or either of that.
+    If we know exactly how many non-zero characters it is, such as
+    char a[42];
+    ...
+      memcpy (a, "01234567890123456789", 20);
+    then we take an earlier if for the INTEGER_CST case and set correctly
+    just pdata->minlen to 20 in that case, but if we have something like
+      int len;
+      ...
+      if (len < 15 || len > 32) return;
+      memcpy (a, "0123456789012345678901234567890123456789", len);
+    then we have [15, 32] range for the nonzero_chars and we set pdata->minlen
+    correctly to 15, but incorrectly set also pdata->maxlen to 32.  That is
+    not what the above implies, it just means that in some cases we know that
+    there are at least 32 non-zero characters, followed by something we don't
+    know.  There is no guarantee that there is '\0' right after it, so it
+    means nothing.
+    The reason this is harmless, just confusing, is that the code a few lines
+    later fortunately overwrites this incorrect pdata->maxlen value with
+    something different (either array length - 1 or all ones etc.).
+    
+    2024-01-29  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/110603* tree-ssa-strlen.cc (get_range_strlen_dynamic): Remove incorrect
+            setting of pdata->maxlen to vr.upper_bound (which is unconditionally
+            overwritten anyway).  Avoid creating invalid range with minlen
+            larger than maxlen.  Formatting fix.
+    
+            * gcc.c-torture/compile/pr110603.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-01-29 09:30:38 UTC
+  Text: Fixed.
+

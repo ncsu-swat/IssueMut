@@ -1,0 +1,485 @@
+Bug Summary: wrong code with _BitInt() arithmetics at -O2
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-02-05 18:13:53 UTC
+  Text: Createdattachment 57328[details]reduced testcase
+
+This fails even with thePR113753patch applied.
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -O2 testcase.c
+$ ./a.out 
+Aborted
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-8795-20240204180638-g91e09b3a7e9-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-8795-20240204180638-g91e09b3a7e9-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240205 (experimental) (GCC)
+
+- User: Zdenek Sojka | Time: 2024-02-06 12:04:02 UTC
+  Text: Createdattachment 57341[details]another testcase, failing at -O1
+
+I didn't check if thePR113753patch fixes this.
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -O testcase.c
+$ ./a.out 
+Aborted
+
+- User: Jakub Jelinek | Time: 2024-02-07 18:28:49 UTC
+  Text: /*PR tree-optimization/113774*/
+/* { dg-do run { target bitint } } */
+/* { dg-options "-std=c23 -pedantic-errors" } */
+/* { dg-skip-if "" { ! run_expensive_tests }  { "*" } { "-O0" "-O2" } } */
+/* { dg-skip-if "" { ! run_expensive_tests } { "-flto" } { "" } } */
+
+#if __BITINT_MAXWIDTH__ >= 512
+unsigned _BitInt(512) u;
+unsigned _BitInt(512) v;
+
+void
+foo (unsigned _BitInt(255) a, unsigned _BitInt(257) b, unsigned _BitInt(512) *r)
+{
+  b += v;
+  b |= a - b;
+  unsigned _BitInt(512) c = b * 6;
+  unsigned _BitInt(512) h = c >> u;
+  *r = h;
+}
+#endif
+
+int
+main ()
+{
+#if __BITINT_MAXWIDTH__ >= 512
+  unsigned _BitInt(512) x;
+  foo (0x10000000000000000wb, 0x10000000000000001wb, &x);
+  if (x != 0x1fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffawb)
+    __builtin_abort ();
+#endif
+  return 0;
+}
+
+This looks like a PRE bug to me.
+The bug at runtime is that b |= a - b (i.e. the operand of the multiplication) which ought to be
+0x01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffuwb I think is different.
+What bitint lowering emits to compute this are 2 separate loops + straight line code after each to handle the most significant limb of 257-bit unsigned _BitInts.
+The first computes b += v; and because v is 0, it doesn't change anything and uses
+the same underlying variable (the PARM_DECL) for both the input and result, the second
+one performs the b |= a - b which is complicated because there needs to be zero extension from 255-bit a to 257 bits.  This loop handles 2 limbs at a time, so iterates twice:
+  <bb 5> [local count: 1073741824]:
+  # _49 = PHI <0(4), _50(11)>
+  # _55 = PHI <0(4), _56(11)>
+  _51 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_49];
+  if (_49 < 3)
+    goto <bb 6>; [80.00%]
+  else
+    goto <bb 7>; [20.00%]
+
+  <bb 6> [local count: 1073741824]:
+  _52 = VIEW_CONVERT_EXPR<unsigned long[4]>(a)[_49];
+
+  <bb 7> [local count: 1073741824]:
+  # _53 = PHI <_52(6), 0(5)>
+  _54 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_49];
+  _57 = .USUBC (_53, _54, _55);
+  _58 = IMAGPART_EXPR <_57>;
+  _59 = REALPART_EXPR <_57>;
+  _60 = _59 | _51;
+  bitint.6[_49] = _60;
+  _61 = _49 + 1;
+  _62 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_61];
+  if (_61 <= 3)
+    goto <bb 8>; [80.00%]
+  else
+    goto <bb 11>; [20.00%]
+
+  <bb 8> [local count: 1073741824]:
+  if (_61 == 3)
+    goto <bb 10>; [20.00%]
+  else
+    goto <bb 9>; [80.00%]
+
+  <bb 9> [local count: 1073741824]:
+  _63 = VIEW_CONVERT_EXPR<unsigned long[4]>(a)[_61];
+  goto <bb 11>; [100.00%]
+
+  <bb 10> [local count: 214748360]:
+  _64 = MEM <unsigned long> [(unsigned _BitInt(255) *)&a + 24B];
+  _65 = (<unnamed-unsigned:63>) _64;
+  _66 = (unsigned long) _65;
+  
+  <bb 11> [local count: 1073741824]:
+  # _67 = PHI <_63(9), 0(7), _66(10)>
+  _68 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_61];
+  _69 = .USUBC (_67, _68, _58);
+  _56 = IMAGPART_EXPR <_69>;
+  _70 = REALPART_EXPR <_69>;
+  _71 = _70 | _62;
+  bitint.6[_61] = _71;
+  _50 = _49 + 2;
+  if (_50 != 4)
+    goto <bb 5>; [0.05%]
+  else
+    goto <bb 12>; [99.95%]
+
+  <bb 12> [local count: 1073741824]:
+  _72 = MEM <unsigned long> [(unsigned _BitInt(257) *)&b + 32B];
+  _73 = (<unnamed-unsigned:1>) _72;
+  _74 = MEM <unsigned long> [(unsigned _BitInt(257) *)&b + 32B];
+  _75 = (<unnamed-unsigned:1>) _74;
+  _76 = (unsigned long) _75;
+  _77 = .USUBC (0, _76, _56);
+  _78 = IMAGPART_EXPR <_77>;
+  _79 = REALPART_EXPR <_77>;
+  _80 = (<unnamed-unsigned:1>) _79;
+  _81 = _80 | _73;
+  _82 = (unsigned long) _81;
+  MEM[(unsigned long *)&bitint.6 + 32B] = _82;
+  a ={v} {CLOBBER(eos)};
+
+bitint.6 is the result of b | (zext (a) - b) which is then used as argument to __mulbitint3.
+Now, there is something I should improve, eventhough later optimizations like VRP IMHO ought to be able to figure it out, because the loop iterates just twice, _49 will be in the [0, 2] range (actually 0 or 2), so _49 < 3 condition is actually always true and similarly _61 <= 3 is also always true (because _61 is in [1, 3] range (actually 1 or 3)).
+Guess I should in the handle_cast handling look at the m_upwards_2limb exact value and figure out conditions which will be always true or always false.
+
+Anyway, with the above which is IMHO correct but non-optimal let's see what happens to the processing of the second least significant limb, i.e. the second half of the first iteration which is what is IMHO miscompiled during PRE.
+First thread1 pass goes wild and threads everything it thinks it is possible to thread.
+The second least significant limb is handled in
+  # _67 = PHI <_63(8), 0(6)>
+  # _144 = PHI <_143(8), _136(6)>
+  # _146 = PHI <_145(8), _140(6)>
+  # _148 = PHI <_147(8), _141(6)>
+  _68 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_146];
+  _69 = .USUBC (_67, _68, _144);
+  _56 = IMAGPART_EXPR <_69>;
+  _70 = REALPART_EXPR <_69>;
+  _71 = _70 | _148;
+  bitint.6[_146] = _71;
+and the important thing to look at is the second .USUBC argument there, so _68, load from b's _146
+index, and second LS limb is entering this from bb 8 with
+  <bb 8> [local count: 1073741824]:
+  # _143 = PHI <_10(7), _136(6)>
+  # _145 = PHI <_4(7), _140(6)>
+  # _147 = PHI <_3(7), _141(6)>
+  _63 = VIEW_CONVERT_EXPR<unsigned long[4]>(a)[_145];
+  goto <bb 10>; [100.00%]
+entered from bb 7, where
+  _4 = _49 + 1;
+and earlier:
+  <bb 5> [local count: 1073741824]:
+  # _49 = PHI <0(4), _50(10)>
+  # _55 = PHI <0(4), _56(10)>
+is the head of the whole loop entered from bb 4, so _146 is 1 in the first iteration.
+All good.  This is the state which is also in walloca2.
+But PRE changes this to:
+@@ -144,9 +251,10 @@ void foo (unsigned _BitInt(255) a, unsig
+   # DEBUG BEGIN_STMT
+ 
+   <bb 5> [local count: 1073741824]:
+-  # _49 = PHI <0(4), _50(28)>
+-  # _55 = PHI <0(4), _56(28)>
++  # _49 = PHI <0(4), _50(10)>
++  # _55 = PHI <0(4), _56(10)>
+   _51 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_49];
++  _179 = _49 + 1;
+   if (_49 <= 2)
+     goto <bb 7>; [80.00%]
+   else
+@@ -158,9 +266,7 @@ void foo (unsigned _BitInt(255) a, unsig
+   _137 = REALPART_EXPR <_135>;
+   _138 = _51 | _137;
+   bitint.6[_49] = _138;
+-  _140 = _49 + 1;
+-  _141 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_140];
+-  if (_140 <= 3)
++  if (_179 <= 3)
+     goto <bb 8>; [0.00%]
+   else
+     goto <bb 10>; [100.00%]
+@@ -172,18 +278,16 @@ void foo (unsigned _BitInt(255) a, unsig
+   _9 = REALPART_EXPR <_11>;
+   _6 = _9 | _51;
+   bitint.6[_49] = _6;
+-  _4 = _49 + 1;
+-  _3 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_4];
+-  if (_4 == 3)
++  _3 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_179];
++  if (_179 == 3)
+     goto <bb 9>; [20.00%]
+   else
+     goto <bb 8>; [80.00%]
+ 
+   <bb 8> [local count: 1073741824]:
+   # _143 = PHI <_10(7), _136(6)>
+-  # _145 = PHI <_4(7), _140(6)>
+-  # _147 = PHI <_3(7), _141(6)>
+-  _63 = VIEW_CONVERT_EXPR<unsigned long[4]>(a)[_145];
++  # _147 = PHI <_3(7), _134(6)>
++  _63 = VIEW_CONVERT_EXPR<unsigned long[4]>(a)[_179];
+   goto <bb 10>; [100.00%]
+
+   <bb 9> [local count: 214748360]:
+@@ -200,27 +304,21 @@ void foo (unsigned _BitInt(255) a, unsig
+   <bb 10> [local count: 858993464]:
+   # _67 = PHI <_63(8), 0(6)>
+   # _144 = PHI <_143(8), _136(6)>
+-  # _146 = PHI <_145(8), _140(6)>
+-  # _148 = PHI <_147(8), _141(6)>
+-  _68 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_146];
+-  _69 = .USUBC (_67, _68, _144);
++  # _148 = PHI <_147(8), _134(6)>
++  _69 = .USUBC (_67, _134, _144);
+   _56 = IMAGPART_EXPR <_69>;
+   _70 = REALPART_EXPR <_69>;
+   _71 = _70 | _148;
+-  bitint.6[_146] = _71;
++  bitint.6[_179] = _71;
+   _50 = _49 + 2;
+   if (_50 != 4)
+-    goto <bb 28>; [0.06%]
++    goto <bb 5>; [0.06%]
+   else
+     goto <bb 11>; [99.94%]
+ 
+Now, the bug is IMHO in using _134 in the .USUBC call, _134 is the VIEW_CONVERT_EXPR<unsigned long[5]>(b)[4] value,
+so something that is valid when bb 10 is entered from the edge from bb 6, but when entered from bb 8 it ought
+to be VIEW_CONVERT_EXPR<unsigned long[4]>(b)[_179], so _3, so the right thing would be to use there _148
+which contains that value.
+Later on we completely unroll the loop and there it is clearly visible, for the least significant limb
+we correctly compute bitint.6[0] = b[0] | (a[0] - b[0]), while for the second least significant limb
+bitint.6[1] = b[1] | (a[1] - (b[4] & 1) - carry) and so while bitint.6[0] is -1, bitint.6[1] is 1.
+
+- User: Jakub Jelinek | Time: 2024-02-07 20:24:45 UTC
+  Text: unsigned long long a[32], b[32], v[32], r[32];
+
+void
+foo (unsigned int n)
+{
+  unsigned long long c = 0;
+  for (unsigned long i = 0; i < n; i += 2)
+    {
+      unsigned long j = i + 1;
+      b[i] = __builtin_addcll (b[i], v[i], c, &c);
+      b[j] = __builtin_addcll (b[j], v[j], c, &c);
+    }
+  b[4] = __builtin_addcll (b[4] & 1, v[4] & 1, c, &c) & 1;
+  c = 0;
+  for (unsigned long i = 0; i < n; i += 2)
+    {
+      unsigned long j = i + 1;
+      unsigned long long k = i < 3 ? a[i] : 0;
+      r[i] = b[i] | __builtin_subcll (k, b[i], c, &c);
+      unsigned long long l = b[j];
+      if (j <= 3)
+	{
+	  if (j == 3)
+	    k = a[3] & 0x7fffffffffffffffULL;
+	  else
+	    k = a[3];
+	}
+      else
+	k = 0;
+      r[j] = l | __builtin_subcll (k, b[j], c, &c);
+    }
+  r[4] = (b[4] | __builtin_subcll (0, b[4] & 1, c, &c)) & 1;
+}
+
+might help understand better what bitintlower emits there, except it uses PARM_DECLs or automatic VAR_DECLs instead of the global ones (except for v) and n is 4 (I've used function argument only to avoid VRP figuring out earlier that certain paths are dead) and the var sizes is actually just 4 (for a) or 5 elts.
+That said, even _134 in the #c2 testcase at -O2 in the PHI argument is fishy, but the
+point is that bb 6 is really dead but it isn't known to the compiler yet; it is reached if _49 <= 2 is false, but given that _49 is incremented in increments of 2 and the array size is 5 maybe PRE knows that _49 then would have to be 4. bb 6 either jumps directly to bb 10 (if _140 (aka _49 + 1) > 3) or hops through bb 8 to bb 10.
+
+- User: Jakub Jelinek | Time: 2024-02-08 13:54:32 UTC
+  Text: Createdattachment 57359[details]gcc14-pr113774.patch
+
+So far lightly tested optimization on the bitint lowering side which emits
+more optimal code for that (for the unsigned 255 -> 257 bit extension and
+m_upwards_2limb low is 3 and high is 4, so when processing first limb in the
+loop, the idx < 3 condition is always true (as idx is 0 or 2) and when processing the second limb in the loop, similarly idxp1 <= 3 condition is always true (as idxp1 is 1 or 3) while idxp1 == 3 still needs to be compared.
+
+This makes the PRE (or VN?) bug latent.
+
+- User: Richard Biener | Time: 2024-02-08 14:04:44 UTC
+  Text: This must go wrong during alias disambiguation, somehow figuring we can ignore the backedge?!  The ref we hoist is
+
+  _68 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_146];
+
+where _146 is _49 + 1, but _49 is an IV:
+
+  _134 = _105 & 1;
+  MEM <unsigned long> [(unsigned _BitInt(257) *)&b + 32B] = _134;
+
+  <bb 5> [local count: 1073741824]:
+  # _49 = PHI <0(4), _50(28)>
+
+it's also odd that we seem to arrive at b + 32B.
+
+Value numbering stmt = _146 = PHI <_145(8), _140(31)>
+Setting value number of _146 to _140 (changed)
+Making available beyond BB10 _146 for value _140
+...
+Value numbering stmt = .MEM_150 = PHI <.MEM_149(8), .MEM_139(31)>
+Setting value number of .MEM_150 to .MEM_150 (changed)
+Value numbering stmt = _68 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_146];
+Setting value number of _68 to _134 (changed)
+
+huh.
+
+Hmm.  But we have
+
+  # RANGE [irange] sizetype [4, 4][6, +INF] MASK 0xfffffffffffffffe VALUE 0x1
+  _140 = _49 + 1;
+
+  # RANGE [irange] sizetype [1, 2][4, 4][6, +INF] MASK 0xfffffffffffffffe VALUE 0x1 
+  # _146 = PHI <_145(8), _140(6)>
+
+we should look at the range of _146
+
+Hmm, I _think_ I know what happens.  We have
+
+<bb 5> [local count: 1073741824]:
+# _49 = PHI <0(4), _50(28)>
+# _55 = PHI <0(4), _56(28)>
+_51 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_49];
+if (_49 <= 2)
+  goto <bb 7>; [80.00%]
+else
+  goto <bb 6>; [20.00%]
+
+<bb 6> [local count: 214748360]:
+_135 = .USUBC (0, _51, _55);
+_136 = IMAGPART_EXPR <_135>;
+_137 = REALPART_EXPR <_135>;
+_138 = _51 | _137;
+bitint.6[_49] = _138;
+_140 = _49 + 1;
+_141 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_140];
+
+and this is the "same" valueized ref (what gets recorded in the hashtable),
+but here we can see that _140 >= 4 which makes it known 4 based on the
+array extent.  This matches it up with the store of _134:
+
+Value numbering stmt = _141 = VIEW_CONVERT_EXPR<unsigned long[5]>(b)[_140];
+Setting value number of _141 to _134 (changed)
+_134 is available for _134
+
+we record the expression with the VUSE of the definition.  Later when we
+look up the same expression from the later block (where _140 isn't known
+to be 4) we find the very same expression when looking with the VUSE of
+the definition and thus we take the expression already in the hashtable
+which has been assigned the value _134 and then boom.
+
+Sth like the following is miscompiled at -O2 by FRE.
+
+int a[3];
+int __attribute__((noipa))
+foo(int i, int x)
+{
+  int tem = 0;
+  a[2] = x;
+  if (i < 1)
+    ++i;
+  else
+    {
+      ++i;
+      tem = a[i];
+    }
+  tem += a[i];
+  return tem;
+}
+
+int main() { if (foo (0, 7) != 0) __builtin_abort(); }
+
+- User: Jakub Jelinek | Time: 2024-02-08 14:12:24 UTC
+  Text: Thanks.
+The #c5 reduced testcase started to be miscompiled withr9-398-g6b9fc1782effc67dd9f6def16207653d79647553Perhaps we should move that to a separate bug so that it can be marked [11/12/13/14 Regression] and leave this just for the bitint lowering enhancements not to emit clearly always true or always false conditions if possible.
+
+- User: Richard Biener | Time: 2024-02-08 14:18:25 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #6)> Thanks.
+> The #c5 reduced testcase started to be miscompiled with
+>r9-398-g6b9fc1782effc67dd9f6def16207653d79647553> Perhaps we should move that to a separate bug so that it can be marked
+> [11/12/13/14 Regression] and leave this just for the bitint lowering
+> enhancements not to emit clearly always true or always false conditions if
+> possible.PR113831
+
+- User: GCC Commits | Time: 2024-02-09 10:06:49 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:97e49bf00d1a7b7a2a02531a1c5362fad27348d9commitr14-8894-g97e49bf00d1a7b7a2a02531a1c5362fad27348d9Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Feb 9 11:06:00 2024 +0100
+
+    lower-bitint: Attempt not to emit always true conditions in handle_cast [PR113774]
+    
+    The following patch is the optimization part ofPR113774, where in
+    handle_cast we emit some conditionals which are always true and presumably
+    VRP would figure that out later and clean it up, except that instead
+    thread1 is invoked and threads everything through the conditions, so we end
+    up with really ugly code which is hard to be cleaned up later and then
+    run intoPR113831VN bug and miscompile stuff.
+    
+    handle_cast computes low and high as limb indexes, where idx < low
+    doesn't need any special treatment, just uses the operand's limb,
+    idx >= high cases all the bits in the limb are an extension (so, for
+    unsigned widening cast all those bits are 0, for signed widening cast
+    all those bits are equal to the in earlier code computed sign mask,
+    narrowing cast don't trigger this code) and then the idx == low && idx <
+    high case if it exists need special treatment (some bits are copied, others
+    extended, or all bits are copied but sign mask needs to be computed).
+    
+    The code already attempted to optimize away some unneeded casts, in the
+    first hunk below e.g. for the case like 257 -> 321 bit extension, where
+    low is 4 and high 5 and we use a loop handling the first 4 limbs (2
+    iterations) with m_upwards_2limb 4 - no special handling is needed in the
+    loop, and the special handling is done on the first limb after the loop
+    and then the last limb after the loop gets the extension only, or
+    in the second hunk where can emit a single comparison instead of
+    2 e.g. for the low == high case - that must be a zero extension from
+    multiple of limb bits, say 192 -> 328, or for the case where we know
+    the idx == low case happens in the other limb processed in the loop, not
+    the current one.
+    
+    But the testcase shows further cases where we always know some of the
+    comparisons can be folded to true/false, in particular there is
+    255 -> 257 bit zero extension, so low 3, high 4, m_upwards_2limb 4.
+    The loop handles 2 limbs at the time and for the first limb we were
+    emitting idx < low ? operand[idx] : 0; but because idx goes from 0
+    with step 2 2 iterations, idx < 3 is always true, so we can just
+    emit operand[idx].  This is handled in the first hunk.  In addition
+    to fixing it (that is the " - m_first" part in there) I've rewritten
+    it using low to make it more readable.
+    
+    Similarly, in the other limb we were emitting
+    idx + 1 <= low ? (idx + 1 == low ? operand[idx] & 0x7ff....ff : operand[idx]) : 0
+    but idx + 1 <= 3 is always true in the loop, so all we should emit is
+    idx + 1 == low ? operand[idx] & 0x7ff....ff : operand[idx],
+    Unfortunately for the latter, when single_comparison is true, we emit
+    just one comparison, but the code which fills the branches will fill it
+    with the operand[idx] and 0 cases (for zero extension, for sign extension
+    similarly), not the operand[idx] (aka copy) and operand[idx] & 0x7ff....ff
+    (aka most significant limb of the narrower precision) cases.  Instead
+    of making the code less readable by using single_comparison for that and
+    handling it in the code later differently I've chosen to just emit
+    a condition which will be always true and let cfg cleanup clean it up.
+    
+    2024-02-09  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113774* gimple-lower-bitint.cc (bitint_large_huge::handle_cast): Don't
+            emit any comparison if m_first and low + 1 is equal to
+            m_upwards_2limb, simplify condition for that.  If not
+            single_comparison, not m_first and we can prove that the idx <= low
+            comparison will be always true, emit instead of idx <= low
+            comparison low <= low such that cfg cleanup will optimize it at
+            the end of the pass.
+    
+            * gcc.dg/torture/bitint-57.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-02-09 10:14:18 UTC
+  Text: Fixed.
+

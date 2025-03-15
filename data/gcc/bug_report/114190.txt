@@ -1,0 +1,130 @@
+Bug Summary: [14 regression] Wrong code with -O2 -fno-dce -fharden-compares -mvpclmulqdq --param=max-rtl-if-conversion-unpredictable-cost=136
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-03-01 12:11:43 UTC
+  Text: Createdattachment 57585[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -O2 -fno-dce -fharden-compares -mvpclmulqdq --param=max-rtl-if-conversion-unpredictable-cost=136 testcase.c -Wno-psabi
+$ ./a.out 
+Aborted
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-9248-20240301110451-gd3d0fcb6527-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-9248-20240301110451-gd3d0fcb6527-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240301 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-03-01 20:58:17 UTC
+  Text: >        test    esi, esiis missing with `-fno-dce`
+
+- User: Andrew Pinski | Time: 2024-03-01 21:04:45 UTC
+  Text: So after reload, it looks ok:
+(insn 22 21 380 2 (set (reg:CCZ 17 flags)
+        (compare:CCZ (reg:SI 4 si [orig:111 _21+4 ] [111])
+            (const_int 0 [0]))) "/app/example.cpp":8:8 discrim 1 7 {*cmpsi_ccno_1}
+     (nil))
+(insn 380 22 381 2 (parallel [
+            (set (reg:DI 1 dx [353])
+                (plus:DI (reg/f:DI 7 sp)
+                    (const_int 212 [0xd4])))
+            (clobber (reg:CC 17 flags))
+        ]) "/app/example.cpp":8:65 discrim 1 272 {*adddi_1}
+     (expr_list:REG_EQUIV (plus:DI (reg/f:DI 16 argp)
+            (const_int 76 [0x4c]))
+        (nil)))
+(insn 381 380 466 2 (set (reg:CCZ 17 flags)
+        (compare:CCZ (reg:SI 4 si [orig:111 _21+4 ] [111])
+            (const_int 0 [0]))) "/app/example.cpp":8:65 discrim 1 7 {*cmpsi_ccno_1}
+     (nil))
+
+Note without -fno-dce, `insn 22` is not in the IR and that is the only difference so far. THis is ok at this point.
+
+- User: Andrew Pinski | Time: 2024-03-01 21:08:52 UTC
+  Text: cmpelim produces:
+```
+(insn 22 21 486 2 (set (reg:CCZ 17 flags)
+        (compare:CCZ (reg:SI 4 si [orig:111 _21+4 ] [111])
+            (const_int 0 [0]))) "/app/example.cpp":8:8 discrim 1 7 {*cmpsi_ccno_1}
+     (expr_list:REG_UNUSED (reg:CCZ 17 flags)
+        (nil)))
+(insn 486 22 466 2 (set (reg:DI 1 dx [353])
+        (plus:DI (reg/f:DI 7 sp)
+            (const_int 212 [0xd4]))) "/app/example.cpp":8:65 discrim 1 254 {*leadi}
+     (nil))
+(insn 466 486 383 2 (set (reg:DI 4 si [354])
+        (const:DI (plus:DI (symbol_ref:DI ("u") [flags 0x2]  <var_decl 0x7fe775410c60 u>)
+                (const_int 1 [0x1])))) "/app/example.cpp":8:65 discrim 1 84 {*movdi_internal}
+     (expr_list:REG_EQUIV (const:DI (plus:DI (symbol_ref:DI ("u") [flags 0x2]  <var_decl 0x7fe775410c60 u>)
+                (const_int 1 [0x1])))
+        (nil)))
+(insn 383 466 384 2 (set (reg:DI 1 dx [348])
+        (if_then_else:DI (eq (reg:CCZ 17 flags)
+                (const_int 0 [0]))
+            (reg:DI 1 dx [353])
+            (reg:DI 4 si [354]))) "/app/example.cpp":8:65 discrim 1 1451 {*movdicc_noc}
+     (expr_list:REG_DEAD (reg:CCZ 17 flags)
+        (expr_list:REG_DEAD (reg:DI 4 si [354])
+            (nil))))
+```
+
+Which is fine (but note the REG_UNUSED note which was not updated).
+
+From pro_and_epilogue's dump:
+deleting insn with uid = 22.
+
+Which is totally bogus; I think someone didn't redo REG_UNUSED notes again.
+
+- User: Jakub Jelinek | Time: 2024-03-05 08:02:23 UTC
+  Text: Started withr14-5355-g3cd3a09b3f91a1d023cb180763d40598d6bb274b
+
+- User: Jakub Jelinek | Time: 2024-03-05 09:19:36 UTC
+  Text: Createdattachment 57611[details]gcc14-pr114190.patch
+
+Untested fix.  After removing the REG_DEAD/REG_UNUSED notes the pass calls df_analyze, but as problems are normally only removed during df_finish_pass, the note problem is still requested and the df_analyze recreates the notes again.
+We could just move the df_analyze before the manual note removal, but I think it is a waste of time to compute the notes again there.
+
+- User: GCC Commits | Time: 2024-03-06 08:36:23 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:1157d5de35b41eabe5ee51d532224864173c37bdcommitr14-9329-g1157d5de35b41eabe5ee51d532224864173c37bdAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Wed Mar 6 09:35:37 2024 +0100
+
+    i386: Fix up the vzeroupper REG_DEAD/REG_UNUSED note workaround [PR114190]
+    
+    When writing the rest_of_handle_insert_vzeroupper workaround to manually
+    remove all the REG_DEAD/REG_UNUSED notes from the IL, I've missed that
+    there is a df_analyze () call right after it and that the problems added
+    earlier in the pass, like df_note_add_problem () done during mode switching,
+    doesn't affect just the next df_analyze () call right after it, but all
+    other df_analyze () calls until the end of the current pass where
+    df_finish_pass removes the optional problems.
+    
+    So, as can be seen on the following patch, the workaround doesn't actually
+    work there, because while rest_of_handle_insert_vzeroupper carefully removes
+    all REG_DEAD/REG_UNUSED notes, the df_analyze () call at the end of the
+    function immediately adds them in again (so, I must say I have no idea
+    why the workaround worked on the earlier testcases).
+    
+    Now, I could move the df_analyze () call just before the REG_DEAD/REG_UNUSED
+    note removal loop, but I think the following patch is better, because
+    the df_analyze () call doesn't have to recompute the problem when we don't
+    care about it and will actively strip all traces of it away.
+    
+    2024-03-06  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/114190* config/i386/i386-features.cc (rest_of_handle_insert_vzeroupper):
+            Call df_remove_problem for df_note before calling df_analyze.
+    
+            * gcc.target/i386/avx-pr114190.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-03-06 08:37:31 UTC
+  Text: Fixed.
+

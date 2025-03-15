@@ -1,0 +1,129 @@
+Bug Summary: Unexpected vectorization for RISC-V
+Product: gcc
+Component: c
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2023-11-07 07:11:39 UTC
+  Text: FAIL: gcc.dg/vect/pr65518.c -flto -ffat-lto-objects  scan-tree-dump-times vect "vectorized 0 loops in function" 2
+FAIL: gcc.dg/vect/pr65518.c scan-tree-dump-times vect "vectorized 0 loops in function" 2
+
+#if VECTOR_BITS > 256
+#define NINTS (VECTOR_BITS / 32)
+#else
+#define NINTS 8
+#endif
+
+#define N (NINTS * 2)
+#define RESULT (NINTS * (NINTS - 1) / 2 * N + NINTS)
+
+extern void abort (void);
+
+typedef struct giga
+{
+  unsigned int g[N];
+} giga;
+
+unsigned long __attribute__((noinline,noclone))
+addfst(giga const *gptr, int num)
+{
+  unsigned int retval = 0;
+  int i;
+  for (i = 0; i < num; i++)
+    retval += gptr[i].g[0];
+  return retval;
+}
+
+In "vect" dump, we can see:
+
+single-element interleaving not supported for not adjacent vector loads
+
+However, it still vectorize it.
+
+Inhttps://godbolt.org/z/WfP88sfj4Shows that ARM SVE will disable vectorization wheras RVV still vectorize it.
+
+- User: Richard Biener | Time: 2023-11-07 08:50:18 UTC
+  Text: We end up using gathers for the strided load which would be OK and avoid the
+issue noted in the comment.  Thus we get true from vect_use_strided_gather_scatters_p ().  That has a comment guard:
+
+      /* As a last resort, trying using a gather load or scatter store.
+
+         ??? Although the code can handle all group sizes correctly,
+         it probably isn't a win to use separate strided accesses based
+         on nearby locations.  Or, even if it's a win over scalar code,
+         it might not be a win over vectorizing at a lower VF, if that
+         allows us to use contiguous accesses.  */
+      if (*memory_access_type == VMAT_ELEMENTWISE
+          && single_element_p
+          && loop_vinfo
+          && vect_use_strided_gather_scatters_p (stmt_info, loop_vinfo,
+                                                 masked_p, gs_info))
+
+- User: JuzheZhong | Time: 2023-11-07 08:54:05 UTC
+  Text: (In reply to Richard Biener fromcomment #1)> We end up using gathers for the strided load which would be OK and avoid the
+> issue noted in the comment.  Thus we get true from
+> vect_use_strided_gather_scatters_p ().  That has a comment guard:
+> 
+>       /* As a last resort, trying using a gather load or scatter store.
+> 
+>          ??? Although the code can handle all group sizes correctly,
+>          it probably isn't a win to use separate strided accesses based
+>          on nearby locations.  Or, even if it's a win over scalar code,
+>          it might not be a win over vectorizing at a lower VF, if that
+>          allows us to use contiguous accesses.  */
+>       if (*memory_access_type == VMAT_ELEMENTWISE
+>           && single_element_p
+>           && loop_vinfo
+>           && vect_use_strided_gather_scatters_p (stmt_info, loop_vinfo,
+>                                                  masked_p, gs_info))Thanks Richi.
+
+So, do you mean I need to fix test to fix the FAIL?
+
+Is this following reasonable ?
+
+/* { dg-final { scan-tree-dump-times "vectorized 0 loops in function" 2 "vect" target {! riscv*-*-* } } } */
+
+- User: rguenther@suse.de | Time: 2023-11-07 09:00:01 UTC
+  Text: On Tue, 7 Nov 2023, juzhe.zhong at rivai dot ai wrote:>https://gcc.gnu.org/bugzilla/show_bug.cgi?id=112420> 
+> ---Comment #2from JuzheZhong <juzhe.zhong at rivai dot ai> ---
+> (In reply to Richard Biener fromcomment #1)
+> > We end up using gathers for the strided load which would be OK and avoid the
+> > issue noted in the comment.  Thus we get true from
+> > vect_use_strided_gather_scatters_p ().  That has a comment guard:
+> > 
+> >       /* As a last resort, trying using a gather load or scatter store.
+> > 
+> >          ??? Although the code can handle all group sizes correctly,
+> >          it probably isn't a win to use separate strided accesses based
+> >          on nearby locations.  Or, even if it's a win over scalar code,
+> >          it might not be a win over vectorizing at a lower VF, if that
+> >          allows us to use contiguous accesses.  */
+> >       if (*memory_access_type == VMAT_ELEMENTWISE
+> >           && single_element_p
+> >           && loop_vinfo
+> >           && vect_use_strided_gather_scatters_p (stmt_info, loop_vinfo,
+> >                                                  masked_p, gs_info))
+> 
+> Thanks Richi.
+> 
+> So, do you mean I need to fix test to fix the FAIL?
+> 
+> Is this following reasonable ?Yes.  Adding a scan for the "using gather/scatter for strided/grouped 
+accesses" for riscv might be good as well, explaining things a bit.> /* { dg-final { scan-tree-dump-times "vectorized 0 loops in function" 2 "vect"
+> target {! riscv*-*-* } } } */
+
+- User: GCC Commits | Time: 2023-11-07 13:31:49 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:beb1e2bf1bd4b7c8fc8d3dd450667344ae8e0acacommitr14-5221-gbeb1e2bf1bd4b7c8fc8d3dd450667344ae8e0acaAuthor: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Tue Nov 7 21:30:14 2023 +0800
+
+    test: Fix FAIL ofpr65518.c for RVV[PR112420]PR target/112420gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/vect/pr65518.c: Fix check for RVV.
+
+- User: JuzheZhong | Time: 2023-11-07 13:32:30 UTC
+  Text: Fixed
+

@@ -1,0 +1,407 @@
+Bug Summary: internal compiler error: in convert_memory_address_addr_space_1, at explow.cc:302
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: addr-space, ice-on-valid-code
+Known to Work: 
+Known to Fail: 13.2.0, 14.0, 5.4.0, 8.5.0
+
+Comments:
+- User: Georg-Johann Lay | Time: 2023-12-03 12:22:36 UTC
+  Text: Compile the following C test case with avr-gcc -S:
+
+typedef __SIZE_TYPE__ size_t;
+
+void copy_n (void *vdst, const __memx void *vsrc, size_t n)
+{
+    typedef struct { char a[n]; } T;
+    T *dst = (T*) vdst;
+    const __memx T *src = (const __memx T*) vsrc;
+    *dst = *src;
+}
+
+during RTL pass: expand
+ice.c: In function 'copy_n':
+ce.c:20:10: internal compiler error: in convert_memory_address_addr_space_1, at explow.cc:302
+   20 |     *dst = *src;
+      |     ~~~~~^~~~~~
+
+It occurs with at least v5.4 to current master (future v14).
+
+Configured with: ../../source/gcc-master/configure --target=avr --disable-nls --with-dwarf2 --with-gnu-as --with-gnu-ld --disable-shared --enable-checking=release --enable-languages=c,c++
+
+- User: Georg-Johann Lay | Time: 2023-12-03 12:37:25 UTC
+  Text: In explow.cc, we have:
+
+rtx convert_memory_address_addr_space_1 (...)
+{
+#ifndef POINTERS_EXTEND_UNSIGNED
+  gcc_assert (GET_MODE (x) == to_mode || GET_MODE (x) == VOIDmode); // line 302
+  return x;
+#else /* defined(POINTERS_EXTEND_UNSIGNED) */
+
+so it seems the backend has to define POINTERS_EXTEND_UNSIGNED, which it currently doesn't.  However, the documentation of PEU reads:> Macro: POINTERS_EXTEND_UNSIGNED
+>   A C expression that determines how pointers should be extended from
+>   ptr_mode to either Pmode or word_mode. It is greater than zero if
+>   pointers should be zero-extended, zero if they should be sign-extended,
+>   and negative if some other sort of conversion is needed. In the last case,
+>   the extension is done by the target’s ptr_extend instruction.
+>   You need not define this macro if the ptr_mode, Pmode and word_mode are
+>   all the same width.The avr backend has:
+
+Pmode = word_mode = HImode (16 bits), mode for ADDR_SPACE_GENERIC
+
+PSImode = 24 bits, mode for ADDR_SPACE_MEMX, aka. __memx
+
+So it appear the middle-end wants to "extend" a pointer from 24-bit PSImode to 16-bit Pmode, which makes no sense.  Apart from that, the code does not require any pointer adjustments.
+
+One guess is that the middle-end tries to expand the memcpy, because insn cpymemhi only support CONST_INT lengths, and gets somethig wrong about address spaces.
+
+The backend defines TARGET_ADDR_SPACE_CONVERT, and TARGET_ADDR_SPACE_ADDRESS_MODE is the same like TARGET_ADDR_SPACE_POINTER_MODE for all address spaces.
+
+- User: Andrew Pinski | Time: 2023-12-03 22:17:37 UTC
+  Text: The middle-end of GCC definitely does not support the case where size_type for address spaces is different from the original type. At this point as shown by the other bug reports too. I had ideas of how to change/fix that but have not implemented it since the targets recently I work on don't have that issue (well don't have address spaces either).
+
+This work does require modifying almost all of the middle-end to support this.
+
+Did it get this support worse with the addition of pointer plus, yes but at the same time it did get easier to implement.
+
+- User: Richard Biener | Time: 2023-12-04 07:06:03 UTC
+  Text: I think the assert can be relaxed to make truncation OK.
+
+- User: Richard Biener | Time: 2023-12-04 08:40:37 UTC
+  Text: @defmac POINTERS_EXTEND_UNSIGNED
+A C expression that determines how pointers should be extended from
+@code{ptr_mode} to either @code{Pmode} or @code{word_mode}.  It is
+greater than zero if pointers should be zero-extended, zero if they  
+should be sign-extended, and negative if some other sort of conversion
+is needed.  In the last case, the extension is done by the target's
+@code{ptr_extend} instruction.
+
+You need not define this macro if the @code{ptr_mode}, @code{Pmode}
+and @code{word_mode} are all the same width.
+@end defmac
+
+
+so you _need_ to define POINTERS_EXTEND_UNSIGNED given that obviously
+the modes are not the same.  The other possibility is that the caller
+passes in the wrong modes for the address-space in question or it uses
+the wrong function - the function is for converting of ptr_mode <-> Pmode
+of the _same_ address-space, but guessing from the source we are converting
+from different address-spaces.
+
+- User: Richard Biener | Time: 2023-12-04 09:07:44 UTC
+  Text: Note we end up trying to expand a memcpy between different address spaces
+and that does
+
+  addr = expand_expr (orig_exp, NULL_RTX, ptr_mode, EXPAND_NORMAL);
+  mem = gen_rtx_MEM (BLKmode, memory_address (BLKmode, addr)); 
+
+which assumes the default address-space.  The get_memory_rtx () function
+also doesn't correctly preserve the address-space for the MEM_EXPR.
+
+The following fixes the ICE and tries to correct the MEM_EXPR.  But I wonder
+if the actual code generation is sane?  It also appears we'd eventually
+emit a call to memcpy as we call emit_block_move_hints with BLOCK_OP_NORMAL
+which sets may_use_call to 1.
+
+So, can you check whether we generate correct code with the following patch?
+Otherwise we should keep it ICEing (wrong-code is IMHO worse).
+
+diff --git a/gcc/builtins.cc b/gcc/builtins.cc
+index 4fc58a0bda9..244863699be 100644
+--- a/gcc/builtins.cc
++++ b/gcc/builtins.cc
+@@ -1353,7 +1353,8 @@ get_memory_rtx (tree exp, tree len)
+     exp = TREE_OPERAND (exp, 0);
+ 
+   addr = expand_expr (orig_exp, NULL_RTX, ptr_mode, EXPAND_NORMAL);
+-  mem = gen_rtx_MEM (BLKmode, memory_address (BLKmode, addr));
++  addr_space_t as = TYPE_ADDR_SPACE (TREE_TYPE (TREE_TYPE (exp)));
++  mem = gen_rtx_MEM (BLKmode, memory_address_addr_space (BLKmode, addr, as));
+ 
+   /* Get an expression we can use to find the attributes to assign to MEM.
+      First remove any nops.  */
+@@ -1363,8 +1364,11 @@ get_memory_rtx (tree exp, tree len)
+ 
+   /* Build a MEM_REF representing the whole accessed area as a byte blob,
+      (as builtin stringops may alias with anything).  */
++  tree ctype = char_type_node;
++  if (as != ADDR_SPACE_GENERIC)
++    ctype = build_qualified_type (ctype, ENCODE_QUAL_ADDR_SPACE (as));
+   exp = fold_build2 (MEM_REF,
+-                    build_array_type (char_type_node,
++                    build_array_type (ctype,
+                                       build_range_type (sizetype,
+                                                         size_one_node, len)),
+                     exp, build_int_cst (ptr_type_node, 0));
+@@ -1381,7 +1385,7 @@ get_memory_rtx (tree exp, tree len)
+       unsigned int align = get_pointer_alignment (TREE_OPERAND (exp, 0));
+       exp = build_fold_addr_expr (base);
+       exp = fold_build2 (MEM_REF,
+-                        build_array_type (char_type_node,
++                        build_array_type (ctype,
+                                           build_range_type (sizetype,
+                                                             size_zero_node,
+                                                             NULL)),
+
+- User: Richard Biener | Time: 2023-12-04 09:08:55 UTC
+  Text: Ah, that function does later
+
+  else if (may_use_call && !might_overlap
+           && ADDR_SPACE_GENERIC_P (MEM_ADDR_SPACE (x))
+           && ADDR_SPACE_GENERIC_P (MEM_ADDR_SPACE (y)))
+    {
+
+so only emits memcpy for generic address-space.
+
+- User: Richard Biener | Time: 2023-12-04 09:27:39 UTC
+  Text: The following avoids gimplifying to a memcpy, but we are not prepared for
+WITH_SIZE_EXPR in GIMPLE assigns (guess we think we can handle all with
+memcpy).  Removing the verification makes the testcase "work" as well.
+
+diff --git a/gcc/gimplify.cc b/gcc/gimplify.cc
+index 02f85e7109b..a1d5ee28cbe 100644
+--- a/gcc/gimplify.cc
++++ b/gcc/gimplify.cc
+@@ -6331,7 +6331,8 @@ gimplify_modify_expr (tree *expr_p, gimple_seq *pre_p, gim
+ple_seq *post_p,
+       && TYPE_SIZE_UNIT (TREE_TYPE (*from_p))
+       && !poly_int_tree_p (TYPE_SIZE_UNIT (TREE_TYPE (*from_p)))
+       && TREE_CODE (*from_p) == CONSTRUCTOR
+-      && CONSTRUCTOR_NELTS (*from_p) == 0)
++      && CONSTRUCTOR_NELTS (*from_p) == 0
++      && ADDR_SPACE_GENERIC_P (TYPE_ADDR_SPACE (TREE_TYPE (*to_p))))
+     {
+       maybe_with_size_expr (from_p);
+       gcc_assert (TREE_CODE (*from_p) == WITH_SIZE_EXPR);
+@@ -6464,10 +6465,12 @@ gimplify_modify_expr (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p,
+       tree from = TREE_OPERAND (*from_p, 0);
+       tree size = TREE_OPERAND (*from_p, 1);
+ 
+-      if (TREE_CODE (from) == CONSTRUCTOR)
++      if (!ADDR_SPACE_GENERIC_P (TYPE_ADDR_SPACE (TREE_TYPE (*to_p)))
++         || !ADDR_SPACE_GENERIC_P (TYPE_ADDR_SPACE (TREE_TYPE (from))))
++       ;
++      else if (TREE_CODE (from) == CONSTRUCTOR)
+        return gimplify_modify_expr_to_memset (expr_p, size, want_value, pre_p);
+-
+-      if (is_gimple_addressable (from))
++      else if (is_gimple_addressable (from))
+        {
+          *from_p = from;
+          return gimplify_modify_expr_to_memcpy (expr_p, size, want_value,
+
+- User: Richard Biener | Time: 2023-12-04 11:56:17 UTC
+  Text: Is there a valid testcase that has __memx as the destination?  Or is there an address space with similar constraints that allows non-const accesses?
+
+- User: Georg-Johann Lay | Time: 2023-12-04 19:19:31 UTC
+  Text: (In reply to Richard Biener fromcomment #8)> Is there a valid testcase that has __memx as the destination?  Or is there
+> an address space with similar constraints that allows non-const accesses?No.  The avr backend throws an error when a non-generic address space thing is not const, like
+
+__memx int var;
+
+int f1 (__memx int *p)
+{
+    return *p;
+}
+
+foo.c:1:12: error: variable 'var' must be const in order to be put into read-only section by means of '__memx'
+    1 | __memx int var;
+      |            ^~~
+foo.c:3:21: error: pointer targeting address space '__memx' must be const in function parameter 'p'
+    3 | int f1 (__memx int *p)
+      |         ~~~~~~~~~~~~^
+
+__memx covers all address spacec, including generic.  But in order to write one has to cast it to a generic pointer (after checking that it actually points to generic and not somewhere else (flash)).
+
+(In reply to Richard Biener fromcomment #3)> I think the assert can be relaxed to make truncation OK.A truncation from 24-bit __memx address to some other AS (all 16 bits) would require a run-time check which 16-bit AS it encodes, and depending on that execute code fit for that AS.
+
+This is ok when the user is doing it, but the compiler should never require any kind of truncation.  And extension / casts are handled by TARGET_ADDR_SPACE_CONVERT.
+
+- User: Richard Biener | Time: 2023-12-05 09:48:52 UTC
+  Text: x86 testcase:
+
+void
+foo (int n, __seg_fs void *p, __seg_gs void *q)
+{
+typedef struct { char t[n]; } T;
+  *(__seg_fs T *)p = *(__seg_gs T *)q;
+}
+
+- User: Richard Biener | Time: 2023-12-05 10:54:55 UTC
+  Text: I'm struggling in creating test coverage for the *VLA = {} gimplification to
+memset.  If I convince the C frontend to accept
+
+void
+bar (int n, __seg_fs void *p)
+{
+  typedef struct { char t[n]; } T;
+  *(__seg_fs T *)p = (T) {};
+}
+
+with
+
+diff --git a/gcc/c/c-parser.cc b/gcc/c/c-parser.cc
+index df9a07928b5..a94270b6065 100644
+--- a/gcc/c/c-parser.cc
++++ b/gcc/c/c-parser.cc
+@@ -12223,12 +12223,7 @@ c_parser_postfix_expression_after_paren_type (c_parser *parser,
+               || (scspecs && scspecs->storage_class == csc_static)
+               || constexpr_p), constexpr_p, &richloc);
+   type = groktypename (type_name, &type_expr, &type_expr_const);
+-  if (type != error_mark_node && C_TYPE_VARIABLE_SIZE (type))
+-    {
+-      error_at (type_loc, "compound literal has variable size");
+-      type = error_mark_node;
+-    }
+-  else if (TREE_CODE (type) == FUNCTION_TYPE)
++  if (TREE_CODE (type) == FUNCTION_TYPE)
+     {
+       error_at (type_loc, "compound literal has function type");
+       type = error_mark_node;
+@@ -12257,6 +12252,13 @@ c_parser_postfix_expression_after_paren_type (c_parser *parser,
+   finish_init ();
+   maybe_warn_string_init (type_loc, type, init);
+ 
++  if (type != error_mark_node
++      && C_TYPE_VARIABLE_SIZE (type)
++      && CONSTRUCTOR_NELTS (init.value) != 0)
++    {
++      error_at (type_loc, "compound literal has variable size");
++      type = error_mark_node;
++    }
+   if (type != error_mark_node
+       && !ADDR_SPACE_GENERIC_P (TYPE_ADDR_SPACE (type))
+       && current_function_decl)
+
+then I see the gimplifier fails to wrap the CONSTRUCTOR inside a WITH_SIZE_EXPR
+which could be fixed with
+
+diff --git a/gcc/gimplify.cc b/gcc/gimplify.cc
+index a1d5ee28cbe..ae339c4a82a 100644
+--- a/gcc/gimplify.cc
++++ b/gcc/gimplify.cc
+@@ -5787,6 +5787,7 @@ gimplify_init_constructor (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p,
+       tree rhs = TREE_OPERAND (*expr_p, 1);
+       if (want_value && object == lhs)
+        lhs = unshare_expr (lhs);
++      maybe_with_size_expr (&rhs);
+       gassign *init = gimple_build_assign (lhs, rhs);
+       gimplify_seq_add_stmt (pre_p, init);
+     }
+diff --git a/gcc/tree-cfg.cc b/gcc/tree-cfg.cc
+index a075fa38fba..e81b3f6ba72 100644
+--- a/gcc/tree-cfg.cc
++++ b/gcc/tree-cfg.cc
+@@ -3363,7 +3363,10 @@ verify_types_in_gimple_reference (tree expr, bool require_lvalue)
+     }
+ 
+   if (!require_lvalue
+-      && (is_gimple_reg (expr) || is_gimple_min_invariant (expr)))
++      && (is_gimple_reg (expr)
++         || is_gimple_min_invariant (expr)
++         || (TREE_CODE (expr) == CONSTRUCTOR
++             && CONSTRUCTOR_NELTS (expr) == 0)))
+     return false;
+ 
+   if (TREE_CODE (expr) != SSA_NAME && is_gimple_id (expr))
+
+but then of course RTL expansion isn't prepared for this - we run into
+store_expr expanding the CTOR but it would require special-casing such
+RHS to eventually either call store_constructor or clear_storage_hints
+directly.
+
+Does Ada have support for address-spaces and is there a way to construct
+a testcase that requires clearing of a VLA object in another address-space?
+
+- User: Eric Botcazou | Time: 2023-12-05 11:31:35 UTC
+  Text: > Does Ada have support for address-spaces and is there a way to construct
+> a testcase that requires clearing of a VLA object in another address-space?No, Ada has no such support.
+
+- User: GCC Commits | Time: 2023-12-05 13:55:50 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:68d32d02035fc081384ec6d6fd275e49ffa5d016commitr14-6182-g68d32d02035fc081384ec6d6fd275e49ffa5d016Author: Richard Biener <rguenther@suse.de>
+Date:   Mon Dec 4 10:35:38 2023 +0100
+
+    middle-end/112830 - avoid gimplifying non-default addr-space assign to memcpy
+    
+    The following avoids turning aggregate copy involving non-default
+    address-spaces to memcpy since that is not prepared for that.
+    
+    GIMPLE verification no longer accepts WITH_SIZE_EXPR in aggregate
+    copies, the following re-allows that for the RHS.  I also needed
+    to adjust one assert in DCE.
+    
+    get_memory_address is used for string builtin expansion, so instead
+    of fixing that up for non-generic address-spaces I've put an assert
+    there.
+    
+    I'll note that the same issue exists for initialization from an
+    empty CTOR which we gimplify to a memset call but since we are
+    not prepared to handle RTL expansion of the original VLA init and
+    I failed to provide test coverage (without extending the GNU C
+    extension for VLA structs) and the Ada frontend (or other frontends)
+    to not have address-space support the patch instead asserts we only
+    see generic address-spaces there.PR middle-end/112830* gimplify.cc (gimplify_modify_expr): Avoid turning aggregate
+            copy of non-generic address-spaces to memcpy.
+            (gimplify_modify_expr_to_memcpy): Assert we are dealing with
+            a copy inside the generic address-space.
+            (gimplify_modify_expr_to_memset): Likewise.
+            * tree-cfg.cc (verify_gimple_assign_single): Allow
+            WITH_SIZE_EXPR as part of the RHS of an assignment.
+            * builtins.cc (get_memory_address): Assert we are dealing
+            with the generic address-space.
+            * tree-ssa-dce.cc (ref_may_be_aliased): Handle WITH_SIZE_EXPR.
+    
+            * gcc.target/avr/pr112830.c: New testcase.
+            * gcc.target/i386/pr112830.c: Likewise.
+
+- User: Richard Biener | Time: 2023-12-05 13:56:02 UTC
+  Text: Fixed.
+
+- User: Georg-Johann Lay | Time: 2023-12-05 20:46:04 UTC
+  Text: (In reply to Richard Biener fromcomment #13)> The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:
+> 
+>https://gcc.gnu.org/g:68d32d02035fc081384ec6d6fd275e49ffa5d016> 
+> commitr14-6182-g68d32d02035fc081384ec6d6fd275e49ffa5d016> Author: Richard Biener <rguenther@suse.de>
+> Date:   Mon Dec 4 10:35:38 2023 +0100
+> 
+>     middle-end/112830 - avoid gimplifying non-default addr-space assign to
+> memcpy
+>     
+>     The following avoids turning aggregate copy involving non-default
+>     address-spaces to memcpy since that is not prepared for that.avr.md cpymemhi currently only accepts const_int sizes.  Does your change mean it's not possible (or unsafe) to implement that insn with variable sizes for better code?
+
+The middle end still tries to expand cpymemhi for variable sizes (but currently the expander FAILs), so I think I don't understand that part of the commit message.
+
+- User: Richard Biener | Time: 2023-12-06 07:33:43 UTC
+  Text: (In reply to Georg-Johann Lay fromcomment #15)> (In reply to Richard Biener fromcomment #13)
+> > The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:
+> > 
+> >https://gcc.gnu.org/g:68d32d02035fc081384ec6d6fd275e49ffa5d016> > 
+> > commitr14-6182-g68d32d02035fc081384ec6d6fd275e49ffa5d016> > Author: Richard Biener <rguenther@suse.de>
+> > Date:   Mon Dec 4 10:35:38 2023 +0100
+> > 
+> >     middle-end/112830 - avoid gimplifying non-default addr-space assign to
+> > memcpy
+> >     
+> >     The following avoids turning aggregate copy involving non-default
+> >     address-spaces to memcpy since that is not prepared for that.
+> 
+> avr.md cpymemhi currently only accepts const_int sizes.  Does your change
+> mean it's not possible (or unsafe) to implement that insn with variable
+> sizes for better code?
+> 
+> The middle end still tries to expand cpymemhi for variable sizes (but
+> currently the expander FAILs), so I think I don't understand that part of
+> the commit message.It specifically avoids expanding __builtin_memcpy since that goes off
+rails, losing address-space info.  And a user using memcpy () himself
+for copying between address-spaces is doing invalid things anyway.
+
+The middle-end should still try to use cpymem and as fallback will emit
+a loop IIRC.  Tuning from within the backend should be still possible,
+also for variable-size.  It might be the middle-end needs improvements
+as well, feel free to open new bugreports with testcases where things
+do not work as expected from the middle-end side.
+

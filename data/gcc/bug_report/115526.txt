@@ -1,0 +1,393 @@
+Bug Summary: [14/15 regression] invalid assember emitted for alpha, "Error: duplicate !tlsgd!62" since r14-5109-ga291237b628f41
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: assemble-failure
+Known to Work: 13.3.0
+Known to Fail: 14.1.1
+
+Comments:
+- User: Andreas K. Huettel | Time: 2024-06-17 18:23:09 UTC
+  Text: Compiling Python 3.12.4 on Gentoo for alpha fails with the following message:
+
+alpha-unknown-linux-gnu-gcc -c -fno-strict-overflow -Wsign-compare -mieee -DNDEBUG     -mieee -pipe -O2 -mcpu=ev4 -fwrapv -std=c11 -Wextra -Wno-unused-parameter  
+  -Wno-missing-field-initializers -Wstrict-prototypes -Werror=implicit-function-declaration -fvisibility=hidden  -I./Include/internal  -I. -I./Include -I/usr/include/ncursesw   
+  -fPIC -DPy_BUILD_CORE  -o Python/dtoa.o Python/dtoa.c
+{standard input}: Assembler messages:
+{standard input}:1773: Error: duplicate !tlsgd!62
+make: *** [Makefile:2748: Python/dtoa.o] Error 1
+
+This worked fine with gcc-13 and is now broken with
+
+dilfridge-alpha / # gcc --version
+gcc (Gentoo 14.1.1_p20240615 p2) 14.1.1 20240615
+[...]
+dilfridge-alpha / # as --version
+GNU assembler (Gentoo 2.42 p3) 2.42.0
+
+Preprocessed source and assembler source follow.
+
+- User: Andreas K. Huettel | Time: 2024-06-17 18:24:21 UTC
+  Text: Createdattachment 58453[details]preprocessed source file
+
+- User: Andreas K. Huettel | Time: 2024-06-17 18:24:51 UTC
+  Text: Createdattachment 58454[details]assembler source file
+
+- User: Andrew Pinski | Time: 2024-06-17 20:54:42 UTC
+  Text: beq $10,$L293
+	lda $13,_Py_tss_tstate($29)		!tlsgd!62
+...
+
+
+$L293:
+	lda $16,1($31)
+	ldq $27,Balloc($29)		!literal!78
+	jsr $26,($27),0		!lituse_jsr!78
+	ldah $29,0($26)		!gpdisp!79
+	lda $29,0($29)		!gpdisp!79
+	mov $0,$10
+	beq $0,$L260
+	lda $1,625($31)
+	stl $1,24($0)
+	lda $1,1($31)
+	stl $1,20($0)
+	stq $0,5288($12)
+	lda $13,_Py_tss_tstate($29)		!tlsgd!62
+	stq $31,0($0)
+
+- User: Andreas K. Huettel | Time: 2024-06-20 17:46:15 UTC
+  Text: Here's what cvise came up with as minimal test case.
+
+1) compile command:
+alpha-unknown-linux-gnu-gcc -c -fno-strict-overflow -Wsign-compare -mieee -DNDEBUG     -mieee -pipe -O2 -mcpu=ev4 -fwrapv -std=c11 \
+   -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wstrict-prototypes -Werror=implicit-function-declaration \
+   -fvisibility=hidden -fPIC -DPy_BUILD_CORE  -o test $1
+
+2) interestingness test:
+/home/huettel/alpha-bug/compile.sh dtoa.i 2>&1 | grep 'Error: duplicate !tlsgd!'
+
+3) output:
+======================
+struct _ts {
+  struct _dtoa_state *interp
+};
+struct Bigint {
+  int k
+} *_Py_dg_strtod_bs;
+struct _dtoa_state {
+  struct Bigint p5s;
+  struct Bigint *freelist[]
+};
+extern _Thread_local struct _ts _Py_tss_tstate;
+typedef struct Bigint Bigint;
+int pow5mult_k;
+long _Py_dg_strtod_ndigits;
+void PyMem_Free();
+void Bfree(Bigint *v) {
+  if (v)
+    if (v->k)
+      PyMem_Free();
+    else {
+      struct _dtoa_state *interp = _Py_tss_tstate.interp;
+      interp->freelist[v->k] = v;
+    }
+}
+static Bigint *pow5mult(Bigint *b) {
+  for (;;) {
+    if (pow5mult_k & 1) {
+      Bfree(b);
+      if (b == 0)
+        return 0;
+    }
+    if (!(pow5mult_k >>= 1))
+      break;
+  }
+}
+void _Py_dg_strtod() {
+  if (_Py_dg_strtod_ndigits)
+    pow5mult(_Py_dg_strtod_bs);
+}
+======================
+
+4) double-check:
+huettel@crossdev ~/alpha-bug $ ./compile.sh dtoa.i
+dtoa.i:3:1: warning: no semicolon at end of struct or union
+    3 | };
+      | ^
+dtoa.i:6:1: warning: no semicolon at end of struct or union
+    6 | } *_Py_dg_strtod_bs;
+      | ^
+dtoa.i:10:1: warning: no semicolon at end of struct or union
+   10 | };
+      | ^
+dtoa.i:15:1: warning: function declaration isn’t a prototype [-Wstrict-prototypes]
+   15 | void PyMem_Free();
+      | ^~~~
+dtoa.i:36:6: warning: function declaration isn’t a prototype [-Wstrict-prototypes]
+   36 | void _Py_dg_strtod() {
+      |      ^~~~~~~~~~~~~
+{standard input}: Assembler messages:
+{standard input}:140: Error: duplicate !tlsgd!6
+
+- User: Andreas K. Huettel | Time: 2024-06-30 09:51:21 UTC
+  Text: I tried bisecting this, and the result is ... puzzling.
+
+a291237b628f419d7f7ac264dd7b42947b565222 is the first bad commit
+commit a291237b628f419d7f7ac264dd7b42947b565222
+Author: Andrew MacLeod <amacleod@redhat.com>
+Date:   Tue Oct 31 11:51:34 2023 -0400
+
+    Remove simple ranges from trailing zero bitmasks.
+    
+    During the intersection operation, it can be helpful to remove any
+    low-end ranges when the bitmask has trailing zeros.  This prevents
+    obviously incorrect ranges from appearing without requiring a bitmask
+    check.
+    
+            * value-range.cc (irange_bitmask::adjust_range): New.
+            (irange::intersect_bitmask): Call adjust_range.
+            * value-range.h (irange_bitmask::adjust_range): New prototype.
+
+ gcc/value-range.cc | 30 ++++++++++++++++++++++++++++++
+ gcc/value-range.h  |  2 ++
+ 2 files changed, 32 insertions(+)
+bisect found first bad commit
+
+- User: Andreas K. Huettel | Time: 2024-06-30 15:24:29 UTC
+  Text: for reference...
+
+crossdev ~/bisection/gcc # git bisect log
+git bisect start
+# status: waiting for both good and bad commits
+# good: [c042baa99ef0cb1c1711cd913822ce1e7354f144] testsuite, Darwin: Remove an unnecessary flags addition.
+git bisect good c042baa99ef0cb1c1711cd913822ce1e7354f144
+# status: waiting for bad commit, 1 good commit known
+# bad: [47cbc76568b9f8bfbdcf93845ea17cbf8a0ceba1] Daily bump.
+git bisect bad 47cbc76568b9f8bfbdcf93845ea17cbf8a0ceba1
+# good: [8e08c7886eed5824bebd0e011526ec302d622844] ipa: Fix double reference-count decrements for the same edge (PR 107769,PR 109318)
+git bisect good 8e08c7886eed5824bebd0e011526ec302d622844
+# bad: [942ff588ba257d530b671019716275f9ef04041d] RISC-V regression test: Fix FAIL of bb-slp-39.c
+git bisect bad 942ff588ba257d530b671019716275f9ef04041d
+# good: [caabf0973a4e9a26421c94d540e3e20051e93e77] Include insn-opinit.h in PLUGIN_H [PR110610]
+git bisect good caabf0973a4e9a26421c94d540e3e20051e93e77
+# good: [75f069a6403b5d4217fb5b654a9c656b4dca9dc1] RISC-V: Remove unused structure in cost model
+git bisect good 75f069a6403b5d4217fb5b654a9c656b4dca9dc1
+# good: [7c76c876e917a1f20a788f602cc78fff7d0a2a65] Fix missed CSE with a BLKmode entity
+git bisect good 7c76c876e917a1f20a788f602cc78fff7d0a2a65
+# good: [83e24e8c1e5eb3366e35d5b8494a4cd9a2395b59] LoongArch: Use explicit relocs for addresses only used for one load or store with -mexplicit-relocs=auto and -mcmodel={normal,medium}
+git bisect good 83e24e8c1e5eb3366e35d5b8494a4cd9a2395b59
+# good: [31cc9824d1cd5e0f7fa145d0831a923479333cd6] ARC: Improved ARC rtx_costs/insn_cost for SHIFTs and ROTATEs.
+git bisect good 31cc9824d1cd5e0f7fa145d0831a923479333cd6
+# good: [8c8ad4e3533b8590ce063386b8b32f6fce1c3942] Fortran: Defined operators with unlimited polymorphic args [PR98498]
+git bisect good 8c8ad4e3533b8590ce063386b8b32f6fce1c3942
+# bad: [4dbb14c26dafe70ee4bef5fdf8df39d001dd56f1] i386: Add LEGACY_INDEX_REG register class.
+git bisect bad 4dbb14c26dafe70ee4bef5fdf8df39d001dd56f1
+# bad: [5340f48b7639fcc874f64aac214f9ef9ae43d43e] Fortran: fix issue with multiple references of a procedure pointer [PR97245]
+git bisect bad 5340f48b7639fcc874f64aac214f9ef9ae43d43e
+# good: [4bfc5091a6a489d9fa5558f0fbcff11d65e1837b] Format gotools.sum closer to what DejaGnu does
+git bisect good 4bfc5091a6a489d9fa5558f0fbcff11d65e1837b
+# bad: [a291237b628f419d7f7ac264dd7b42947b565222] Remove simple ranges from trailing zero bitmasks.
+git bisect bad a291237b628f419d7f7ac264dd7b42947b565222
+# good: [95cfa2cdd1b525a5b2830206692ddb9f948000d3] Cleanup vectorizable_live_operation
+git bisect good 95cfa2cdd1b525a5b2830206692ddb9f948000d3
+# good: [751fc7bcdcdf25e7cc0d9821f69313b6571a62e3] i386: Handle multiple address register classes
+git bisect good 751fc7bcdcdf25e7cc0d9821f69313b6571a62e3
+# first bad commit: [a291237b628f419d7f7ac264dd7b42947b565222] Remove simple ranges from trailing zero bitmasks.
+
+- User: Sam James | Time: 2024-06-30 15:30:50 UTC
+  Text: Uros, is there any chance you'd be so kind to take a look?
+
+- User: Uroš Bizjak | Time: 2024-06-30 16:00:34 UTC
+  Text: (In reply to Sam James fromcomment #7)> Uros, is there any chance you'd be so kind to take a look?I'm afraid that this is not some dead-simple issue that I can fix without the access to the alpha machine.
+
+Other that that, it is not possible to enable LRA for alpha for !BWX arch (seePR66207#c10), so everything less than ev56 is (or will be) obsolete soon.
+
+- User: Uroš Bizjak | Time: 2024-07-01 11:13:22 UTC
+  Text: Createdattachment 58549[details]Proposed patch
+
+Add missing "cannot_copy" attribute to instructions that have to stay in 1-1 correspondence with another insn.
+
+- User: Uroš Bizjak | Time: 2024-07-01 11:14:01 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #9)> Createdattachment 58549[details]> Proposed patchCan someone please regression test the attached patch?
+
+- User: Andreas K. Huettel | Time: 2024-07-01 21:06:41 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #10)> (In reply to Uroš Bizjak fromcomment #9)
+> > Createdattachment 58549[details]> > Proposed patch
+> 
+> Can someone please regression test the attached patch?More in a bit, but:
+
+Applied to 14 branch tip, the patch indeed makes the minimal test case compile.
+
+- User: Uroš Bizjak | Time: 2024-07-10 07:19:29 UTC
+  Text: (In reply to Andreas K. Huettel fromcomment #11)> > Can someone please regression test the attached patch?
+> 
+> More in a bit, but:Any progress with testing?
+
+- User: Uroš Bizjak | Time: 2024-07-10 07:26:26 UTC
+  Text: CC Maciej if he can test the patch on his Alpha system.
+
+- User: Sam James | Time: 2024-07-15 03:25:45 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #12)> (In reply to Andreas K. Huettel fromcomment #11)
+> > > Can someone please regression test the attached patch?
+> > 
+> > More in a bit, but:
+> Any progress with testing?There was some trouble getting some of the test deps on the machine but I believe it's sorted now, just waiting for results to be ready.
+
+- User: Maciej W. Rozycki | Time: 2024-07-15 12:07:59 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #13)> CC Maciej if he can test the patch on his Alpha system.It takes about a day to complete and I had to rerun the libstdc++3
+subdirectory due to an intermittent failure.  Eventually there were
+no regressions, but there were no progressions either, meaning that
+the reduced reproducer should I think be converted into a test case.
+
+Owing to the load of other commitments over the weekend I have run
+out of time to do that, but I can see if I can see if I can look
+into it over the coming days unless someone beats me to it.
+
+- User: Uroš Bizjak | Time: 2024-07-15 12:58:58 UTC
+  Text: Createdattachment 58666[details]Cleaned up testcase
+
+Can you please test this slightly cleaned up testcase?
+
+- User: Uroš Bizjak | Time: 2024-07-15 13:00:34 UTC
+  Text: (In reply to Uroš Bizjak fromcomment #16)> Can you please test this slightly cleaned up testcase?Just put it in gcc/testsuite/gcc.target/alpha and do:
+
+make -k check-gcc RUNTESTFLASG=alpha.exp=pr115526.c
+
+- User: Uroš Bizjak | Time: 2024-07-15 13:01:38 UTC
+  Text: > make -k check-gcc RUNTESTFLASG=alpha.exp=pr115526.cs/RUNTESTFLASG/RUNTESTFLAGS/
+
+- User: Andreas K. Huettel | Time: 2024-07-15 14:09:41 UTC
+  Text: Sorry for the delay here, the machine I have access to is quite slow. 
+It spent ~2 days building unmodified git master and is now running the testsuite as baseline...
+
+- User: Maciej W. Rozycki | Time: 2024-07-16 22:53:16 UTC
+  Text: Createdattachment 58687[details]Test case modified to use scan-assembler-times instead
+
+(In reply to Uroš Bizjak fromcomment #17)> (In reply to Uroš Bizjak fromcomment #16)
+> 
+> > Can you please test this slightly cleaned up testcase?
+> 
+> Just put it in gcc/testsuite/gcc.target/alpha and do:
+> 
+> make -k check-gcc RUNTESTFLASG=alpha.exp=pr115526.cThank you for the detailed instructions, however I've been doing this
+stuff for decades now.  I may not have been the most prolific contributor
+to the GNU toolchain, however I started back in 1998 and my very first
+patch was actually for the Alpha/Linux target.
+
+Anyway, I have verified your proposed test case and the results are as
+follows:
+
+FAIL: gcc.target/alpha/pr115526.c (test for excess errors)
+Excess errors:
+/tmp/ccQEE4xV.s:144: Error: duplicate !tlsgd!6
+
+with pristine GCC 15 master and:
+
+PASS: gcc.target/alpha/pr115526.c (test for excess errors)
+
+with either your fix applied or with commit a291237b628f ("Remove simple
+ranges from trailing zero bitmasks.") reverted (trivially tweaked to
+cleanly apply).
+
+Alternatively `Bfree' could be marked `static' and a compilation only
+test used with { scan-assembler-times "!tlsgd!" 1 } to qualify to pass,
+to avoid relying on the assembler, as with the diff attached, which also
+works here.  But I guess your test case as posted is good enough too.
+
+- User: Sam James | Time: 2024-07-16 22:55:32 UTC
+  Text: I think the instructions were for OP's benefit.
+
+Anyway, thank you!
+
+- User: Uroš Bizjak | Time: 2024-07-17 06:25:31 UTC
+  Text: (In reply to Sam James fromcomment #21)> I think the instructions were for OP's benefit.True ;)
+
+@Maciej: I'd like to keep the testcase that also exercises the assembler, because the error is best detected by assembler here.
+
+Thanks for the test run, I'll commit the fix today afternoon.
+
+- User: GCC Commits | Time: 2024-07-17 16:12:51 UTC
+  Text: The master branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:0841fd4c42ab053be951b7418233f0478282d020commitr15-2104-g0841fd4c42ab053be951b7418233f0478282d020Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Wed Jul 17 18:11:26 2024 +0200
+
+    alpha: Fix duplicate !tlsgd!62 assemble error [PR115526]
+    
+    Add missing "cannot_copy" attribute to instructions that have to
+    stay in 1-1 correspondence with another insn.PR target/115526gcc/ChangeLog:
+    
+            * config/alpha/alpha.md (movdi_er_high_g): Add cannot_copy attribute.
+            (movdi_er_tlsgd): Ditto.
+            (movdi_er_tlsldm): Ditto.
+            (call_value_osf_<tls>): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/alpha/pr115526.c: New test.
+
+- User: GCC Commits | Time: 2024-07-17 16:26:05 UTC
+  Text: The releases/gcc-14 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:3a963d441a68797956a5f67dcb351b2dbd4ac1d0commitr14-10448-g3a963d441a68797956a5f67dcb351b2dbd4ac1d0Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Wed Jul 17 18:11:26 2024 +0200
+
+    alpha: Fix duplicate !tlsgd!62 assemble error [PR115526]
+    
+    Add missing "cannot_copy" attribute to instructions that have to
+    stay in 1-1 correspondence with another insn.PR target/115526gcc/ChangeLog:
+    
+            * config/alpha/alpha.md (movdi_er_high_g): Add cannot_copy attribute.
+            (movdi_er_tlsgd): Ditto.
+            (movdi_er_tlsldm): Ditto.
+            (call_value_osf_<tls>): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/alpha/pr115526.c: New test.
+    
+    (cherry picked from commit 0841fd4c42ab053be951b7418233f0478282d020)
+
+- User: GCC Commits | Time: 2024-07-17 16:33:31 UTC
+  Text: The releases/gcc-13 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:37bd7d5c4e17c97d2b7d50f630b1cf8b347a31f4commitr13-8920-g37bd7d5c4e17c97d2b7d50f630b1cf8b347a31f4Author: Uros Bizjak <ubizjak@gmail.com>
+Date:   Wed Jul 17 18:11:26 2024 +0200
+
+    alpha: Fix duplicate !tlsgd!62 assemble error [PR115526]
+    
+    Add missing "cannot_copy" attribute to instructions that have to
+    stay in 1-1 correspondence with another insn.PR target/115526gcc/ChangeLog:
+    
+            * config/alpha/alpha.md (movdi_er_high_g): Add cannot_copy attribute.
+            (movdi_er_tlsgd): Ditto.
+            (movdi_er_tlsldm): Ditto.
+            (call_value_osf_<tls>): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/alpha/pr115526.c: New test.
+    
+    (cherry picked from commit 0841fd4c42ab053be951b7418233f0478282d020)
+
+- User: GCC Commits | Time: 2024-07-18 14:38:47 UTC
+  Text: The releases/gcc-12 branch has been updated by Uros Bizjak <uros@gcc.gnu.org>:https://gcc.gnu.org/g:c5a26fc24b0af61498fae65ccad69d51d63d2a8bcommitr12-10623-gc5a26fc24b0af61498fae65ccad69d51d63d2a8bAuthor: Uros Bizjak <ubizjak@gmail.com>
+Date:   Wed Jul 17 18:11:26 2024 +0200
+
+    alpha: Fix duplicate !tlsgd!62 assemble error [PR115526]
+    
+    Add missing "cannot_copy" attribute to instructions that have to
+    stay in 1-1 correspondence with another insn.PR target/115526gcc/ChangeLog:
+    
+            * config/alpha/alpha.md (movdi_er_high_g): Add cannot_copy attribute.
+            (movdi_er_tlsgd): Ditto.
+            (movdi_er_tlsldm): Ditto.
+            (call_value_osf_<tls>): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/alpha/pr115526.c: New test.
+    
+    (cherry picked from commit 0841fd4c42ab053be951b7418233f0478282d020)
+
+- User: Uroš Bizjak | Time: 2024-07-18 14:41:49 UTC
+  Text: Fixed for gcc-12.5+.
+
+- User: Sam James | Time: 2024-07-20 05:31:16 UTC
+  Text: Many thanks both.
+

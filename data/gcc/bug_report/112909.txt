@@ -1,0 +1,124 @@
+Bug Summary: [14 Regression] glibc -Wuninitialized build failure for i686-gnu
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: diagnostic
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Joseph S. Myers | Time: 2023-12-07 22:10:38 UTC
+  Text: Createdattachment 56829[details]preprocessed source
+
+What look like spurious -Wuninitialized errors were introduced building glibc for i686-gnu (Hurd) by:
+
+commit 602e824eec30a7c6792b8b27d61c40f1c1a2714c
+Author:     Aldy Hernandez <aldyh@redhat.com>
+AuthorDate: Thu Jun 29 11:27:49 2023 +0200
+Commit:     Aldy Hernandez <aldyh@redhat.com>
+CommitDate: Wed Jul 12 18:21:29 2023 +0200
+
+    [range-op] Enable value/mask propagation in range-op.
+
+Compile the attached test for i686-gnu with -O2 -Wall -Werror (likely the issue appears also as a regression for other targets, the source file in glibc that this came from is Hurd-specific so it wouldn't have broken the glibc build for other targets).
+
+../sysdeps/mach/hurd/x86/trampoline.c: In function '_hurd_setup_sighandler':
+../sysdeps/mach/hurd/x86/trampoline.c:108:22: error: 'scp' may be used uninitialized [-Werror=maybe-uninitialized]
+  108 |   struct sigcontext *scp;
+      |                      ^~~
+../sysdeps/mach/hurd/x86/trampoline.c:353:34: error: 'args' may be used uninitialized [-Werror=maybe-uninitialized]
+  353 |       struct mach_msg_trap_args *args = (void *) state->basic.esp;
+      |                                  ^~~~
+cc1: all warnings being treated as errors
+
+I don't see any way these variables can be used uninitialized, even taking into account the use of setjmp in this function which could well be confusing things.
+
+- User: Richard Biener | Time: 2023-12-08 07:56:04 UTC
+  Text: Confirmed.  We diagnose
+
+_hurd_setup_sighandler ()
+{
+if (ss->context)
+  {
+...
+<bb5>
+scp_67(ab) = PHI <scp_98(D)(4), scp_68(ab)(6)>
+_105 = setjmp ();
+if (_105 == 0)
+  scp_202 = scp_67(ab);
+
+
+and scp_98(D) is not initialized from function start but only eventually
+via the abnormal path (note how the CFG is sligthly incorrect since the
+abnormal return wouldn't enter setjmp again and also not really bypass
+the _105 == 0 check).
+
+I think the copy we diagnose is a spurious use we just fail to propagate,
+but scp_67 is really used on an abnormal edge in a PHI (in the abnormal
+dispatcher).
+
+I can't convince myself right now that it's always safe to propagate
+the copy (scp_202 is single-use with a use in a PHI argument not on
+an abnormal edge).
+
+The copy appears from thread2 which copies along the 9->10 edge, turning
+
+ # scp_69(ab) = PHI <scp_98(D)(3), scp_67(ab)(9), scp_67(ab)(8)>
+
+into a copy there.
+
+But we can make uninit analysis look through reg-reg copies, ignoring
+unguarded uninit uses in those.
+
+- User: Richard Biener | Time: 2023-12-08 08:14:06 UTC
+  Text: Reduced testcase:
+
+struct machine_thread_all_state {
+  int set;
+} _hurd_setup_sighandler_state;
+int _hurd_setup_sighandler_ss_0;
+struct {
+  int ctx;
+} *_hurd_setup_sighandler_stackframe;
+void _setjmp();
+void __thread_get_state();
+int machine_get_basic_state(struct machine_thread_all_state *state) {
+  if (state->set)
+    __thread_get_state();
+  return 1;
+}
+int *_hurd_setup_sighandler() {
+  int *scp;
+  if (_hurd_setup_sighandler_ss_0) {
+    _setjmp();
+    _hurd_setup_sighandler_state.set |= 5;
+  }
+  machine_get_basic_state(&_hurd_setup_sighandler_state);
+  scp = &_hurd_setup_sighandler_stackframe->ctx;
+  _setjmp();
+  return scp;
+}
+
+- User: GCC Commits | Time: 2023-12-08 10:32:16 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:5e25baa7e577f9b73f746005efb5ccd4e000e51ecommitr14-6319-g5e25baa7e577f9b73f746005efb5ccd4e000e51eAuthor: Richard Biener <rguenther@suse.de>
+Date:   Fri Dec 8 09:14:43 2023 +0100
+
+    tree-optimization/112909 - uninit diagnostic with abnormal copy
+    
+    The following avoids spurious uninit diagnostics for SSA name
+    copies which mostly appear when the source is marked as abnormal
+    which prevents copy propagation.
+    
+    To prevent regressions I remove the bail out for anonymous SSA
+    names in the PHI arg place from warn_uninitialized_phi leaving
+    that to warn_uninit where I handle SSA copies from a SSA name
+    which isn't anonymous.  In theory this might cause more
+    valid and false positive diagnostics to pop up.PR tree-optimization/112909* tree-ssa-uninit.cc (find_uninit_use): Look through a
+            single level of SSA name copies with single use.
+    
+            * gcc.dg/uninit-pr112909.c: New testcase.
+
+- User: Richard Biener | Time: 2023-12-08 10:33:06 UTC
+  Text: Should be fixed now.
+

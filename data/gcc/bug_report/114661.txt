@@ -1,0 +1,106 @@
+Bug Summary: Bit operations not optimized to multiplication
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 15.0
+Known to Fail: 
+
+Comments:
+- User: Antony Polukhin | Time: 2024-04-09 16:11:10 UTC
+  Text: Consider the example:
+
+unsigned mul(unsigned char c) {
+    if (c > 3) __builtin_unreachable();
+    return c << 18 | c << 15 |
+        c << 12 | c << 9 |
+        c << 6 | c << 3 | c;
+}
+
+GCC with -O2 generates the following assembly:
+
+mul(unsigned char):
+  movzx edi, dil
+  lea edx, [rdi+rdi*8]
+  lea eax, [0+rdx*8]
+  mov ecx, edx
+  sal edx, 15
+  or eax, edi
+  sal ecx, 9
+  or eax, ecx
+  or eax, edx
+  ret
+
+However it could be optimized to just:
+
+mul(unsigned char):
+  imul eax, edi, 299593
+  ret
+
+Compiling with -Os does not help.
+
+Godbolt playground:https://godbolt.org/z/YszzMbovKP.S.: without `c << 18 | c << 15 |` the bit operations are transformed to multiplication.
+
+- User: Andrew Pinski | Time: 2024-04-09 19:57:32 UTC
+  Text: Seems like another example where -fwrapv improves code ...
+
+- User: Andrew Pinski | Time: 2024-04-09 22:04:34 UTC
+  Text: Confirmed.
+
+- User: GCC Commits | Time: 2024-07-16 07:02:11 UTC
+  Text: The master branch has been updated by Roger Sayle <sayle@gcc.gnu.org>:https://gcc.gnu.org/g:df9451936c6c9e4faea371e3f188e1fc6b6d39e3commitr15-2053-gdf9451936c6c9e4faea371e3f188e1fc6b6d39e3Author: Roger Sayle <roger@nextmovesoftware.com>
+Date:   Tue Jul 16 07:58:28 2024 +0100PR tree-optimization/114661: Generalize MULT_EXPR recognition in match.pd.
+    
+    This patch resolvesPR tree-optimization/114661, by generalizing the set
+    of expressions that we canonicalize to multiplication.  This extends the
+    optimization(s) contributed (by me) back in July 2021.https://gcc.gnu.org/pipermail/gcc-patches/2021-July/575999.htmlThe existing transformation folds (X*C1)^(X<<C2) into X*C3 when
+    allowed.  A subtlety is that for non-wrapping integer types, we
+    actually fold this into (int)((unsigned)X*C3) so that we don't
+    introduce an undefined overflow that wasn't in the original.
+    Unfortunately, this transformation confuses itself, as the type-cast
+    multiplication isn't recognized when further combining bit operations.
+    Fixed here by allowing optional useless type conversions in transforms
+    to turn (int)((unsigned)X*C1)^(X<<C2) into (int)((unsigned)X*C3) so
+    that match.pd and EVRP can continue to construct multiplications.
+    
+    For the example given in the PR:
+    
+    unsigned mul(unsigned char c) {
+        if (c > 3) __builtin_unreachable();
+        return c << 18 | c << 15 |
+               c << 12 | c << 9 |
+               c << 6 | c << 3 | c;
+    }
+    
+    GCC on x86_64 with -O2 previously generated:
+    
+    mul:    movzbl  %dil, %edi
+            leal    (%rdi,%rdi,8), %edx
+            leal    0(,%rdx,8), %eax
+            movl    %edx, %ecx
+            sall    $15, %edx
+            orl     %edi, %eax
+            sall    $9, %ecx
+            orl     %ecx, %eax
+            orl     %edx, %eax
+            ret
+    
+    with this patch we now generate:
+    
+    mul:    movzbl  %dil, %eax
+            imull   $299593, %eax, %eax
+            ret
+    
+    2024-07-16  Roger Sayle  <roger@nextmovesoftware.com>
+                Richard Biener  <rguenther@suse.de>
+    
+    gcc/ChangeLogPR tree-optimization/114661* match.pd ((X*C1)|(X*C2) to X*(C1+C2)): Allow optional useless
+            type conversions around multiplications, such as those inserted
+            by this transformation.
+    
+    gcc/testsuite/ChangeLogPR tree-optimization/114661* gcc.dg/pr114661.c: New test case.
+
+- User: Roger Sayle | Time: 2024-07-18 15:21:45 UTC
+  Text: This should now be fixed/implemented on mainline.
+

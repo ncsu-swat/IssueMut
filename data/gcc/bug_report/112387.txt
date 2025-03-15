@@ -1,0 +1,151 @@
+Bug Summary: RISC-V: failed to SLP INT64 gather load
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: missed-optimization
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: JuzheZhong | Time: 2023-11-05 01:06:43 UTC
+  Text: https://godbolt.org/z/beq8TcGKeConsider this following case:
+
+void
+f (int *restrict y, int *restrict x, 
+int *restrict indices, int n)
+{
+  for (int64_t i = 0; i < n; ++i)
+    {
+      y[i * 2] = x[indices[i * 2]] + 1;
+      y[i * 2 + 1] = x[indices[i * 2 + 1]] + 2;
+    }
+}
+
+Current RVV GCC can SLP:
+
+        vsetvli zero,a5,e32,m1,ta,ma
+        vle32.v v1,0(a2)
+        vsetvli t4,zero,e64,m2,ta,ma
+        vsext.vf2       v2,v1
+        vsll.vi v2,v2,2
+        vsetvli zero,a5,e32,m1,ta,ma
+        vluxei64.v      v2,(a1),v2
+        vsetvli t1,zero,e32,m1,ta,ma
+        vadd.vv v2,v2,v4
+        vsetvli zero,a5,e32,m1,ta,ma
+        vse32.v v2,0(a0)
+        add     a3,a3,t5
+        add     a2,a2,a6
+        add     a0,a0,a6
+        bgtu    a7,a4,.L4
+
+However if we change int -> uint64_t, it failed:
+
+void
+f2 (uint64_t *restrict y, uint64_t *restrict x, 
+uint64_t *restrict indices, uint64_t n)
+{
+  for (int64_t i = 0; i < n; ++i)
+    {
+      y[i * 2] = x[indices[i * 2]] + 1;
+      y[i * 2 + 1] = x[indices[i * 2 + 1]] + 2;
+    }
+}
+
+        vsetvli a5,a3,e64,m1,ta,ma
+        vlseg2e64.v     v2,(a2)           -> unexpected
+        slli    a4,a5,4
+        vsll.vi v4,v2,3
+        vsll.vi v1,v3,3
+        vluxei64.v      v4,(a1),v4
+        vluxei64.v      v1,(a1),v1
+        vadd.vi v2,v4,1
+        vadd.vi v3,v1,2
+        sub     a3,a3,a5
+        vsseg2e64.v     v2,(a0)           -> unexpected
+        add     a2,a2,a4
+        add     a0,a0,a4
+        bne     a3,zero,.L10
+
+ARM SVE is able to SLP both of them.
+
+I was thinking it was fixed by this patch:https://gcc.gnu.org/pipermail/gcc-patches/2023-November/635084.htmlBut turns out we are still missing something. It can only succeed on int,
+failed on int64_t
+
+- User: JuzheZhong | Time: 2023-11-06 07:17:36 UTC
+  Text: Oh. I see.
+
+with -fno-vect-cost-model, it can SLP now:https://godbolt.org/z/q5se4sd9xfoo:
+        beq     a3,zero,.L8
+        csrr    a6,vlenb
+        srli    a4,a6,3
+        slli    a3,a3,1
+        neg     t1,a4
+        vsetvli a5,zero,e64,m1,ta,ma
+        vmv.v.i v2,1
+        vid.v   v0
+        vand.vi v0,v0,1
+        vmseq.vi        v0,v0,1
+        vmerge.vim      v2,v2,2,v0
+.L3:
+        minu    a5,a3,a4
+        vsetvli zero,a5,e64,m1,ta,ma
+        mv      a7,a3
+        vle64.v v1,0(a2)
+        vsll.vi v1,v1,3
+        vluxei64.v      v1,(a1),v1
+        vadd.vv v1,v1,v2
+        vse64.v v1,0(a0)
+        add     a2,a2,a6
+        add     a0,a0,a6
+        add     a3,a3,t1
+        bgtu    a7,a4,.L3
+.L8:
+        ret
+
+It's odd.... I think SLP should always preferrable choice.
+
+- User: Richard Biener | Time: 2023-11-06 08:31:57 UTC
+  Text: Indeed less gathers should be better.  Note gathers are costed as
+vector_load (for the index vector) and N times scalar_load when not emulated.
+There isn't a specific gather_load.
+
+I suspect your scalar_load costs do not inter-operate with vector_* costs
+(aka you add apples and oranges?)
+
+- User: GCC Commits | Time: 2023-12-14 07:49:39 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:e9f0af150358d93b4c4c5f65d662748ae87bd3d0commitr14-6533-ge9f0af150358d93b4c4c5f65d662748ae87bd3d0Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Thu Dec 14 15:47:52 2023 +0800
+
+    RISC-V: Add failed SLP testcase
+    
+    After recent RVV cost model tweak, I found this PR issue has been fixed.
+    
+    Add testcase and committed.PR target/112387gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/vect/costmodel/riscv/rvv/pr112387.c: New test.
+
+- User: JuzheZhong | Time: 2023-12-14 07:52:33 UTC
+  Text: Fixed
+
+- User: GCC Commits | Time: 2023-12-15 00:32:24 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:4bfafea6922dffea145d1aa1d5f5fa4814e66173commitr14-6572-g4bfafea6922dffea145d1aa1d5f5fa4814e66173Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Fri Dec 15 06:24:32 2023 +0800
+
+    RISC-V: Tweak generic vector COST model
+    
+    Notice current generic vector cost model makePR112387failed to vectorize.
+    
+    Adapt it same as ARM SVE generic vector cost model which can fix it.
+    
+    Committed as it is obvious fix.PR target/112387gcc/ChangeLog:
+    
+            * config/riscv/riscv.cc: Adapt generic cost model same ARM SVE.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.dg/vect/costmodel/riscv/rvv/pr112387.c: Moved to...
+            * gcc.dg/vect/costmodel/riscv/rvv/pr112387-1.c: ...here.
+            * gcc.dg/vect/costmodel/riscv/rvv/pr112387-2.c: New test.
+

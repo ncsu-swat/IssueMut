@@ -1,0 +1,135 @@
+Bug Summary: sel-sched2 ICE without checking verify_changes
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 11.4.0
+
+Comments:
+- User: Kewen Lin | Time: 2023-12-13 06:35:20 UTC
+  Text: With selective scheduling 2 enabled by default, I failed to build gcc with non-bootstrap on Power10, one reduced test case is listed below:
+
+int a[];
+int b(__ieee128 e) {
+  int c;
+  __ieee128 d;
+  c = e;
+  d = c;
+  d = a[c] + d;
+  return d;
+}
+
+option: -O2 -S -fselective-scheduling2 -mcpu=power10 (or -mcpu=power9)
+
+ICE reason:
+
+test.c:9:1: error: insn does not satisfy its constraints:
+    9 | }
+      | ^
+
+(insn 48 0 0 (set (reg:DI 32 0)
+        (sign_extend:DI (reg/v:SI 64 0 [orig:119 c ] [119]))) 31 {extendsidi2}
+     (nil))
+
+- User: Kewen Lin | Time: 2023-12-13 06:46:13 UTC
+  Text: Initially we have:
+
+(insn 31 6 10 2 (set (reg/v:SI 9 9 [orig:119 c ] [119])
+        (reg/v:SI 64 0 [orig:119 c ] [119])) "test.i":5:5 555 {*movsi_internal1}
+     (expr_list:REG_DEAD (reg/v:SI 64 0 [orig:119 c ] [119])
+        (nil)))
+(insn 10 31 25 2 (set (reg:DI 10 10 [128])
+        (ashift:DI (sign_extend:DI (reg/v:SI 9 9 [orig:119 c ] [119]))
+            (const_int 2 [0x2]))) "test.i":7:8 278 {ashdi3_extswsli}
+     (nil))
+(insn 25 10 27 2 (set (reg:DI 64 0 [135])
+        (sign_extend:DI (reg/v:SI 9 9 [orig:119 c ] [119]))) "test.i":6:5 31 {extendsidi2}
+     (expr_list:REG_DEAD (reg/v:SI 9 9 [orig:119 c ] [119])
+        (nil)))
+
+with moving up, we have:
+
+(insn 46 0 0 (set (reg:DI 64 0 [135])
+        (sign_extend:DI (reg/v:SI 64 0 [orig:119 c ] [119]))) 31 {extendsidi2}
+     (expr_list:REG_DEAD (reg/v:SI 9 9 [orig:119 c ] [119])
+        (nil)))
+
+in try_replace_dest_reg, we updated the above EXPR_INSN_RTX to:
+
+(insn 48 0 0 (set (reg:DI 32 0)
+        (sign_extend:DI (reg/v:SI 64 0 [orig:119 c ] [119]))) 31 {extendsidi2}
+     (nil))
+
+This doesn't match any constraint and it's an unexpected modification.
+
+Unfortunately function try_replace_dest_reg just checks the orig insn with:
+
+      if (REGNO (best_reg) != REGNO (INSN_LHS (orig_insn))
+	  && (! replace_src_with_reg_ok_p (orig_insn, best_reg)
+	      || ! replace_dest_with_reg_ok_p (orig_insn, best_reg)))
+
+But it doesn't check EXPR_INSN_RTX, I think it's under the assumption that if the original insn is able to be replaced then the change on EXPR_INSN_RTX is fine, but this isn't true as the given test case shows.
+
+- User: Andrew Pinski | Time: 2023-12-13 07:03:39 UTC
+  Text: fselective-scheduling has so many issues.
+
+- User: Kewen Lin | Time: 2023-12-13 07:30:39 UTC
+  Text: (In reply to Andrew Pinski fromcomment #2)> fselective-scheduling has so many issues.ah, thanks a lot for pointing this out.
+
+I was testing the impact of my proposed scheduling change and found this feature didn't work well on Power (turning on it by default and failed to build even without bootstrap). I thought it's able to specify these selective-scheduling related options on Power, maybe we need to ensure some quality there. I just know Power is not alone ;-), by scanning those PRs under meta-bug I noticed at least more than three had the same/similar ICE traces as what I found in those exposed failures. As noticing thishttps://gcc.gnu.org/bugzilla/show_bug.cgi?id=110526#c4, I wonder if they have become in low priority?
+
+- User: GCC Commits | Time: 2023-12-21 05:32:43 UTC
+  Text: The master branch has been updated by Kewen Lin <linkw@gcc.gnu.org>:https://gcc.gnu.org/g:5fbc77726f68a35a938c829fe259d6c376d608cacommitr14-6768-g5fbc77726f68a35a938c829fe259d6c376d608caAuthor: Kewen Lin <linkw@linux.ibm.com>
+Date:   Wed Dec 20 23:20:19 2023 -0600
+
+    sel-sched: Verify change before replacing dest in EXPR_INSN_RTX [PR112995]PR112995exposed one issue in current try_replace_dest_reg
+    that the result rtx insn after replace_dest_with_reg_in_expr
+    is probably unable to match any constraints.  Although there
+    are some checks on the changes onto dest or src of orig_insn,
+    none is performed on the EXPR_INSN_RTX.
+    
+    Initially we have:
+    
+    (insn 31 6 10 2 (set (reg/v:SI 9 9 [orig:119 c ] [119])
+                         (reg/v:SI 64 0 [orig:119 c ] [119]))
+                    "test.i":5:5 555 {*movsi_internal1} ... )
+    ...
+    (insn 25 10 27 2 (set (reg:DI 64 0 [135])
+                          (sign_extend:DI
+                             (reg/v:SI 9 9 [orig:119 c ] [119])))
+                     "test.i":6:5 31 {extendsidi2} ...)
+    
+    with moving up, we have:
+    
+    (insn 46 0 0 (set (reg:DI 64 0 [135])
+                      (sign_extend:DI
+                          (reg/v:SI 64 0 [orig:119 c ] [119])))
+                       31 {extendsidi2} ...)
+    
+    in try_replace_dest_reg, we updated the above EXPR_INSN_RTX to:
+    
+    (insn 48 0 0 (set (reg:DI 32 0)
+                      (sign_extend:DI
+                          (reg/v:SI 64 0 [orig:119 c ] [119])))
+                       31 {extendsidi2} ...)
+    
+    The dest (reg 64) is a VR (also VSX REG), the updating makes
+    it become to (reg 32) which is a FPR (also VSX REG), we have
+    an alternative to match "VR,VR" but no one to match "FPR/VSX,
+    VR/VSX", so it fails with ICE.
+    
+    This patch is to add the check before actually replacing dest
+    in expr with reg.PR rtl-optimization/112995gcc/ChangeLog:
+    
+            * sel-sched.cc (try_replace_dest_reg): Check the validity of the
+            replaced insn before actually replacing dest in expr.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/powerpc/pr112995.c: New test.
+
+- User: Kewen Lin | Time: 2023-12-21 06:30:48 UTC
+  Text: Should be fixed on trunk, guessing we don't want a backport, so closing.
+

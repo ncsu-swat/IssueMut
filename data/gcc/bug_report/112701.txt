@@ -1,0 +1,90 @@
+Bug Summary: wrong type inference for ternary operator with `0/0u` in preprocessing context
+Product: gcc
+Component: preprocessor
+
+  (show other bugs)
+Keywords: patch
+Known to Work: 
+Known to Fail: 4.1.2
+
+Comments:
+- User: Alexander Monakov | Time: 2023-11-24 14:56:57 UTC
+  Text: In the following snippet, the result of the ternary operator is (-1, cast to an unsigned type), so the comparison yields false, and both conditional inclusions must come out empty:
+
+#if (0 ? 0u : -1) < 0
+int foo = (0 ? 0u : -1) < 0;
+#endif
+
+#if (0 ? 0/0u : -1) < 0
+int bar = (0 ? 0/0u : -1) < 0;
+#endif
+
+However, GCC emits:
+
+bar:
+        .zero   4
+
+So clearly the evaluation of the second expression is inconsistent between preprocessing context (where it incorrectly yields 1) vs. initializer context (where it is zero as it should be, as seen from the resulting asm).
+
+- User: Andrew Pinski | Time: 2023-11-24 15:46:45 UTC
+  Text: Interesting is MSVC emits both. clang emits none.
+
+- User: Mikael Pettersson | Time: 2023-11-25 17:06:21 UTC
+  Text: gcc-2.95.3 generates neither, gcc-3.0.4 and up generate the bar: .long 0 (or .zero 4) one.
+
+- User: Richard Biener | Time: 2023-11-27 07:56:35 UTC
+  Text: Heh, I didn't know ?: is valid as preprocessor conditional.
+
+- User: Lewis Hyatt | Time: 2023-11-27 17:56:08 UTC
+  Text: Here is the fix. Not sure if it needs to wait for GCC 15 by now, but I can submit it with the testcase.
+
+diff --git a/libcpp/expr.cc b/libcpp/expr.cc
+index 825d2c2369d..4f4a9722ac7 100644
+--- a/libcpp/expr.cc
++++ b/libcpp/expr.cc
+@@ -2216,6 +2216,7 @@ num_div_op (cpp_reader *pfile, cpp_num lhs, cpp_num rhs, enum cpp_ttype op,
+       if (!pfile->state.skip_eval)
+        cpp_error_with_line (pfile, CPP_DL_ERROR, location, 0,
+                             "division by zero in #if");
++      lhs.unsignedp = unsignedp;
+       return lhs;
+     }
+
+- User: Andrew Pinski | Time: 2023-11-27 18:02:00 UTC
+  Text: (In reply to Lewis Hyatt fromcomment #4)> Here is the fix. Not sure if it needs to wait for GCC 15 by now, but I can
+> submit it with the testcase.Bugs can be fixed during stage 3 (just no new __major__ features), only during stage 4 is when regression only fixes can happen. Note this might even be considered a regression since it worked in GCC 2.95.3.
+
+- User: Lewis Hyatt | Time: 2023-11-28 00:14:25 UTC
+  Text: (In reply to Andrew Pinski fromcomment #5)> (In reply to Lewis Hyatt fromcomment #4)
+> > Here is the fix. Not sure if it needs to wait for GCC 15 by now, but I can
+> > submit it with the testcase.
+> 
+> Bugs can be fixed during stage 3 (just no new __major__ features), only
+> during stage 4 is when regression only fixes can happen. Note this might
+> even be considered a regression since it worked in GCC 2.95.3.Thanks for the clarification! Patch is at:https://gcc.gnu.org/pipermail/gcc-patches/2023-November/638346.html
+
+- User: GCC Commits | Time: 2023-11-28 02:44:54 UTC
+  Text: The master branch has been updated by Lewis Hyatt <lhyatt@gcc.gnu.org>:https://gcc.gnu.org/g:ce52f1f7074d96c4d9ce63b1169c11087757e926commitr14-5898-gce52f1f7074d96c4d9ce63b1169c11087757e926Author: Lewis Hyatt <lhyatt@gmail.com>
+Date:   Mon Nov 27 12:08:41 2023 -0500
+
+    libcpp: Fix unsigned promotion for unevaluated divide by zero [PR112701]
+    
+    When libcpp encounters a divide by zero while processing a constant
+    expression "x/y", it returns "x" as a fallback. The value of the fallback is
+    not normally important, since an error will be generated anyway, but if the
+    expression appears in an unevaluated context, such as "0 ? 0/0u : -1", then
+    there will be no error, and the fallback value will be meaningful to the
+    extent that it may cause promotion from signed to unsigned of an operand
+    encountered later. As the PR notes, libcpp does not do the unsigned
+    promotion correctly in this case; fix it by making the fallback return value
+    unsigned as necessary.
+    
+    libcpp/ChangeLog:PR preprocessor/112701* expr.cc (num_div_op): Set unsignedp appropriately when returning a
+            stub value for divide by 0.
+    
+    gcc/testsuite/ChangeLog:PR preprocessor/112701* gcc.dg/cpp/expr.c: Add additional tests to cover divide by 0 in an
+            unevaluated context, where the unsignedness still matters.
+
+- User: Lewis Hyatt | Time: 2023-11-28 02:45:56 UTC
+  Text: Fixed for GCC 14.
+

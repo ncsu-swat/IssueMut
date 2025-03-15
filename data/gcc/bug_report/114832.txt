@@ -1,0 +1,109 @@
+Bug Summary: [14 Regression] ICE at -O{2,3} with "-fno-tree-loop-if-convert -fno-tree-loop-distribute-patterns -ftree-vectorize" on x86_64-linux-gnu: in verify_dominators, at dominance.cc:1194
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-checking, ice-on-valid-code
+Known to Work: 13.2.0
+Known to Fail: 14.0
+
+Comments:
+- User: Zhendong Su | Time: 2024-04-24 03:12:45 UTC
+  Text: It appears to be a recent regression and does not reproduce with 13.2 and earlier.
+
+Compiler Explorer:https://godbolt.org/z/1do4bc9W7[515] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.1 20240423 (experimental) (GCC) 
+[516] % 
+[516] % gcctk -c -O2 -fno-tree-loop-if-convert -fno-tree-loop-distribute-patterns -ftree-vectorize small.c 
+small.c: In function ‘e’:
+small.c:2:6: error: dominator of 6 should be 13, not 5
+    2 | void e() {
+      |      ^
+during GIMPLE pass: vect
+small.c:2:6: internal compiler error: in verify_dominators, at dominance.cc:1194
+0x7a1828 verify_dominators(cdi_direction)
+	../../gcc-trunk/gcc/dominance.cc:1194
+0x145a0d0 checking_verify_dominators(cdi_direction)
+	../../gcc-trunk/gcc/dominance.h:76
+0x145a0d0 slpeel_tree_duplicate_loop_to_edge_cfg(loop*, edge_def*, loop*, edge_def*, edge_def*, edge_def**, bool, vec<basic_block_def*, va_heap, vl_ptr>*)
+	../../gcc-trunk/gcc/tree-vect-loop-manip.cc:1961
+0x145d46c vect_do_peeling(_loop_vec_info*, tree_node*, tree_node*, tree_node**, tree_node**, tree_node**, int, bool, bool, tree_node**)
+	../../gcc-trunk/gcc/tree-vect-loop-manip.cc:3444
+0x144cd58 vect_transform_loop(_loop_vec_info*, gimple*)
+	../../gcc-trunk/gcc/tree-vect-loop.cc:11910
+0x149374e vect_transform_loops
+	../../gcc-trunk/gcc/tree-vectorizer.cc:1006
+0x1493e53 try_vectorize_loop_1
+	../../gcc-trunk/gcc/tree-vectorizer.cc:1152
+0x1493e53 try_vectorize_loop
+	../../gcc-trunk/gcc/tree-vectorizer.cc:1182
+0x149448c execute
+	../../gcc-trunk/gcc/tree-vectorizer.cc:1298
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+[517] % 
+[517] % cat small.c
+int a, b, c, d[3];
+void e() {
+  int f, g = 0;
+  for (; g < 3; g++) {
+    if (f || a || b && c) {
+      int h, *i = &h, **j = &i;
+    }
+    d[g] = 0;
+  }
+}
+
+- User: Andrew Pinski | Time: 2024-04-24 03:23:29 UTC
+  Text: Confirmed. ICE does not happen with -fno-checking so adding ice-checking.
+
+- User: Andrew Pinski | Time: 2024-04-24 03:24:05 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> Confirmed. ICE does not happen with -fno-checking so adding ice-checking.Also GCC 13.2.0 didn't ICE with -fchecking either.
+
+- User: Richard Biener | Time: 2024-04-24 04:22:26 UTC
+  Text: With the early break code we now allow multiple blocks in the loop body but guess this only happens for blocks with exits.  In this case we have a simple forwarder which seems to confuse the code.  Usually if-conversion gets rid of those so -fno-tree-loop-if-convert is critical to trigger this.
+
+If we want to fix this on the release branch I think we should reject loops
+with this kind of CFG again.  In stage1 we should fix the real issue.
+
+I think the fix is just
+
+diff --git a/gcc/tree-vect-loop-manip.cc b/gcc/tree-vect-loop-manip.cc
+index 8d9b533d50f..43c7881c640 100644
+--- a/gcc/tree-vect-loop-manip.cc
++++ b/gcc/tree-vect-loop-manip.cc
+@@ -1523,7 +1523,7 @@ slpeel_tree_duplicate_loop_to_edge_cfg (class loop *loop, edge loop_exit,
+ 
+   exit_dest = exit->dest;
+   was_imm_dom = (get_immediate_dominator (CDI_DOMINATORS,
+-                                         exit_dest) == loop->header ?
++                                         exit_dest) == exit->src ?
+                 true : false);
+ 
+   /* Also copy the pre-header, this avoids jumping through hoops to
+
+- User: GCC Commits | Time: 2024-04-24 08:13:08 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:e28e8ab1a92e9b49f7c4045377577c8dc17751b7commitr14-10105-ge28e8ab1a92e9b49f7c4045377577c8dc17751b7Author: Richard Biener <rguenther@suse.de>
+Date:   Wed Apr 24 06:24:22 2024 +0200
+
+    tree-optimization/114832 - wrong dominator info with vect peeling
+    
+    When we update the dominator of the redirected exit after peeling
+    we check whether the immediate dominator was the loop header rather
+    than the exit source when we later want to just update it to the
+    new source.  The following fixes this oversight.PR tree-optimization/114832* tree-vect-loop-manip.cc (slpeel_tree_duplicate_loop_to_edge_cfg):
+            Fix dominance check.
+    
+            * gcc.dg/vect/pr114832.c: New testcase.
+
+- User: Richard Biener | Time: 2024-04-24 08:13:40 UTC
+  Text: Fixed.
+

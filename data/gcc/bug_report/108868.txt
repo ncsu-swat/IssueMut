@@ -1,0 +1,151 @@
+Bug Summary: [13 Regression] ocaml-dune miscompilation on i686 since r13-5965
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jakub Jelinek | Time: 2023-02-20 23:01:58 UTC
+  Text: Createdattachment 54499[details]spawn_stubs.i.xz
+
+The following source from ocaml-dune seems to be miscompiled starting withr13-5965with
+-mfpmath=sse -m32 -march=i686 -mtune=generic -msse2 -mfpmath=sse -mstackrealign -O2 -fno-strict-aliasing -fwrapv -fstack-protector-strong -fcf-protection=full -fPIC -fexceptions -fstack-protector-strong -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection=full
+The spawn_unix function uses (conditionally) vfork and the vfork child now clobbers -672(%ebp) - 9 is stored in there.
+
+The main problem I see is that .ABNORMAL_DISPATCHER (0) call disappears in cddce1 pass.
+
+- User: Andrew Pinski | Time: 2023-02-20 23:17:02 UTC
+  Text: Here is a testcase which shows the removal of ABNORMAL_DISPATCHER though I am not sure what is the best way to test if the removal makes a difference.
+
+```
+extern int vfork (void) __attribute__ ((__nothrow__ , __leaf__, __returns_twice__));
+extern int fork (void) __attribute__ ((__nothrow__ , __leaf__, __returns_twice__));
+
+void sink(int*) __attribute__((noipa));
+void sink(int*) {}
+int f(int a, int b) __attribute__((noipa));
+int f(int a, int b)
+{
+        sink(&b);
+        int ret = a ? vfork() : fork();
+        if (ret == 0) {
+                sink(&b);
+                b++;
+                sink(&b);
+                return 0;
+        }
+        if(b) __builtin_abort();
+        __builtin_exit(0);
+}
+```
+
+- User: Jakub Jelinek | Time: 2023-02-20 23:31:55 UTC
+  Text: That would be invalid, vfork can't return from the containing function.
+
+Anyway, reduced testcase which shows the .ABNORMAL_DISPATCHER call inr13-5964and none inr13-5965in optimized is e.g. with just -O2:
+int x;
+int vfork (void) __attribute__((__leaf__, __returns_twice__));
+int fork (void);
+void bar (int, int, int *);
+
+void
+foo (void)
+{
+  int b = 0;
+  int r = x ? vfork () : fork ();
+  bar (r, x, &b);
+}
+
+This could be valid, as bar could e.g. for the first argument equal to 0 execve or _exit.  It doesn't show the spill slot clobbering though.
+
+- User: Andrew Pinski | Time: 2023-02-20 23:50:37 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #2)> That would be invalid, vfork can't return from the containing function.I messed up the if (it should be the opposite way around, that is checking for non-zero). That is "if (ret != 0) {" :).
+
+- User: Jakub Jelinek | Time: 2023-02-20 23:56:16 UTC
+  Text: I think the reason why it doesn't work is clear, call_can_make_abnormal_goto on the vfork call is false, because it is leaf (and that is how glibc declares vfork BTW) and ctrl_altering flag is initialized by gimple_call_initialize_ctrl_altering based on that or if it is noreturn etc. (nothing applies).
+So, I think as discussed in another PR, I think we really should make if not
+call_can_make_abnormal_goto at least gimple_call_initialize_ctrl_altering be true for
+RETURNS_TWICE calls.
+
+- User: Richard Biener | Time: 2023-02-21 07:21:13 UTC
+  Text: (In reply to Jakub Jelinek fromcomment #4)> I think the reason why it doesn't work is clear, call_can_make_abnormal_goto
+> on the vfork call is false, because it is leaf (and that is how glibc
+> declares vfork BTW) and ctrl_altering flag is initialized by
+> gimple_call_initialize_ctrl_altering based on that or if it is noreturn etc.
+> (nothing applies).
+> So, I think as discussed in another PR, I think we really should make if not
+> call_can_make_abnormal_goto at least gimple_call_initialize_ctrl_altering be
+> true for
+> RETURNS_TWICE calls.I think I'm going to revertr13-5965since neither setjmp nor [v]fork alter
+control flow.  They receive additional control flow.
+
+I'm not sure why we have abnormal edges into fork(), fork simply returns
+twice but you can't longjmp to it.  It's probably the same reason we
+have them on setjmp - to avoid code motion across the call, though as
+you can't jump to it I wonder if that's necessary there.r13-5965has the side-effect of removing the RTL side-effects as well,
+though that's probably only ->calls_setjmp, forks never had REG_SETJMP
+on them?
+
+That said, if we choose to set ctrl-altering for setjmp + fork (seePR108855for the problem with that), we need to do that explicitely
+rather than relying on call_can_make_abnormal_goto as you say.
+
+I still prefer to revert the offending revision and see how to handle
+the indirect -> direct transform better (in the end reverting the assert
+in DCE will solve these ICEs for us and get us back to previous behavior)
+
+- User: Richard Biener | Time: 2023-02-21 09:23:35 UTC
+  Text: Btw, there's also cleanup_call_ctrl_altering_flag in CFG cleanup which cleans
+up the flag on the _last_ stmt of blocks.  Dependent on whether fork/setjmp
+is last it would clean the flag based on outgoing edges not being abnormal.
+That's another reason to not abuse the ctrl-altering flag here.
+
+I'm going to do the reversion now - is there a runtime testcase we can add for this PR or should we solely rely on the abnormal dispatcher presence?
+
+Btw, if the testcase would be just
+
+void foo ()
+{
+  if (!vfork ())
+    _exit (0);
+}
+
+then it's IMHO OK to elide the abnormal edges?  There's still the issue
+of clobbering if RTL doesn't have a REG_SETJMP note on the vfork (it
+lacks the abnormal edges preventing code motion I think).
+
+I'm going to revert the offending rev. now.
+
+- User: GCC Commits | Time: 2023-02-21 09:33:51 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:ecc863e85efe259c799515de0c38c2297b0e3bd7commitr13-6153-gecc863e85efe259c799515de0c38c2297b0e3bd7Author: Richard Biener <rguenther@suse.de>
+Date:   Tue Feb 21 10:32:10 2023 +0100
+
+    tree-optimization/108868 - new testcase
+    
+    New testcase for the fixed bug.PR tree-optimization/108868* gcc.dg/pr108868.c: New testcase.
+
+- User: Richard Biener | Time: 2023-02-21 09:34:21 UTC
+  Text: The offending patch was reverted.
+
+- User: Jakub Jelinek | Time: 2023-02-21 09:35:14 UTC
+  Text: (In reply to Richard Biener fromcomment #5)> (In reply to Jakub Jelinek fromcomment #4)
+> > I think the reason why it doesn't work is clear, call_can_make_abnormal_goto
+> > on the vfork call is false, because it is leaf (and that is how glibc
+> > declares vfork BTW) and ctrl_altering flag is initialized by
+> > gimple_call_initialize_ctrl_altering based on that or if it is noreturn etc.
+> > (nothing applies).
+> > So, I think as discussed in another PR, I think we really should make if not
+> > call_can_make_abnormal_goto at least gimple_call_initialize_ctrl_altering be
+> > true for
+> > RETURNS_TWICE calls.
+> 
+> I think I'm going to revertr13-5965since neither setjmp nor [v]fork alter
+> control flow.  They receive additional control flow.So we could just add GF_CALL_RETURNS_TWICE, there are still bits left.> I'm not sure why we have abnormal edges into fork(), fork simply returnsWe don't.  vfork isn't a builtin but we have handle it by name in special_function_p.
+fork is a builtin, but just
+DEF_EXT_LIB_BUILTIN        (BUILT_IN_FORK, "fork", BT_FN_PID, ATTR_NOTHROW_LIST)
+and is a builtin just because of gcov wrappers.
+And glibc don't declare returns_twice any of them, it just uses nothrow, leaf
+attributes on vfork and just nothrow attribute on fork.
+

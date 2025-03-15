@@ -1,0 +1,161 @@
+Bug Summary: [15 Regression] ICE on libjack2-1.9.22: in expand_fn_using_insn, at internal-fn.cc:263 since r15-1671-gf2476a2649e997
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2024-09-23 05:56:16 UTC
+  Text: Initially observed ICE on libjack2-1.9.22 on gcc-master atr15-3784-g4fc92480675bd0.
+
+cvise reduced it down to the following:
+
+$ cat JackMidiAsyncWaitQueue.cpp.cpp
+unsigned long long GetTimeFromFrames(int);
+unsigned long long GetMicroSeconds();
+void DequeueEvent(unsigned frame) {
+  long long frame_time = GetTimeFromFrames(frame);
+  unsigned long long current_time = GetMicroSeconds();
+  DequeueEvent(frame_time < current_time ? 0 : frame_time - current_time);
+}
+
+gcc/xg++ -Bgcc -O2 -fPIC -c JackMidiAsyncWaitQueue.cpp.cpp -m32
+during RTL pass: expand
+JackMidiAsyncWaitQueue.cpp.cpp: In function 'void DequeueEvent(unsigned int)':
+JackMidiAsyncWaitQueue.cpp.cpp:3:6: internal compiler error: in expand_fn_using_insn, at internal-fn.cc:263
+    3 | void DequeueEvent(unsigned frame) {
+      |      ^~~~~~~~~~~~
+0x27b580d diagnostic_context::diagnostic_impl(rich_location*, diagnostic_metadata const*, diagnostic_option_id, char const*, __va_list_tag (*) [1], diagnostic_t)
+        ???:0
+0x27c4a3f internal_error(char const*, ...)
+        ???:0
+0x27b3994 fancy_abort(char const*, int, char const*)
+        ???:0
+0xf25ae5 expand_fn_using_insn(gcall*, insn_code, unsigned int, unsigned int)
+        ???:0
+0xf2a124 expand_direct_optab_fn(internal_fn, gcall*, optab_tag, unsigned int)
+        ???:0
+0xf2c87c expand_SAT_SUB(internal_fn, gcall*)
+        ???:0
+0xf3079d expand_internal_call(internal_fn, gcall*)
+        ???:0
+0xf307b7 expand_internal_call(gcall*)
+        ???:0
+0xc8f160 expand_gimple_stmt(gimple*)
+        ???:0
+0xc95099 expand_gimple_basic_block(basic_block_def*, bool)
+        ???:0
+0xc971b2 (anonymous namespace)::pass_expand::execute(function*)
+        ???:0
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+$ gcc/xg++ -Bgcc -v
+Reading specs from gcc/specs
+COLLECT_GCC=gcc/xg++
+COLLECT_LTO_WRAPPER=gcc/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /home/slyfox/dev/git/gcc/configure --disable-multilib --disable-bootstrap --disable-lto --disable-libsanitizer --disable-libstdcxx-pch --enable-languages=c,c++ --disable-libgomp --disable-libquadmath --disable-libvtv CFLAGS='-O1 -g0' CXXFLAGS='-O1 -g0' LDFLAGS='-O1 -g0'
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240923 (experimental) (GCC)
+
+- User: Li Pan | Time: 2024-09-23 07:41:21 UTC
+  Text: Ack, thanks for reporting this.
+
+Should be introduced by this commit.https://github.com/gcc-mirror/gcc/commit/f2476a2649e9975d454d179145574c21d8218aeeI am preparing a fix for this.
+
+- User: Sergei Trofimovich | Time: 2024-09-23 08:51:25 UTC
+  Text: Yeah, git bisect landed onr15-1671-gf2476a2649e997for me as well. Thank you!
+
+- User: GCC Commits | Time: 2024-09-24 13:12:33 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:de6fe690db32689ba5e5c6f551672a19e6cae5d4commitr15-3832-gde6fe690db32689ba5e5c6f551672a19e6cae5d4Author: Pan Li <pan2.li@intel.com>
+Date:   Mon Sep 23 22:37:58 2024 +0800
+
+    Widening-Mul: Fix one ICE for SAT_SUB matching operand checking
+    
+    This patch would like to fix the following ICE for -O2 -m32 of x86_64.
+    
+    during RTL pass: expand
+    JackMidiAsyncWaitQueue.cpp.cpp: In function 'void DequeueEvent(unsigned
+    int)':
+    JackMidiAsyncWaitQueue.cpp.cpp:3:6: internal compiler error: in
+    expand_fn_using_insn, at internal-fn.cc:263
+        3 | void DequeueEvent(unsigned frame) {
+          |      ^~~~~~~~~~~~
+    0x27b580d diagnostic_context::diagnostic_impl(rich_location*,
+    diagnostic_metadata const*, diagnostic_option_id, char const*,
+    __va_list_tag (*) [1], diagnostic_t)
+            ???:0
+    0x27c4a3f internal_error(char const*, ...)
+            ???:0
+    0x27b3994 fancy_abort(char const*, int, char const*)
+            ???:0
+    0xf25ae5 expand_fn_using_insn(gcall*, insn_code, unsigned int, unsigned int)
+            ???:0
+    0xf2a124 expand_direct_optab_fn(internal_fn, gcall*, optab_tag, unsigned int)
+            ???:0
+    0xf2c87c expand_SAT_SUB(internal_fn, gcall*)
+            ???:0
+    
+    We allowed the operand convert when matching SAT_SUB in match.pd, to support
+    the zip benchmark SAT_SUB pattern.  Aka,
+    
+    (convert? (minus (convert1? @0) (convert1? @1))) for below sample code.
+    
+    void test (uint16_t *x, unsigned b, unsigned n)
+    {
+      unsigned a = 0;
+      register uint16_t *p = x;
+    
+      do {
+        a = *--p;
+        *p = (uint16_t)(a >= b ? a - b : 0); // Truncate after .SAT_SUB
+      } while (--n);
+    }
+    
+    The pattern match for SAT_SUB itself may also act on below scalar sample
+    code too.
+    
+    unsigned long long GetTimeFromFrames(int);
+    unsigned long long GetMicroSeconds();
+    
+    void DequeueEvent(unsigned frame) {
+      long long frame_time = GetTimeFromFrames(frame);
+      unsigned long long current_time = GetMicroSeconds();
+      DequeueEvent(frame_time < current_time ? 0 : frame_time - current_time);
+    }
+    
+    Aka:
+    
+    uint32_t a = (uint32_t)SAT_SUB(uint64_t, uint64_t);
+    
+    Then there will be a problem when ia32 or -m32 is given when compiling.
+    Because we only check the lhs (aka uint32_t) type is supported by ifn
+    instead of the operand (aka uint64_t).  Mostly DImode is disabled for
+    32 bits target like ia32 or rv32gcv, and then trigger ICE when expanding.
+    
+    The below test suites are passed for this patch.
+    * The rv64gcv fully regression test.
+    * The x86 bootstrap test.
+    * The x86 fully regression test.PR middle-end/116814gcc/ChangeLog:
+    
+            * tree-ssa-math-opts.cc (build_saturation_binary_arith_call): Make
+            ifn is_supported type check based on operand instead of lhs.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.dg/torture/pr116814-1.C: New test.
+    
+    Signed-off-by: Pan Li <pan2.li@intel.com>
+
+- User: Sergei Trofimovich | Time: 2024-09-25 22:00:17 UTC
+  Text: The change fixed libjack2-1.9.22 for me. Thank you!
+
+- User: Sergei Trofimovich | Time: 2024-10-12 15:30:12 UTC
+  Text: Declaring it fixed.
+

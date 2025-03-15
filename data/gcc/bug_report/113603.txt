@@ -1,0 +1,423 @@
+Bug Summary: [12 Regression] ICE Segfault during GIMPLE pass: strlen at -O3 since r12-145
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Patrick O'Neill | Time: 2024-01-25 19:18:10 UTC
+  Text: Command:> /scratch/tc-testing/tc-jan-8-trunk/build-rv64gcv/bin/riscv64-unknown-linux-gnu-gcc -O3 red.c -S -freport-bugduring GIMPLE pass: strlen
+red.c: In function 'h':
+red.c:7:6: internal compiler error: Segmentation fault
+    7 | int *h() {
+      |      ^
+0x12c0303 crash_signal
+        ../../../gcc/gcc/toplev.cc:316
+0x7fe82a04251f ???
+        ./signal/../sysdeps/unix/sysv/linux/x86_64/libc_sigaction.c:0
+0x14f03cc contains_struct_check(tree_node*, tree_node_structure_enum, char const*, int, char const*)
+        ../../../gcc/gcc/tree.h:3757
+0x14f03cc maybe_invalidate
+        ../../../gcc/gcc/tree-ssa-strlen.cc:1361
+0x14f0861 do_invalidate
+        ../../../gcc/gcc/tree-ssa-strlen.cc:5730
+0x150015e strlen_pass::before_dom_children(basic_block_def*)
+        ../../../gcc/gcc/tree-ssa-strlen.cc:5780
+0x23cb957 dom_walker::walk(basic_block_def*)
+        ../../../gcc/gcc/domwalk.cc:311
+0x15006e6 printf_strlen_execute
+        ../../../gcc/gcc/tree-ssa-strlen.cc:5899
+Please submit a full bug report, with preprocessed source.
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+The bug is not reproducible, so it is likely a hardware or OS problem.
+
+Testcase:
+int a, e;
+char b;
+int *c;
+signed char *d;
+short f;
+char g[3];
+int *h() {
+  int i = 0;
+  for (; i < 3; i++)
+    g[i] = 2;
+  int j[100][100] = {{}, {4}};
+  signed char *k = &g[1];
+  do {
+    for (;;) {
+      if (c)
+        break;
+      return &a;
+    }
+    f = 0;
+    for (;; f++) {
+      b = 0;
+      for (; b < 2; b++)
+        *c = j[b][f];
+      if (e)
+        d = k;
+      *k = *d;
+      if (*c)
+        break;
+      if (f)
+        break;
+    }
+  } while (f);
+  return 0;
+}
+
+Godbolt:https://godbolt.org/z/ax1Tzc3ToOccurs on x86, RISC-V, ARM
+Found using a fuzzer.
+
+- User: Jakub Jelinek | Time: 2024-01-25 20:06:23 UTC
+  Text: Started withr12-145-gd1d01a66012a93cc8cb7dafbe1b5ec453ec96b59but guess that just triggered a latent bug in the strlen pass.
+
+- User: Jakub Jelinek | Time: 2024-01-29 15:28:57 UTC
+  Text: Createdattachment 57253[details]gcc14-pr113603.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-01-30 08:59:16 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d7250c1e02478586a0cd6d5cb67bf4d17249a7e7commitr14-8517-gd7250c1e02478586a0cd6d5cb67bf4d17249a7e7Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jan 30 09:58:05 2024 +0100
+
+    tree-ssa-strlen: Fix up handle_store [PR113603]
+    
+    Sincer10-2101-gb631bdb3c16e85f35d3handle_store uses
+    count_nonzero_bytes{,_addr} which (more recently limited to statements
+    with the same vuse) can walk earlier statements feeding the rhs
+    of the store and call get_stridx on it.
+    Unlike most of the other functions where get_stridx is called first on
+    rhs and only later on lhs, handle_store calls get_stridx on the lhs before
+    the count_nonzero_bytes* call and does some si->nonzero_bytes comparison
+    on it.
+    Now, strinfo structures are refcounted and it is important not to screw
+    it up.
+    What happens on the following testcase is that we call get_strinfo on the
+    destination idx's base (g), which returns a strinfo at that moment
+    with refcount of 2, one copy referenced in bb 2 final strinfos, one in bb 3
+    (the vector of strinfos was unshared from the dominator there because some
+    other strinfo was added) and finally we process a store in bb 6.
+    Now, count_nonzero_bytes is called and that sees &g[1] in a PHI and
+    calls get_stridx on it, which in turn calls get_stridx_plus_constant
+    because &g + 1 address doesn't have stridx yet.  This creates a new
+    strinfo for it:
+      si = new_strinfo (ptr, idx, build_int_cst (size_type_node, nonzero_chars),
+                        basesi->full_string_p);
+      set_strinfo (idx, si);
+    and the latter call, because it is the first one in bb 6 that needs it,
+    unshares the stridx_to_strinfo vector (so refcount of the g strinfo becomes
+    3).
+    Now, get_stridx_plus_constant needs to chain the new strinfo of &g[1] in
+    between the related strinfos, so after the g record.  Because the strinfo
+    is now shared between the current bb and 2 other bbs, it needs to
+    unshare_strinfo it (creating a new strinfo which can be modified as a copy
+    of the old one, decrementing refcount of the old shared one and setting
+    refcount of the new one to 1):
+      if (strinfo *nextsi = get_strinfo (chainsi->next))
+        {
+          nextsi = unshare_strinfo (nextsi);
+          si->next = nextsi->idx;
+          nextsi->prev = idx;
+        }
+      chainsi = unshare_strinfo (chainsi);
+      if (chainsi->first == 0)
+        chainsi->first = chainsi->idx;
+      chainsi->next = idx;
+    Now, the bug is that the caller of this a couple of frames above,
+    handle_store, holds on a pointer to this g strinfo (but doesn't know
+    about the unsharing, so the pointer is to the old strinfo with refcount
+    of 2), and later needs to update it, so it
+              si = unshare_strinfo (si);
+    and modifies some fields in it.
+    This creates a new strinfo (with refcount of 1 which is stored into
+    the vector of the current bb) based on the old strinfo for g and
+    decrements refcount of the old one to 1.  So, now we are in inconsistent
+    state, because the old strinfo for g is referenced in bb 2 and bb 3
+    vectors, but has just refcount of 1, and then have one strinfo (the one
+    created by unshare_strinfo (chainsi) in get_stridx_plus_constant) which
+    has refcount of 1 but isn't referenced from anywhere anymore.
+    Later on when we free one of the bb 2 or bb 3 vectors (forgot which)
+    that decrements refcount from 1 to 0 and poisons the strinfo/returns it to
+    the pool, but then maybe_invalidate when looking at the other bb's pointer
+    to it ICEs.
+    
+    The following patch fixes it by calling get_strinfo again, it is guaranteed
+    to return non-NULL, but could be an unshared copy instead of the originally
+    fetched shared one.
+    
+    I believe we only need to do this refetching for the case where get_strinfo
+    is called on the lhs before get_stridx is called on other operands, because
+    we should be always modifying (apart from the chaining changes) the strinfo
+    for the destination of the statements, not other strinfos just consumed in
+    there.
+    
+    2024-01-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113603* tree-ssa-strlen.cc (strlen_pass::handle_store): After
+            count_nonzero_bytes call refetch si using get_strinfo in case it
+            has been unshared in the meantime.
+    
+            * gcc.c-torture/compile/pr113603.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-01-30 09:04:26 UTC
+  Text: Fixed on the trunk so far.
+
+- User: GCC Commits | Time: 2024-03-02 00:38:32 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:7bc85af4c48b555da4447405f1319b35ca769d7bcommitr13-8386-g7bc85af4c48b555da4447405f1319b35ca769d7bAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jan 30 09:58:05 2024 +0100
+
+    tree-ssa-strlen: Fix up handle_store [PR113603]
+    
+    Sincer10-2101-gb631bdb3c16e85f35d3handle_store uses
+    count_nonzero_bytes{,_addr} which (more recently limited to statements
+    with the same vuse) can walk earlier statements feeding the rhs
+    of the store and call get_stridx on it.
+    Unlike most of the other functions where get_stridx is called first on
+    rhs and only later on lhs, handle_store calls get_stridx on the lhs before
+    the count_nonzero_bytes* call and does some si->nonzero_bytes comparison
+    on it.
+    Now, strinfo structures are refcounted and it is important not to screw
+    it up.
+    What happens on the following testcase is that we call get_strinfo on the
+    destination idx's base (g), which returns a strinfo at that moment
+    with refcount of 2, one copy referenced in bb 2 final strinfos, one in bb 3
+    (the vector of strinfos was unshared from the dominator there because some
+    other strinfo was added) and finally we process a store in bb 6.
+    Now, count_nonzero_bytes is called and that sees &g[1] in a PHI and
+    calls get_stridx on it, which in turn calls get_stridx_plus_constant
+    because &g + 1 address doesn't have stridx yet.  This creates a new
+    strinfo for it:
+      si = new_strinfo (ptr, idx, build_int_cst (size_type_node, nonzero_chars),
+                        basesi->full_string_p);
+      set_strinfo (idx, si);
+    and the latter call, because it is the first one in bb 6 that needs it,
+    unshares the stridx_to_strinfo vector (so refcount of the g strinfo becomes
+    3).
+    Now, get_stridx_plus_constant needs to chain the new strinfo of &g[1] in
+    between the related strinfos, so after the g record.  Because the strinfo
+    is now shared between the current bb and 2 other bbs, it needs to
+    unshare_strinfo it (creating a new strinfo which can be modified as a copy
+    of the old one, decrementing refcount of the old shared one and setting
+    refcount of the new one to 1):
+      if (strinfo *nextsi = get_strinfo (chainsi->next))
+        {
+          nextsi = unshare_strinfo (nextsi);
+          si->next = nextsi->idx;
+          nextsi->prev = idx;
+        }
+      chainsi = unshare_strinfo (chainsi);
+      if (chainsi->first == 0)
+        chainsi->first = chainsi->idx;
+      chainsi->next = idx;
+    Now, the bug is that the caller of this a couple of frames above,
+    handle_store, holds on a pointer to this g strinfo (but doesn't know
+    about the unsharing, so the pointer is to the old strinfo with refcount
+    of 2), and later needs to update it, so it
+              si = unshare_strinfo (si);
+    and modifies some fields in it.
+    This creates a new strinfo (with refcount of 1 which is stored into
+    the vector of the current bb) based on the old strinfo for g and
+    decrements refcount of the old one to 1.  So, now we are in inconsistent
+    state, because the old strinfo for g is referenced in bb 2 and bb 3
+    vectors, but has just refcount of 1, and then have one strinfo (the one
+    created by unshare_strinfo (chainsi) in get_stridx_plus_constant) which
+    has refcount of 1 but isn't referenced from anywhere anymore.
+    Later on when we free one of the bb 2 or bb 3 vectors (forgot which)
+    that decrements refcount from 1 to 0 and poisons the strinfo/returns it to
+    the pool, but then maybe_invalidate when looking at the other bb's pointer
+    to it ICEs.
+    
+    The following patch fixes it by calling get_strinfo again, it is guaranteed
+    to return non-NULL, but could be an unshared copy instead of the originally
+    fetched shared one.
+    
+    I believe we only need to do this refetching for the case where get_strinfo
+    is called on the lhs before get_stridx is called on other operands, because
+    we should be always modifying (apart from the chaining changes) the strinfo
+    for the destination of the statements, not other strinfos just consumed in
+    there.
+    
+    2024-01-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113603* tree-ssa-strlen.cc (strlen_pass::handle_store): After
+            count_nonzero_bytes call refetch si using get_strinfo in case it
+            has been unshared in the meantime.
+    
+            * gcc.c-torture/compile/pr113603.c: New test.
+    
+    (cherry picked from commit d7250c1e02478586a0cd6d5cb67bf4d17249a7e7)
+
+- User: Jakub Jelinek | Time: 2024-03-04 12:13:02 UTC
+  Text: Should be now fixed for GCC 13.3+ too.
+
+- User: GCC Commits | Time: 2024-06-11 10:36:55 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:f5758e8142d8926f9a3e3500ba3c9956054dfaf8commitr12-10509-gf5758e8142d8926f9a3e3500ba3c9956054dfaf8Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jan 30 09:58:05 2024 +0100
+
+    tree-ssa-strlen: Fix up handle_store [PR113603]
+    
+    Sincer10-2101-gb631bdb3c16e85f35d3handle_store uses
+    count_nonzero_bytes{,_addr} which (more recently limited to statements
+    with the same vuse) can walk earlier statements feeding the rhs
+    of the store and call get_stridx on it.
+    Unlike most of the other functions where get_stridx is called first on
+    rhs and only later on lhs, handle_store calls get_stridx on the lhs before
+    the count_nonzero_bytes* call and does some si->nonzero_bytes comparison
+    on it.
+    Now, strinfo structures are refcounted and it is important not to screw
+    it up.
+    What happens on the following testcase is that we call get_strinfo on the
+    destination idx's base (g), which returns a strinfo at that moment
+    with refcount of 2, one copy referenced in bb 2 final strinfos, one in bb 3
+    (the vector of strinfos was unshared from the dominator there because some
+    other strinfo was added) and finally we process a store in bb 6.
+    Now, count_nonzero_bytes is called and that sees &g[1] in a PHI and
+    calls get_stridx on it, which in turn calls get_stridx_plus_constant
+    because &g + 1 address doesn't have stridx yet.  This creates a new
+    strinfo for it:
+      si = new_strinfo (ptr, idx, build_int_cst (size_type_node, nonzero_chars),
+                        basesi->full_string_p);
+      set_strinfo (idx, si);
+    and the latter call, because it is the first one in bb 6 that needs it,
+    unshares the stridx_to_strinfo vector (so refcount of the g strinfo becomes
+    3).
+    Now, get_stridx_plus_constant needs to chain the new strinfo of &g[1] in
+    between the related strinfos, so after the g record.  Because the strinfo
+    is now shared between the current bb and 2 other bbs, it needs to
+    unshare_strinfo it (creating a new strinfo which can be modified as a copy
+    of the old one, decrementing refcount of the old shared one and setting
+    refcount of the new one to 1):
+      if (strinfo *nextsi = get_strinfo (chainsi->next))
+        {
+          nextsi = unshare_strinfo (nextsi);
+          si->next = nextsi->idx;
+          nextsi->prev = idx;
+        }
+      chainsi = unshare_strinfo (chainsi);
+      if (chainsi->first == 0)
+        chainsi->first = chainsi->idx;
+      chainsi->next = idx;
+    Now, the bug is that the caller of this a couple of frames above,
+    handle_store, holds on a pointer to this g strinfo (but doesn't know
+    about the unsharing, so the pointer is to the old strinfo with refcount
+    of 2), and later needs to update it, so it
+              si = unshare_strinfo (si);
+    and modifies some fields in it.
+    This creates a new strinfo (with refcount of 1 which is stored into
+    the vector of the current bb) based on the old strinfo for g and
+    decrements refcount of the old one to 1.  So, now we are in inconsistent
+    state, because the old strinfo for g is referenced in bb 2 and bb 3
+    vectors, but has just refcount of 1, and then have one strinfo (the one
+    created by unshare_strinfo (chainsi) in get_stridx_plus_constant) which
+    has refcount of 1 but isn't referenced from anywhere anymore.
+    Later on when we free one of the bb 2 or bb 3 vectors (forgot which)
+    that decrements refcount from 1 to 0 and poisons the strinfo/returns it to
+    the pool, but then maybe_invalidate when looking at the other bb's pointer
+    to it ICEs.
+    
+    The following patch fixes it by calling get_strinfo again, it is guaranteed
+    to return non-NULL, but could be an unshared copy instead of the originally
+    fetched shared one.
+    
+    I believe we only need to do this refetching for the case where get_strinfo
+    is called on the lhs before get_stridx is called on other operands, because
+    we should be always modifying (apart from the chaining changes) the strinfo
+    for the destination of the statements, not other strinfos just consumed in
+    there.
+    
+    2024-01-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113603* tree-ssa-strlen.cc (strlen_pass::handle_store): After
+            count_nonzero_bytes call refetch si using get_strinfo in case it
+            has been unshared in the meantime.
+    
+            * gcc.c-torture/compile/pr113603.c: New test.
+    
+    (cherry picked from commit d7250c1e02478586a0cd6d5cb67bf4d17249a7e7)
+
+- User: Jakub Jelinek | Time: 2024-06-11 10:49:50 UTC
+  Text: Should be fixed for 12.4+ too.
+
+- User: GCC Commits | Time: 2024-06-20 13:22:09 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:1b91d111dad699a0738d158b0eca7fd12ded6211commitr11-11493-g1b91d111dad699a0738d158b0eca7fd12ded6211Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Jan 30 09:58:05 2024 +0100
+
+    tree-ssa-strlen: Fix up handle_store [PR113603]
+    
+    Sincer10-2101-gb631bdb3c16e85f35d3handle_store uses
+    count_nonzero_bytes{,_addr} which (more recently limited to statements
+    with the same vuse) can walk earlier statements feeding the rhs
+    of the store and call get_stridx on it.
+    Unlike most of the other functions where get_stridx is called first on
+    rhs and only later on lhs, handle_store calls get_stridx on the lhs before
+    the count_nonzero_bytes* call and does some si->nonzero_bytes comparison
+    on it.
+    Now, strinfo structures are refcounted and it is important not to screw
+    it up.
+    What happens on the following testcase is that we call get_strinfo on the
+    destination idx's base (g), which returns a strinfo at that moment
+    with refcount of 2, one copy referenced in bb 2 final strinfos, one in bb 3
+    (the vector of strinfos was unshared from the dominator there because some
+    other strinfo was added) and finally we process a store in bb 6.
+    Now, count_nonzero_bytes is called and that sees &g[1] in a PHI and
+    calls get_stridx on it, which in turn calls get_stridx_plus_constant
+    because &g + 1 address doesn't have stridx yet.  This creates a new
+    strinfo for it:
+      si = new_strinfo (ptr, idx, build_int_cst (size_type_node, nonzero_chars),
+                        basesi->full_string_p);
+      set_strinfo (idx, si);
+    and the latter call, because it is the first one in bb 6 that needs it,
+    unshares the stridx_to_strinfo vector (so refcount of the g strinfo becomes
+    3).
+    Now, get_stridx_plus_constant needs to chain the new strinfo of &g[1] in
+    between the related strinfos, so after the g record.  Because the strinfo
+    is now shared between the current bb and 2 other bbs, it needs to
+    unshare_strinfo it (creating a new strinfo which can be modified as a copy
+    of the old one, decrementing refcount of the old shared one and setting
+    refcount of the new one to 1):
+      if (strinfo *nextsi = get_strinfo (chainsi->next))
+        {
+          nextsi = unshare_strinfo (nextsi);
+          si->next = nextsi->idx;
+          nextsi->prev = idx;
+        }
+      chainsi = unshare_strinfo (chainsi);
+      if (chainsi->first == 0)
+        chainsi->first = chainsi->idx;
+      chainsi->next = idx;
+    Now, the bug is that the caller of this a couple of frames above,
+    handle_store, holds on a pointer to this g strinfo (but doesn't know
+    about the unsharing, so the pointer is to the old strinfo with refcount
+    of 2), and later needs to update it, so it
+              si = unshare_strinfo (si);
+    and modifies some fields in it.
+    This creates a new strinfo (with refcount of 1 which is stored into
+    the vector of the current bb) based on the old strinfo for g and
+    decrements refcount of the old one to 1.  So, now we are in inconsistent
+    state, because the old strinfo for g is referenced in bb 2 and bb 3
+    vectors, but has just refcount of 1, and then have one strinfo (the one
+    created by unshare_strinfo (chainsi) in get_stridx_plus_constant) which
+    has refcount of 1 but isn't referenced from anywhere anymore.
+    Later on when we free one of the bb 2 or bb 3 vectors (forgot which)
+    that decrements refcount from 1 to 0 and poisons the strinfo/returns it to
+    the pool, but then maybe_invalidate when looking at the other bb's pointer
+    to it ICEs.
+    
+    The following patch fixes it by calling get_strinfo again, it is guaranteed
+    to return non-NULL, but could be an unshared copy instead of the originally
+    fetched shared one.
+    
+    I believe we only need to do this refetching for the case where get_strinfo
+    is called on the lhs before get_stridx is called on other operands, because
+    we should be always modifying (apart from the chaining changes) the strinfo
+    for the destination of the statements, not other strinfos just consumed in
+    there.
+    
+    2024-01-30  Jakub Jelinek  <jakub@redhat.com>PR tree-optimization/113603* tree-ssa-strlen.c (strlen_pass::handle_store): After
+            count_nonzero_bytes call refetch si using get_strinfo in case it
+            has been unshared in the meantime.
+    
+            * gcc.c-torture/compile/pr113603.c: New test.
+    
+    (cherry picked from commit d7250c1e02478586a0cd6d5cb67bf4d17249a7e7)
+

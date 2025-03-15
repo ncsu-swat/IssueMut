@@ -1,0 +1,249 @@
+Bug Summary: LoongArch: target options from LTO objects not respected during linking
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: 
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Yang Yujie | Time: 2024-01-04 13:02:53 UTC
+  Text: Compiling LTO objects with certain target options like -march=, -msimd= have no effect on the final linked binary, since COLLECT_GCC_OPTIONS from the "linker GCC" driver always overrides these options.
+
+For instance, running the following command:
+
+$ gcc -S -o- -xc - -msimd=lasx  -O3 <<< "void m2 (float *a, int n) { for (int i = 0; i < n; i++) a[i] += 1; }" | grep vfadd
+
+outputs SIMD instructions (as enabled by -msimd=lasx):
+ 
+        xvfadd.s        $xr4,$xr4,$xr0
+        xvfadd.s        $xr2,$xr2,$xr0
+        xvfadd.s        $xr1,$xr1,$xr0
+        xvfadd.s        $xr3,$xr3,$xr0
+        vfadd.s $vr1,$vr1,$vr0
+        vfadd.s $vr1,$vr1,$vr0
+        vfadd.s $vr1,$vr1,$vr0
+        vfadd.s $vr1,$vr1,$vr0
+        vfadd.s $vr1,$vr1,$vr0
+        vfadd.s $vr1,$vr1,$vr0
+        vfadd.s $vr0,$vr1,$vr0
+
+However, LTO generates code according to the compiler's default config (-msimd=none).
+
+Running:
+$ gcc -flto -c -o test.o -xc - -msimd=lasx -O3 <<< "void m2 (float *a, int n) { for (int i = 0; i < n; i++) a[i] += 1; }"
+
+and then:
+$ gcc -S -o- -xlto test.o | grep vfadd
+
+outputs nothing, indicating that the final code generation have LSX/LASX disabled.
+
+While:
+$ gcc -S -o- -xlto test.o -mlasx | grep vfadd
+
+outputs the same "vfadd" / "xvfadd" instructions as above.
+
+-------------------------------------------------------------------------------------
+Proposed solution: implement option save/restore to enable LTO option streaming.
+-------------------------------------------------------------------------------------
+
+- User: Yang Yujie | Time: 2024-01-04 13:06:07 UTC
+  Text: I've already made a patch for this, will push it togcc-patches@gcc.gnu.orglater.
+
+- User: Xi Ruoyao | Time: 2024-01-04 13:31:28 UTC
+  Text: Confirm.  But option save/restore has been always implemented:
+
+    .section    .gnu.lto_.opts,"",@progbits
+    .ascii  "'-fno-openmp' '-fno-openacc' '-fno-pie' '-fcf-protection"
+    .ascii  "=none' '-mabi=lp64d' '-march=loongarch64' '-mfpu=64' '-m"
+    .ascii  "simd=lasx' '-mcmodel=normal' '-mtune=loongarch64' '-flto"
+    .ascii  "'\000"
+
+So -msimd=lasx is correctly recorded.  Not sure why it does not work.
+
+- User: Jan Hubicka | Time: 2024-01-04 13:49:25 UTC
+  Text: > Confirm.  But option save/restore has been always implemented:
+> 
+>     .section    .gnu.lto_.opts,"",@progbits
+>     .ascii  "'-fno-openmp' '-fno-openacc' '-fno-pie' '-fcf-protection"
+>     .ascii  "=none' '-mabi=lp64d' '-march=loongarch64' '-mfpu=64' '-m"
+>     .ascii  "simd=lasx' '-mcmodel=normal' '-mtune=loongarch64' '-flto"
+>     .ascii  "'\000"
+> 
+> So -msimd=lasx is correctly recorded.  Not sure why it does not work.With LTO we need to mix code compiled with different sets of options.
+For this reason we imply for every function defition and optimization
+and target attribute which record the flags.  So it seems target
+attribute is likely broken for this flag.
+
+- User: Xi Ruoyao | Time: 2024-01-04 13:51:59 UTC
+  Text: (In reply to Jan Hubicka fromcomment #3)> > Confirm.  But option save/restore has been always implemented:
+> > 
+> >     .section    .gnu.lto_.opts,"",@progbits
+> >     .ascii  "'-fno-openmp' '-fno-openacc' '-fno-pie' '-fcf-protection"
+> >     .ascii  "=none' '-mabi=lp64d' '-march=loongarch64' '-mfpu=64' '-m"
+> >     .ascii  "simd=lasx' '-mcmodel=normal' '-mtune=loongarch64' '-flto"
+> >     .ascii  "'\000"
+> > 
+> > So -msimd=lasx is correctly recorded.  Not sure why it does not work.
+> 
+> With LTO we need to mix code compiled with different sets of options.
+> For this reason we imply for every function defition and optimization
+> and target attribute which record the flags.  So it seems target
+> attribute is likely broken for this flag.Target attribute is not implemented for LoongArch.  And I don't think it's a good idea to implement it in stage 3.
+
+- User: Xi Ruoyao | Time: 2024-01-04 13:52:59 UTC
+  Text: Note that x86 also passes the recorded -mavx2 etc. to lto1.
+
+- User: Yang Yujie | Time: 2024-01-05 01:31:16 UTC
+  Text: (In reply to Xi Ruoyao fromcomment #4)> (In reply to Jan Hubicka fromcomment #3)
+> > > Confirm.  But option save/restore has been always implemented:
+> > > 
+> > >     .section    .gnu.lto_.opts,"",@progbits
+> > >     .ascii  "'-fno-openmp' '-fno-openacc' '-fno-pie' '-fcf-protection"
+> > >     .ascii  "=none' '-mabi=lp64d' '-march=loongarch64' '-mfpu=64' '-m"
+> > >     .ascii  "simd=lasx' '-mcmodel=normal' '-mtune=loongarch64' '-flto"
+> > >     .ascii  "'\000"
+> > > 
+> > > So -msimd=lasx is correctly recorded.  Not sure why it does not work.
+> > 
+> > With LTO we need to mix code compiled with different sets of options.
+> > For this reason we imply for every function defition and optimization
+> > and target attribute which record the flags.  So it seems target
+> > attribute is likely broken for this flag.
+> 
+> Target attribute is not implemented for LoongArch.  And I don't think it's a
+> good idea to implement it in stage 3.Yes, target attribute may have to wait.  But save/restore can be implemented without target attributes of functions.  By marking options as "Save" in .opt or implementing custom TARGET_OPTION_{SAVE,RESTORE} hooks, we can stream the target configuration (which may come from the command line / the target attributes / #pragma GCC target) into the per-function LTO bytecode, so that lto1 can pick up and use them later when generating code for each function.
+
+- User: GCC Commits | Time: 2024-01-11 11:04:17 UTC
+  Text: The master branch has been updated by LuluCheng <chenglulu@gcc.gnu.org>:https://gcc.gnu.org/g:ea2a9c76a1dcffbbec6e53655bef9236d3a8e691commitr14-7134-gea2a9c76a1dcffbbec6e53655bef9236d3a8e691Author: Yang Yujie <yangyujie@loongson.cn>
+Date:   Thu Jan 11 09:07:10 2024 +0800
+
+    LoongArch: Implement option save/restore
+    
+    LTO option streaming and target attributes both require per-function
+    target configuration, which is achieved via option save/restore.
+    
+    We implement TARGET_OPTION_{SAVE,RESTORE} to switch the la_target
+    context in addition to other automatically maintained option states
+    (via the "Save" option property in the .opt files).
+    
+    Tested on loongarch64-linux-gnu without regression.PR target/113233gcc/ChangeLog:
+    
+            * config/loongarch/genopts/loongarch.opt.in: Mark options with
+            the "Save" property.
+            * config/loongarch/loongarch.opt: Same.
+            * config/loongarch/loongarch-opts.cc: Refresh -mcmodel= state
+            according to la_target.
+            * config/loongarch/loongarch.cc: Implement TARGET_OPTION_{SAVE,
+            RESTORE} for the la_target structure; Rename option conditions
+            to have the same "la_" prefix.
+            * config/loongarch/loongarch.h: Same.
+
+- User: GCC Commits | Time: 2024-04-01 03:21:32 UTC
+  Text: The releases/gcc-13 branch has been updated by LuluCheng <chenglulu@gcc.gnu.org>:https://gcc.gnu.org/g:4736b317047ae6b04f7609843f21cb68fef6a0c1commitr13-8545-g4736b317047ae6b04f7609843f21cb68fef6a0c1Author: Lulu Cheng <chenglulu@loongson.cn>
+Date:   Fri Mar 15 16:23:05 2024 +0800
+
+    LoongArch: gcc13: Implement option save/restore.
+    
+    LTO option streaming and target attributes both require per-function
+    target configuration, which is achieved via option save/restore.
+    
+    We implement TARGET_OPTION_{SAVE,RESTORE} to switch the la_target
+    context in addition to other automatically maintained option states
+    (via the "Save" option property in the .opt files).PR target/113233gcc/ChangeLog:
+    
+            * config/loongarch/genopts/loongarch.opt.in: Mark options with
+            the "Save" property.
+            * config/loongarch/loongarch-opts.cc
+            (loongarch_update_gcc_opt_status): Update the value of the
+            la_target to global_options.
+            * config/loongarch/loongarch-opts.h
+            (loongarch_update_gcc_opt_status): Add a function declaration.
+            * config/loongarch/loongarch.cc
+            (loongarch_option_override_internal): Call the function
+            loongarch_update_gcc_opt_status.
+            (loongarch_option_save): New functions.
+            (loongarch_option_restore): Likewise.
+            (TARGET_OPTION_SAVE): Define macro.
+            (TARGET_OPTION_RESTORE): Likewise.
+            * config/loongarch/loongarch.opt: Regenerate.
+    
+    (cherry picked from commit ea2a9c76a1dcffbbec6e53655bef9236d3a8e691)
+
+- User: GCC Commits | Time: 2024-04-01 03:23:00 UTC
+  Text: The releases/gcc-12 branch has been updated by LuluCheng <chenglulu@gcc.gnu.org>:https://gcc.gnu.org/g:bf0b32d7929f8b4b15b21658d572b89ded03d8f8commitr12-10303-gbf0b32d7929f8b4b15b21658d572b89ded03d8f8Author: Lulu Cheng <chenglulu@loongson.cn>
+Date:   Fri Mar 15 16:41:20 2024 +0800
+
+    LoongArch: gcc12: Implement option save/restore.
+    
+    LTO option streaming and target attributes both require per-function
+    target configuration, which is achieved via option save/restore.
+    
+    We implement TARGET_OPTION_{SAVE,RESTORE} to switch the la_target
+    context in addition to other automatically maintained option states
+    (via the "Save" option property in the .opt files).PR target/113233gcc/ChangeLog:
+    
+            * config/loongarch/genopts/loongarch.opt.in: Mark options with
+            the "Save" property.
+            * config/loongarch/loongarch-opts.cc
+            (loongarch_update_gcc_opt_status): Update the value of the
+            la_target to global_options.
+            * config/loongarch/loongarch-opts.h
+            (loongarch_update_gcc_opt_status): Add a function declaration.
+            * config/loongarch/loongarch.cc
+            (loongarch_option_override_internal): Call the function
+            loongarch_update_gcc_opt_status.
+            (loongarch_option_save): New functions.
+            (loongarch_option_restore): Likewise.
+            (TARGET_OPTION_SAVE): Define macro.
+            (TARGET_OPTION_RESTORE): Likewise.
+            * config/loongarch/loongarch.opt: Regenerate.
+    
+    (cherry picked from commit ea2a9c76a1dcffbbec6e53655bef9236d3a8e691)
+
+- User: Xi Ruoyao | Time: 2024-04-01 03:30:13 UTC
+  Text: So fixed for all branches.
+
+- User: Xi Ruoyao | Time: 2024-04-07 08:37:15 UTC
+  Text: I misunderstood the last change and this is not fixed:https://gcc.gnu.org/pipermail/gcc-patches/2024-April/648921.html
+
+- User: GCC Commits | Time: 2024-04-09 09:03:41 UTC
+  Text: The master branch has been updated by LuluCheng <chenglulu@gcc.gnu.org>:https://gcc.gnu.org/g:8657d76d583f0f87000e9003ba75922f2bbe4455commitr14-9866-g8657d76d583f0f87000e9003ba75922f2bbe4455Author: Yang Yujie <yangyujie@loongson.cn>
+Date:   Mon Apr 8 16:45:13 2024 +0800
+
+    LoongArch: Enable switchable target
+    
+    This patch fixes the back-end context switching in cases where functions
+    should be built with their own target contexts instead of the
+    global one, such as LTO linking and functions with target attributes (TBD).PR target/113233gcc/ChangeLog:
+    
+            * config/loongarch/loongarch.cc (loongarch_reg_init):
+            Reinitialize the loongarch_regno_mode_ok cache.
+            (loongarch_option_override): Same.
+            (loongarch_save_restore_target_globals): Restore target globals.
+            (loongarch_set_current_function): Restore the target contexts
+            for functions.
+            (TARGET_SET_CURRENT_FUNCTION): Define.
+            * config/loongarch/loongarch.h (SWITCHABLE_TARGET): Enable
+            switchable target context.
+            * config/loongarch/loongarch-builtins.cc (loongarch_init_builtins):
+            Initialize all builtin functions at startup.
+            (loongarch_expand_builtin): Turn assertion of builtin availability
+            into a test.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * lib/target-supports.exp: Define condition loongarch_sx_as.
+            * gcc.dg/lto/pr113233_0.c: New test.
+
+- User: Xi Ruoyao | Time: 2024-04-09 10:13:48 UTC
+  Text: Will we back port the fix to 13 and 12?
+
+- User: Yang Yujie | Time: 2024-04-10 02:09:33 UTC
+  Text: Is it not really necessary for now, since there is no LSX/LASX support in GCC 12 / 13?
+
+- User: Xi Ruoyao | Time: 2024-04-10 04:06:53 UTC
+  Text: (In reply to Yang Yujie fromcomment #14)> Is it not really necessary for now, since there is no LSX/LASX support in
+> GCC 12 / 13?So closing the ticket as fixed.
+

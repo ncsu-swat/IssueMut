@@ -1,0 +1,193 @@
+Bug Summary: [14 regression] ICE with -fno-guess-branch-probability on aarch64 starting with r14-7187-g74e3e839ab2d36
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Radek Barton | Time: 2024-01-18 15:01:04 UTC
+  Text: Createdattachment 57140[details]neon-issue.i
+
+Hello everyone.
+
+When code with certain combination of NEON instructions intrinsics is compiled for `aarch64-linux-gnu` target with at least `-O1` optimizations enabled, the compilation fails with:
+
+```
+during RTL pass: split1
+neon-issue.c:23:1: internal compiler error: Segmentation fault
+   23 | }
+      | ^
+0xdd5ac3 crash_signal
+        /home/blackhex/mingw-woarm64-build/code/gcc-master/gcc/toplev.cc:317
+0x7f5e7aa0851f ???
+        ./signal/../sysdeps/unix/sysv/linux/x86_64/libc_sigaction.c:0
+0x9e1c4d mark_label_nuses
+        /home/blackhex/mingw-woarm64-build/code/gcc-master/gcc/emit-rtl.cc:3896
+0x9e1cca mark_label_nuses
+        /home/blackhex/mingw-woarm64-build/code/gcc-master/gcc/emit-rtl.cc:3907
+0x9e1c99 mark_label_nuses
+        /home/blackhex/mingw-woarm64-build/code/gcc-master/gcc/emit-rtl.cc:3904
+0x9e7779 try_split(rtx_def*, rtx_insn*, int)
+        /home/blackhex/mingw-woarm64-build/code/gcc-master/gcc/emit-rtl.cc:4093
+0xd3fdd1 split_insn
+        /home/blackhex/mingw-woarm64-build/code/gcc-master/gcc/recog.cc:3405
+0xd44daf split_all_insns()
+        /home/blackhex/mingw-woarm64-build/code/gcc-master/gcc/recog.cc:3509
+0xd44e5c execute
+        /home/blackhex/mingw-woarm64-build/code/gcc-master/gcc/recog.cc:4433
+Please submit a full bug report, with preprocessed source.
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+The bug is not reproducible, so it is likely a hardware or OS problem.
+```
+
+I've reproduced the issue on a recent master branch (9a5e8f9d112adb0fdd0931f72a023cd77c09dd8c) from git://gcc.gnu.org/git/gcc.git compiled with:
+
+```
+configure --prefix=/home/blackhex/cross-aarch64-linux-gnu-libc --target=aarch64-linux-gnu --includedir=/home/blackhex/cross-aarch64-linux-gnu-libc/aarch64-linux-gnu/include --enable-languages=c,lto,c++,fortran --enable-shared --enable-static --enable-graphite --enable-fully-dynamic-string --enable-libstdcxx-filesystem-ts=yes --enable-libstdcxx-time=yes --enable-cloog-backend=isl --enable-version-specific-runtime-libs --enable-lto --enable-libgomp --enable-checking=release --disable-multilib --disable-shared --disable-rpath --disable-werror --disable-symvers --disable-libstdcxx-pch --disable-libstdcxx-debug --disable-isl-version-check --disable-bootstrap --with-libiconv --with-system-zlib --with-gnu-as --with-gnu-ld --enable-debug
+```
+
+when building libjpeg-turbo.
+
+I've managed to narrow down that this regression was introduced by 74e3e839ab2d368413207455af2fdaaacc73842b commit.
+
+The issue is not reproducible when -fno-guess-branch-probability optimization is disabled.
+
+The minimum repro-case, I've found, is:
+
+```
+#include <arm_neon.h>
+
+void test()
+{
+  while (1)
+  {
+    static const uint16_t jsimd_rgb_ycc_neon_consts[] = {19595, 0, 0, 0, 0, 0, 0, 0};
+    uint16x8_t consts = vld1q_u16(jsimd_rgb_ycc_neon_consts);
+    
+    uint8_t tmp_buf[0];
+    uint8x8x3_t input_pixels = vld3_u8(tmp_buf);
+    uint16x8_t r = vmovl_u8(input_pixels.val[1]);
+    uint32x4_t y_l = vmull_laneq_u16(vget_low_u16(r), consts, 0);
+
+    uint32x4_t s = vdupq_n_u32(1);
+    uint16x4_t a = vrshrn_n_u32(s, 16);
+    uint16x4_t y = vrshrn_n_u32(y_l, 16);
+    uint16x8_t ay = vcombine_u16(a, y);
+
+    unsigned char ***out_buf;
+    vst1_u8(out_buf[1][0], vmovn_u16(ay));
+  }
+}
+```
+and the build command I used is:
+```
+/home/blackhex/cross-aarch64-linux-gnu-libc/bin/aarch64-linux-gnu-gcc \
+    -O1 -Wall -Wextra \
+    -c neon-issue.c \
+    -freport-bug -save-temps
+```
+
+I am attaching the repro-case with the header expanded.
+
+Radek Bartoň
+
+- User: Andrew Pinski | Time: 2024-01-18 15:32:36 UTC
+  Text: aarch64_get_shareable_reg looks questionable for a split ...
+
+- User: Andrew Pinski | Time: 2024-01-18 17:46:41 UTC
+  Text: cfun->machine->advsimd_zero_insn use is plain wrong. As the RTL could be removed fully from the RTL stream and then it will be GC'ed.
+
+Plus I really doubt using emit_insn_before with function_beg_insn during split is going to work correctly.
+
+- User: Maxim Kuvyrkov | Time: 2024-01-23 19:09:36 UTC
+  Text: Hi Richard,
+
+Would you please investigate this?
+
+- User: Andrew Pinski | Time: 2024-01-24 03:18:05 UTC
+  Text: ***Bug 113573has been marked as a duplicate of this bug. ***
+
+- User: Andrew Pinski | Time: 2024-01-24 03:26:50 UTC
+  Text: Note the issue is really:
+9730        rtx op = lowpart_subreg (<VNARROWQ2>mode, operands[1], <VNARROWQ>mode);
+
+
+We have:
+(subreg:V8QI (reg/v:V4x8QI 110 [ input_pixels ]) 8)
+
+And then lowpart_subreg  returns null.
+
+Note I still have my doubts about aarch64_get_shareable_reg, especially when spread across different splits.
+
+- User: Jakub Jelinek | Time: 2024-01-24 13:49:28 UTC
+  Text: Yeah, in particular the
+;; Sign- or zero-extend a 64-bit integer vector to a 128-bit vector.
+(define_insn_and_split "<optab><Vnarrowq><mode>2"
+  [(set (match_operand:VQN 0 "register_operand" "=w")
+        (ANY_EXTEND:VQN (match_operand:<VNARROWQ> 1 "register_operand" "w")))]
+  "TARGET_SIMD"
+  "<su>xtl\t%0.<Vtype>, %1.<Vntype>"
+  "&& <CODE> == ZERO_EXTEND
+   && aarch64_split_simd_shift_p (insn)"
+  [(const_int 0)]
+  {
+    /* On many cores, it is cheaper to implement UXTL using a ZIP1 with zero,
+       provided that the cost of the zero can be amortized over several
+       operations.  We'll later recombine the zero and zip if there are
+       not sufficient uses of the zero to make the split worthwhile.  */
+    rtx res = simplify_gen_subreg (<VNARROWQ2>mode, operands[0],
+                                   <MODE>mode, 0);
+    rtx zero = aarch64_gen_shareable_zero (<VNARROWQ2>mode);
+    rtx op = lowpart_subreg (<VNARROWQ2>mode, operands[1], <VNARROWQ>mode);
+    emit_insn (gen_aarch64_zip1<Vnarrowq2> (res, op, zero));
+    DONE;
+  }
+  [(set_attr "type" "neon_shift_imm_long")]
+)
+splitter here.
+Note, this ICE breaks quite a few packages in fedora, including firefox.
+
+- User: Richard Sandiford | Time: 2024-01-24 14:48:47 UTC
+  Text: I suppose the ZIP1 patterns should just have 64-bit inputs,
+rather than going to the trouble of creating paradoxical subregs.> cfun->machine->advsimd_zero_insn use is plain wrong. As the RTL could be removed fully from the RTL stream and then it will be GC'ed.But machine_function is a GTYed structure, so the reference itself should prevent GC.  I don't think we should be in the practice of explicitly ggc_free()ing RTL, since callers don't generally know what other references there might be.
+
+- User: GCC Commits | Time: 2024-01-25 12:03:34 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:f251bbfec9174169510b2dec14b9bf763e7b77afcommitr14-8420-gf251bbfec9174169510b2dec14b9bf763e7b77afAuthor: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Thu Jan 25 12:03:17 2024 +0000
+
+    aarch64: Avoid paradoxical subregs in UXTL split [PR113485]g:74e3e839ab2d36841320handled the UXTL{,2}-ZIP[12] optimisation
+    in split1.  The UXTL input is a 64-bit vector of N-bit elements
+    and the result is a 128-bit vector of 2N-bit elements.  The
+    corresponding ZIP1 operates on 128-bit vectors of N-bit elements.
+    
+    This meant that the ZIP1 input had to be a 128-bit paradoxical subreg
+    of the 64-bit UXTL input.  In the PRs, it wasn't possible to generate
+    this subreg because the inputs were already subregs of a x[234]
+    structure of 64-bit vectors.
+    
+    I don't think the same thing can happen for UXTL2->ZIP2 because
+    UXTL2 input is a 128-bit vector rather than a 64-bit vector.
+    
+    It isn't really necessary for ZIP1 to take 128-bit inputs,
+    since the upper 64 bits are ignored.  This patch therefore adds
+    a pattern for 64-bit â 128-bit ZIP1s.
+    
+    In principle, we should probably use this form for all ZIP1s.
+    But in practice, that creates an awkward special case, and
+    would be quite invasive for stage 4.
+    
+    gcc/PR target/113485* config/aarch64/aarch64-simd.md (aarch64_zip1<mode>_low): New
+            pattern.
+            (<optab><Vnarrowq><mode>2): Use it instead of generating a
+            paradoxical subreg for the input.
+    
+    gcc/testsuite/PR target/113485* gcc.target/aarch64/pr113485.c: New test.
+            * gcc.target/aarch64/pr113573.c: Likewise.
+
+- User: Richard Sandiford | Time: 2024-01-25 12:11:38 UTC
+  Text: Fixed.
+

@@ -1,0 +1,188 @@
+Bug Summary: [15 regression] wrong code at -Os with "-fno-tree-sra" on x86_64-linux-gnu since r15-1391-g4b75ed33fa5fd6
+Product: gcc
+Component: tree-optimization
+
+  (show other bugs)
+Keywords: alias, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Zhendong Su | Time: 2024-06-21 12:42:24 UTC
+  Text: It appears to be a very recent regression as it doesn't reproduce with 14.1. 
+
+Compiler Explorer:https://godbolt.org/z/8qsq5zbeE[572] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240620 (experimental) (GCC) 
+[573] % 
+[573] % gcctk -Os small.c; ./a.out
+[574] % 
+[574] % gcctk -Os -fno-tree-sra small.c
+[575] % ./a.out
+Aborted
+[576] % 
+[576] % cat small.c
+int printf(const char *, ...);
+int a, b = 1, c;
+int main() {
+  int d[2], *e = &d[1];
+  while (a) {
+    int *f = &b;
+    d[1] = 0;
+    *f = 0;
+  }
+  if (c)
+    printf("%d\n", *e);
+  if (b != 1)
+    __builtin_abort();
+  return 0;
+}
+
+- User: Sam James | Time: 2024-06-21 12:43:10 UTC
+  Text: ***Bug 115578has been marked as a duplicate of this bug. ***
+
+- User: Sam James | Time: 2024-06-21 13:49:37 UTC
+  Text: very recent indeed:r15-1391-g4b75ed33fa5fd6
+
+- User: Zhendong Su | Time: 2024-06-21 16:36:43 UTC
+  Text: Perhaps the same or a related issue.  It reproduces for -O{s,2,3}. 
+
+Compiler Explorer:https://godbolt.org/z/x779P9b5a[570] % gcctk -v
+Using built-in specs.
+COLLECT_GCC=gcctk
+COLLECT_LTO_WRAPPER=/local/suz-local/software/local/gcc-trunk/libexec/gcc/x86_64-pc-linux-gnu/15.0.0/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: ../gcc-trunk/configure --disable-bootstrap --enable-checking=yes --prefix=/local/suz-local/software/local/gcc-trunk --enable-sanitizers --enable-languages=c,c++ --disable-werror --enable-multilib
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 15.0.0 20240620 (experimental) (GCC) 
+[571] % 
+[571] % gcctk -O2 small.c; ./a.out
+[572] % 
+[572] % gcctk -O2 -fno-tree-fre -fno-tree-sra -fno-tree-ch -fno-tree-dce small.c
+[573] % ./a.out
+Floating point exception
+[574] % 
+[574] % cat small.c
+int a = 1;
+int main() {
+  int b[1], c;
+  for (c = 0; c < 2; c++) {
+    int d = a, e = 1 / d;
+    while (!e) {
+      b[0] = 0;
+      while (b[0])
+        ;
+      a = 0;
+    }
+  }
+  return 0;
+}
+
+- User: Andrew Pinski | Time: 2024-06-21 16:43:30 UTC
+  Text: Confirmed. LIM is doing it wrong:
+```
+  <bb 2> [local count: 118111600]:
+  a.0_1 = a;
+...
+  b_lsm.10_17 = _16(D);
+  goto <bb 4>; [100.00%]
+...
+  <bb 4> [local count: 1073741824]:
+  # d_I_lsm.9_13 = PHI <d_I_lsm.9_15(2), d_I_lsm.9_18(3)>
+  # b_lsm.10_14 = PHI <b_lsm.10_17(2), b_lsm.10_19(3)>
+  if (a.0_1 != 0)
+    goto <bb 3>; [89.00%]
+  else
+    goto <bb 5>; [11.00%]
+
+  <bb 5> [local count: 118111600]:
+  # d_I_lsm.9_23 = PHI <d_I_lsm.9_13(4)>
+  # b_lsm.10_24 = PHI <b_lsm.10_14(4)>
+  d[1] = d_I_lsm.9_23;
+  b = b_lsm.10_24;
+...
+```
+
+Why was the store to b an unconditional one here?
+
+
+
+Before LIM:
+```
+  <bb 2> [local count: 118111600]:
+  goto <bb 4>; [100.00%]
+
+  <bb 3> [local count: 955630224]:
+  d[1] = 0;
+  b = 0;
+
+  <bb 4> [local count: 1073741824]:
+  a.0_1 = a;
+  if (a.0_1 != 0)
+    goto <bb 3>; [89.00%]
+  else
+    goto <bb 5>; [11.00%]
+```
+
+It looks like it is pulling out d[1] of the loop unconditionally and that also causes b to be done unconditionally ...
+
+So -Os is needed because we can't see the loop is an infinite one too ...
+
+- User: Andrew Pinski | Time: 2024-06-21 16:45:04 UTC
+  Text: (In reply to Zhendong Su fromcomment #3)> Perhaps the same or a related issue.  It reproduces for -O{s,2,3}.It is the same due to -fno-tree-ch . -Os has a very restrictive version of that.
+
+- User: Andrew Pinski | Time: 2024-06-21 16:58:25 UTC
+  Text: So looking into the code. The problem is the ordering.
+That is if the store to b is first things will just work.
+
+The loop to call execute_sm:
+          execute_sm (loop, ref, aux_map, true, !first_p);
+
+Except use_other_flag_var is wrong if the first one didn't have a store flag.
+
+  if (multi_threaded_model_p && !use_other_flag_var)
+    aux->store_flag
+      = execute_sm_if_changed_flag_set (loop, ref, &aux->flag_bbs);
+  else
+    aux->store_flag = NULL_TREE;
+
+- User: Richard Biener | Time: 2024-06-22 12:28:06 UTC
+  Text: Mine.  This is probably a latent issue.
+
+- User: Richard Biener | Time: 2024-06-22 12:58:01 UTC
+  Text: Ah, ok - the situation is new in that store-flag re-use is only considered for
+loops which have all stores in a single BB and of course there always_stored
+is always the same but now ref_can_have_store_data_races can be different for
+stores.
+
+I have a fix, it's to some extent not optimal as we emit unnecessary loads
+up to the first var that needs the MT model.
+
+There's the general optimization opportunity missing to share flag vars
+for stores that are stored in the same BBs.
+
+- User: GCC Commits | Time: 2024-06-23 09:24:25 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:8a1795bddcd34284936af4706f762d89c60fc69ccommitr15-1564-g8a1795bddcd34284936af4706f762d89c60fc69cAuthor: Richard Biener <rguenther@suse.de>
+Date:   Sat Jun 22 14:59:09 2024 +0200
+
+    tree-optimization/115579 - fix wrong code with store-motion
+    
+    The recent change to relax store motion for variables that cannot have
+    store data races broke the optimization to share flag vars for stores
+    that all happen in the same single BB.  The following fixes this.PR tree-optimization/115579* tree-ssa-loop-im.cc (execute_sm): Return the auxiliary data
+            created.
+            (hoist_memory_references): Record the flag var that's eventually
+            created and re-use it when all stores are in the same BB.
+    
+            * gcc.dg/pr115579.c: New testcase.
+
+- User: Richard Biener | Time: 2024-06-23 09:24:38 UTC
+  Text: Fixed.
+

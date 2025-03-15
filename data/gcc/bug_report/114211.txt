@@ -1,0 +1,155 @@
+Bug Summary: [13 Regression] wrong code with -O -fno-tree-coalesce-vars since r13-1907
+Product: gcc
+Component: rtl-optimization
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 13.2.1, 14.0
+
+Comments:
+- User: Zdenek Sojka | Time: 2024-03-02 19:03:25 UTC
+  Text: Createdattachment 57596[details]reduced testcase
+
+Output:
+$ x86_64-pc-linux-gnu-gcc -O -fno-tree-coalesce-vars testcase.c
+$ ./a.out 
+Aborted
+
+
+$ x86_64-pc-linux-gnu-gcc -v
+Using built-in specs.
+COLLECT_GCC=/repo/gcc-trunk/binary-latest-amd64/bin/x86_64-pc-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/repo/gcc-trunk/binary-trunk-r14-9272-20240302122604-gc8d12343a94-checking-yes-rtl-df-extra-nobootstrap-amd64/bin/../libexec/gcc/x86_64-pc-linux-gnu/14.0.1/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /repo/gcc-trunk//configure --enable-languages=c,c++ --enable-valgrind-annotations --disable-nls --enable-checking=yes,rtl,df,extra --disable-bootstrap --with-cloog --with-ppl --with-isl --build=x86_64-pc-linux-gnu --host=x86_64-pc-linux-gnu --target=x86_64-pc-linux-gnu --with-ld=/usr/bin/x86_64-pc-linux-gnu-ld --with-as=/usr/bin/x86_64-pc-linux-gnu-as --enable-libsanitizer --disable-libstdcxx-pch --prefix=/repo/gcc-trunk//binary-trunk-r14-9272-20240302122604-gc8d12343a94-checking-yes-rtl-df-extra-nobootstrap-amd64
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 14.0.1 20240302 (experimental) (GCC)
+
+- User: Andrew Pinski | Time: 2024-03-02 20:59:35 UTC
+  Text: The difference with/without -fno-tree-coalesce-vars is just the expansion from gimple to RTL does not reuse psedu-registers for variables which could have been coalesced.
+
+- User: Richard Biener | Time: 2024-03-04 10:08:38 UTC
+  Text: Possibly target independent rtl-optimization issue.
+
+- User: Uroš Bizjak | Time: 2024-03-04 15:00:35 UTC
+  Text: (In reply to Richard Biener fromcomment #2)> Possibly target independent rtl-optimization issue.It is _subreg1 pass that converts:
+
+(insn 10 7 11 2 (set (reg/v:TI 106 [ h ])
+        (rotate:TI (reg/v:TI 106 [ h ])
+            (const_int 64 [0x40]))) "pr114211.c":9:5 1042 {rotl64ti2_doubleword}
+     (nil))
+
+to:
+
+(insn 39 7 40 2 (set (reg:DI 128 [ h+8 ])
+        (reg:DI 127 [ h ])) "pr114211.c":9:5 84 {*movdi_internal}
+     (nil))
+(insn 40 39 11 2 (set (reg:DI 127 [ h ])
+        (reg:DI 128 [ h+8 ])) "pr114211.c":9:5 84 {*movdi_internal}
+     (nil))
+
+Well... this won't swap. Either parallel should be emitted, or a temporary should be used.
+
+Adding -fno-split-wide-types fixes the testcase.
+
+Re-confirmed as rtl-optimization problem.
+
+- User: Jakub Jelinek | Time: 2024-03-04 18:32:19 UTC
+  Text: Started withr13-1907-g525a1a73a5a563c829a5f76858fe122c9b39f254
+
+- User: Jakub Jelinek | Time: 2024-03-04 18:59:38 UTC
+  Text: Anyway, the actual bug is in ther9-4082-g38e601118ca88adf0a472750b0da83f0ef1798a7PR87507change.
+Either we need to punt if the rotate input and output overlaps, or handle that case correctly.
+
+- User: Jakub Jelinek | Time: 2024-03-04 19:41:16 UTC
+  Text: Createdattachment 57603[details]gcc14-pr114211.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2024-03-05 09:33:51 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:aed445b0fd0c7ed16124c61e7eb732992426f103commitr14-9315-gaed445b0fd0c7ed16124c61e7eb732992426f103Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Mar 5 10:32:38 2024 +0100
+
+    lower-subreg: Fix ROTATE handling [PR114211]
+    
+    On the following testcase, we have
+    (insn 10 7 11 2 (set (reg/v:TI 106 [ h ])
+            (rotate:TI (reg/v:TI 106 [ h ])
+                (const_int 64 [0x40]))) "pr114211.c":8:5 1042 {rotl64ti2_doubleword}
+         (nil))
+    before subreg1 and the pass decides to use
+    (reg:DI 127 [ h ]) / (reg:DI 128 [ h+8 ])
+    register pair instead of (reg/v:TI 106 [ h ]).
+    resolve_operand_for_swap_move_operator implements it by pretending it is
+    an assignment from
+    (concatn (reg:DI 127 [ h ]) (reg:DI 128 [ h+8 ]))
+    to
+    (concatn (reg:DI 128 [ h+8 ]) (reg:DI 127 [ h ]))
+    The problem is that if the rotate argument is the same as destination or
+    if there is even an overlap between the first half of the destination with
+    second half of the source we emit incorrect code, because the store to
+    (reg:DI 128 [ h+8 ]) overwrites what we need for source of the second
+    move.  The following patch detects that case and uses a temporary pseudo
+    to hold the original (reg:DI 128 [ h+8 ]) value across the first store.
+    
+    2024-03-05  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/114211* lower-subreg.cc (resolve_simple_move): For double-word
+            rotates by BITS_PER_WORD if there is overlap between source
+            and destination use a temporary.
+    
+            * gcc.dg/pr114211.c: New test.
+
+- User: Jakub Jelinek | Time: 2024-03-05 09:38:33 UTC
+  Text: Fixed on the trunk so far.
+
+- User: Uroš Bizjak | Time: 2024-03-05 11:35:05 UTC
+  Text: Noticed this in passing:
+
+-->     movq    %rcx, %rdx
+        addq    v(%rip), %rax
+        adcq    v+8(%rip), %rdx
+        vmovq   %rax, %xmm1
+        vpinsrq $1, %rdx, %xmm1, %xmm0
+
+We could use %rcx instead of %rdx to eliminate the marked move. This is an artefact of post-reload split of *add<dwi>3_doubleword. The _doubleword patterns use only general regs, so they could be split before reload as well. IIRC, there were some minor RA problems with the later approach, but as years passed and LRA improved, perhaps the split point can be moved before reload.
+
+Something to try (again) for gcc-15. It is just the case of using ix86_pre_reload_split instead of reload_completed.
+
+- User: GCC Commits | Time: 2024-03-15 23:29:15 UTC
+  Text: The releases/gcc-13 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:df3994a1be3565ad450d552dc94b696748a7807acommitr13-8447-gdf3994a1be3565ad450d552dc94b696748a7807aAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Tue Mar 5 10:32:38 2024 +0100
+
+    lower-subreg: Fix ROTATE handling [PR114211]
+    
+    On the following testcase, we have
+    (insn 10 7 11 2 (set (reg/v:TI 106 [ h ])
+            (rotate:TI (reg/v:TI 106 [ h ])
+                (const_int 64 [0x40]))) "pr114211.c":8:5 1042 {rotl64ti2_doubleword}
+         (nil))
+    before subreg1 and the pass decides to use
+    (reg:DI 127 [ h ]) / (reg:DI 128 [ h+8 ])
+    register pair instead of (reg/v:TI 106 [ h ]).
+    resolve_operand_for_swap_move_operator implements it by pretending it is
+    an assignment from
+    (concatn (reg:DI 127 [ h ]) (reg:DI 128 [ h+8 ]))
+    to
+    (concatn (reg:DI 128 [ h+8 ]) (reg:DI 127 [ h ]))
+    The problem is that if the rotate argument is the same as destination or
+    if there is even an overlap between the first half of the destination with
+    second half of the source we emit incorrect code, because the store to
+    (reg:DI 128 [ h+8 ]) overwrites what we need for source of the second
+    move.  The following patch detects that case and uses a temporary pseudo
+    to hold the original (reg:DI 128 [ h+8 ]) value across the first store.
+    
+    2024-03-05  Jakub Jelinek  <jakub@redhat.com>PR rtl-optimization/114211* lower-subreg.cc (resolve_simple_move): For double-word
+            rotates by BITS_PER_WORD if there is overlap between source
+            and destination use a temporary.
+    
+            * gcc.dg/pr114211.c: New test.
+    
+    (cherry picked from commit aed445b0fd0c7ed16124c61e7eb732992426f103)
+
+- User: Jakub Jelinek | Time: 2024-03-18 14:41:07 UTC
+  Text: Fixed for 13.3+ too.
+

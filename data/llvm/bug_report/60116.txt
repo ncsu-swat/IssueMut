@@ -1,0 +1,153 @@
+Issue Title: Unexpected relocation type R_X86_64_REX_GOTPCRELX when customized stack protector is enabled with -fno-PIE
+Original Post: GCC version: 9.3.0
+CLANG version: 15.0.7
+
+Hello.
+
+I'm trying to pick the commit in [https://lwn.net/ml/linux-kernel/20211113124035.9180-2-brgerst@gmail.com/](url) , which uses
+`-mstack-protector-guard-reg=gs -mstack-protector-guard-symbol=__stack_chk_guard` to implement per-cpu variable for the stack protector instead of fixed location.
+
+But kernel built with LLVM=1 failed due to unexpected relocation type `R_X86_64_REX_GOTPCRELX` for `__stack_chk_guard`.
+Although, it would be optimized by linker later. However, for GCC, it generates relocation type R_X86_64_PC32 directly.
+
+So I write a test case as following:
+```C
+#include <err.h>
+
+extern int ttyname_r(int, char *, int);
+
+int test(void)
+{
+	char name[10];
+
+	if (ttyname_r(0, name, 10))
+	    err(1, "capsicum");
+
+        return 0;
+}
+``` 
+
+For gcc, it generates `R_X86_64_PC32`.
+```shell
+gcc -O2 -fstack-protector-strong -mcmodel=kernel -fno-PIE -mstack-protector-guard-reg=gs -mstack-protector-guard-symbol=__stack_chk_guard -c test.c -o test.o
+
+objdump -r test.o
+
+test.o:     file format elf64-x86-64
+
+RELOCATION RECORDS FOR [.text]:
+OFFSET           TYPE              VALUE
+000000000000000f R_X86_64_PC32     __stack_chk_guard-0x0000000000000004
+0000000000000020 R_X86_64_PLT32    ttyname_r-0x0000000000000004
+0000000000000031 R_X86_64_PC32     __stack_chk_guard-0x0000000000000004
+0000000000000041 R_X86_64_32S      .rodata.str1.1
+000000000000004d R_X86_64_PLT32    err-0x0000000000000004
+0000000000000052 R_X86_64_PLT32    __stack_chk_fail-0x0000000000000004
+
+
+RELOCATION RECORDS FOR [.eh_frame]:
+OFFSET           TYPE              VALUE
+0000000000000020 R_X86_64_PC32     .text
+```
+
+For clang, it generates `R_X86_64_REX_GOTPCRELX`.
+```shell
+clang -O2 -fstack-protector-strong -mcmodel=kernel -fno-PIE -mstack-protector-guard-reg=gs -mstack-protector-guard-symbol=__stack_chk_guard -c test.c -o test.o
+
+objdump -r test.o
+
+test.o:     file format elf64-x86-64
+
+RELOCATION RECORDS FOR [.text]:
+OFFSET           TYPE              VALUE
+0000000000000008 R_X86_64_REX_GOTPCRELX  __stack_chk_guard-0x0000000000000004
+0000000000000022 R_X86_64_PLT32    ttyname_r-0x0000000000000004
+0000000000000045 R_X86_64_32S      .rodata.str1.1
+000000000000004c R_X86_64_PLT32    err-0x0000000000000004
+0000000000000051 R_X86_64_PLT32    __stack_chk_fail-0x0000000000000004
+
+
+RELOCATION RECORDS FOR [.eh_frame]:
+OFFSET           TYPE              VALUE
+0000000000000020 R_X86_64_PC32     .text
+```
+
+Why clang doesn't generates relocation type `R_X86_64_PC32` directly with `-fno-PIE` ?
+
+Thanks.
+
+Comment by MaskRay: Clang's `-fno-pic` option chooses `R_X86_64_REX_GOTPCRELX` which is correct, although it differs from GCC's `-fno-pic` option.
+
+The compiler doesn't know whether `__stack_chk_guard` will be provided by the main executable (`libc.a`) or a shared object (`libc.so`, available on some ports of glibc but not x86, on musl this is available for all ports).
+(Also see `__stack_chk_guard` on https://maskray.me/blog/2022-12-18-control-flow-integrity)
+
+If an `R_X86_64_32` relocation is used and `__stack_chk_guard` is defined by a shared object, copy relocation.
+We will need an ELF hack called [copy relocation](https://maskray.me/blog/2021-01-09-copy-relocations-canonical-plt-entries-and-protected).
+
+The instruction movq __stack_chk_guard@GOTPCREL(%rip), %rbx produces an R_X86_64_REX_GOTPCRELX relocation. 
+If `__stack_chk_guard` is non-preemptible, linkers can [optimize the access to be direct](https://maskray.me/blog/2021-08-29-all-about-global-offset-table#got-optimization).
+
+Although we could technically use the `-fno-direct-access-external-data` option to switch between `R_X86_64_REX_GOTPCRELX` and `R_X86_64_32`, I think there is no justification to complicate the compiler.
+Comment by MaskRay: I consider Clang's behavior working as intended and the issue a wontfix. The Linux kernel should support `R_X86_64_REX_GOTPCRELX`. It is straightforward: just treat `R_X86_64_REX_GOTPCRELX` the same way as `R_X86_64_PC32` (`-shared -Bsymbolic` plus that every symbol is defined means every symbol is non-preemptible).
+
+The behavior of `gcc -fpie` using a direct access `movq    %gs:__stack_chk_guard(%rip), %rax` should be fixed to use `R_X86_64_REX_GOTPCRELX`.
+
+
+Comment by ardbiesheuvel: I disagree.
+
+We are emitting GOT based references when explicitly using -fno-pic/-fno-pie. You can argue that this is correct behavior, but this never happens otherwise, so it is at least surprising. I would at least expect -fdirect-access-external-data to live up to its name here. But it would be better if -fno-pie would have the same effect on stack cookie references that it has on all other symbol references.
+
+For the Linux/x86 kernel, having GOTPCREL relocations is problematic for a variety of reasons:
+- Instead of PIE linking, we rely on --emit-relocs to describe all quantities in the binary that need to be fixed up. This is tricky because this describes the situation before relaxation, and so they tend to go out of sync. This is made worse by the fact that we need runtime fixups for RIP-relative accesses to per-CPU variables, which could be the result of such relaxations. (In general, the x86 use of per-CPU variables and GS indexing is rather insane, but we're stuck with it for the time being)
+- Non-PIE linking of GOTPCRELX references may result in relaxations that replace GOT memory operands with absolute immediates. (e.g., `ADD foo@GOTPCREL, %eax` may be converted into `ADD $0x###, %eax`). We have some C code in the kernel that may execute from a different virtual address than it was linked at, and this is brittle code. So in general, we cannot assume that absolute and relative references can be freely substituted, and so at this point, I don't think x86 should rely on GOT relaxations at all.
+
+- We have to update our tooling to deal with GOTPCREL relocations. Ideally, we could just ignore them, but given the above, we cannot. However, --emit-relocs does not describe the GOT, so our build tools don't have sufficient information to describe it (This is why we ASSERT() in the linker script that the GOT is empty)
+
+Comment by MaskRay: `--emit-relocs` is compatible with `R_X86_64_REX_GOTPCRELX`. You just get the original relocation record.
+I see that `R_X86_64_PC32` occurrs in multiple locations in `arch/x86/`.
+I don't know which one is relevant, but you can recognize `R_X86_64_REX_GOTPCRELX` only for `__stack_chk_guard`, not other symbols.
+
+```
+# RUN: llvm-mc -filetype=obj -triple=x86_64 %s -o %t.o
+# RUN: ld.lld -shared -Bsymbolic --emit-relocs %t.o -o %t
+
+.globl _start
+_start:
+  movq __stack_chk_guard@GOTPCREL(%rip), %rax
+
+.data
+.globl __stack_chk_guard
+__stack_chk_guard:
+.quad 1
+```
+
+```
+% llvm-objdump -dr a.o
+...
+0000000000000000 <_start>:
+       0: 48 8b 05 00 00 00 00          movq    (%rip), %rax            # 0x7 <_start+0x7>
+                0000000000000003:  R_X86_64_REX_GOTPCRELX       __stack_chk_guard-0x4
+% llvm-objdump -dr a
+...
+00000000000012a8 <_start>:
+    12a8: 48 8d 05 81 20 00 00          leaq    0x2081(%rip), %rax      # 0x3330 <__stack_chk_guard>
+                00000000000012ab:  R_X86_64_REX_GOTPCRELX       __stack_chk_guard-0x4
+```
+
+> Non-PIE linking of GOTPCRELX references may result in relaxations that replace GOT memory operands with absolute immediates.
+
+Yes, both `addl bar@GOTPCREL(%rip), %ebx` and `addq bar@GOTPCREL(%rip), %rbx` can be relaxed to use absolute addressing for `-no-pie` linking.
+GNU ld performs both `R_X86_64_GOTPCRELX` and `R_X86_64_REX_GOTPCRELX` relaxations while lld only implements the latter.
+If the kernel uses `-pie` or `-shared`, such relaxations will not be performed.
+
+With the optimization, there will be no GOT entry for `__stack_chk_guard`.
+
+Comment by ardbiesheuvel: Thanks for elaborating.
+
+However, I don't think it is reasonable to simply assume that all R_X86_64_REX_GOTPCRELX relocations refer to a RIP-relative LEAQ instruction involving __stack_chk_guard without decoding the instruction,
+
+Alsol the instruction sequence is substantially longer, and given how often it is instantiated, this is not negligible.
+
+Bottom line: I don't think we will be able to use this in the kernel in its current form. Can we at least implement `-fdirect-access-external-data`?
+Comment by MaskRay: https://reviews.llvm.org/D150841 will allow `-f[no-]direct-access-external-data` to affect direct/indirect accesses of the stack guard symbol.
+Comment by llvmbot: @llvm/issue-subscribers-clang-codegen

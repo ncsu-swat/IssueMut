@@ -1,0 +1,370 @@
+Bug Summary: [15 regression] TLS relocation issue when building glibc with -O3 -mavx512bf16 by r15-1619
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Sam James | Time: 2024-07-23 06:34:40 UTC
+  Text: Createdattachment 58731[details]argp-help.i.xz
+
+I can report this over on the binutils side if needed but I think it's a gcc-side issue, but not probed it far yet.
+
+I'm going to clean up the testcase in a minute.
+
+```
+$ gcc-15 ../build-amd64-x86_64-pc-linux-gnu-nptl/argp/argp-help.i -O3 -march=znver4 -std=gnu11 -fgnu89-inline -Wl,-z,undefs
+[...]
+/usr/libexec/gcc/x86_64-pc-linux-gnu/ld: /tmp/ccnElaGo.o:argp-help.c:(.text+0x1b95): more undefined references to `strchr' follow
+/usr/libexec/gcc/x86_64-pc-linux-gnu/ld: /tmp/ccnElaGo.o: TLS transition from R_X86_64_GOTTPOFF to R_X86_64_TPOFF32 against `__libc_tsd_CTYPE_B' at 0x22f7 in section `.text' failed
+/usr/libexec/gcc/x86_64-pc-linux-gnu/ld: final link failed: bad value
+collect2: error: ld returned 1 exit status
+```
+
+The relocation issue isn't there with -O2 or with gcc 14.
+
+--
+
+```
+Using built-in specs.
+COLLECT_GCC=gcc
+COLLECT_LTO_WRAPPER=/usr/libexec/gcc/x86_64-pc-linux-gnu/15/lto-wrapper
+Target: x86_64-pc-linux-gnu
+Configured with: /var/tmp/portage/sys-devel/gcc-15.0.0_pre20240721/work/gcc-15-20240721/configure --host=x86_64-pc-linux-gnu --build=x86_64-pc-linux-gnu --prefix=/usr --bindir=/usr/x86_64-pc-linux-gnu/gcc-bin/15 --includedir=/usr/lib/gcc/x86_64-pc-linux-gnu/15/include --datadir=/usr/share/gcc-data/x86_64-pc-linux-gnu/15 --mandir=/usr/share/gcc-data/x86_64-pc-linux-gnu/15/man --infodir=/usr/share/gcc-data/x86_64-pc-linux-gnu/15/info --with-gxx-include-dir=/usr/lib/gcc/x86_64-pc-linux-gnu/15/include/g++-v15 --disable-silent-rules --disable-dependency-tracking --with-python-dir=/share/gcc-data/x86_64-pc-linux-gnu/15/python --enable-languages=c,c++,fortran --enable-obsolete --enable-secureplt --disable-werror --with-system-zlib --enable-nls --without-included-gettext --disable-libunwind-exceptions --enable-checking=yes,extra,rtl --with-bugurl=https://bugs.gentoo.org/--with-pkgversion='Gentoo Hardened 15.0.0_pre20240721 p6' --with-gcc-major-version-only --enable-libstdcxx-time --enable-lto --disable-libstdcxx-pch --enable-shared --enable-threads=posix --enable-__cxa_atexit --enable-clocale=gnu --enable-multilib --with-multilib-list=m32,m64 --disable-fixed-point --enable-targets=all --enable-libgomp --disable-libssp --disable-libada --enable-cet --disable-systemtap --disable-valgrind-annotations --disable-vtable-verify --disable-libvtv --with-zstd --without-isl --enable-default-pie --enable-host-pie --enable-host-bind-now --enable-default-ssp --disable-fixincludes --with-build-config='bootstrap-O3 bootstrap-lto bootstrap-cet'
+Thread model: posix
+Supported LTO compression algorithms: zlib zstd
+gcc version 15.0.0 20240721 (experimental) (Gentoo Hardened 15.0.0_pre20240721 p6)
+```
+
+- User: Sam James | Time: 2024-07-23 06:52:59 UTC
+  Text: Createdattachment 58732[details]reduced.i
+
+First attempt at reduction. Not sure it's valid.
+
+- User: Sam James | Time: 2024-07-23 07:00:43 UTC
+  Text: 'gcc argp-help.i -O3 -mavx512bf16' is enough.
+
+- User: Sam James | Time: 2024-07-23 07:03:19 UTC
+  Text: (In reply to Sam James fromcomment #2)> 'gcc argp-help.i -O3 -mavx512bf16' is enough.gcc argp-help.i -O2 -mavx512bf16 --param=max-inline-insns-auto=30
+
+- User: Richard Biener | Time: 2024-07-23 07:11:21 UTC
+  Text: -mavx512bw is enough, the "bad" assembly has
+
+        leaq    __libc_tsd_CTYPE_B@gottpoff(%rip), %rsi
+
+the "good" has only movq with gottpoff(%rip) relocations.
+
+- User: H.J. Lu | Time: 2024-07-23 07:18:44 UTC
+  Text: [hjl@gnu-tgl-3pr116043]$ cat foo.s
+	.text
+	leaq	__libc_tsd_CTYPE_B@gottpoff(%rip), %rax
+	vmovq	(%rax), %xmm0
+[hjl@gnu-tgl-3pr116043]$ gcc -c foo.s
+[hjl@gnu-tgl-3pr116043]$ ld foo.o
+ld: warning: cannot find entry symbol _start; defaulting to 0000000000401000
+ld: foo.o:(.text+0x3): undefined reference to `__libc_tsd_CTYPE_B'
+ld: foo.o: TLS transition from R_X86_64_GOTTPOFF to R_X86_64_TPOFF32 against `__libc_tsd_CTYPE_B' at 0x3 in section `.text' failed
+ld: final link failed: bad value
+[hjl@gnu-tgl-3pr116043]$
+
+- User: Richard Biener | Time: 2024-07-23 07:25:57 UTC
+  Text: (In reply to Richard Biener fromcomment #4)> -mavx512bw is enough, the "bad" assembly has
+> 
+>         leaq    __libc_tsd_CTYPE_B@gottpoff(%rip), %rsi
+> 
+> the "good" has only movq with gottpoff(%rip) relocations.Note in the object file I see
+
+ 243:   48 8d 35 00 00 00 00    lea    0x0(%rip),%rsi        # 24a <hol_entry_qcmp+0x5a>
+ 24a:   4c 8b 0d 00 00 00 00    mov    0x0(%rip),%r9        # 251 <hol_entry_qcmp+0x61>
+
+lld reports
+
+ld.lld-14.0.6: error: t.o:(function hol_entry_qcmp: .text+0x243): R_X86_64_GOTTPOFF must be used in MOVQ or ADDQ instructions only
+ld.lld-14.0.6: error: t.o:(function hol_entry_qcmp: .text+0x365): R_X86_64_GOTTPOFF must be used in MOVQ or ADDQ instructions only
+
+so it's a backend issue.
+
+- User: H.J. Lu | Time: 2024-07-23 07:26:11 UTC
+  Text: Linker only allows mov and add for @gottpoff(%rip).
+
+- User: Richard Biener | Time: 2024-07-23 07:30:02 UTC
+  Text: (In reply to H.J. Lu fromcomment #7)> Linker only allows mov and add for @gottpoff(%rip).Though LEA might indeed be a reasonable additional opcode?
+
+- User: H.J. Lu | Time: 2024-07-23 07:51:26 UTC
+  Text: (In reply to Richard Biener fromcomment #8)> (In reply to H.J. Lu fromcomment #7)
+> > Linker only allows mov and add for @gottpoff(%rip).
+> 
+> Though LEA might indeed be a reasonable additional opcode?x86-64 TLS psABI should be updated first.
+
+- User: H.J. Lu | Time: 2024-07-23 08:30:26 UTC
+  Text: (In reply to Richard Biener fromcomment #8)> (In reply to H.J. Lu fromcomment #7)
+> > Linker only allows mov and add for @gottpoff(%rip).
+> 
+> Though LEA might indeed be a reasonable additional opcode?What do these do:
+
+        leaq    __libc_tsd_CTYPE_B@gottpoff(%rip), %rax
+        vmovq   (%rax), %xmm0
+
+From x86-64 TLS psABI:
+
+The assembler generates for the x@gottpoff(%rip) expressions a R X86 64 GOTTPOFF
+relocation for the symbol x which requests the linker to generate a GOT entry with a
+R X86 64 TPOFF64 relocation. The offset of the GOT entry relative to the end of the
+instruction is then used in the instruction. The R X86 64 TPOFF64 relocation is pro-
+cessed at program startup time by the dynamic linker by looking up the symbol x in the
+modules loaded at that point. The offset is written in the GOT entry and later loaded
+by the addq instruction.
+
+The above code sequence looks wrong to me.
+
+- User: Hongtao Liu | Time: 2024-07-23 09:13:14 UTC
+  Text: The buggy insn is like
+----------------
+(insn:TI 348 525 527 5 (set (reg:DI 4 si [156])
+        (const:DI (unspec:DI [
+                    (symbol_ref:DI ("__libc_tsd_CTYPE_B") [flags 0x60]  <var_decl 0x7b3f66210c60 __libc_tsd_CTYPE_B>)
+                ] UNSPEC_GOTNTPOFF))) "/app/example.c":12:37 discrim 1 258 {*leadi}
+     (nil))
+-----------------
+
+-----------------define_insn is like------------------
+6276(define_insn "*lea<mode>"                                                                                                                                                                                                                                
+ 6277  [(set (match_operand:SWI48 0 "register_operand" "=r")                                                                                                                                                                                                  
+ 6278        (match_operand:SWI48 1 "address_no_seg_operand" "Ts"))]                                                                                                                                                                                          
+ 6279  "ix86_hardreg_mov_ok (operands[0], operands[1])"         
+
+
+1346;; Return true if op is a valid address for LEA, and does not contain                                                                                                                                                                                     
+1347;; a segment override.  Defined as a special predicate to allow                                                                                                                                                                                           
+1348;; mode-less const_int operands pass to address_operand.                                                                                                                                                                                                  
+1349(define_special_predicate "address_no_seg_operand"                                                                                                                                                                                                        
+1350  (match_test "address_operand (op, VOIDmode)")                                                                                                                                                                                                           
+1351{                                                                                                                                                                                                                                                         
+1352  struct ix86_address parts;                                                                                                                                                                                                                              
+1353  int ok;                                                                                                                                                                                                                                                 
+1354                                                                                                                                                                                                                                                          
+1355  if (!CONST_INT_P (op)                                                                                                                                                                                                                                   
+1356      && mode != VOIDmode                                                                                                                                                                                                                                 
+1357      && GET_MODE (op) != mode)                                                                                                                                                                                                                           
+1358    return false;                                                                                                                                                                                                                                         
+1359                                                                                                                                                                                                                                                          
+1360  ok = ix86_decompose_address (op, &parts);                                                                                                                                                                                                               
+1361  gcc_assert (ok);                                                                                                                                                                                                                                        
+1362  return parts.seg == ADDR_SPACE_GENERIC;                                                                                                                                                                                                                 
+1363})
+----------------------define_insn ends----------------
+
+I think we can exclude case when base and index are both NULL_RTX, let's always use *mov{si,di}_internal pattern to move const to register.
+
+- User: Sam James | Time: 2024-07-23 09:15:48 UTC
+  Text: Createdattachment 58733[details]reduced-2.i
+
+- User: H.J. Lu | Time: 2024-07-23 23:15:25 UTC
+  Text: This caused byr15-1619-g3b9b8d6cfdf593.
+
+- User: Andrew Pinski | Time: 2024-07-23 23:23:07 UTC
+  Text: (In reply to H.J. Lu fromcomment #13)> This caused byr15-1619-g3b9b8d6cfdf593.exposed by because that just changed the register allocation allocation really.
+
+- User: Hongtao Liu | Time: 2024-07-24 03:24:03 UTC
+  Text: > I think we can exclude case when base and index are both NULL_RTX, let's
+> always use *mov{si,di}_internal pattern to move const to register.No, i misunderstood the issue, it's not the problem of lea pattern, it's the address of gottpoff shouldn't be reloaded.
+
+InPR103275,r12-5445-gb5844cb0bc8c7d9be2ff1ecded249cad82b9b71cadded new constraint "Bk" to avoid kmovq	foo@gottpoff(%rip), %k0, but RA may still allocates k/v register and try to reload for address since it thought the cost of reload address is cheap?
+
+Adjust "Bk" to define_special_memory_constraint to avoid address reload can solve the issue.
+
+modified   gcc/config/i386/constraints.md                                                                                                                                                                                                                     
+@@ -187,7 +187,7 @@ (define_special_memory_constraint "Bm"                                                                                                                                                                                                    
+   "@internal Vector memory operand."                                                                                                                                                                                                                         
+   (match_operand 0 "vector_memory_operand"))                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                                              
+-(define_memory_constraint "Bk"                                                                                                                                                                                                                               
++(define_special_memory_constraint "Bk"                                                                                                                                                                                                                       
+   "@internal TLS address that allows insn using non-integer registers."                                                                                                                                                                                      
+   (and (match_operand 0 "memory_operand")                                                                                                                                                                                                                    
+        (not (match_test "ix86_gpr_tls_address_pattern_p (op)")))) 
+
+I'm testing the patch.
+
+- User: GCC Commits | Time: 2024-07-30 02:52:08 UTC
+  Text: The master branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:bc1fda00d5f20e2f3e77a50b2822562b6e0040b2commitr15-2395-gbc1fda00d5f20e2f3e77a50b2822562b6e0040b2Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Jul 24 11:29:23 2024 +0800
+
+    Refine constraint "Bk" to define_special_memory_constraint.
+    
+    For below pattern, RA may still allocate r162 as v/k register, try to
+    reload for address with leaq __libc_tsd_CTYPE_B@gottpoff(%rip), %rsi
+    which result a linker error.
+    
+    (set (reg:DI 162)
+         (mem/u/c:DI
+           (const:DI (unspec:DI
+                     [(symbol_ref:DI ("a") [flags 0x60]  <var_decl 0x7f621f6e1c60 a>)]
+                     UNSPEC_GOTNTPOFF))
+    
+    Quote from H.J for why linker issue an error.
+    >What do these do:
+    >
+    >        leaq    __libc_tsd_CTYPE_B@gottpoff(%rip), %rax
+    >        vmovq   (%rax), %xmm0
+    >
+    >From x86-64 TLS psABI:
+    >
+    >The assembler generates for the x@gottpoff(%rip) expressions a R X86
+    >64 GOTTPOFF relocation for the symbol x which requests the linker to
+    >generate a GOT entry with a R X86 64 TPOFF64 relocation. The offset of
+    >the GOT entry relative to the end of the instruction is then used in
+    >the instruction. The R X86 64 TPOFF64 relocation is pro- cessed at
+    >program startup time by the dynamic linker by looking up the symbol x
+    >in the modules loaded at that point. The offset is written in the GOT
+    >entry and later loaded by the addq instruction.
+    >
+    >The above code sequence looks wrong to me.
+    
+    gcc/ChangeLog:PR target/116043* config/i386/constraints.md (Bk): Refine to
+            define_special_memory_constraint.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr116043.c: New test.
+
+- User: GCC Commits | Time: 2024-08-02 08:03:09 UTC
+  Text: The releases/gcc-14 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:a295076bee293aa3112c615f9af7a27231816a36commitr14-10551-ga295076bee293aa3112c615f9af7a27231816a36Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Jul 24 11:29:23 2024 +0800
+
+    Refine constraint "Bk" to define_special_memory_constraint.
+    
+    For below pattern, RA may still allocate r162 as v/k register, try to
+    reload for address with leaq __libc_tsd_CTYPE_B@gottpoff(%rip), %rsi
+    which result a linker error.
+    
+    (set (reg:DI 162)
+         (mem/u/c:DI
+           (const:DI (unspec:DI
+                     [(symbol_ref:DI ("a") [flags 0x60]  <var_decl 0x7f621f6e1c60 a>)]
+                     UNSPEC_GOTNTPOFF))
+    
+    Quote from H.J for why linker issue an error.
+    >What do these do:
+    >
+    >        leaq    __libc_tsd_CTYPE_B@gottpoff(%rip), %rax
+    >        vmovq   (%rax), %xmm0
+    >
+    >From x86-64 TLS psABI:
+    >
+    >The assembler generates for the x@gottpoff(%rip) expressions a R X86
+    >64 GOTTPOFF relocation for the symbol x which requests the linker to
+    >generate a GOT entry with a R X86 64 TPOFF64 relocation. The offset of
+    >the GOT entry relative to the end of the instruction is then used in
+    >the instruction. The R X86 64 TPOFF64 relocation is pro- cessed at
+    >program startup time by the dynamic linker by looking up the symbol x
+    >in the modules loaded at that point. The offset is written in the GOT
+    >entry and later loaded by the addq instruction.
+    >
+    >The above code sequence looks wrong to me.
+    
+    gcc/ChangeLog:PR target/116043* config/i386/constraints.md (Bk): Refine to
+            define_special_memory_constraint.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr116043.c: New test.
+    
+    (cherry picked from commit bc1fda00d5f20e2f3e77a50b2822562b6e0040b2)
+
+- User: Sam James | Time: 2024-08-05 22:44:38 UTC
+  Text: All done, I think? Thanks all.
+
+I've also seen no new issues pop up with h.j.'s ld tightening.
+
+- User: GCC Commits | Time: 2024-08-12 02:57:06 UTC
+  Text: The releases/gcc-12 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:c94738e2462ff46f3013f6270f6a955b749d82b2commitr12-10668-gc94738e2462ff46f3013f6270f6a955b749d82b2Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Jul 24 11:29:23 2024 +0800
+
+    Refine constraint "Bk" to define_special_memory_constraint.
+    
+    For below pattern, RA may still allocate r162 as v/k register, try to
+    reload for address with leaq __libc_tsd_CTYPE_B@gottpoff(%rip), %rsi
+    which result a linker error.
+    
+    (set (reg:DI 162)
+         (mem/u/c:DI
+           (const:DI (unspec:DI
+                     [(symbol_ref:DI ("a") [flags 0x60]  <var_decl 0x7f621f6e1c60 a>)]
+                     UNSPEC_GOTNTPOFF))
+    
+    Quote from H.J for why linker issue an error.
+    >What do these do:
+    >
+    >        leaq    __libc_tsd_CTYPE_B@gottpoff(%rip), %rax
+    >        vmovq   (%rax), %xmm0
+    >
+    >From x86-64 TLS psABI:
+    >
+    >The assembler generates for the x@gottpoff(%rip) expressions a R X86
+    >64 GOTTPOFF relocation for the symbol x which requests the linker to
+    >generate a GOT entry with a R X86 64 TPOFF64 relocation. The offset of
+    >the GOT entry relative to the end of the instruction is then used in
+    >the instruction. The R X86 64 TPOFF64 relocation is pro- cessed at
+    >program startup time by the dynamic linker by looking up the symbol x
+    >in the modules loaded at that point. The offset is written in the GOT
+    >entry and later loaded by the addq instruction.
+    >
+    >The above code sequence looks wrong to me.
+    
+    gcc/ChangeLog:PR target/116043* config/i386/constraints.md (Bk): Refine to
+            define_special_memory_constraint.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr116043.c: New test.
+    
+    (cherry picked from commit bc1fda00d5f20e2f3e77a50b2822562b6e0040b2)
+
+- User: GCC Commits | Time: 2024-08-12 02:57:25 UTC
+  Text: The releases/gcc-13 branch has been updated by hongtao Liu <liuhongt@gcc.gnu.org>:https://gcc.gnu.org/g:617562e4e422c7bd282960b14abfffd994445009commitr13-8971-g617562e4e422c7bd282960b14abfffd994445009Author: liuhongt <hongtao.liu@intel.com>
+Date:   Wed Jul 24 11:29:23 2024 +0800
+
+    Refine constraint "Bk" to define_special_memory_constraint.
+    
+    For below pattern, RA may still allocate r162 as v/k register, try to
+    reload for address with leaq __libc_tsd_CTYPE_B@gottpoff(%rip), %rsi
+    which result a linker error.
+    
+    (set (reg:DI 162)
+         (mem/u/c:DI
+           (const:DI (unspec:DI
+                     [(symbol_ref:DI ("a") [flags 0x60]  <var_decl 0x7f621f6e1c60 a>)]
+                     UNSPEC_GOTNTPOFF))
+    
+    Quote from H.J for why linker issue an error.
+    >What do these do:
+    >
+    >        leaq    __libc_tsd_CTYPE_B@gottpoff(%rip), %rax
+    >        vmovq   (%rax), %xmm0
+    >
+    >From x86-64 TLS psABI:
+    >
+    >The assembler generates for the x@gottpoff(%rip) expressions a R X86
+    >64 GOTTPOFF relocation for the symbol x which requests the linker to
+    >generate a GOT entry with a R X86 64 TPOFF64 relocation. The offset of
+    >the GOT entry relative to the end of the instruction is then used in
+    >the instruction. The R X86 64 TPOFF64 relocation is pro- cessed at
+    >program startup time by the dynamic linker by looking up the symbol x
+    >in the modules loaded at that point. The offset is written in the GOT
+    >entry and later loaded by the addq instruction.
+    >
+    >The above code sequence looks wrong to me.
+    
+    gcc/ChangeLog:PR target/116043* config/i386/constraints.md (Bk): Refine to
+            define_special_memory_constraint.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * gcc.target/i386/pr116043.c: New test.
+    
+    (cherry picked from commit bc1fda00d5f20e2f3e77a50b2822562b6e0040b2)
+

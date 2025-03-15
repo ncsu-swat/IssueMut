@@ -1,0 +1,179 @@
+Bug Summary: Inconsistent optimization of replaced operator new()
+Product: gcc
+Component: ipa
+
+  (show other bugs)
+Keywords: wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Vlad Yaglamunov | Time: 2023-10-11 15:59:40 UTC
+  Text: #include <new>
+#include <cstdint>
+#include <cstdio>
+
+int a[10];
+void* operator new(std::size_t) {
+    return a;
+}
+
+int main() {
+    int* p = static_cast<int*>(::operator new(sizeof(int)));
+
+    std::ptrdiff_t x = a - p;
+
+    printf("%ld %d", x, x == 0);
+
+    return 0;
+}
+
+
+Here, GCC with -O1 optimizes 'x' to 0 and 'x == 0' to false at the same time.
+
+Compiler explorer link:https://godbolt.org/z/4Y3eeY56r---
+Also, possibly related:
+ 
+#include <new>
+
+void* operator new(std::size_t sz)
+{
+    throw std::bad_alloc{};
+}
+ 
+int main()
+{
+    int* p1 = static_cast<int*>(::operator new(sizeof(int)));
+
+    return 10;
+}
+
+Here, again with -O1, terminate is not called, and the program returned successfully. However, the program returned 0 instead of 10.
+
+Compiler explorer link:https://godbolt.org/z/9oczTzP7s
+
+- User: Andrew Pinski | Time: 2023-10-11 16:05:40 UTC
+  Text: I think both of these are valid things to do according to the standard and the requirements of operator new.
+
+- User: Richard Biener | Time: 2023-10-12 08:15:37 UTC
+  Text: For the second case I think we do something wrong.  local-pure-const figures
+operator new is 'noreturn':
+
+Function is locally looping.
+Function is locally throwing.
+Function is locally malloc.
+Function found to be noreturn: operator new
+
+and fixup_cfg in turn turns main into
+
+int main ()
+{
+  int * D.3130;
+  int * p1;
+  int * _3(D);
+
+  <bb 2> :
+  operator new (4);
+
+}
+
+which would be fine I think.  But then CDDCE decides
+
+Eliminating unnecessary statements:
+Deleting : operator new (4);
+
+and we end up with
+
+int main ()
+{
+  int * D.3130;
+  int * p1;
+  int * _3(D);
+
+  <bb 2> :
+
+}
+
+and local-pure-const adds an unreachable:
+
+ local analysis of int main()/18
+     checking previously known:Function is locally const.
+Function found to be noreturn: main
+Function found to be const: int main()/18
+Declaration updated to be const: int main()/18
+Function found to be nothrow: main
+Introduced new external node (void __builtin_unreachable()/32).
+int main ()
+{
+  int * D.3130;
+  int * p1;
+  int * _3(D);
+
+  <bb 2> [count: 0]:
+  __builtin_unreachable ();
+
+I think CD-DCE shouldn't remove the call as it's looping and noreturn.  It
+doesn't mark the allocation as necessary because of -fallocation-dce:
+
+        if (callee != NULL_TREE
+            && flag_allocation_dce
+            && DECL_IS_REPLACEABLE_OPERATOR_NEW_P (callee))
+          return;
+
+we fail to check gimple_call_from_new_or_delete here I think (we later do
+it in most other places).  But we maybe should never remove a control
+stmt which a noreturn call is, even more so as it can throw (yeah, we
+remove "dead" exceptions, but together with noreturn this doesn't quite
+match).
+
+Adding gimple_call_from_new_or_delete () will fix the testcase at hand
+but I think the same issue would exist with a class scope operator new
+triggered by a new expression.
+
+So, it's maybe not wrong we remove the call to ::operator new(), but if
+we do we have to preserve the 'return 10;' - we cannot do both, take
+advantage of 'noreturn' _and_ elide it.
+
+The behavior for the other testcase is OK I think.
+
+- User: Sam James | Time: 2023-10-12 08:48:23 UTC
+  Text: (Assigned to who?)
+
+- User: GCC Commits | Time: 2023-10-13 06:34:48 UTC
+  Text: The master branch has been updated by Richard Biener <rguenth@gcc.gnu.org>:https://gcc.gnu.org/g:35b5bb475375dba4ea9101d6db13a6012c4e84cacommitr14-4611-g35b5bb475375dba4ea9101d6db13a6012c4e84caAuthor: Richard Biener <rguenther@suse.de>
+Date:   Thu Oct 12 10:13:58 2023 +0200
+
+    tree-optimization/111773 - avoid CD-DCE of noreturn special calls
+    
+    The support to elide calls to allocation functions in DCE runs into
+    the issue that when implementations are discovered noreturn we end
+    up DCEing the calls anyway, leaving blocks without termination and
+    without outgoing edges which is both invalid IL and wrong-code when
+    as in the example the noreturn call would throw.  The following
+    avoids taking advantage of both noreturn and the ability to elide
+    allocation at the same time.
+    
+    For the testcase it's valid to throw or return 10 by eliding the
+    allocation.  But we have to do either where currently we'd run
+    off the function.PR tree-optimization/111773* tree-ssa-dce.cc (mark_stmt_if_obviously_necessary): Do
+            not elide noreturn calls that are reflected to the IL.
+    
+            * g++.dg/torture/pr111773.C: New testcase.
+
+- User: Richard Biener | Time: 2023-10-13 06:43:04 UTC
+  Text: So the second example is fixed, but it's quite a corner-case so probably not worth backporting.  Given we have a single bugreport for two issues back to
+UNCONFIRMED for the first issue.
+
+I agree with Andrew _that_ issue behaves within the constraints of the standard.
+ISTR it says that 'operator new' has to return a pointer that nothing else points to which means it acts as if it were restrict qualified.  That allows
+GCC to conclude x != 0 because it rewrites x == 0 as a - p == 0 and
+a == p.  The difference operation cannot be constant folded based on this
+but during IPA optimization we inline 'new' which exposes p == a and thus
+a - p == 0.
+
+- User: Vlad Yaglamunov | Time: 2023-10-18 14:09:05 UTC
+  Text: I agree with Richard's explanation. Seems like my first example is an undefined behavior. In section [basic.stc.dynamic.allocation] par 2, in C++17, was added the following: "Furthermore, for the library allocation functions in [new.delete.single] and [new.delete.array], p0 shall represent the address of a block of storage disjoint from the storage for any other object accessible to the caller."
+
+- User: Richard Biener | Time: 2023-10-19 06:16:59 UTC
+  Text: So fixed for the 2nd, invalid for the 1st testcase.  The 2nd is special enough that it doesn't warrant backporting - it's very unlikely to appear in real-world code.
+

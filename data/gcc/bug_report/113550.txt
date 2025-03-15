@@ -1,0 +1,88 @@
+Bug Summary: data512_t initializers dereference a clobbered register
+Product: gcc
+Component: target
+
+  (show other bugs)
+Keywords: patch, wrong-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Ian Thompson | Time: 2024-01-22 23:12:11 UTC
+  Text: Createdattachment 57189[details]Additional non-minimal failing cases
+
+When initializing or copying a data512_t, the compiler is generating code which clobbers the register containing the source pointer of the copy. Initially observed on Arm GNU Toolchain 12.2.Rel1, but this also reproduces on trunk.
+
+Minimal reproduction, hits a segfault when compiled with "aarch64-none-elf-gcc -march=armv9-a+ls64":
+
+#include <arm_acle.h>
+void test_data512_init() {
+    data512_t my_value = {};
+}
+
+This code generates this assembly snippet for initializing my_value:
+	adrp	x0, .LC0
+	add	x0, x0, :lo12:.LC0
+	ldp	x0, x1, [x0]
+	ldp	x2, x3, [x0, 16]
+	ldp	x4, x5, [x0, 32]
+	ldp	x6, x7, [x0, 48]
+
+Notice that the first ldp clobbers x0, redirecting the remaining 3 loads to whatever address happens to be in val[0] of the initializer.
+
+Similar incorrect code is generated in many other situations that involve copying a data512_t (passing a global variable to a function, dereferencing a data512_t*, etc). See the attached source file for the other failing cases I'm seeing.
+
+- User: Andrew Pinski | Time: 2024-01-22 23:26:08 UTC
+  Text: Should be an easy fix.
+
+The pattern:
+(define_insn "*aarch64_movv8di"
+  [(set (match_operand:V8DI 0 "nonimmediate_operand" "=r,m,r")
+	(match_operand:V8DI 1 "general_operand" " r,r,m"))]
+  "(register_operand (operands[0], V8DImode)
+    || register_operand (operands[1], V8DImode))"
+  "#"
+  [(set_attr "type" "multiple,multiple,multiple")
+   (set_attr "length" "32,16,16")]
+)
+
+Is missing a & on the r/m case.
+
+Or the split could be improved such that the one that gets loadded last is the one that might conflict:
+(define_split
+  [(set (match_operand:V8DI 0 "nonimmediate_operand")
+        (match_operand:V8DI 1 "general_operand"))]
+  "reload_completed"
+  [(const_int 0)]
+
+aarch64_simd_emit_reg_reg_move handles this case already too.
+
+I am going to go with the improving the define_split ...
+
+- User: Andrew Pinski | Time: 2024-01-24 04:31:09 UTC
+  Text: Thinking about this, maybe it is too complex to figure out which register overlaps with the memory.  So the easiest is just to mark `=r/m` alternative as an early clobber.
+
+- User: Andrew Pinski | Time: 2024-01-24 07:01:44 UTC
+  Text: Patch posted:https://gcc.gnu.org/pipermail/gcc-patches/2024-January/643766.html
+
+- User: GCC Commits | Time: 2024-01-25 12:03:39 UTC
+  Text: The trunk branch has been updated by Richard Sandiford <rsandifo@gcc.gnu.org>:https://gcc.gnu.org/g:8eead1148cd0ac086b39a7abccea404041c85cb5commitr14-8421-g8eead1148cd0ac086b39a7abccea404041c85cb5Author: Richard Sandiford <richard.sandiford@arm.com>
+Date:   Thu Jan 25 12:03:18 2024 +0000
+
+    aarch64: Handle overlapping registers in movv8di [PR113550]
+    
+    The LS64 movv8di pattern didn't handle loads that overlapped with
+    the address register (unless the overlap happened to be in the
+    last subload).
+    
+    gcc/PR target/113550* config/aarch64/aarch64-simd.md: In the movv8di splitter, check
+            whether each split instruction is a load that clobbers the source
+            address.  Emit that instruction last if so.
+    
+    gcc/testsuite/PR target/113550* gcc.target/aarch64/pr113550.c: New test.
+
+- User: Richard Sandiford | Time: 2024-01-25 12:14:11 UTC
+  Text: Yeah, FWIW, I agree improving the define_split is probably best.
+
+Now fixed.
+

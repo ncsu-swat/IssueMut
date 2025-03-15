@@ -1,0 +1,323 @@
+Bug Summary: [14 Regression] ICE on audiofile-0.3.6: RTL: vartrack: Segmentation fault in mode_to_precision(machine_mode)
+Product: gcc
+Component: debug
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 13.1.1
+Known to Fail: 
+
+Comments:
+- User: Sergei Trofimovich | Time: 2023-06-19 07:33:33 UTC
+  Text: Initially observed ICE on audiofile-0.3.6 when building withr14-1921-g7360cba833cd92.
+
+Reduced example:
+
+// $ cat bug.cpp.cpp
+int channelCount, decodeBlock_outputLength;
+struct BlockCodec {
+  virtual int decodeBlock(const unsigned char *, short *);
+};
+struct ms_adpcm_state {
+  char predictorIndex;
+  int sample1;
+  ms_adpcm_state();
+};
+bool decodeBlock_ok;
+void encodeBlock() { ms_adpcm_state(); }
+struct MSADPCM : BlockCodec {
+  int decodeBlock(const unsigned char *, short *);
+};
+void decodeSample(ms_adpcm_state, bool *);
+int MSADPCM::decodeBlock(const unsigned char *, short *) {
+  ms_adpcm_state decoderState[2];
+  ms_adpcm_state *state[2];
+  state[0] = &decoderState[0];
+  if (channelCount == 2)
+    state[1] = &decoderState[0];
+  short m_coefficients[state[1]->predictorIndex];
+  for (int i = 0; i < channelCount; i++)
+    ++state[i]->sample1;
+  decodeSample(*state[1], &decodeBlock_ok);
+  return decodeBlock_outputLength;
+}
+
+$ g++ -fvisibility=hidden -g2 -O2 -c bug.cpp.cpp -o bug.o
+during RTL pass: vartrack
+bug.cpp.cpp: In function 'void encodeBlock()':
+bug.cpp.cpp:11:40: internal compiler error: Segmentation fault
+   11 | void encodeBlock() { ms_adpcm_state(); }
+      |                                        ^
+0xe9ac7f crash_signal
+        ../../source/gcc/toplev.cc:314
+0x1155ea0 mode_to_precision(machine_mode)
+        ../../source/gcc/machmode.h:585
+0x1155ea0 GET_MODE_PRECISION(machine_mode)
+        ../../source/gcc/machmode.h:702
+0x1155ea0 paradoxical_subreg_p(machine_mode, machine_mode)
+        ../../source/gcc/rtl.h:3211
+0x1155ea0 track_loc_p
+        ../../source/gcc/var-tracking.cc:5341
+0x1157121 use_type
+        ../../source/gcc/var-tracking.cc:5555
+0x11574a1 add_stores
+        ../../source/gcc/var-tracking.cc:5966
+0xe3ef65 note_pattern_stores(rtx_def const*, void (*)(rtx_def*, rtx_def const*, void*), void*)
+        ../../source/gcc/rtlanal.cc:1979
+0x11567c0 add_with_sets
+        ../../source/gcc/var-tracking.cc:6638
+0xa666a8 cselib_record_sets
+        ../../source/gcc/cselib.cc:3012
+0xa67d5e cselib_process_insn(rtx_insn*)
+        ../../source/gcc/cselib.cc:3174
+0x1162fef vt_initialize
+        ../../source/gcc/var-tracking.cc:10282
+0x1167ca3 variable_tracking_main_1
+        ../../source/gcc/var-tracking.cc:10510
+0x1167e6b variable_tracking_main()
+        ../../source/gcc/var-tracking.cc:10563
+0x1167e6b execute
+        ../../source/gcc/var-tracking.cc:10600
+
+$ g++ -v
+Using built-in specs.
+COLLECT_GCC=/<<NIX>>/gcc-14.0.0/bin/g++
+COLLECT_LTO_WRAPPER=/<<NIX>>/gcc-14.0.0/libexec/gcc/x86_64-unknown-linux-gnu/14.0.0/lto-wrapper
+Target: x86_64-unknown-linux-gnu
+Configured with:
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 99999999 (experimental) (GCC)
+
+- User: Sergei Trofimovich | Time: 2023-06-19 07:36:45 UTC
+  Text: Createdattachment 55362[details]bug.cpp.cpp.orig.xz - unreduced
+
+In case I reduced it incorrectly bug.cpp.cpp.orig.xz is the unreduced preprocessed fiel.
+
+- User: Richard Biener | Time: 2023-06-19 08:06:54 UTC
+  Text: Confirmed.
+
+- User: Andrew Pinski | Time: 2023-06-19 20:47:34 UTC
+  Text: There are a difference in .optimized with respect to debug statements:
+GCC 13:
+  # DEBUG i => 0
+
+vs
+GCC trunk:
+  # DEBUG i => NULL
+
+This is in BB 5.
+
+The change in Debug statements happened starting in ch2.
+
+Before ch2:
+  <bb 5> [local count: 715863673]:
+  # DEBUG BEGIN_STMT
+  _3 = state[i_8];
+  _4 = _3->sample1;
+  _5 = _4 + 1;
+  _3->sample1 = _5;
+  # DEBUG BEGIN_STMT
+  i_23 = i_8 + 1;
+  # DEBUG i => i_23
+
+  <bb 6> [local count: 1073741824]:
+  # i_8 = PHI <0(4), i_23(5)>
+  # DEBUG i => i_8
+  # DEBUG BEGIN_STMT
+  if (channelCount.1_1 > i_8)
+    goto <bb 5>; [66.67%]
+  else
+    goto <bb 7>; [33.33%]
+
+After:
+  <bb 5> [local count: 715863673]:
+  # i_9 = PHI <i_23(5), 0(4)>
+  # DEBUG BEGIN_STMT
+  _3 = state[i_9];
+  _4 = _3->sample1;
+  _5 = _4 + 1;
+  _3->sample1 = _5;
+  # DEBUG BEGIN_STMT
+  i_23 = i_9 + 1;
+  # DEBUG i => i_23
+  # DEBUG i => i_23
+  # DEBUG BEGIN_STMT
+  if (channelCount.1_1 > i_23)
+    goto <bb 5>; [66.67%]
+  else
+    goto <bb 6>; [33.33%]
+
+
+While in GCC 13 after ch2 looks like:
+  <bb 5> [local count: 715863673]:
+  # i_9 = PHI <i_23(5), 0(4)>
+  # DEBUG i => i_9
+  # DEBUG BEGIN_STMT
+  _3 = state[i_9];
+  _4 = _3->sample1;
+  _5 = _4 + 1;
+  _3->sample1 = _5;
+  # DEBUG BEGIN_STMT
+  i_23 = i_9 + 1;
+  # DEBUG i => i_23
+  # DEBUG i => i_23
+  # DEBUG BEGIN_STMT
+  if (channelCount.1_1 > i_23)
+    goto <bb 5>; [66.67%]
+  else
+    goto <bb 6>; [33.33%]
+
+Notice the `i => i_9` debug statement which is now missing.
+
+- User: Andrew Pinski | Time: 2023-06-19 20:50:11 UTC
+  Text: So I think there are 2 bugs here. First the lost of debugging info because of ch, and the latent segfault.
+
+- User: Jakub Jelinek | Time: 2023-06-20 09:55:55 UTC
+  Text: ICE started withr14-1873-g6a2e8dcbbd4bab3
+
+- User: Jakub Jelinek | Time: 2023-06-20 10:12:19 UTC
+  Text: First change with that commit already appears in the reload pass:
+ (insn 12 6 8 2 (set (reg:DI 5 di [84])
+-        (plus:DI (reg/f:DI 7 sp)
++        (plus:DI (reg/f:DI 7 sp [orig:103 state+8 ] [103])
+             (const_int 8 [0x8]))) "pr110308.C":11:22 249 {*leadi}
+      (nil))
+and many further changes of this kind appear later in cprop_hardreg.
+The vartrack ICE is because regno_reg_rtx[103] is NULL and so PSEUDO_REGNO_MODE (103) ICEs.
+For debug info, propagation of the sp with the extra debug info related stuff (ORIGINAL_REGNO and REG_ATTRS) is I think very harmful, but I admit I haven't tried to understand why that change has been done.
+
+- User: Manolis Tsamis | Time: 2023-06-20 14:47:08 UTC
+  Text: Some context for the commit:
+
+This change is originally part of an late rtl pass to optimize memory accesses. There are a lot of cases (especially involving local arrays) that generate reduntant stack pointer adds for address calculation which can get reduced to `mov reg, sp`, but without actually propagating these we don't gain something. In general it should be good to allow propagation of the stack pointer if that is correct.
+
+Now for the actual issue, it looks like my change for that was a bit carelees and I didn't properly understand the context of cprop-hardreg.> For debug info, propagation of the sp with the extra debug info related stuff (ORIGINAL_REGNO and REG_ATTRS) is I think very harmful, but I admit I haven't tried to understand why that change has been done.Yes, the attachment of ORIGINAL_REGNO and REG_ATTRS to the stack pointer has been accidental and is of course wrong.
+
+I have a proposed change below that fixes the segfault by not setting ORIGINAL_REGNO/REG_ATTRS for the stack pointer. My understanding is that this should be fine, but I'm still testing that.> So I think there are 2 bugs here. First the lost of debugging info because of ch, and the latent segfault.I'm still looking into the difference in the debug statements.
+
+--cut here--
+--- a/gcc/regcprop.cc
++++ b/gcc/regcprop.cc
+@@ -423,7 +423,7 @@ maybe_mode_change (machine_mode orig_mode, machine_mode copy_mode,
+      It's unclear if we need to do the same for other special registers.  */
+   if (regno == STACK_POINTER_REGNUM)
+     {
+-      if (orig_mode == new_mode)
++      if (orig_mode == new_mode && new_mode == GET_MODE (stack_pointer_rtx))
+        return stack_pointer_rtx;
+       else
+        return NULL_RTX;
+@@ -487,9 +487,14 @@ find_oldest_value_reg (enum reg_class cl, rtx reg, struct value_data *vd)
+       new_rtx = maybe_mode_change (oldmode, vd->e[regno].mode, mode, i, regno);
+       if (new_rtx)
+        {
+-         ORIGINAL_REGNO (new_rtx) = ORIGINAL_REGNO (reg);
+-         REG_ATTRS (new_rtx) = REG_ATTRS (reg);
+-         REG_POINTER (new_rtx) = REG_POINTER (reg);
++         if (new_rtx != stack_pointer_rtx)
++           {
++             ORIGINAL_REGNO (new_rtx) = ORIGINAL_REGNO (reg);
++             REG_ATTRS (new_rtx) = REG_ATTRS (reg);
++             REG_POINTER (new_rtx) = REG_POINTER (reg);
++           }
++         else if (REG_POINTER (new_rtx) != REG_POINTER (reg))
++           return NULL_RTX;
+          return new_rtx;
+        }
+     }
+@@ -965,15 +970,27 @@ copyprop_hardreg_forward_1 (basic_block bb, struct value_data *vd)
+ 
+                  if (validate_change (insn, &SET_SRC (set), new_rtx, 0))
+                    {
+-                     ORIGINAL_REGNO (new_rtx) = ORIGINAL_REGNO (src);
+-                     REG_ATTRS (new_rtx) = REG_ATTRS (src);
+-                     REG_POINTER (new_rtx) = REG_POINTER (src);
+-                     if (dump_file)
+-                       fprintf (dump_file,
+-                                "insn %u: replaced reg %u with %u\n",
+-                                INSN_UID (insn), regno, REGNO (new_rtx));
+-                     changed = true;
+-                     goto did_replacement;
++                     bool can_change;
++                     if (new_rtx != stack_pointer_rtx)
++                       {
++                         ORIGINAL_REGNO (new_rtx) = ORIGINAL_REGNO (src);
++                         REG_ATTRS (new_rtx) = REG_ATTRS (src);
++                         REG_POINTER (new_rtx) = REG_POINTER (src);
++                         can_change = true;
++                       }
++                     else
++                       can_change
++                         = (REG_POINTER (new_rtx) == REG_POINTER (src));
++
++                     if (can_change)
++                       {
++                         if (dump_file)
++                           fprintf (dump_file,
++                                    "insn %u: replaced reg %u with %u\n",
++                                    INSN_UID (insn), regno, REGNO (new_rtx));
++                         changed = true;
++                         goto did_replacement;
++                       }
+                    }
+                  /* We need to re-extract as validate_change clobbers
+                     recog_data.  */(In reply to Jakub Jelinek fromcomment #5)
+--cut here--
+
+- User: N/A | Time: 2023-06-20 14:56:27 UTC
+  Text: @mtsamis: Could you attach the proposed patch as an attachment (to allow easy application and testing that this resolves the ICE)?
+
+- User: Jeffrey A. Law | Time: 2023-06-20 15:00:35 UTC
+  Text: Right.  It's fairly common with fold-mem-offsets to end up rewriting the address arithmetic such that we'll have an sp->gpr copy of some sort in the IL.  We'd really like to be able to cprop that copy away.
+
+After Manolis's fixes to that code it seemed independently commit-able so I acked it while we iterate on the fold-mem-offsets work.  It's tickled a few problems, but nothing that seems unmanageable right now.
+
+- User: Manolis Tsamis | Time: 2023-06-20 15:14:16 UTC
+  Text: Createdattachment 55369[details]ICE-fix-proposal-1
+
+- User: Sergei Trofimovich | Time: 2023-06-21 07:46:17 UTC
+  Text: (In reply to manolis.tsamis fromcomment #10)> Createdattachment 55369[details]> ICE-fix-proposal-1Proposed patch fixes ICE on audiofile-0.3.6 for me. Thank you!
+
+- User: Tobias Burnus | Time: 2023-06-21 08:45:29 UTC
+  Text: ***Bug 110313has been marked as a duplicate of this bug. ***
+
+- User: Tobias Burnus | Time: 2023-06-21 08:46:45 UTC
+  Text: (In reply to Sergei Trofimovich fromcomment #11)> (In reply to manolis.tsamis fromcomment #10)
+> > Createdattachment 55369[details]> Proposed patch fixes ICE on audiofile-0.3.6 for me. Thank you!It also fixesPR 110313- thanks! Now it only needs to be submitted and later committed to mainline ;-)
+
+- User: Thiago Jung Bauermann | Time: 2023-06-22 13:18:55 UTC
+  Text: (In reply to manolis.tsamis fromcomment #10)> Createdattachment 55369[details]> ICE-fix-proposal-1This patch fixes the ICEs I reported on the mailing list with profiled bootstrap lto in both armv8l-linux-gnueabihf and aarch64-linux-gnu. Thanks!
+
+- User: GCC Commits | Time: 2023-06-28 14:06:41 UTC
+  Text: The master branch has been updated by Philipp Tomsich <ptomsich@gcc.gnu.org>:https://gcc.gnu.org/g:893883f2f8f56984209c6ed210ee992ff71a14b0commitr14-2165-g893883f2f8f56984209c6ed210ee992ff71a14b0Author: Manolis Tsamis <manolis.tsamis@vrull.eu>
+Date:   Tue Jun 20 16:23:52 2023 +0200
+
+    cprop_hardreg: fix ORIGINAL_REGNO/REG_ATTRS/REG_POINTER handling
+    
+    Fixes: 6a2e8dcbbd4bab3
+    
+    Propagation for the stack pointer in regcprop was enabled in
+    6a2e8dcbbd4bab3, but set ORIGINAL_REGNO/REG_ATTRS/REG_POINTER for
+    stack_pointer_rtx which caused regression (e.g.,PR 110313,PR 110308).
+    
+    This fix adds special handling for stack_pointer_rtx in the places
+    where maybe_mode_change is called. This also adds an check in
+    maybe_mode_change to return the stack pointer only when the requested
+    mode matches the mode of stack_pointer_rtx.PR debug/110308gcc/ChangeLog:
+    
+            * regcprop.cc (maybe_mode_change): Check stack_pointer_rtx mode.
+            (maybe_copy_reg_attrs): New function.
+            (find_oldest_value_reg): Use maybe_copy_reg_attrs.
+            (copyprop_hardreg_forward_1): Ditto.
+    
+    gcc/testsuite/ChangeLog:
+    
+            * g++.dg/torture/pr110308.C: New test.
+    
+    Signed-off-by: Manolis Tsamis <manolis.tsamis@vrull.eu>
+    Signed-off-by: Philipp Tomsich <philipp.tomsich@vrull.eu>
+
+- User: Andrew Pinski | Time: 2023-11-05 21:52:47 UTC
+  Text: Fixed.
+

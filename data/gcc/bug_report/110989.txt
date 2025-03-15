@@ -1,0 +1,206 @@
+Bug Summary: RISC-V vector ICE due to invalid tree code in GIMPLE vect pass
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-on-valid-code
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: Jeremy Bennett | Time: 2023-08-11 09:59:00 UTC
+  Text: Createdattachment 55722[details]C source of the testcase
+
+The following code (testcase.c) causes an ICE when using RISC-V vector as target.
+
+int a, b, c;
+double *d;
+void e() {
+  double f;
+  for (; c; c++, d--)
+    f = *d ?: *(&a + c);
+  b = f;
+}
+
+Compiled with:
+
+riscv64-unknown-linux-gnu-gcc -march=rv64gcv -mabi=lp64d -c \
+    -Ofast --param=riscv-autovec-preference=scalable testcase.c
+
+The output is:
+
+during GIMPLE pass: vect
+testcase.c: In function 'e':
+testcase.c:3:6: internal compiler error: tree check: expected class 'type', have 'exceptional' (<invalid tree code>) in build_int_cst, at tree.cc:1507
+    3 | void e() {
+      |      ^
+0x914c99 tree_class_check_failed(tree_node const*, tree_code_class, char const*, int, char const*)
+	/home/jeremy/gittrees/mustang/gcc/gcc/tree.cc:8949
+0x91e2c7 tree_class_check(tree_node*, tree_code_class, char const*, int, char const*)
+	/home/jeremy/gittrees/mustang/gcc/gcc/tree.h:3700
+0x91e2c7 build_int_cst(tree_node*, poly_int<2u, long>)
+	/home/jeremy/gittrees/mustang/gcc/gcc/tree.cc:1507
+0x20f3e2d vectorizable_load
+	/home/jeremy/gittrees/mustang/gcc/gcc/tree-vect-stmts.cc:10719
+0x2100ee5 vect_transform_stmt(vec_info*, _stmt_vec_info*, gimple_stmt_iterator*, _slp_tree*, _slp_instance*)
+	/home/jeremy/gittrees/mustang/gcc/gcc/tree-vect-stmts.cc:12337
+0x131f464 vect_transform_loop_stmt
+	/home/jeremy/gittrees/mustang/gcc/gcc/tree-vect-loop.cc:11039
+0x13442bc vect_transform_loop(_loop_vec_info*, gimple*)
+	/home/jeremy/gittrees/mustang/gcc/gcc/tree-vect-loop.cc:11488
+0x138611f vect_transform_loops
+	/home/jeremy/gittrees/mustang/gcc/gcc/tree-vectorizer.cc:1004
+0x138679c try_vectorize_loop_1
+	/home/jeremy/gittrees/mustang/gcc/gcc/tree-vectorizer.cc:1150
+0x138679c try_vectorize_loop
+	/home/jeremy/gittrees/mustang/gcc/gcc/tree-vectorizer.cc:1180
+0x1386b44 execute
+	/home/jeremy/gittrees/mustang/gcc/gcc/tree-vectorizer.cc:1296
+Please submit a full bug report, with preprocessed source (by using -freport-bug).
+Please include the complete backtrace with any bug report.
+See <https://gcc.gnu.org/bugs/> for instructions.
+
+System information
+------------------
+
+Using built-in specs.
+COLLECT_GCC=riscv64-unknown-linux-gnu-gcc
+COLLECT_LTO_WRAPPER=/home/jeremy/gittrees/mustang/install/libexec/gcc/riscv64-unknown-linux-gnu/14.0.0/lto-wrapper
+Target: riscv64-unknown-linux-gnu
+Configured with: /home/jeremy/gittrees/mustang/gcc/configure --target=riscv64-unknown-linux-gnu --prefix=/home/jeremy/gittrees/mustang/install --with-sysroot=/home/jeremy/gittrees/mustang/install/sysroot --with-pkgversion=g68783211f66 --with-system-zlib --enable-shared --enable-tls --enable-languages=c,c++,fortran --disable-libmudflap --disable-libssp --disable-libquadmath --disable-libsanitizer --disable-nls --disable-bootstrap --src=/home/jeremy/gittrees/mustang/gcc --enable-multilib --with-abi=lp64d --with-arch=rv64gc --with-tune= --with-isa-spec=20191213 'CFLAGS_FOR_TARGET=-O2    -mcmodel=medany' 'CXXFLAGS_FOR_TARGET=-O2    -mcmodel=medany'
+Thread model: posix
+Supported LTO compression algorithms: zlib
+gcc version 14.0.0 20230811 (experimental) (g68783211f66)
+
+- User: JuzheZhong | Time: 2023-08-11 11:33:08 UTC
+  Text: I didn't
+
+- User: JuzheZhong | Time: 2023-08-11 11:34:58 UTC
+  Text: Confirm it's caused by:
+
+			if (!final_len)
+			  {
+			    /* Pass VF value to 'len' argument of
+			       MASK_LEN_LOAD if LOOP_LENS is invalid.  */
+			    tree iv_type
+			      = LOOP_VINFO_RGROUP_IV_TYPE (loop_vinfo);
+			    final_len
+			      = build_int_cst (iv_type,
+					       TYPE_VECTOR_SUBPARTS (vectype));
+			  }
+
+
+The final_len is false when we didn't record len. 
+In this situation, LOOP_VINFO_RGROUP_IV_TYPE (loop_vinfo) is not 
+set correctly.
+
+
+Thanks for reporting.
+
+- User: GCC Commits | Time: 2023-08-11 21:50:48 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:5bfb5e772f6cf121563f08d27d2c652ea469bbfbcommitr14-3167-g5bfb5e772f6cf121563f08d27d2c652ea469bbfbAuthor: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Fri Aug 11 21:55:42 2023 +0800
+
+    VECT: Fix ICE on MASK_LEN_{LOAD, STORE} when no LEN recorded[PR110989]
+    
+    This ICE is caused because of this situation:
+    
+    mask__49.21_99 = vect__17.19_96 == { 0.0, ... };
+    ...
+    vect__6.24_107 = .MASK_LEN_LOAD (vectp.22_105, 32B, mask__49.21_99, POLY_INT_CST [2, 2], 0);
+    
+    The MASK_LEN_LOAD is using real MASK which is produced by the EQ comparison wheras the LEN
+    is the dummy LEN which is the vectorization factor.
+    
+    In this situation, we didn't enter 'vect_record_loop_len' since there is no LEN loop control.
+    Then 'LOOP_VINFO_RGROUP_IV_TYPE' is not suitable type for 'build_int_cst' used for producing
+    LEN argument for 'MASK_LEN_LOAD', so use sizetype instead which is perfectly matching
+    RVV length requirement.
+    
+    gcc/ChangeLog:PR middle-end/110989* tree-vect-stmts.cc (vectorizable_store): Replace iv_type with sizetype.
+            (vectorizable_load): Ditto.
+    
+    gcc/testsuite/ChangeLog:PR middle-end/110989* gcc.target/riscv/rvv/autovec/pr110989.c: New test.
+
+- User: Jeremy Bennett | Time: 2023-08-14 14:51:00 UTC
+  Text: Confirmed the patch resolves this issue.
+
+- User: GCC Commits | Time: 2023-08-15 13:55:41 UTC
+  Text: The master branch has been updated by Pan Li <panli@gcc.gnu.org>:https://gcc.gnu.org/g:0618adfa80fcd2fd7ae03b30553c60a6b1abf573commitr14-3222-g0618adfa80fcd2fd7ae03b30553c60a6b1abf573Author: Juzhe-Zhong <juzhe.zhong@rivai.ai>
+Date:   Sat Aug 12 22:15:15 2023 +0800
+
+    RISC-V: Fix autovec_length_operand predicate[PR110989]
+    
+    Currently, autovec_length_operand predicate incorrect configuration is
+    discovered inPR110989since this following situation:
+    
+    vect__6.24_107 = .MASK_LEN_LOAD (vectp.22_105, 32B, mask__49.21_99, POLY_INT_CST [2, 2], 0); ---> dummy length = VF.
+    
+    The current autovec length operand failed to recognize the VF dummy length.
+    
+    -march=rv64gcv -mabi=lp64d --param=riscv-autovec-preference=scalable -Ofast -fno-schedule-insns -fno-schedule-insns2:
+    
+    Before this patch:
+    
+            srli    a4,s0,2
+            addi    a4,a4,-3
+            srli    s0,s0,3
+            vsetvli a5,zero,e64,m1,ta,ma
+            vid.v   v1
+            vmul.vx v1,v1,a4
+            addi    a4,s0,-2
+            vadd.vx v1,v1,a4
+            addi    a4,s0,-1
+            vslide1up.vx    v2,v1,a4
+            vmv.v.x v1,a4
+            vand.vv v1,v2,v1
+            vl1re64.v       v3,0(t2)
+            vrgather.vv     v2,v3,v1
+            vmv.v.i v1,0
+            vmfeq.vv        v0,v2,v1
+            vsetvli zero,s0,e32,mf2,ta,ma    ---> s0 = POLY (2,2)
+            vle32.v v3,0(t3),v0.t
+            vsetvli a5,zero,e64,m1,ta,ma
+            vmfne.vv        v0,v2,v1
+            vsetvli zero,zero,e32,mf2,ta,ma
+            vfwcvt.f.x.v    v1,v3
+            vsetvli zero,zero,e64,m1,ta,ma
+            vmerge.vvm      v1,v1,v2,v0
+            vslidedown.vx   v1,v1,a4
+            vfmv.f.s        fa5,v1
+            j       .L6
+    
+    After this patch:
+    
+            srli    a4,s0,2
+            addi    a4,a4,-3
+            srli    s0,s0,3
+            vsetvli a5,zero,e64,m1,ta,ma
+            vid.v   v1
+            vmul.vx v1,v1,a4
+            addi    a4,s0,-2
+            vadd.vx v1,v1,a4
+            addi    s0,s0,-1
+            vslide1up.vx    v2,v1,s0
+            vmv.v.x v1,s0
+            vand.vv v1,v2,v1
+            vl1re64.v       v3,0(t2)
+            vrgather.vv     v2,v3,v1
+            vmv.v.i v1,0
+            vmfeq.vv        v0,v2,v1
+            vle32.v v3,0(t3),v0.t
+            vmfne.vv        v0,v2,v1
+            vsetvli zero,zero,e32,mf2,ta,ma
+            vfwcvt.f.x.v    v1,v3
+            vsetvli zero,zero,e64,m1,ta,ma
+            vmerge.vvm      v1,v1,v2,v0
+            vslidedown.vx   v1,v1,s0
+            vfmv.f.s        fa5,v1
+            j       .L6
+    
+    2 vsetvli insns are reduced.
+    
+    gcc/ChangeLog:PR target/110989* config/riscv/predicates.md: Fix predicate.
+    
+    gcc/testsuite/ChangeLog:PR target/110989* gcc.target/riscv/rvv/autovec/pr110989.c: Add vsetvli assembly check.
+

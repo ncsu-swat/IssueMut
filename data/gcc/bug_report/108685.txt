@@ -1,0 +1,293 @@
+Bug Summary: [10 Regression] ICE in verify_loop_structure, at cfgloop.cc:1748 since r13-2388-ga651e6d59188da
+Product: gcc
+Component: middle-end
+
+  (show other bugs)
+Keywords: ice-checking, openmp
+Known to Work: 
+Known to Fail: 
+
+Comments:
+- User: G. Steinmetz | Time: 2023-02-06 18:50:55 UTC
+  Text: Started between 20220828 and 20220904, at -O1+ :
+
+
+$ cat z1.c
+void f (int a)
+{
+  for (;;)
+    #pragma omp for collapse(2) ordered(4)
+    for (int i = 0; i < 2; i++)
+      for (int j = 0; j < a; j++)
+        for (int k = 0; k < 2; k++)
+          for (int l = 0; l < a; l++)
+          {
+            #pragma omp ordered doacross (source:)
+            __builtin_abort ();
+          }
+}
+
+
+$ gcc-13-20230205 -c z1.c -fopenmp -O2
+z1.c: In function 'f':
+z1.c:4:13: error: size of loop 3 should be 9, not 10
+    4 |     #pragma omp for collapse(2) ordered(4)
+      |             ^~~
+z1.c:4:13: error: bb 8 does not belong to loop 3
+z1.c:4:13: error: bb 18 does not belong to loop 3
+z1.c:4:13: error: bb 15 does not belong to loop 3
+z1.c:4:13: error: bb 14 does not belong to loop 3
+z1.c:4:13: error: bb 13 does not belong to loop 3
+z1.c:4:13: error: bb 9 does not belong to loop 3
+z1.c:4:13: error: bb 17 does not belong to loop 3
+z1.c:4:13: error: bb 16 does not belong to loop 3
+z1.c:4:13: error: bb 10 does not belong to loop 3
+z1.c:4:13: error: loop 3's header does not belong directly to it
+during GIMPLE pass: ompexp
+z1.c:4:13: internal compiler error: in verify_loop_structure, at cfgloop.cc:1748
+0x9ae013 verify_loop_structure()
+        ../../gcc/cfgloop.cc:1748
+0xd21499 checking_verify_loop_structure
+        ../../gcc/cfgloop.h:646
+0xd21499 fix_loop_structure(bitmap_head*)
+        ../../gcc/loop-init.cc:327
+0xf8dd37 repair_loop_structures
+        ../../gcc/tree-cfgcleanup.cc:1190
+0xf8dd37 cleanup_tree_cfg(unsigned int)
+        ../../gcc/tree-cfgcleanup.cc:1218
+0xe1dc14 execute_function_todo
+        ../../gcc/passes.cc:2057
+0xe1e5a2 execute_todo
+        ../../gcc/passes.cc:2145
+
+- User: Andrew Pinski | Time: 2023-02-06 20:20:03 UTC
+  Text: Most likelyr13-2388-ga651e6d59188da
+
+- User: Martin Liška | Time: 2023-02-10 09:05:43 UTC
+  Text: (In reply to Andrew Pinski fromcomment #1)> Most likelyr13-2388-ga651e6d59188daYes.
+
+- User: Jakub Jelinek | Time: 2023-02-15 13:41:10 UTC
+  Text: This actually ICEs all the way tor6-3899-gd9a6bd32adc40a7e1e5c7269if you use depend (source) instead of doacross (source:).
+
+- User: Jakub Jelinek | Time: 2023-02-15 15:15:26 UTC
+  Text: expand_omp_for_generic like other ompexp functions has the notion of broken_loop for
+loops where the body doesn't fall through to the artificial #pragma omp continue.
+This works fine even for doacross loops if they have ordered equals collapse or all the loops between ordered (inclusive) and collapse (exclusive) have compile time constant non-zero number of iterations.
+The problem is when they could have zero iterations (as in the testcase) or do have those provably - say if l < a above is replaced with l < -2, in that case while the ultimate body is a broken loop, either conditionally or always that ultimate body will not be encountered at runtime at all, and the loop will do nothing at all.  In that case
+the loop is no longer a non-loop (broken_loop) because in some cases or all it can actually loop.
+We can I think detect that after the expand_omp_for_init_counts call in expand_omp_for_generic.  The question is if we at that point can add an artificial cont_bb somewhere, set broken_loop to false and do whatever is needed to make the rest of the function work as if it wasn't a broken loop.
+
+- User: Jakub Jelinek | Time: 2023-02-15 16:14:17 UTC
+  Text: Though, we have such code already:
+      if (broken_loop)
+        {
+          int i;
+          for (i = fd->collapse; i < fd->ordered; i++)
+            {
+              tree type = TREE_TYPE (fd->loops[i].v);
+              tree this_cond
+                = fold_build2 (fd->loops[i].cond_code, boolean_type_node,
+                               fold_convert (type, fd->loops[i].n1),
+                               fold_convert (type, fd->loops[i].n2));
+              if (!integer_onep (this_cond))
+                break;
+            }
+          if (i < fd->ordered)
+            {
+              cont_bb
+                = create_empty_bb (EXIT_BLOCK_PTR_FOR_FN (cfun)->prev_bb);
+              add_bb_to_loop (cont_bb, l1_bb->loop_father);
+              gimple_stmt_iterator gsi = gsi_after_labels (cont_bb);
+              gimple *g = gimple_build_omp_continue (fd->loop.v, fd->loop.v);
+              gsi_insert_before (&gsi, g, GSI_SAME_STMT);
+              make_edge (cont_bb, l3_bb, EDGE_FALLTHRU);
+              make_edge (cont_bb, l1_bb, 0);
+              l2_bb = create_empty_bb (cont_bb);
+              broken_loop = false;
+            }
+        }
+and at least when the outermost for (;;) is missing, it works fine.
+
+- User: Jakub Jelinek | Time: 2023-03-16 17:32:03 UTC
+  Text: Createdattachment 54685[details]gcc13-pr108685.patch
+
+Untested fix.
+
+- User: GCC Commits | Time: 2023-03-17 08:00:08 UTC
+  Text: The master branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:713fa5db8ceb4ba8783a0d690ceb4c07f2ff03d0commitr13-6731-g713fa5db8ceb4ba8783a0d690ceb4c07f2ff03d0Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Mar 17 08:46:28 2023 +0100
+
+    openmp: Fix up handling of doacross loops with noreturn body in loops [PR108685]
+    
+    The following patch fixes an ICE with doacross loops which have a single entry
+    no exit body, at least one of the ordered > collapse loops isn't guaranteed to
+    have at least one iteration and the whole doacross loop is inside some other loop.
+    The OpenMP constructs aren't represented by struct loop until the omp expansions,
+    so for a normal doacross loop which doesn't have a noreturn body the entry_bb
+    with the GOMP_FOR statement and the first bb of the body typically have the
+    same loop_father, and if the doacross loop isn't inside of some other loop
+    and the body is noreturn as well, both are part of loop 0.  The problematic
+    case is when the entry_bb is inside of some deeper loop, but the body, because
+    it falls through into EXIT, has loop 0 as loop_father.  l0_bb is created by
+    splitting the entry_bb fallthru edge into l1_bb, and because the two basic blocks
+    have different loop_father, a common loop is found for those (which is loop 0).
+    Now, if the doacross loop has collapse == ordered or all the ordered > collapse
+    loops are guaranteed to iterate at least once, all is still fine, because all
+    enter the l1_bb (body), which doesn't return and so doesn't loop further either.
+    But, if one of those loops could loop 0 times, the user written body wouldn't be
+    reached at all, so unlike the expectations the whole construct actually wouldn't
+    be noreturn if entry_bb is encountered and decides to handle at least one
+    iteration.
+    
+    In this case, we need to fix up, move the l0_bb into the same loop as entry_bb
+    (initially) and for the extra added loops put them as children of that same
+    loop, rather than of loop 0.
+    
+    2023-03-17  Jakub Jelinek  <jakub@redhat.com>PR middle-end/108685* omp-expand.cc (expand_omp_for_ordered_loops): Add L0_BB argument,
+            use its loop_father rather than BODY_BB's loop_father.
+            (expand_omp_for_generic): Adjust expand_omp_for_ordered_loops caller.
+            If broken_loop with ordered > collapse and at least one of those
+            extra loops aren't guaranteed to have at least one iteration, change
+            l0_bb's loop_father to entry_bb's loop_father.  Set cont_bb's
+            loop_father to l0_bb's loop_father rather than l1_bb's.
+    
+            * c-c++-common/gomp/doacross-8.c: New test.
+
+- User: Jakub Jelinek | Time: 2023-03-17 08:29:38 UTC
+  Text: Fixed on the trunk so far.
+
+- User: GCC Commits | Time: 2023-03-19 05:31:05 UTC
+  Text: The releases/gcc-12 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:d1b61495f60141dd9c8cad4a699d5adcecc56b85commitr12-9291-gd1b61495f60141dd9c8cad4a699d5adcecc56b85Author: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Mar 17 08:46:28 2023 +0100
+
+    openmp: Fix up handling of doacross loops with noreturn body in loops [PR108685]
+    
+    The following patch fixes an ICE with doacross loops which have a single entry
+    no exit body, at least one of the ordered > collapse loops isn't guaranteed to
+    have at least one iteration and the whole doacross loop is inside some other loop.
+    The OpenMP constructs aren't represented by struct loop until the omp expansions,
+    so for a normal doacross loop which doesn't have a noreturn body the entry_bb
+    with the GOMP_FOR statement and the first bb of the body typically have the
+    same loop_father, and if the doacross loop isn't inside of some other loop
+    and the body is noreturn as well, both are part of loop 0.  The problematic
+    case is when the entry_bb is inside of some deeper loop, but the body, because
+    it falls through into EXIT, has loop 0 as loop_father.  l0_bb is created by
+    splitting the entry_bb fallthru edge into l1_bb, and because the two basic blocks
+    have different loop_father, a common loop is found for those (which is loop 0).
+    Now, if the doacross loop has collapse == ordered or all the ordered > collapse
+    loops are guaranteed to iterate at least once, all is still fine, because all
+    enter the l1_bb (body), which doesn't return and so doesn't loop further either.
+    But, if one of those loops could loop 0 times, the user written body wouldn't be
+    reached at all, so unlike the expectations the whole construct actually wouldn't
+    be noreturn if entry_bb is encountered and decides to handle at least one
+    iteration.
+    
+    In this case, we need to fix up, move the l0_bb into the same loop as entry_bb
+    (initially) and for the extra added loops put them as children of that same
+    loop, rather than of loop 0.
+    
+    2023-03-17  Jakub Jelinek  <jakub@redhat.com>PR middle-end/108685* omp-expand.cc (expand_omp_for_ordered_loops): Add L0_BB argument,
+            use its loop_father rather than BODY_BB's loop_father.
+            (expand_omp_for_generic): Adjust expand_omp_for_ordered_loops caller.
+            If broken_loop with ordered > collapse and at least one of those
+            extra loops aren't guaranteed to have at least one iteration, change
+            l0_bb's loop_father to entry_bb's loop_father.  Set cont_bb's
+            loop_father to l0_bb's loop_father rather than l1_bb's.
+    
+            * c-c++-common/gomp/doacross-8.c: New test.
+    
+    (cherry picked from commit 713fa5db8ceb4ba8783a0d690ceb4c07f2ff03d0)
+
+- User: Jakub Jelinek | Time: 2023-03-20 10:30:28 UTC
+  Text: Fixed for 12.3 too.
+
+- User: GCC Commits | Time: 2023-05-02 20:15:53 UTC
+  Text: The releases/gcc-11 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:38812e9e87c4d42f1d9916788c92f17273d772dccommitr11-10725-g38812e9e87c4d42f1d9916788c92f17273d772dcAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Mar 17 08:46:28 2023 +0100
+
+    openmp: Fix up handling of doacross loops with noreturn body in loops [PR108685]
+    
+    The following patch fixes an ICE with doacross loops which have a single entry
+    no exit body, at least one of the ordered > collapse loops isn't guaranteed to
+    have at least one iteration and the whole doacross loop is inside some other loop.
+    The OpenMP constructs aren't represented by struct loop until the omp expansions,
+    so for a normal doacross loop which doesn't have a noreturn body the entry_bb
+    with the GOMP_FOR statement and the first bb of the body typically have the
+    same loop_father, and if the doacross loop isn't inside of some other loop
+    and the body is noreturn as well, both are part of loop 0.  The problematic
+    case is when the entry_bb is inside of some deeper loop, but the body, because
+    it falls through into EXIT, has loop 0 as loop_father.  l0_bb is created by
+    splitting the entry_bb fallthru edge into l1_bb, and because the two basic blocks
+    have different loop_father, a common loop is found for those (which is loop 0).
+    Now, if the doacross loop has collapse == ordered or all the ordered > collapse
+    loops are guaranteed to iterate at least once, all is still fine, because all
+    enter the l1_bb (body), which doesn't return and so doesn't loop further either.
+    But, if one of those loops could loop 0 times, the user written body wouldn't be
+    reached at all, so unlike the expectations the whole construct actually wouldn't
+    be noreturn if entry_bb is encountered and decides to handle at least one
+    iteration.
+    
+    In this case, we need to fix up, move the l0_bb into the same loop as entry_bb
+    (initially) and for the extra added loops put them as children of that same
+    loop, rather than of loop 0.
+    
+    2023-03-17  Jakub Jelinek  <jakub@redhat.com>PR middle-end/108685* omp-expand.c (expand_omp_for_ordered_loops): Add L0_BB argument,
+            use its loop_father rather than BODY_BB's loop_father.
+            (expand_omp_for_generic): Adjust expand_omp_for_ordered_loops caller.
+            If broken_loop with ordered > collapse and at least one of those
+            extra loops aren't guaranteed to have at least one iteration, change
+            l0_bb's loop_father to entry_bb's loop_father.  Set cont_bb's
+            loop_father to l0_bb's loop_father rather than l1_bb's.
+    
+            * c-c++-common/gomp/doacross-8.c: New test.
+    
+    (cherry picked from commit 713fa5db8ceb4ba8783a0d690ceb4c07f2ff03d0)
+
+- User: Jakub Jelinek | Time: 2023-05-03 10:37:22 UTC
+  Text: Fixed for 11.4 as well.
+
+- User: GCC Commits | Time: 2023-05-03 15:22:38 UTC
+  Text: The releases/gcc-10 branch has been updated by Jakub Jelinek <jakub@gcc.gnu.org>:https://gcc.gnu.org/g:605449d80639a9892c645ce3449f01cb955512facommitr10-11378-g605449d80639a9892c645ce3449f01cb955512faAuthor: Jakub Jelinek <jakub@redhat.com>
+Date:   Fri Mar 17 08:46:28 2023 +0100
+
+    openmp: Fix up handling of doacross loops with noreturn body in loops [PR108685]
+    
+    The following patch fixes an ICE with doacross loops which have a single entry
+    no exit body, at least one of the ordered > collapse loops isn't guaranteed to
+    have at least one iteration and the whole doacross loop is inside some other loop.
+    The OpenMP constructs aren't represented by struct loop until the omp expansions,
+    so for a normal doacross loop which doesn't have a noreturn body the entry_bb
+    with the GOMP_FOR statement and the first bb of the body typically have the
+    same loop_father, and if the doacross loop isn't inside of some other loop
+    and the body is noreturn as well, both are part of loop 0.  The problematic
+    case is when the entry_bb is inside of some deeper loop, but the body, because
+    it falls through into EXIT, has loop 0 as loop_father.  l0_bb is created by
+    splitting the entry_bb fallthru edge into l1_bb, and because the two basic blocks
+    have different loop_father, a common loop is found for those (which is loop 0).
+    Now, if the doacross loop has collapse == ordered or all the ordered > collapse
+    loops are guaranteed to iterate at least once, all is still fine, because all
+    enter the l1_bb (body), which doesn't return and so doesn't loop further either.
+    But, if one of those loops could loop 0 times, the user written body wouldn't be
+    reached at all, so unlike the expectations the whole construct actually wouldn't
+    be noreturn if entry_bb is encountered and decides to handle at least one
+    iteration.
+    
+    In this case, we need to fix up, move the l0_bb into the same loop as entry_bb
+    (initially) and for the extra added loops put them as children of that same
+    loop, rather than of loop 0.
+    
+    2023-03-17  Jakub Jelinek  <jakub@redhat.com>PR middle-end/108685* omp-expand.c (expand_omp_for_ordered_loops): Add L0_BB argument,
+            use its loop_father rather than BODY_BB's loop_father.
+            (expand_omp_for_generic): Adjust expand_omp_for_ordered_loops caller.
+            If broken_loop with ordered > collapse and at least one of those
+            extra loops aren't guaranteed to have at least one iteration, change
+            l0_bb's loop_father to entry_bb's loop_father.  Set cont_bb's
+            loop_father to l0_bb's loop_father rather than l1_bb's.
+    
+            * c-c++-common/gomp/doacross-8.c: New test.
+    
+    (cherry picked from commit 713fa5db8ceb4ba8783a0d690ceb4c07f2ff03d0)
+
+- User: Jakub Jelinek | Time: 2023-05-04 07:24:42 UTC
+  Text: Fixed for 10.5 too.
+
