@@ -1,0 +1,1 @@
+typeof_unqual(int) u = 12;
