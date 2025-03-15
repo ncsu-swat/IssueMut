@@ -1,0 +1,1 @@
+foo() { return (int)foo; }
