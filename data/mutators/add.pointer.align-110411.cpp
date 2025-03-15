@@ -1,0 +1,25 @@
+#include <clang/AST/ASTContext.h>
+#include <clang/AST/RecursiveASTVisitor.h>
+#include <clang/Basic/SourceManager.h>
+#include <clang/Lex/Lexer.h>
+#include "Mutator.h"
+#include "MutatorUsingBash.h"
+#include "MutatorManager.h"
+
+using namespace clang;
+
+class AlignPointerMutator : public MutatorUsingBash,
+    public RecursiveASTVisitor<AlignPointerMutator> {
+public:
+    using MutatorUsingBash::MutatorUsingBash;
+    
+    bool mutate() override {
+        return replaceWithBashScript("~/MetaMut/mutators/auto/add.pointer.align-110411.sh");
+    }
+
+private:
+};
+
+static RegisterMutator<AlignPointerMutator> M(
+    "add.pointer.align",
+    "Adds pointer alignment mask");
