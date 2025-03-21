@@ -13,8 +13,8 @@ retrofit such mutators into existing mutational compiler fuzzers.
 
 ```
 |-- data                     # Data directory containing evaluation results, mutators, seeds, and compiler-specific files
-|   |-- evaluation           # Evaluation results
-|   |-- seeds                # Seed programs
+|   |-- Evaluation           # Evaluation results for RQ1, RQ2, and RQ3 (including reported bugs)
+|   |-- seeds.tar.gz         # Seed programs
 |   |-- gcc                  # GCC compiler-related data
 |   |   |-- bug_reports      # GCC bug reports
 |   |   |-- negative_inputs  # Negative inputs for GCC
@@ -23,7 +23,6 @@ retrofit such mutators into existing mutational compiler fuzzers.
 |   |   |-- bug_reports      # LLVM bug reports
 |   |   |-- negative_inputs  # Negative inputs for LLVM
 |   |   |-- mutators         # Mutators mined from LLVM bug reports
-|
 |-- src                      # The implementation directory
 |   |-- mutator_mining       # The code for GCC/LLVM bug report extractor and negative input generator
 |   |-- MutatorUsingBash.cpp # The code to extend MetaMut for bash scripts
