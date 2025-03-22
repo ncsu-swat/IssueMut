@@ -1,0 +1,1 @@
+double g() { return 5.0; }
