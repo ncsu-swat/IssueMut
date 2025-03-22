@@ -12,16 +12,17 @@ retrofit such mutators into existing mutational compiler fuzzers.
 ## Structure of the project
 
 ```
-|-- data                     # Data directory containing evaluation results, mutators, seeds, and compiler-specific files
-|   |-- Evaluation           # Evaluation results for RQ1, RQ2, and RQ3 (including reported bugs)
-|   |-- seeds.tar.gz         # Seed programs
-|   |-- gcc                  # GCC compiler-related data (including test cases from bug reports, bug report contents, negative test cases, and mutators)
-|   |-- llvm                 # LLVM compiler-related data (including test cases from bug reports, bug report contents, negative test cases, and mutators)
-|-- src                      # The implementation directory
-|   |-- mutator_mining       # The code for GCC/LLVM bug report extractor and negative input generator
-|   |-- issuemut.patch       # The patch file to support MetaMut for bash scripts and the setup for the compilers that we used for experiments
-|   |-- MutatorUsingBash.h   # The header file that extend MetaMut for bash scripts
-|   |-- MutatorUsingBash.cpp # The code to extend MetaMut for bash scripts
-|   |-- replaceOne.sh        # Bash script using grep, awk, and sed to perform mutations
-|-- Fuzz4All                 # The results of running Fuzz4All
+|-- data                         # Data directory containing evaluation results, mutators, seeds, and compiler-specific files
+|   |-- Evaluation               # Evaluation results for RQ1, RQ2, and RQ3 (including reported bugs)
+|   |-- seeds.tar.gz             # Seed programs
+|   |-- gcc                      # GCC compiler-related data (including test cases from bug reports, bug report contents, negative test cases, and mutators)
+|   |-- llvm                     # LLVM compiler-related data (including test cases from bug reports, bug report contents, negative test cases, and mutators)
+|-- src                          # The implementation directory
+|   |-- mutator_mining           # The code for GCC/LLVM bug report extractor and negative input generator
+|   |-- fuzzer                   # The code for enhanced fuzzer
+|   |   |-- issuemut.patch       # The patch file to support MetaMut for bash scripts and the setup for the compilers that we used for experiments
+|   |   |-- MutatorUsingBash.h   # The header file that extend MetaMut for bash scripts
+|   |   |-- MutatorUsingBash.cpp # The code to extend MetaMut for bash scripts
+|   |   |-- replaceOne.sh        # Bash script using grep, awk, and sed to perform mutations
+|-- Fuzz4All                     # The results of running Fuzz4All
 ```
