@@ -1,3 +1,187 @@
+diff --git a/fuzzer/configs.py b/fuzzer/configs.py
+index 36cac5b3..d2011ed0 100644
+--- a/fuzzer/configs.py
++++ b/fuzzer/configs.py
+@@ -5,7 +5,7 @@ import pathlib
+ homedir = pathlib.Path(__file__).parent.parent
+ 
+ muss_homedir = f"{homedir}/mutators"
+-muss_bin = f"{muss_homedir}/output/muss"
++muss_bin = f"{muss_homedir}/output/bhis"
+ 
+ seeds_dir = f"{homedir}/seeds"
+ 
+@@ -17,11 +17,11 @@ clang_bin = f"{llvm_objdir}/bin/clang"
+ 
+ instrum_gcc_objdir = f"{homedir}/objects/gcc-project-trunk.instrum"
+ instrum_gcc_bin = f"{instrum_gcc_objdir}/install/bin/gcc"
+-instrum_gcc_nbrs = 1478061
++instrum_gcc_nbrs = 1573521
+ 
+ instrum_llvm_objdir = f"{homedir}/objects/llvm-project-trunk.instrum"
+ instrum_clang_bin = f"{instrum_llvm_objdir}/bin/clang"
+-instrum_clang_nbrs = 4915140
++instrum_clang_nbrs = 4422726
+ 
+ cc_map = {
+     gcc_bin: instrum_gcc_bin,
+diff --git a/fuzzer/lib/BugInst.py b/fuzzer/lib/BugInst.py
+index d3af9a40..4c14b7bf 100644
+--- a/fuzzer/lib/BugInst.py
++++ b/fuzzer/lib/BugInst.py
+@@ -218,6 +218,11 @@ class FromBugTracks:
+       "__GI_abort",
+       "__assert_fail_base",
+       "__GI___assert_fail",
++      #### added ####
++      "diagnostic_context::action_after_output",
++      "diagnostic_context::report_diagnostic",
++      "diagnostic_context::diagnostic_impl",
++      ###############
+       "diagnostic_action_after_output",
+       "diagnostic_report_diagnostic",
+       "diagnostic_impl",
+@@ -233,7 +238,17 @@ class FromBugTracks:
+       "llvm::report_fatal_error(char const*, bool)",
+       "llvm::llvm_unreachable_internal(char const*, char const*, unsigned int)",
+       "tree_class_check",
+-      "llvm::CastInst::Create(llvm::Instruction::CastOps, llvm::Value*, llvm::Type*, llvm::Twine const&, llvm::Instruction*)",
++      #### added ####
++      # "tree_class_check_failed",
++      "tree_check",
++      # "tree_check_failed",
++      "tree_not_check",
++      # "tree_not_check_failed",
++      "tree_ssa_strip_useless_type_conversions",
++      "gimplify_expr",
++      "c_gimplify_expr",
++      ###############
++      "llvm::CastInst::Create(llvm::Instruction::CastOps, llvm::Value*, llvm::Type*, llvm::Twine const&, llvm::InsertPosition)",
+       "llvm::IRBuilderBase::CreateCast(llvm::Instruction::CastOps, llvm::Value*, llvm::Type*, llvm::Twine const&)",
+     ]
+   @staticmethod
+diff --git a/fuzzer/lib/ControlledProcess.py b/fuzzer/lib/ControlledProcess.py
+index 9d51c480..b22409cf 100644
+--- a/fuzzer/lib/ControlledProcess.py
++++ b/fuzzer/lib/ControlledProcess.py
+@@ -230,7 +230,8 @@ class ControlledGDB:
+     last_time = time.time()
+     counter = {}
+     while time.time() < last_time + duration:
+-      self.run(cmd='c', timeout=step)
++      if not self.run(cmd='c', timeout=step):
++        break
+       response = self.communicate('-stack-list-frames 0 {depth}')
+       funcs = re.findall(r'func="[^"]*"', response)
+       for func in funcs:
+@@ -280,3 +281,4 @@ class ControlledGDB:
+     time.sleep(0.1)
+     self.p.terminate()
+     self.p.wait()
++    self.pmon.kill_procs()
+diff --git a/fuzzer/lib/Fuzzer.py b/fuzzer/lib/Fuzzer.py
+index 1d00a69e..26eaff16 100644
+--- a/fuzzer/lib/Fuzzer.py
++++ b/fuzzer/lib/Fuzzer.py
+@@ -52,6 +52,8 @@ class CompilerTracer:
+     self.gdb.communicate('b llvm::sys::PrintStackTrace')
+     # True means normally exits, False means timeout
+     res = self.gdb.run(timeout=self.timeout)
++    if not res:
++      return (res, None)
+     # return (res, self.gdb.traceback_functions())
+     # return (res, self.gdb.traceback_functions_and_addresses())
+     return (res, self.gdb.traceback_functions_and_lines())
+@@ -219,7 +221,9 @@ class Fuzzer:
+             self.fuzz_args.mutator.clean(ot)
+         else:
+           assert len(ot.ifiles) == 1
+-          self.fuzz_args.testcases.append(ot.ifiles[0])
++          ## added a condition (if not has_crash)
++          if not has_crash:
++            self.fuzz_args.testcases.append(ot.ifiles[0])
+         self.last_save_time = time.time()
+       else:
+         if not has_crash:
+@@ -231,3 +235,11 @@ class Fuzzer:
+       # clean tmpdir
+       Utils.remove_files(self.tmpdir)
+     self.mark_current_state('done')
++
++    with open(f"{self.fuzz_args.wdir}/seeds.txt", 'w') as fp:
++      for testcase in self.fuzz_args.testcases:
++        base_filename = os.path.basename(testcase)
++        if re.match(r'^\d+\.c$', base_filename):
++          continue
++        else:
++          fp.write(testcase + "\n")
+diff --git a/fuzzer/lib/Muss.py b/fuzzer/lib/Muss.py
+index 7279c5b5..e59305dd 100644
+--- a/fuzzer/lib/Muss.py
++++ b/fuzzer/lib/Muss.py
+@@ -49,6 +49,7 @@ class Muss(Mutator):
+     seed = random.randint(0, 2**31 - 1)
+     cmd  = f'{self.mutator_bin} --seed {seed}'
+     cmd += f' --randomly-try-all-mutators'
++    cmd += f' --print-mutations'
+     cmd += f' -i {ifile} -o {ofile}'
+     self.invoke_cmd = cmd
+     p = ControlledProcess(cmd,
+diff --git a/fuzzer/lib/Schedule.py b/fuzzer/lib/Schedule.py
+index bdd039d8..5dda7b7f 100644
+--- a/fuzzer/lib/Schedule.py
++++ b/fuzzer/lib/Schedule.py
+@@ -28,6 +28,5 @@ class Scheduler:
+       p = Process(target=self.worker, args=[job])
+       p.start()
+       self.ps.append([affinity, p, job])
+-      psutil.Process(p.pid).cpu_affinity([
+-        affinity, affinity + psutil.cpu_count() // 2])
++      psutil.Process(p.pid).cpu_affinity(list(range(60)))
+     for _, p, _ in self.ps: p.join()
+diff --git a/fuzzer/show.py b/fuzzer/show.py
+index 13cb76d4..0ce2e504 100644
+--- a/fuzzer/show.py
++++ b/fuzzer/show.py
+@@ -36,9 +36,9 @@ def load_bugs(dirs):
+   bugmap = {}
+   for d in dirs:
+     d = pathlib.Path(d)
+-    st_date = parse_start_date(d/'log.txt')
+     if not d.is_dir(): continue
+     if ',' not in str(d): continue
++    st_date = parse_start_date(d/'log.txt')
+     mutator, cc, num = str(d).split(',')
+     jfile = d/'crashes.json'
+     if os.access(jfile, os.R_OK):
+diff --git a/mutators/CMakeLists.txt b/mutators/CMakeLists.txt
+index 20d917f3..57d65133 100644
+--- a/mutators/CMakeLists.txt
++++ b/mutators/CMakeLists.txt
+@@ -53,3 +53,22 @@ add_muss_executable(mu.s
+   FILES main.cpp "mu.s/*.cpp" "mu.s/*.cpp")
+ add_muss_executable(mu.u
+   FILES main.cpp "mu.u/*.cpp" "mu.u/*.cpp")
++add_muss_executable(bhis
++  FILES main.cpp "bhis/*.cpp" "bhis/*.cpp")
++add_muss_executable(successful
++  FILES main.cpp "successful/*.cpp" "successful/*.cpp")
++
++# Find all .sh files in the scripts/ directory
++file(GLOB SCRIPT_FILES ${CMAKE_SOURCE_DIR}/scripts/*.sh)
++
++# Copy all .sh files to the build directory after building each executable
++foreach(EXECUTABLE muss mu.s mu.u bhis successful)
++    add_custom_command(TARGET ${EXECUTABLE} POST_BUILD
++        COMMAND ${CMAKE_COMMAND} -E copy_directory
++        ${CMAKE_SOURCE_DIR}/scripts
++        ${CMAKE_BINARY_DIR}/scripts
++    )
++endforeach()
++
++# Install all scripts as executable programs
++install(PROGRAMS ${SCRIPT_FILES} DESTINATION bin)
+\ No newline at end of file
 diff --git a/mutators/bhis/remove.variable.declaration-59944.cpp b/mutators/bhis/remove.variable.declaration-59944.cpp
 new file mode 100644
 index 00000000..29bb75b9
@@ -29,6 +213,39 @@ index 00000000..29bb75b9
 +static RegisterMutator<RemoveVariableDeclaration> M(
 +    "remove.variable.declaration",
 +    "Removes variable declaration that the variable was used for address of operator.");
+diff --git a/mutators/include/Mutator.h b/mutators/include/Mutator.h
+index 8301173c..543f5b3d 100644
+--- a/mutators/include/Mutator.h
++++ b/mutators/include/Mutator.h
+@@ -103,6 +103,7 @@ public:
+ 
+   clang::ASTContext &getASTContext() const;
+   clang::CompilerInstance &getCompilerInstance() const;
++  unsigned getSeed() const;
+   MutationRange getMutationRange() const;
+ 
+   const char *getName() const { return name; }
+diff --git a/mutators/include/MutatorManager.h b/mutators/include/MutatorManager.h
+index 6d2b34e0..1c56fa76 100644
+--- a/mutators/include/MutatorManager.h
++++ b/mutators/include/MutatorManager.h
+@@ -64,6 +64,8 @@ public:
+     return mutationRange;
+   }
+ 
++  unsigned getSeed() const { return SEED; }
++
+   llvm::raw_ostream &outs();
+ 
+   MutatorManager() = default;
+@@ -72,6 +74,7 @@ private:
+   std::string ErrorMsg;
+ 
+   unsigned seed = 0;
++  unsigned SEED = 0;
+   std::unique_ptr<std::mt19937> rndgen;
+   std::string mutatorName;
+   std::string inputFile;
 diff --git a/mutators/include/MutatorUsingBash.h b/mutators/include/MutatorUsingBash.h
 new file mode 100644
 index 00000000..90a3b10a
@@ -94,6 +311,56 @@ index 00000000..90a3b10a
 +
 +#endif // MUTATOR_USING_BASH_H
 \ No newline at end of file
+diff --git a/mutators/lib/CorrectUndefinedBehavior.cpp b/mutators/lib/CorrectUndefinedBehavior.cpp
+index 38444930..3db84709 100644
+--- a/mutators/lib/CorrectUndefinedBehavior.cpp
++++ b/mutators/lib/CorrectUndefinedBehavior.cpp
+@@ -809,5 +809,5 @@ public:
+   bool post(llvm::raw_ostream &os) override { return cforge_injector.post(os); }
+ };
+ 
+-static RegisterMutator<CorrectUndefinedBehavior>
+-    X("CorrectUndefinedBehavior", "correct static undefined behavior");
++// static RegisterMutator<CorrectUndefinedBehavior>
++//     X("CorrectUndefinedBehavior", "correct static undefined behavior");
+diff --git a/mutators/lib/Mutator.cpp b/mutators/lib/Mutator.cpp
+index 32a068a3..a0947045 100644
+--- a/mutators/lib/Mutator.cpp
++++ b/mutators/lib/Mutator.cpp
+@@ -24,6 +24,8 @@ clang::CompilerInstance &Mutator::getCompilerInstance() const {
+   return getManager().getCompilerInstance();
+ }
+ 
++unsigned Mutator::getSeed() const { return getManager().getSeed(); }
++
+ MutationRange Mutator::getMutationRange() const {
+   return getManager().getMutationRange();
+ }
+diff --git a/mutators/lib/MutatorManager.cpp b/mutators/lib/MutatorManager.cpp
+index 0a9d2a50..229ab294 100644
+--- a/mutators/lib/MutatorManager.cpp
++++ b/mutators/lib/MutatorManager.cpp
+@@ -30,6 +30,7 @@ MutatorManager *MutatorManager::getInstance() {
+ }
+ 
+ void MutatorManager::srand(unsigned seed) {
++  this->SEED = seed;
+   rndgen = std::make_unique<std::mt19937>(seed);
+ }
+ 
+@@ -60,8 +61,10 @@ bool MutatorManager::hasMutator(std::string name) {
+ 
+ std::vector<std::string> MutatorManager::getAllMutators() {
+   std::vector<std::string> mutators;
+-  for (auto &kvpair : getMutatorsMap())
+-    mutators.push_back(kvpair.first);
++  for (auto &kvpair : getMutatorsMap()) {
++    if (kvpair.first != "CorrectUndefinedBehavior")
++      mutators.push_back(kvpair.first);
++  }
+   return mutators;
+ }
+ 
 diff --git a/mutators/lib/MutatorUsingBash.cpp b/mutators/lib/MutatorUsingBash.cpp
 new file mode 100644
 index 00000000..676b7eae
@@ -310,6 +577,126 @@ index 00000000..676b7eae
 +    return true;
 +}
 \ No newline at end of file
+diff --git a/mutators/lib/examples/ChangeBinop.cpp b/mutators/lib/examples/ChangeBinop.cpp
+index 9eaf6366..8b6d7c98 100644
+--- a/mutators/lib/examples/ChangeBinop.cpp
++++ b/mutators/lib/examples/ChangeBinop.cpp
+@@ -63,5 +63,5 @@ private:
+   }
+ };
+ 
+-static RegisterMutator<ChangeBinop> M(
+-    "ChangeBinop", "Change binary expression's operator.");
++// static RegisterMutator<ChangeBinop> M(
++//     "ChangeBinop", "Change binary expression's operator.");
+diff --git a/mutators/lib/examples/ChangeDeclRef.cpp b/mutators/lib/examples/ChangeDeclRef.cpp
+index 87a40a91..6375c968 100644
+--- a/mutators/lib/examples/ChangeDeclRef.cpp
++++ b/mutators/lib/examples/ChangeDeclRef.cpp
+@@ -73,5 +73,5 @@ private:
+   std::vector<std::vector<clang::VarDecl *>> TheVars;
+ };
+ 
+-static RegisterMutator<ChangeDeclRef> M(
+-    "ChangeDeclRef", "Change a DeclRefExpr's referenced variable.");
++// static RegisterMutator<ChangeDeclRef> M(
++//     "ChangeDeclRef", "Change a DeclRefExpr's referenced variable.");
+diff --git a/mutators/main.cpp b/mutators/main.cpp
+index 25e5ea31..e4ab3d7c 100644
+--- a/mutators/main.cpp
++++ b/mutators/main.cpp
+@@ -38,6 +38,10 @@ cl::opt<bool> listMutators("list-mutators", cl::desc("List all mutators"),
+ cl::opt<bool> syntaxOnly("syntax-only", cl::desc("Perform syntax checks only"),
+                          cl::init(false), cl::cat(mutOpts));
+ 
++cl::opt<bool> printMutationState("print-mutations",
++    cl::desc("Print each mutation's results"), cl::init(false),
++    cl::cat(mutOpts));
++
+ cl::opt<std::string>
+     tryMutators("try-mutators",
+                 cl::desc("Try all specific mutators in specified order"),
+@@ -61,33 +65,63 @@ std::vector<std::string> splitString(const std::string &str, char delimiter) {
+ 
+ bool tryMutationWithMutators(MutatorManager *manager,
+                              const std::vector<std::string> &mutators) {
+-  std::string text;
+-  llvm::raw_string_ostream oss(text);
+-  if (mutators.size() > 1) {
+-    manager->setOutStream(oss);
++  json state = json::array();
++  state.push_back(
++      json::object({{"entry", "record"}, {"seed", unsigned(opt::seed)}, {"input", std::string(opt::input)}}));
++  
++  // read file contents
++  std::ifstream file(std::string(opt::input));
++  std::stringstream buffer;
++
++  if (file) {
++    buffer << file.rdbuf();
++  } else {
++    return false;
+   }
+ 
++  std::string buffer_contents = buffer.str();
++  llvm::StringRef srctext = buffer_contents;
++
++  std::string text;
++
+   for (auto &m : mutators) {
+     if (!manager->hasMutator(m)) {
+       llvm::errs() << "nonexistent mutator " << m << "\n";
+       continue;
+     }
++    text.clear();
++    llvm::raw_string_ostream oss(text);
++    manager->setOutStream(oss);
+     manager->setMutator(m);
+-    if (manager->mutate()) {
++    bool success = manager->mutate();
++    oss.flush();
++    llvm::StringRef output = llvm::StringRef(text);
++    bool changed = (output.size() != 0) && (output != srctext);
++    if (success && changed) {
+       llvm::errs() << "successfully with " << m << "\n";
+-      if (mutators.size() > 1) {
++      //if (mutators.size() > 1) {
+         if (opt::output == "-")
+           llvm::outs() << oss.str();
+         else {
++          state.push_back(
++            json::object({{"entry", "mutation"}, {"mutator", m}}));
++
+           std::ofstream outfile;
+           outfile.open(std::string(opt::output));
+           outfile << text;
+           outfile.close();
+         }
++      //}
++      if (opt::printMutationState) {
++        std::error_code ec;
++        llvm::raw_fd_ostream ofs(std::string(opt::output) + ".json", ec);
++            ofs << state.dump(2) << "\n";
++        ofs.close();
+       }
+       return true;
+-    } else if (oss.str().size())
+-      llvm::errs() << "error with " << m << ":\n" << oss.str() << "\n";
++    }
++    // else if (oss.str().size())
++    //   llvm::errs() << "error with " << m << ":\n" << oss.str() << "\n";
+   }
+   return false;
+ }
+@@ -117,7 +151,7 @@ int main(int argc, char **argv) {
+ 
+   range.filename = opt::input;
+ 
+-  manager->setOutputFile(opt::output);
++  // manager->setOutputFile(opt::output);
+   manager->setSourceFile(opt::input);
+   manager->setMutationRange(range);
+ 
 diff --git a/mutators/scripts/remove.variable.declaration-59944.sh b/mutators/scripts/remove.variable.declaration-59944.sh
 new file mode 100644
 index 00000000..101f42d1
@@ -399,3 +786,59 @@ index 00000000..a76a6464
 +
 +# cat $FILE
 \ No newline at end of file
+diff --git a/setup.sh b/setup.sh
+index 8ea094e5..0c31a58c 100644
+--- a/setup.sh
++++ b/setup.sh
+@@ -6,13 +6,20 @@ set -e
+ # configurations
+ : "${CC_DWNDIR:=$(pwd)/compilers}"
+ : "${CC_OBJDIR:=$(pwd)/objects}"
+-: "${JOBS:=4}"
++: "${JOBS:=8}"
++
++LLVM_CONFIG=$(which llvm-config)
++
++if ! [ -x $LLVM_CONFIG ]; then
++  echo -e "\033[1;31mCannot find an executable llvm-config"
++  exit 1
++fi
+ 
+ # other variables
+ PROJ_HOME=$(pwd)
+ CFORGE_OBJDIR=${PROJ_HOME}/output
+ INSTRUM_PATH=$PROJ_HOME/instrumenter/output/afl-bins
+-LLVM_VERSION=$(llvm-config --version | grep -oE '([0-9]+)\.[0-9]+\.[0-9]+' | awk -F. '{print $1}')
++LLVM_VERSION=$($LLVM_CONFIG --version | grep -oE '([0-9]+)\.[0-9]+\.[0-9]+' | awk -F. '{print $1}')
+ 
+ mkdir -p $CC_DWNDIR
+ mkdir -p $CC_OBJDIR
+@@ -22,13 +29,15 @@ mkdir -p $CFORGE_OBJDIR
+ cd $PROJ_HOME/instrumenter
+ mkdir -p output; cd output
+ cmake .. -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11
+-make -j4
++make -j8
+ 
+ # download gcc source
+ if ! [ -d $CC_DWNDIR/gcc-project-trunk ]; then
+   cd $CC_DWNDIR
+   echo "[*] downloading gcc's source code"
+-  git clone --depth=1 git://gcc.gnu.org/git/gcc.git gcc-project-trunk
++  git clone https://github.com/gcc-mirror/gcc.git gcc-project-trunk
++  cd gcc-project-trunk
++  git checkout 87492fb3fd5e7510983e0275a38ba95769335018
+ fi
+ 
+ # gcc-project-trunk.obj
+@@ -76,7 +85,9 @@ fi
+ if ! [ -d $CC_DWNDIR/llvm-project-trunk ]; then
+   cd $CC_DWNDIR
+   echo "[*] downloading llvm's source code"
+-  git clone --depth=1 git@github.com:llvm/llvm-project llvm-project-trunk
++  git clone https://github.com/llvm/llvm-project.git llvm-project-trunk
++  cd llvm-project-trunk
++  git checkout 9bdf683ba6cd9ad07667513d264a2bc02d969186
+ fi
+ 
+ # llvm-project-trunk.obj
