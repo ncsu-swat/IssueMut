@@ -21,16 +21,16 @@ anthropic_client = anthropic.Anthropic(
 
 llm_vendor = "openai"
 
-model = "o1-mini"
+model = "gpt-4o-mini"
 # model = "claude-3-5-sonnet-20241022"
 
 bug_report_directory = "llvm_bug_report"
-out_folder = "llvm_fixed_code"
+out_folder = "llvm_negative_code"
 
 # Helper Functions
 def setup_logger():
-    logging.basicConfig(filename="fixed_code_generator.log", level=logging.INFO)
-    logger.info(f"Logging started for fixed code generation!")
+    logging.basicConfig(filename="negative_code_generator.log", level=logging.INFO)
+    logger.info(f"Logging started for negative code generation!")
 
 def openai_api_request(conversation):
     # Call the OpenAI API
@@ -106,19 +106,19 @@ def number_of_processed_bug_reports(directory):
     history_files = Path(directory).glob("*.json")
     return len(list(history_files))
 
-def write_fixed_code(code, bug_id):
+def write_negative_code(code, bug_id):
     """
-    Write the fixed code to a file.
+    Write the negative code to a file.
     
-    :param code: The fixed code to write.
+    :param code: The negative code to write.
     :param bug_id: The ID of the bug.
     :return: None
     """
     if code:
-        output_file = f"{out_folder}/{bug_id}-fixed.c"
+        output_file = f"{out_folder}/{bug_id}-negative.c"
         with open(output_file, "w", encoding="utf-8") as file:
             file.write(code)
-        logger.info(f"Fixed code saved to {output_file}")
+        logger.info(f"Negative code saved to {output_file}")
 
 def save_conversation(bug_id, messages):
     """
@@ -149,16 +149,11 @@ def main():
 
     bug_ids = list_ids_from_c_files(bug_report_directory)
 
-    processed_ids = [id.replace("-fixed", "") for id in list_ids_from_c_files(out_folder)]
-
     for bug_id in bug_ids:
-
-        if number_of_processed_bug_reports(out_folder) >= 250:
-            logger.info("Number of processed bug reports reached 250. Exiting.")
-            break
         
-        if bug_id in processed_ids:
-            continue
+        # if number_of_processed_bug_reports(out_folder) >= 250:
+        #     logger.info("Number of processed bug reports reached 250. Exiting.")
+        #     break
         
         try: 
             with open(f"{bug_report_directory}/{bug_id}.txt", 'r') as file:
@@ -168,8 +163,8 @@ def main():
         except:
             continue
         
-        logger.info(f"Fixed code generation started for {bug_id}")
-        prompt = f"You are an experienced C expert. Your task is to read the following bug report and identify what makes the LLVM buggy. Then, mutate the following C program to fix the issue without mutating the comments in the code or adding new comments.\nThe response should include only the description of the mutation and the mutated C code.\n###Bug Report:\n{bug_report_content}\nOriginal C Code:\n```c\n{code}\n```"
+        logger.info(f"Negative code generation started for {bug_id}")
+        prompt = f"You are an experienced C Developer. Your task is to read the following bug report and corresponding bug-revealing input and produced a similar input that does not manifest the bug. Then, mutate the following C program to fix the issue without mutating the comments in the code or adding new comments.\nThe response should only include the description of the mutation and the mutated C code.\n###Bug Report:\n{bug_report_content}\n###Bug-revealing Input:\n```c\n{code}\n```"
         # logger.info(prompt)
 
         messages = [
@@ -189,9 +184,7 @@ def main():
         # Extracting and printing the code
         extracted_code = code_block.group(1).strip() if code_block else None
 
-        # TODO: check if the code is mutated
-        # TODO: refine the code
-        write_fixed_code(extracted_code, bug_id)
+        write_negative_code(extracted_code, bug_id)
         messages.append(
             {
                 "role": "assistant",
@@ -202,5 +195,3 @@ def main():
         
 if __name__ == "__main__":
     main()
-#TODO: send godbolt api to validate the mutation
-#TODO: agentize
