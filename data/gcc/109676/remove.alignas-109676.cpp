@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/remove.alignas-109676.sh");
+        return replaceWithBashScript("../scripts/remove.alignas-109676.sh");
     }
 
 private:

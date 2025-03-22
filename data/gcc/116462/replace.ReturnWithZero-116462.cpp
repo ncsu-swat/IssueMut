@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/replace.ReturnWithZero-116462.sh");
+        return replaceWithBashScript("../scripts/replace.ReturnWithZero-116462.sh");
     }
 
 private:

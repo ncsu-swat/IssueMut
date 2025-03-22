@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/array.element.mutator-110496.sh");
+        return replaceWithBashScript("../scripts/array.element.mutator-110496.sh");
     }
 private:
 };

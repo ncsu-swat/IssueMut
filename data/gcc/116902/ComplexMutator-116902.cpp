@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/ComplexMutator-116902.sh");
+        return replaceWithBashScript("../scripts/ComplexMutator-116902.sh");
     }
 
 private:

@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/convert.DoWhileToFor-109743.sh");
+        return replaceWithBashScript("../scripts/convert.DoWhileToFor-109743.sh");
     }
 private:
 };

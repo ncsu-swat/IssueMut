@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/mutate.void.function.declaration-109412.sh");
+        return replaceWithBashScript("../scripts/mutate.void.function.declaration-109412.sh");
     }
 
 private:

@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/remove.pragma-80664.sh");
+        return replaceWithBashScript("../scripts/remove.pragma-80664.sh");
     }
     
 private:

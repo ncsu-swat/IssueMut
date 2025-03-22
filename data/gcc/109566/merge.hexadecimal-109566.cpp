@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/merge.hexadecimal-109566.sh");
+        return replaceWithBashScript("../scripts/merge.hexadecimal-109566.sh");
     }
 
 private:

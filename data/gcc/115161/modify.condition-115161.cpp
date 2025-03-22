@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/modify.condition-115161.sh");
+        return replaceWithBashScript("../scripts/modify.condition-115161.sh");
     }
 
 private:

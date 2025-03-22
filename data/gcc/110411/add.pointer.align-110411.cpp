@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/add.pointer.align-110411.sh");
+        return replaceWithBashScript("../scripts/add.pointer.align-110411.sh");
     }
 
 private:

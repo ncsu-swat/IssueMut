@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/remove.temp.variable-108950.sh");
+        return replaceWithBashScript("../scripts/remove.temp.variable-108950.sh");
     }
 
 private:

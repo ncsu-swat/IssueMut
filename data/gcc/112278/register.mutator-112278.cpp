@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
 
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/register.mutator-112278.sh");
+        return replaceWithBashScript("../scripts/register.mutator-112278.sh");
     }
 
 private:

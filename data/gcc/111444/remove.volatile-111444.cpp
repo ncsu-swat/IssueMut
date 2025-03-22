@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
 
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/remove.volatile-111444.sh");
+        return replaceWithBashScript("../scripts/remove.volatile-111444.sh");
     }
 
 private:

@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/GlobalVarToFuncPtr-108547.sh");
+        return replaceWithBashScript("../scripts/GlobalVarToFuncPtr-108547.sh");
     }
 
 private:

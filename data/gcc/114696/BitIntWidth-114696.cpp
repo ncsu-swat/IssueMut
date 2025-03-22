@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/BitIntWidth-114696.sh");
+        return replaceWithBashScript("../scripts/BitIntWidth-114696.sh");
     }
 
 private:

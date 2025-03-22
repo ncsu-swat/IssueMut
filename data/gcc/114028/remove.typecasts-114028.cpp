@@ -12,7 +12,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/remove.typecasts-114028.sh");
+        return replaceWithBashScript("../scripts/remove.typecasts-114028.sh");
     }
 
 private:

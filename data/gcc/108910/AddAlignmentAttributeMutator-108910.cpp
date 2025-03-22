@@ -15,7 +15,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
 
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/AddAlignmentAttributeMutator-108910.sh");
+        return replaceWithBashScript("../scripts/AddAlignmentAttributeMutator-108910.sh");
     }
 
 private:

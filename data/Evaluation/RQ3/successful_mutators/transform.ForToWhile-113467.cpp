@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/transform.ForToWhile-113467.sh");
+        return replaceWithBashScript("../scripts/transform.ForToWhile-113467.sh");
     }
     
 private:

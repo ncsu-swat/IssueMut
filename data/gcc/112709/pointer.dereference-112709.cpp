@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/pointer.dereference-112709.sh");
+        return replaceWithBashScript("../scripts/pointer.dereference-112709.sh");
     }
 
 private:

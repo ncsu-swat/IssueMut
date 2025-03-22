@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/replace.temp.to.direct.call-60006.sh");
+        return replaceWithBashScript("../scripts/replace.temp.to.direct.call-60006.sh");
     }
 
 private:

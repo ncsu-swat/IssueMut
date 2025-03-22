@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/mask.comparison-113609.sh");
+        return replaceWithBashScript("../scripts/mask.comparison-113609.sh");
     }
 
 private:

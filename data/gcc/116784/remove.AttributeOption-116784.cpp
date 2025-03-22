@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
 
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/remove.AttributeOption-116784.sh");
+        return replaceWithBashScript("../scripts/remove.AttributeOption-116784.sh");
     }
 
 private:

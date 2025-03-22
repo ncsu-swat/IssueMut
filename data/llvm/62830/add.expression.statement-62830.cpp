@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/add.expression.statement-62830.sh");
+        return replaceWithBashScript("../scripts/add.expression.statement-62830.sh");
     }
     
 private:

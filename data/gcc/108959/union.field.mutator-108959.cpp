@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/union.field.mutator-108959.sh");
+        return replaceWithBashScript("../scripts/union.field.mutator-108959.sh");
     }
 };
 

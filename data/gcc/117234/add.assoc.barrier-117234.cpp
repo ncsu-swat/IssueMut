@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/add.assoc.barrier-117234.sh");
+        return replaceWithBashScript("../scripts/add.assoc.barrier-117234.sh");
     }
 
 private:

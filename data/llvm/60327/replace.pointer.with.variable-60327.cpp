@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/replace.pointer.with.variable-60327.sh");
+        return replaceWithBashScript("../scripts/replace.pointer.with.variable-60327.sh");
     }
 
 private:

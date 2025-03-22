@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/omp.IsDevicePtrToMap-109837.sh");
+        return replaceWithBashScript("../scripts/omp.IsDevicePtrToMap-109837.sh");
     }
 
 private:

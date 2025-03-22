@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/remove.var.init-113699.sh");
+        return replaceWithBashScript("../scripts/remove.var.init-113699.sh");
     }
 
 private:

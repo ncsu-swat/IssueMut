@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/reduce.size.of.bitint-61960.sh");
+        return replaceWithBashScript("../scripts/reduce.size.of.bitint-61960.sh");
     }
 
 private:

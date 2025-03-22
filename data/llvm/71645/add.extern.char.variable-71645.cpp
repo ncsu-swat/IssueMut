@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/add.extern.char.variable-71645.sh");
+        return replaceWithBashScript("../scripts/add.extern.char.variable-71645.sh");
     }
     
 private:

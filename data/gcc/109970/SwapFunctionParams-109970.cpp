@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/SwapFunctionParams-109970.sh");
+        return replaceWithBashScript("../scripts/SwapFunctionParams-109970.sh");
     }
 
 private:

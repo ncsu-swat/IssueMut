@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/replace.variable.in.if.condition-79435.sh");
+        return replaceWithBashScript("../scripts/replace.variable.in.if.condition-79435.sh");
     }
 
 private:

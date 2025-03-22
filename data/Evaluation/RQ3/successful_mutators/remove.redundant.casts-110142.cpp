@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/remove.redundant.casts-110142.sh");
+        return replaceWithBashScript("../scripts/remove.redundant.casts-110142.sh");
     }
 
 private:

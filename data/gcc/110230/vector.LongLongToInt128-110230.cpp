@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/vector.LongLongToInt128-110230.sh");
+        return replaceWithBashScript("../scripts/vector.LongLongToInt128-110230.sh");
     }
 
 private:

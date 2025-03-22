@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/replace.int8_t.with.macro.param-111255.sh");
+        return replaceWithBashScript("../scripts/replace.int8_t.with.macro.param-111255.sh");
     }
 
 private:

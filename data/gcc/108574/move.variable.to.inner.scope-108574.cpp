@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/auto/move.variable.to.inner.scope-108574.sh");
+        return replaceWithBashScript("../scripts/move.variable.to.inner.scope-108574.sh");
     }
 
 private:
