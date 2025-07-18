@@ -57,31 +57,31 @@
 | M31 | LLVM | Remove | Unary Operator | † Removes `typeof()` operators, introduced in the C23 standard. |
 | M32 | LLVM | Add | Character | Adds escape characters (e.g., backslashes) after line break characters. |
 | M33 | LLVM | Remove | Parameter | Removes `void` parameter from function declarator. |
-| M34 | | Add | Attribute, Function Declaration | Adds `__attribute__((noipa))` to function declarators. |
-| M35 | | Modify | Expression | Modifies array index in array subscript expressions. | 
-| M36 | | Modify | Type, Field Declaration | † Replaces bit-field types with `unsigned _BitInt`(e.g., changing `int` to `unsigned _BitInt(32)`). |
-| M37 | | Modify | Type | † Increases the width of `_BitInt` type declarations. |
-| M38 | | Modify | Type | Replaces unsigned integer types with signed integer types in variable declarations. |
-| M39 | | Modify | Type | Replaces signed int types with unsigned types in variable declarations. |
-| M40 | | Modify | Type | Converts a struct to a union and updates associated variables and parameters. |
-| M41 | | Duplicate	| Storage Class Specifier, Function Declaration | Duplicates function declarations with opposite storage class specifier. |
-| M42 | | Duplicate | Statement | Duplicates function call expressions. |
-| M43 | | Modify | Statement | Replaces a `#include` directive with a `#embed` directive. |
-| M44 | | Modify | Statement | Combines nested `if` statements into single `if` statements with logical AND operator. |
-| M45 | | Remove | Storage Class Specifier | Removes `static` storage class specifier from declarations. |
-| M46 | | Remove | Field Declaration | Removes a field declaration from struct/union declarations. |
-| M47 | | Remove | Parameter | Removes a parameter from variadic functions and updates references. |
-| M48 | | Remove | Initialization | Removes initialization expressions from global variable declarations. |
-| M49 | | Remove | Statement | Removes a macro definition (`#define`). |
-| M50 | | Remove | Statement | Removes an assignment statement. |
-| M51 | | Modify | Type | Converts named struct declarations to anonymous struct declarations. |
-| M52 | | Modify | Type | † Modifies the width of `_BitInt` type declarations. |
-| M53 | | Modify | Builtin Function, Statement | Replaces a return statement with `__builtin_unreachable()`. |
-| M54 | | Modify | Expression | Replaces a return expression with 0. |
-| M55 | | Modify | Type | Replaces type `size_t` with type `int`. |
-| M56 | | Modify | Type | Converts a struct definition into a forward declaration. |
-| M57 | | Modify | Type | Inlines struct definitions by replacing named struct usage with anonymous struct bodies. |
-| M58 | | Modify | Type | Replaces `int` types with `short int` in variable declarations. |
-| M59 | | Add | Attribute | Adds `__attribute__((returns\_twice))` to function declarators. |
-| M60 | | Swap | Parameter | Swaps parameters of a function declaration and updates corresponding function call expressions. |
+| M34 | GCC | Add | Attribute, Function Declaration | Adds `__attribute__((noipa))` to function declarators. |
+| M35 | GCC | Modify | Expression | Modifies array index in array subscript expressions. | 
+| M36 | GCC | Modify | Type, Field Declaration | † Replaces bit-field types with `unsigned _BitInt`(e.g., changing `int` to `unsigned _BitInt(32)`). |
+| M37 | GCC | Modify | Type | † Increases the width of `_BitInt` type declarations. |
+| M38 | GCC | Modify | Type | Replaces unsigned integer types with signed integer types in variable declarations. |
+| M39 | GCC | Modify | Type | Replaces signed int types with unsigned types in variable declarations. |
+| M40 | GCC | Modify | Type | Converts a struct to a union and updates associated variables and parameters. |
+| M41 | GCC | Duplicate	| Storage Class Specifier, Function Declaration | Duplicates function declarations with opposite storage class specifier. |
+| M42 | GCC | Duplicate | Statement | Duplicates function call expressions. |
+| M43 | LLVM | Modify | Statement | Replaces a `#include` directive with a `#embed` directive. |
+| M44 | GCC | Modify | Statement | Combines nested `if` statements into single `if` statements with logical AND operator. |
+| M45 | LLVM | Remove | Storage Class Specifier | Removes `static` storage class specifier from declarations. |
+| M46 | GCC | Remove | Field Declaration | Removes a field declaration from struct/union declarations. |
+| M47 | LLVM | Remove | Parameter | Removes a parameter from variadic functions and updates references. |
+| M48 | GCC | Remove | Initialization | Removes initialization expressions from global variable declarations. |
+| M49 | GCC | Remove | Statement | Removes a macro definition (`#define`). |
+| M50 | GCC | Remove | Statement | Removes an assignment statement. |
+| M51 | GCC | Modify | Type | Converts named struct declarations to anonymous struct declarations. |
+| M52 | LLVM | Modify | Type | † Modifies the width of `_BitInt` type declarations. |
+| M53 | GCC | Modify | Builtin Function, Statement | Replaces a return statement with `__builtin_unreachable()`. |
+| M54 | GCC | Modify | Expression | Replaces a return expression with 0. |
+| M55 | GCC | Modify | Type | Replaces type `size_t` with type `int`. |
+| M56 | LLVM | Modify | Type | Converts a struct definition into a forward declaration. |
+| M57 | LLVM | Modify | Type | Inlines struct definitions by replacing named struct usage with anonymous struct bodies. |
+| M58 | GCC | Modify | Type | Replaces `int` types with `short int` in variable declarations. |
+| M59 | GCC | Add | Attribute | Adds `__attribute__((returns\_twice))` to function declarators. |
+| M60 | GCC | Swap | Parameter | Swaps parameters of a function declaration and updates corresponding function call expressions. |
 
