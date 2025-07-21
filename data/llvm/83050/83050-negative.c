@@ -1,0 +1,16 @@
+unsigned short _Fract e1 = 0x1.e8p-1uhr; 
+unsigned short _Fract e2 = 0x1.8ep-1uhr; 
+unsigned short _Fract e3 = 0x1.e0p-1uhr; 
+unsigned _Accum e4 = 0xe.0000p-1uk;    
+unsigned _Accum e5 = 0xe.1000p-1uk;  
+unsigned _Accum e6 = 0xe.e000p-1uk;  
+unsigned _Accum e7 = 0xe.e800p-1uk; 
+unsigned _Accum e8 = 0xe.8e00p-1uk; 
+unsigned short _Fract E1 = 0x1.E8p-1uhr; 
+unsigned short _Fract E2 = 0x1.8Ep-1uhr; 
+unsigned short _Fract E3 = 0x1.E0p-1uhr; 
+unsigned _Accum E4 = 0xE.0000p-1uk;    
+unsigned _Accum E5 = 0xE.1000p-1uk;  
+unsigned _Accum E6 = 0xE.E000p-1uk;  
+unsigned _Accum E7 = 0xE.E800p-1uk; 
+unsigned _Accum E8 = 0xE.8E00p-1uk;

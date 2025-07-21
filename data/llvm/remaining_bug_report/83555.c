@@ -1,9 +1,9 @@
 // RUN: %clang_builtins %s %librt -o %t && %run %t
 // REQUIRES: librt_has_trampoline_setup
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdint.h>
 
 /*
  * Tests nested functions
@@ -22,34 +22,34 @@ typedef int (*nested_func_t)(int x);
 nested_func_t proc;
 
 int main() {
-    /* Some locals */
-    int c = 10;
-    int d = 7;
-    
-    /* Define a nested function: */
-    int bar(int x) { return x*5 + c*d; };
+  /* Some locals */
+  int c = 10;
+  int d = 7;
 
-    /* Assign global to point to nested function
-     * (really points to trampoline). */
-    proc = bar;
-    
-    /* Invoke nested function: */
-    c = 4;
-    if ( (*proc)(3) != 43 )
-        return 1;
-    d = 5;
-    if ( (*proc)(4) != 40 )
-        return 1;
+  /* Define a nested function: */
+  int bar(int x) { return x * 5 + c * d; };
 
-    /* Success. */
-    return 0;
+  /* Assign global to point to nested function
+   * (really points to trampoline). */
+  proc = bar;
+
+  /* Invoke nested function: */
+  c = 4;
+  if ((*proc)(3) != 43)
+    return 1;
+  d = 5;
+  if ((*proc)(4) != 40)
+    return 1;
+
+  /* Success. */
+  return 0;
 }
 
 #else
 
 int main() {
-    printf("skipped\n");
-    return 0;
+  printf("skipped\n");
+  return 0;
 }
 
 #endif

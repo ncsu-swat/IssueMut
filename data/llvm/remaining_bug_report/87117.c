@@ -7,9 +7,9 @@
 // KMP_HOT_TEAMS_MAX_LEVEL=1 means only the initial outer team
 //   is a hot team.
 
+#include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <omp.h>
 
 int main() {
   int a;
@@ -18,19 +18,19 @@ int main() {
 #pragma omp parallel num_threads(2)
   {
 #pragma omp parallel num_threads(2)
-    {
+      {
 #pragma omp atomic
-      a++;
-    }
-  }
+          a++;
+}
+}
 
 // Causes assert if hidden helper thread tries to allocate from thread pool
 // instead of creating new OS threads
 #pragma omp parallel num_threads(1)
-  {
+{
 #pragma omp target nowait
-    { a++; }
-  }
+  { a++; }
+}
 
-  return EXIT_SUCCESS;
+return EXIT_SUCCESS;
 }

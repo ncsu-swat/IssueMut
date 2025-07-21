@@ -1,0 +1,1 @@
+__attribute__((naked, no_stack_protector)) void foo(void) { asm("ret"); }

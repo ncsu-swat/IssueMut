@@ -1,0 +1,2 @@
+void f20(void) __attribute__((ownership_returns(foo)));  // expected-error {{'ownership_returns' attribute only applies to functions that return a pointer}}
+int f21(void) __attribute__((ownership_returns(foo)));  // expected-error {{'ownership_returns' attribute only applies to functions that return a pointer}}

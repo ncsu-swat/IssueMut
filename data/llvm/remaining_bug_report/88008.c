@@ -7,5 +7,6 @@ struct S {
 struct T; // expected-note {{forward declaration of 'struct T'}}
 
 void gh88008_nocrash(struct T *t) {
-  struct S s = { .v = t->y }; // expected-error {{incomplete definition of type 'struct T'}}
+  struct S s = {
+      .v = t->y}; // expected-error {{incomplete definition of type 'struct T'}}
 }

@@ -1,0 +1,1 @@
+int foo(_BitInt(256) x) { return __builtin_ctzg((unsigned _BitInt(512)) *(volatile _BitInt(256) *)&x); }

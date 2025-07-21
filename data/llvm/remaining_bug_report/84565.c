@@ -1,38 +1,32 @@
-/* RUN: %clang_cc1 -std=c89 -verify=expected,c89only -pedantic -Wno-c11-extensions %s
-   RUN: %clang_cc1 -std=c99 -verify=expected -pedantic -Wno-c11-extensions %s
-   RUN: %clang_cc1 -std=c11 -verify=expected -pedantic %s
-   RUN: %clang_cc1 -std=c17 -verify=expected -pedantic %s
-   RUN: %clang_cc1 -std=c2x -verify=expected -pedantic %s
- */
+// RUN: %clang_cc1 -triple i386-unknown-unknown -x c++ -emit-llvm -o - %s |
+// FileCheck %s
 
-/* WG14 DR502:
- * Flexible array member in an anonymous struct
- */
-void dr502(void) {
-  /* This is EXAMPLE 3 from 6.7.2.1 and is intended to show that a flexible
-   * array member can be used when the only other members of the class are from
-   * an anonymous structure member.
-   */
-  struct s {
-    struct { int i; };
-    int a[]; /* c89only-warning {{flexible array members are a C99 feature}} */
-  };
+union _u {
+  char a[];
+} u = {};
+union _u0 {
+  char a[];
+} u0 = {0};
 
-  /* This is a slightly modified example that looks to see whether the
-   * anonymous structure itself can provide a flexible array member for the
-   * containing class.
-   *
-   * The committee does not think this is valid because it would mean the
-   * anonymous structure would have size 0. Additionally, the anonymous
-   * structure has no additional members and so the flexible array member is
-   * not valid within the anonymous structure.
-   */
-  struct t {
-    int i;
-    struct { int a[]; }; /* expected-warning {{flexible array member 'a' in otherwise empty struct is a GNU extension}}
-                            c89only-warning {{flexible array members are a C99 feature}}
-                            expected-warning {{'' may not be nested in a struct due to flexible array member}}
-                          */
-  };
+// CHECK: %union._u = type { [0 x i8] }
+
+// CHECK: @u = global %union._u zeroinitializer, align 1
+// CHECK: @u0 = global { [1 x i8] } zeroinitializer, align 1
+
+union {
+  char a[];
+} z = {};
+// CHECK: @z = internal global %union.{{.*}} zeroinitializer, align 1
+union {
+  char a[];
+} z0 = {0};
+// CHECK: @z0 = internal global { [1 x i8] } zeroinitializer, align 1
+
+/* C++ requires global anonymous unions have static storage, so we have to
+   reference them to keep them in the IR output. */
+char keep(int pick) {
+  if (pick)
+    return z.a[0];
+  else
+    return z0.a[0];
 }
-
