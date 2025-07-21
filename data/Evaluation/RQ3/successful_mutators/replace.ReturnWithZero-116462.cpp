@@ -8,17 +8,17 @@
 
 using namespace clang;
 
-class AddAssocBarrier : public MutatorUsingBash, public RecursiveASTVisitor<AddAssocBarrier> {
+class ReplaceReturnWithZero : public MutatorUsingBash, public RecursiveASTVisitor<ReplaceReturnWithZero> {
 public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/scripts/add.assoc.barrier-117234.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/replace.ReturnWithZero-116462.sh");
     }
 
 private:
 };
 
-static RegisterMutator<AddAssocBarrier> M(
-    "add.assoc.barrier", 
-    "Wraps return value with __builtin_assoc_barrier.");
+static RegisterMutator<ReplaceReturnWithZero> M(
+    "replace.ReturnWithZero", 
+    "Replaces a return statement expression with 0.");

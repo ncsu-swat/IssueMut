@@ -15,7 +15,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
 
     bool mutate() override {
-        return replaceWithBashScript("../scripts/convert.goto.asmgoto-110079.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/convert.goto.asmgoto-110079.sh");
     }
 
 private:

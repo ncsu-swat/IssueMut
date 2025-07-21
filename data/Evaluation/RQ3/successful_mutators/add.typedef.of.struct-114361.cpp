@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/add.typedef.of.struct-114361.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/add.typedef.of.struct-114361.sh");
     }
 
 private:

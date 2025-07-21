@@ -8,17 +8,17 @@
 
 using namespace clang;
 
-class AddAssocBarrier : public MutatorUsingBash, public RecursiveASTVisitor<AddAssocBarrier> {
+class BitIntWidthMutator : public MutatorUsingBash, public RecursiveASTVisitor<BitIntWidthMutator> {
 public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/scripts/add.assoc.barrier-117234.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/BitIntWidth-114696.sh");
     }
 
 private:
 };
 
-static RegisterMutator<AddAssocBarrier> M(
-    "add.assoc.barrier", 
-    "Wraps return value with __builtin_assoc_barrier.");
+static RegisterMutator<BitIntWidthMutator> M(
+    "BitIntWidth", 
+    "Increases the width of _BitInt type declarations.");

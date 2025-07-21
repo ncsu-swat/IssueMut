@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/add.backslash-62054.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/add.backslash-62054.sh");
     }
     
 private:

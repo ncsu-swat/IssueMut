@@ -8,17 +8,17 @@
 
 using namespace clang;
 
-class AddAssocBarrier : public MutatorUsingBash, public RecursiveASTVisitor<AddAssocBarrier> {
+class SwapFunctionParams : public MutatorUsingBash, public RecursiveASTVisitor<SwapFunctionParams> {
 public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/scripts/add.assoc.barrier-117234.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/SwapFunctionParams-109970.sh");
     }
 
 private:
 };
 
-static RegisterMutator<AddAssocBarrier> M(
-    "add.assoc.barrier", 
-    "Wraps return value with __builtin_assoc_barrier.");
+static RegisterMutator<SwapFunctionParams> M(
+    "SwapFunctionParams", 
+    "Swaps parameters in function foo's declaration and calls.");

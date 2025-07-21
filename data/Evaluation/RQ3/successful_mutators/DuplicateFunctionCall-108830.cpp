@@ -5,20 +5,21 @@
 #include "Mutator.h"
 #include "MutatorUsingBash.h"
 #include "MutatorManager.h"
+#include <iostream>
 
 using namespace clang;
 
-class AddAssocBarrier : public MutatorUsingBash, public RecursiveASTVisitor<AddAssocBarrier> {
+class DuplicateFunctionCall : public MutatorUsingBash, public RecursiveASTVisitor<DuplicateFunctionCall> {
 public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("~/MetaMut/mutators/scripts/add.assoc.barrier-117234.sh");
+        return replaceOne("([_a-zA-Z][_a-zA-Z0-9]{0,30}\\([^;]*\\);)", "\\1\\1");
     }
 
 private:
 };
 
-static RegisterMutator<AddAssocBarrier> M(
-    "add.assoc.barrier", 
-    "Wraps return value with __builtin_assoc_barrier.");
+static RegisterMutator<DuplicateFunctionCall> M(
+    "DuplicateFunctionCall",
+    "Duplicates function calls in functions containing malloc.");
