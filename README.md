@@ -13,12 +13,12 @@ retrofit such mutators into existing mutational compiler fuzzers.
 
 ```
 |-- data                         # Data directory containing evaluation results, mutators, seeds, and compiler-specific files
-|   |-- Evaluation               # Evaluation results for RQ1, RQ2, and RQ3 (including reported bugs)
+|   |-- Evaluation               # Evaluation results for RQ1, RQ2, RQ3, and RQ4 (including reported bugs)
 |   |-- seeds.tar.gz             # Seed programs
 |   |-- gcc                      # GCC compiler-related data (including test cases from bug reports, bug report contents, negative test cases, and mutators)
 |   |-- llvm                     # LLVM compiler-related data (including test cases from bug reports, bug report contents, negative test cases, and mutators)
 |-- src                          # The implementation directory
-|   |-- mutator_mining           # The code for GCC/LLVM bug report extractor and negative input generator
+|   |-- mutator_mining           # The code for GCC/LLVM bug report extractor, negative input generator, and langchain-based mutator generator
 |   |-- fuzzer                   # The code for enhanced fuzzer
 |   |   |-- issuemut.patch       # The patch file to support MetaMut for bash scripts and the setup for the compilers that we used for experiments
 |   |   |-- MutatorUsingBash.h   # The header file that extend MetaMut for bash scripts
