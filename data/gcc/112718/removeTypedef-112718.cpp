@@ -8,7 +8,7 @@
 
 using namespace clang;
 
-class RemoveTypedef : public MutatorUsingBash, public RecursiveASTVisitor<RemoveTypedef> {
+class RemoveTypedef112718 : public MutatorUsingBash, public RecursiveASTVisitor<RemoveTypedef112718> {
 public:
     using MutatorUsingBash::MutatorUsingBash;
     
@@ -19,6 +19,6 @@ public:
 private:
 };
 
-static RegisterMutator<RemoveTypedef> M(
+static RegisterMutator<RemoveTypedef112718> M(
     "removeTypedef", 
     "Removes typedef and replaces with inline struct definitions.");

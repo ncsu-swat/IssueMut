@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/remove.volatile-113295.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/remove.volatile-113295.sh");
     }
 
 private:

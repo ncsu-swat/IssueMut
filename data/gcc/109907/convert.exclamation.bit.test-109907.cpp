@@ -15,7 +15,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/convert.exclamation.bit.test-109907.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/convert.exclamation.bit.test-109907.sh");
     }
 private:
 };

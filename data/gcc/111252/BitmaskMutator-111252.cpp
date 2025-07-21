@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/BitmaskMutator-111252.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/BitmaskMutator-111252.sh");
     }
 };
 

@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/post.increment.mutator-116295.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/post.increment.mutator-116295.sh");
     }
 
 private:

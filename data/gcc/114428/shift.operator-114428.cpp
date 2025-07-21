@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/shift.operator-114428.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/shift.operator-114428.sh");
     }
 
 private:

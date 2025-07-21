@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/ReduceVectorSizeMutator-112393.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/ReduceVectorSizeMutator-112393.sh");
     }
 
 private:

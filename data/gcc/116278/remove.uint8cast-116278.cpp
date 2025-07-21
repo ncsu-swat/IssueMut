@@ -7,7 +7,7 @@
 
 using namespace clang;
 
-class RemoveUint8Cast : public Mutator, public RecursiveASTVisitor<RemoveUint8Cast> {
+class RemoveUint8Cast116278 : public Mutator, public RecursiveASTVisitor<RemoveUint8Cast116278> {
 public:
     using Mutator::Mutator;
     
@@ -46,6 +46,6 @@ private:
     std::vector<CStyleCastExpr*> CastExprs;
 };
 
-static RegisterMutator<RemoveUint8Cast> M(
+static RegisterMutator<RemoveUint8Cast116278> M(
     "remove.uint8cast", 
     "Removes unnecessary uint8_t cast from uint16_t cast expression");

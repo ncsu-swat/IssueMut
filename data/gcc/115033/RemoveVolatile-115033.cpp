@@ -7,7 +7,7 @@
 
 using namespace clang;
 
-class RemoveVolatile : public Mutator, public RecursiveASTVisitor<RemoveVolatile> {
+class RemoveVolatile115033 : public Mutator, public RecursiveASTVisitor<RemoveVolatile115033> {
 public:
     using Mutator::Mutator;
     
@@ -65,6 +65,6 @@ private:
     std::vector<FieldDecl *> VolatileFields;
 };
 
-static RegisterMutator<RemoveVolatile> M(
+static RegisterMutator<RemoveVolatile115033> M(
     "RemoveVolatile", 
     "Removes volatile qualifier from pointer type fields in structures.");

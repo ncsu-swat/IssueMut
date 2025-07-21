@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/add.smmintrin.header-64664.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/add.smmintrin.header-64664.sh");
     }
     
 private:

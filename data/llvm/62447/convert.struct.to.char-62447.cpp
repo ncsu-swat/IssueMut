@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/convert.struct.to.char-62447.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/convert.struct.to.char-62447.sh");
     }
     
 private:

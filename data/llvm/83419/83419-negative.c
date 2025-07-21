@@ -1,0 +1,1 @@
+void f() { static _BitInt(128) p = {}; }

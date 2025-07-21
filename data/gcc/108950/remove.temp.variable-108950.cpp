@@ -8,17 +8,17 @@
 
 using namespace clang;
 
-class RemoveTempVariable : public MutatorUsingBash, public RecursiveASTVisitor<RemoveTempVariable> {
+class RemoveTempVariable108950 : public MutatorUsingBash, public RecursiveASTVisitor<RemoveTempVariable108950> {
 public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/remove.temp.variable-108950.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/remove.temp.variable-108950.sh");
     }
 
 private:
 };
 
-static RegisterMutator<RemoveTempVariable> M(
+static RegisterMutator<RemoveTempVariable108950> M(
     "remove.temp.variable.108950", 
     "Removes temporary variable and replaces its uses with direct cast expression.");

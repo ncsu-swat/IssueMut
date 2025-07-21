@@ -7,7 +7,7 @@
 
 using namespace clang;
 
-class RemoveVolatileQualifier : public Mutator, public RecursiveASTVisitor<RemoveVolatileQualifier> {
+class RemoveVolatileQualifier110914 : public Mutator, public RecursiveASTVisitor<RemoveVolatileQualifier110914> {
 public:
     using Mutator::Mutator;
     
@@ -67,6 +67,6 @@ private:
     std::vector<VarDecl*> VolatileVarDecls;
 };
 
-static RegisterMutator<RemoveVolatileQualifier> M(
+static RegisterMutator<RemoveVolatileQualifier110914> M(
     "remove.volatile.110914",
     "Removes volatile qualifier from variable declarations and related casts.");

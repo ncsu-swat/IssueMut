@@ -7,7 +7,7 @@
 
 using namespace clang;
 
-class RemoveInitializer : public Mutator, public RecursiveASTVisitor<RemoveInitializer> {
+class RemoveInitializer112581 : public Mutator, public RecursiveASTVisitor<RemoveInitializer112581> {
 public:
     using Mutator::Mutator;
     
@@ -46,6 +46,6 @@ private:
     std::vector<VarDecl *> DeclsWithInit;
 };
 
-static RegisterMutator<RemoveInitializer> M(
+static RegisterMutator<RemoveInitializer112581> M(
     "remove.initializer.112581", 
     "Removes initializer from variable declarations.");

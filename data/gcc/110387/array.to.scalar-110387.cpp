@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/array.to.scalar-110387.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/array.to.scalar-110387.sh");
     }
     
 private:

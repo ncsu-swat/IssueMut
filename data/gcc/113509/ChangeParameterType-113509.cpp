@@ -7,7 +7,7 @@
 
 using namespace clang;
 
-class ChangeParameterType : public Mutator, public clang::RecursiveASTVisitor<ChangeParameterType> {
+class ChangeParameterType113509 : public Mutator, public clang::RecursiveASTVisitor<ChangeParameterType113509> {
 public:
     using Mutator::Mutator;
 
@@ -53,6 +53,6 @@ private:
 };
 
 // Register the mutator
-static RegisterMutator<ChangeParameterType> M(
+static RegisterMutator<ChangeParameterType113509> M(
     "ChangeParameterType",
     "Changes the parameter type of FOO_showfatal from int to char.");

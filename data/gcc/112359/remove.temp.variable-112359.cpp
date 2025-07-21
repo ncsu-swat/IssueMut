@@ -7,8 +7,8 @@
 
 using namespace clang;
 
-class RemoveTempVariable : public Mutator, 
-                          public RecursiveASTVisitor<RemoveTempVariable> {
+class RemoveTempVariable112359 : public Mutator, 
+                          public RecursiveASTVisitor<RemoveTempVariable112359> {
 public:
     using Mutator::Mutator;
     
@@ -98,6 +98,6 @@ private:
     std::vector<DeclRefExpr*> TempVarRefs;
 };
 
-static RegisterMutator<RemoveTempVariable> M(
+static RegisterMutator<RemoveTempVariable112359> M(
     "remove.temp.variable.112359", 
     "Removes temporary variable and replaces its uses with the original variable");

@@ -8,7 +8,7 @@
 
 using namespace clang;
 
-class RemoveAttributes : public MutatorUsingBash, public RecursiveASTVisitor<RemoveAttributes> {
+class RemoveAttributes108723 : public MutatorUsingBash, public RecursiveASTVisitor<RemoveAttributes108723> {
 public:
     using MutatorUsingBash::MutatorUsingBash;
     
@@ -19,6 +19,6 @@ public:
 private:
 };
 
-static RegisterMutator<RemoveAttributes> M(
+static RegisterMutator<RemoveAttributes108723> M(
     "remove.attributes", 
     "Removes function attributes.");

@@ -7,7 +7,7 @@
 
 using namespace clang;
 
-class RemoveTypedef : public Mutator, public clang::RecursiveASTVisitor<RemoveTypedef> {
+class RemoveTypedef108681 : public Mutator, public clang::RecursiveASTVisitor<RemoveTypedef108681> {
 public:
     using Mutator::Mutator;
 
@@ -45,6 +45,6 @@ private:
 };
 
 // Register the mutator
-static RegisterMutator<RemoveTypedef> M(
+static RegisterMutator<RemoveTypedef108681> M(
     "RemoveTypedef",
     "Removes the typedef declaration for 'int64x1x4_t'.");

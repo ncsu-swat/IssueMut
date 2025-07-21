@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/add.header-69889.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/add.header-69889.sh");
     }
     
 private:

@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/add.likely.unlikely-69841.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/add.likely.unlikely-69841.sh");
     }
     
 private:

@@ -8,7 +8,7 @@
 
 using namespace clang;
 
-class ModifyForLoopCondition : public MutatorUsingBash, public RecursiveASTVisitor<ModifyForLoopCondition> {
+class ModifyForLoopCondition108793 : public MutatorUsingBash, public RecursiveASTVisitor<ModifyForLoopCondition108793> {
 public:
     using MutatorUsingBash::MutatorUsingBash;
     
@@ -19,6 +19,6 @@ public:
 private:
 };
 
-static RegisterMutator<ModifyForLoopCondition> X(
+static RegisterMutator<ModifyForLoopCondition108793> X(
     "modify.for.loop.condition", 
     "Transforms a while loop to an equivalent for loop.");

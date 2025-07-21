@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/SimplifyCode-113756.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/SimplifyCode-113756.sh");
     }
 
 private:

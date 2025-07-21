@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/add.if.to.omp.pragma-69368.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/add.if.to.omp.pragma-69368.sh");
     }
     
 private:

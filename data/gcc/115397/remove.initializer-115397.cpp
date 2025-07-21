@@ -8,7 +8,7 @@
 
 using namespace clang;
 
-class RemoveInitializer : public MutatorUsingBash, public RecursiveASTVisitor<RemoveInitializer> {
+class RemoveInitializer115397 : public MutatorUsingBash, public RecursiveASTVisitor<RemoveInitializer115397> {
 public:
     using MutatorUsingBash::MutatorUsingBash;
     
@@ -19,6 +19,6 @@ public:
 private:
 };
 
-static RegisterMutator<RemoveInitializer> M(
+static RegisterMutator<RemoveInitializer115397> M(
     "remove.initializer.115397", 
     "Removes initialization of pointer variables initialized to 0");

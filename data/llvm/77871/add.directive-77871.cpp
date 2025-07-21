@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/add.directive-77871.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/add.directive-77871.sh");
     }
     
 private:

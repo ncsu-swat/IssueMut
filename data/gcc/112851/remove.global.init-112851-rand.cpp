@@ -7,8 +7,8 @@
 
 using namespace clang;
 
-class RemoveGlobalInit : public Mutator, 
-    public clang::RecursiveASTVisitor<RemoveGlobalInit> {
+class RemoveGlobalInitRand : public Mutator, 
+    public clang::RecursiveASTVisitor<RemoveGlobalInitRand> {
 public:
     using Mutator::Mutator;
 
@@ -72,7 +72,7 @@ private:
     std::vector<VarDecl*> TargetVarDecls;
 };
 
-static RegisterMutator<RemoveGlobalInit> M(
+static RegisterMutator<RemoveGlobalInitRand> M(
     "remove.global.init-rand",
     "Removes initialization values from global variable declarations."
 );

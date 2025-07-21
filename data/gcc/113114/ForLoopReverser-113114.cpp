@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/ForLoopReverser-113114.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/ForLoopReverser-113114.sh");
     }
 
 private:

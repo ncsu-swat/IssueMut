@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/remove.unnecessary.cast-114975.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/remove.unnecessary.cast-114975.sh");
     }
 
 private:

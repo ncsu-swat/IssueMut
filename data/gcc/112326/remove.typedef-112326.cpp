@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
 
     bool mutate() override {
-        return replaceWithBashScript("../scripts/remove.typedef-112326.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/remove.typedef-112326.sh");
     }
 
 private:

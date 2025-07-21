@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/remove.calloc.free.functions-110777.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/remove.calloc.free.functions-110777.sh");
     }
 
 private:

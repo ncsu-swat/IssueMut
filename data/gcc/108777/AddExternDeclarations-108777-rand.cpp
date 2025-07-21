@@ -7,7 +7,7 @@
 
 using namespace clang;
 
-class AddExternDeclarations : public Mutator, public RecursiveASTVisitor<AddExternDeclarations> {
+class AddExternDeclarationsRand : public Mutator, public RecursiveASTVisitor<AddExternDeclarationsRand> {
 public:
     using Mutator::Mutator;
 
@@ -94,6 +94,6 @@ private:
 };
 
 // Register the mutator
-static RegisterMutator<AddExternDeclarations> M(
+static RegisterMutator<AddExternDeclarationsRand> M(
     "AddExternDeclarations.rand",
     "Adds extern declarations for functions called in the code.");

@@ -9,17 +9,17 @@
 
 using namespace clang;
 
-class RemovePragma : public MutatorUsingBash, public RecursiveASTVisitor<RemovePragma> {
+class RemovePragma80664 : public MutatorUsingBash, public RecursiveASTVisitor<RemovePragma80664> {
 public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/remove.pragma-80664.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/remove.pragma-80664.sh");
     }
     
 private:
 };
 
-static RegisterMutator<RemovePragma> M(
+static RegisterMutator<RemovePragma80664> M(
     "remove.pragma",
     "Removes a pragma.");

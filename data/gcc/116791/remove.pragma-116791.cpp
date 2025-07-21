@@ -7,7 +7,7 @@
 
 using namespace clang;
 
-class RemovePragma : public Mutator, public RecursiveASTVisitor<RemovePragma> {
+class RemovePragma116791 : public Mutator, public RecursiveASTVisitor<RemovePragma116791> {
 public:
     using Mutator::Mutator;
     
@@ -54,6 +54,6 @@ private:
     std::vector<CharSourceRange> PragmaLocations;
 };
 
-static RegisterMutator<RemovePragma> M(
+static RegisterMutator<RemovePragma116791> M(
     "remove.pragma.116791", 
     "Removes pragma directives from the source code");

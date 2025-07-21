@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/remove.countedby.macro-75173.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/remove.countedby.macro-75173.sh");
     }
     
 private:

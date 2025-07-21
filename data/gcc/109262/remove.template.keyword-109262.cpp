@@ -15,7 +15,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/remove.template.keyword-109262.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/remove.template.keyword-109262.sh");
     }
 
 private:

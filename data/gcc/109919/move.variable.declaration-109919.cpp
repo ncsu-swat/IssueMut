@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/move.variable.declaration-109919.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/move.variable.declaration-109919.sh");
     }
 
 private:

@@ -7,7 +7,7 @@
 
 using namespace clang;
 
-class RemoveMacroDefinition : public Mutator, public RecursiveASTVisitor<RemoveMacroDefinition> {
+class RemoveMacroDefinition115988 : public Mutator, public RecursiveASTVisitor<RemoveMacroDefinition115988> {
 public:
     using Mutator::Mutator;
     
@@ -58,6 +58,6 @@ private:
     }
 };
 
-static RegisterMutator<RemoveMacroDefinition> M(
+static RegisterMutator<RemoveMacroDefinition115988> M(
     "remove.macro.definition.115988",
     "Removes a macro definition from the source code.");

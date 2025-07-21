@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/SIMDVectorizationMutator-110485.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/SIMDVectorizationMutator-110485.sh");
     }
 
 private:

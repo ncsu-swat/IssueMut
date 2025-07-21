@@ -7,8 +7,8 @@
 
 using namespace clang;
 
-class RemoveVolatileQualifier : public Mutator, 
-    public RecursiveASTVisitor<RemoveVolatileQualifier> {
+class RemoveVolatileQualifier108790 : public Mutator, 
+    public RecursiveASTVisitor<RemoveVolatileQualifier108790> {
 
 public:
     using Mutator::Mutator;
@@ -53,6 +53,6 @@ private:
     std::vector<CStyleCastExpr *> TargetExprs;
 };
 
-static RegisterMutator<RemoveVolatileQualifier> M(
+static RegisterMutator<RemoveVolatileQualifier108790> M(
     "remove.volatile.108790",
     "Removes volatile qualifier from pointer cast expressions.");

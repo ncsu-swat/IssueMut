@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/add.countedby.attribute-73168.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/add.countedby.attribute-73168.sh");
     }
     
 private:

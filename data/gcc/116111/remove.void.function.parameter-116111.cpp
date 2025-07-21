@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/remove.void.function.parameter-116111.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/remove.void.function.parameter-116111.sh");
     }
 
 private:

@@ -8,7 +8,7 @@
 
 using namespace clang;
 
-class RemoveVariableInitialization : public Mutator, public RecursiveASTVisitor<RemoveVariableInitialization> {
+class RemoveVariableInitialization112320 : public Mutator, public RecursiveASTVisitor<RemoveVariableInitialization112320> {
 public:
     using Mutator::Mutator;
 
@@ -55,6 +55,6 @@ private:
 };
 
 // Register the mutator
-static RegisterMutator<RemoveVariableInitialization> M(
+static RegisterMutator<RemoveVariableInitialization112320> M(
     "RemoveVariableInitialization",
     "Removes the initialization for a randomly selected local variable.");

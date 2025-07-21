@@ -9,7 +9,7 @@
 
 using namespace clang;
 
-class RemoveUint8Cast : public MutatorUsingBash, public RecursiveASTVisitor<RemoveUint8Cast> {
+class RemoveUint8Cast71751 : public MutatorUsingBash, public RecursiveASTVisitor<RemoveUint8Cast71751> {
 public:
     using MutatorUsingBash::MutatorUsingBash;
     
@@ -20,6 +20,6 @@ public:
 private:
 };
 
-static RegisterMutator<RemoveUint8Cast> M(
+static RegisterMutator<RemoveUint8Cast71751> M(
     "remove.uint8_t.cast",
     "Removes uint8_t casting.");

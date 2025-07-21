@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/duplicate-linkage-111708.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/duplicate-linkage-111708.sh");
     }
 
 private:

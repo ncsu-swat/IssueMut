@@ -8,7 +8,7 @@
 
 using namespace clang;
 
-class ModifyForLoopCondition : public Mutator, public clang::RecursiveASTVisitor<ModifyForLoopCondition> {
+class ModifyForLoopCondition111519 : public Mutator, public clang::RecursiveASTVisitor<ModifyForLoopCondition111519> {
 public:
     using Mutator::Mutator;
 
@@ -74,6 +74,6 @@ private:
 };
 
 // Register the mutator
-static RegisterMutator<ModifyForLoopCondition> M(
+static RegisterMutator<ModifyForLoopCondition111519> M(
     "ModifyForLoopCondition",
     "Modifies the condition in a for loop from 'g < 2' to 'g <= 1'.");

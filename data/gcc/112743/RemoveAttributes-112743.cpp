@@ -8,7 +8,7 @@
 
 using namespace clang;
 
-class RemoveAttributes : public MutatorUsingBash, public RecursiveASTVisitor<RemoveAttributes> {
+class RemoveAttributes112743 : public MutatorUsingBash, public RecursiveASTVisitor<RemoveAttributes112743> {
 public:
     using MutatorUsingBash::MutatorUsingBash;
     
@@ -19,6 +19,6 @@ public:
 private:
 };
 
-static RegisterMutator<RemoveAttributes> X(
+static RegisterMutator<RemoveAttributes112743> X(
     "RemoveAttributes", 
     "Removes all __attribute__ annotations from the code");

@@ -8,7 +8,7 @@
 
 using namespace clang;
 
-class ChangeComparisonOperator : public Mutator, public RecursiveASTVisitor<ChangeComparisonOperator> {
+class ChangeComparisonOperatorEq : public Mutator, public RecursiveASTVisitor<ChangeComparisonOperatorEq> {
 public:
     using Mutator::Mutator;
 
@@ -43,6 +43,6 @@ private:
 };
 
 // Register the mutator
-static RegisterMutator<ChangeComparisonOperator> M(
+static RegisterMutator<ChangeComparisonOperatorEq> M(
     "ChangeComparisonOperator.eq",
     "Changes '!=' to '==' in a return statement of a function.");

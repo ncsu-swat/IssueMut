@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/delete.register.decl-113950.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/delete.register.decl-113950.sh");
     }
 
 private:

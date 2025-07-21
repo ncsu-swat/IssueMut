@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/change.typedef.to.orig.type-64404.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/change.typedef.to.orig.type-64404.sh");
     }
     
 private:

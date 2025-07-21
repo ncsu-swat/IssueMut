@@ -8,7 +8,7 @@
 
 using namespace clang;
 
-class RemoveMacroDefinition : public MutatorUsingBash, public RecursiveASTVisitor<RemoveMacroDefinition> {
+class RemoveMacroDefinition113921 : public MutatorUsingBash, public RecursiveASTVisitor<RemoveMacroDefinition113921> {
 public:
     using MutatorUsingBash::MutatorUsingBash;
     
@@ -17,6 +17,6 @@ public:
     }
 };
 
-static RegisterMutator<RemoveMacroDefinition> M(
+static RegisterMutator<RemoveMacroDefinition113921> M(
     "remove.macro.definition.113921",
     "Removes the asm_goto macro definition and empty lines.");

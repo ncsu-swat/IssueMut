@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/add.parameters-114132.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/add.parameters-114132.sh");
     }
 
 private:

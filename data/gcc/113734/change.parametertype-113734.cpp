@@ -7,8 +7,8 @@
 
 using namespace clang;
 
-class ChangeParameterType : public Mutator, 
-                          public RecursiveASTVisitor<ChangeParameterType> {
+class ChangeParameterType113734 : public Mutator, 
+                          public RecursiveASTVisitor<ChangeParameterType113734> {
 public:
     using Mutator::Mutator;
     
@@ -34,6 +34,6 @@ private:
     std::vector<ParmVarDecl *> TargetParams;
 };
 
-static RegisterMutator<ChangeParameterType> M(
+static RegisterMutator<ChangeParameterType113734> M(
     "change.parametertype", 
     "Changes parameter type from 'unsigned int' to 'unsigned short'");

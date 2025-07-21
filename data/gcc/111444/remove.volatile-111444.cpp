@@ -8,18 +8,18 @@
 
 using namespace clang;
 
-class RemoveVolatileQualifier : public MutatorUsingBash,
-    public RecursiveASTVisitor<RemoveVolatileQualifier> {
+class RemoveVolatileQualifier111444 : public MutatorUsingBash,
+    public RecursiveASTVisitor<RemoveVolatileQualifier111444> {
 public:
     using MutatorUsingBash::MutatorUsingBash;
 
     bool mutate() override {
-        return replaceWithBashScript("../scripts/remove.volatile-111444.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/remove.volatile-111444.sh");
     }
 
 private:
 };
 
-static RegisterMutator<RemoveVolatileQualifier> X(
+static RegisterMutator<RemoveVolatileQualifier111444> X(
     "remove.volatile.111444",
     "Removes volatile qualifier from variable declarations.");

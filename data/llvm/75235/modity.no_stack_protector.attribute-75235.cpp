@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/modity.no_stack_protector.attribute-75235.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/modity.no_stack_protector.attribute-75235.sh");
     }
     
 private:

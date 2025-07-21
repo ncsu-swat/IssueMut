@@ -14,7 +14,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/switch.loc.unused.attribute-59973.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/switch.loc.unused.attribute-59973.sh");
     }
 
 private:

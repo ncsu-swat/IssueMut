@@ -15,7 +15,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/WhileConditionMutator-111822.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/WhileConditionMutator-111822.sh");
     }
 
 private:

@@ -13,7 +13,7 @@ public:
     using MutatorUsingBash::MutatorUsingBash;
     
     bool mutate() override {
-        return replaceWithBashScript("../scripts/convert.X86IntrinsicToBuiltin-109973.sh");
+        return replaceWithBashScript("~/MetaMut/mutators/scripts/convert.X86IntrinsicToBuiltin-109973.sh");
     }
 
 private:
