@@ -1,4 +1,4 @@
-# IssueMut-ICSE2026
+# IssueMut-Artifacts
 
 This is the replication package for the paper "Bug Histories as Sources of Compiler Fuzzing Mutators" submitted to ICSE'26.
 
