@@ -1,7 +1,9 @@
 # IssueMut Install Instructions
 
-This document provides step-by-step instructions for setting up and running the IssueMut.
-Since the IssueMut is built on top of MetaMut, please clone MetaMut and apply the patch.
+This document provides step-by-step instructions for setting up and running the IssueMut mutators.
+Since we ran IssueMut mutators on top of MetaMut, please clone MetaMut and apply the patch.
+
+- Note: To run kitten_i, please clone the repository of Kitten (https://github.com/uw-pluverse/perses.git) and apply the `kitten_i.patch` to it.
 
 ## Setup Process
 
