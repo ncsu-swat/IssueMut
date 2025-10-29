@@ -1,10 +1,10 @@
 #!/bin/bash
 
-number_of_agents=60
+number_of_agents=15
 number_of_jobs=$((2 * number_of_agents))
 
 # seconds
-time=28800
+time=86400
 
 working_dir=$(pwd)
 
