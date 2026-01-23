@@ -1,6 +1,6 @@
 # IssueMut-Artifacts
 
-This is the replication package for the paper "Learning Compiler Fuzzing Mutators from Historical Bugs".
+This is the replication package for the paper MSR 2026 paper **"Learning Compiler Fuzzing Mutators from Historical Bugs"**.
 
 This paper proposes IssueMut, an approach for extracting compiler
 fuzzing mutators from bug histories. Our insight is that bug reports
