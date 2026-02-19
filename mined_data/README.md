@@ -47,7 +47,7 @@ These are produced by the `mutator_mining` component.
 
 Contains fuzzer-ready mutators derived from bug reports:
 
-- `{id}.yaml` (or `.cpp`) — Mutator generated from bug `{id}`
+- `{name}-{id}.cpp` (or `.sh`) — Mutator generated from bug `{id}`
 
 Mutators are directly consumed by the `fuzzer` component.
 
