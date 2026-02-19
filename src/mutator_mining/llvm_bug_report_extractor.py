@@ -1,9 +1,11 @@
 import requests
 import json
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone
 from dateutil.parser import isoparse
 import time
 import logging
+import argparse
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +27,7 @@ if token:
     headers["Authorization"] = f"token {token}"
 
 def setup_logger():
-    logging.basicConfig(filename="llvm_code_extractor.log", level=logging.INFO)
+    logging.basicConfig(filename="llvm_bug_report_extractor.log", level=logging.INFO)
     logger.info(f"Logging started for LLVM bug report extraction!")
 
 def github_api_call(url):
@@ -69,7 +71,7 @@ def extract_discussion(issue):
         return "\n".join(discussion)
     return "No discussion found."
 
-def extract_testcase(issue):
+def extract_testcase(issue, out_folder: str):
     if not issue:
         return None
     
@@ -92,7 +94,7 @@ def extract_testcase(issue):
                     contents_response = github_api_call(file['contents_url'])
                     testcase_response = requests.get(contents_response['download_url'])
                     if testcase_response.status_code == 200:
-                        with open(f"llvm_bug_report/{issue['number']}.c", "w") as f:
+                        with open(f"{out_folder}/{issue['number']}.c", "w") as f:
                             f.write(testcase_response.text)
                             return True
                     else:
@@ -101,33 +103,33 @@ def extract_testcase(issue):
     return False
 
 
-def is_within_date_range(timestamp):
+def is_within_date_range(timestamp: str, start_date: datetime, end_date: datetime):
 
     # Convert to datetime object
     dt = isoparse(timestamp)  # Parses ISO format
-
-    # Define start and end range
-    start_date = datetime(2023, 1, 1, tzinfo=timezone.utc)  # January 1, 2023
-    end_date = datetime(2024, 10, 31, 23, 59, 59, tzinfo=timezone.utc)  # End of October 2024
 
     # Check if the timestamp is within range
     return start_date <= dt <= end_date
 
-def after_end_date(timestamp):
+def after_end_date(timestamp, end_date: datetime):
     # Convert to datetime object
     dt = isoparse(timestamp)  # Parses ISO format
-
-    # Define start and end range
-    end_date = datetime(2024, 10, 31, 23, 59, 59, tzinfo=timezone.utc)  # January 1, 2023
-
     return dt > end_date
 
-def collect_llvm_bug_reports():
+def date_bounds_utc(start_d: date, end_d: date):
+    start_dt = datetime(start_d.year, start_d.month, start_d.day, 0, 0, 0, tzinfo=timezone.utc)
+    end_dt = datetime(end_d.year, end_d.month, end_d.day, 23, 59, 59, tzinfo=timezone.utc)
+    return start_dt, end_dt
+
+def collect_llvm_bug_reports(out_folder: str, start_d: date, end_d: date):
+    start_dt, end_dt = date_bounds_utc(start_d, end_d)
+    os.makedirs(out_folder, exist_ok=True)
 
     page_number = 1
+    since_iso = f"{start_d.isoformat()}T00:00:00Z"
 
     while True:
-        issue_url = f"{base_url}?state=closed&per_page=100&page={page_number}&since=2023-01-01T00:00:00Z&direction=asc"
+        issue_url = f"{base_url}?state=closed&per_page=100&page={page_number}&since={since_iso}&direction=asc"
 
         issues = github_api_call(issue_url)
         for issue in issues:
@@ -139,33 +141,55 @@ def collect_llvm_bug_reports():
                 logger.info(f"Skipping issue {issue['number']} because it is not completed")
                 continue
             
-            if not is_within_date_range(issue["closed_at"]) or not is_within_date_range(issue["created_at"]):
+            created_at = issue.get("created_at")
+            closed_at = issue.get("closed_at")
+            if not created_at or not closed_at:
+                continue
+            
+            if (not is_within_date_range(created_at, start_dt, end_dt) or
+                not is_within_date_range(closed_at, start_dt, end_dt)):
                 logger.info(f"Skipping issue {issue['number']} because it is not within the date range")
                 continue
             
             logger.info(f"========= Processing issue {issue['number']} =========")
 
-            testcase = extract_testcase(issue)
-            if not testcase:
+            if not extract_testcase(issue, out_folder):
                 logger.info(f"Skipping issue {issue['number']} because it has no testcase")
                 continue
             
             # Save bug report
-            with open(f"llvm_bug_report/{issue['number']}.txt", "w") as f:
+            with open(f"{out_folder}/{issue['number']}.txt", "w") as f:
                 discussion = extract_discussion(issue)
                 f.write(discussion)
             
             
-        if after_end_date(issues[-1]["created_at"]):
+        last_created = issues[-1].get("created_at")
+        if last_created and after_end_date(last_created, end_dt):
             break
 
         page_number += 1
 
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--out_folder", default="llvm_bug_report")
+    p.add_argument("--start_date", default="2023-01-01")
+    p.add_argument("--end_date", default="2024-10-31")
+    return p.parse_args()
+
+def parse_ymd(s):
+    y, m, d = s.split("-")
+    return date(int(y), int(m), int(d))
+
 # Main logic to collect LLVM bug reports
 def main():
+    args = parse_args()
+    out_folder = args.out_folder
+    start_date = parse_ymd(args.start_date)
+    end_date = parse_ymd(args.end_date)
 
     setup_logger()
-    collect_llvm_bug_reports()
+    print("Start extracting LLVM bug reports... (please check log file)")
+    collect_llvm_bug_reports(out_folder, start_date, end_date)
     logger.info(f"Finished processing bug reports for LLVM!")
 
 if __name__ == "__main__":
