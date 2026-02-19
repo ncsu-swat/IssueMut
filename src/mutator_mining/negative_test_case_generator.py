@@ -25,12 +25,12 @@ model = "gpt-4o-mini"
 # model = "claude-3-5-sonnet-20241022"
 
 bug_report_directory = "llvm_bug_report"
-out_folder = "llvm_negative_code"
+out_folder = "llvm_negative_test_case"
 
 # Helper Functions
 def setup_logger():
-    logging.basicConfig(filename="negative_code_generator.log", level=logging.INFO)
-    logger.info(f"Logging started for negative code generation!")
+    logging.basicConfig(filename="negative_test_case_generator.log", level=logging.INFO)
+    logger.info(f"Logging started for negative test case generation!")
 
 def openai_api_request(conversation):
     # Call the OpenAI API
@@ -118,7 +118,7 @@ def write_negative_code(code, bug_id):
         output_file = f"{out_folder}/{bug_id}-negative.c"
         with open(output_file, "w", encoding="utf-8") as file:
             file.write(code)
-        logger.info(f"Negative code saved to {output_file}")
+        logger.info(f"Negative test case saved to {output_file}")
 
 def save_conversation(bug_id, messages):
     """
@@ -163,7 +163,7 @@ def main():
         except:
             continue
         
-        logger.info(f"Negative code generation started for {bug_id}")
+        logger.info(f"Negative test case generation started for {bug_id}")
         prompt = f"You are an experienced C Developer. Your task is to read the following bug report and corresponding bug-revealing input and produced a similar input that does not manifest the bug. Then, mutate the following C program to fix the issue without mutating the comments in the code or adding new comments.\nThe response should only include the description of the mutation and the mutated C code.\n###Bug Report:\n{bug_report_content}\n###Bug-revealing Input:\n```c\n{code}\n```"
         # logger.info(prompt)
 
