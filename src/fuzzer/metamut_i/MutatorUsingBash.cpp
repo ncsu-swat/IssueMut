@@ -103,7 +103,7 @@ bool MutatorUsingBash::replaceOne(std::string pattern, std::string replacement) 
     std::string tempFileName = createTempFile(EntireFileContent);
 
     // Run bash command on the string
-    std::string bashCommand = "bash ~/MetaMut/mutators/replaceOne.sh " + tempFileName + " \'" + pattern + "\' \'" + replacement + "\' " + std::to_string(getSeed()) + " 2>/dev/null";
+    std::string bashCommand = "bash ~/MetaMut/mutators/scripts/replaceOne.sh " + tempFileName + " \'" + pattern + "\' \'" + replacement + "\' " + std::to_string(getSeed()) + " 2>/dev/null";
     
     // llvm::outs() << "bashCommand: " << bashCommand << "\n";
     bool result = runBash(bashCommand);

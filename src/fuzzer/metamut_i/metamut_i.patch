@@ -1,5 +1,49 @@
+diff --git a/exp_run.sh b/exp_run.sh
+new file mode 100644
+index 00000000..9d058795
+--- /dev/null
++++ b/exp_run.sh
+@@ -0,0 +1,38 @@
++#!/bin/bash
++
++number_of_agents=15
++number_of_jobs=$((2 * number_of_agents))
++
++# seconds
++time=86400
++
++working_dir=$(pwd)
++
++method="metamut_i"
++
++seeds=(2034567890 157839206 4037289401 1324675832 2947583017 1908234765 3284957103 2763891275 3746283957 1092387456)
++
++# Loop from 0 to 4
++for i in {0..4}; do
++    dir="$method-$i"
++    
++    # Create the directory if it doesn't exist
++    mkdir -p "$dir"
++
++    # Navigate into the directory
++    cd "$dir" || exit
++
++    echo ${seeds[$i]}
++
++    # Run the Python script
++    python3 ../fuzzer/run.py -j ${number_of_jobs} \
++      --wdir $working_dir/$dir \
++      --repeat-times ${number_of_agents} \
++      --duration ${time} \
++      --seeds-dir $working_dir/seeds \
++      --cc-opt=-O2 \
++      --seed ${seeds[$i]}
++
++    # Return to the original directory
++    cd ..
++done
 diff --git a/fuzzer/configs.py b/fuzzer/configs.py
-index 36cac5b3..d2011ed0 100644
+index 36cac5b3..5338e290 100644
 --- a/fuzzer/configs.py
 +++ b/fuzzer/configs.py
 @@ -5,7 +5,7 @@ import pathlib
@@ -7,7 +51,7 @@ index 36cac5b3..d2011ed0 100644
  
  muss_homedir = f"{homedir}/mutators"
 -muss_bin = f"{muss_homedir}/output/muss"
-+muss_bin = f"{muss_homedir}/output/bhis"
++muss_bin = f"{muss_homedir}/output/metamut_i"
  
  seeds_dir = f"{homedir}/seeds"
  
@@ -16,7 +60,7 @@ index 36cac5b3..d2011ed0 100644
  instrum_gcc_objdir = f"{homedir}/objects/gcc-project-trunk.instrum"
  instrum_gcc_bin = f"{instrum_gcc_objdir}/install/bin/gcc"
 -instrum_gcc_nbrs = 1478061
-+instrum_gcc_nbrs = 1573521
++instrum_gcc_nbrs = 1573698
  
  instrum_llvm_objdir = f"{homedir}/objects/llvm-project-trunk.instrum"
  instrum_clang_bin = f"{instrum_llvm_objdir}/bin/clang"
@@ -26,7 +70,7 @@ index 36cac5b3..d2011ed0 100644
  cc_map = {
      gcc_bin: instrum_gcc_bin,
 diff --git a/fuzzer/lib/BugInst.py b/fuzzer/lib/BugInst.py
-index d3af9a40..4c14b7bf 100644
+index d3af9a40..54f37cf4 100644
 --- a/fuzzer/lib/BugInst.py
 +++ b/fuzzer/lib/BugInst.py
 @@ -218,6 +218,11 @@ class FromBugTracks:
@@ -41,7 +85,7 @@ index d3af9a40..4c14b7bf 100644
        "diagnostic_action_after_output",
        "diagnostic_report_diagnostic",
        "diagnostic_impl",
-@@ -233,7 +238,17 @@ class FromBugTracks:
+@@ -233,7 +238,19 @@ class FromBugTracks:
        "llvm::report_fatal_error(char const*, bool)",
        "llvm::llvm_unreachable_internal(char const*, char const*, unsigned int)",
        "tree_class_check",
@@ -55,6 +99,8 @@ index d3af9a40..4c14b7bf 100644
 +      "tree_ssa_strip_useless_type_conversions",
 +      "gimplify_expr",
 +      "c_gimplify_expr",
++      "_fatal_insn",
++      "_fatal_insn_not_found",
 +      ###############
 +      "llvm::CastInst::Create(llvm::Instruction::CastOps, llvm::Value*, llvm::Type*, llvm::Twine const&, llvm::InsertPosition)",
        "llvm::IRBuilderBase::CreateCast(llvm::Instruction::CastOps, llvm::Value*, llvm::Type*, llvm::Twine const&)",
@@ -80,7 +126,7 @@ index 9d51c480..b22409cf 100644
      self.p.wait()
 +    self.pmon.kill_procs()
 diff --git a/fuzzer/lib/Fuzzer.py b/fuzzer/lib/Fuzzer.py
-index 1d00a69e..26eaff16 100644
+index 1d00a69e..4d4abb12 100644
 --- a/fuzzer/lib/Fuzzer.py
 +++ b/fuzzer/lib/Fuzzer.py
 @@ -52,6 +52,8 @@ class CompilerTracer:
@@ -92,18 +138,87 @@ index 1d00a69e..26eaff16 100644
      # return (res, self.gdb.traceback_functions())
      # return (res, self.gdb.traceback_functions_and_addresses())
      return (res, self.gdb.traceback_functions_and_lines())
-@@ -219,7 +221,9 @@ class Fuzzer:
-             self.fuzz_args.mutator.clean(ot)
-         else:
-           assert len(ot.ifiles) == 1
--          self.fuzz_args.testcases.append(ot.ifiles[0])
-+          ## added a condition (if not has_crash)
-+          if not has_crash:
-+            self.fuzz_args.testcases.append(ot.ifiles[0])
+@@ -184,7 +186,12 @@ class Fuzzer:
+           j = [v.to_json() for v in self.crashes.values()]
+           fp.write(json.dumps(j, indent=2))
+     return True
+-
++  
++  def save_crash(self, cc, testcase):
++    with open(f"{self.fuzz_args.wdir}/crash.log", 'a+') as fp:
++      now = time.time() - self.start_time
++      fp.write(f'{now}: [{cc}] Found bug report message in {testcase}\n')
++    
+   def fuzz(self):
+     if self.query_current_state() == 'done':
+       wlog('done detected, quit now')
+@@ -200,30 +207,50 @@ class Fuzzer:
+       opfx = self.next_opfx()
+       ot = self.fuzz_args.mutator.mutate(ifile, opfx)
+       if not ot: continue
+-      if self.fuzz_args.coverage_only:
+-        has_crash = False
++      
++      has_crash = False
++      # compile with GCC
++      if self.fuzz_args.cc.name == 'gcc':
++        prev_coverage = self.sampler.sample()
++        with self.sampler:
++          for opt_str in configs.options:
++            pRes = self.compile(configs.instrum_gcc_bin, ot, options=shlex.split(opt_str), capture_stderr=True)
++        curr_coverage = self.sampler.sample()
++      else:
++        for opt_str in configs.options:
++          pRes = self.compile(configs.gcc_bin, ot, options=shlex.split(opt_str), capture_stderr=True)
++      
++        chkRes = CompilerStatus.analyze(pRes.retcode, pRes.stderr, pRes.is_tle, pRes.is_oom)
++        if chkRes == CompilerStatus.Crash:
++          self.save_crash("GCC",ot)
++          has_crash = True
++      
++      # compile with Clang
++      if self.fuzz_args.cc.name == 'clang':
++        prev_coverage = self.sampler.sample()
++        with self.sampler:
++          for opt_str in configs.options:
++            pRes = self.compile(configs.instrum_clang_bin, ot, options=shlex.split(opt_str), capture_stderr=True)
++        curr_coverage = self.sampler.sample()
+       else:
+-        has_crash = self.check_crash(ot)
+-      # check coverage
+-      prev_coverage = self.sampler.sample()
+-      with self.sampler:
+         for opt_str in configs.options:
+-          self.compile(self.fuzz_args.cc.instrum_path,
+-              ot, options=shlex.split(opt_str))
+-      curr_coverage = self.sampler.sample()
++          pRes = self.compile(configs.clang_bin, ot, options=shlex.split(opt_str), capture_stderr=True)
++      
++        chkRes = CompilerStatus.analyze(pRes.retcode, pRes.stderr, pRes.is_tle, pRes.is_oom)
++        if chkRes == CompilerStatus.Crash:
++          self.save_crash("Clang",ot)
++          has_crash = True
++      
+       if curr_coverage.outperforms(prev_coverage):
+         # wlog(f"new branch: {ot}")
+         self.save_coverage(curr_coverage)
+-        if self.fuzz_args.mutator.is_generator():
+-          if not has_crash:
+-            self.fuzz_args.mutator.clean(ot)
+-        else:
+-          assert len(ot.ifiles) == 1
++        assert len(ot.ifiles) == 1
++        ## added a condition (if not has_crash)
++        if not has_crash:
+           self.fuzz_args.testcases.append(ot.ifiles[0])
          self.last_save_time = time.time()
        else:
          if not has_crash:
-@@ -231,3 +235,11 @@ class Fuzzer:
+-          # wlog(f"bored testcase: {ot}")
+           self.fuzz_args.mutator.clean(ot)
+         if time.time() >= self.last_save_time + 600:
+           self.last_save_time = time.time()
+@@ -231,3 +258,11 @@ class Fuzzer:
        # clean tmpdir
        Utils.remove_files(self.tmpdir)
      self.mark_current_state('done')
@@ -128,16 +243,27 @@ index 7279c5b5..e59305dd 100644
      self.invoke_cmd = cmd
      p = ControlledProcess(cmd,
 diff --git a/fuzzer/lib/Schedule.py b/fuzzer/lib/Schedule.py
-index bdd039d8..5dda7b7f 100644
+index bdd039d8..f70982b8 100644
 --- a/fuzzer/lib/Schedule.py
 +++ b/fuzzer/lib/Schedule.py
-@@ -28,6 +28,5 @@ class Scheduler:
+@@ -8,7 +8,8 @@ class Scheduler:
+     self.worker_args = worker_args
+     self.jobs = jobs
+     self.ps = []
+-    self.cores = list(range(self.jobs))
++    # self.cores = list(range(self.jobs))
++    self.cores = psutil.Process().cpu_affinity()
+ 
+   def execute_jobs(self):
+     jobs = iter(self.worker_args)
+@@ -28,6 +29,6 @@ class Scheduler:
        p = Process(target=self.worker, args=[job])
        p.start()
        self.ps.append([affinity, p, job])
 -      psutil.Process(p.pid).cpu_affinity([
 -        affinity, affinity + psutil.cpu_count() // 2])
-+      psutil.Process(p.pid).cpu_affinity(list(range(60)))
++      # psutil.Process(p.pid).cpu_affinity()
++      psutil.Process(p.pid).cpu_affinity([affinity])
      for _, p, _ in self.ps: p.join()
 diff --git a/fuzzer/show.py b/fuzzer/show.py
 index 13cb76d4..0ce2e504 100644
@@ -155,64 +281,40 @@ index 13cb76d4..0ce2e504 100644
      jfile = d/'crashes.json'
      if os.access(jfile, os.R_OK):
 diff --git a/mutators/CMakeLists.txt b/mutators/CMakeLists.txt
-index 20d917f3..57d65133 100644
+index 20d917f3..9b7a8a82 100644
 --- a/mutators/CMakeLists.txt
 +++ b/mutators/CMakeLists.txt
-@@ -53,3 +53,22 @@ add_muss_executable(mu.s
+@@ -3,6 +3,9 @@ project(MUSS CXX C)
+ include(cmake/string_to_list.cmake)
+ include(cmake/find_llvm.cmake)
+ 
++# set(CMAKE_BUILD_TYPE Debug)
++# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -g")
++
+ set(CMAKE_C_COMPILER "gcc")
+ set(CMAKE_CXX_COMPILER "g++")
+ 
+@@ -47,9 +50,19 @@ function(add_muss_executable name)
+   endif()
+ endfunction()
+ 
+-add_muss_executable(muss
++add_muss_executable(metamut
+   FILES main.cpp "mu*/*.cpp" "mu*/*.cpp")
+ add_muss_executable(mu.s
    FILES main.cpp "mu.s/*.cpp" "mu.s/*.cpp")
  add_muss_executable(mu.u
    FILES main.cpp "mu.u/*.cpp" "mu.u/*.cpp")
 +add_muss_executable(bhis
 +  FILES main.cpp "bhis/*.cpp" "bhis/*.cpp")
++add_muss_executable(bhis-gcc
++  FILES main.cpp "bhis_gcc_sample/*.cpp" "bhis_gcc_sample/*.cpp")
++add_muss_executable(bhis-llvm
++  FILES main.cpp "bhis_llvm_sample/*.cpp" "bhis_llvm_sample/*.cpp")
++add_muss_executable(metamut_i
++  FILES main.cpp "metamut_i/*.cpp" "metamut_i/*.cpp")
 +add_muss_executable(successful
 +  FILES main.cpp "successful/*.cpp" "successful/*.cpp")
-+
-+# Find all .sh files in the scripts/ directory
-+file(GLOB SCRIPT_FILES ${CMAKE_SOURCE_DIR}/scripts/*.sh)
-+
-+# Copy all .sh files to the build directory after building each executable
-+foreach(EXECUTABLE muss mu.s mu.u bhis successful)
-+    add_custom_command(TARGET ${EXECUTABLE} POST_BUILD
-+        COMMAND ${CMAKE_COMMAND} -E copy_directory
-+        ${CMAKE_SOURCE_DIR}/scripts
-+        ${CMAKE_BINARY_DIR}/scripts
-+    )
-+endforeach()
-+
-+# Install all scripts as executable programs
-+install(PROGRAMS ${SCRIPT_FILES} DESTINATION bin)
-\ No newline at end of file
-diff --git a/mutators/bhis/remove.variable.declaration-59944.cpp b/mutators/bhis/remove.variable.declaration-59944.cpp
-new file mode 100644
-index 00000000..29bb75b9
---- /dev/null
-+++ b/mutators/bhis/remove.variable.declaration-59944.cpp
-@@ -0,0 +1,25 @@
-+#include <clang/AST/ASTContext.h>
-+#include <clang/AST/RecursiveASTVisitor.h>
-+#include <clang/Basic/SourceManager.h>
-+#include <clang/Lex/Lexer.h>
-+#include "Mutator.h"
-+#include "MutatorUsingBash.h"
-+#include "MutatorManager.h"
-+#include <iostream>
-+
-+using namespace clang;
-+
-+class RemoveVariableDeclaration : public MutatorUsingBash, public RecursiveASTVisitor<RemoveVariableDeclaration> {
-+public:
-+    using MutatorUsingBash::MutatorUsingBash;
-+    
-+    bool mutate() override {
-+        return replaceWithBashScript("../scripts/remove.variable.declaration-59944.sh");
-+    }
-+
-+private:
-+};
-+
-+static RegisterMutator<RemoveVariableDeclaration> M(
-+    "remove.variable.declaration",
-+    "Removes variable declaration that the variable was used for address of operator.");
 diff --git a/mutators/include/Mutator.h b/mutators/include/Mutator.h
 index 8301173c..543f5b3d 100644
 --- a/mutators/include/Mutator.h
@@ -363,7 +465,7 @@ index 0a9d2a50..229ab294 100644
  
 diff --git a/mutators/lib/MutatorUsingBash.cpp b/mutators/lib/MutatorUsingBash.cpp
 new file mode 100644
-index 00000000..676b7eae
+index 00000000..58f16688
 --- /dev/null
 +++ b/mutators/lib/MutatorUsingBash.cpp
 @@ -0,0 +1,209 @@
@@ -472,7 +574,7 @@ index 00000000..676b7eae
 +    std::string tempFileName = createTempFile(EntireFileContent);
 +
 +    // Run bash command on the string
-+    std::string bashCommand = "bash ../scripts/replaceOne.sh " + tempFileName + " \'" + pattern + "\' \'" + replacement + "\' " + std::to_string(getSeed()) + " 2>/dev/null";
++    std::string bashCommand = "bash ~/MetaMut/mutators/scripts/replaceOne.sh " + tempFileName + " \'" + pattern + "\' \'" + replacement + "\' " + std::to_string(getSeed()) + " 2>/dev/null";
 +    
 +    // llvm::outs() << "bashCommand: " << bashCommand << "\n";
 +    bool result = runBash(bashCommand);
@@ -697,49 +799,6 @@ index 25e5ea31..e4ab3d7c 100644
    manager->setSourceFile(opt::input);
    manager->setMutationRange(range);
  
-diff --git a/mutators/scripts/remove.variable.declaration-59944.sh b/mutators/scripts/remove.variable.declaration-59944.sh
-new file mode 100644
-index 00000000..101f42d1
---- /dev/null
-+++ b/mutators/scripts/remove.variable.declaration-59944.sh
-@@ -0,0 +1,37 @@
-+#!/bin/bash
-+
-+# Check if a file argument is provided
-+if [ $# -ne 2 ]; then
-+    echo "Usage: $0 <file> <seed>"
-+    exit 1
-+fi
-+
-+file="$1"
-+SEED=$2
-+
-+#### Randomly pick one
-+# Find all occurrences of address of variable
-+matches=$(grep -oE '\&([a-zA-Z_][a-zA-Z0-9_]*)' "$file" | \
-+sed -E 's/\&([a-zA-Z_][a-zA-Z0-9_]*)/\1/')
-+
-+# If no matches are found, exit
-+if [ -z "$matches" ]; then
-+  echo "No matching patterns found."
-+  exit 0
-+fi
-+
-+# Convert matches to an array and randomly pick one
-+varible=$(echo "$matches" | awk -v seed="$SEED" 'BEGIN {srand(seed); line=""} {if (rand() <= 1/NR) line=$0} END {print line}')
-+
-+
-+# Find the variable declaration
-+matches=$(grep -noE "([a-zA-Z_][a-zA-Z0-9_]* )*[a-zA-Z_][a-zA-Z0-9_]* $varible( = (.*))?;" "$file")
-+
-+if [ -z "$matches" ]; then
-+  echo "No matching patterns found."
-+  exit 0
-+fi
-+
-+line=$(echo "$matches" | head -n 1 | cut -d: -f1)
-+
-+sed -i -E "${line}s/([a-zA-Z_][a-zA-Z0-9_]* )*[a-zA-Z_][a-zA-Z0-9_]* $varible( = (.*))?;//" "$file"
 diff --git a/mutators/scripts/replaceOne.sh b/mutators/scripts/replaceOne.sh
 new file mode 100644
 index 00000000..a76a6464
@@ -787,7 +846,7 @@ index 00000000..a76a6464
 +# cat $FILE
 \ No newline at end of file
 diff --git a/setup.sh b/setup.sh
-index 8ea094e5..0c31a58c 100644
+index 8ea094e5..cfba154b 100644
 --- a/setup.sh
 +++ b/setup.sh
 @@ -6,13 +6,20 @@ set -e
@@ -813,7 +872,7 @@ index 8ea094e5..0c31a58c 100644
  
  mkdir -p $CC_DWNDIR
  mkdir -p $CC_OBJDIR
-@@ -22,13 +29,15 @@ mkdir -p $CFORGE_OBJDIR
+@@ -22,13 +29,16 @@ mkdir -p $CFORGE_OBJDIR
  cd $PROJ_HOME/instrumenter
  mkdir -p output; cd output
  cmake .. -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11
@@ -825,20 +884,38 @@ index 8ea094e5..0c31a58c 100644
    cd $CC_DWNDIR
    echo "[*] downloading gcc's source code"
 -  git clone --depth=1 git://gcc.gnu.org/git/gcc.git gcc-project-trunk
-+  git clone https://github.com/gcc-mirror/gcc.git gcc-project-trunk
++  git clone --depth 1 https://github.com/gcc-mirror/gcc.git gcc-project-trunk
 +  cd gcc-project-trunk
++  git fetch --depth 1 origin 87492fb3fd5e7510983e0275a38ba95769335018
 +  git checkout 87492fb3fd5e7510983e0275a38ba95769335018
  fi
  
  # gcc-project-trunk.obj
-@@ -76,7 +85,9 @@ fi
+@@ -76,7 +86,10 @@ fi
  if ! [ -d $CC_DWNDIR/llvm-project-trunk ]; then
    cd $CC_DWNDIR
    echo "[*] downloading llvm's source code"
 -  git clone --depth=1 git@github.com:llvm/llvm-project llvm-project-trunk
-+  git clone https://github.com/llvm/llvm-project.git llvm-project-trunk
++  git clone --depth 1 https://github.com/llvm/llvm-project.git llvm-project-trunk
 +  cd llvm-project-trunk
++  git fetch --depth 1 origin 9bdf683ba6cd9ad07667513d264a2bc02d969186
 +  git checkout 9bdf683ba6cd9ad07667513d264a2bc02d969186
  fi
  
  # llvm-project-trunk.obj
+diff --git a/test_run.sh b/test_run.sh
+new file mode 100644
+index 00000000..8469100b
+--- /dev/null
++++ b/test_run.sh
+@@ -0,0 +1,10 @@
++#!/bin/bash
++
++working_dir=$(pwd)
++
++mkdir workspace
++
++cd workspace
++
++python3 ../fuzzer/run.py -j 10 --wdir $working_dir/workspace --repeat-times 5 --duration 300 --seeds-dir $working_dir/seeds/ --seed 0
++
