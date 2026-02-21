@@ -2,6 +2,8 @@ import requests
 from bs4 import BeautifulSoup
 import logging
 from datetime import datetime, date
+import argparse
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +95,7 @@ def process_testcases(out_folder, bug_id, sha, testcases):
         try:
             response = requests.get(f"{GCC_REPO_URL}{sha}/{testcase_path}")
             response.raise_for_status()
-            with open(f"./{out_folder}/{bug_id}-{idx}.c", "w") as file:
+            with open(f"{out_folder}/{bug_id}-{idx}.c", "w") as file:
                 file.write(response.text)
         except Exception as e:
             logger.warning(f"Failed to fetch {testcase_path} for Bug ID {bug_id}: {e}")
@@ -111,7 +113,7 @@ def process_one_testcase(out_folder, bug_id, sha, testcase):
     try:
         response = requests.get(f"{GCC_REPO_URL}{sha}/{testcase_path}")
         response.raise_for_status()
-        with open(f"./{out_folder}/{bug_id}.c", "w") as file:
+        with open(f"{out_folder}/{bug_id}.c", "w") as file:
             file.write(response.text)
         return True
     except Exception as e:
@@ -196,15 +198,27 @@ def collect_bug_report_data(start_date, end_date, out_folder):
             # Bug Report Summary
             process_bug_report(out_folder, bug_id, bug_report_soup)
 
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--out_folder", default="gcc_bug_report")
+    p.add_argument("--start_date", default="2023-01-01", help="YYYY-MM-DD")
+    p.add_argument("--end_date",   default="2024-10-31", help="YYYY-MM-DD")
+    return p.parse_args()
+
+def parse_ymd(s: str) -> date:
+    y, m, d = s.split("-")
+    return date(int(y), int(m), int(d))
 
 # Main Function
 def main():
-    
-    out_folder = "gcc_bug_report"
-    start_date = date(2023, 1, 1)
-    end_date = date(2024, 10, 31)
+    args = parse_args()
+    out_folder = args.out_folder
+    start_date = parse_ymd(args.start_date)
+    end_date = parse_ymd(args.end_date)
 
     setup_logger()
+    os.makedirs(out_folder, exist_ok=True)
+    print("Start extracting GCC bug reports... (please check log file)")
     collect_bug_report_data(start_date, end_date, out_folder)
     logger.info(f"Finished processing bug reports for {out_folder}!")
 
