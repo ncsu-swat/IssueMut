@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, date
 import argparse
 import os
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,8 @@ def parse_date(date_string):
     return datetime.strptime(date_string, DATE_FORMAT).date()
 
 def fetch_page(url):
-    response = requests.get(url)
+    headers = {"User-Agent": "IssueMut/1.0"}
+    response = requests.get(url, headers=headers, timeout=30)
     response.raise_for_status()
     return BeautifulSoup(response.text, 'html.parser')
 
@@ -31,10 +33,50 @@ def extract_bug_ids(soup):
 
 def extract_bug_report_details(bug_report_soup):
     """
-    Extract title and reported date from a bug report page.
+    Extract title and reported date from a bug report page (robust to Bugzilla HTML changes).
     """
-    title = bug_report_soup.find("span", {"id": "short_desc_nonedit_display"}).contents[0]
-    reported_date_string = bug_report_soup.find("th", string="\n      Reported:\n    ").parent.find("td").contents[0].split(" ")[0]
+    # --- Title ---
+    title = None
+
+    # Old Bugzilla sometimes had this id
+    t = bug_report_soup.find("span", {"id": "short_desc_nonedit_display"})
+    if t and t.get_text(strip=True):
+        title = t.get_text(" ", strip=True)
+
+    # Fallback: use <title> tag: "12345 – blah blah"
+    if not title:
+        if bug_report_soup.title and bug_report_soup.title.get_text(strip=True):
+            full = bug_report_soup.title.get_text(" ", strip=True)
+            # Remove leading "12345 – " (or "12345 - ")
+            title = re.sub(r"^\s*\d+\s*[–-]\s*", "", full).strip()
+
+    if not title:
+        title = "N/A"
+
+    # --- Reported date ---
+    reported_date_string = None
+
+    # Try common field containers first (more stable than table labels)
+    # Some Bugzilla themes store it under an element containing a timestamp
+    creation = bug_report_soup.find(id=re.compile(r"(creation|reported)", re.I))
+    if creation:
+        m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", creation.get_text(" ", strip=True))
+        if m:
+            reported_date_string = m.group(1)
+
+    # Fallback: find a <th> containing "Reported" ignoring whitespace
+    if not reported_date_string:
+        th = bug_report_soup.find("th", string=re.compile(r"Reported", re.I))
+        if th and th.parent:
+            td = th.parent.find("td")
+            if td:
+                m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", td.get_text(" ", strip=True))
+                if m:
+                    reported_date_string = m.group(1)
+
+    if not reported_date_string:
+        reported_date_string = "1970-01-01"  # safe fallback so parse_date won't crash if you forget to guard
+
     return title, reported_date_string
 
 def extract_commit_links(bug_report_soup):
@@ -42,7 +84,7 @@ def extract_commit_links(bug_report_soup):
     for commit_span in bug_report_soup.find_all("span", string="GCC Commits"):
         comment = commit_span.parent.parent.parent.parent
         if is_master_branch(comment):
-            commit = comment.find("a", href=lambda href: href and "gitweb.cgi?p=gcc.git;h=" in href)
+            commit = comment.find("a", href=lambda href: href and ("gitweb.cgi?p=gcc.git;h=" in href or "gcc.gnu.org/cgit/gcc/commit/" in href))
             if commit:
                 commits.append(commit['href'])
     return commits
@@ -60,12 +102,24 @@ def extract_testcase_links(commit_soup, sha):
 def extract_one_testcase_link(commit_soup, sha):
     """
     Extract one testcase from a commit page.
+    Supports both gitweb (diff_tree) and cgit (diffstat).
     """
+    # --- Old gitweb style ---
     testcases = []
     for diff_tree in commit_soup.find_all("table", {"class": "diff_tree"}):
         links = diff_tree.find_all('a', string=lambda text: text and "testsuite" in text)
-        testcases.extend([(sha, link.string) for link in links])
-    return testcases[0] if testcases != [] else None
+        testcases.extend([(sha, link.get_text(strip=True)) for link in links if link.get_text(strip=True)])
+    if testcases:
+        return testcases[0]
+
+    # --- New cgit style ---
+    # Example: <table class="diffstat"> ... <a>gcc/testsuite/.../foo.c</a>
+    for a in commit_soup.select("table.diffstat a"):
+        path = a.get_text(strip=True)
+        if path and "testsuite" in path:
+            return (sha, path)
+
+    return None
 
 # Extract bug details with error handling
 def safe_find_text(soup_element, tag, **kwargs):
@@ -74,8 +128,9 @@ def safe_find_text(soup_element, tag, **kwargs):
 
 # Validators
 def is_c_plus_plus(bug_report_soup):
-    component = bug_report_soup.find("a", string="Component:").parent.parent.find("td").contents[0]
-    return "c++" in component
+    component = safe_find_text(bug_report_soup, "td", id="field_container_component")
+    component = component.lower()
+    return "c++" in component or "cxx" in component
 
 def before_starting_date(start_date, reported_date_string):
     return parse_date(reported_date_string) < start_date
@@ -133,9 +188,24 @@ def process_bug_report(out_folder, bug_report_id, soup):
     # Extract comments
     comments = []
     for comment_div in soup.find_all("div", class_="bz_comment"):
-        user = safe_find_text(comment_div, "span", class_="fn")
+        # user
+        user = (
+            safe_find_text(comment_div, "span", class_="fn")
+            if comment_div.find("span", class_="fn") else
+            safe_find_text(comment_div, "span", class_="bz_comment_user")
+        )
+
+        # time
         time = safe_find_text(comment_div, "span", class_="bz_comment_time")
+        if time == "N/A":
+            time = safe_find_text(comment_div, "time")
+
+        # text
         text = safe_find_text(comment_div, "pre", class_="bz_comment_text")
+        if text == "N/A":
+            # sometimes comment text is in a div instead of pre
+            text = safe_find_text(comment_div, "div", class_="bz_comment_text")
+
         comments.append({"user": user, "time": time, "text": text})
 
 
@@ -175,8 +245,8 @@ def collect_bug_report_data(start_date, end_date, out_folder):
         logger.info(f"Processing Bug Report: {bug_id}")
         bug_report_soup = fetch_page(f"{BASE_URL}show_bug.cgi?id={bug_id}")
 
-        if is_c_plus_plus(bug_report_soup):
-            continue
+        # if is_c_plus_plus(bug_report_soup):
+        #     continue
 
         title, reported_date_string = extract_bug_report_details(bug_report_soup)
         if before_starting_date(start_date, reported_date_string):
@@ -189,7 +259,7 @@ def collect_bug_report_data(start_date, end_date, out_folder):
             continue
 
         for commit_link in commit_links:
-            sha = commit_link.split("gitweb.cgi?p=gcc.git;h=")[1]
+            sha = commit_link.split("gcc.gnu.org/cgit/gcc/commit/?id=")[1]
             commit_soup = fetch_page(commit_link)
             testcase = extract_one_testcase_link(commit_soup, sha)
             testcase_exists = process_one_testcase(out_folder, bug_id, sha, testcase)
@@ -197,7 +267,7 @@ def collect_bug_report_data(start_date, end_date, out_folder):
         if testcase_exists:
             # Bug Report Summary
             process_bug_report(out_folder, bug_id, bug_report_soup)
-
+        
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--out_folder", default="gcc_bug_report")
