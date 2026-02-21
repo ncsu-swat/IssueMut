@@ -54,15 +54,18 @@ bug_report_directory = "../../mined_data/llvm/bug_report"
 out_folder = "llvm_negative_test_case"
 ```
 
-Run the generator:
+Run the generator with your OPENAI_API_KEY or ANTHROPIC_API_KEY:
 ```console
+~/IssueMut/src/mutator_mining$ export OPENAI_API_KEY="yourkeyhere"
+~/IssueMut/src/mutator_mining$ export ANTHROPIC_API_KEY="yourkeyhere"
 ~/IssueMut/src/mutator_mining$ python3 negative_test_case_generator.py
 ```
 
 ### 3. Generate Mutators
-This step synthesizes fuzzing mutators from mined bug reports using a LangChain-based pipeline. Before running, update the paths in `src/mutator_mining/langchain-issuemut/scripts/config.txt` to point to your bug report and negative test case directories.
+This step synthesizes fuzzing mutators from mined bug reports using a LangChain-based pipeline. Before running, update the paths in `src/mutator_mining/langchain-issuemut/scripts/config.txt` to point to your bug report and negative test case directories. (please export your GOOGLE_API_KEY)
 ```console
 ~/IssueMut/src/mutator_mining$ cd langchain-issuemut/scripts
+~/IssueMut/src/mutator_mining$ export GOOGLE_API_KEY="yourkeyhere"
 ~/IssueMut/src/mutator_mining/langchain-issuemut/scripts$ bash run_parallel.sh
 ```
 
