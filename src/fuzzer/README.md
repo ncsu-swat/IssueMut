@@ -1,11 +1,11 @@
-# IssueMut Install Instructions
+# IssueMut Mutator Integration Instructions
 
-This document provides step-by-step instructions for setting up and running the IssueMut mutators.
-Since we ran IssueMut mutators on top of MetaMut, please clone MetaMut and apply the patch.
+This document provides step-by-step instructions for setting up and running the IssueMut mutators with two fuzzing frameworks: MetaMut and Kitten.
 
-- Note: To run kitten_i, please clone the repository of Kitten (https://github.com/uw-pluverse/perses.git) and apply the `kitten_i.patch` to it.
+- [MetaMut Integration](#metamut-integration)
+- [Kitten Integration](#kitten-integration)
 
-## Setup Process
+## MetaMut Integration
 
 ### 1. Clone the Repository of MetaMut
 
@@ -17,10 +17,10 @@ git checkout 2284f81534954fdf1763c0ce6a12441b7394f02e
 ```
 
 ### 2. Apply the Patch
-
+The `metamut_i.patch` is located in `metamut_i` folder.
 ```bash
 # Apply the patch file
-git apply ../issuemut.patch
+git apply ../metamut_i.patch
 ```
 
 ### 3. Install Required Packages for Mutators
@@ -40,8 +40,14 @@ The setup script will install the compilers that we used in the experiment.
 bash setup.sh
 ```
 
+### 5. Copy mutators into MetaMut framework
+From mined_data/gcc/mutators and mined_data/llvm/mutators folders, 
+- copy mutator cpp files (.cpp) to mutators/<mutator_set_folder>
+- copy mutator bash scripts (.sh) to mutators/scripts
+
+
 ### 5. Build the Mutators
-Before building the mutators, please copy the mutators from data/ folder.
+- Before building the mutators, please edit CMakeList.txt to add your mutator executable with designated path.
 
 ```bash
 cd mutators
@@ -74,17 +80,55 @@ sudo update-alternatives --install /usr/bin/llvm-config llvm-config $(which llvm
 ```
 
 ### 8. Run the Fuzzer
-Run the fuzzer for once
+Please check which mutator executable you wish to run before running the fuzzer. you can check in muss_bin `MetaMut/fuzzer/configs.py`
+
+Run the fuzzer for a test run for 5 minutes.
 ```bash
-mkdir -p workspace; cd workspace
-python3 ../fuzzer/run.py -j 120 \
-  --wdir $(pwd) \
-  --repeat-times 60 \
-  --duration 28800 \
-  --seeds-dir $(pwd)/../seeds \
-  --cc-opt=-O2
+bash test_run.sh
 ```
-Run the fuzzer for 5 times
+Run the fuzzer for 5 times (each run lasts 24h)
 ```bash
-bash run.sh
+bash exp_run.sh
+```
+
+## Kitten Integration
+
+### 1. Clone the Repository of Kitten
+```bash
+# Clone the repository
+git clone https://github.com/uw-pluverse/perses.git
+cd perses
+git checkout 2284f81534954fdf1763c0ce6a12441b7394f02e
+```
+
+### 2. Apply the Patch
+The `kitten_i.patch` is located in `kitten_i` folder.
+```bash
+# Apply the patch file
+git apply ../kitten_i.patch
+```
+
+### 3. Copy the Execution Scripts
+Copy the provided scripts to your workspace folder:
+```bash
+cp kitten_i/* /your/workspace/
+```
+
+### 4. Build kitten_i
+```
+bash compile.sh
+```
+
+### 5. Setup configs
+Check out the config.yaml and make sure your seed folder path and installed compiler path
+
+### 6. Run the fuzzer
+Run the fuzzer for a test run for 5 minutes.
+```bash
+bash test_run.sh
+```
+(Slurm) Run the fuzzer for experiment run
+- kitten and kitten_i each for 50 times in parallel (each run lasts 8h)
+```bash
+bash exp_runs.sh
 ```
