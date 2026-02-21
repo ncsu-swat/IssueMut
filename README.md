@@ -1,6 +1,6 @@
 # IssueMut
 
-IssueMut is a compiler fuzzing mutator mining tool. It extracts mutation operators from historical compiler bug reports and retrofits such mutators into existing mutational compiler fuzzers. The approach is described in our MSR 2026 paper, [**"Learning Compiler Fuzzing Mutators from Historical Bugs"**](https://https://lingjunliu.github.io/files/LiuETAlIssueMutMSR26.pdf).
+IssueMut is a compiler fuzzing mutator mining tool. It extracts mutation operators from historical compiler bug reports and retrofits such mutators into existing mutational compiler fuzzers. The approach is described in our MSR 2026 paper, **"Learning Compiler Fuzzing Mutators from Historical Bugs"**.
 
 The tool is structured in two parts:
 
