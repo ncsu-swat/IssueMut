@@ -19,13 +19,16 @@ anthropic_client = anthropic.Anthropic(
     api_key=os.environ.get("ANTHROPIC_API_KEY")
 )
 
+
+# CONFIGS
 llm_vendor = "openai"
 
 model = "gpt-4o-mini"
 # model = "claude-3-5-sonnet-20241022"
 
-bug_report_directory = "llvm_bug_report"
+bug_report_directory = "../../mined_data/llvm/bug_report"
 out_folder = "llvm_negative_test_case"
+os.makedirs(out_folder, exist_ok=True)
 
 # Helper Functions
 def setup_logger():
