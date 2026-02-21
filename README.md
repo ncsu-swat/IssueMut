@@ -1,6 +1,6 @@
 # IssueMut
 
-IssueMut is a compiler fuzzing mutator mining tool. It extracts mutation operators from historical compiler bug reports and retrofits such mutators into existing mutational compiler fuzzers. The approach is described in our MSR 2026 paper, **"Learning Compiler Fuzzing Mutators from Historical Bugs"**.
+IssueMut is a compiler fuzzing mutator mining tool. It extracts mutation operators from historical compiler bug reports and retrofits such mutators into existing mutational compiler fuzzers. The approach is described in our MSR 2026 paper, [**"Learning Compiler Fuzzing Mutators from Historical Bugs"**]().
 
 The tool is structured in two parts:
 
@@ -11,13 +11,13 @@ The tool is structured in two parts:
 ```
 ├── experiment_data/          # Experimental data in our MSR paper
 │   ├── Evaluation/           # Evaluation results for RQ1, RQ2, RQ3, and RQ4 (including reported bugs)
-│   ├── Fuzz4All/             # The results of running Fuzz4All
+│   └── Fuzz4All/             # The results of running Fuzz4All
 ├── mined_data/               # Mined bug reports, negative test cases, and mutators
 │   ├── gcc/
-│   ├── llvm/
-├── src/                      # Implementation of IssueMut
-│   ├── mutator_mining/       # The code for GCC/LLVM bug report extractor, negative test case generator, and langchain-based mutator generator
-│   ├── fuzzer/               # The code for enhanced fuzzer
+│   └── llvm/
+└── src/                      # Implementation of IssueMut
+    ├── mutator_mining/       # The code for GCC/LLVM bug report extractor, negative test case generator, and langchain-based mutator generator
+    └── fuzzer/               # The code for enhanced fuzzer
 ```
 
 ## Prerequisite
@@ -27,7 +27,7 @@ Install dependencies:
 ```console
 pip install -r src/mutator_mining/requirements.txt
 ```
-- (Optional) dependencies for fuzzer integration please check here(link).
+- (Optional) dependencies for fuzzer integration please check [here](src/fuzzer/README.md).
 
 ## Mutator Mining Steps
 ### 1. Scrape GCC/LLVM bug reports
@@ -55,5 +55,8 @@ This step synthesizes fuzzing mutators from mined bug reports using a langchain-
 ```
 
 ## Fuzzer Integration
-We integrated our mined mutators into mutaitonal fuzzing frameworks MetaMut and kitten.
-Please refer to src/fuzzer/README.md for detailed integration instructions.
+We integrated our mined mutators into mutaitonal fuzzing frameworks MetaMut[1] and Kitten[2].
+Please refer to [here](src/fuzzer/README.md) for detailed integration instructions.
+
+[1]: https://github.com/icsnju/MetaMut/tree/gh-pages
+[2]: https://github.com/uw-pluverse/perses/tree/master/kitten
