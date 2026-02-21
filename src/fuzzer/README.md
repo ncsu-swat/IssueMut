@@ -1,6 +1,7 @@
 # IssueMut Mutator Integration Instructions
 
 This document provides step-by-step instructions for setting up and running the IssueMut mutators with two fuzzing frameworks: MetaMut and Kitten.
+A Docker image is available with all mined mutators and pre-configured metamut_i and kitten_i: `docker pull issuemut/issuemut:latest`
 
 - [MetaMut Integration](#metamut-integration)
 - [Kitten Integration](#kitten-integration)

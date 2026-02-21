@@ -6,6 +6,7 @@ The tool is structured in two parts:
 
 - **Mutator Mining**: Scrapes test cases from bug reports, extracts negative test cases, and generates mutators via LangChain-based pipeline
 - **Fuzzer Integration**: Incorporates the mined mutators into existing mutational fuzzing frameworks
+  - Docker image is available on [Docker Hub](https://hub.docker.com/r/issuemut/issuemut/tags).
 
 ## Repository Structure
 ```
